@@ -9969,36 +9969,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buddy_reply_write_failure_frees_allocated_response_block() {
-        let pool = small_response_pool("a");
-        let writer = closed_writer().await;
-        let payload = b"x".repeat(8192);
+    async fn ordinary_shm_reply_write_failure_releases_only_its_allocation() {
+        for len in [8193, 64 * 1024 + 1] {
+            let pool = small_response_pool("a");
+            let live = pool.inner.write().alloc_shm_handle(4096).unwrap();
+            let writer = closed_writer().await;
+            let payload = b"x".repeat(len);
 
-        let err = write_buddy_reply_with_data(&pool, &writer, 7, payload.as_slice())
-            .await
-            .unwrap_err();
+            let err = smart_reply_with_data(&pool, &writer, 7, &payload, 1024, 4096)
+                .await
+                .unwrap_err();
 
-        assert!(err.to_string().contains("buddy reply write failed"));
+            assert!(matches!(&err, ResponseSendError::Transport(_)));
+            assert!(err.to_string().contains("buddy reply write failed"));
+            let stats = pool.read().stats();
+            assert_eq!(stats.alloc_count, 1);
+            assert_eq!(stats.buddy_occupied_bytes, 4096);
+            assert_eq!(stats.dedicated_active_count, 0);
+            assert_eq!(stats.dedicated_allocs, u64::from(len > 64 * 1024));
+            pool.inner.write().release_handle(live).unwrap();
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_shm_reply_write_failure_releases_only_its_allocation() {
+        for len in [8193, 64 * 1024 + 1] {
+            let pool = small_response_pool("b");
+            let live = pool.inner.write().alloc_shm_handle(4096).unwrap();
+            let prepared = crate::response::try_prepare_shm_response(&pool, 1024, len, |dst| {
+                dst.fill(b'x');
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+            let writer = closed_writer().await;
+
+            let err = send_response_meta(&pool, &writer, 7, prepared, 1024, 4096, 128 * 1024)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, ResponseSendError::Transport(_)));
+            let stats = pool.read().stats();
+            assert_eq!(stats.alloc_count, 1);
+            assert_eq!(stats.buddy_occupied_bytes, 4096);
+            assert_eq!(stats.dedicated_active_count, 0);
+            assert_eq!(stats.dedicated_allocs, u64::from(len > 64 * 1024));
+            pool.inner.write().release_handle(live).unwrap();
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn smart_reply_without_shm_capacity_sends_complete_ordered_chunks() {
+        let pool = small_response_pool("chunkfallback");
+        let reservations: Vec<_> = (0..2)
+            .map(|_| pool.inner.write().alloc_shm_handle(64 * 1024).unwrap())
+            .collect();
+        assert!(pool.inner.write().alloc_shm_handle(8193).is_err());
+        let payload: Vec<_> = (0..8193).map(|i| (i % 251) as u8).collect();
+        let (mut peer, stream) = LocalStream::pair().await.unwrap();
+        let (reader, half) = stream.into_split();
+        let writer = Arc::new(Mutex::new(half));
+        let receive = async {
+            for (idx, expected) in payload.chunks(4096).enumerate() {
+                let (request_id, flags, body) = read_reply_frame(&mut peer).await;
+                assert_eq!(request_id, 7);
+                let last = if idx == 2 { FLAG_CHUNK_LAST } else { 0 };
+                assert_eq!(flags, FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_CHUNKED | last);
+                assert_eq!(
+                    c2_wire::chunk::decode_reply_chunk_meta(&body, 0).unwrap(),
+                    (8193, 3, idx as u32, REPLY_CHUNK_META_SIZE)
+                );
+                assert_eq!(&body[REPLY_CHUNK_META_SIZE..], expected);
+            }
+        };
+        let (sent, ()) = tokio::join!(
+            smart_reply_with_data(&pool, &writer, 7, &payload, 1024, 4096),
+            receive
+        );
+        sent.unwrap();
+        drop((reader, writer));
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        assert_eq!(pool.read().stats().alloc_count, 2);
+        for block in reservations {
+            pool.inner.write().release_handle(block).unwrap();
+        }
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     #[tokio::test]
-    async fn prepared_shm_reply_write_failure_frees_allocated_response_block() {
-        let pool = small_response_pool("b");
-        let prepared = crate::response::try_prepare_shm_response(&pool, 1024, 8192, |dst| {
-            dst.fill(b'x');
-            Ok(())
-        })
-        .unwrap()
-        .unwrap();
-        let writer = closed_writer().await;
-
-        let err = send_response_meta(&pool, &writer, 7, prepared, 1024, 4096, 16 * 1024)
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("prepared SHM reply write failed"));
-        assert_eq!(pool.read().stats().alloc_count, 0);
+    async fn cancelled_reply_waiting_for_writer_keeps_unpublished_allocation() {
+        for prepared in [false, true] {
+            let pool = small_response_pool("cancelreply");
+            let (mut peer, stream) = LocalStream::pair().await.unwrap();
+            let (reader, half) = stream.into_split();
+            let writer = Arc::new(Mutex::new(half));
+            let meta = if prepared {
+                crate::response::try_prepare_shm_response(&pool, 1024, 8193, |dst| {
+                    dst.fill(b'x');
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap()
+            } else {
+                ResponseMeta::Inline(b"x".repeat(8193))
+            };
+            assert_eq!(pool.read().stats().alloc_count, u32::from(prepared));
+            let guard = writer.lock().await;
+            let mut send = Box::pin(send_response_meta(
+                &pool, &writer, 7, meta, 1024, 4096, 16384,
+            ));
+            assert!(owner_admission_poll_once(send.as_mut()).await.is_pending());
+            assert_eq!(pool.read().stats().alloc_count, 1);
+            drop(send);
+            drop(guard);
+            drop((reader, writer));
+            assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+            // Both paths currently retain their allocation before publication.
+            assert_eq!(pool.read().stats().alloc_count, 1);
+            pool.inner.write().destroy(); // Only this test's isolated pool.
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        }
     }
 
     #[tokio::test]
@@ -10068,20 +10160,6 @@ mod tests {
             err.to_string()
                 .contains("response payload size 8192 exceeds max_payload_size 4096")
         );
-        assert_eq!(pool.read().stats().alloc_count, 0);
-    }
-
-    #[tokio::test]
-    async fn smart_reply_treats_buddy_write_failure_as_fatal() {
-        let pool = small_response_pool("e");
-        let writer = closed_writer().await;
-        let payload = b"x".repeat(8192);
-
-        let err = smart_reply_with_data(&pool, &writer, 7, payload.as_slice(), 1024, 4096)
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("buddy reply write failed"));
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 

@@ -207,13 +207,15 @@ mod tests {
     fn write_failure_frees_allocated_response_block() {
         let pool = test_pool();
 
-        let err = super::try_prepare_shm_response(&pool, 1024, 8192, |_dst| {
+        let err = super::try_prepare_shm_response(&pool, 1024, 8193, |dst| {
+            assert_eq!(dst.len(), 8193);
             Err("copy failed".to_string())
         })
         .expect_err("copy failure should be reported");
 
         assert!(err.contains("copy failed"));
         assert_eq!(pool.read().stats().alloc_count, 0);
+        assert_eq!(pool.read().stats().buddy_occupied_bytes, 0);
     }
 
     #[test]
