@@ -19,7 +19,7 @@ def run_crm_service(impl_module: str, impl_class: str):
             if request_type == 'STOP':
                 break
             
-            elif request_type == "CREATE":
+            if request_type == "CREATE":
                 args, kwargs = data
                 crm = crm_class(*args, **kwargs)
                 response = ("SUCCESS", None)
