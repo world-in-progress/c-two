@@ -1,4 +1,5 @@
-from src.test.module import schema, CRM, GridAttribute, Get_Wrapper
+from proto.schema import schema_pb2 as schema
+from test import CRM, GridAttribute, Get_Wrapper
 
 # Grid parameters
 redis_host = 'localhost'

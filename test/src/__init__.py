@@ -1,6 +1,7 @@
-from .proto import schema_pb2 as schema
-from .crm.crm import CRM, GridAttribute
-from .wrapper import Wrapper, Register_Wrapper, Get_Wrapper
+from .crm import CRM, GridAttribute
+from proto.common import base_pb2 as base
+from proto.schema import schema_pb2 as schema
+from ..wrapper import Get_Wrapper, Register_Wrapper
 
 # schema.InitializeRequest ##################################################
 def serialize_init(redis_host: str, redis_port: int, epsg: int, bounds: list[float], first_size: list[float], subdivide_rules: list[list[int]]) -> schema.InitializeRequest:
@@ -35,7 +36,7 @@ def deserialize_sibling_grid_infos(args: schema.GetGridInfosRequest) -> tuple[in
     return level, global_ids
 
 # schema.GetGridInfosResponse ##################################################
-def serialize_multi_grid_attributes(status: schema.Status, message: str, data: list[GridAttribute]) -> schema.GetGridInfosResponse:
+def serialize_multi_grid_attributes(status: base.Status, message: str, data: list[GridAttribute]) -> schema.GetGridInfosResponse:
     proto = schema.GetGridInfosResponse()
     proto.status = status
     proto.message = message
@@ -57,7 +58,7 @@ def serialize_multi_grid_attributes(status: schema.Status, message: str, data: l
     ])
     return proto
 
-def deserialize_multi_grid_attributes(proto: schema.GetGridInfosResponse) -> tuple[schema.Status, str, list[GridAttribute]]:
+def deserialize_multi_grid_attributes(proto: schema.GetGridInfosResponse) -> tuple[base.Status, str, list[GridAttribute]]:
     status = proto.status
     message = proto.message
     grid_infos = [

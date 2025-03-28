@@ -1,0 +1,20 @@
+// proto/common/base.proto
+syntax = "proto3";
+
+package common;
+
+enum Status {
+    UNKNOWN = 0;
+    SUCCESS = 1;
+    ERROR_INVALID = 2;
+    ERROR_TIMEOUT = 3;
+    ERROR_UNAVAILABLE = 4;
+    BUSY = 5;
+    IDLE = 6;
+    PENDING = 7;
+}
+
+message BaseResponse {
+    Status status = 1;
+    string message = 2;
+}

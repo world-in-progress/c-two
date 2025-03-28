@@ -1,5 +1,5 @@
 from functools import wraps
-from .proto import schema_pb2 as schema
+from proto.common import base_pb2 as base
 
 # Message wrapper for communication based on ProtoBuf ########################
 
@@ -22,19 +22,19 @@ def Get_Wrapper(name: str) -> Wrapper | None:
     return None if name not in WRAPPER_MAP else WRAPPER_MAP[name]
 
 # proto: BaseResponse
-def serialize_base_res(status: schema.Status, message: str, _: any) -> schema.InitializeResponse:
-    proto = schema.InitializeResponse()
+def serialize_base_res(status: base.Status, message: str, _: any) -> base.BaseResponse:
+    proto = base.BaseResponse()
     proto.status = status
     proto.message = message
     return proto
 
-def deserialize_base_res(proto: schema.InitializeResponse) -> tuple[schema.Status, str]:
+def deserialize_base_res(proto: base.BaseResponse) -> tuple[base.Status, str]:
     status = proto.status
     message = proto.message
     return status, message
 
 # Register BaseResposne
-Register_Wrapper(schema.InitializeResponse.DESCRIPTOR.full_name, serialize_base_res, deserialize_base_res)
+Register_Wrapper(base.BaseResponse.DESCRIPTOR.full_name, serialize_base_res, deserialize_base_res)
 
 # Wrapper decorator for CRM ##################################################
 
@@ -50,7 +50,7 @@ def cc_wrapper(input_schema: str = '', output_schema: str = '', static: bool = F
             if output_schema != '' and output_schema not in WRAPPER_MAP:
                 raise ValueError(f'No converter defined for method: {output_schema}')
             input_wrapper = WRAPPER_MAP[input_schema].deserialize if input_schema != '' else None
-            output_wrapper = WRAPPER_MAP[output_schema].serialize if output_schema != '' else WRAPPER_MAP[schema.InitializeResponse.DESCRIPTOR.full_name].serialize
+            output_wrapper = WRAPPER_MAP[output_schema].serialize if output_schema != '' else WRAPPER_MAP[base.BaseResponse.DESCRIPTOR.full_name].serialize
             
             # Convert input and run method
             try:
@@ -65,12 +65,12 @@ def cc_wrapper(input_schema: str = '', output_schema: str = '', static: bool = F
                     args_converted = input_wrapper(request) if request is not None else tuple()
                     result = func(obj, *args_converted)
                     
-                status = schema.SUCCESS
+                status = base.SUCCESS
                 message = 'Processing successed'
                 
             except Exception as e:
                 result = None
-                status = schema.ERROR_INVALID
+                status = base.ERROR_INVALID
                 message = f'Error happened: {e}'
             return result, output_wrapper(status, message, result)
         
