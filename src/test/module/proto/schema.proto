@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package cc.v0;
+
+enum Status {
+    UNKNOWN = 0;
+    SUCCESS = 1;
+    ERROR_INVALID = 2;
+    ERROR_TIMEOUT = 3;
+    ERROR_UNAVAILABLE = 4;
+    BUSY = 5;
+    IDLE = 6;
+    PENDING = 7;
+}
+
+message GridAttribute {
+    bool deleted = 1;
+    bool activate = 2;
+    int32 type = 3;
+    int32 level = 4;
+    int32 global_id = 5;
+    double elevation = 6;
+    optional double min_x = 7;
+    optional double min_y = 8;
+    optional double max_x = 9;
+    optional double max_y = 10;
+    optional int32 local_id = 11;
+}
+
+message SubdivideRule {
+    repeated int32 rule = 1;
+}
+
+message InitializeRequest {
+    string redis_host = 1;
+    int32 redis_port = 2;
+    int32 epsg = 3;
+    repeated double bounds = 4; // [min_x, min_y, max_x, max_y]
+    repeated float first_size = 5; // [width, height]
+    repeated SubdivideRule subdivide_rules = 6;
+}
+
+message InitializeResponse {
+    Status status = 1;
+    string message = 2;
+}
+
+message GetLocalIdsRequest {
+    int32 level = 1;
+    repeated int32 global_ids = 2;
+}
+
+message GetLocalIdsResponse {
+    Status status = 1;
+    string message = 2;
+    repeated int32 local_ids = 3;
+}
+
+message GetCoordinatesRequest {
+    int32 level = 1;
+    repeated int32 global_ids = 2;
+}
+
+message GetCoordinatesResponse {
+    Status status = 1;
+    repeated double min_xs = 2;
+    repeated double min_ys = 3;
+    repeated double max_xs = 4;
+    repeated double max_ys = 5;
+    string message = 6;
+}
+
+message GetGridInfosRequest {
+    int32 level = 1;
+    repeated int32 global_ids = 2;
+}
+
+message GetGridInfosResponse {
+    Status status = 1;
+    repeated GridAttribute grid_infos = 2;
+    string message = 3;
+}
+
+message SubdivideGridsRequest {
+    repeated int32 levels = 1;
+    repeated int32 global_ids = 2;
+    int32 batch_size = 3;
+}
+
+message SubdivideGridsResponse {
+    Status status = 1;
+    repeated string grid_keys = 2;
+    string message = 3;
+}

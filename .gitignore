@@ -182,3 +182,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+*_pb2.py
