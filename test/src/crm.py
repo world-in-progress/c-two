@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.compute as pc
 from ..wrapper import cc_wrapper
-from ..proto import schema_pb2 as schema
+from proto.schema import schema_pb2 as schema
 
 # Const ##############################
 GRID_DEFINITION = 'grid_definition'

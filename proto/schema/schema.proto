@@ -1,17 +1,9 @@
+// proto/schema/schema.proto
 syntax = "proto3";
 
-package cc.v0;
+package schema;
 
-enum Status {
-    UNKNOWN = 0;
-    SUCCESS = 1;
-    ERROR_INVALID = 2;
-    ERROR_TIMEOUT = 3;
-    ERROR_UNAVAILABLE = 4;
-    BUSY = 5;
-    IDLE = 6;
-    PENDING = 7;
-}
+import "proto/common/base.proto";
 
 message GridAttribute {
     bool deleted = 1;
@@ -40,18 +32,13 @@ message InitializeRequest {
     repeated SubdivideRule subdivide_rules = 6;
 }
 
-message InitializeResponse {
-    Status status = 1;
-    string message = 2;
-}
-
 message GetLocalIdsRequest {
     int32 level = 1;
     repeated int32 global_ids = 2;
 }
 
 message GetLocalIdsResponse {
-    Status status = 1;
+    common.Status status = 1;
     string message = 2;
     repeated int32 local_ids = 3;
 }
@@ -62,12 +49,12 @@ message GetCoordinatesRequest {
 }
 
 message GetCoordinatesResponse {
-    Status status = 1;
-    repeated double min_xs = 2;
-    repeated double min_ys = 3;
-    repeated double max_xs = 4;
-    repeated double max_ys = 5;
-    string message = 6;
+    common.Status status = 1;
+    string message = 2;
+    repeated double min_xs = 3;
+    repeated double min_ys = 4;
+    repeated double max_xs = 5;
+    repeated double max_ys = 6;
 }
 
 message GetGridInfosRequest {
@@ -76,9 +63,9 @@ message GetGridInfosRequest {
 }
 
 message GetGridInfosResponse {
-    Status status = 1;
-    repeated GridAttribute grid_infos = 2;
-    string message = 3;
+    common.Status status = 1;
+    string message = 2;
+    repeated GridAttribute grid_infos = 3;
 }
 
 message SubdivideGridsRequest {
@@ -88,7 +75,7 @@ message SubdivideGridsRequest {
 }
 
 message SubdivideGridsResponse {
-    Status status = 1;
-    repeated string grid_keys = 2;
-    string message = 3;
+    common.Status status = 1;
+    string message = 2;
+    repeated string grid_keys = 3;
 }
