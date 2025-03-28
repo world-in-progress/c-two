@@ -41,3 +41,8 @@ def run_crm_service(impl_module: str, impl_class: str):
         
         sys.stdout.buffer.write(pickle.dumps(response))
         sys.stdout.buffer.flush()
+        
+if __name__ == "__main__":
+    impl_module = sys.argv[1]
+    impl_class = sys.argv[2]
+    run_crm_service(impl_module, impl_class)

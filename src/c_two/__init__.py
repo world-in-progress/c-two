@@ -11,13 +11,16 @@ class CRMServer:
 
     def _start_crm(self, crm_module: str, crm_class: str, poetry_env_path: str) -> subprocess.Popen:
         """Start the CRM service in a separate process using Poetry environment."""
-        python_path = os.path.join(poetry_env_path, "bin", "python" if sys.platform != "win32" else "Scripts", "python.exe")
+        python_path = os.path.join(poetry_env_path, "bin", "python")
         if not os.path.exists(python_path):
             raise FileNotFoundError(f"Poetry Python executable not found at {python_path}")
         
         cmd = [python_path, "-m", "c_two.service", crm_module, crm_class]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"/app/resource/crm{os.pathsep}{env.get('PYTHONPATH', '')}"
         proc = subprocess.Popen(
             cmd,
+            env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
