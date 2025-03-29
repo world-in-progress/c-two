@@ -3,8 +3,6 @@ syntax = "proto3";
 
 package schema;
 
-import "proto/common/base.proto";
-
 message GridAttribute {
     bool deleted = 1;
     bool activate = 2;
@@ -23,7 +21,7 @@ message SubdivideRule {
     repeated int32 rule = 1;
 }
 
-message InitializeRequest {
+message InitParams {
     string redis_host = 1;
     int32 redis_port = 2;
     int32 epsg = 3;
@@ -32,50 +30,31 @@ message InitializeRequest {
     repeated SubdivideRule subdivide_rules = 6;
 }
 
-message GetLocalIdsRequest {
+message PeerGridInfos {
     int32 level = 1;
     repeated int32 global_ids = 2;
 }
 
-message GetLocalIdsResponse {
-    common.Status status = 1;
-    string message = 2;
-    repeated int32 local_ids = 3;
-}
-
-message GetCoordinatesRequest {
-    int32 level = 1;
-    repeated int32 global_ids = 2;
-}
-
-message GetCoordinatesResponse {
-    common.Status status = 1;
-    string message = 2;
-    repeated double min_xs = 3;
-    repeated double min_ys = 4;
-    repeated double max_xs = 5;
-    repeated double max_ys = 6;
-}
-
-message GetGridInfosRequest {
-    int32 level = 1;
-    repeated int32 global_ids = 2;
-}
-
-message GetGridInfosResponse {
-    common.Status status = 1;
-    string message = 2;
-    repeated GridAttribute grid_infos = 3;
-}
-
-message SubdivideGridsRequest {
+message GridInfos {
     repeated int32 levels = 1;
     repeated int32 global_ids = 2;
-    int32 batch_size = 3;
 }
 
-message SubdivideGridsResponse {
-    common.Status status = 1;
-    string message = 2;
-    repeated string grid_keys = 3;
+message LocalIds {
+    repeated int32 local_ids = 1;
+}
+
+message GridBBoxes {
+    repeated double min_xs = 1;
+    repeated double min_ys = 2;
+    repeated double max_xs = 3;
+    repeated double max_ys = 4;
+}
+
+message GridAttributes {
+    repeated GridAttribute attributes = 1;
+}
+
+message GridKeys {
+    repeated string grid_keys = 1;
 }
