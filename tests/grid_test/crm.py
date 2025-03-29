@@ -5,7 +5,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.compute as pc
-from ..wrapper import cc_wrapper
+from c_two import cc_wrapper
 from proto.schema import schema_pb2 as schema
 
 # Const ##############################
@@ -131,7 +131,7 @@ class CRM():
         self.subdivide_rules: list[list[int]] = grid_definition['subdivide_rules']
     
     @staticmethod
-    @cc_wrapper(input_schema=schema.InitializeRequest.DESCRIPTOR.full_name, static=True)
+    @cc_wrapper(input_proto=schema.InitParams, static=True)
     def create(redis_host: str, redis_port: int, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]]) -> 'CRM':
         return CRM(redis_host, redis_port, epsg, bounds, first_size, subdivide_rules)
             
@@ -184,7 +184,7 @@ class CRM():
                         ATTR_DELETED, ATTR_ACTIVATE, ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y]
         return df[column_order]
     
-    @cc_wrapper(input_schema=schema.GetGridInfosRequest.DESCRIPTOR.full_name, output_schema=schema.GetGridInfosResponse.DESCRIPTOR.full_name)
+    @cc_wrapper(input_proto=schema.PeerGridInfos, output_proto=schema.GridAttributes)
     def get_grid_infos(self, level: int, global_ids: np.ndarray) -> list[GridAttribute]:
         keys = [f'{level}-{global_id}' for global_id in global_ids]
         buffer_list = self.redis_client.mget(keys)

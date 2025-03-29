@@ -3,7 +3,7 @@ syntax = "proto3";
 
 package common;
 
-enum Status {
+enum Code {
     UNKNOWN = 0;
     SUCCESS = 1;
     ERROR_INVALID = 2;
@@ -14,7 +14,11 @@ enum Status {
     PENDING = 7;
 }
 
+message BaseRequestMetaInfo {
+    string method_name = 1;
+}
+
 message BaseResponse {
-    Status status = 1;
+    Code code = 1;
     string message = 2;
 }
