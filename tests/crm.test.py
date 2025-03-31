@@ -4,9 +4,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 if __name__ == '__main__':
     
-    from proto.schema import schema_pb2 as schema
-    from c_two import CRMServer, get_wrapper
-    from grid_test import CRM
+    import c_two as cc
+    from crm import CRM
 
     # Grid parameters
     redis_host = 'localhost'
@@ -19,11 +18,10 @@ if __name__ == '__main__':
         [478, 310], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [1, 1]
     ]
     
-    crm: CRM
-    init_args: schema.InitParams = get_wrapper(schema.InitParams).forward(redis_host, redis_port, epsg, bounds, first_size, subdivide_rules)
-    crm, _ = CRM.create(init_args.SerializeToString())
-    print(crm.epsg)
+    # Init CRM
+    crm = CRM(redis_host, redis_port, epsg, bounds, first_size, subdivide_rules)
     
-    server = CRMServer(crm, 'ipc:///tmp/zmq_test')
-    server.run_service()
+    # Run CRM server
+    server = cc.Server('ipc:///tmp/zmq_test', crm)
+    server.run()
     
