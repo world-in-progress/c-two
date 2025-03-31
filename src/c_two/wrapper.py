@@ -52,42 +52,6 @@ register_wrapper(BASE_RESPONSE, _forward_base_res, _inverse_base_res)
 
 # Wrapper decorator for CRM ##################################################
 
-def forward_wrapper(input_name: str | None = None, output_name: str | None = None) -> callable:
-    
-    def decorator(func: callable) -> callable:
-        
-        @wraps(func)
-        def wrapper(*args: any) -> tuple[any, any]:
-            input_proto_name = None if input_name is None else input_name
-            output_proto_name = None if output_name is None else output_name
-            
-            # Get converter
-            if input_proto_name is not None and input_proto_name not in _WRAPPER_MAP:
-                raise ValueError(f'No converter defined for method: {input_proto_name}')
-            if output_proto_name is not None and output_proto_name not in _WRAPPER_MAP:
-                raise ValueError(f'No converter defined for method: {output_proto_name}')
-            input_wrapper = None if input_proto_name is None else _WRAPPER_MAP[input_proto_name].forward
-            output_wrapper = None if output_proto_name is None else _WRAPPER_MAP[output_proto_name].inverse
-            
-            # Convert input and run method
-            try:
-                if len(args) < 1:
-                    raise ValueError("Instance method requires self, but only get one argument.")
-                obj = args[0]
-                request = args[1:] if len(args) > 1 else None
-                args_converted = input_wrapper(*request) if (request is not None and input_wrapper is not None) else tuple()
-                method_name = func.__name__
-                result_bytes = obj.call(method_name, args_converted)
-                return None if output_wrapper is None else output_wrapper(result_bytes)
-                
-            except Exception as e:
-                print(f'Failed to call CRM: {e}')
-                return None
-        
-        return wrapper
-    
-    return decorator
-
 def transfer(input_name: str | None = None, output_name: str | None = None, static: bool = False) -> callable:
     
     def decorator(func: callable) -> callable:
