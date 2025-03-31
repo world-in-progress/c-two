@@ -2,7 +2,7 @@ from .server import Server
 from .client import Client
 from functools import wraps
 from .component_server import ComponentServer
-from .wrapper import Wrapper, register_wrapper, get_wrapper, forward_wrapper, transfer, serialize_from_table, deserialize_to_rows
+from .wrapper import Wrapper, register_wrapper, get_wrapper, transfer, serialize_from_table, deserialize_to_rows
 
 def connect(icrm_class: any) -> callable:
     """
@@ -37,17 +37,19 @@ def connect(icrm_class: any) -> callable:
         
         @wraps(func)
         def wrapper(*args: any, crm_address: str = '', crm_connection: Client | None = None) -> tuple[any, any]:
-            if crm_address == '' and crm_conn is None:
+            if crm_address == '' and icrm is None:
                 raise ValueError("Either 'crm_address' or 'icrm_instance' must be provided.")
             
-            crm_conn = icrm_class()
-            crm_conn.direction = '->'
+            icrm = icrm_class()
+            icrm.direction = '->'
             if crm_address != '':
-                crm_conn.client = Client(crm_address)
+                icrm.client = Client(crm_address)
             else:
-                crm_conn.client = crm_connection
+                icrm.client = crm_connection
             
-            return func(crm_conn, *args)
+            result = func(icrm, *args)
+            icrm.client.terminate()
+            return result
         
         return wrapper
     

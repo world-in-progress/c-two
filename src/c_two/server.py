@@ -15,24 +15,27 @@ class Server:
         self.context.term()
     
     def run(self):
-        while True:
-            full_request = self.socket.recv()
-            sub_messages = _parse_message(full_request)
-            if len(sub_messages) != 2:
-                raise ValueError("Expected exactly 2 sub-messages (meta and data)")
-            
-            # Get method name 
-            method_name = sub_messages[0].tobytes().decode('utf-8')
-            
-            # Get arguments
-            args_bytes = sub_messages[1]
-            
-            # Call method wrapped from CRM instance method
-            method = getattr(self.crm, method_name)
-            _, response = method(args_bytes)
-            
-            # Send response
-            self.socket.send(response)
+        try:
+            while True:
+                full_request = self.socket.recv()
+                sub_messages = _parse_message(full_request)
+                if len(sub_messages) != 2:
+                    raise ValueError("Expected exactly 2 sub-messages (meta and data)")
+                
+                # Get method name 
+                method_name = sub_messages[0].tobytes().decode('utf-8')
+                
+                # Get arguments
+                args_bytes = sub_messages[1]
+                
+                # Call method wrapped from CRM instance method
+                method = getattr(self.crm, method_name)
+                _, response = method(args_bytes)
+                
+                # Send response
+                self.socket.send(response)
+        except KeyboardInterrupt:
+            print('Shutting down CRM Server...')
 
 # Helper ##################################################
 
