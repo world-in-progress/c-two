@@ -1,9 +1,9 @@
 import zmq
 import struct
-import google.protobuf.message
-from proto.common import base_pb2 as base
+from . import globals
+from .wrapper import get_wrapper
 
-class ComponentClient:
+class Client:
     def __init__(self, server_address):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
@@ -14,12 +14,12 @@ class ComponentClient:
         self.socket.close()
         self.context.term()
 
-    def _send_request(self, method_name: str, data: google.protobuf.message.Message | None = None) -> bytes:
+    def _send_request(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a request to the CRM service and get the response synchronously."""
         
         # Serialize
-        serialized_meta = base.BaseRequestMetaInfo(method_name=method_name).SerializeToString()
-        serialized_data = b'' if data is None else data.SerializeToString()
+        serialized_meta = method_name.encode('utf-8')
+        serialized_data = b'' if data is None else data
         combinned_request = _add_length_prefix(serialized_meta) + _add_length_prefix(serialized_data)
         
         # Send and get response
@@ -29,14 +29,13 @@ class ComponentClient:
         if len(sub_responses) != 2:
                 raise ValueError("Expected exactly 2 sub-messages (response and result)")
         
-        response: base.BaseResponse = base.BaseResponse()
-        response.ParseFromString(sub_responses[0])
-        if response.code == base.ERROR_INVALID:
+        response = get_wrapper(globals.BASE_RESPONSE).inverse(sub_responses[0])
+        if response['code'] == globals.Code.ERROR_INVALID:
             raise RuntimeError(f'Failed to make CRM process: {response.message}')
         
         return sub_responses[1]
 
-    def call(self, method_name: str, data: google.protobuf.message.Message | None = None) -> bytes:
+    def call(self, method_name: str, data: bytes | None = None) -> bytes:
         """Call a method on the CRM instance."""
         try:
             return self._send_request(method_name, data)

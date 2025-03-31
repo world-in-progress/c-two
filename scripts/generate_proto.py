@@ -16,10 +16,13 @@ def generate_protos():
         print(proto_file.split('/')[-1])
 
         cmd = [
-            "protoc",
-            "-I=.",
+            "python",
+            "-m",
+            "grpc_tools.protoc",
+            "-I.",
             f"--python_out=.",
             f"--mypy_out=.",
+            f'--grpc_python_out=.',
             proto_file
         ]
         subprocess.run(cmd, check=True)

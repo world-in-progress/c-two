@@ -1,7 +1,7 @@
-// proto/schema/schema.proto
+// proto/schema/componnet.proto
 syntax = "proto3";
 
-package schema;
+package componnet;
 
 message GridAttribute {
     bool deleted = 1;
@@ -57,4 +57,15 @@ message GridAttributes {
 
 message GridKeys {
     repeated string grid_keys = 1;
+}
+
+message ComponentRequest {
+    string crm_address = 1;
+    oneof args {
+        PeerGridInfos peerGridInfos = 2;
+    }
+}
+
+service ComponentService {
+    rpc Execute (ComponentRequest) returns (GridAttributes) {}
 }
