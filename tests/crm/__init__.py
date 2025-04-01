@@ -1,5 +1,5 @@
+import os
 import json
-import redis
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -13,27 +13,27 @@ _GRID_DEFINITION = 'grid_definition'
 
 _ACTIVE_SET = 'Activate'
 
-_ATTR_MIN_X = 'min_x'
-_ATTR_MIN_Y = 'min_y'
-_ATTR_MAX_X = 'max_x'
-_ATTR_MAX_Y = 'max_y'
-_ATTR_LOCAL_ID = 'local_id'
+ATTR_MIN_X = 'min_x'
+ATTR_MIN_Y = 'min_y'
+ATTR_MAX_X = 'max_x'
+ATTR_MAX_Y = 'max_y'
+ATTR_LOCAL_ID = 'local_id'
 
-_ATTR_DELETED = 'deleted'
-_ATTR_ACTIVATE = 'activate'
+ATTR_DELETED = 'deleted'
+ATTR_ACTIVATE = 'activate'
 
-_ATTR_TYPE = 'type'
-_ATTR_LEVEL = 'level'
-_ATTR_GLOBAL_ID = 'global_id'
-_ATTR_ELEVATION = 'elevation'
+ATTR_TYPE = 'type'
+ATTR_LEVEL = 'level'
+ATTR_GLOBAL_ID = 'global_id'
+ATTR_ELEVATION = 'elevation'
 
-_GRID_SCHEMA: pa.Schema = pa.schema([
-    (_ATTR_DELETED, pa.bool_()),
-    (_ATTR_ACTIVATE, pa.bool_()), 
-    (_ATTR_TYPE, pa.int8()),
-    (_ATTR_LEVEL, pa.int8()),
-    (_ATTR_GLOBAL_ID, pa.int32()),
-    (_ATTR_ELEVATION, pa.float64())
+GRID_SCHEMA: pa.Schema = pa.schema([
+    (ATTR_DELETED, pa.bool_()),
+    (ATTR_ACTIVATE, pa.bool_()), 
+    (ATTR_TYPE, pa.int8()),
+    (ATTR_LEVEL, pa.int8()),
+    (ATTR_GLOBAL_ID, pa.int32()),
+    (ATTR_ELEVATION, pa.float64())
 ])
 
 class CRM(ICRM):
@@ -43,88 +43,160 @@ class CRM(ICRM):
     The Grid Resource.  
     Grid is a 2D grid system that can be subdivided into smaller grids by pre-declared subdivide rules.  
     """
-    def __init__(self, redis_host: str, redis_port: int, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]]):
+    def __init__(self, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]], grid_file_path: str = None):
         """Method to initialize Grid
 
         Args:
-            redis_host (str): host name of redis service
-            redis_port (str): port of redis service
             epsg (int): epsg code of the grid
             bounds (list): bounding box of the grid (organized as [min_x, min_y, max_x, max_y])
             first_size (list[float]): [width, height] of the first level grid
             subdivide_rules (list[list[int]]): list of subdivision rules per level
+            grid_file_path (str, optional): path to .arrow file containing grid data. If provided, grid data will be loaded from this file
         """
         self.direction = '<-'
-        self._redis_client: redis.Redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=False)
+        self.epsg: int = epsg
+        self.bounds: list = bounds
+        self.first_size: list[float] = first_size
+        self.subdivide_rules: list[list[int]] = subdivide_rules
+        self.grid_file_path = grid_file_path
         
-        # Check if grid definition exists in Redis
-        if not self._redis_client.exists(_GRID_DEFINITION):
-            # Calculate level infos
-            level_info: list[dict[str, int]] = [{
-                'width': 1,
-                'height': 1
-            }]
-            for level, rule in enumerate(subdivide_rules):
-                if level == len(subdivide_rules) - 1: 
-                    break
-                sub_width: int = level_info[level]['width'] * rule[0]
-                sub_height: int = level_info[level]['height'] * rule[1]
-                level_info.append({
-                    'width': sub_width,
-                    'height': sub_height
-                })
-            
-            # Store grid definition in Redis
-            grid_definition = {
-                'epsg': epsg,
-                'bounds': bounds,
-                'first_size': first_size,
-                'level_info': level_info,
-                'subdivide_rules': subdivide_rules
-            }
-            self._redis_client.set(_GRID_DEFINITION, json.dumps(grid_definition).encode('utf-8'))
-            
-            # Initialize grid data (ONLY Level 1) as PyArrow Table
-            with self._redis_client.pipeline() as pipe:
-                level = 1
-                total_width = level_info[level]['width']
-                total_height = level_info[level]['height']
-                num_grids = total_width * total_height
-                
-                data = {
-                    _ATTR_ACTIVATE: np.full(num_grids, True),
-                    _ATTR_DELETED: np.full(num_grids, False, dtype=np.bool),
-                    _ATTR_TYPE: np.zeros(num_grids, dtype=np.int8),
-                    _ATTR_LEVEL: np.full(num_grids, level, dtype=np.int8),
-                    _ATTR_GLOBAL_ID: np.arange(num_grids, dtype=np.int32),
-                    _ATTR_ELEVATION: np.full(num_grids, -9999.0, dtype=np.float64)
-                }
-                
-                keys_to_activate = []
-                batches = pa.Table.from_pydict(data, schema=_GRID_SCHEMA).to_batches(max_chunksize=1000)
-                for batch in batches:
-                    for row_idx in range(batch.num_rows):
-                        key = f'{level}-{batch[_ATTR_GLOBAL_ID][row_idx].as_py()}'
-                        keys_to_activate.append(key)
-                        
-                        single_batch = batch.slice(row_idx, 1)
-                        sink = pa.BufferOutputStream()
-                        with ipc.new_stream(sink, _GRID_SCHEMA) as writer:
-                            writer.write_batch(single_batch)
-                        buffer = sink.getvalue()
-                        pipe.set(key, buffer.to_pybytes())
-                
-                pipe.sadd(_ACTIVE_SET, *keys_to_activate)
-                pipe.execute()
+        # Initialize grid DataFrame
+        self.grids = pd.DataFrame(columns=[
+            ATTR_DELETED, ATTR_ACTIVATE, ATTR_TYPE, 
+            ATTR_LEVEL, ATTR_GLOBAL_ID, ATTR_ELEVATION
+        ])
+        
+        # Calculate level info for later use
+        self.level_info: list[dict[str, int]] = [{'width': 1, 'height': 1}]
+        for level, rule in enumerate(subdivide_rules[:-1]):
+            prev_width, prev_height = self.level_info[level]['width'], self.level_info[level]['height']
+            self.level_info.append({
+                'width': prev_width * rule[0],
+                'height': prev_height * rule[1]
+            })
+        
+        self.grid_definition = {
+            'epsg': epsg,
+            'bounds': bounds,
+            'first_size': first_size,
+            'subdivide_rules': subdivide_rules
+        }
+        
+        # Load from Arrow file if file exists
+        if grid_file_path and os.path.exists(grid_file_path):
+            try:
+                # Load grid data from Arrow file
+                self._load_grid_from_file(grid_file_path, batch_size=50000)
+            except Exception as e:
+                print(f'Failed to load grid data from file: {str(e)}, the grid will be initialized using default method')
+                self._initialize_default_grid(batch_size=50000)
+        else:
+            # Initialize grid data using default method
+            print('grid file does not exist, initializing default grid data...')
+            self._initialize_default_grid(batch_size=50000)
+            print('Successfully initialized default grid data')
+    
+    def _load_grid_from_file(self, file_path: str, batch_size: int = 50000):
+        """Load grid data from file streaming
 
-        # Load grid definition from Redis
-        grid_definition_bytes = self._redis_client.get(_GRID_DEFINITION)
-        grid_definition = json.loads(grid_definition_bytes.decode('utf-8'))
-        self.epsg: int = grid_definition['epsg']
-        self.bounds: list = grid_definition['bounds']
-        self.first_size: list[float] = grid_definition['first_size']
-        self.level_info: list[dict[str, int]] = grid_definition['level_info']
-        self.subdivide_rules: list[list[int]] = grid_definition['subdivide_rules']
+        Args:
+            file_path (str): Arrow file path
+            batch_size (int): number of records processed per batch
+        """
+        
+        try:
+            with pa.ipc.open_file(self.grid_file_path)  as reader:
+                # Open the Arrow file and read the table
+                all_batches = []
+                for i in range(reader.num_record_batches):
+                    batch = reader.get_batch(i)
+                    all_batches.append(batch)
+                    
+                    if len(all_batches) >= batch_size / batch.num_rows:
+                        partial_table = pa.Table.from_batches(all_batches, schema=GRID_SCHEMA)
+                        all_batches = []
+                        partial_df = partial_table.to_pandas(use_threads=True)
+                        partial_df.set_index([ATTR_LEVEL, ATTR_GLOBAL_ID], inplace=True)
+                        
+                        if hasattr(self, 'grids') and not self.grids.empty:
+                            self.grids = pd.concat([self.grids, partial_df])
+                        else:
+                            self.grids = partial_df
+                
+                if all_batches:
+                    partial_table = pa.Table.from_batches(all_batches, schema=GRID_SCHEMA)
+                    partial_df = partial_table.to_pandas(use_threads=True)
+                    partial_df.set_index([ATTR_LEVEL, ATTR_GLOBAL_ID], inplace=True)
+                        
+                    if hasattr(self, 'grids') and not self.grids.empty:
+                        self.grids = pd.concat([self.grids, partial_df])
+                    else:
+                        self.grids = partial_df
+            
+                self.grids = self.grids.sort_index()
+                print(f'Successfully loaded {len(self.grids)} grid records from {self.grid_file_path}')
+        
+        except Exception as e:
+            print(f'Error loading grid data from file: {str(e)}')
+            raise e
+
+    def _initialize_default_grid(self, batch_size: int = 10000):
+        """Initialize grid data (ONLY Level 1) as pandas DataFrame"""
+        level = 1
+        total_width = self.level_info[level]['width']
+        total_height = self.level_info[level]['height']
+        num_grids = total_width * total_height
+        
+        global_ids = np.arange(num_grids, dtype=np.int32)
+        grid_data = {
+            ATTR_ACTIVATE: np.full(num_grids, True),
+            ATTR_DELETED: np.full(num_grids, False, dtype=np.bool_),
+            ATTR_TYPE: np.zeros(num_grids, dtype=np.int8),
+            ATTR_LEVEL: np.full(num_grids, level, dtype=np.int8),
+            ATTR_GLOBAL_ID: global_ids,
+            ATTR_ELEVATION: np.full(num_grids, -9999.0, dtype=np.float64)
+        }
+        
+        df = pd.DataFrame(grid_data)
+        df.set_index([ATTR_LEVEL, ATTR_GLOBAL_ID], inplace=True)
+        
+        self.grids = df
+        print(f'Successfully initialized grid data with {num_grids} grids at level 1')
+    
+    def terminate(self, grid_file_path: str = None):
+        """Save the grid data to Arrow file
+
+        Args:
+            grid_file_path (str, optional): The file path to save the grid data. If None, the path provided during initialization is used
+
+        Returns:
+            bool: Whether the save was successful
+        """
+        
+        save_path = grid_file_path or self.grid_file_path
+        if not save_path:
+            print('No file path provided for saving grid data')
+            return False
+        
+        try:
+            if self.grids.empty:
+                print('No grid data to save')
+                return False
+            
+            # Reset index to include level and globale_id columns in the table
+            df = self.grids.reset_index()
+            table = pa.Table.from_pandas(df, schema=GRID_SCHEMA)
+            
+            # Write to Arrow file
+            with pa.ipc.new_file(save_path, GRID_SCHEMA) as writer:
+                writer.write_table(table)
+            
+            print(f'Successfully saved grid data to {save_path}')
+            return True
+        
+        except Exception as e:
+            print(f'Failed to save grid data: {str(e)}')
+            return False
             
     def _get_local_ids(self, level: int, global_ids: np.ndarray) -> np.ndarray:
         """Method to calculate local_ids for provided grids having same level
@@ -144,6 +216,43 @@ class CRM(ICRM):
         local_x = global_ids % total_width
         local_y = global_ids // total_width
         return (((local_y % sub_height) * sub_width) + (local_x % sub_width))
+    
+    def _get_parent_global_id(self, level: int, global_id: int) -> int:
+        """Method to get parent global id
+        Args:
+            level (int): level of provided grids
+            global_id (int): global_id of provided grids
+        Returns:
+            parent_global_id (int): parent global id of provided grids
+        """
+        total_width = self.level_info[level]['width']
+        sub_width = self.subdivide_rules[level - 1][0]
+        sub_height = self.subdivide_rules[level - 1][1]
+        u = global_id % total_width
+        v = global_id // total_width
+        return (v // sub_height) * sub_width + (u // sub_width)
+    
+    @cc.transfer(input_name='GridInfos', output_name='GridKeys')
+    def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
+        """Method to get parent keys for provided grids having same level
+
+        Args:
+            levels (list[int]): levels of provided grids
+            global_ids (list[int]): global_ids of provided grids
+
+        Returns:
+            parent_keys (list[str]): parent keys of provided grids, organized by list of strings in the format "level-global_id"
+        """
+        parent_keys: list[str | None]  = []
+        for level, global_id in zip(levels, global_ids):
+            if level == 1:
+                parent_keys.append(None)
+                continue
+            
+            parent_global_id = self._get_parent_global_id(level, global_id)
+            parent_key = f'{level - 1}-{parent_global_id}'
+            parent_keys.append(parent_key)
+        return parent_keys
     
     def _get_coordinates(self, level: int, global_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Method to calculate coordinates for provided grids having same level
@@ -171,26 +280,26 @@ class CRM(ICRM):
         key = f'{level}-{global_id}'
         buffer = self._redis_client.get(key)
         if buffer is None:
-            return pd.DataFrame(columns=[_ATTR_LEVEL, _ATTR_GLOBAL_ID, _ATTR_LOCAL_ID, _ATTR_TYPE, 
-                                       _ATTR_ELEVATION, _ATTR_DELETED, _ATTR_ACTIVATE, 
-                                       _ATTR_MIN_X, _ATTR_MIN_Y, _ATTR_MAX_X, _ATTR_MAX_Y])
+            return pd.DataFrame(columns=[ATTR_LEVEL, ATTR_GLOBAL_ID, ATTR_LOCAL_ID, ATTR_TYPE, 
+                                       ATTR_ELEVATION, ATTR_DELETED, ATTR_ACTIVATE, 
+                                       ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y])
         
         reader = ipc.open_stream(buffer)
         grid_record = reader.read_next_batch()
-        table = pa.Table.from_batches([grid_record], schema=_GRID_SCHEMA)
+        table = pa.Table.from_batches([grid_record], schema=GRID_SCHEMA)
         df = table.to_pandas(use_threads=True)
         
         # Calculate computed attributes
         local_id = self._get_local_ids(level, np.array([global_id]))[0]
         min_x, min_y, max_x, max_y = self._get_coordinates(level, np.array([global_id]))
-        df[_ATTR_LOCAL_ID] = local_id
-        df[_ATTR_MIN_X] = min_x
-        df[_ATTR_MIN_Y] = min_y
-        df[_ATTR_MAX_X] = max_x
-        df[_ATTR_MAX_Y] = max_y
+        df[ATTR_LOCAL_ID] = local_id
+        df[ATTR_MIN_X] = min_x
+        df[ATTR_MIN_Y] = min_y
+        df[ATTR_MAX_X] = max_x
+        df[ATTR_MAX_Y] = max_y
         
-        column_order = [_ATTR_LEVEL, _ATTR_GLOBAL_ID, _ATTR_LOCAL_ID, _ATTR_TYPE, _ATTR_ELEVATION, 
-                        _ATTR_DELETED, _ATTR_ACTIVATE, _ATTR_MIN_X, _ATTR_MIN_Y, _ATTR_MAX_X, _ATTR_MAX_Y]
+        column_order = [ATTR_LEVEL, ATTR_GLOBAL_ID, ATTR_LOCAL_ID, ATTR_TYPE, ATTR_ELEVATION, 
+                        ATTR_DELETED, ATTR_ACTIVATE, ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y]
         return df[column_order]
     
     @cc.transfer(input_name='PeerGridInfos', output_name='GridAttributes')
@@ -202,52 +311,45 @@ class CRM(ICRM):
             global_ids (list[int]): global_ids of provided grids
 
         Returns:
-            grid_infos (list[GridAttribute]): grid infos orgnized by dataFrame, the order of which is: level, global_id, local_id, type, elevation, deleted, activate, tl_x, tl_y, br_x, br_y
+            grid_infos (list[GridAttribute]): grid infos organized by GridAttribute objects with attributes: 
+            level, global_id, local_id, type, elevation, deleted, activate, min_x, min_y, max_x, max_y
         """
-        keys = [f'{level}-{global_id}' for global_id in global_ids]
-        buffer_list = self._redis_client.mget(keys)
+        index_keys = [(level, global_id) for global_id in global_ids]
+        filtered_grids = self.grids.loc[self.grids.index.isin(index_keys)]
+        if filtered_grids.empty:
+            return []
         
-        grid_records = []
-        for buffer in buffer_list:
-            if buffer:
-                reader = ipc.open_stream(buffer)
-                grid_records.append(reader.read_next_batch())
-                
-        if grid_records is None:
-            return pd.DataFrame(columns=[_ATTR_LEVEL, _ATTR_GLOBAL_ID, _ATTR_LOCAL_ID, _ATTR_TYPE, 
-                                       _ATTR_ELEVATION, _ATTR_DELETED, _ATTR_ACTIVATE, 
-                                       _ATTR_MIN_X, _ATTR_MIN_Y, _ATTR_MAX_X, _ATTR_MAX_Y]) 
-        # Filter table by global_ids
-        table = pa.Table.from_batches(grid_records, schema=_GRID_SCHEMA)
-        df = table.to_pandas(use_threads=True)
-            
-        # Calculate computed attributes
-        global_ids_array = df[_ATTR_GLOBAL_ID].to_numpy(dtype=np.int32)
-        local_ids = self._get_local_ids(level, global_ids_array)
-        min_xs, min_ys, max_xs, max_ys = self._get_coordinates(level, global_ids_array)
-        df[_ATTR_LOCAL_ID] = local_ids
-        df[_ATTR_MIN_X] = min_xs
-        df[_ATTR_MIN_Y] = min_ys
-        df[_ATTR_MAX_X] = max_xs
-        df[_ATTR_MAX_Y] = max_ys
+        # Reset index to have level and global_id as columns
+        filtered_grids = filtered_grids.reset_index()
+        
+        global_ids = filtered_grids[ATTR_GLOBAL_ID].to_numpy()
+        local_ids = self._get_local_ids(level, global_ids)
+        min_xs, min_ys, max_xs, max_ys = self._get_coordinates(level, global_ids)
+        
+        filtered_grids[ATTR_LOCAL_ID] = local_ids
+        filtered_grids[ATTR_MIN_X] = min_xs
+        filtered_grids[ATTR_MIN_Y] = min_ys
+        filtered_grids[ATTR_MAX_X] = max_xs
+        filtered_grids[ATTR_MAX_Y] = max_ys
+        
         return [
             GridAttribute(
-                deleted=row.deleted,
-                activate=row.activate,
-                type=row.type,
-                level=row.level,
-                global_id=row.global_id,
-                local_id=row.local_id,
-                elevation=row.elevation,
-                min_x=row.min_x,
-                min_y=row.min_y,
-                max_x=row.max_x,
-                max_y=row.max_y
+                deleted=row[ATTR_DELETED],
+                activate=row[ATTR_ACTIVATE],
+                type=row[ATTR_TYPE],
+                level=row[ATTR_LEVEL],
+                global_id=row[ATTR_GLOBAL_ID],
+                local_id=row[ATTR_LOCAL_ID],
+                elevation=row[ATTR_ELEVATION],
+                min_x=row[ATTR_MIN_X],
+                min_y=row[ATTR_MIN_Y],
+                max_x=row[ATTR_MAX_X],
+                max_y=row[ATTR_MAX_Y]
             )
-            for row in df.itertuples(index=False)
+            for _, row in filtered_grids.iterrows()
         ]
     
-    def _get_grid_children(self, level: int, global_id: int) -> np.ndarray | None:
+    def _get_grid_children_global_ids(self, level: int, global_id: int) -> list[int] | None:
         if (level < 0) or (level >= len(self.level_info)):
             return None
         
@@ -259,7 +361,7 @@ class CRM(ICRM):
         sub_count = sub_width * sub_height
         
         baseGlobalWidth = width * sub_width
-        child_global_ids = np.ndarray(sub_count, dtype=np.int32)
+        child_global_ids = [0] * sub_count
         for local_id in range(sub_count):
             local_u = local_id % sub_width
             local_v = local_id // sub_width
@@ -270,7 +372,8 @@ class CRM(ICRM):
         
         return child_global_ids
     
-    def _subdivide_grids(self, levels: np.ndarray, global_ids: np.ndarray, batch_size: int = 1000) -> list[str]:
+    @cc.transfer(input_name='GridInfos', output_name='GridKeys')
+    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
         """
         Subdivide grids by turning off parent grids' activate flag and activating children's activate flags
         if the parent grid is activate and not deleted.
@@ -278,187 +381,110 @@ class CRM(ICRM):
         Args:
             levels (list[int]): Array of levels for each grid to subdivide
             global_ids (list[int]): Array of global IDs for each grid to subdivide
-            batch_size (int): Size of batches for writing to Redis
 
         Returns:
             grid_keys (list[str]): List of child grid keys in the format "level-global_id"
         """
-        def get_grid_children(row) -> tuple[np.ndarray, np.ndarray] | None:
-            level = row[_ATTR_LEVEL]
-            global_id = row[_ATTR_GLOBAL_ID]
-            child_global_ids = self._get_grid_children(level, global_id)
-            child_levels = np.full(child_global_ids.size, level + 1, dtype=np.int8)
-            
-            return (child_levels, child_global_ids)
-        
-        # Get parents data frame
-        parent_keys: list[str] = []
-        for level, global_id in zip(levels, global_ids):
-            parent_keys.append(f'{level}-{global_id}')
-        parent_buffers = self._redis_client.mget(parent_keys)
-        
-        parent_batches = []
-        for buffer in parent_buffers:
-            if buffer:
-                reader = ipc.open_stream(buffer)
-                parent_batches.append(reader.read_next_batch())
-                
-        mask = (pc.field(_ATTR_DELETED) == False) & (pc.field(_ATTR_ACTIVATE) == True)
-        parent_df: pd.DataFrame = pa.Table.from_batches(parent_batches, schema=_GRID_SCHEMA).filter(mask).to_pandas()
-        
-        # Get all child infos
-        child_info_series: pd.DataFrame = parent_df.apply(get_grid_children, axis=1)
-        if child_info_series.empty:
+        # Get all parents
+        parent_idx_keys = list(zip(levels, global_ids))
+        parent_idx = pd.MultiIndex.from_tuples(parent_idx_keys, names=[ATTR_LEVEL, ATTR_GLOBAL_ID])
+        existing_parents = parent_idx.intersection(self.grids.index)
+        if len(existing_parents) == 0:
             return []
         
-        # Create children table
-        child_levels, child_global_ids = [info for infos in child_info_series for info in infos]
-        child_keys = [f'{level}-{global_id}' for level, global_id in zip(child_levels, child_global_ids)]
-        child_num = len(child_keys)
-        child_table = pa.Table.from_pydict(
-            {
-                _ATTR_ACTIVATE: np.full(child_num, True),
-                _ATTR_DELETED: np.full(child_num, False, dtype=np.bool),
-                _ATTR_TYPE: np.zeros(child_num, dtype=np.int8),
-                _ATTR_LEVEL: child_levels,
-                _ATTR_GLOBAL_ID: child_global_ids,
-                _ATTR_ELEVATION: np.full(child_num, -9999.0, dtype=np.float64)
-            }, 
-            schema=_GRID_SCHEMA
+        # Filter for valid parents
+        valid_parents = self.grids.loc[existing_parents]
+        valid_parents = valid_parents[(valid_parents[ATTR_ACTIVATE]) & (~valid_parents[ATTR_DELETED])]
+        if valid_parents.empty:
+            return []
+        
+        # Collect all child grid information
+        all_child_data = []
+        all_child_keys = []
+        
+        # Process each parent grid
+        for (level, global_id) in valid_parents.index:
+            child_global_ids = self._get_grid_children_global_ids(level, global_id)
+            if not child_global_ids:
+                continue
+            
+            # Generate child keys for return value
+            child_level = level + 1
+            child_keys = [f'{child_level}-{child_global_id}' for child_global_id in child_global_ids]
+            all_child_keys.extend(child_keys)
+            
+            # Create child records
+            for child_global_id in child_global_ids:
+                all_child_data.append((
+                    child_level, child_global_id, 
+                    False, True, 0, -9999.0,
+                ))
+        if not all_child_data:
+            return []
+        
+        # Make child DataFrame
+        children = pd.DataFrame(
+            all_child_data,
+            columns=[ATTR_LEVEL, ATTR_GLOBAL_ID, ATTR_DELETED, ATTR_ACTIVATE, ATTR_TYPE, ATTR_ELEVATION]
         )
+        children.set_index([ATTR_LEVEL, ATTR_GLOBAL_ID], inplace=True)
         
-        # Write all children to redis
-        with self._redis_client.pipeline() as pipe:
-            batches = child_table.to_batches(max_chunksize=batch_size)
-            for batch in batches:
-                for row_idx in range(batch.num_rows):
-                    key = f'{batch[_ATTR_LEVEL][row_idx].as_py()}-{batch[_ATTR_GLOBAL_ID][row_idx].as_py()}'
-                    single_batch = batch.slice(row_idx, 1)
-                    sink = pa.BufferOutputStream()
-                    with ipc.new_stream(sink, _GRID_SCHEMA) as writer:
-                        writer.write_batch(single_batch)
-                    buffer = sink.getvalue()
-                    pipe.set(key, buffer.to_pybytes())
-            pipe.execute()
-        
-        # Deactivate parents
-        self._deactivate_grids(levels, global_ids)
-        
-        return child_keys
+        # Update existing children and add new ones
+        child_idx = children.index
+        existing_mask = child_idx.isin(self.grids.index)
+        if existing_mask.any():
+            # Update existing children attributes
+            existing_indices = child_idx[existing_mask]
+            self.grids.loc[existing_indices, ATTR_ACTIVATE] = True
+            self.grids.loc[existing_indices, ATTR_DELETED] = False
+            
+            # Add only new children
+            new_children = children.loc[~existing_mask]
+            if not new_children.empty:
+                self.grids = pd.concat([self.grids, new_children])
+        else:
+            # All children are new
+            self.grids = pd.concat([self.grids, children])
     
-    def _activate_grids(self, levels: np.ndarray, global_ids: np.ndarray) -> bool:
-        """
-        Activate multiple grids by adding them to the 'Activate' Set and setting active=True.
+        # Deactivate parent grids
+        valid_parent_indices = valid_parents.index
+        self.grids.loc[valid_parent_indices, ATTR_ACTIVATE] = False
+        
+        return all_child_keys
+    
+    @cc.transfer(input_name='GridInfos')
+    def delete_grids(self, levels: list[int], global_ids: list[int]):
+        """Method to delete grids.
 
         Args:
-            levels: Array of level values for the grids to activate.
-            global_ids: Array of global IDs for the grids to activate.
+            levels (list[int]): levels of grids to delete
+            global_ids (list[int]): global_ids of grids to delete
 
         Returns:
-            bool: True if all grids were successfully activated, False if any grid does not exist.
+            bool: whether the deletion was successful
         """
-        if len(levels) != len(global_ids):
-            raise ValueError("Length of levels and global_ids must match")
-
-        keys = [f'{level}-{global_id}' for level, global_id in zip(levels, global_ids)]
-        buffers = self._redis_client.mget(keys)
+        idx_keys = list(zip(levels, global_ids))
+        idx = pd.MultiIndex.from_tuples(idx_keys, names=[ATTR_LEVEL, ATTR_GLOBAL_ID])
+        existing_grids = idx.intersection(self.grids.index)
+        if len(existing_grids) == 0:
+            return
         
-        # Check if any grid does not exist
-        if any(buffer is None for buffer in buffers):
-            return False
-
-        # Prepare updates
-        batches = []
-        for buffer in buffers:
-            reader = ipc.open_stream(buffer)
-            batches.append(reader.read_next_batch())
+        # Filter for valid grids
+        valid_grids = self.grids.loc[existing_grids]
+        valid_grids = valid_grids[valid_grids[ATTR_ACTIVATE] & (~valid_grids[ATTR_DELETED])]
+        if valid_grids.empty:
+            return
         
-        table = pa.Table.from_batches(batches, schema=_GRID_SCHEMA)
-        df = table.to_pandas()
-        
-        # Filter to only grids that are not activated (shown=False)
-        inactive_mask = ~df[_ATTR_ACTIVATE]
-        if not inactive_mask.any():
-            return True
-
-        df_to_update = df[inactive_mask].copy()
-        df_to_update[_ATTR_ACTIVATE] = True
-        updated_table = pa.Table.from_pandas(df_to_update, schema=_GRID_SCHEMA)
-
-        # Get keys for grids that need to be activated
-        keys_to_activate = [f'{row[_ATTR_LEVEL]}-{row[_ATTR_GLOBAL_ID]}' 
-                        for _, row in df_to_update.iterrows()]
-
-        # Write updates to Redis and update Activate Set
-        with self._redis_client.pipeline() as pipe:
-            for batch in updated_table.to_batches():
-                for row_idx in range(batch.num_rows):
-                    key = f'{batch[_ATTR_LEVEL][row_idx].as_py()}-{batch[_ATTR_GLOBAL_ID][row_idx].as_py()}'
-                    single_batch = batch.slice(row_idx, 1)
-                    sink = pa.BufferOutputStream()
-                    with ipc.new_stream(sink, _GRID_SCHEMA) as writer:
-                        writer.write_batch(single_batch)
-                    pipe.set(key, sink.getvalue().to_pybytes())
-            pipe.sadd(_ACTIVE_SET, *keys_to_activate)
-            pipe.execute()
-        
-        return True
+        # Update deleted status
+        self.grids.loc[valid_grids.index, ATTR_DELETED] = True
+        self.grids.loc[valid_grids.index, ATTR_ACTIVATE] = False
     
-    def _deactivate_grids(self, levels: np.ndarray, global_ids: np.ndarray) -> bool:
-        """
-        Deactivate multiple grids by removing them from the 'Activate' Set and setting shown=False.
-        Only grids that are currently activated (shown=True) will be updated.
-
-        Args:
-            levels: Array of level values for the grids to deactivate.
-            global_ids: Array of global IDs for the grids to deactivate.
+    @cc.transfer(output_name='GridInfos')
+    def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
+        """Method to get all active grids' global ids and levels
 
         Returns:
-            bool: True if all grids were successfully deactivated or already inactive, False if any grid does not exist.
+            tuple[list[int], list[int]]: active grids' global ids and levels
         """
-        if len(levels) != len(global_ids):
-            raise ValueError("Length of levels and global_ids must match")
-
-        keys = [f'{level}-{global_id}' for level, global_id in zip(levels, global_ids)]
-        buffers = self._redis_client.mget(keys)
-        
-        # Check if any grid does not exist
-        if any(buffer is None for buffer in buffers):
-            return False
-
-        # Prepare updates
-        batches = []
-        for buffer in buffers:
-            reader = ipc.open_stream(buffer)
-            batches.append(reader.read_next_batch())
-        
-        table = pa.Table.from_batches(batches, schema=_GRID_SCHEMA)
-        df = table.to_pandas()
-
-        # Filter to only grids that are activated (shown=True)
-        active_mask = df[_ATTR_ACTIVATE]
-        if not active_mask.any():
-            return True
-        
-        df_to_update = df[active_mask].copy()
-        df_to_update[_ATTR_ACTIVATE] = False
-        updated_table = pa.Table.from_pandas(df_to_update, schema=_GRID_SCHEMA)
-
-        # Get keys for grids that need to be deactivated
-        keys_to_deactivate = [f'{row[_ATTR_LEVEL]}-{row[_ATTR_GLOBAL_ID]}' 
-                            for _, row in df_to_update.iterrows()]
-
-        # Write updates to Redis and update Activate Set
-        with self._redis_client.pipeline() as pipe:
-            for batch in updated_table.to_batches():
-                for row_idx in range(batch.num_rows):
-                    key = f'{batch[_ATTR_LEVEL][row_idx].as_py()}-{batch[_ATTR_GLOBAL_ID][row_idx].as_py()}'
-                    single_batch = batch.slice(row_idx, 1)
-                    sink = pa.BufferOutputStream()
-                    with ipc.new_stream(sink, _GRID_SCHEMA) as writer:
-                        writer.write_batch(single_batch)
-                    pipe.set(key, sink.getvalue().to_pybytes())
-            pipe.srem(_ACTIVE_SET, *keys_to_deactivate)
-            pipe.execute()
-        
-        return True
+        active_grids = self.grids[self.grids[ATTR_ACTIVATE] == True]
+        return active_grids.index.get_level_values(0).tolist(), active_grids.index.get_level_values(1).tolist()

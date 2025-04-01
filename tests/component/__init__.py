@@ -1,34 +1,21 @@
 import c_two as cc
 from icrm import ICRM, GridAttribute
-from proto.execute import execute_pb2 as execute, execute_pb2_grpc as execute_grpc
 
-@cc.connect(ICRM)
-def component_func(crm_conn: ICRM, args: execute.PeerGridInfos):
-    grids: list[GridAttribute] = crm_conn.get_grid_infos(args.level, [global_id for global_id in args.global_ids])
-    result = execute.GridAttributes()
-    result.attributes.extend([
-        execute.GridAttribute(
-            deleted=grid.deleted,
-            activate=grid.activate,
-            type=grid.type,
-            level=grid.level,
-            global_id=grid.global_id,
-            elevation=grid.elevation,
-            min_x=grid.min_x,
-            min_y=grid.min_y,
-            max_x=grid.max_x,
-            max_y=grid.max_y,
-            local_id=grid.local_id
-        )
-        for grid in grids
-    ])
-    return result
+@cc.compo.runtime.connect
+def get_grid_infos(crm: ICRM, level: int, global_ids: list[int]) -> list[GridAttribute]:
+    grids: list[GridAttribute] = crm.get_grid_infos(level, global_ids)
+    return grids
 
-class Component(execute_grpc.ComponentServiceServicer):
-    
-    def Execute(self, request: execute.ComponentRequest, context):
-        return component_func(request.peerGridInfos, crm_address=request.crm_address)
-    
-    @staticmethod
-    def register_to_server(server):
-        execute_grpc.add_ComponentServiceServicer_to_server(Component(), server)
+@cc.compo.runtime.connect
+def subdivide_grids(crm: ICRM, levels: list[int], global_ids: list[int]) -> list[str]:
+    keys: list[str] = crm.subdivide_grids(levels, global_ids)
+    return keys
+
+@cc.compo.runtime.connect
+def get_parent_keys(crm: ICRM, levels: list[int], global_ids: list[int]) -> list[str | None]:
+    keys: list[str] = crm.get_parent_keys(levels, global_ids)
+    return keys
+
+@cc.compo.runtime.connect
+def get_active_grid_render_info(crm: ICRM):
+    pass
