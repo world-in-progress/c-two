@@ -8,8 +8,6 @@ if __name__ == '__main__':
     from crm import CRM
 
     # Grid parameters
-    redis_host = 'localhost'
-    redis_port = 6379
     epsg = 2326
     first_size = [64.0, 64.0]
     bounds = [808357.5, 824117.5, 838949.5, 843957.5]
@@ -19,9 +17,12 @@ if __name__ == '__main__':
     ]
     
     # Init CRM
-    crm = CRM(redis_host, redis_port, epsg, bounds, first_size, subdivide_rules)
+    grid_file_path='./grids.arrow'
+    crm = CRM(epsg, bounds, first_size, subdivide_rules)
     
     # Run CRM server
-    server = cc.Server('ipc:///tmp/zmq_test', crm)
+    ipc_address = 'ipc:///tmp/zmq_test'
+    tcp_address = 'tcp://localhost:5555'
+    server = cc.message.Server(tcp_address, crm)
     server.run()
     

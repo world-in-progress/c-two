@@ -36,6 +36,11 @@ class Server:
                 self.socket.send(response)
         except KeyboardInterrupt:
             print('Shutting down CRM Server...')
+            try:
+                if hasattr(self.crm, 'terminate') and self.crm.terminate:
+                    self.crm.terminate()
+            except Exception as e:
+                print(f"Error during termination: {e}")
 
 # Helper ##################################################
 

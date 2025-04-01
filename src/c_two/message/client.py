@@ -29,9 +29,9 @@ class Client:
         if len(sub_responses) != 2:
                 raise ValueError("Expected exactly 2 sub-messages (response and result)")
         
-        response = get_wrapper(globals.BASE_RESPONSE).inverse(sub_responses[0])
-        if response['code'] == globals.Code.ERROR_INVALID:
-            raise RuntimeError(f'Failed to make CRM process: {response.message}')
+        response = get_wrapper(globals.BASE_RESPONSE).deserialize(sub_responses[0])
+        if response['code'] == globals.Code.ERROR_INVALID.value:
+            raise RuntimeError(f'Failed to make CRM process: {response['message']}')
         
         return sub_responses[1]
 
@@ -40,7 +40,7 @@ class Client:
         try:
             return self._send_request(method_name, data)
         except Exception as e:
-            print(f'Failed to call CRM: {e}')
+            raise RuntimeError(f'Failed to call CRM: {e}')
 
 # Helper ##################################################
 def _add_length_prefix(message_bytes: bytes):

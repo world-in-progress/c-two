@@ -39,14 +39,48 @@ class ICRM:
     
     direction: str # At component side, direction is '->'; at crm side, direction is '<-'
 
+    @cc.transfer(input_name='GridInfos', output_name='GridKeys')
+    def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
+        return
+
     @cc.transfer(input_name='PeerGridInfos', output_name='GridAttributes')
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
         return
     
+    @cc.transfer(input_name='GridInfos', output_name='GridKeys')
+    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
+        return
+    
+    @cc.transfer(output_name='GridInfos')
+    def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
+        return
+    
 # Define transfer methods ##################################################
+
+# GridInfo
+def serialize_grid_info(level: int, global_id: int) -> bytes:
+    schema = pa.schema([
+        pa.field('level', pa.int8()),
+        pa.field('global_id', pa.pa.int32())
+    ])
+    
+    data = {
+        'level': level,
+        'global_id': global_id
+    }
+    
+    table = pa.Table.from_pylist([data], schema=schema)
+    return cc.message.serialize_from_table(table)
+
+def deserialize_grid_info(arrow_bytes: bytes) -> tuple[int, int]:
+    row = cc.message.deserialize_to_rows(arrow_bytes)[0]
+    return (
+        row['level'],
+        row['global_id']
+    )
     
 # PeerGridInfos
-def forward_peer_grid_infos(level: int, global_ids: list[int]) -> bytes:
+def serialize_peer_grid_infos(level: int, global_ids: list[int]) -> bytes:
     schema = pa.schema([
         pa.field('level', pa.int8()),
         pa.field('global_ids', pa.list_(pa.int32()))
@@ -58,17 +92,17 @@ def forward_peer_grid_infos(level: int, global_ids: list[int]) -> bytes:
     }
     
     table = pa.Table.from_pylist([data], schema=schema)
-    return cc.serialize_from_table(table)
+    return cc.message.serialize_from_table(table)
 
-def inverse_peer_grid_infos(arrow_bytes: bytes) -> tuple[int, list[int]]:
-    row = cc.deserialize_to_rows(arrow_bytes)[0]
+def deserialize_peer_grid_infos(arrow_bytes: bytes) -> tuple[int, list[int]]:
+    row = cc.message.deserialize_to_rows(arrow_bytes)[0]
     return (
         row['level'],
         row['global_ids']
     )
     
 # GridAttributes
-def forward_grid_attributes(data: list[GridAttribute]) -> bytes:
+def serialize_grid_attributes(data: list[GridAttribute]) -> bytes:
     schema = pa.schema([
         pa.field('deleted', pa.bool_()),
         pa.field('activate', pa.bool_()),
@@ -101,11 +135,10 @@ def forward_grid_attributes(data: list[GridAttribute]) -> bytes:
     ]
     
     table = pa.Table.from_pylist(data_dicts, schema=schema)
-    return cc.serialize_from_table(table)
+    return cc.message.serialize_from_table(table)
 
-def inverse_grid_attributes(arrow_bytes: bytes) -> list[GridAttribute]:
-    
-    rows = cc.deserialize_to_rows(arrow_bytes)
+def deserialize_grid_attributes(arrow_bytes: bytes) -> list[GridAttribute]:
+    rows = cc.message.deserialize_to_rows(arrow_bytes)
     grids = [
         GridAttribute(
             deleted=row['deleted'],
@@ -124,8 +157,44 @@ def inverse_grid_attributes(arrow_bytes: bytes) -> list[GridAttribute]:
     ]
     return grids
 
+# GridInfos
+def serialize_grid_infos(levels: list[int], global_ids: list[int]) -> bytes:
+    schema = pa.schema([
+        pa.field('levels', pa.int8()),
+        pa.field('global_ids', pa.int32())
+    ])
+    table = pa.Table.from_arrays(
+        [
+            pa.array(levels, type=pa.int8()), 
+            pa.array(global_ids, type=pa.int32())
+        ],
+        schema=schema
+    )
+    return cc.message.serialize_from_table(table)
+
+def deserialize_grid_infos(arrow_bytes: bytes) -> tuple[list[int], list[list[int]]]:
+    table = cc.message.deserialize_to_table(arrow_bytes)
+    levels = table.column('levels').to_pylist()
+    global_ids = table.column('global_ids').to_pylist()
+    return levels, global_ids
+
+# GridKeys
+def serialize_grid_keys(keys: list[str]) -> bytes:
+    schema = pa.schema([pa.field('keys', pa.string())])
+    data = {'keys': keys}
+    table = pa.Table.from_pydict(data, schema=schema)
+    return cc.message.serialize_from_table(table)
+
+def deserialize_grid_keys(arrow_bytes: bytes) -> list[str]:
+    table = cc.message.deserialize_to_table(arrow_bytes)
+    keys = table.column('keys').to_pylist()
+    return keys
+
 # Register transfer methods ##################################################
 
-cc.register_wrapper('PeerGridInfos', forward_peer_grid_infos, inverse_peer_grid_infos)
-cc.register_wrapper('GridAttributes', forward_grid_attributes, inverse_grid_attributes)
+cc.message.register_wrapper('GridInfo', serialize_grid_info, deserialize_grid_info)
+cc.message.register_wrapper('PeerGridInfos', serialize_peer_grid_infos, deserialize_peer_grid_infos)
+cc.message.register_wrapper('GridAttributes', serialize_grid_attributes, deserialize_grid_attributes)
+cc.message.register_wrapper('GridInfos', serialize_grid_infos, deserialize_grid_infos)
+cc.message.register_wrapper('GridKeys', serialize_grid_keys, deserialize_grid_keys)
     
