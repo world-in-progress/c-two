@@ -17,21 +17,16 @@ class Server:
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def terminate(self):
-        self.runnig = False
+        self.running = False
         self.socket.close()
         self.context.term()
     
     def run(self):
         try:
-            
-            poller = zmq.Poller()
-            poller.register(self.socket, zmq.POLLIN)
-            
+            self.socket.setsockopt(zmq.RCVTIMEO, 1000)
             while self.running:
-                sockets = dict(poller.poll(100))
                 
-                if self.socket in sockets and sockets[self.socket] == zmq.POLLIN:
-                
+                try:
                     full_request = self.socket.recv()
                     sub_messages = _parse_message(full_request)
                     if len(sub_messages) != 2:
@@ -50,13 +45,15 @@ class Server:
                     # Send response
                     self.socket.send(response)
                 
+                except zmq.error.Again:
+                    continue
+            
         except KeyboardInterrupt:
             self._cleanup('Shutting down CRM Server...')
         except Exception as e:
-            self._cleanup('Error in CRM Server: {e}')
+            self._cleanup(f'Error in CRM Server: {e}')
     
     def _signal_handler(self, sig, frame):
-        self.running = False
         self._cleanup(f'Shutting down CRM Server via signal {sig}...')
     
     def _cleanup(self, message: str = ''):
@@ -65,8 +62,10 @@ class Server:
             if hasattr(self.crm, 'terminate') and self.crm.terminate:
                 self.crm.terminate()
             self.terminate()
+            sys.exit(0)
         except Exception as e:
             print(f'Error during termination: {e}')
+            sys.exit(1)
             
 
 # Helper ##################################################
