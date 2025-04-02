@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.1.8"
+version = "0.1.9"
 description = "A python server to support IPC between CRM and Component processes."
 authors = [
     {name = "YcSoku",email = "dsssyc02@gmail.com"}
