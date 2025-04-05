@@ -108,7 +108,6 @@ def connect(func = None, icrm_class = None) -> callable:
                 raise ValueError("No client available: Either use 'with connect_crm()', or provide 'crm_address' or 'crm_connection'")
             
             icrm = icrm_class()
-            icrm.direction = '->'
             icrm.client = client
             
             try:

@@ -1,4 +1,6 @@
+from . import crm
 from . import compo
 from . import message
-from .message.wrapper import transfer
+from .crm.meta import icrm
+from .message.wrapper import transfer, auto_transfer, AbstractWrapper
 

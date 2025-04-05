@@ -27,10 +27,10 @@ class Client:
         full_response = self.socket.recv()
         sub_responses = _parse_message(full_response)
         if len(sub_responses) != 2:
-                raise ValueError("Expected exactly 2 sub-messages (response and result)")
+            raise ValueError("Expected exactly 2 sub-messages (response and result)")
         
         response = get_wrapper(globals.BASE_RESPONSE).deserialize(sub_responses[0])
-        if response['code'] == globals.Code.ERROR_INVALID.value:
+        if response['code'] == globals.Code.ERROR_INVALID:
             raise RuntimeError(f'Failed to make CRM process: {response['message']}')
         
         return sub_responses[1]
