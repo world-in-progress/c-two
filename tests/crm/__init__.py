@@ -4,14 +4,10 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
-import pyarrow.compute as pc
 import c_two as cc
-from icrm import GridAttribute, ICRM
+from icrm import IGrid, GridSchema, GridAttribute
 
 # Const ##############################
-_GRID_DEFINITION = 'grid_definition'
-
-_ACTIVE_SET = 'Activate'
 
 ATTR_MIN_X = 'min_x'
 ATTR_MIN_Y = 'min_y'
@@ -36,7 +32,7 @@ GRID_SCHEMA: pa.Schema = pa.schema([
     (ATTR_ELEVATION, pa.float64())
 ])
 
-class CRM(ICRM):
+class Grid(IGrid):
     """ 
     CRM
     =
@@ -197,6 +193,20 @@ class CRM(ICRM):
         except Exception as e:
             print(f'Failed to save grid data: {str(e)}')
             return False
+    
+    @cc.auto_transfer
+    def get_schema(self) -> GridSchema:
+        """Method to get grid schema
+
+        Returns:
+            GridSchema: grid schema
+        """
+        return GridSchema(
+            epsg=self.epsg,
+            bounds=self.bounds,
+            first_size=self.first_size,
+            subdivide_rules=self.subdivide_rules
+        )
             
     def _get_local_ids(self, level: int, global_ids: np.ndarray) -> np.ndarray:
         """Method to calculate local_ids for provided grids having same level
@@ -232,7 +242,7 @@ class CRM(ICRM):
         v = global_id // total_width
         return (v // sub_height) * sub_width + (u // sub_width)
     
-    @cc.transfer(input_name='GridInfos', output_name='GridKeys')
+    @cc.auto_transfer
     def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
         """Method to get parent keys for provided grids having same level
 
@@ -302,7 +312,7 @@ class CRM(ICRM):
                         ATTR_DELETED, ATTR_ACTIVATE, ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y]
         return df[column_order]
     
-    @cc.transfer(input_name='PeerGridInfos', output_name='GridAttributes')
+    @cc.auto_transfer
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
         """Method to get all attributes for provided grids having same level
 
@@ -372,8 +382,8 @@ class CRM(ICRM):
         
         return child_global_ids
     
-    @cc.transfer(input_name='GridInfos', output_name='GridKeys')
-    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
+    @cc.auto_transfer
+    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
         """
         Subdivide grids by turning off parent grids' activate flag and activating children's activate flags
         if the parent grid is activate and not deleted.
@@ -452,16 +462,13 @@ class CRM(ICRM):
         
         return all_child_keys
     
-    @cc.transfer(input_name='GridInfos')
+    @cc.auto_transfer
     def delete_grids(self, levels: list[int], global_ids: list[int]):
         """Method to delete grids.
 
         Args:
             levels (list[int]): levels of grids to delete
             global_ids (list[int]): global_ids of grids to delete
-
-        Returns:
-            bool: whether the deletion was successful
         """
         idx_keys = list(zip(levels, global_ids))
         idx = pd.MultiIndex.from_tuples(idx_keys, names=[ATTR_LEVEL, ATTR_GLOBAL_ID])
@@ -479,7 +486,7 @@ class CRM(ICRM):
         self.grids.loc[valid_grids.index, ATTR_DELETED] = True
         self.grids.loc[valid_grids.index, ATTR_ACTIVATE] = False
     
-    @cc.transfer(output_name='GridInfos')
+    @cc.auto_transfer
     def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
         """Method to get all active grids' global ids and levels
 

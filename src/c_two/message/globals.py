@@ -1,6 +1,6 @@
 from enum import Enum
 
-BASE_RESPONSE = 'cc_base_response'
+BASE_RESPONSE = 'BaseResponse'
 
 class Code(Enum):
     UNKNOWN = 0

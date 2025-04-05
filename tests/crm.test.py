@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 if __name__ == '__main__':
     
     import c_two as cc
-    from crm import CRM
+    from crm import Grid
 
     # Grid parameters
     epsg = 2326
@@ -18,7 +18,7 @@ if __name__ == '__main__':
     
     # Init CRM
     grid_file_path='./grids.arrow'
-    crm = CRM(epsg, bounds, first_size, subdivide_rules)
+    crm = Grid(epsg, bounds, first_size, subdivide_rules)
     
     # Run CRM server
     ipc_address = 'ipc:///tmp/zmq_test'

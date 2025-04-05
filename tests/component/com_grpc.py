@@ -1,9 +1,9 @@
 import c_two as cc
-from icrm import ICRM, GridAttribute
+from icrm import IGrid, GridAttribute
 from proto.execute import execute_pb2 as execute, execute_pb2_grpc as execute_grpc
 
-@cc.connect(ICRM)
-def get_grid_info(crm: ICRM, args: execute.PeerGridInfos):
+@cc.connect(IGrid)
+def get_grid_info(crm: IGrid, args: execute.PeerGridInfos):
     grids: list[GridAttribute] = crm.get_grid_infos(args.level, [global_id for global_id in args.global_ids])
     result = execute.GridAttributes()
     result.attributes.extend([
@@ -26,8 +26,8 @@ def get_grid_info(crm: ICRM, args: execute.PeerGridInfos):
         gridAttributes=result
     )
 
-@cc.connect(ICRM)
-def subdivide_grids(crm: ICRM, args: execute.GridInfos):
+@cc.connect(IGrid)
+def subdivide_grids(crm: IGrid, args: execute.GridInfos):
     keys: list[str] = crm.subdivide_grids([level for level in args.levels], [global_id for global_id in args.global_ids])
     result = execute.GridKeys()
     result.grid_keys.extend(keys)

@@ -1,54 +1,12 @@
 import c_two as cc
 import pyarrow as pa
-from dataclasses import dataclass
+from . import GridSchema as GS, GridAttribute
 
-@dataclass
-class GridAttribute:
-    """
-    Attributes of Grid
-    ---
-    - level (int8): the level of the grid
-    - type (int8): the type of the grid, default to 0
-    - activate (bool), the subdivision status of the grid
-    - deleted (bool): the deletion status of the grid, default to False
-    - elevation (float64): the elevation of the grid, default to -9999.0
-    - global_id (int32): the global id within the bounding box that subdivided by grids all in the level of this grid
-    - local_id (int32): the local id within the parent grid that subdivided by child grids all in the level of this grid
-    - min_x (float64): the min x coordinate of the grid
-    - min_y (float64): the min y coordinate of the grid
-    - max_x (float64): the max x coordinate of the grid
-    - max_y (float64): the max y coordinate of the grid
-    """
-    level: int
-    type: int
-    activate: bool
-    global_id: int
-    deleted: bool = False   
-    elevation: float = -9999.0
-    local_id: int | None = None
-    min_x: float | None = None
-    min_y: float | None = None
-    max_x: float | None = None
-    max_y: float | None = None
-    
 # Define transfer wrappers ##################################################
-@dataclass
+
 class GridSchema(cc.AbstractWrapper):
-    """
-    Grid Schema
-    ---
-    - epsg (int): the EPSG code of the grid
-    - bounds (list[float]): the bounds of the grid in the format [min_x, min_y, max_x, max_y]
-    - first_size (float): the size of the first grid (unit: m)
-    - subdivide_rules (list[tuple[int, int]]): the subdivision rules of the grid in the format [(sub_width, sub_height)]
-    """
-    epsg: int
-    bounds: list[float]  # [min_x, min_y, max_x, max_y]
-    first_size: float
-    subdivide_rules: list[list[int]]  # [(sub_width, sub_height), ...]
-        
-    def serialize(grid_schema: 'GridSchema') -> bytes:
-        arrow_schema = pa.schema([
+    def serialize(schema: GS) -> bytes:
+        schema = pa.schema([
             pa.field('epsg', pa.int32()),
             pa.field('bounds', pa.list_(pa.float64())),
             pa.field('first_size', pa.float64()),
@@ -56,16 +14,16 @@ class GridSchema(cc.AbstractWrapper):
         ])
         
         data = {
-            'epsg': grid_schema.epsg,
-            'bounds': grid_schema.bounds,
-            'first_size': grid_schema.first_size,
-            'subdivide_rules': grid_schema.subdivide_rules
+            'epsg': schema.epsg,
+            'bounds': schema.bounds,
+            'first_size': schema.first_size,
+            'subdivide_rules': schema.subdivide_rules
         }
         
-        table = pa.Table.from_pylist([data], schema=arrow_schema)
+        table = pa.Table.from_pylist([data], schema=schema)
         return cc.message.serialize_from_table(table)
 
-    def deserialize(arrow_bytes: bytes) -> 'GridSchema':
+    def deserialize(arrow_bytes: bytes) -> GS:
         row = cc.message.deserialize_to_rows(arrow_bytes)[0]
         return GridSchema(
             epsg=row['epsg'],
@@ -196,41 +154,13 @@ class GridAttributes(cc.AbstractWrapper):
         return grids
 
 class GridKeys(cc.AbstractWrapper):
-    def serialize(keys: list[str | None]) -> bytes:
+    def serialize(keys: list[str]) -> bytes:
         schema = pa.schema([pa.field('keys', pa.string())])
         data = {'keys': keys}
         table = pa.Table.from_pydict(data, schema=schema)
         return cc.message.serialize_from_table(table)
 
-    def deserialize(arrow_bytes: bytes) -> list[str | None]:
+    def deserialize(arrow_bytes: bytes) -> list[str]:
         table = cc.message.deserialize_to_table(arrow_bytes)
         keys = table.column('keys').to_pylist()
         return keys
-
-@cc.icrm
-class IGrid:
-    """
-    ICRM
-    =
-    Interface of Core Resource Model (ICRM) specifies how to interact with CRM. 
-    """
-    @cc.auto_transfer
-    def get_schema(self) -> GridSchema:
-        return
-    
-    @cc.auto_transfer
-    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
-        return
-    
-    @cc.auto_transfer
-    def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
-        return
-
-    @cc.auto_transfer
-    def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        return
-    
-    @cc.auto_transfer
-    def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
-        return
-    

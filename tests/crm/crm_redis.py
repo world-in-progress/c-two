@@ -7,7 +7,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.compute as pc
 import c_two as cc
-from icrm import GridAttribute, ICRM
+from icrm import GridAttribute, IGrid
 
 # Const ##############################
 _GRID_DEFINITION = 'grid_definition'
@@ -37,7 +37,7 @@ GRID_SCHEMA: pa.Schema = pa.schema([
     (ATTR_ELEVATION, pa.float64())
 ])
 
-class CRM(ICRM):
+class CRM(IGrid):
     """ 
     CRM
     =

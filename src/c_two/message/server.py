@@ -67,7 +67,6 @@ class Server:
             print(f'Error during termination: {e}')
             sys.exit(1)
             
-
 # Helper ##################################################
 
 def _parse_message(full_message: bytes) -> list[memoryview]:
