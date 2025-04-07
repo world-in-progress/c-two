@@ -32,8 +32,9 @@ GRID_SCHEMA: pa.Schema = pa.schema([
     (ATTR_ELEVATION, pa.float64())
 ])
 
+@cc.iicrm
 class Grid(IGrid):
-    """ 
+    """
     CRM
     =
     The Grid Resource.  
@@ -91,7 +92,42 @@ class Grid(IGrid):
             print('grid file does not exist, initializing default grid data...')
             self._initialize_default_grid(batch_size=50000)
             print('Successfully initialized default grid data')
-    
+     
+    def terminate(self):
+        """Save the grid data to Arrow file
+
+        Args:
+            grid_file_path (str, optional): The file path to save the grid data. If None, the path provided during initialization is used
+
+        Returns:
+            bool: Whether the save was successful
+        """
+        
+        save_path = self.grid_file_path
+        if not save_path:
+            print('No file path provided for saving grid data')
+            return False
+        
+        try:
+            if self.grids.empty:
+                print('No grid data to save')
+                return False
+            
+            # Reset index to include level and globale_id columns in the table
+            df = self.grids.reset_index()
+            table = pa.Table.from_pandas(df, schema=GRID_SCHEMA)
+            
+            # Write to Arrow file
+            with pa.ipc.new_file(save_path, GRID_SCHEMA) as writer:
+                writer.write_table(table)
+            
+            print(f'Successfully saved grid data to {save_path}')
+            return True
+        
+        except Exception as e:
+            print(f'Failed to save grid data: {str(e)}')
+            return False
+
     def _load_grid_from_file(self, file_path: str, batch_size: int = 50000):
         """Load grid data from file streaming
 
@@ -158,56 +194,7 @@ class Grid(IGrid):
         
         self.grids = df
         print(f'Successfully initialized grid data with {num_grids} grids at level 1')
-    
-    def terminate(self, grid_file_path: str = None):
-        """Save the grid data to Arrow file
-
-        Args:
-            grid_file_path (str, optional): The file path to save the grid data. If None, the path provided during initialization is used
-
-        Returns:
-            bool: Whether the save was successful
-        """
-        
-        save_path = grid_file_path or self.grid_file_path
-        if not save_path:
-            print('No file path provided for saving grid data')
-            return False
-        
-        try:
-            if self.grids.empty:
-                print('No grid data to save')
-                return False
-            
-            # Reset index to include level and globale_id columns in the table
-            df = self.grids.reset_index()
-            table = pa.Table.from_pandas(df, schema=GRID_SCHEMA)
-            
-            # Write to Arrow file
-            with pa.ipc.new_file(save_path, GRID_SCHEMA) as writer:
-                writer.write_table(table)
-            
-            print(f'Successfully saved grid data to {save_path}')
-            return True
-        
-        except Exception as e:
-            print(f'Failed to save grid data: {str(e)}')
-            return False
-    
-    @cc.auto_transfer
-    def get_schema(self) -> GridSchema:
-        """Method to get grid schema
-
-        Returns:
-            GridSchema: grid schema
-        """
-        return GridSchema(
-            epsg=self.epsg,
-            bounds=self.bounds,
-            first_size=self.first_size,
-            subdivide_rules=self.subdivide_rules
-        )
-            
+   
     def _get_local_ids(self, level: int, global_ids: np.ndarray) -> np.ndarray:
         """Method to calculate local_ids for provided grids having same level
         
@@ -241,28 +228,6 @@ class Grid(IGrid):
         u = global_id % total_width
         v = global_id // total_width
         return (v // sub_height) * sub_width + (u // sub_width)
-    
-    @cc.auto_transfer
-    def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
-        """Method to get parent keys for provided grids having same level
-
-        Args:
-            levels (list[int]): levels of provided grids
-            global_ids (list[int]): global_ids of provided grids
-
-        Returns:
-            parent_keys (list[str]): parent keys of provided grids, organized by list of strings in the format "level-global_id"
-        """
-        parent_keys: list[str | None]  = []
-        for level, global_id in zip(levels, global_ids):
-            if level == 1:
-                parent_keys.append(None)
-                continue
-            
-            parent_global_id = self._get_parent_global_id(level, global_id)
-            parent_key = f'{level - 1}-{parent_global_id}'
-            parent_keys.append(parent_key)
-        return parent_keys
     
     def _get_coordinates(self, level: int, global_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Method to calculate coordinates for provided grids having same level
@@ -312,7 +277,63 @@ class Grid(IGrid):
                         ATTR_DELETED, ATTR_ACTIVATE, ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y]
         return df[column_order]
     
-    @cc.auto_transfer
+    def _get_grid_children_global_ids(self, level: int, global_id: int) -> list[int] | None:
+        if (level < 0) or (level >= len(self.level_info)):
+            return None
+        
+        width = self.level_info[level]['width']
+        global_u = global_id % width
+        global_v = global_id // width
+        sub_width = self.subdivide_rules[level][0]
+        sub_height = self.subdivide_rules[level][1]
+        sub_count = sub_width * sub_height
+        
+        baseGlobalWidth = width * sub_width
+        child_global_ids = [0] * sub_count
+        for local_id in range(sub_count):
+            local_u = local_id % sub_width
+            local_v = local_id // sub_width
+            
+            sub_global_u = global_u * sub_width + local_u
+            sub_global_v = global_v * sub_height + local_v
+            child_global_ids[local_id] = sub_global_v * baseGlobalWidth + sub_global_u
+        
+        return child_global_ids
+    
+    def get_schema(self) -> GridSchema:
+        """Method to get grid schema
+
+        Returns:
+            GridSchema: grid schema
+        """
+        return GridSchema(
+            epsg=self.epsg,
+            bounds=self.bounds,
+            first_size=self.first_size,
+            subdivide_rules=self.subdivide_rules
+        )
+      
+    def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
+        """Method to get parent keys for provided grids having same level
+
+        Args:
+            levels (list[int]): levels of provided grids
+            global_ids (list[int]): global_ids of provided grids
+
+        Returns:
+            parent_keys (list[str]): parent keys of provided grids, organized by list of strings in the format "level-global_id"
+        """
+        parent_keys: list[str | None]  = []
+        for level, global_id in zip(levels, global_ids):
+            if level == 1:
+                parent_keys.append(None)
+                continue
+            
+            parent_global_id = self._get_parent_global_id(level, global_id)
+            parent_key = f'{level - 1}-{parent_global_id}'
+            parent_keys.append(parent_key)
+        return parent_keys
+    
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
         """Method to get all attributes for provided grids having same level
 
@@ -359,30 +380,6 @@ class Grid(IGrid):
             for _, row in filtered_grids.iterrows()
         ]
     
-    def _get_grid_children_global_ids(self, level: int, global_id: int) -> list[int] | None:
-        if (level < 0) or (level >= len(self.level_info)):
-            return None
-        
-        width = self.level_info[level]['width']
-        global_u = global_id % width
-        global_v = global_id // width
-        sub_width = self.subdivide_rules[level][0]
-        sub_height = self.subdivide_rules[level][1]
-        sub_count = sub_width * sub_height
-        
-        baseGlobalWidth = width * sub_width
-        child_global_ids = [0] * sub_count
-        for local_id in range(sub_count):
-            local_u = local_id % sub_width
-            local_v = local_id // sub_width
-            
-            sub_global_u = global_u * sub_width + local_u
-            sub_global_v = global_v * sub_height + local_v
-            child_global_ids[local_id] = sub_global_v * baseGlobalWidth + sub_global_u
-        
-        return child_global_ids
-    
-    @cc.auto_transfer
     def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
         """
         Subdivide grids by turning off parent grids' activate flag and activating children's activate flags
@@ -462,7 +459,6 @@ class Grid(IGrid):
         
         return all_child_keys
     
-    @cc.auto_transfer
     def delete_grids(self, levels: list[int], global_ids: list[int]):
         """Method to delete grids.
 
@@ -486,7 +482,6 @@ class Grid(IGrid):
         self.grids.loc[valid_grids.index, ATTR_DELETED] = True
         self.grids.loc[valid_grids.index, ATTR_ACTIVATE] = False
     
-    @cc.auto_transfer
     def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
         """Method to get all active grids' global ids and levels
 
