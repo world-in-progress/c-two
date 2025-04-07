@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.1.10"
+version = "0.1.11"
 description = "A python server to support IPC between CRM and Component processes."
 authors = [
     {name = "YcSoku",email = "dsssyc02@gmail.com"}
@@ -22,7 +22,6 @@ requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.group.dev.dependencies]
-redis = "^5.2.1"
 numpy = "^2.2.4"
 pandas = "^2.2.3"
 
