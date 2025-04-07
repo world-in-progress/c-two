@@ -1,10 +1,9 @@
 import os
-import json
+import c_two as cc
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
-import c_two as cc
 from icrm import IGrid, GridSchema, GridAttribute
 
 # Const ##############################

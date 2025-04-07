@@ -1,14 +1,18 @@
+import json
 import struct
 import inspect
-import pyarrow as pa
+from abc import ABCMeta
 from functools import wraps
-from abc import ABCMeta, abstractmethod
 from typing import get_type_hints, get_args
 from dataclasses import dataclass, is_dataclass
 from .globals import Code, BASE_RESPONSE
 
-_TRANSFERABLE_INFOS: list[dict[str, any]] = []
+# Global Caches ###################################################################
+
 _TRANSFERABLE_MAP: dict[str, 'Transferable'] = {}
+_TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
+
+# Definition of Transferable ######################################################
 
 class TransferableMeta(ABCMeta):
     """
@@ -70,6 +74,8 @@ class Transferable(metaclass=TransferableMeta):
         """
         ...
 
+# Transferable-related interfaces #################################################
+
 def register_transferable(transferable: Transferable):
     name = transferable.__name__
     _TRANSFERABLE_MAP[name] = transferable
@@ -78,31 +84,7 @@ def get_transferable(transferable_name: str) -> Transferable | None:
     name = transferable_name
     return None if name not in _TRANSFERABLE_MAP else _TRANSFERABLE_MAP[name]
 
-# Register base transferables #####################################################
-
-class BaseResponse(Transferable):
-    def serialize(code: Code, message: str) -> bytes:
-        schema = pa.schema([
-            pa.field('code', pa.int8()),
-            pa.field('message', pa.string()),
-        ])
-        
-        data = {
-            'code': code.value,
-            'message': message
-        }
-        
-        table = pa.Table.from_pylist([data], schema)
-        return serialize_from_table(table)
-
-    def deserialize(arrow_bytes: bytes) -> dict[str, int | str]:
-        row = deserialize_to_rows(arrow_bytes)[0]
-        return {
-            'code': Code(row['code']),
-            'message': row['message']
-        }
-
-# Transferable-related decorator ##################################################
+# Transferable-related decorators #################################################
 
 def transferable(cls: type) -> type:
     """
@@ -281,30 +263,26 @@ def auto_transfer(func = None) -> callable:
         # @auto_transfer syntax - apply decorator directly to the function
         return create_wrapper(func)
 
-# Helper ##################################################
-
-def serialize_from_table(table: pa.Table) -> bytes:
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    binary_data = sink.getvalue().to_pybytes()
-    return binary_data
-
-def deserialize_to_table(serialized_data: bytes) -> pa.Table:
-    buffer = pa.py_buffer(serialized_data)
-    with pa.ipc.open_stream(buffer) as reader:
-        table = reader.read_all()
-    return table
-
-def deserialize_to_rows(serialized_data: bytes) -> dict:
-    buffer = pa.py_buffer(serialized_data)
-
-    with pa.ipc.open_stream(buffer) as reader:
-        table = reader.read_all()
-
-    return table.to_pylist()
+# Helpers #########################################################################
 
 def _add_length_prefix(message_bytes):
     length = len(message_bytes)
     prefix = struct.pack('>Q', length)
     return prefix + message_bytes
+
+# Register base transferables #####################################################
+
+class BaseResponse(Transferable):
+    def serialize(code: Code, message: str) -> bytes:
+        res = {
+            'code': code.value,
+            'message': message
+        }
+        return json.dumps(res).encode('utf-8')
+
+    def deserialize(res_bytes: memoryview) -> dict[str, int | str]:
+        res = json.loads(res_bytes.tobytes().decode('utf-8'))
+        return {
+            'code': Code(res['code']),
+            'message': res['message']
+        }
