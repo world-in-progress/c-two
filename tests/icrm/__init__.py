@@ -1,39 +1,10 @@
 import c_two as cc
 import pyarrow as pa
-from dataclasses import dataclass
 
-@dataclass
-class GridAttribute:
-    """
-    Attributes of Grid
-    ---
-    - level (int8): the level of the grid
-    - type (int8): the type of the grid, default to 0
-    - activate (bool), the subdivision status of the grid
-    - deleted (bool): the deletion status of the grid, default to False
-    - elevation (float64): the elevation of the grid, default to -9999.0
-    - global_id (int32): the global id within the bounding box that subdivided by grids all in the level of this grid
-    - local_id (int32): the local id within the parent grid that subdivided by child grids all in the level of this grid
-    - min_x (float64): the min x coordinate of the grid
-    - min_y (float64): the min y coordinate of the grid
-    - max_x (float64): the max x coordinate of the grid
-    - max_y (float64): the max y coordinate of the grid
-    """
-    level: int
-    type: int
-    activate: bool
-    global_id: int
-    deleted: bool = False   
-    elevation: float = -9999.0
-    local_id: int | None = None
-    min_x: float | None = None
-    min_y: float | None = None
-    max_x: float | None = None
-    max_y: float | None = None
-    
-# Define transfer wrappers ##################################################
-@dataclass
-class GridSchema(cc.AbstractWrapper):
+# Define transferables ##################################################
+
+@cc.transferable
+class GridSchema:
     """
     Grid Schema
     ---
@@ -74,7 +45,71 @@ class GridSchema(cc.AbstractWrapper):
             subdivide_rules=row['subdivide_rules']
         )
 
-class GridInfo(cc.AbstractWrapper):
+@cc.transferable
+class GridAttribute:
+    """
+    Attributes of Grid
+    ---
+    - level (int8): the level of the grid
+    - type (int8): the type of the grid, default to 0
+    - activate (bool), the subdivision status of the grid
+    - deleted (bool): the deletion status of the grid, default to False
+    - elevation (float64): the elevation of the grid, default to -9999.0
+    - global_id (int32): the global id within the bounding box that subdivided by grids all in the level of this grid
+    - local_id (int32): the local id within the parent grid that subdivided by child grids all in the level of this grid
+    - min_x (float64): the min x coordinate of the grid
+    - min_y (float64): the min y coordinate of the grid
+    - max_x (float64): the max x coordinate of the grid
+    - max_y (float64): the max y coordinate of the grid
+    """
+    level: int
+    type: int
+    activate: bool
+    global_id: int
+    deleted: bool = False   
+    elevation: float = -9999.0
+    local_id: int | None = None
+    min_x: float | None = None
+    min_y: float | None = None
+    max_x: float | None = None
+    max_y: float | None = None
+    
+    def serialize(data: 'GridAttribute') -> bytes:
+        schema = pa.schema([
+            pa.field('deleted', pa.bool_()),
+            pa.field('activate', pa.bool_()),
+            pa.field('type', pa.int8()),
+            pa.field('level', pa.int8()),
+            pa.field('global_id', pa.int32()),
+            pa.field('local_id', pa.int32(), nullable=True),
+            pa.field('elevation', pa.float64()),
+            pa.field('min_x', pa.float64(), nullable=True),
+            pa.field('min_y', pa.float64(), nullable=True),
+            pa.field('max_x', pa.float64(), nullable=True),
+            pa.field('max_y', pa.float64(), nullable=True),
+        ])
+        
+        table = pa.Table.from_pylist([data.__dict__], schema=schema)
+        return cc.message.serialize_from_table(table)
+    
+    def deserialize(arrow_bytes: bytes) -> 'GridAttribute':
+        row = cc.message.deserialize_to_rows(arrow_bytes)[0]
+        return GridAttribute(
+            deleted=row['deleted'],
+            activate=row['activate'],
+            type=row['type'],
+            level=row['level'],
+            global_id=row['global_id'],
+            local_id=row['local_id'],
+            elevation=row['elevation'],
+            min_x=row['min_x'],
+            min_y=row['min_y'],
+            max_x=row['max_x'],
+            max_y=row['max_y']
+        )
+
+@cc.transferable
+class GridInfo:
     def serialize(level: int, global_id: int) -> bytes:
         schema = pa.schema([
             pa.field('level', pa.int8()),
@@ -96,7 +131,8 @@ class GridInfo(cc.AbstractWrapper):
             row['global_id']
         )
 
-class PeerGridInfos(cc.AbstractWrapper):
+@cc.transferable
+class PeerGridInfos:
     def serialize(level: int, global_ids: list[int]) -> bytes:
         schema = pa.schema([
             pa.field('level', pa.int8()),
@@ -118,7 +154,8 @@ class PeerGridInfos(cc.AbstractWrapper):
             row['global_ids']
         )
 
-class GridInfos(cc.AbstractWrapper):
+@cc.transferable
+class GridInfos:
     def serialize(levels: list[int], global_ids: list[int]) -> bytes:
         schema = pa.schema([
             pa.field('levels', pa.int8()),
@@ -139,63 +176,29 @@ class GridInfos(cc.AbstractWrapper):
         global_ids = table.column('global_ids').to_pylist()
         return levels, global_ids
 
-class GridAttributes(cc.AbstractWrapper):
+@cc.transferable
+class GridAttributes:
     def serialize(data: list[GridAttribute]) -> bytes:
         schema = pa.schema([
-            pa.field('deleted', pa.bool_()),
-            pa.field('activate', pa.bool_()),
-            pa.field('type', pa.int8()),
-            pa.field('level', pa.int8()),
-            pa.field('global_id', pa.int32()),
-            pa.field('local_id', pa.int32(), nullable=True),
-            pa.field('elevation', pa.float64()),
-            pa.field('min_x', pa.float64(), nullable=True),
-            pa.field('min_y', pa.float64(), nullable=True),
-            pa.field('max_x', pa.float64(), nullable=True),
-            pa.field('max_y', pa.float64(), nullable=True),
+            pa.field('attribute_bytes', pa.list_(pa.binary())),
         ])
+
+        data_dict = {
+            'attribute_bytes': [GridAttribute.serialize(grid) for grid in data]
+        }
         
-        data_dicts = [
-            {
-                'deleted': grid.deleted,
-                'activate': grid.activate,
-                'type': grid.type,
-                'level': grid.level,
-                'global_id': grid.global_id,
-                'local_id': grid.local_id,
-                'elevation': grid.elevation,
-                'min_x': grid.min_x,
-                'min_y': grid.min_y,
-                'max_x': grid.max_x,
-                'max_y': grid.max_y
-            }
-            for grid in data
-        ]
-        
-        table = pa.Table.from_pylist(data_dicts, schema=schema)
+        table = pa.Table.from_pylist([data_dict], schema=schema)
         return cc.message.serialize_from_table(table)
 
     def deserialize(arrow_bytes: bytes) -> list[GridAttribute]:
-        rows = cc.message.deserialize_to_rows(arrow_bytes)
-        grids = [
-            GridAttribute(
-                deleted=row['deleted'],
-                activate=row['activate'],
-                type=row['type'],
-                level=row['level'],
-                global_id=row['global_id'],
-                local_id=row['local_id'],
-                elevation=row['elevation'],
-                min_x=row['min_x'],
-                min_y=row['min_y'],
-                max_x=row['max_x'],
-                max_y=row['max_y']
-            )
-            for row in rows
-        ]
-        return grids
+        table = cc.message.deserialize_to_table(arrow_bytes)
+        
+        grid_bytes = table.column('attribute_bytes').to_pylist()[0]
+        
+        return [GridAttribute.deserialize(grid_byte) for grid_byte in grid_bytes]
 
-class GridKeys(cc.AbstractWrapper):
+@cc.transferable
+class GridKeys:
     def serialize(keys: list[str | None]) -> bytes:
         schema = pa.schema([pa.field('keys', pa.string())])
         data = {'keys': keys}
@@ -207,6 +210,8 @@ class GridKeys(cc.AbstractWrapper):
         keys = table.column('keys').to_pylist()
         return keys
 
+# Define ICRM ###########################################################
+
 @cc.icrm
 class IGrid:
     """
@@ -214,23 +219,18 @@ class IGrid:
     =
     Interface of Core Resource Model (ICRM) specifies how to interact with CRM. 
     """
-    @cc.auto_transfer
     def get_schema(self) -> GridSchema:
-        return
+        ...
     
-    @cc.auto_transfer
     def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
-        return
+        ...
     
-    @cc.auto_transfer
     def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
-        return
+        ...
 
-    @cc.auto_transfer
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        return
+        ...
     
-    @cc.auto_transfer
     def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
-        return
+        ...
     

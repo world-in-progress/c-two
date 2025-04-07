@@ -1,7 +1,7 @@
 import zmq
 import struct
 from . import globals
-from .wrapper import get_wrapper
+from .transferable import get_transferable
 
 class Client:
     def __init__(self, server_address):
@@ -29,7 +29,7 @@ class Client:
         if len(sub_responses) != 2:
             raise ValueError("Expected exactly 2 sub-messages (response and result)")
         
-        response = get_wrapper(globals.BASE_RESPONSE).deserialize(sub_responses[0])
+        response = get_transferable(globals.BASE_RESPONSE).deserialize(sub_responses[0])
         if response['code'] == globals.Code.ERROR_INVALID:
             raise RuntimeError(f'Failed to make CRM process: {response['message']}')
         
