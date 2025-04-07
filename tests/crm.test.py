@@ -1,10 +1,11 @@
 import os
 import sys
+import c_two as cc
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 if __name__ == '__main__':
     
-    import c_two as cc
     from crm import Grid
 
     # Grid parameters
