@@ -2,6 +2,7 @@ import sys
 import zmq
 import signal
 import struct
+import threading
 
 class Server:
     def __init__(self, server_address: str, crm_instance: any):
@@ -13,19 +14,29 @@ class Server:
         self.crm = crm_instance
         self.running = True
         
+        self._termination_event = threading.Event()
+        self._server_thread: threading.Thread | None = None
+    
+    def start(self):
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.name = 'CRM Server'
+        self._server_thread = thread
+        self._server_thread.start()
+    
+    def stop(self):
+        self._cleanup(f'Cleaning up CRM Server...')
+    
+    def set_signal_handler(self):
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
-    def terminate(self):
-        self.running = False
-        self.socket.close()
-        self.context.term()
+    def wait_for_termination(self):
+        self._termination_event.wait()
     
-    def run(self):
+    def _run(self):
         try:
             self.socket.setsockopt(zmq.RCVTIMEO, 1000)
             while self.running:
-                
                 try:
                     full_request = self.socket.recv()
                     
@@ -53,25 +64,31 @@ class Server:
                 
                 except zmq.error.Again:
                     continue
+                except zmq.ContextTerminated:
+                    break
             
-        except KeyboardInterrupt:
-            self._cleanup('Shutting down CRM Server...')
         except Exception as e:
             self._cleanup(f'Error in CRM Server: {e}')
     
     def _signal_handler(self, sig, frame):
         self._cleanup(f'Shutting down CRM Server via signal {sig}...')
+        self._termination_event.set()
+        
+    def _stop(self):
+        self.running = False
+        if hasattr(self, '_server_thread') and self._server_thread.is_alive():
+            self._server_thread.join()
+        self.socket.close()
+        self.context.term()
     
     def _cleanup(self, message: str = ''):
         print(message, flush=True)
         try:
+            self._stop()
             if hasattr(self.crm, 'terminate') and self.crm.terminate:
                 self.crm.terminate()
-            self.terminate()
-            sys.exit(0)
         except Exception as e:
             print(f'Error during termination: {e}')
-            sys.exit(1)
             
 # Helpers ##################################################
 

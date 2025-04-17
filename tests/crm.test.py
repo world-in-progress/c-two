@@ -26,5 +26,12 @@ if __name__ == '__main__':
     ipc_address = 'ipc:///tmp/zmq_test'
     tcp_address = 'tcp://localhost:5555'
     server = cc.message.Server(tcp_address, crm)
-    server.run()
+    server.start()
+    
+    try:
+        print("CRM server is running. Press Ctrl+C to stop.")
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received. Stopping CRM server...")
+        server.stop()
     
