@@ -1,12 +1,9 @@
-import sys
 import zmq
-import signal
 import struct
 import threading
 
 class Server:
     def __init__(self, server_address: str, crm_instance: any):
-        
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind(server_address)
@@ -15,23 +12,24 @@ class Server:
         self.running = True
         
         self._termination_event = threading.Event()
-        self._server_thread: threading.Thread | None = None
+        self._server_thread = threading.Thread(target=self._run, daemon=True)
     
     def start(self):
-        thread = threading.Thread(target=self._run, daemon=True)
-        thread.name = 'CRM Server'
-        self._server_thread = thread
+        self._server_thread.name = 'CRM Server'
         self._server_thread.start()
     
     def stop(self):
         self._cleanup(f'Cleaning up CRM Server...')
+        self._termination_event.set()
     
-    def set_signal_handler(self):
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-    
-    def wait_for_termination(self):
-        self._termination_event.wait()
+    def wait_for_termination(self, check_interval: float = 0.1):
+        while not self._termination_event.is_set():
+            try:
+                threading.Event().wait(check_interval)
+            except KeyboardInterrupt:
+                print('\nKeyboardInterrupt received.\nStopping CRM server...', flush=True)
+                self._cleanup(f'Cleaning up...')
+                self._termination_event.set()
     
     def _run(self):
         try:
@@ -69,10 +67,6 @@ class Server:
             
         except Exception as e:
             self._cleanup(f'Error in CRM Server: {e}')
-    
-    def _signal_handler(self, sig, frame):
-        self._cleanup(f'Shutting down CRM Server via signal {sig}...')
-        self._termination_event.set()
         
     def _stop(self):
         self.running = False
