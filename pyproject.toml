@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.1.14"
+version = "0.1.15"
 description = "A python server to support communication between CRM and Component processes."
 readme = "README.md"
 requires-python = ">=3.10"
