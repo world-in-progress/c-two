@@ -1,8 +1,9 @@
 import os
 import sys
-import c_two as cc
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
+import c_two as cc
 
 import component as com
 
@@ -10,6 +11,13 @@ if __name__ == '__main__':
     
     ipc_address = 'ipc:///tmp/zmq_test'
     tcp_address = 'tcp://localhost:5555'
+    
+    # Check if CRM is running
+    if cc.message.Client.ping(tcp_address):
+        print('CRM is running!\n')
+    else:
+        print('CRM is not running!\n')
+        sys.exit(1)
     
     with cc.compo.runtime.connect_crm(tcp_address):
         # Check grid 1-0

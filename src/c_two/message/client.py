@@ -1,10 +1,11 @@
 import zmq
+import time
 import struct
 from . import globals
 from .transferable import get_transferable
 
 class Client:
-    def __init__(self, server_address):
+    def __init__(self, server_address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(server_address)
@@ -25,13 +26,14 @@ class Client:
         # Send and get response
         self.socket.send(combinned_request)
         full_response = self.socket.recv()
+        
         sub_responses = _parse_message(full_response)
         if len(sub_responses) != 2:
             raise ValueError("Expected exactly 2 sub-messages (response and result)")
         
         response = get_transferable(globals.BASE_RESPONSE).deserialize(sub_responses[0])
         if response['code'] == globals.Code.ERROR_INVALID:
-            raise RuntimeError(f'Failed to make CRM process: {response['message']}')
+            raise RuntimeError(f'Failed to make CRM process: {response["message"]}')
         
         return sub_responses[1]
 
@@ -41,6 +43,29 @@ class Client:
             return self._send_request(method_name, data)
         except Exception as e:
             raise RuntimeError(f'Failed to call CRM: {e}')
+    
+    @staticmethod
+    def ping(server_address: str, timeout: float = 0.5) -> bool:
+        """Ping the CRM service to check if it's alive."""
+        
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
+        socket.connect(server_address)
+        
+        try:
+            socket.send(b'PING')
+            
+            response = socket.recv()
+            if response == b'PONG':
+                return True
+            return False
+        except zmq.ZMQError:
+            return False
+        finally:
+            socket.close()
+            context.term()
 
 # Helper ##################################################
 def _add_length_prefix(message_bytes: bytes):
