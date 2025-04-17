@@ -22,16 +22,13 @@ if __name__ == '__main__':
     grid_file_path='./grids.arrow'
     crm = Grid(epsg, bounds, first_size, subdivide_rules)
     
-    # Run CRM server
+    # Create CRM server
     ipc_address = 'ipc:///tmp/zmq_test'
     tcp_address = 'tcp://localhost:5555'
     server = cc.message.Server(tcp_address, crm)
-    server.start()
     
-    try:
-        print("CRM server is running. Press Ctrl+C to stop.")
-        server.wait_for_termination()
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt received. Stopping CRM server...")
-        server.stop()
+    # Run CRM server and handle termination gracefully
+    server.start()
+    print("CRM server is running. Press Ctrl+C to stop.")
+    server.wait_for_termination()
     
