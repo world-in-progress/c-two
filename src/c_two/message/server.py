@@ -28,6 +28,12 @@ class Server:
                 
                 try:
                     full_request = self.socket.recv()
+                    
+                    # Check for PING message
+                    if full_request == b'PING':
+                        self.socket.send(b'PONG')
+                        continue
+                    
                     sub_messages = _parse_message(full_request)
                     if len(sub_messages) != 2:
                         raise ValueError("Expected exactly 2 sub-messages (meta and data)")

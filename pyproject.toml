@@ -1,27 +1,19 @@
 [project]
 name = "c-two"
-version = "0.1.12"
-description = "A python server to support IPC between CRM and Component processes."
-authors = [
-    {name = "YcSoku",email = "dsssyc02@gmail.com"}
-]
-license = {text = "MIT license"}
+version = "0.1.14"
+description = "A python server to support communication between CRM and Component processes."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "zmq (>=0.0.0,<0.0.1)",
-    "grpcio (>=1.71.0,<2.0.0)",
-    "grpcio-tools (>=1.71.0,<2.0.0)",
-    "mypy-protobuf (>=3.6.0,<4.0.0)",
-    "pyarrow (>=19.0.1,<20.0.0)"
+    "grpcio>=1.71.0",
+    "grpcio-tools>=1.71.0",
+    "mypy-protobuf>=3.6.0",
+    "pyarrow>=19.0.1",
+    "zmq>=0.0.0",
 ]
 
-
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
-
-[tool.poetry.group.dev.dependencies]
-numpy = "^2.2.4"
-pandas = "^2.2.3"
-
+[dependency-groups]
+dev = [
+    "numpy>=2.2.4",
+    "pandas>=2.2.3",
+]
