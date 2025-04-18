@@ -1,5 +1,4 @@
 import zmq
-import time
 import struct
 from . import globals
 from .transferable import get_transferable

@@ -118,7 +118,7 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                 request = args[1:] if len(args) > 1 else None
                 
                 try:
-                    args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else tuple()
+                    args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                     result_bytes = obj.client.call(method_name, args_converted)
                     return None if output_transferable is None else output_transferable(result_bytes)
                 except Exception as e:
@@ -162,8 +162,15 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                     code = Code.ERROR_INVALID
                     message = f'Error occurred: {e}'
                 
+                # Create a serialized response based on the serialized_response and serialized_result
                 serialized_response: str = get_transferable(BASE_RESPONSE).serialize(code, message)
-                serialized_result: str = b'' if (output_transferable is None or result is None) else output_transferable(result)
+                serialized_result = b''
+                if output_transferable is not None and result is not None:
+                    # Unpack tuple arguments or pass single argument based on result type
+                    serialized_result = (
+                        output_transferable(*result) if isinstance(result, tuple)
+                        else output_transferable(result)
+                    )
                 combined_response = _add_length_prefix(serialized_response) + _add_length_prefix(serialized_result)
                 return result, combined_response
             

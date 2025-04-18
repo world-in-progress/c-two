@@ -1,6 +1,8 @@
-from functools import wraps
+from typing import TypeVar, cast
 from inspect import isfunction
 from ..message.transferable import auto_transfer
+
+T = TypeVar('T')
 
 class ICRMMeta(type):
     """
@@ -33,7 +35,7 @@ class ICRMMeta(type):
         cls = super().__new__(mcs, name, bases, attrs, **kwargs)
         return cls
     
-def icrm(cls):
+def icrm(cls: T) -> T:
     """
     Interface of Core Resource Model (ICRM) decorator
     --
@@ -44,13 +46,38 @@ def icrm(cls):
     Additionally, it decorates all member functions of the class with @auto_transfer,
     so that they can be automatically transferred between Component and CRM.
     """
-    attrs = {
-        name: auto_transfer(value) if isfunction(value) else value
-        for name, value in cls.__dict__.items()
-        if name not in ('__dict__', '__weakref__', '__module__', '__qualname__')
-    }
     
-    return ICRMMeta(cls.__name__, cls.__bases__, attrs)
+    decorated_methods = {}
+    for name, value in cls.__dict__.items():
+        if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__'):
+            decorated_methods[name] = auto_transfer(value)
+    
+    # Define a new class with ICRMMeta metaclass that inherits from the original class
+    class_name = cls.__name__
+    bases = (cls,)
+    
+    # Create the new class
+    NewClass = ICRMMeta(class_name, bases, {
+        **{k: v for k, v in cls.__dict__.items() 
+           if k not in decorated_methods and k not in ('__dict__', '__weakref__')},
+        **decorated_methods
+    })
+    
+    # Copy over type hints explicitly to help type checkers
+    try:
+        NewClass.__annotations__ = getattr(cls, '__annotations__', {})
+    except (AttributeError, TypeError):
+        pass
+    
+    # Copy docstring, module name etc.
+    for attr in ['__doc__', '__module__', '__qualname__']:
+        try:
+            setattr(NewClass, attr, getattr(cls, attr))
+        except (AttributeError, TypeError):
+            pass
+    
+    # Use cast to maintain the original type for static type checking
+    return cast(T, NewClass)
 
 def iicrm(cls):
     """
@@ -64,6 +91,7 @@ def iicrm(cls):
     
     Note: The name 'iicrm' is used because 'crm' is already used as a sub-module name in c-two.
     """
+    
     # Get the base class decorated with @icrm
     base_class = None
     for base in cls.__bases__:
