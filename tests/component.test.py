@@ -19,10 +19,22 @@ if __name__ == '__main__':
         print('CRM is not running!\n')
         sys.exit(1)
     
-    with cc.compo.runtime.connect_crm(tcp_address):
+    # One way to use connect_crm:
+    # Provide both the address and an ICRM class.
+    # connect_crm returns an ICRM instance that can be used directly.
+    # This approach is particularly useful for component scripts.
+    with cc.compo.runtime.connect_crm(tcp_address, com.IGrid) as grid:
         # Check grid 1-0
-        parent: com.GridAttribute = com.get_grid_infos(1, [0])[0]
-        print('Parent:', parent.activate, parent.level, parent.global_id, parent.local_id, parent.elevation, parent.min_x, parent.min_y, parent.max_x, parent.max_y)
+        parent: com.GridAttribute = grid.get_grid_infos(1, [0])[0]
+        print('Parent checked by ICRM instance:', parent.activate, parent.level, parent.global_id, parent.local_id, parent.elevation, parent.min_x, parent.min_y, parent.max_x, parent.max_y)
+    
+    # Alternative way to use connect_crm:
+    # When providing only the address, connect_crm returns a Client instance.
+    # While the client is rarely needed directly, it's used internally by the runtime.
+    # Functions decorated with @cc.compo.runtime.connect automatically receive an ICRM instance that contains this client as their first argument.
+    # This approach is particularly useful for component functions.
+    # In this case, the client is not needed, but it's included here for demonstration purposes.
+    with cc.compo.runtime.connect_crm(tcp_address) as client:
             
         # Subdivide grid 1-0
         keys = com.subdivide_grids([1], [0])
