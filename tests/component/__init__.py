@@ -17,5 +17,6 @@ def get_parent_keys(crm: IGrid, levels: list[int], global_ids: list[int]) -> lis
     return keys
 
 @cc.compo.runtime.connect
-def get_active_grid_render_info(crm: IGrid):
-    pass
+def get_active_grid_infos(crm: IGrid) -> tuple[list[int], list[int]]:
+    levels, global_ids = crm.get_active_grid_infos()
+    return levels, global_ids

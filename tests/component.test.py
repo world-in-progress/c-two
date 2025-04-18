@@ -41,4 +41,8 @@ if __name__ == '__main__':
         parents = com.get_parent_keys(levels, global_ids)
         for parent in parents:
             print('Parent:', parent)
+        
+        # Test get_active_grid_infos
+        levels, global_ids = com.get_active_grid_infos()
+        print(len(levels), len(global_ids))
     
