@@ -1,13 +1,16 @@
 import inspect
 import threading
+from typing import TypeVar, cast
 from functools import wraps
 from contextlib import contextmanager
 from ..message.client import Client
 
 _local = threading.local()
 
+T = TypeVar('T')
+
 @contextmanager
-def connect_crm(address: str):
+def connect_crm(address: str, icrm_class: T = None):
     """
     Context manager to connect to a CRM server.  
     
@@ -19,13 +22,20 @@ def connect_crm(address: str):
         address (str): The address of the CRM server to connect to.
         
     Returns:
-        contextlib.contextmanager: A context manager that yields the client.
+        Client: The connected client instance, or an ICRM instance if icrm_class is provided
     """
-    client = Client(address)
-    old_client = getattr(_local, 'current_client', None)
-    _local.current_client = client
     try:
-        yield client
+        icrm = None
+        client = Client(address)
+        old_client = getattr(_local, 'current_client', None)
+        _local.current_client = client
+        if icrm_class is not None:
+            icrm = icrm_class()
+            icrm.client = client
+            
+        yield client if icrm is None else cast(T, icrm)
+    except Exception as e:
+        print(f"An error occurred when connecting to CRM: {e}")
     finally:
         if old_client is not None:
             _local.current_client = old_client
