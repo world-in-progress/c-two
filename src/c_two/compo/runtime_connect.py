@@ -1,7 +1,7 @@
 import inspect
 import threading
-from typing import TypeVar, cast
 from functools import wraps
+from typing import TypeVar, cast
 from contextlib import contextmanager
 from ..message.client import Client
 
@@ -50,7 +50,6 @@ def get_current_client():
     client = getattr(_local, 'current_client', None)
     return client
 
-
 def connect(func = None, icrm_class = None) -> callable:
     """
     Insert a CRM client into ICRM instance and transfer the instance to a Component function. 
@@ -84,8 +83,13 @@ def connect(func = None, icrm_class = None) -> callable:
     Supports both @connect and @connect() usage patterns.
     
     If icrm_class is None, it will be inferred from the first parameter type annotation of the decorated function.
+    
+    Args:
+        func (callable, optional): The function to decorate
+        icrm_class (type, optional): The ICRM class to use
     """
     def create_wrapper(func):
+        
         # Get the icrm_class from the first parameter's type annotation if not provided
         nonlocal icrm_class
         if icrm_class is None:
@@ -125,7 +129,6 @@ def connect(func = None, icrm_class = None) -> callable:
             finally:
                 if close_client:
                     icrm.client.terminate()
-        
         return wrapper
     
     # Handle both @connect and @connect() usage patterns

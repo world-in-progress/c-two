@@ -1,3 +1,4 @@
+from . import mcp
 from . import crm
 from . import compo
 from . import message

@@ -215,7 +215,7 @@ class GridKeys:
 @cc.icrm
 class IGrid:
     """
-    ICRM
+    IGrid
     =
     Interface of Core Resource Model (ICRM) specifies how to interact with CRM. 
     """

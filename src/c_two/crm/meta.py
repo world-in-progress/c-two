@@ -1,8 +1,16 @@
-from typing import TypeVar, cast
 from inspect import isfunction
+from typing import TypeVar, cast, Protocol, Union
+from ..message.client import Client
 from ..message.transferable import auto_transfer
 
+class HasConnect(Protocol):
+    @staticmethod
+    def connect(address: str) -> any:
+        ...
+
+
 T = TypeVar('T')
+ConnecttableT = TypeVar('ConnecttableT', bound=HasConnect)
 
 class ICRMMeta(type):
     """
@@ -45,6 +53,10 @@ def icrm(cls: T) -> T:
     making it a proper ICRM that other classes can implement.  
     Additionally, it decorates all member functions of the class with @auto_transfer,
     so that they can be automatically transferred between Component and CRM.
+    
+    Returns:
+        A class that has all the attributes of the original class plus a static
+        'connect' method that creates and returns instances connected to a remote service.
     """
     
     decorated_methods = {}
@@ -77,6 +89,25 @@ def icrm(cls: T) -> T:
             pass
     
     # Use cast to maintain the original type for static type checking
+    # Add a static connect method to the class
+    @staticmethod
+    def connect(address: str) -> T:
+        """
+        Connect to a remote ICRM service at the given address.
+        
+        Args:
+            address: The address of the remote service.
+            
+        Returns:
+            An instance of the ICRM class connected to the remote service.
+        """
+        instance = NewClass()
+        instance.client = Client(address)
+        return instance
+    
+    # setattr(NewClass, 'connect', connect)
+    
+    # return cast(Union[T, HasConnect], NewClass)
     return cast(T, NewClass)
 
 def iicrm(cls):
