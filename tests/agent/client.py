@@ -1,14 +1,14 @@
 import os
+import sys
 import httpx
 import asyncio
 from typing import Optional
+from dotenv import load_dotenv
+from anthropic import Anthropic
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
-from anthropic import Anthropic
-from dotenv import load_dotenv
 
 CLAUDE_3_5 = 'claude-3-5-sonnet-20241022'
 CLAUDE_3_7 = 'claude-3-7-sonnet-20250219'
@@ -22,10 +22,6 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         
-        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-        if proxy:
-            print(f'Using proxy: {proxy}')
-        
         self.anthropic = Anthropic(
             http_client=httpx.Client()
         )
@@ -34,16 +30,13 @@ class MCPClient:
         """Connect to an MCP server
         
         Args:
-            server_script_path: Path to the server script (.py or .js)
+            server_script_path: Path to the server script (.py)
         """
-        is_python = server_script_path.endswith('.py')
-        is_js = server_script_path.endswith('.js')
-        if not (is_python or is_js):
-            raise ValueError("Server script must be a .py or .js file")
+        if not (server_script_path.endswith('.py')):
+            raise ValueError("Server script must be a .py file")
             
-        command = "python" if is_python else "node"
         server_params = StdioServerParameters(
-            command=command,
+            command='python',
             args=[server_script_path],
             env=None
         )
@@ -74,84 +67,66 @@ class MCPClient:
             "description": tool.description,
             "input_schema": tool.inputSchema
         } for tool in response.tools]
-
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model=CURRENT_MODEL,
-            max_tokens=1000,
-            messages=messages,
-            tools=available_tools
-        )
-
-        final_text = []
-        tool_calls_made = 0
-        max_tool_calls = 1000
         
-        while tool_calls_made < max_tool_calls:
-            has_tool_call = False
-
-            for content in response.content:
-                if content.type == 'text':
-                    final_text.append(content.text)
-                elif content.type == 'tool_use':
-                    has_tool_call = True
-                    tool_calls_made += 1
-                    tool_id = content.id
-                    tool_name = content.name
-                    tool_args = content.input
-                    
-                    # Execute tool call
-                    result = await self.session.call_tool(tool_name, tool_args)
-                    # final_text.append(f'\n[Using tool: {tool_name}]\n')
-                    final_text.append(f"\n[Using tool: {tool_name}]\nInput: {tool_args}\nResult: {result.content}")
-
-                    # Add both the assistant's tool call and the result to the message history
-                    messages.append({
-                        "role": "assistant",
-                        "content": [
-                            {"type": "text", "text": f"I'll use the {tool_name} tool."},
-                            {"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_args}
-                        ]
-                    })
-                    
-                    messages.append({
-                        "role": "user", 
-                        "content": [
-                            {"type": "tool_result", "tool_use_id": tool_id, "content": result.content}
-                        ]
-                    })
-                    
-                    # Break after processing the first tool call
-                    break
-
-            # If no tool calls were made, we're done
-            if not has_tool_call:
-                break
+        tool_call = True
+        while tool_call:
             
-            # Get next response from Claude
-            response = self.anthropic.messages.create(
+            tool_call = False
+            with self.anthropic.messages.stream(
                 model=CURRENT_MODEL,
-                max_tokens=1000,
+                max_tokens=1024,
                 messages=messages,
-                tools=available_tools
-            )
+                tools=available_tools,
+            ) as stream:
+                for text in stream.text_stream:
+                    print(text, end='', flush=True)
+                
+                for content in stream.get_final_message().content:
+                    # Execute tool call
+                    if content.type == 'tool_use':
+                        tool_call = True
+                        tool_id = content.id
+                        tool_name = content.name
+                        tool_args = content.input
+                    
+                        print(f'\n[Using tool: {tool_name}]\n', end='', flush=True)
+                        print(f'\nInput: {tool_args}\n', end='', flush=True)
+                        result = await self.session.call_tool(tool_name, tool_args)
+                        print(f'\nResult: {result.content}\n', end='', flush=True)
 
-        return "\n".join(final_text)
+                        # Add both the assistant's tool call and the result to the message history
+                        messages.append({
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": f"I'll use the {tool_name} tool."},
+                                {"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_args}
+                            ]
+                        })
+                        
+                        messages.append({
+                            "role": "user", 
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": tool_id, "content": result.content}
+                            ]
+                        })
+                    
+                print('\n', end='', flush=True)
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
         print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
+        print("Type your queries or 'q' to exit.")
         
         while True:
             try:
                 query = input("\nQuery: ").strip()
                 
-                if query.lower() == 'quit':
+                if query.lower() == 'q':
                     break
-                    
-                response = await self.process_query(query)
-                print("\n" + response)
+                
+                print("\n", end='', flush=True)
+                await self.process_query(query)
+                print("\n", end='', flush=True)
                     
             except Exception as e:
                 print(f"\nError: {str(e)}")
@@ -173,5 +148,4 @@ async def main():
         await client.cleanup()
 
 if __name__ == "__main__":
-    import sys
     asyncio.run(main())
