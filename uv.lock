@@ -51,7 +51,7 @@ wheels = [
 
 [[package]]
 name = "c-two"
-version = "0.1.17"
+version = "0.1.18"
 source = { virtual = "." }
 dependencies = [
     { name = "grpcio" },
