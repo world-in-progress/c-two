@@ -18,5 +18,6 @@ dependencies = [
 dev = [
     "anthropic>=0.49.0",
     "numpy>=2.2.4",
+    "openai>=1.76.0",
     "pandas>=2.2.3",
 ]
