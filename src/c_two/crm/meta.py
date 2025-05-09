@@ -1,7 +1,6 @@
 from inspect import isfunction
-from typing import TypeVar, cast, Protocol, Union
-from ..message.client import Client
-from ..message.transferable import auto_transfer
+from typing import TypeVar, cast, Protocol
+from ..message.transferable import auto_transfer, transfer
 
 class HasConnect(Protocol):
     @staticmethod
@@ -87,27 +86,7 @@ def icrm(cls: T) -> T:
             setattr(NewClass, attr, getattr(cls, attr))
         except (AttributeError, TypeError):
             pass
-    
-    # Use cast to maintain the original type for static type checking
-    # Add a static connect method to the class
-    @staticmethod
-    def connect(address: str) -> T:
-        """
-        Connect to a remote ICRM service at the given address.
-        
-        Args:
-            address: The address of the remote service.
-            
-        Returns:
-            An instance of the ICRM class connected to the remote service.
-        """
-        instance = NewClass()
-        instance.client = Client(address)
-        return instance
-    
-    # setattr(NewClass, 'connect', connect)
-    
-    # return cast(Union[T, HasConnect], NewClass)
+
     return cast(T, NewClass)
 
 def iicrm(cls):

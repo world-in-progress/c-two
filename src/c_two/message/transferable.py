@@ -3,8 +3,9 @@ import struct
 import inspect
 from abc import ABCMeta
 from functools import wraps
-from typing import get_type_hints, get_args
+from typing import get_type_hints, get_args, get_origin, Any, Callable
 from dataclasses import dataclass, is_dataclass
+from pydantic import BaseModel, create_model
 from .globals import Code, BASE_RESPONSE
 
 # Global Caches ###################################################################
@@ -193,81 +194,112 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
     return decorator
 
 def auto_transfer(func = None) -> callable:
-    
-    def create_wrapper(func: callable) -> callable:
-        
-        # Skip 'self' and get parameters
-        sig = inspect.signature(func)
-        parameters = list(sig.parameters.values())
-        if parameters and parameters[0].name == 'self':
-            parameters = parameters[1:]
-        
-        # Try to find a matching transferable for input parameters
-        input_transferable_name = None 
-        if parameters:
-            input_param_map = {}
-            for param in parameters:
-                input_param_map[param.name] = param.annotation
-            
-            for transferable_info in _TRANSFERABLE_INFOS:
-                if transferable_info['param_map'] == input_param_map:
-                    input_transferable_name = transferable_info['name']
-                    break
-            if input_transferable_name is None:
-                raise ValueError(f'No matching transferable found for input parameters {input_param_map} of {func.__qualname__}')
 
-        # Get type hints for the function
+    def create_wrapper(func: callable) -> callable:
+
+        # --- Input Matching using Pydantic Model Comparison ---
+        input_model = _create_pydantic_model_from_func_sig(func)
+        input_transferable_name = None
+
+        if input_model is not None:
+            # Get fields from the generated Pydantic model
+            input_model_fields = getattr(input_model, 'model_fields', {})
+
+            is_empty_input = not bool(input_model_fields)
+
+            for info in _TRANSFERABLE_INFOS:
+                registered_param_map = info.get('param_map', {})
+                is_empty_registered = not bool(registered_param_map)
+
+                # Match if both are empty
+                if is_empty_input and is_empty_registered:
+                    input_transferable_name = info['name']
+                    break
+
+                # Match if field names and types align
+                if not is_empty_input and not is_empty_registered:
+                    # Compare names first
+                    if set(input_model_fields.keys()) == set(registered_param_map.keys()):
+                        # Compare types (more robustly)
+                        match = True
+                        for name, field_info in input_model_fields.items():
+                            # Get the type annotation from Pydantic's FieldInfo
+                            pydantic_type = field_info.annotation
+                            registered_type = registered_param_map.get(name)
+                            # Simple type comparison (might need refinement for complex types like generics)
+                            if pydantic_type != registered_type:
+                                match = False
+                                break
+                        if match:
+                            input_transferable_name = info['name']
+                            break
+
+            # Error only if input fields were expected but no match found
+            if input_transferable_name is None and not is_empty_input:
+                 func_sig_str = ", ".join(f"{n}: {getattr(f.annotation, '__name__', repr(f.annotation))}" for n, f in input_model_fields.items())
+                 available_sigs = "\n".join([f"  - {i['name']}: { {n: getattr(t, '__name__', repr(t)) for n, t in i.get('param_map', {}).items()} }" for i in _TRANSFERABLE_INFOS])
+                 raise ValueError(
+                     f"No matching transferable found for Pydantic-derived input signature ({func_sig_str}) of {func.__qualname__}.\n"
+                     f"Available transferable input signatures:\n{available_sigs}"
+                 )
+
+        else:
+             print(f"Warning: Could not create Pydantic model for input signature of {func.__qualname__}. Proceeding without specific input transferable.")
+             input_transferable_name = None
+
+        # --- Output Matching (compares types directly) ---
         type_hints = get_type_hints(func)
-        
-        # Try to find a matching transferable for output parameters
         output_transferable_name = None
         if 'return' in type_hints:
             return_type = type_hints['return']
-            return_name = return_type.__name__
-                
-            if return_name in _TRANSFERABLE_MAP:
-                output_transferable_name = return_name
+            if return_type is None or return_type is type(None):
+                 output_transferable_name = None
             else:
-                return_param_map = {}
-                if return_name == 'tuple':
-                    return_args = get_args(return_type)
-                    for i, arg in enumerate(return_args):
-                        return_param_map[f'param{i}'] = arg
-                    
-                    for transferable_info in _TRANSFERABLE_INFOS:
-                        if return_param_map and len(transferable_info['param_map']) == len(return_param_map):
-                            # Check hit or not
-                            hit = True
-                            for i in range (len(return_param_map)):
-                                if list(transferable_info['param_map'].values())[i] != list(return_param_map.values())[i]:
-                                    hit = False
-                                    break
-                            if hit:
-                                output_transferable_name = transferable_info['name']
-                                break
-                   
+                return_type_name = getattr(return_type, '__name__', str(return_type))
+                if return_type_name in _TRANSFERABLE_MAP:
+                    output_transferable_name = return_type_name
                 else:
-                    for transferable_info in _TRANSFERABLE_INFOS:
-                        
-                        param_list = list(transferable_info['param_map'].values())
-                        if len(param_list) == 1 and param_list[0] == return_type:
-                            output_transferable_name = transferable_info['name']
-                            break
-            
-            if output_transferable_name is None:
-                raise ValueError(f'No matching transferable found for output parameters {return_type} of {func.__qualname__}')
-        
+                    origin = get_origin(return_type)
+                    args = get_args(return_type)
+                    expected_output_types = []
+                    if origin is tuple:
+                        expected_output_types = list(args)
+                    elif return_type is not None and return_type is not type(None):
+                        expected_output_types = [return_type]
+
+                    if expected_output_types:
+                        for info in _TRANSFERABLE_INFOS:
+                            registered_param_map = info.get('param_map', {})
+                            registered_output_types = list(registered_param_map.values())
+                            if expected_output_types == registered_output_types:
+                                output_transferable_name = info['name']
+                                break
+                if output_transferable_name is None and not (return_type is None or return_type is type(None)):
+                    expected_types_str = [getattr(t, '__name__', repr(t)) for t in expected_output_types]
+                    available_output_sigs = "\n".join([f"  - {i['name']}: {[getattr(t, '__name__', repr(t)) for t in i.get('param_map', {}).values()]}" for i in _TRANSFERABLE_INFOS])
+                    raise ValueError(
+                        f"No matching transferable found for output type(s) {expected_types_str} of {func.__qualname__}.\n"
+                        f"Available transferable output signatures (types):\n{available_output_sigs}"
+                    )
+        else:
+             output_transferable_name = None
+
+
+        # --- Wrapping ---
+        transfer_decorator = transfer(input=input_transferable_name, output=output_transferable_name)
+        wrapped_func = transfer_decorator(func)
+
         @wraps(func)
-        def wrapped_func(*args: any) -> any:
-            decorated = transfer(input=input_transferable_name, output=output_transferable_name)(func)
-            return decorated(*args)
-        return wrapped_func
-    
+        def final_wrapper(*args, **kwargs):
+             return wrapped_func(*args, **kwargs)
+
+        return final_wrapper
+
     if func is None:
-        # @auto_transfer() syntax - return a decorator
         return create_wrapper
     else:
-        # @auto_transfer syntax - apply decorator directly to the function
+        if not callable(func):
+             raise TypeError("@auto_transfer requires a callable function or parentheses.")
         return create_wrapper(func)
 
 # Helpers #########################################################################
@@ -276,6 +308,49 @@ def _add_length_prefix(message_bytes):
     length = len(message_bytes)
     prefix = struct.pack('>Q', length)
     return prefix + message_bytes
+
+def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str = "InputModel") -> type[BaseModel] | None:
+    """
+    Creates a Pydantic model representing the input signature of a function,
+    skipping the first parameter if it's 'self' or 'cls'.
+    Returns None if signature cannot be determined or on error.
+    """
+    try:
+        signature = inspect.signature(func)
+        type_hints = get_type_hints(func)
+
+        fields = {}
+        param_names = list(signature.parameters.keys())
+
+        for i, name in enumerate(param_names):
+            param = signature.parameters[name]
+            # Skip 'self' or 'cls' only if it's the *first* parameter
+            if i == 0 and name in ('self', 'cls'):
+                continue
+            
+            annotation = type_hints.get(name, param.annotation)
+            # Pydantic needs Ellipsis (...) for required fields without defaults
+            default = ... if param.default is inspect.Parameter.empty else param.default
+            # Use Any if no annotation found, Pydantic handles Any
+            actual_annotation = annotation if annotation is not inspect.Parameter.empty else Any
+
+            fields[name] = (actual_annotation, default)
+
+        # Create the dynamic model
+        model_name = f"{func.__qualname__.replace('.', '_')}_{model_name_suffix}"
+        # Handle functions with no relevant parameters (e.g., only self)
+        if not fields:
+             # Return an empty model definition
+             return create_model(model_name)
+
+        return create_model(model_name, **fields)
+
+    except ValueError: # Handle functions without signatures (like some built-ins)
+        print(f"Warning: Could not get signature for {func.__qualname__}")
+        return None
+    except Exception as e:
+        print(f"Error creating Pydantic model for {func.__qualname__}: {e}")
+        return None
 
 # Register base transferables #####################################################
 
