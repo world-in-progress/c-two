@@ -352,9 +352,9 @@ class Grid(IGrid):
         # Reset index to have level and global_id as columns
         filtered_grids = filtered_grids.reset_index()
         
-        global_ids = filtered_grids[ATTR_GLOBAL_ID].to_numpy()
-        local_ids = self._get_local_ids(level, global_ids)
-        min_xs, min_ys, max_xs, max_ys = self._get_coordinates(level, global_ids)
+        global_ids_numpy = filtered_grids[ATTR_GLOBAL_ID].to_numpy()
+        local_ids = self._get_local_ids(level, global_ids_numpy)
+        min_xs, min_ys, max_xs, max_ys = self._get_coordinates(level, global_ids_numpy)
         
         filtered_grids[ATTR_LOCAL_ID] = local_ids
         filtered_grids[ATTR_MIN_X] = min_xs
