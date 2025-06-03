@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 class Server:
     def __init__(self, server_address: str, crm_instance: any, max_workers: int = 10):
         self.context = zmq.Context()
-        # self.socket = self.context.socket(zmq.REP)
         self.socket = self.context.socket(zmq.ROUTER)
         self.socket.bind(server_address)
         self.server_address = server_address
@@ -52,37 +51,11 @@ class Server:
                     request_data = message_parts[2]
                     
                     if request_data == b'PING':
-                        print([correlation_id, b'PONG'])
                         self.socket.send_multipart([client_id, correlation_id, b'PONG'])
                         continue
                     
                     # Submit request processing to the thread pool
                     self._executor.submit(self._process_request, client_id, correlation_id, request_data)
-                        
-                    
-                    # full_request = self.socket.recv()
-                    
-                    # # Check for PING message
-                    # if full_request == b'PING':
-                    #     self.socket.send(b'PONG')
-                    #     continue
-                    
-                    # sub_messages = _parse_message(full_request)
-                    # if len(sub_messages) != 2:
-                    #     raise ValueError("Expected exactly 2 sub-messages (meta and data)")
-                
-                    # # Get method name 
-                    # method_name = sub_messages[0].tobytes().decode('utf-8')
-                    
-                    # # Get arguments
-                    # args_bytes = sub_messages[1]
-                    
-                    # # Call method wrapped from CRM instance method
-                    # method = getattr(self.crm, method_name)
-                    # _, response = method(args_bytes)
-                    
-                    # # Send response
-                    # self.socket.send(response)
                 
                 except zmq.error.Again:
                     continue
