@@ -56,17 +56,22 @@ def subdivide_grids(grid: IGrid, levels: list[int], global_ids: list[int]) -> tu
 
 # Helpers ##################################################
 
-def _keys_to_levels_global_ids(keys: list[str]) -> tuple[list[int], list[int]]:
+def _keys_to_levels_global_ids(keys: list[str | None]) -> tuple[list[int], list[int]]:
     """
     Convert grid keys to levels and global IDs.
     Args:
-        keys (list[str]): List of grid keys in the format "level-global_id"
+        keys (list[str | None]): List of grid keys in the format "level-global_id"
     Returns:
         tuple[list[int], list[int]]: Tuple of two lists - levels and global IDs
     """
+    if not keys:
+        return [], []
+
     levels: list[int] = []
     global_ids: list[int] = []
     for key in keys:
+        if key is None:
+            continue
         level, global_id = map(int, key.split('-'))
         levels.append(level)
         global_ids.append(global_id)

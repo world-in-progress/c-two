@@ -1,12 +1,14 @@
 import json
+import pickle
 import struct
 import inspect
+import warnings
 from abc import ABCMeta
 from functools import wraps
 from typing import get_type_hints, get_args, get_origin, Any, Callable
 from dataclasses import dataclass, is_dataclass
 from pydantic import BaseModel, create_model
-from .globals import Code, BASE_RESPONSE
+from .context import Code, BASE_RESPONSE
 
 # Global Caches ###################################################################
 
@@ -74,6 +76,143 @@ class Transferable(metaclass=TransferableMeta):
         No Need To Add @staticmethod Here.
         """
         ...
+
+# Default Transferable Creation Factory ###########################################
+
+def defaultTransferableFactory(func, is_input: bool):
+    """
+    Factory function to dynamically create a Transferable class for a given function.
+
+    This factory analyzes the function signature and creates a transferable class
+    that uses pickle-based serialization as a fallback.
+
+    Args:
+        func: The function to create a transferable for
+        is_input: True for input parameters, False for return values
+
+    Returns:
+        A dynamically created Transferable class
+    """
+    warnings.warn(
+        f'\nUsing default transferable factory for {"parameters" if is_input else "return values"} of function {func.__name__}. '
+        'For better performance, consider using @transferable with custom serialize/deserialize methods.\n',
+        RuntimeWarning,
+        stacklevel=1
+    )
+    
+    if is_input:
+        # Create dynamic class name for input
+        class_name = f'Default{func.__name__.title()}InputTransferable'
+        
+        # Create transferable for function input parameters
+        sig = inspect.signature(func)
+        param_names = list(sig.parameters.keys())
+        type_hints = get_type_hints(func)
+        
+        # Filter out 'self' or 'cls' if they are the first parameter
+        filtered_params = []
+        for i, name in enumerate(param_names):
+            if i == 0 and name in ('self', 'cls'):
+                continue
+            filtered_params.append(name)
+        
+        # Define the dynamic transferable class for input
+        class DynamicInputTransferable(Transferable):
+            def serialize(*args) -> bytes:
+                """
+                Default serialization for function input parameters using pickle
+                """
+                try:
+                    # Create a mapping of parameter names to arguments
+                    args_dict = {}
+                    for i, arg in enumerate(args):
+                        if i < len(filtered_params):
+                            args_dict[filtered_params[i]] = arg
+                        else:
+                            args_dict[f'extra_arg_{i}'] = arg
+                    
+                    args_dict['__serialized__'] = True
+                    return pickle.dumps(args_dict)
+                except Exception:
+                    # Fallback to direct args serialization
+                    return pickle.dumps(args)
+            
+            def deserialize(data: memoryview):
+                """
+                Default deserialization for function input parameters using pickle
+                Returns either the original dict mapping or tuple of args.
+                """
+                try:
+                    unpickled = pickle.loads(data.tobytes())
+                    
+                    if isinstance(unpickled, dict):
+                        if '__serialized__' not in unpickled:
+                            return unpickled
+
+                        # If it's a dict (from serialize method), convert back to tuple
+                        del unpickled['__serialized__']
+                        
+                        # Preserve parameter order
+                        ordered_args = []
+                        for param_name in filtered_params:
+                            if param_name in unpickled:
+                                ordered_args.append(unpickled[param_name])
+                        
+                        # Add any extra arguments
+                        for key, value in unpickled.items():
+                            if key.startswith('extra_arg_'):
+                                ordered_args.append(value)
+                        
+                        return tuple(ordered_args) if len(ordered_args) != 1 else ordered_args[0]
+                    else:
+                        # Direct args tuple
+                        return unpickled
+                        
+                except Exception as e:
+                    raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
+        
+        # Set the dynamic class properties
+        DynamicInputTransferable._is_input = True
+        DynamicInputTransferable._original_func = func
+        DynamicInputTransferable.__name__ = class_name
+        DynamicInputTransferable._type_hints = type_hints
+        DynamicInputTransferable.__qualname__ = class_name
+        DynamicInputTransferable._param_names = filtered_params
+        
+        return DynamicInputTransferable
+    
+    else:
+        # Create dynamic class name for output
+        class_name = f'Default{func.__name__.title()}OutputTransferable'
+        
+        # Create transferable for function return value
+        type_hints = get_type_hints(func)
+        return_type = type_hints['return']
+        origin = get_origin(return_type)
+        if origin is tuple:
+            serialize_func = lambda *args: pickle.dumps(args)
+        else:
+            serialize_func = lambda arg: pickle.dumps(arg)
+        deserialize_func = lambda data: pickle.loads(data.tobytes())
+
+        # Define the dynamic transferable class for output
+        DynamicOutputTransferable = type(
+            class_name,
+            (Transferable,),
+            {
+                'serialize': staticmethod(serialize_func),
+                'deserialize': staticmethod(deserialize_func)
+            }
+        )
+        
+        # Set the dynamic class properties
+        DynamicOutputTransferable._is_input = False
+        DynamicOutputTransferable.__name__ = class_name
+        DynamicOutputTransferable._original_func = func
+        DynamicOutputTransferable.__qualname__ = class_name
+        DynamicOutputTransferable._return_type = return_type
+        
+        return DynamicOutputTransferable
 
 # Transferable-related interfaces #################################################
 
@@ -234,18 +373,11 @@ def auto_transfer(func = None) -> callable:
                             input_transferable_name = info['name']
                             break
 
-            # Error only if input fields were expected but no match found
+            # If no matching transferable found, create a default one
             if input_transferable_name is None and not is_empty_input:
-                 func_sig_str = ", ".join(f"{n}: {getattr(f.annotation, '__name__', repr(f.annotation))}" for n, f in input_model_fields.items())
-                 available_sigs = "\n".join([f"  - {i['name']}: { {n: getattr(t, '__name__', repr(t)) for n, t in i.get('param_map', {}).items()} }" for i in _TRANSFERABLE_INFOS])
-                 raise ValueError(
-                     f"No matching transferable found for Pydantic-derived input signature ({func_sig_str}) of {func.__qualname__}.\n"
-                     f"Available transferable input signatures:\n{available_sigs}"
-                 )
-
-        else:
-             print(f"Warning: Could not create Pydantic model for input signature of {func.__qualname__}. Proceeding without specific input transferable.")
-             input_transferable_name = None
+                input_transferable = defaultTransferableFactory(func, is_input=True)
+                input_transferable_name = input_transferable.__name__
+                register_transferable(input_transferable)
 
         # --- Output Matching (compares types directly) ---
         type_hints = get_type_hints(func)
@@ -274,16 +406,12 @@ def auto_transfer(func = None) -> callable:
                             if expected_output_types == registered_output_types:
                                 output_transferable_name = info['name']
                                 break
+                
+                # If no matching transferable found, create a default one
                 if output_transferable_name is None and not (return_type is None or return_type is type(None)):
-                    expected_types_str = [getattr(t, '__name__', repr(t)) for t in expected_output_types]
-                    available_output_sigs = "\n".join([f"  - {i['name']}: {[getattr(t, '__name__', repr(t)) for t in i.get('param_map', {}).values()]}" for i in _TRANSFERABLE_INFOS])
-                    raise ValueError(
-                        f"No matching transferable found for output type(s) {expected_types_str} of {func.__qualname__}.\n"
-                        f"Available transferable output signatures (types):\n{available_output_sigs}"
-                    )
-        else:
-             output_transferable_name = None
-
+                    output_transferable = defaultTransferableFactory(func, is_input=False)
+                    output_transferable_name = output_transferable.__name__
+                    register_transferable(output_transferable)
 
         # --- Wrapping ---
         transfer_decorator = transfer(input=input_transferable_name, output=output_transferable_name)
