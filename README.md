@@ -1,4 +1,4 @@
-# C-Two
+# C-Two (0.1.19)
 
 <p align="center">
 <img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/logo.png">
