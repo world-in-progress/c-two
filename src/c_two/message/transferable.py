@@ -166,7 +166,10 @@ def defaultTransferableFactory(func, is_input: bool):
                         return tuple(ordered_args) if len(ordered_args) != 1 else ordered_args[0]
                     else:
                         # Direct args tuple
-                        return unpickled
+                        if isinstance(unpickled, tuple):
+                            return unpickled
+                        else:
+                            return (unpickled,)
                         
                 except Exception as e:
                     raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
