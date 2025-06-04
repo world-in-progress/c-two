@@ -13,9 +13,6 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "mypy-protobuf>=3.6.0",
-    "grpcio>=1.71.0",
-    "grpcio-tools>=1.71.0",
     "anthropic>=0.49.0",
     "numpy>=2.2.4",
     "openai>=1.76.0",
