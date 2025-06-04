@@ -137,13 +137,13 @@ def defaultTransferableFactory(func, is_input: bool):
                     # Fallback to direct args serialization
                     return pickle.dumps(args)
             
-            def deserialize(data: memoryview):
+            def deserialize(data: memoryview | bytes):
                 """
                 Default deserialization for function input parameters using pickle
                 Returns either the original dict mapping or tuple of args.
                 """
                 try:
-                    unpickled = pickle.loads(data.tobytes())
+                    unpickled = pickle.loads(data)
                     
                     if isinstance(unpickled, dict):
                         if '__serialized__' not in unpickled:
@@ -193,7 +193,7 @@ def defaultTransferableFactory(func, is_input: bool):
             serialize_func = lambda *args: pickle.dumps(args)
         else:
             serialize_func = lambda arg: pickle.dumps(arg)
-        deserialize_func = lambda data: pickle.loads(data.tobytes())
+        deserialize_func = lambda data: pickle.loads(data)
 
         # Define the dynamic transferable class for output
         DynamicOutputTransferable = type(
