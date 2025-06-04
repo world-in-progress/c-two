@@ -233,4 +233,7 @@ class IGrid:
     
     def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
         ...
+        
+    def hello(self, name: str) -> str:
+        ...
     

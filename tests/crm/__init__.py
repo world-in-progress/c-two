@@ -490,3 +490,6 @@ class Grid(IGrid):
         active_grids = self.grids[self.grids[ATTR_ACTIVATE] == True]
         # print(active_grids.index.get_level_values(0).tolist(), active_grids.index.get_level_values(1).tolist())
         return active_grids.index.get_level_values(0).tolist(), active_grids.index.get_level_values(1).tolist()
+
+    def hello(self, name: str) -> str:
+        return f'Hello, {name}!'
