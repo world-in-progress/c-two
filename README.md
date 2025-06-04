@@ -27,7 +27,7 @@ Client-side components that consume remote resources through ICRM interfaces, pr
 Core Resource Models implementing the actual business logic and resource management, exposed through standardized interfaces.
 
 ### Transport Layer
-Protocol-agnostic communication layer supporting multiple transport mechanisms (ZMQ, gRPC, MCP) with automatic load balancing and connection pooling.
+Protocol-agnostic communication layer supporting multiple transport mechanisms (ZMQ, MCP) with automatic load balancing and connection pooling.
 
 ## Quick Start
 

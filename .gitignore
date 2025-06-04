@@ -183,9 +183,5 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-proto
-*_pb2.py
-*_pb2.pyi
-*_pb2_grpc.py
 *.pptx
 *.arrow
