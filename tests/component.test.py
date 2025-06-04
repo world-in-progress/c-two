@@ -24,6 +24,7 @@ if __name__ == '__main__':
     # connect_crm returns an ICRM instance that can be used directly.
     # This approach is particularly useful for component scripts.
     with cc.compo.runtime.connect_crm(tcp_address, com.IGrid) as grid:
+        print(grid.hello('World'))
         # Check grid 1-0
         parent: com.GridAttribute = grid.get_grid_infos(1, [0])[0]
         print('Parent checked by ICRM instance:', parent.activate, parent.level, parent.global_id, parent.local_id, parent.elevation, parent.min_x, parent.min_y, parent.max_x, parent.max_y)

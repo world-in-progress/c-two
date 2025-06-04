@@ -157,7 +157,6 @@ def defaultTransferableFactory(func, is_input: bool):
                         for param_name in filtered_params:
                             if param_name in unpickled:
                                 ordered_args.append(unpickled[param_name])
-                        
                         # Add any extra arguments
                         for key, value in unpickled.items():
                             if key.startswith('extra_arg_'):
@@ -165,11 +164,7 @@ def defaultTransferableFactory(func, is_input: bool):
                         
                         return tuple(ordered_args) if len(ordered_args) != 1 else ordered_args[0]
                     else:
-                        # Direct args tuple
-                        if isinstance(unpickled, tuple):
-                            return unpickled
-                        else:
-                            return (unpickled,)
+                        return unpickled
                         
                 except Exception as e:
                     raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
@@ -291,6 +286,10 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                     request = args[1] if len(args) > 1 else None
                     
                     args_converted = input_transferable(request) if (request is not None and input_transferable is not None) else tuple()
+                    # If args_converted is not a tuple, convert it to a tuple
+                    if not isinstance(args_converted, tuple):
+                        args_converted = (args_converted,)
+                    
                     result = func(obj, *args_converted)
                     
                     code = Code.SUCCESS
