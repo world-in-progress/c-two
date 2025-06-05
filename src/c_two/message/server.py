@@ -1,6 +1,11 @@
 import zmq
 import struct
+import logging
 import threading
+
+# Logging Configuration ###########################################################
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class Server:
     def __init__(self, server_address: str, crm_instance: any):
@@ -27,7 +32,7 @@ class Server:
             try:
                 threading.Event().wait(check_interval)
             except KeyboardInterrupt:
-                print('\nKeyboardInterrupt received.\nStopping CRM server...', flush=True)
+                logger.info('\nKeyboardInterrupt received.\nStopping CRM server...', flush=True)
                 self._cleanup(f'Cleaning up...')
                 self._termination_event.set()
     
@@ -76,14 +81,14 @@ class Server:
         self.context.term()
     
     def _cleanup(self, message: str = ''):
-        print(message, flush=True)
+        logger.info(message)
         try:
             self._stop()
             if hasattr(self.crm, 'terminate') and self.crm.terminate:
                 self.crm.terminate()
         except Exception as e:
-            print(f'Error during termination: {e}')
-            
+            logger.error(f'Error during termination: {e}')
+
 # Helpers ##################################################
 
 def _parse_message(full_message: bytes) -> list[memoryview]:

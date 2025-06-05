@@ -108,107 +108,110 @@ class GridAttribute:
             max_y=row['max_y']
         )
 
-# @cc.transferable
-# class GridInfo:
-#     def serialize(level: int, global_id: int) -> bytes:
-#         schema = pa.schema([
-#             pa.field('level', pa.int8()),
-#             pa.field('global_id', pa.pa.int32())
-#         ])
+# Define custom transferables ###########################################################
+# Uncomment the following code if you want to use custom transferables for grid info and attributes.
+
+@cc.transferable
+class GridInfo:
+    def serialize(level: int, global_id: int) -> bytes:
+        schema = pa.schema([
+            pa.field('level', pa.int8()),
+            pa.field('global_id', pa.pa.int32())
+        ])
         
-#         data = {
-#             'level': level,
-#             'global_id': global_id
-#         }
+        data = {
+            'level': level,
+            'global_id': global_id
+        }
         
-#         table = pa.Table.from_pylist([data], schema=schema)
-#         return cc.message.serialize_from_table(table)
+        table = pa.Table.from_pylist([data], schema=schema)
+        return cc.message.serialize_from_table(table)
 
-#     def deserialize(arrow_bytes: bytes) -> tuple[int, int]:
-#         row = cc.message.deserialize_to_rows(arrow_bytes)[0]
-#         return (
-#             row['level'],
-#             row['global_id']
-#         )
+    def deserialize(arrow_bytes: bytes) -> tuple[int, int]:
+        row = cc.message.deserialize_to_rows(arrow_bytes)[0]
+        return (
+            row['level'],
+            row['global_id']
+        )
 
-# @cc.transferable
-# class PeerGridInfos:
-#     def serialize(level: int, global_ids: list[int]) -> bytes:
-#         schema = pa.schema([
-#             pa.field('level', pa.int8()),
-#             pa.field('global_ids', pa.list_(pa.int32()))
-#         ])
+@cc.transferable
+class PeerGridInfos:
+    def serialize(level: int, global_ids: list[int]) -> bytes:
+        schema = pa.schema([
+            pa.field('level', pa.int8()),
+            pa.field('global_ids', pa.list_(pa.int32()))
+        ])
         
-#         data = {
-#             'level': level,
-#             'global_ids': global_ids
-#         }
+        data = {
+            'level': level,
+            'global_ids': global_ids
+        }
         
-#         table = pa.Table.from_pylist([data], schema=schema)
-#         return cc.message.serialize_from_table(table)
+        table = pa.Table.from_pylist([data], schema=schema)
+        return cc.message.serialize_from_table(table)
 
-#     def deserialize(bytes: bytes) -> tuple[int, list[int]]:
-#         row = cc.message.deserialize_to_rows(bytes)[0]
-#         return (
-#             row['level'],
-#             row['global_ids']
-#         )
+    def deserialize(bytes: bytes) -> tuple[int, list[int]]:
+        row = cc.message.deserialize_to_rows(bytes)[0]
+        return (
+            row['level'],
+            row['global_ids']
+        )
 
-# @cc.transferable
-# class GridInfos:
-#     def serialize(levels: list[int], global_ids: list[int]) -> bytes:
-#         schema = pa.schema([
-#             pa.field('levels', pa.int8()),
-#             pa.field('global_ids', pa.int32())
-#         ])
-#         table = pa.Table.from_arrays(
-#             [
-#                 pa.array(levels, type=pa.int8()), 
-#                 pa.array(global_ids, type=pa.int32())
-#             ],
-#             schema=schema
-#         )
-#         return cc.message.serialize_from_table(table)
+@cc.transferable
+class GridInfos:
+    def serialize(levels: list[int], global_ids: list[int]) -> bytes:
+        schema = pa.schema([
+            pa.field('levels', pa.int8()),
+            pa.field('global_ids', pa.int32())
+        ])
+        table = pa.Table.from_arrays(
+            [
+                pa.array(levels, type=pa.int8()), 
+                pa.array(global_ids, type=pa.int32())
+            ],
+            schema=schema
+        )
+        return cc.message.serialize_from_table(table)
 
-#     def deserialize(arrow_bytes: bytes) -> tuple[list[int], list[int]]:
-#         table = cc.message.deserialize_to_table(arrow_bytes)
-#         levels = table.column('levels').to_pylist()
-#         global_ids = table.column('global_ids').to_pylist()
-#         return levels, global_ids
+    def deserialize(arrow_bytes: bytes) -> tuple[list[int], list[int]]:
+        table = cc.message.deserialize_to_table(arrow_bytes)
+        levels = table.column('levels').to_pylist()
+        global_ids = table.column('global_ids').to_pylist()
+        return levels, global_ids
 
-# @cc.transferable
-# class GridAttributes:
-#     def serialize(data: list[GridAttribute]) -> bytes:
-#         schema = pa.schema([
-#             pa.field('attribute_bytes', pa.list_(pa.binary())),
-#         ])
+@cc.transferable
+class GridAttributes:
+    def serialize(data: list[GridAttribute]) -> bytes:
+        schema = pa.schema([
+            pa.field('attribute_bytes', pa.list_(pa.binary())),
+        ])
 
-#         data_dict = {
-#             'attribute_bytes': [GridAttribute.serialize(grid) for grid in data]
-#         }
+        data_dict = {
+            'attribute_bytes': [GridAttribute.serialize(grid) for grid in data]
+        }
         
-#         table = pa.Table.from_pylist([data_dict], schema=schema)
-#         return cc.message.serialize_from_table(table)
+        table = pa.Table.from_pylist([data_dict], schema=schema)
+        return cc.message.serialize_from_table(table)
 
-#     def deserialize(arrow_bytes: bytes) -> list[GridAttribute]:
-#         table = cc.message.deserialize_to_table(arrow_bytes)
+    def deserialize(arrow_bytes: bytes) -> list[GridAttribute]:
+        table = cc.message.deserialize_to_table(arrow_bytes)
         
-#         grid_bytes = table.column('attribute_bytes').to_pylist()[0]
+        grid_bytes = table.column('attribute_bytes').to_pylist()[0]
         
-#         return [GridAttribute.deserialize(grid_byte) for grid_byte in grid_bytes]
+        return [GridAttribute.deserialize(grid_byte) for grid_byte in grid_bytes]
 
-# @cc.transferable
-# class GridKeys:
-#     def serialize(keys: list[str | None]) -> bytes:
-#         schema = pa.schema([pa.field('keys', pa.string())])
-#         data = {'keys': keys}
-#         table = pa.Table.from_pydict(data, schema=schema)
-#         return cc.message.serialize_from_table(table)
+@cc.transferable
+class GridKeys:
+    def serialize(keys: list[str | None]) -> bytes:
+        schema = pa.schema([pa.field('keys', pa.string())])
+        data = {'keys': keys}
+        table = pa.Table.from_pydict(data, schema=schema)
+        return cc.message.serialize_from_table(table)
 
-#     def deserialize(arrow_bytes: bytes) -> list[str | None]:
-#         table = cc.message.deserialize_to_table(arrow_bytes)
-#         keys = table.column('keys').to_pylist()
-#         return keys
+    def deserialize(arrow_bytes: bytes) -> list[str | None]:
+        table = cc.message.deserialize_to_table(arrow_bytes)
+        keys = table.column('keys').to_pylist()
+        return keys
 
 # Define ICRM ###########################################################
 
