@@ -32,7 +32,7 @@ class Server:
             try:
                 threading.Event().wait(check_interval)
             except KeyboardInterrupt:
-                logger.info('\nKeyboardInterrupt received.\nStopping CRM server...', flush=True)
+                logger.info('\nKeyboardInterrupt received.\nStopping CRM server...')
                 self._cleanup(f'Cleaning up...')
                 self._termination_event.set()
     
