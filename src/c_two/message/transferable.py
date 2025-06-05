@@ -2,6 +2,7 @@ import json
 import pickle
 import struct
 import inspect
+import logging
 import warnings
 from abc import ABCMeta
 from functools import wraps
@@ -9,6 +10,10 @@ from typing import get_type_hints, get_args, get_origin, Any, Callable
 from dataclasses import dataclass, is_dataclass
 from pydantic import BaseModel, create_model
 from .context import Code, BASE_RESPONSE
+
+# Logging Configuration ###########################################################
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Global Caches ###################################################################
 
@@ -93,12 +98,6 @@ def defaultTransferableFactory(func, is_input: bool):
     Returns:
         A dynamically created Transferable class
     """
-    warnings.warn(
-        f'\nUsing default transferable factory for {"parameters" if is_input else "return values"} of function {func.__name__}. '
-        'For better performance, consider using @transferable with custom serialize/deserialize methods.\n',
-        RuntimeWarning,
-        stacklevel=1
-    )
     
     if is_input:
         # Create dynamic class name for input
@@ -263,7 +262,7 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                     error_context = 'input serialization at Component side' if 'args_converted' not in locals() else \
                                     'CRM function call' if 'result_bytes' not in locals() else \
                                     'output deserialization at Component side'
-                    print(f'Error during {error_context}: {e}')
+                    logger.error(f'Error during {error_context}: {e}')
                     raise e
             
             @wraps(func)
@@ -299,7 +298,7 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                     error_context = 'input deserialization at CRM side' if 'args_converted' not in locals() else \
                                     'CRM function execution' if 'result' not in locals() else \
                                     'output serialization at CRM side'
-                    print(f'Error during {error_context}: {e}')
+                    logger.error(f'Error during {error_context}: {e}')
                     result = None
                     code = Code.ERROR_INVALID
                     message = f'Error occurred: {e}'
@@ -476,10 +475,10 @@ def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str 
         return create_model(model_name, **fields)
 
     except ValueError: # Handle functions without signatures (like some built-ins)
-        print(f"Warning: Could not get signature for {func.__qualname__}")
+        logger.error(f'Could not get signature for {func.__qualname__}')
         return None
     except Exception as e:
-        print(f"Error creating Pydantic model for {func.__qualname__}: {e}")
+        logger.error(f'Error creating Pydantic model for {func.__qualname__}: {e}')
         return None
 
 # Register base transferables #####################################################

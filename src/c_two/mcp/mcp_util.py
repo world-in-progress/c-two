@@ -1,6 +1,11 @@
 import inspect
+import logging
 from mcp.server.fastmcp import FastMCP
 from ..compo.runtime_connect import connect_crm
+
+# Logging Configuration ###########################################################
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 _MCP_FUNCTION_REGISTRY: dict = {}
 
@@ -10,7 +15,7 @@ def register_mcp_tool_from_compo_funcs(mcp: FastMCP, funcs: list[callable]):
             mcp.add_tool(func)
         mcp.add_tool(flow)
     except Exception as e:
-        print(f"Error registering component functions to MCP: {e}")
+        logger.error(f'Error registering component functions to MCP: {e}')
         raise e
 
 def register_mcp_tools_from_compo_module(mcp: FastMCP, module):
@@ -44,7 +49,7 @@ def register_mcp_tools_from_compo_module(mcp: FastMCP, module):
         register_mcp_tool_from_compo_funcs(mcp, funcs)
         
     except Exception as e:
-        print(f"Error registering component module to MCP: {e}")
+        logger.error(f'Error registering component module to MCP: {e}')
         raise e
 
 def adapt_compo_func_for_mcp(func):

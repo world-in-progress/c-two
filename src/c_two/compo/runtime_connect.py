@@ -1,16 +1,30 @@
 import inspect
+import logging
 import threading
 from functools import wraps
-from typing import TypeVar, cast
+from typing import ContextManager, Type, TypeVar, Union, cast, overload
 from contextlib import contextmanager
+
 from ..message.client import Client
 
 _local = threading.local()
 
 T = TypeVar('T')
 
+# Logging Configuration ###########################################################
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@overload
+def connect_crm(address: str) -> ContextManager[Client]:
+    ...
+
+@overload
+def connect_crm(address: str, icrm_class: Type[T]) -> ContextManager[T]:
+    ...
+
 @contextmanager
-def connect_crm(address: str, icrm_class: T = None):
+def connect_crm(address: str, icrm_class: Type[T] = None) -> Union[Client, T]:
     """
     Context manager to connect to a CRM server.  
     
@@ -19,29 +33,31 @@ def connect_crm(address: str, icrm_class: T = None):
     Also, it terminates the client connection to the server.
     
     Args:
-        address (str): The address of the CRM server to connect to.
+        address (str): The address of the CRM server to connect to
+        icrm_class (Type[T], optional): The ICRM class to instantiate
         
-    Returns:
-        Client: The connected client instance, or an ICRM instance if icrm_class is provided
+    Yields:
+        Union[Client, T]: The connected client instance, or an ICRM instance if icrm_class is provided
     """
     try:
-        icrm = None
         client = Client(address)
         old_client = getattr(_local, 'current_client', None)
         _local.current_client = client
         if icrm_class is not None:
             icrm = icrm_class()
             icrm.client = client
-            
-        yield client if icrm is None else cast(T, icrm)
+            yield cast(T, icrm)
+        else:
+            yield client
     except Exception as e:
-        print(f"An error occurred when connecting to CRM: {e}")
+        logger.error(f'An error occurred when connecting to CRM: {e}')
     finally:
         if old_client is not None:
             _local.current_client = old_client
         else:
             delattr(_local, 'current_client')
             client.terminate()
+
 
 def get_current_client():
     """
