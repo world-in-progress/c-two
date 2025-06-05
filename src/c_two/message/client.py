@@ -1,6 +1,6 @@
 import zmq
 import struct
-from . import globals
+from . import context
 from .transferable import get_transferable
 
 class Client:
@@ -30,8 +30,8 @@ class Client:
         if len(sub_responses) != 2:
             raise ValueError("Expected exactly 2 sub-messages (response and result)")
         
-        response = get_transferable(globals.BASE_RESPONSE).deserialize(sub_responses[0])
-        if response['code'] == globals.Code.ERROR_INVALID:
+        response = get_transferable(context.BASE_RESPONSE).deserialize(sub_responses[0])
+        if response['code'] == context.Code.ERROR_INVALID:
             raise RuntimeError(f'Failed to make CRM process: {response["message"]}')
         
         return sub_responses[1]
