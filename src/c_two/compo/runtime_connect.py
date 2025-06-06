@@ -2,7 +2,7 @@ import inspect
 import logging
 import threading
 from functools import wraps
-from typing import ContextManager, Type, TypeVar, Union, cast, overload
+from typing import ContextManager, Generator, Type, TypeVar, Union, cast, overload
 from contextlib import contextmanager
 
 from ..message.client import Client
@@ -23,41 +23,75 @@ def connect_crm(address: str) -> ContextManager[Client]:
 def connect_crm(address: str, icrm_class: Type[T]) -> ContextManager[T]:
     ...
 
+@overload
+def connect_crm(crm_instance, icrm_class: Type[T]) -> ContextManager[T]:
+    ...
+
 @contextmanager
-def connect_crm(address: str, icrm_class: Type[T] = None) -> Union[Client, T]:
+def connect_crm(address_or_instance: Union[str, object], icrm_class: Type[T] = None) -> Generator[Client | T, None, None]:
     """
-    Context manager to connect to a CRM server.  
-    
-    This function creates a new client and sets it as the current client in thread-local storage.  
-    When the context manager exits, it restores the old client or deletes the current client if it was the only one.
-    Also, it terminates the client connection to the server.
+    Context manager to connect to a CRM server or localize a CRM instance.
     
     Args:
-        address (str): The address of the CRM server to connect to
-        icrm_class (Type[T], optional): The ICRM class to instantiate
+        address_or_instance: Either a server address string or a local CRM instance
+        icrm_class: The ICRM class to instantiate
         
     Yields:
-        Union[Client, T]: The connected client instance, or an ICRM instance if icrm_class is provided
+        The connected client instance, or an ICRM instance if icrm_class is provided
     """
-    try:
-        client = Client(address)
-        old_client = getattr(_local, 'current_client', None)
-        _local.current_client = client
-        if icrm_class is not None:
-            icrm = icrm_class()
-            icrm.client = client
-            yield cast(T, icrm)
-        else:
-            yield client
-    except Exception as e:
-        logger.error(f'An error occurred when connecting to CRM: {e}')
-    finally:
-        if old_client is not None:
-            _local.current_client = old_client
-        else:
-            delattr(_local, 'current_client')
-            client.terminate()
+    if isinstance(address_or_instance, str):
+        # Remote CRM server connection logic
+        try:
+            client = Client(address_or_instance)
+            old_client = getattr(_local, 'current_client', None)
+            _local.current_client = client
+            if icrm_class is not None:
+                icrm = icrm_class()
+                icrm.client = client
+                yield cast(T, icrm)
+            else:
+                yield client
+        except Exception as e:
+            logger.error(f'An error occurred when connecting to CRM: {e}')
+        finally:
+            if old_client is not None:
+                _local.current_client = old_client
+            else:
+                delattr(_local, 'current_client')
+                client.terminate()
+    else:
+        # Local CRM instance logic
+        if icrm_class is None:
+            raise ValueError('icrm_class is required when connecting to a local CRM instance')
+        
+        with localize_crm(icrm_class, address_or_instance) as localized_icrm:
+            yield localized_icrm
 
+@contextmanager
+def localize_crm(icrm_class: Type[T], crm_instance) -> Generator[T, None, None]:
+    """
+    Create a local ICRM proxy that directly calls CRM methods without network communication.
+    
+    Args:
+        icrm_class: The ICRM interface class
+        crm_instance: The CRM instance to wrap
+        
+    Yields:
+        An ICRM proxy that delegates calls to the local CRM instance
+    """
+    class LocalICRM:
+        def __init__(self, crm):
+            self._crm = crm
+        
+        def __getattr__(self, name):
+            if hasattr(self._crm, name):
+                method = getattr(self._crm, name)
+                if hasattr(method, '__origin__'):
+                    return lambda *args, **kwargs: method.__origin__(self._crm, *args, **kwargs)
+            
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+    
+    yield cast(T, LocalICRM(crm_instance))
 
 def get_current_client():
     """

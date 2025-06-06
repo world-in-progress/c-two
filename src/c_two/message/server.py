@@ -7,6 +7,7 @@ import threading
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# TODO: Add auto-termination of server subprocess if max idle time is exceeded
 class Server:
     def __init__(self, server_address: str, crm_instance: any):
         self.context = zmq.Context()

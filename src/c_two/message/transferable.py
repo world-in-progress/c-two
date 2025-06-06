@@ -422,6 +422,7 @@ def auto_transfer(func = None) -> callable:
         def final_wrapper(*args, **kwargs):
              return wrapped_func(*args, **kwargs)
 
+        final_wrapper.__origin__ = func
         return final_wrapper
 
     if func is None:
