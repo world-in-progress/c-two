@@ -1,37 +1,38 @@
-# C-Two (0.1.20)
+# C-Two (0.1.21)
 
-<p align="center">
-<img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/logo.png">
-</p>
+C-Two is a **type-safe Remote Procedure Call (RPC) framework** designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method invocation between client components and Core Resource Models (CRM) with automatic serialization and protocol-agnostic communication.
 
-C-Two (CC) is a **type-safe [RPC](https://en.wikipedia.org/wiki/Remote_procedure_call) framework** for distributed resource computation. It provides an abstraction layer between client components and remote Core Resource Models (CRM), enabling remote procedure calls with automatic serialization and multi-protocol support.
+## Framework Overview
 
-## Key Features
+C-Two addresses the complexity of distributed computing by implementing a clear separation of concerns through interface-based programming and automatic type marshalling. The framework enables developers to write distributed applications using familiar local programming patterns while maintaining type safety across network boundaries.
 
-- **🔧 Decorator-Based Interface Definition**: Define and implement remote interfaces using `@icrm` and `@iicrm` decorators
-- **🔒 Type Safety**: Type annotation support with automatic type checking and inference
-- **⚡ Serialization**: Automatic serialization based on function signatures and type hints
-- **🔄 Proxy Pattern**: Call remote methods through local proxy interfaces
-- **📡 Connection Management**: Connection handling with context management support
+### Core Architectural Principles
+
+- **Interface Segregation**: Clean separation between interface definitions (ICRM) and implementations (CRM)
+- **Type Safety**: Compile-time and runtime type checking with automatic serialization inference
+- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (ZMQ, MCP)
+- **Resource Isolation**: Encapsulation of computational resources behind well-defined interfaces
 
 ## Architecture
 
-The framework implements a three-layer architecture that separates concerns between client components, resource models, and transport protocols:
+The framework implements a three-tier architecture:
 
 <img src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/architecture.png" alt="Architecture" width="1500" />
 
 ### Component Layer
-Client-side components that consume remote resources through ICRMs (Interface of Core Resource Models), providing abstraction over network communication.
+Client-side computational units that consume remote resources through Interface of Core Resource Models (ICRM), providing network transparency for distributed operations.
 
 ### CRM Layer
-Core Resource Models implementing business logic and resource management, exposed through standardized interfaces (ICRM).
+Server-side Core Resource Models implementing domain-specific business logic and resource management, exposed through standardized ICRM interfaces.
 
 ### Transport Layer
-Protocol-agnostic communication layer supporting multiple transport mechanisms (ZMQ, MCP) with connection pooling.
+Protocol-agnostic communication infrastructure supporting multiple transport mechanisms with connection management and message serialization.
 
-## Quick Start
+## Implementation Guide
 
-### 1. Define an Interface (ICRM)
+### 1. Interface Definition (ICRM)
+
+Define remote interfaces using the `@icrm` decorator to establish contracts for distributed communication:
 
 ```python
 import c_two as cc
@@ -39,15 +40,17 @@ import c_two as cc
 @cc.icrm
 class IGrid:
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        """Get grid information from remote resource"""
+        """Retrieve grid information for specified level and identifiers"""
         ...
     
     def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
-        """Subdivide grids and return child keys"""
+        """Perform grid subdivision operations"""
         ...
 ```
 
-### 2. Implement the Resource Model (CRM)
+### 2. Resource Model Implementation (CRM)
+
+Implement the Core Resource Model using the `@iicrm` decorator:
 
 ```python
 @cc.iicrm
@@ -55,18 +58,20 @@ class Grid(IGrid):
     def __init__(self, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]]):
         self.epsg = epsg
         self.bounds = bounds
-        # initialization logic
+        # Resource initialization
     
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        # Implementation with automatic serialization
+        # Business logic implementation with automatic serialization
         return [GridAttribute(level=level, global_id=gid, ...) for gid in global_ids]
     
     def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
-        # Implementation logic
+        # Subdivision algorithm implementation
         return [f"{level+1}-{child_id}" for level, gid in zip(levels, global_ids) for child_id in children]
 ```
 
-### 3. Define Custom Transferable Types
+### 3. Custom Data Type Definition
+
+Define serializable data structures using the `@transferable` decorator:
 
 ```python
 @cc.transferable
@@ -76,8 +81,11 @@ class GridAttribute:
     elevation: float
     
     def serialize(data: 'GridAttribute') -> bytes:
-        # Arrow-based serialization
-        schema = pa.schema([...])
+        schema = pa.schema([
+            pa.field('level', pa.int32()),
+            pa.field('global_id', pa.int32()),
+            pa.field('elevation', pa.float64())
+        ])
         table = pa.Table.from_pylist([data.__dict__], schema=schema)
         return cc.message.serialize_from_table(table)
     
@@ -86,75 +94,93 @@ class GridAttribute:
         return GridAttribute(**row)
 ```
 
-### 4. Start the CRM Server
+### 4. Server Deployment
+
+Deploy the CRM as a networked service:
 
 ```python
-# Server side
+# Resource initialization and server configuration
 grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
 server = cc.message.Server("tcp://localhost:5555", grid)
 server.start()
 server.wait_for_termination()
 ```
 
-### 5. Client Usage
+### 5. Client Implementation
 
+#### Script-Based Component Approach
 ```python
-# Script-style component usage
 with cc.compo.runtime.connect_crm('tcp://localhost:5555', IGrid) as grid:
-    infos = grid.get_grid_infos(1, [0, 1, 2])  # Remote call
+    infos = grid.get_grid_infos(1, [0, 1, 2])
     keys = grid.subdivide_grids([1, 1], [0, 1])
-    print(f'Received {len(infos)} grid attributes, created {len(keys)} children)
-
-# Function-style component definition
-@cc.compo.runtime.connect
-def process_grids(grid: IGrid, target_level: int) -> list[str]:
-    """Reusable component that works with any IGrid implementation"""
-    active_levels, active_ids = grid.get_active_grid_infos()
-    grids_to_subdivide = [gid for level, gid in zip(active_levels, active_ids) if level == target_level]
-    return grid.subdivide_grids([target_level] * len(grids_to_subdivide), grids_to_subdivide)
-
-# Function-style component usage
-result = process_grids(target_level=1, crm_address='tcp://localhost:5555')
-# Or
-with cc.compo.runtime.connect_crm('tcp://localhost:5555'):
-    result = process_grids(grid, target_level=1)
-    print(f'Subdivided grids: {result}')
+    print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
 ```
 
-### 6. MCP Integration
+#### Function-Based Component Approach
+```python
+@cc.compo.runtime.connect
+def process_grids(grid: IGrid, target_level: int) -> list[str]:
+    """Reusable component for grid processing operations"""
+    infos = grid.get_grid_infos(target_level, [0, 1, 2, 3, 4])
+    candidates = [info.global_id for info in infos if hasattr(info, 'elevation') and info.elevation > 0]
+    return grid.subdivide_grids([target_level] * len(candidates), candidates)
+
+# Execution with automatic connection injection
+result = process_grids(1, crm_address='tcp://localhost:5555')
+
+# Or using a context manager
+with cc.compo.runtime.connect_crm('tcp://localhost:5555', IGrid) as grid:
+    result = process_grids(1)
+```
+
+### 6. External System Integration
+
+Integrate with external systems using the Model Context Protocol (MCP):
 
 ```python
-# MCP server for external system integration
 from mcp.server.fastmcp import FastMCP
-import compo  # Your function-style component module
+import compo  # Component module
 
 mcp = FastMCP('GridAgent', instructions=cc.mcp.CC_INSTRUCTION)
 cc.mcp.register_mcp_tools_from_compo_module(mcp, compo)
 
 if __name__ == '__main__':
-    mcp.run()  # Exposes operations via MCP protocol
+    mcp.run()
 ```
 
-## Use Cases
+## Application Domains
 
-C-Two is suitable for:
+C-Two is particularly suited for:
 
-- **Distributed Computing**: Resource computations across multiple machines
-- **Microservices Architecture**: Type-safe inter-service communication
-- **Scientific Computing**: Data processing with custom transferable types
-- **System Integration**: MCP protocol support for external system access
-- **Component Reusability**: Reusable components across different CRM implementations
+- **Distributed Scientific Computing**: High-performance computing applications requiring resource distribution
+- **Microservices Architecture**: Type-safe inter-service communication in distributed systems
+- **Computational Resource Management**: Systems requiring dynamic resource allocation and computation distribution
+- **System Integration**: Applications requiring protocol-agnostic communication with external systems
+- **Modular Component Systems**: Reusable computational components across different resource implementations
 
-## Core Components
+## Framework Components
 
-- **`@icrm`**: Define remote interface specifications
-- **`@iicrm`**: Implement CRM classes with automatic method decoration
-- **`@transferable`**: Create custom serializable data types
-- **`@auto_transfer`**: Automatic serialization based on type hints
-- **`@connect`**: Inject CRM connections into component functions
-- **`connect_crm`**: Context manager for CRM connections
-- **MCP Tools**: External system integration utilities
+### Core Decorators
+- **`@icrm`**: Interface definition for remote resource specifications
+- **`@iicrm`**: Implementation marker for Core Resource Models
+- **`@transferable`**: Custom serializable data type definition
+- **`@auto_transfer`**: Automatic serialization based on type annotations
+- **`@connect`**: Connection injection for component functions
+
+### Runtime Components
+- **`connect_crm`**: Context manager for CRM connection lifecycle management
+- **`Server`**: CRM service deployment infrastructure
+- **`Client`**: Remote resource access client
+
+### Integration Utilities
+- **MCP Tools**: Model Context Protocol integration for external system communication
+
+## Technical Requirements
+
+- Python ≥ 3.10
+- Type annotation support
+- Network connectivity for distributed deployment
 
 ---
 
-*C-Two provides a structured approach to distributed computing by abstracting remote procedure calls into familiar local function interfaces.*
+*C-Two provides a principled approach to distributed computing through type-safe abstractions and protocol-agnostic communication, enabling developers to build robust distributed systems with familiar programming patterns.*
