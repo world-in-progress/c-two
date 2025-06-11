@@ -1,6 +1,5 @@
-import os
+import sys
 import zmq
-import queue
 import struct
 import logging
 import threading
@@ -35,14 +34,21 @@ class Server:
         self._termination_event.set()
     
     def wait_for_termination(self, check_interval: float = 0.1):
-        while not self._termination_event.is_set():
-            try:
-                threading.Event().wait(check_interval)
-            except KeyboardInterrupt:
-                logger.info('\nKeyboardInterrupt received.\nStopping CRM server...')
-                self._cleanup(f'Cleaning up CRM Server "{self.name}"...')
-                self._termination_event.set()
-    
+        if sys.platform != 'win32':
+            while not self._termination_event.is_set():
+                try:
+                    threading.Event().wait(check_interval)
+                except KeyboardInterrupt:
+                    logger.info('\nKeyboardInterrupt received.\nStopping CRM server...')
+                    self._cleanup(f'Cleaning up CRM Server "{self.name}"...')
+                    self._termination_event.set()
+
+        else:
+            while not self._termination_event.is_set():
+                pass
+            self._cleanup(f'Cleaning up CRM Server "{self.name}"...')
+            self._termination_event.set()
+            
     def _run(self):
         try:
             timeout_ms = int(self._idle_timeout * 1000) if self._idle_timeout > 0 else -1

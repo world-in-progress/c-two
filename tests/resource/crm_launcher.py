@@ -40,7 +40,7 @@ def start_mock_crm():
     while cc.message.Client.ping('tcp://localhost:5555') is False:
         pass
 
-    logger.info(f"Mock CRM process started with PID: {CRM_PROCESS.pid}")
+    logger.info(f'Mock CRM process started with PID: {CRM_PROCESS.pid}')
 
 def stop_mock_crm():
     global CRM_PROCESS
