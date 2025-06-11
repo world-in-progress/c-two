@@ -129,7 +129,7 @@ def process_grids(grid: IGrid, target_level: int) -> list[str]:
 result = process_grids(1, crm_address='tcp://localhost:5555')
 
 # Or using a context manager
-with cc.compo.runtime.connect_crm('tcp://localhost:5555', IGrid) as grid:
+with cc.compo.runtime.connect_crm('tcp://localhost:5555'):
     result = process_grids(1)
 ```
 

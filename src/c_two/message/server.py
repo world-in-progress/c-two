@@ -1,4 +1,6 @@
+import os
 import zmq
+import queue
 import struct
 import logging
 import threading
@@ -9,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 # TODO: Add auto-termination of server subprocess if max idle time is exceeded
 class Server:
-    def __init__(self, server_address: str, crm_instance: any):
+    def __init__(self, server_address: str, crm_instance: object):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind(server_address)
@@ -19,6 +21,33 @@ class Server:
         
         self._termination_event = threading.Event()
         self._server_thread = threading.Thread(target=self._run, daemon=True)
+        self._shutdown_queue = queue.Queue()
+        
+        if os.name == 'nt': # Windows
+            import win32api
+            import win32con
+            
+            def windows_handler(dwCtrlType):
+                if dwCtrlType in (win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT, 
+                                win32con.CTRL_CLOSE_EVENT, win32con.CTRL_SHUTDOWN_EVENT):
+                    logger.info(f'\nReceived Windows shutdown signal: {dwCtrlType}')
+                    self._shutdown_queue.put('SHUTDOWN')
+                    self._termination_event.set()
+                    return True
+                return False
+            
+            win32api.SetConsoleCtrlHandler(windows_handler, True)
+            
+        else: # Unix-like systems
+            import signal
+            
+            def signal_handler(signum, frame):
+                logger.info(f'\nReceived signal: {signum}')
+                self._shutdown_queue.put('SHUTDOWN')
+                self._termination_event.set()
+            
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
     
     def start(self):
         self._server_thread.name = 'CRM Server'
@@ -29,19 +58,32 @@ class Server:
         self._termination_event.set()
     
     def wait_for_termination(self, check_interval: float = 0.1):
-        while not self._termination_event.is_set():
-            try:
-                threading.Event().wait(check_interval)
-            except KeyboardInterrupt:
-                logger.info('\nKeyboardInterrupt received.\nStopping CRM server...')
-                self._cleanup(f'Cleaning up...')
-                self._termination_event.set()
+        try:
+            while not self._termination_event.is_set():
+                try:
+                    shutdown_signal = self._shutdown_queue.get(timeout=check_interval)
+                    if shutdown_signal == 'SHUTDOWN':
+                        break
+                except queue.Empty:
+                    continue
+        except Exception as e:
+            logger.error(f'Error in wait_for_termination: {e}')
+        finally:
+            self._cleanup('Shutting down...')
     
     def _run(self):
         try:
             self.socket.setsockopt(zmq.RCVTIMEO, 1000)
-            while self.running:
+            while self.running and not self._termination_event.is_set():
                 try:
+                    # Check for shutdown signal
+                    try:
+                        shutdown_signal = self._shutdown_queue.get_nowait()
+                        if shutdown_signal == 'SHUTDOWN':
+                            break
+                    except queue.Empty:
+                        pass
+                    
                     full_request = self.socket.recv()
                     
                     # Check for PING message
