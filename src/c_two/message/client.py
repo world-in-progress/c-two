@@ -1,5 +1,9 @@
+import os
+import sys
 import zmq
 import struct
+import signal
+import subprocess
 from . import context
 from .transferable import get_transferable
 
@@ -60,6 +64,51 @@ class Client:
             if response == b'PONG':
                 return True
             return False
+        except zmq.ZMQError:
+            return False
+        finally:
+            socket.close()
+            context.term()
+    
+    @staticmethod
+    def shutdown(server_address: str, timeout: float = 0.5, process: subprocess.Popen | None = None) -> bool:
+        """Send a shutdown command to the CRM service."""
+        
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
+        socket.connect(server_address)
+        
+        try:
+            socket.send(b'SHUTDOWN')
+            response = socket.recv()
+            if response == b'SHUTDOWN_ACK':
+                if process:
+                    if sys.platform != 'win32':
+                        # Unix-specific: terminate the process group
+                        try:
+                            os.killpg(os.getpgid(process.pid), signal.SIGINT)
+                        except (AttributeError, ProcessLookupError):
+                            process.terminate()
+                    else:
+                        # Windows-specific: send Ctrl+C signal and then terminate
+                        try:
+                            process.send_signal(signal.CTRL_C_EVENT)
+                        except (AttributeError, ProcessLookupError):
+                            process.terminate()
+
+                    try:
+                        process.wait()
+                    except subprocess.TimeoutExpired:
+                        if sys.platform != 'win32':
+                            try:
+                                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                            except (AttributeError, ProcessLookupError):
+                                process.kill()
+                        else:
+                            process.kill()
+                return True
         except zmq.ZMQError:
             return False
         finally:
