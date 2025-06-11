@@ -119,7 +119,7 @@ class Server:
     def _stop(self):
         self.running = False
         if hasattr(self, '_server_thread') and self._server_thread.is_alive():
-            self._server_thread.join()
+            self._server_thread.join(timeout=5.0)
         self.socket.close()
         self.context.term()
     
@@ -127,7 +127,7 @@ class Server:
         logger.info(message)
         try:
             self._stop()
-            if hasattr(self.crm, 'terminate') and self.crm.terminate:
+            if hasattr(self.crm, 'terminate') and callable(self.crm.terminate):
                 self.crm.terminate()
         except Exception as e:
             logger.error(f'Error during termination: {e}')
