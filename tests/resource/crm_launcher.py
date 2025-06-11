@@ -44,36 +44,12 @@ def start_mock_crm():
 
 def stop_mock_crm():
     global CRM_PROCESS
-    if CRM_PROCESS:
-        if sys.platform != 'win32':
-            # Unix-specific: terminate the process group
-            try:
-                os.killpg(os.getpgid(CRM_PROCESS.pid), signal.SIGINT)
-            except (AttributeError, ProcessLookupError):
-                CRM_PROCESS.terminate()
-        else:
-            # Windows-specific: send Ctrl+C signal and then terminate
-            try:
-                CRM_PROCESS.send_signal(signal.CTRL_C_EVENT)
-            except (AttributeError, ProcessLookupError):
-                CRM_PROCESS.terminate()
-
-        try:
-            CRM_PROCESS.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            if sys.platform != 'win32':
-                try:
-                    os.killpg(os.getpgid(CRM_PROCESS.pid), signal.SIGKILL)
-                except (AttributeError, ProcessLookupError):
-                    CRM_PROCESS.kill()
-            else:
-                CRM_PROCESS.kill()
+    if cc.message.Client.shutdown('tcp://localhost:5555', 0.5, CRM_PROCESS):
         
-        logger.info(f"Mock CRM process stopped with PID: {CRM_PROCESS.pid}")
+        logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
     else:
-        logger.warning("Mock CRM process is not running.")
+        logger.error('Failed to stop the Mock CRM process.')
 
 if __name__ == '__main__':
-    stop_mock_crm()
     start_mock_crm()
     stop_mock_crm()
