@@ -52,7 +52,7 @@ def connect_crm(address: str, icrm_class: Type[T] = None) -> Generator[Client | 
             else:
                 yield client
         except Exception as e:
-            logger.error(f'An error occurred when connecting to CRM: {e}')
+            logger.error(f'Error occurred when connecting to CRM:\n{e}')
         finally:
             if old_client is not None:
                 _local.current_client = old_client

@@ -1,16 +1,15 @@
-import sys
 import json
 import pickle
-import struct
 import inspect
 import logging
-import warnings
 from abc import ABCMeta
 from functools import wraps
-from typing import get_type_hints, get_args, get_origin, Any, Callable
-from dataclasses import dataclass, is_dataclass
 from pydantic import BaseModel, create_model
-from .context import Code, BASE_RESPONSE
+from dataclasses import dataclass, is_dataclass
+from typing import get_type_hints, get_args, get_origin, Any, Callable
+
+from . import error
+from .util.encoding import add_length_prefix
 
 # Logging Configuration ###########################################################
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -235,87 +234,89 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
     
     def decorator(func: callable) -> callable:
         
-        @wraps(func)
-        def transfer_wrapper(*args: any) -> any:
-            def com_to_crm(*args: any) -> any:
-                method_name = func.__name__
-                
-                # Get transferable
-                if input is not None and input not in _TRANSFERABLE_MAP:
-                    raise ValueError(f'No transferable defined for method: {input}')
-                if output is not None and output not in _TRANSFERABLE_MAP:
-                    raise ValueError(f'No transferable defined for method: {output}')
-                input_transferable = None if input is None else _TRANSFERABLE_MAP[input].serialize
-                output_transferable = None if output is None else _TRANSFERABLE_MAP[output].deserialize
-                
-                # Convert input and run method
+        def com_to_crm(*args: any) -> any:
+            method_name = func.__name__
+            
+            # Get transferable
+            if input is not None and input not in _TRANSFERABLE_MAP:
+                raise ValueError(f'No transferable defined for method: {input}')
+            if output is not None and output not in _TRANSFERABLE_MAP:
+                raise ValueError(f'No transferable defined for method: {output}')
+            input_transferable = None if input is None else _TRANSFERABLE_MAP[input].serialize
+            output_transferable = None if output is None else _TRANSFERABLE_MAP[output].deserialize
+            
+            # Convert input and run method
+            if len(args) < 1:
+                raise ValueError('Instance method requires self, but only get one argument.')
+            
+            obj = args[0]
+            request = args[1:] if len(args) > 1 else None
+            
+            try:
+                args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
+                result_bytes = obj.client.call(method_name, args_converted)
+                return None if output_transferable is None else output_transferable(result_bytes)
+            except Exception as e:
+                if 'args_converted' not in locals():
+                    raise error.CompoSerializeInput(str(e))
+                elif 'result_bytes' not in locals():
+                    raise error.CompoCRMCalling(str(e))
+                else:
+                    raise error.CompoDeserializeOutput(str(e))
+        
+        def crm_to_com(*args: any) -> tuple[any, any]:
+            
+            # Get transferable
+            if input is not None and input not in _TRANSFERABLE_MAP:
+                raise ValueError(f'No transferable defined for method: {input}')
+            if output is not None and output not in _TRANSFERABLE_MAP:
+                raise ValueError(f'No transferable defined for method: {output}')
+            input_transferable = None if input is None else _TRANSFERABLE_MAP[input].deserialize
+            output_transferable = None if output is None else _TRANSFERABLE_MAP[output].serialize
+            
+            # Convert input and run method
+            try:
                 if len(args) < 1:
                     raise ValueError('Instance method requires self, but only get one argument.')
                 
                 obj = args[0]
-                request = args[1:] if len(args) > 1 else None
+                request = args[1] if len(args) > 1 else None
                 
-                try:
-                    args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
-                    result_bytes = obj.client.call(method_name, args_converted)
-                    return None if output_transferable is None else output_transferable(result_bytes)
-                except Exception as e:
-                    error_context = 'input serialization at Component side' if 'args_converted' not in locals() else \
-                                    'CRM function call' if 'result_bytes' not in locals() else \
-                                    'output deserialization at Component side'
-                    logger.error(f'Error during {error_context}: {e}')
-                    raise e
-            
-            @wraps(func)
-            def crm_to_com(*args: any) -> tuple[any, any]:
+                args_converted = input_transferable(request) if (request is not None and input_transferable is not None) else tuple()
+                # If args_converted is not a tuple, convert it to a tuple
+                if not isinstance(args_converted, tuple):
+                    args_converted = (args_converted,)
                 
-                # Get transferable
-                if input is not None and input not in _TRANSFERABLE_MAP:
-                    raise ValueError(f'No transferable defined for method: {input}')
-                if output is not None and output not in _TRANSFERABLE_MAP:
-                    raise ValueError(f'No transferable defined for method: {output}')
-                input_transferable = None if input is None else _TRANSFERABLE_MAP[input].deserialize
-                output_transferable = None if output is None else _TRANSFERABLE_MAP[output].serialize
+                result = func(obj, *args_converted)
+                err = None
                 
-                # Convert input and run method
-                try:
-                    if len(args) < 1:
-                        raise ValueError('Instance method requires self, but only get one argument.')
-                    
-                    obj = args[0]
-                    request = args[1] if len(args) > 1 else None
-                    
-                    args_converted = input_transferable(request) if (request is not None and input_transferable is not None) else tuple()
-                    # If args_converted is not a tuple, convert it to a tuple
-                    if not isinstance(args_converted, tuple):
-                        args_converted = (args_converted,)
-                    
-                    result = func(obj, *args_converted)
-                    
-                    code = Code.SUCCESS
-                    message = 'Processing succeeded'
-                    
-                except Exception as e:
-                    error_context = 'input deserialization at CRM side' if 'args_converted' not in locals() else \
-                                    'CRM function execution' if 'result' not in locals() else \
-                                    'output serialization at CRM side'
-                    logger.error(f'Error during {error_context}: {e}')
-                    result = None
-                    code = Code.ERROR_INVALID
-                    message = f'Error occurred: {e}'
-                
-                # Create a serialized response based on the serialized_response and serialized_result
-                serialized_response: str = get_transferable(BASE_RESPONSE).serialize(code, message)
-                serialized_result = b''
-                if output_transferable is not None and result is not None:
-                    # Unpack tuple arguments or pass single argument based on result type
-                    serialized_result = (
-                        output_transferable(*result) if isinstance(result, tuple)
-                        else output_transferable(result)
-                    )
-                combined_response = _add_length_prefix(serialized_response) + _add_length_prefix(serialized_result)
-                return result, combined_response
-            
+            except Exception as e:
+                error_context = 'input deserialization at CRM side' if 'args_converted' not in locals() else \
+                                'CRM function execution' if 'result' not in locals() else \
+                                'output serialization at CRM side'
+                logger.error(f'Error during {error_context}:\n{e}')
+                result = None
+                if 'args_converted' not in locals():
+                    err = error.CRMDeserializeInput(str(e))
+                elif 'result' not in locals():
+                    err = error.CRMExecuteFunction(str(e))
+                else:
+                    err = error.CRMSerializeOutput(str(e))
+
+            # Create a serialized response based on the serialized_error and serialized_result
+            serialized_error: bytes = error.CCError.serialize(err)
+            serialized_result = b''
+            if output_transferable is not None and result is not None:
+                # Unpack tuple arguments or pass single argument based on result type
+                serialized_result = (
+                    output_transferable(*result) if isinstance(result, tuple)
+                    else output_transferable(result)
+                )
+            combined_response = add_length_prefix(serialized_error) + add_length_prefix(serialized_result)
+            return combined_response
+        
+        @wraps(func)
+        def transfer_wrapper(*args: any) -> any:
             if not args:
                 raise ValueError('No arguments provided to determine direction.')
             
@@ -440,11 +441,6 @@ def auto_transfer(direction: str, func = None) -> callable:
 
 # Helpers #########################################################################
 
-def _add_length_prefix(message_bytes):
-    length = len(message_bytes)
-    prefix = struct.pack('>Q', length)
-    return prefix + message_bytes
-
 def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str = "InputModel") -> type[BaseModel] | None:
     """
     Creates a Pydantic model representing the input signature of a function,
@@ -487,20 +483,3 @@ def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str 
     except Exception as e:
         logger.error(f'Error creating Pydantic model for {func.__qualname__}: {e}')
         return None
-
-# Register base transferables #####################################################
-
-class BaseResponse(Transferable):
-    def serialize(code: Code, message: str) -> bytes:
-        res = {
-            'code': code.value,
-            'message': message
-        }
-        return json.dumps(res).encode('utf-8')
-
-    def deserialize(res_bytes: memoryview) -> dict[str, int | str]:
-        res = json.loads(res_bytes.tobytes().decode('utf-8'))
-        return {
-            'code': Code(res['code']),
-            'message': res['message']
-        }

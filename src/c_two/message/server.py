@@ -1,14 +1,15 @@
 import sys
 import zmq
-import struct
 import logging
 import threading
+from . import error
+from .transferable import get_transferable
+from .util.encoding import add_length_prefix, parse_message
 
 # Logging Configuration ###########################################################
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# TODO: Add auto-termination of server subprocess if max idle time is exceeded
 class Server:
     def __init__(self, server_address: str, crm_instance: object, name: str = '', timeout: int = 0):
         if name == '':
@@ -52,53 +53,62 @@ class Server:
             logger.info(f'CRM Server "{self.name}" stopped.')
             
     def _run(self):
-        try:
-            timeout_ms = int(self._idle_timeout * 1000) if self._idle_timeout > 0 else 1000
-            self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-            while not self._termination_event.is_set():
-                try:
-                    full_request = self.socket.recv()
-                    
-                    # Check for PING message
-                    if full_request == b'PING':
-                        self.socket.send(b'PONG')
-                        continue
-                    
-                    # Check for SHUTDOWN message
-                    if full_request == b'SHUTDOWN':
-                        self.socket.send(b'SHUTDOWN_ACK')
-                        self._termination_event.set()
-                        break
-                    
-                    sub_messages = _parse_message(full_request)
-                    if len(sub_messages) != 2:
-                        raise ValueError("Expected exactly 2 sub-messages (meta and data)")
+        timeout_ms = int(self._idle_timeout * 1000) if self._idle_timeout > 0 else 1000
+        self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        while not self._termination_event.is_set():
+            try:
+                full_request = self.socket.recv()
                 
-                    # Get method name 
-                    method_name = sub_messages[0].tobytes().decode('utf-8')
-                    
-                    # Get arguments
-                    args_bytes = sub_messages[1]
-                    
-                    # Call method wrapped from CRM instance method
-                    method = getattr(self.crm, method_name)
-                    _, response = method.__wrapped__(self.crm, args_bytes)
-                    
-                    # Send response
-                    self.socket.send(response)
-                
-                except zmq.error.Again:
-                    if self._idle_timeout > 0:
-                        logger.info(f'Server "{self.name}" idle timeout ({self._idle_timeout}s) exceeded. Terminating server...')
-                        self._termination_event.set()
-                        break
+                # Check for PING message
+                if full_request == b'PING':
+                    self.socket.send(b'PONG')
                     continue
-                except zmq.ContextTerminated:
+                
+                # Check for SHUTDOWN message
+                if full_request == b'SHUTDOWN':
+                    self.socket.send(b'SHUTDOWN_ACK')
+                    self._termination_event.set()
                     break
-            
-        except Exception as e:
-            self._cleanup(f'Error in CRM Server "{self.name}": {e}')
+                
+                sub_messages = parse_message(full_request)
+                if len(sub_messages) != 2:
+                    raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_messages)}')
 
+                # Get method name
+                method_name = sub_messages[0].tobytes().decode('utf-8')
+                
+                # Get arguments
+                args_bytes = sub_messages[1]
+                
+                # Call method wrapped from CRM instance method
+                method = getattr(self.crm, method_name)
+                response = method.__wrapped__(self.crm, args_bytes)
+                
+                # Send response
+                self.socket.send(response)
+            
+            except zmq.error.Again:
+                if self._idle_timeout > 0:
+                    logger.info(f'Server "{self.name}" idle timeout ({self._idle_timeout}s) exceeded. Terminating server...')
+                    self._termination_event.set()
+                    break
+                continue
+            
+            except zmq.ContextTerminated:
+                break
+            
+            except Exception as e:
+                # Log the error and send create an error response
+                message = f'Error occurred when CRM Server "{self.name}" tried to process the request "{method_name}":\n{e}'
+                logger.error(f'Error occurred when CRM Server "{self.name}" tried to process the request "{method_name}":\n{e}')
+
+                # Create a serialized response based on the serialized_error and serialized_result
+                serialized_error: bytes = error.CCError.serialize(error.CRMServerError(message))
+                combined_response = add_length_prefix(serialized_error) + add_length_prefix(b'')
+
+                # Send response
+                self.socket.send(combined_response)
+            
     def _stop(self):
         if hasattr(self, '_server_thread') and self._server_thread.is_alive():
             self._server_thread.join()
@@ -114,29 +124,3 @@ class Server:
                 self.crm.terminate()
         except Exception as e:
             logger.error(f'Error during termination: {e}')
-
-# Helpers ##################################################
-
-def _parse_message(full_message: bytes) -> list[memoryview]:
-    buffer = memoryview(full_message)
-    messages = []
-    offset = 0
-    
-    while offset < len(buffer):
-        if offset + 8 > len(buffer):
-            raise ValueError("Incomplete length prefix at end of message")
-        
-        length = struct.unpack('>Q', buffer[offset:offset + 8])[0]
-        offset += 8
-        
-        if offset + length > len(buffer):
-            raise ValueError(f"Message length {length} exceeds remaining buffer size at offset {offset}")
-        
-        message = buffer[offset:offset + length]
-        messages.append(message)
-        offset += length
-    
-    if offset != len(buffer):
-        raise ValueError(f"Extra bytes remaining after parsing: {len(buffer) - offset}")
-    
-    return messages

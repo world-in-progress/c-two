@@ -1,16 +1,16 @@
 import os
 import sys
 import zmq
-import struct
 import signal
 import subprocess
-from . import context
-from .transferable import get_transferable
+from . import error
+from .util.encoding import add_length_prefix, parse_message
 
 class Client:
     def __init__(self, server_address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
+        
         self.socket.connect(server_address)
         self.server_address = server_address
     
@@ -20,23 +20,26 @@ class Client:
 
     def _send_request(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a request to the CRM service and get the response synchronously."""
-        
         # Serialize
-        serialized_meta = method_name.encode('utf-8')
-        serialized_data = b'' if data is None else data
-        combinned_request = _add_length_prefix(serialized_meta) + _add_length_prefix(serialized_data)
+        try:
+            serialized_meta = method_name.encode('utf-8')
+            serialized_data = b'' if data is None else data
+            combined_request = add_length_prefix(serialized_meta) + add_length_prefix(serialized_data)
+        except Exception as e:
+            raise error.CRMSerializeOutput(f'Error occurred when serializing request: {e}')
         
         # Send and get response
-        self.socket.send(combinned_request)
+        self.socket.send(combined_request)
         full_response = self.socket.recv()
         
-        sub_responses = _parse_message(full_response)
+        # Deserialize error
+        sub_responses = parse_message(full_response)
         if len(sub_responses) != 2:
-            raise ValueError("Expected exactly 2 sub-messages (response and result)")
-        
-        response = get_transferable(context.BASE_RESPONSE).deserialize(sub_responses[0])
-        if response['code'] == context.Code.ERROR_INVALID:
-            raise RuntimeError(f'Failed to make CRM process: {response["message"]}')
+            raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
+
+        err = error.CCError.deserialize(sub_responses[0])
+        if err:
+            raise err
         
         return sub_responses[1]
 
@@ -45,8 +48,8 @@ class Client:
         try:
             return self._send_request(method_name, data)
         except Exception as e:
-            raise RuntimeError(f'Failed to call CRM: {e}')
-    
+            raise e
+
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         """Ping the CRM service to check if it's alive."""
@@ -114,33 +117,3 @@ class Client:
         finally:
             socket.close()
             context.term()
-
-# Helper ##################################################
-def _add_length_prefix(message_bytes: bytes):
-    length = len(message_bytes)
-    prefix = struct.pack('>Q', length)
-    return prefix + message_bytes
-
-def _parse_message(full_message: bytes) -> list[memoryview]:
-    buffer = memoryview(full_message)
-    messages = []
-    offset = 0
-    
-    while offset < len(buffer):
-        if offset + 8 > len(buffer):
-            raise ValueError("Incomplete length prefix at end of message")
-        
-        length = struct.unpack('>Q', buffer[offset:offset + 8])[0]
-        offset += 8
-        
-        if offset + length > len(buffer):
-            raise ValueError(f"Message length {length} exceeds remaining buffer size at offset {offset}")
-        
-        message = buffer[offset:offset + length]
-        messages.append(message)
-        offset += length
-    
-    if offset != len(buffer):
-        raise ValueError(f"Extra bytes remaining after parsing: {len(buffer) - offset}")
-    
-    return messages
