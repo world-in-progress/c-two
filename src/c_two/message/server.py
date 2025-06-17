@@ -1,11 +1,10 @@
 import sys
 import zmq
-import struct
 import logging
 import threading
-from .context import Code
-from .util.message_encode import add_length_prefix
-from .transferable import get_transferable, BASE_RESPONSE
+from . import error
+from .transferable import get_transferable
+from .util.encoding import add_length_prefix, parse_message
 
 # Logging Configuration ###########################################################
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -71,11 +70,11 @@ class Server:
                     self._termination_event.set()
                     break
                 
-                sub_messages = _parse_message(full_request)
+                sub_messages = parse_message(full_request)
                 if len(sub_messages) != 2:
-                    raise ValueError("Expected exactly 2 sub-messages (meta and data)")
-            
-                # Get method name 
+                    raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_messages)}')
+
+                # Get method name
                 method_name = sub_messages[0].tobytes().decode('utf-8')
                 
                 # Get arguments
@@ -100,14 +99,13 @@ class Server:
             
             except Exception as e:
                 # Log the error and send create an error response
-                code = Code.ERROR_INVALID
                 message = f'Error occurred when CRM Server "{self.name}" tried to process the request "{method_name}":\n{e}'
                 logger.error(f'Error occurred when CRM Server "{self.name}" tried to process the request "{method_name}":\n{e}')
 
-                # Create a serialized response based on the serialized_response and serialized_result
-                serialized_response: str = get_transferable(BASE_RESPONSE).serialize(code, message)
-                combined_response = add_length_prefix(serialized_response) + add_length_prefix(b'')
-                        
+                # Create a serialized response based on the serialized_error and serialized_result
+                serialized_error: bytes = error.CCError.serialize(error.CRMServerError(message))
+                combined_response = add_length_prefix(serialized_error) + add_length_prefix(b'')
+
                 # Send response
                 self.socket.send(combined_response)
             
@@ -126,30 +124,3 @@ class Server:
                 self.crm.terminate()
         except Exception as e:
             logger.error(f'Error during termination: {e}')
-            
-
-# Helpers ##################################################
-
-def _parse_message(full_message: bytes) -> list[memoryview]:
-    buffer = memoryview(full_message)
-    messages = []
-    offset = 0
-    
-    while offset < len(buffer):
-        if offset + 8 > len(buffer):
-            raise ValueError("Incomplete length prefix at end of message")
-        
-        length = struct.unpack('>Q', buffer[offset:offset + 8])[0]
-        offset += 8
-        
-        if offset + length > len(buffer):
-            raise ValueError(f"Message length {length} exceeds remaining buffer size at offset {offset}")
-        
-        message = buffer[offset:offset + length]
-        messages.append(message)
-        offset += length
-    
-    if offset != len(buffer):
-        raise ValueError(f"Extra bytes remaining after parsing: {len(buffer) - offset}")
-    
-    return messages

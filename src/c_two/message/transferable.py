@@ -1,6 +1,5 @@
 import json
 import pickle
-import struct
 import inspect
 import logging
 from abc import ABCMeta
@@ -8,8 +7,9 @@ from functools import wraps
 from pydantic import BaseModel, create_model
 from dataclasses import dataclass, is_dataclass
 from typing import get_type_hints, get_args, get_origin, Any, Callable
-from .context import Code, BASE_RESPONSE
-from .util.message_encode import add_length_prefix
+
+from . import error
+from .util.encoding import add_length_prefix
 
 # Logging Configuration ###########################################################
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -257,10 +257,12 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                 result_bytes = obj.client.call(method_name, args_converted)
                 return None if output_transferable is None else output_transferable(result_bytes)
             except Exception as e:
-                error_context = 'input serialization at Component side' if 'args_converted' not in locals() else \
-                                'CRM function call' if 'result_bytes' not in locals() else \
-                                'output deserialization at Component side'
-                raise RuntimeError(f'Error during {error_context}:\n{e}')
+                if 'args_converted' not in locals():
+                    raise error.CompoSerializeInput(str(e))
+                elif 'result_bytes' not in locals():
+                    raise error.CompoCRMCalling(str(e))
+                else:
+                    raise error.CompoDeserializeOutput(str(e))
         
         def crm_to_com(*args: any) -> tuple[any, any]:
             
@@ -286,9 +288,7 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                     args_converted = (args_converted,)
                 
                 result = func(obj, *args_converted)
-                
-                code = Code.SUCCESS
-                message = 'Processing succeeded'
+                err = None
                 
             except Exception as e:
                 error_context = 'input deserialization at CRM side' if 'args_converted' not in locals() else \
@@ -296,11 +296,15 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                                 'output serialization at CRM side'
                 logger.error(f'Error during {error_context}:\n{e}')
                 result = None
-                code = Code.ERROR_INVALID
-                message = f'Error occurred: {e}'
-            
-            # Create a serialized response based on the serialized_response and serialized_result
-            serialized_response: str = get_transferable(BASE_RESPONSE).serialize(code, message)
+                if 'args_converted' not in locals():
+                    err = error.CRMDeserializeInput(str(e))
+                elif 'result' not in locals():
+                    err = error.CRMExecuteFunction(str(e))
+                else:
+                    err = error.CRMSerializeOutput(str(e))
+
+            # Create a serialized response based on the serialized_error and serialized_result
+            serialized_error: bytes = error.CCError.serialize(err)
             serialized_result = b''
             if output_transferable is not None and result is not None:
                 # Unpack tuple arguments or pass single argument based on result type
@@ -308,7 +312,7 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
                     output_transferable(*result) if isinstance(result, tuple)
                     else output_transferable(result)
                 )
-            combined_response = add_length_prefix(serialized_response) + add_length_prefix(serialized_result)
+            combined_response = add_length_prefix(serialized_error) + add_length_prefix(serialized_result)
             return combined_response
         
         @wraps(func)
@@ -479,20 +483,3 @@ def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str 
     except Exception as e:
         logger.error(f'Error creating Pydantic model for {func.__qualname__}: {e}')
         return None
-
-# Register base transferables #####################################################
-
-class BaseResponse(Transferable):
-    def serialize(code: Code, message: str) -> bytes:
-        res = {
-            'code': code.value,
-            'message': message
-        }
-        return json.dumps(res).encode('utf-8')
-
-    def deserialize(res_bytes: memoryview) -> dict[str, int | str]:
-        res = json.loads(res_bytes.tobytes().decode('utf-8'))
-        return {
-            'code': Code(res['code']),
-            'message': res['message']
-        }
