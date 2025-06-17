@@ -39,19 +39,21 @@ class Server:
                 try:
                     threading.Event().wait(check_interval)
                 except KeyboardInterrupt:
-                    logger.info('\nKeyboardInterrupt received.\nStopping CRM server...')
-                    self._cleanup(f'Cleaning up CRM Server "{self.name}"...')
+                    logger.info(f'\nKeyboardInterrupt received.')
                     self._termination_event.set()
+                    self._cleanup(f'Stopping CRM Server "{self.name}"...')
+                    logger.info(f'CRM Server "{self.name}" stopped.')
 
         else:
             while not self._termination_event.is_set():
                 pass
-            self._cleanup(f'Cleaning up CRM Server "{self.name}"...')
             self._termination_event.set()
+            self._cleanup(f'Stopping CRM Server "{self.name}"...')
+            logger.info(f'CRM Server "{self.name}" stopped.')
             
     def _run(self):
         try:
-            timeout_ms = int(self._idle_timeout * 1000) if self._idle_timeout > 0 else -1
+            timeout_ms = int(self._idle_timeout * 1000) if self._idle_timeout > 0 else 1000
             self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
             while not self._termination_event.is_set():
                 try:
@@ -80,7 +82,7 @@ class Server:
                     
                     # Call method wrapped from CRM instance method
                     method = getattr(self.crm, method_name)
-                    _, response = method(args_bytes)
+                    _, response = method.__wrapped__(self.crm, args_bytes)
                     
                     # Send response
                     self.socket.send(response)
@@ -100,6 +102,7 @@ class Server:
     def _stop(self):
         if hasattr(self, '_server_thread') and self._server_thread.is_alive():
             self._server_thread.join()
+            
         self.socket.close()
         self.context.term()
     

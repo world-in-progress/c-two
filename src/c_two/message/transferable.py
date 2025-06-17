@@ -1,3 +1,4 @@
+import sys
 import json
 import pickle
 import struct
@@ -333,7 +334,7 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
     
     return decorator
 
-def auto_transfer(func = None) -> callable:
+def auto_transfer(direction: str, func = None) -> callable:
 
     def create_wrapper(func: callable) -> callable:
 
@@ -421,9 +422,14 @@ def auto_transfer(func = None) -> callable:
         @wraps(func)
         def final_wrapper(*args, **kwargs):
              return wrapped_func(*args, **kwargs)
-
-        final_wrapper.__origin__ = func
-        return final_wrapper
+            
+        if direction == '->':
+            return final_wrapper
+        elif direction == '<-':
+            func.__wrapped__ = final_wrapper
+            return func
+        else:
+            raise ValueError(f'Invalid direction value: {direction}. Expected "->" or "<-".')
 
     if func is None:
         return create_wrapper
