@@ -20,7 +20,6 @@ class Client:
 
     def _send_request(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a request to the CRM service and get the response synchronously."""
-        
         # Serialize
         serialized_meta = method_name.encode('utf-8')
         serialized_data = b'' if data is None else data
@@ -36,8 +35,8 @@ class Client:
         
         response = get_transferable(context.BASE_RESPONSE).deserialize(sub_responses[0])
         if response['code'] == context.Code.ERROR_INVALID:
-            raise RuntimeError(f'Failed to make CRM process: {response["message"]}')
-        
+            raise RuntimeError(response["message"])
+
         return sub_responses[1]
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
@@ -45,8 +44,8 @@ class Client:
         try:
             return self._send_request(method_name, data)
         except Exception as e:
-            raise RuntimeError(f'Failed to call CRM: {e}')
-    
+            raise RuntimeError(f'Failed to call CRM:\n{e}')
+
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         """Ping the CRM service to check if it's alive."""
