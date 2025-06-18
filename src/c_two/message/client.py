@@ -3,7 +3,7 @@ import sys
 import zmq
 import signal
 import subprocess
-from . import error
+from .. import error
 from .util.encoding import add_length_prefix, parse_message
 
 class Client:

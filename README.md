@@ -71,9 +71,11 @@ class Grid(IGrid):
 
 ### 3. Custom Data Type Definition
 
-Define serializable data structures using the `@transferable` decorator:
+Define serializable data structures using the `@transferable` decorator with any necessary serialization logic:
 
 ```python
+import pyarrow as pa
+
 @cc.transferable
 class GridAttribute:
     level: int
@@ -87,11 +89,56 @@ class GridAttribute:
             pa.field('elevation', pa.float64())
         ])
         table = pa.Table.from_pylist([data.__dict__], schema=schema)
-        return cc.message.serialize_from_table(table)
+        return serialize_from_table(table)
     
     def deserialize(arrow_bytes: bytes) -> 'GridAttribute':
-        row = cc.message.deserialize_to_rows(arrow_bytes)[0]
+        row = deserialize_to_rows(arrow_bytes)[0]
         return GridAttribute(**row)
+
+@cc.transferable
+class GridAttributes:
+    """
+    A collection of GridAttribute objects with built-in serialization capabilities.
+    
+    The C-Two framework automatically handles serialization/deserialization when this type
+    is detected as a parameter or return type in CRM methods (e.g., the return type of
+    Grid.get_grid_infos()).
+    """
+    def serialize(data: list[GridAttribute]) -> bytes:
+        schema = pa.schema([
+            pa.field('attribute_bytes', pa.list_(pa.binary())),
+        ])
+
+        data_dict = {
+            'attribute_bytes': [GridAttribute.serialize(grid) for grid in data]
+        }
+        
+        table = pa.Table.from_pylist([data_dict], schema=schema)
+        return serialize_from_table(table)
+
+    def deserialize(arrow_bytes: bytes) -> list[GridAttribute]:
+        table = deserialize_to_table(arrow_bytes)
+        
+        grid_bytes = table.column('attribute_bytes').to_pylist()[0]
+        
+        return [GridAttribute.deserialize(grid_byte) for grid_byte in grid_bytes]
+
+# Helpers ##################################################
+
+def serialize_from_table(table: pa.Table) -> bytes:
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    binary_data = sink.getvalue().to_pybytes()
+    return binary_data
+
+def deserialize_to_rows(serialized_data: bytes) -> dict:
+    buffer = pa.py_buffer(serialized_data)
+
+    with pa.ipc.open_stream(buffer) as reader:
+        table = reader.read_all()
+
+    return table.to_pylist()
 ```
 
 ### 4. Server Deployment
