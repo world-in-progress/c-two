@@ -2,7 +2,7 @@ import sys
 import zmq
 import logging
 import threading
-from . import error
+from .. import error
 from .transferable import get_transferable
 from .util.encoding import add_length_prefix, parse_message
 

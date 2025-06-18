@@ -7,7 +7,6 @@ requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
-    "pyarrow>=19.0.1",
     "zmq>=0.0.0",
 ]
 
@@ -17,4 +16,5 @@ dev = [
     "numpy>=2.2.4",
     "openai>=1.76.0",
     "pandas>=2.2.3",
+    "pyarrow>=19.0.1",
 ]

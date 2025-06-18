@@ -1,4 +1,3 @@
-import json
 import pickle
 import inspect
 import logging
@@ -8,7 +7,7 @@ from pydantic import BaseModel, create_model
 from dataclasses import dataclass, is_dataclass
 from typing import get_type_hints, get_args, get_origin, Any, Callable
 
-from . import error
+from .. import error
 from .util.encoding import add_length_prefix
 
 # Logging Configuration ###########################################################
