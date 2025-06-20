@@ -104,34 +104,47 @@ class Client:
     @staticmethod
     def shutdown_by_process(process: subprocess.Popen, timeout: float = 1.0) -> bool:
         """Shutdown the CRM service by terminating the process."""
-        if process:
+        if not process:
+            return True
             
-            if process.poll() is not None:
-                return True  # Process is already terminated
-            
-            if sys.platform != 'win32':
-                # Unix-specific: terminate the process group
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGINT)
-                except (AttributeError, ProcessLookupError):
-                    process.terminate()
-            else:
-                # Windows-specific: send Ctrl+C signal and then terminate
-                try:
-                    process.send_signal(signal.CTRL_C_EVENT)
-                except (AttributeError, ProcessLookupError):
-                    process.terminate()
-
+        if process.poll() is not None:
+            return True  # Process is already terminated
+        
+        if sys.platform != 'win32':
+            # Unix-specific: terminate the process group
             try:
-                process.wait(timeout=timeout)
+                os.killpg(os.getpgid(process.pid), signal.SIGINT)
+            except (AttributeError, ProcessLookupError):
+                process.terminate()
+        else:
+            # Windows-specific: temporarily ignore CTRL_C in parent process
+            original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                process.send_signal(signal.CTRL_C_EVENT)
+            except (AttributeError, ProcessLookupError):
+                process.terminate()
+                
+        # Wait for the process to terminate
+        try:
+            process.wait(timeout=timeout)
+            return True
+        
+        except KeyboardInterrupt:
+            if process.poll() is not None:
                 return True
-            
-            except subprocess.TimeoutExpired:
-                if sys.platform != 'win32':
-                    try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                    except (AttributeError, ProcessLookupError):
-                        process.kill()
-                else:
+        
+        except subprocess.TimeoutExpired:
+            print(f'Timeout expired while waiting for process {process.pid} to terminate. Forcing shutdown...')
+            if sys.platform != 'win32':
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except (AttributeError, ProcessLookupError):
                     process.kill()
-                return False
+            else:
+                process.kill()
+            return False
+        
+        finally:
+            if sys.platform == 'win32':
+                # Restore original signal handler
+                signal.signal(signal.SIGINT, original_handler)

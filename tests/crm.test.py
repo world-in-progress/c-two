@@ -37,7 +37,6 @@ if __name__ == '__main__':
             server.stop()
 
     except KeyboardInterrupt:
-        print("Stopping CRM server...")
+        print('Stopping CRM server...')
         server.stop()
-        print("CRM server stopped.")
-    
+        print('CRM server stopped.')
