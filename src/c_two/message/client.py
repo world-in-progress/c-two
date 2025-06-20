@@ -4,6 +4,7 @@ import zmq
 import signal
 import subprocess
 from .. import error
+from .event import Event, EventTag, PingEvent, ShutdownEvent
 from .util.encoding import add_length_prefix, parse_message
 
 class Client:
@@ -22,18 +23,24 @@ class Client:
         """Send a request to the CRM service and get the response synchronously."""
         # Serialize
         try:
-            serialized_meta = method_name.encode('utf-8')
+            serialized_method_name = method_name.encode('utf-8')
             serialized_data = b'' if data is None else data
-            combined_request = add_length_prefix(serialized_meta) + add_length_prefix(serialized_data)
+            combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
+            event = Event(tag=EventTag.CRM_CALL, data=combined_request)
         except Exception as e:
             raise error.CRMSerializeOutput(f'Error occurred when serializing request: {e}')
         
         # Send and get response
-        self.socket.send(combined_request)
+        self.socket.send(event.serialize())
         full_response = self.socket.recv()
         
+        # Deserialize Event
+        event = Event.deserialize(full_response)
+        if event.tag != EventTag.CRM_REPLY:
+            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
+        
         # Deserialize error
-        sub_responses = parse_message(full_response)
+        sub_responses = parse_message(event.data)
         if len(sub_responses) != 2:
             raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
 
@@ -61,10 +68,10 @@ class Client:
         socket.connect(server_address)
         
         try:
-            socket.send(b'PING')
+            socket.send(PingEvent)
             
             response = socket.recv()
-            if response == b'PONG':
+            if Event.deserialize(response).tag == EventTag.PONG:
                 return True
             return False
         except zmq.ZMQError:
@@ -74,7 +81,7 @@ class Client:
             context.term()
     
     @staticmethod
-    def shutdown(server_address: str, timeout: float = 0.5, process: subprocess.Popen | None = None) -> bool:
+    def shutdown(server_address: str, timeout: float = 0.5) -> bool:
         """Send a shutdown command to the CRM service."""
         
         context = zmq.Context()
@@ -84,36 +91,47 @@ class Client:
         socket.connect(server_address)
         
         try:
-            socket.send(b'SHUTDOWN')
+            socket.send(ShutdownEvent)
             response = socket.recv()
-            if response == b'SHUTDOWN_ACK':
-                if process:
-                    if sys.platform != 'win32':
-                        # Unix-specific: terminate the process group
-                        try:
-                            os.killpg(os.getpgid(process.pid), signal.SIGINT)
-                        except (AttributeError, ProcessLookupError):
-                            process.terminate()
-                    else:
-                        # Windows-specific: send Ctrl+C signal and then terminate
-                        try:
-                            process.send_signal(signal.CTRL_C_EVENT)
-                        except (AttributeError, ProcessLookupError):
-                            process.terminate()
-
-                    try:
-                        process.wait()
-                    except subprocess.TimeoutExpired:
-                        if sys.platform != 'win32':
-                            try:
-                                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                            except (AttributeError, ProcessLookupError):
-                                process.kill()
-                        else:
-                            process.kill()
+            if Event.deserialize(response).tag == EventTag.SHUTDOWN_ACK:
                 return True
         except zmq.ZMQError:
             return False
         finally:
             socket.close()
             context.term()
+    
+    @staticmethod
+    def shutdown_by_process(process: subprocess.Popen, timeout: float = 1.0) -> bool:
+        """Shutdown the CRM service by terminating the process."""
+        if process:
+            
+            if process.poll() is not None:
+                return True  # Process is already terminated
+            
+            if sys.platform != 'win32':
+                # Unix-specific: terminate the process group
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGINT)
+                except (AttributeError, ProcessLookupError):
+                    process.terminate()
+            else:
+                # Windows-specific: send Ctrl+C signal and then terminate
+                try:
+                    process.send_signal(signal.CTRL_C_EVENT)
+                except (AttributeError, ProcessLookupError):
+                    process.terminate()
+
+            try:
+                process.wait(timeout=timeout)
+                return True
+            
+            except subprocess.TimeoutExpired:
+                if sys.platform != 'win32':
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except (AttributeError, ProcessLookupError):
+                        process.kill()
+                else:
+                    process.kill()
+                return False

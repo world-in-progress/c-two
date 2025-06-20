@@ -1,5 +1,6 @@
 import os
 import sys
+import signal
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
@@ -30,5 +31,13 @@ if __name__ == '__main__':
     # Run CRM server and handle termination gracefully
     server.start()
     print("CRM server is running. Press Ctrl+C to stop.")
-    server.wait_for_termination()
+    try:
+        if server.wait_for_termination():
+            print('Timeout reached, stopping CRM server...')
+            server.stop()
+
+    except KeyboardInterrupt:
+        print("Stopping CRM server...")
+        server.stop()
+        print("CRM server stopped.")
     

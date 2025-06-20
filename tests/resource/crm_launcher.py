@@ -44,8 +44,15 @@ def start_mock_crm():
 
 def stop_mock_crm():
     global CRM_PROCESS
-    if cc.message.Client.shutdown('tcp://localhost:5555', 0.5, CRM_PROCESS):
+    if cc.message.Client.shutdown('tcp://localhost:5555', 0.5):
         
+        logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
+    else:
+        logger.error('Failed to stop the Mock CRM process.')
+
+def stop_mock_crm_by_process():
+    global CRM_PROCESS
+    if cc.message.Client.shutdown_by_process(CRM_PROCESS, 0.5):
         logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
     else:
         logger.error('Failed to stop the Mock CRM process.')

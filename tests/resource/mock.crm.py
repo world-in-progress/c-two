@@ -30,4 +30,9 @@ if __name__ == '__main__':
     # Run CRM server and handle termination gracefully
     server.start()
     print("CRM server is running. Press Ctrl+C to stop.")
-    server.wait_for_termination()
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        print("Stopping CRM server...")
+        server.stop()
+        print("CRM server stopped.")

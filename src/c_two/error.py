@@ -1,7 +1,8 @@
 from __future__ import annotations
-from enum import Enum
+from enum import IntEnum, unique
 
-class ERROR_Code(Enum):
+@unique
+class ERROR_Code(IntEnum):
     ERROR_UNKNOWN                           = 0
     ERROR_AT_CRM_INPUT_DESERIALIZING        = 1
     ERROR_AT_CRM_OUTPUT_SERIALIZING         = 2
@@ -11,6 +12,8 @@ class ERROR_Code(Enum):
     ERROR_AT_COMPO_OUTPUT_DESERIALIZING     = 6
     ERROR_AT_COMPO_CRM_CALLING              = 7
     ERROR_AT_COMPO_CLIENT                   = 8
+    ERROR_AT_EVENT_SERIALIZING              = 9
+    ERROR_AT_EVENT_DESERIALIZING            = 10
 
 class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
@@ -109,3 +112,13 @@ class CompoClientError(CCError):
     def __init__(self, message: str | None = None):
         message = 'Error occurred at Compo client' + f':\n{message}' if message else ''
         super().__init__(code=ERROR_Code.ERROR_AT_COMPO_CLIENT, message=message)
+
+class EventSerializeError(CCError):
+    def __init__(self, message: str | None = None):
+        message = 'Error occurred when serializing event' + f':\n{message}' if message else ''
+        super().__init__(code=ERROR_Code.ERROR_AT_EVENT_SERIALIZING, message=message)
+
+class EventDeserializeError(CCError):
+    def __init__(self, message: str | None = None):
+        message = 'Error occurred when deserializing event' + f':\n{message}' if message else ''
+        super().__init__(code=ERROR_Code.ERROR_AT_EVENT_DESERIALIZING, message=message)
