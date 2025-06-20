@@ -9,11 +9,14 @@ import component as com
 
 if __name__ == '__main__':
     
-    ipc_address = 'ipc:///tmp/zmq_test'
-    tcp_address = 'tcp://localhost:5555'
-    
+    IPC_ADDRESS = 'ipc:///tmp/zmq_test'
+    TCP_ADDRESS = 'tcp://localhost:5555'
+    HTTP_ADDRESS = 'http://localhost:5556'
+
+    TEST_ADDRESS = HTTP_ADDRESS
+
     # Check if CRM is running
-    if cc.message.Client.ping(tcp_address):
+    if cc.message.Client.ping(TEST_ADDRESS):
         print('CRM is running!\n')
     else:
         print('CRM is not running!\n')
@@ -23,7 +26,7 @@ if __name__ == '__main__':
     # Provide both the address and an ICRM class.
     # connect_crm returns an ICRM instance that can be used directly.
     # This approach is particularly useful for component scripts.
-    with cc.compo.runtime.connect_crm(tcp_address, com.IGrid) as grid:
+    with cc.compo.runtime.connect_crm(TEST_ADDRESS, com.IGrid) as grid:
         print(grid.hello('World'))
         # Check grid 1-0
         parent: com.GridAttribute = grid.get_grid_infos(1, [0])[0]
@@ -35,8 +38,8 @@ if __name__ == '__main__':
     # Functions decorated with @cc.compo.runtime.connect automatically receive an ICRM instance that contains this client as their first argument.
     # This approach is particularly useful for component functions.
     # In this case, the client is not needed, but it's included here for demonstration purposes.
-    with cc.compo.runtime.connect_crm(tcp_address) as client:
-            
+    with cc.compo.runtime.connect_crm(TEST_ADDRESS) as client:
+
         # Subdivide grid 1-0
         keys = com.subdivide_grids([1], [0])
         

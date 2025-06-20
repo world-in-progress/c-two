@@ -35,7 +35,6 @@ class TcpServer(BaseServer):
                 if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
                     break
             
-    
     def start(self):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)

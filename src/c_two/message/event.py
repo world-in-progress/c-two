@@ -25,6 +25,7 @@ class Event:
     tag: EventTag
     data: bytes | None = None
     completion_type: CompletionType = CompletionType.OP_REQUEST
+    request_id: str | None = None
 
     def serialize(self) -> bytes:
         try:

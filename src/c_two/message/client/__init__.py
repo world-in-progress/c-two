@@ -5,14 +5,17 @@ import subprocess
 
 from .base import BaseClient
 from .tcp_client import TcpClient
+from .http_client import HttpClient
 
 def _get_client_class(server_address: str):
     """Determine the client class based on the server address."""
     if server_address.startswith(('tcp://', 'ipc://')):
         return TcpClient
+    elif server_address.startswith('http://'):
+        return HttpClient
     else:
         # TODO: Handle other protocols if needed
-        pass
+        raise ValueError(f'Unsupported protocol in server_address: {server_address}')
 
 class Client(BaseClient):
     def __init__(self, server_address: str):

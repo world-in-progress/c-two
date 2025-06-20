@@ -1,6 +1,5 @@
 import os
 import sys
-import signal
 import logging
 import subprocess
 from pathlib import Path
@@ -12,9 +11,15 @@ import c_two as cc
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-TEST_RESOURCE_DIR = Path(os.getcwd()).resolve() / 'tests' / 'resource'
-MOCK_CRM_LAUNCHER_PY = TEST_RESOURCE_DIR / 'mock.crm.py'
+TEST_DIR = Path(os.getcwd()).resolve() / 'tests'
+MOCK_CRM_LAUNCHER_PY = TEST_DIR / 'crm.test.py'
 CRM_PROCESS: subprocess.Popen = None
+    
+IPC_ADDRESS = 'ipc:///tmp/zmq_test'
+TCP_ADDRESS = 'tcp://localhost:5555'
+HTTP_ADDRESS = 'http://localhost:5556'
+
+TEST_ADDRESS = HTTP_ADDRESS
 
 def start_mock_crm():
     global CRM_PROCESS
@@ -34,14 +39,14 @@ def start_mock_crm():
         **kwargs
     )
 
-    while cc.message.Client.ping('tcp://localhost:5555') is False:
+    while cc.message.Client.ping(TEST_ADDRESS) is False:
         pass
 
     logger.info(f'Mock CRM process started with PID: {CRM_PROCESS.pid}')
 
 def stop_mock_crm():
     global CRM_PROCESS
-    if cc.message.Client.shutdown('tcp://localhost:5555', 0.5):
+    if cc.message.Client.shutdown(TEST_ADDRESS, 0.5):
         
         logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
     else:

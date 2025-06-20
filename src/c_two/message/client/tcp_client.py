@@ -59,7 +59,6 @@ class TcpClient(BaseClient):
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         """Ping the CRM service to check if it's alive."""
-        
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
@@ -82,7 +81,6 @@ class TcpClient(BaseClient):
     @staticmethod
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
         """Send a shutdown command to the CRM service."""
-        
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)

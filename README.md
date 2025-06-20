@@ -1,4 +1,4 @@
-# C-Two (0.1.21)
+# C-Two (0.1.22)
 
 C-Two is a **type-safe Remote Procedure Call (RPC) framework** designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method invocation between client components and Core Resource Models (CRM) with automatic serialization and protocol-agnostic communication.
 
@@ -10,7 +10,7 @@ C-Two addresses the complexity of distributed computing by implementing a clear 
 
 - **Interface Segregation**: Clean separation between interface definitions (ICRM) and implementations (CRM)
 - **Type Safety**: Compile-time and runtime type checking with automatic serialization inference
-- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (ZMQ, MCP)
+- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (IPC, TCP, HTTP, MCP)
 - **Resource Isolation**: Encapsulation of computational resources behind well-defined interfaces
 
 ## Architecture
@@ -26,7 +26,7 @@ Client-side computational units that consume remote resources through Interface 
 Server-side Core Resource Models implementing domain-specific business logic and resource management, exposed through standardized ICRM interfaces.
 
 ### Transport Layer
-Protocol-agnostic communication infrastructure supporting multiple transport mechanisms with connection management and message serialization.
+Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (IPC, TCP, HTTP, MCP) with automatic protocol detection, connection management and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
 
 ## Implementation Guide
 
@@ -143,21 +143,48 @@ def deserialize_to_rows(serialized_data: bytes) -> dict:
 
 ### 4. Server Deployment
 
-Deploy the CRM as a networked service:
+Deploy the CRM as a networked service with automatic protocol detection:
 
 ```python
 # Resource initialization and server configuration
 grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
+
+# IPC / TCP server (high-performance, low-latency)
 server = cc.message.Server("tcp://localhost:5555", grid)
+# or
+# HTTP server (web-compatible, cross-platform)
+server = cc.message.Server("http://localhost:8000", grid)
+
+# Same server lifecycle management regardless of protocol
 server.start()
-server.wait_for_termination()
+print('CRM server is running. Press Ctrl+C to stop.')
+try:
+    # Wait for server termination with a timeout or not
+    server.wait_for_termination(timeout=10)
+    print('Timeout reached, stopping CRM server...')
+    
+except KeyboardInterrupt:
+    print('Keyboard interrupt received, stopping CRM server...')
+
+finally:
+    server.stop()
+    print('CRM server stopped.')
 ```
 
 ### 5. Client Implementation
 
+The framework provides seamless protocol-transparent connectivity to CRM services.
+
 #### Script-Based Component Approach
 ```python
+# IPC / TCP connection (high-performance)
 with cc.compo.runtime.connect_crm('tcp://localhost:5555', IGrid) as grid:
+    infos = grid.get_grid_infos(1, [0, 1, 2])
+    keys = grid.subdivide_grids([1, 1], [0, 1])
+    print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
+
+# HTTP connection (web-compatible) - same interface, same code
+with cc.compo.runtime.connect_crm('http://localhost:8000', IGrid) as grid:
     infos = grid.get_grid_infos(1, [0, 1, 2])
     keys = grid.subdivide_grids([1, 1], [0, 1])
     print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
@@ -172,10 +199,11 @@ def process_grids(grid: IGrid, target_level: int) -> list[str]:
     candidates = [info.global_id for info in infos if hasattr(info, 'elevation') and info.elevation > 0]
     return grid.subdivide_grids([target_level] * len(candidates), candidates)
 
-# Execution with automatic connection injection
-result = process_grids(1, crm_address='tcp://localhost:5555')
+# Protocol is determined automatically by the address
+result = process_grids(1, crm_address='tcp://localhost:5555')  # Uses TCP
+result = process_grids(1, crm_address='http://localhost:8000')  # Uses HTTP
 
-# Or using a context manager
+# Or using a context manager with automatic protocol detection
 with cc.compo.runtime.connect_crm('tcp://localhost:5555'):
     result = process_grids(1)
 ```
@@ -200,10 +228,12 @@ if __name__ == '__main__':
 C-Two is particularly suited for:
 
 - **Distributed Scientific Computing**: High-performance computing applications requiring resource distribution
-- **Microservices Architecture**: Type-safe inter-service communication in distributed systems
+- **Web-Based Applications**: HTTP protocol support enables seamless web service integration
+- **Microservices Architecture**: Type-safe inter-service communication with flexible protocol selection
 - **Computational Resource Management**: Systems requiring dynamic resource allocation and computation distribution
+- **Cross-Platform Integration**: Unified interface supporting multiple transport protocols
 - **System Integration**: Applications requiring protocol-agnostic communication with external systems
-- **Modular Component Systems**: Reusable computational components across different resource implementations
+- **Modular Component Systems**: Reusable computational components across different resource implementations and protocols
 
 ## Framework Components
 
@@ -215,9 +245,9 @@ C-Two is particularly suited for:
 - **`@connect`**: Connection injection for component functions
 
 ### Runtime Components
-- **`connect_crm`**: Context manager for CRM connection lifecycle management
-- **`Server`**: CRM service deployment infrastructure
-- **`Client`**: Remote resource access client
+- **`connect_crm`**: Context manager for CRM connection lifecycle management with automatic protocol detection
+- **`Server`**: CRM service deployment infrastructure with multi-protocol support
+- **`Client`**: Remote resource access client with transparent protocol handling
 
 ### Integration Utilities
 - **MCP Tools**: Model Context Protocol integration for external system communication
@@ -227,6 +257,21 @@ C-Two is particularly suited for:
 - Python ≥ 3.10
 - Type annotation support
 - Network connectivity for distributed deployment
+
+### Protocol Dependencies
+
+**Core Framework**
+- `pyarrow` - High-performance data serialization
+- `zmq` - ZeroMQ for TCP protocol support
+
+**HTTP Protocol Support**
+- `starlette` - Lightweight ASGI framework for HTTP server
+- `requests` - HTTP client library  
+- `uvicorn` - ASGI server (automatically used by HTTP server)
+
+**Development & Integration**
+- `mcp[cli]` - Model Context Protocol integration
+- `httpx` - Modern HTTP client for advanced scenarios
 
 ---
 
