@@ -1,25 +1,51 @@
 import zmq
 import logging
-from ..event import Event
-from .base_server import BaseServer
+import threading
+from .base import BaseServer
+from ..event import Event, EventTag
+from .event_queue import EventQueue
 
 # Logging Configuration ###########################################################
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+MAXIMUM_WAIT_TIMEOUT = 0.1
+
 class TcpServer(BaseServer):
-    def __init__(self, bind_address: str):
-        super().__call__(bind_address)
-        
+    def __init__(self, bind_address: str, event_queue: EventQueue | None = None):
+        super().__init__(bind_address, event_queue)
+
         self.context = None
         self.socket = None
+        self.shutdown_event = threading.Event()
+    
+    def _serve(self):
+        while True:
+            # Check if the shutdown event is set
+            if self.shutdown_event.is_set():
+                self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
+                break
+            
+            # Poll for events with a timeout
+            event = self._poll(timeout=MAXIMUM_WAIT_TIMEOUT)
+            if event is None:
+                continue
+            else:
+                self.event_queue.put(event)
+                if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
+                    break
+            
     
     def start(self):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind(self.bind_address)
 
-    def pool(self, timeout: float = 0.0) -> Event | None:
+        server_thread = threading.Thread(target=self._serve)
+        server_thread.daemon = True
+        server_thread.start()
+
+    def _poll(self, timeout: float = 0.0) -> Event | None:
         if not self.socket or not self.context:
             return None
         
@@ -45,7 +71,7 @@ class TcpServer(BaseServer):
         self.socket.send(event.serialize())
     
     def shutdown(self):
-        pass
+        self.shutdown_event.set()
     
     def destroy(self):
         self.socket.close()

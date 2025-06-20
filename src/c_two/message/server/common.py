@@ -33,11 +33,12 @@ def wait(
         used for, e.g. work related to forking.
 
     Returns:
-      True if a timeout was supplied and it was reached. False otherwise.
+      bool: True if the wait completed successfully, False if it timed out.
     """
     if timeout is None:
         while not wait_complete_fn():
             _wait_once(wait_fn, MAXIMUM_WAIT_TIMEOUT, spin_cb)
+        return True
     else:
         end = time.time() + timeout
         while not wait_complete_fn():
@@ -45,4 +46,4 @@ def wait(
             if remaining < 0:
                 return True
             _wait_once(wait_fn, remaining, spin_cb)
-    return False
+        return False

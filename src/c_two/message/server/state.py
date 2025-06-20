@@ -1,6 +1,7 @@
 import enum
 import threading
-from .base_server import BaseServer
+from .base import BaseServer
+from .event_queue import EventQueue
 
 @enum.unique
 class ServerStage(enum.Enum):
@@ -13,16 +14,18 @@ class ServerState(object):
     stage: ServerStage
     server: BaseServer
     lock: threading.RLock
-    should_shutdown: threading.Event
+    event_queue: EventQueue
+    server_deallocated: bool
     termination_event: threading.Event
     shutdown_events: list[threading.Event]
 
-    def __init__(self, server: BaseServer, crm: object):
+    def __init__(self, server: BaseServer, event_queue: EventQueue, crm: object):
         self.crm = crm
         self.server = server
-        
+        self.event_queue = event_queue
+
         self.lock = threading.RLock()
+        self.server_deallocated = False
         self.stage = ServerStage.STOPPED
-        self.should_shutdown = threading.Event()
         self.termination_event = threading.Event()
         self.shutdown_events = [self.termination_event]

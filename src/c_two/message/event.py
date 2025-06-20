@@ -4,10 +4,16 @@ from dataclasses import dataclass
 from .. import error
 from .util.encoding import add_length_prefix, parse_message
 
+class CompletionType(Enum):
+    OP_REQUEST = 'op_request'       # request for an operation
+    OP_COMPLETE = 'op_complete'     # operation completed successfully
+    QUEUE_TIMEOUT = 'queue_timeout' # queue operation timed out
+
 @unique
 class EventTag(Enum):
     PING = 'ping'
     PONG = 'pong'
+    EMPTY = 'empty'
     CRM_CALL = 'crm_call'
     CRM_REPLY = 'crm_reply'
     SHUTDOWN_ACK = 'shutdown_ack'
@@ -17,8 +23,10 @@ class EventTag(Enum):
 @dataclass
 class Event:
     tag: EventTag
-    data: bytes | None
-    
+    data: bytes | None = None
+    success: bool = False
+    completion_type: CompletionType = CompletionType.OP_REQUEST
+
     def serialize(self) -> bytes:
         try:
             tag_bytes = self.tag.value.encode('utf-8')
