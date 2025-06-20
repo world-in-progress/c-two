@@ -9,6 +9,12 @@ import c_two as cc
 if __name__ == '__main__':
     
     from crm import Grid
+    
+    IPC_ADDRESS = 'ipc:///tmp/zmq_test'
+    TCP_ADDRESS = 'tcp://localhost:5555'
+    HTTP_ADDRESS = 'http://localhost:5556'
+
+    TEST_ADDRESS = HTTP_ADDRESS
 
     # Grid parameters
     epsg = 2326
@@ -24,19 +30,18 @@ if __name__ == '__main__':
     crm = Grid(epsg, bounds, first_size, subdivide_rules)
     
     # Create CRM server
-    ipc_address = 'ipc:///tmp/zmq_test'
-    tcp_address = 'tcp://localhost:5555'
-    server = cc.message.Server(tcp_address, crm)
-    
+    server = cc.message.Server(TEST_ADDRESS, crm)
+
     # Run CRM server and handle termination gracefully
     server.start()
-    print("CRM server is running. Press Ctrl+C to stop.")
+    print('CRM server is running. Press Ctrl+C to stop.')
     try:
-        if server.wait_for_termination():
-            print('Timeout reached, stopping CRM server...')
-            server.stop()
-
+        server.wait_for_termination()
+        print('Timeout reached, stopping CRM server...')
+        
     except KeyboardInterrupt:
         print('Stopping CRM server...')
+
+    finally:
         server.stop()
         print('CRM server stopped.')

@@ -2,6 +2,7 @@ import logging
 import threading
 from . import common
 from .tcp_server import TcpServer
+from .http_server import HttpServer
 from .event_queue import EventQueue
 from ..util.encoding import parse_message
 from .state import ServerState, ServerStage
@@ -38,15 +39,15 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
     
     # Process PING event
     if event.tag is EventTag.PING:
-        state.server.reply(Event(tag=EventTag.PONG))
+        state.server.reply(Event(tag=EventTag.PONG, request_id=event.request_id))
     
     # Process SHUTDOWN event
     elif event.tag is EventTag.SHUTDOWN_FROM_CLIENT or event.tag is EventTag.SHUTDOWN_FROM_SERVER:
         # Send shutdown acknowledgment if Shutdown event comes from client
         if event.tag is EventTag.SHUTDOWN_FROM_CLIENT:
             logger.info('Received shutdown request from client, shutting down server...')
-            state.server.reply(Event(tag=EventTag.SHUTDOWN_ACK))
-            
+            state.server.reply(Event(tag=EventTag.SHUTDOWN_ACK, request_id=event.request_id))
+
         # If the CRM instance has a terminate method, call it
         if state.crm and hasattr(state.crm, 'terminate'):
             state.crm.terminate()
@@ -72,7 +73,7 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
         response = method.__wrapped__(crm, args_bytes)
         
         # Create a serialized response based on the serialized_error and serialized_result
-        state.server.reply(Event(tag=EventTag.CRM_REPLY, data=response))
+        state.server.reply(Event(tag=EventTag.CRM_REPLY, data=response, request_id=event.request_id))
 
     return should_continue
 
@@ -126,12 +127,14 @@ class Server:
     def __init__(self, bind_address: str, crm: object, name: str = ''):
         self.name = name if name != '' else 'CRM Server'
         
-        # Check bind_address use TCP or IPC protocol
+        # Check bind_address protocol and create appropriate server
         if bind_address.startswith(('tcp://', 'ipc://')):
             self.server = TcpServer(bind_address)
+        elif bind_address.startswith('http://'):
+            self.server = HttpServer(bind_address)
         else:
             # TODO: Handle other protocols if needed
-            pass
+            raise ValueError(f'Unsupported protocol in bind_address: {bind_address}')
         
         # Create an event queue for the server
         event_queue = EventQueue()
