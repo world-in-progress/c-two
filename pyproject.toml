@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.1.22"
+version = "0.1.23"
 description = "A python server to support communication between CRM and Component processes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -8,7 +8,7 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.4",
-    "starlette>=0.47.0",
+    "starlette<0.47.0",
     "zmq>=0.0.0",
 ]
 
