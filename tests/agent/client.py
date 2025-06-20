@@ -73,7 +73,7 @@ class MCPClient:
         global CURRENT_PROVIDER, CURRENT_MODEL
         supported_providers = [MODEL_PROVIDER_ANTHROPIC, MODEL_PROVIDER_DEEPSEEK, MODEL_PROVIDER_OLLAMA]
         if provider not in supported_providers:
-            raise ValueError(f'Unsupported model provider: {provider}. Supported: {', '.join(supported_providers)}')
+            raise ValueError(f"Unsupported model provider: {provider}. Supported: {', '.join(supported_providers)}")
         
         CURRENT_PROVIDER = provider
         
@@ -226,7 +226,7 @@ class MCPClient:
                     if part['type'] == 'text':
                         content_str += part['text'] + '\n'
                     elif part['type'] == 'tool_result':
-                        content_str += f'Tool result: {part['content']}\n'
+                        content_str += f'Tool result: {part["content"]}\n'
                 
                 openai_messages.append({
                     'role': msg['role'],

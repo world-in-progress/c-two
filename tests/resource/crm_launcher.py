@@ -23,9 +23,6 @@ def start_mock_crm():
     if sys.platform != 'win32':
         # Unix-specific: create new process group
         kwargs['preexec_fn'] = os.setsid
-    else:
-        # Windows-specific: don't open a new console window
-        kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
     
     cmd = [
         sys.executable,
@@ -44,8 +41,15 @@ def start_mock_crm():
 
 def stop_mock_crm():
     global CRM_PROCESS
-    if cc.message.Client.shutdown('tcp://localhost:5555', 0.5, CRM_PROCESS):
+    if cc.message.Client.shutdown('tcp://localhost:5555', 0.5):
         
+        logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
+    else:
+        logger.error('Failed to stop the Mock CRM process.')
+
+def stop_mock_crm_by_process():
+    global CRM_PROCESS
+    if cc.message.Client.shutdown_by_process(CRM_PROCESS, 2.0):
         logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
     else:
         logger.error('Failed to stop the Mock CRM process.')
