@@ -11,7 +11,6 @@ class EventQueue:
     def poll(self, timeout: float | None = None) -> Event:
         if self._shutdown.is_set():
             return Event(
-                success=True,
                 tag=EventTag.SHUTDOWN_FROM_SERVER,
                 completion_type=CompletionType.OP_COMPLETE
             )
@@ -28,9 +27,8 @@ class EventQueue:
         except queue.Empty:
             return Event(
                 data=None,
-                success=False,
                 tag=EventTag.EMPTY,
-                completion_type=CompletionType.QUEUE_TIMEOUT
+                completion_type=CompletionType.OP_TIMEOUT
             )
 
     def put(self, event: Event) -> None:

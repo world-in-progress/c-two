@@ -1,23 +1,18 @@
-import os
-import sys
 import zmq
-import signal
-import subprocess
-from .. import error
-from .event import Event, EventTag, PingEvent, ShutdownEvent
-from .util.encoding import add_length_prefix, parse_message
+from ... import error
+from .base import BaseClient
+from ..util.encoding import add_length_prefix, parse_message
+from ..event import Event, EventTag, PingEvent, ShutdownEvent
 
-class Client:
+class TcpClient(BaseClient):
     def __init__(self, server_address: str):
+        super().__init__(server_address)
+        
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         
         self.socket.connect(server_address)
         self.server_address = server_address
-    
-    def terminate(self):
-        self.socket.close()
-        self.context.term()
 
     def _send_request(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a request to the CRM service and get the response synchronously."""
@@ -49,6 +44,10 @@ class Client:
             raise err
         
         return sub_responses[1]
+    
+    def terminate(self):
+        self.socket.close()
+        self.context.term()
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         """Call a method on the CRM instance."""
@@ -100,51 +99,3 @@ class Client:
         finally:
             socket.close()
             context.term()
-    
-    @staticmethod
-    def shutdown_by_process(process: subprocess.Popen, timeout: float = 1.0) -> bool:
-        """Shutdown the CRM service by terminating the process."""
-        if not process:
-            return True
-            
-        if process.poll() is not None:
-            return True  # Process is already terminated
-        
-        if sys.platform != 'win32':
-            # Unix-specific: terminate the process group
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGINT)
-            except (AttributeError, ProcessLookupError):
-                process.terminate()
-        else:
-            # Windows-specific: temporarily ignore CTRL_C in parent process
-            original_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            try:
-                process.send_signal(signal.CTRL_C_EVENT)
-            except (AttributeError, ProcessLookupError):
-                process.terminate()
-                
-        # Wait for the process to terminate
-        try:
-            process.wait(timeout=timeout)
-            return True
-        
-        except KeyboardInterrupt:
-            if process.poll() is not None:
-                return True
-        
-        except subprocess.TimeoutExpired:
-            print(f'Timeout expired while waiting for process {process.pid} to terminate. Forcing shutdown...')
-            if sys.platform != 'win32':
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except (AttributeError, ProcessLookupError):
-                    process.kill()
-            else:
-                process.kill()
-            return False
-        
-        finally:
-            if sys.platform == 'win32':
-                # Restore original signal handler
-                signal.signal(signal.SIGINT, original_handler)

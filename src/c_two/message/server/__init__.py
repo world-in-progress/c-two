@@ -82,7 +82,7 @@ def _serve(state: ServerState):
         event = state.event_queue.poll(timeout=0.1)
         
         # Process the event and check if it is able to continue serving
-        if event.completion_type != CompletionType.QUEUE_TIMEOUT:
+        if event.completion_type != CompletionType.OP_TIMEOUT:
             if not _process_event_and_continue(state, event):
                 return
         

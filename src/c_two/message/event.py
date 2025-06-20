@@ -5,9 +5,9 @@ from .. import error
 from .util.encoding import add_length_prefix, parse_message
 
 class CompletionType(Enum):
-    OP_REQUEST = 'op_request'       # request for an operation
-    OP_COMPLETE = 'op_complete'     # operation completed successfully
-    QUEUE_TIMEOUT = 'queue_timeout' # queue operation timed out
+    OP_REQUEST = 'op_request'       # request for a queue operation
+    OP_TIMEOUT = 'op_timeout'       # queue operation timed out
+    OP_COMPLETE = 'op_complete'     # queue operation completed successfully
 
 @unique
 class EventTag(Enum):
@@ -24,7 +24,6 @@ class EventTag(Enum):
 class Event:
     tag: EventTag
     data: bytes | None = None
-    success: bool = False
     completion_type: CompletionType = CompletionType.OP_REQUEST
 
     def serialize(self) -> bytes:
@@ -49,16 +48,3 @@ class Event:
 
 PingEvent = Event(tag=EventTag.PING, data=None).serialize()
 ShutdownEvent = Event(tag=EventTag.SHUTDOWN_FROM_CLIENT, data=None).serialize()
-
-def bvent(tag: EventTag, data: bytes | None = None) -> bytes:
-    """
-    Create a serialized event with the given tag and optional data.
-    
-    Parameters:
-        tag (EventTag): The event tag.
-        data (bytes | None): Optional data for the event.
-        
-    Returns:
-        bytes: Serialized event data.
-    """
-    return Event(tag=tag, data=data).serialize()

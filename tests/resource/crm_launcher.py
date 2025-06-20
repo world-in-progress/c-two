@@ -56,4 +56,4 @@ def stop_mock_crm_by_process():
 
 if __name__ == '__main__':
     start_mock_crm()
-    stop_mock_crm_by_process()
+    stop_mock_crm()
