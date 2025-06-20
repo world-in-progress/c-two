@@ -1,6 +1,6 @@
 # C-Two (0.1.23)
 
-C-Two is a **type-safe Remote Procedure Call (RPC) framework** designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method invocation between client components and Core Resource Models (CRM) with automatic serialization and protocol-agnostic communication.
+C-Two is a **type-safe Remote Procedure Call (RPC) framework** designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method invocation between client **Components** and **Core Resource Models (CRM)** with automatic serialization and protocol-agnostic communication.
 
 ## Framework Overview
 
@@ -27,6 +27,40 @@ Server-side Core Resource Models implementing domain-specific business logic and
 
 ### Transport Layer
 Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (IPC, TCP, HTTP, MCP) with automatic protocol detection, connection management and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
+
+## Installation
+
+### PyPI Installation
+
+Install the latest stable version from PyPI using pip:
+
+```bash
+pip install c-two
+```
+
+### Package Management with uv
+
+For better dependency resolution, use [uv](https://github.com/astral-sh/uv):
+
+```bash
+# Add c-two to your project
+uv add c-two
+```
+
+### Development Installation with uv
+
+For development, testing, or accessing the latest features:
+
+```bash
+# Clone the repository
+git clone https://github.com/world-in-progress/c-two.git
+
+# Navigate to the project directory
+cd c-two
+
+# Install development dependencies
+uv sync
+```
 
 ## Implementation Guide
 
@@ -257,21 +291,6 @@ C-Two is particularly suited for:
 - Python ≥ 3.10
 - Type annotation support
 - Network connectivity for distributed deployment
-
-### Protocol Dependencies
-
-**Core Framework**
-- `pyarrow` - High-performance data serialization
-- `zmq` - ZeroMQ for TCP protocol support
-
-**HTTP Protocol Support**
-- `starlette` - Lightweight ASGI framework for HTTP server
-- `requests` - HTTP client library  
-- `uvicorn` - ASGI server (automatically used by HTTP server)
-
-**Development & Integration**
-- `mcp[cli]` - Model Context Protocol integration
-- `httpx` - Modern HTTP client for advanced scenarios
 
 ---
 
