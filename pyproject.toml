@@ -7,9 +7,9 @@ requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
+    "pyzmq>=27.0.0",
     "requests>=2.32.4",
     "starlette<0.47.0",
-    "zmq>=0.0.0",
 ]
 
 [dependency-groups]

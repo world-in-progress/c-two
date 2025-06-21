@@ -13,7 +13,7 @@ if __name__ == '__main__':
     TCP_ADDRESS = 'tcp://localhost:5555'
     HTTP_ADDRESS = 'http://localhost:5556'
 
-    TEST_ADDRESS = HTTP_ADDRESS
+    TEST_ADDRESS = IPC_ADDRESS
 
     # Grid parameters
     epsg = 2326
