@@ -1,6 +1,7 @@
 import os
 import enum
 import json
+import mmap
 import logging
 import tempfile
 import threading
@@ -24,7 +25,6 @@ class MemoryServer(BaseServer):
         self.region_id = bind_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
-        
         
         # Pre-cleanup the temp directory
         self._cleanup_temp_dir()
@@ -69,21 +69,27 @@ class MemoryServer(BaseServer):
                     # Parse request information from the file name
                     request_id = filename.replace(event_pattern, '').replace('.mem', '')
                     
-                    # Create a Event from the request file content
-                    with open(file_path, 'rb') as f:
-                        data_bytes = f.read()
-                        event = Event.deserialize(data_bytes)
-                        event.request_id = request_id
-                        
+                    # Read event data from the file
+                    with open(file_path, 'r+b') as f:
+                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                            data_bytes = mm.read()
+                            event = Event.deserialize(data_bytes)
+                            event.request_id = request_id
+                    
                     # Clean up the file after processing
                     file_path.unlink(missing_ok=True)
                     return event
-        except FileNotFoundError:
-            logger.warning(f'No memory event files found in {event_dir}')
+                
+        except Exception as e:
+            logger.error(f'Error polling memory events: {e}')
             
         return None
     
     def _serve(self):
+        # Create the control file
+        self._create_control_file()
+        
+        # Start the service loop
         while True:
             # Check if the shutdown event is set
             if self.shutdown_event.is_set():
@@ -102,25 +108,35 @@ class MemoryServer(BaseServer):
         server_thread.daemon = True
         server_thread.start()
         
-        # Create the control file
-        self._create_control_file()
-        
     def _create_response_file(self, event: Event):
         event_dir = self.temp_dir
         
-        # Create the response file with a temporary name
-        response_filename = f'_temp_cc_event_resp_{self.region_id}_{event.request_id}.mem'
-        response_path = event_dir / response_filename
+        # Create the response paths
+        temp_filename = f'cc_event_resp_{self.region_id}_{event.request_id}.temp'
+        final_filename = f'cc_event_resp_{self.region_id}_{event.request_id}.mem'
+        temp_path = event_dir / temp_filename
+        final_path = event_dir / final_filename
+        
+        # Ensure response file does not exist
+        temp_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
 
         # Serialize the event to bytes and write to the response file
-        with open(response_path, 'wb') as f:
-            f.write(event.serialize())
+        data_bytes = event.serialize()
+        data_length = len(data_bytes)
         
+        # Write to a temporary file
+        with open(temp_path, 'w+b') as f:
+            f.truncate(data_length)
+            
+            # Memory map and write data
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+                mm[:data_length] = data_bytes
+                mm.flush()
+
         # Rename the response file to a permanent name
-        final_response_filename = f'cc_event_resp_{self.region_id}_{event.request_id}.mem'
-        final_response_path = event_dir / final_response_filename
-        response_path.rename(final_response_path)
-    
+        temp_path.rename(final_path)
+
     def reply(self, event: Event):
         self._create_response_file(event)
     

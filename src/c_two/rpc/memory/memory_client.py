@@ -1,6 +1,7 @@
 import json
 import time
 import uuid
+import mmap
 import logging
 import tempfile
 from pathlib import Path
@@ -36,17 +37,30 @@ class MemoryClient(BaseClient):
 
     def _create_request_file(self, event: Event):
         """Create a request file for the given Event."""
-        # Create request file with a temporary filename
-        request_filename = f'_temp_cc_event_req_{self.region_id}_{event.request_id}.mem'
-        request_path = self.temp_dir / request_filename
+        # Create the response paths
+        temp_filename = f'cc_event_req_{self.region_id}_{event.request_id}.temp'
+        final_filename = f'cc_event_req_{self.region_id}_{event.request_id}.mem'
+        temp_path = self.temp_dir / temp_filename
+        final_path = self.temp_dir / final_filename
+        
+        # Ensure response file does not exist
+        temp_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
 
-        with open(request_path, 'wb') as f:
-            f.write(event.serialize())
+        # Serialize the event to bytes
+        data_bytes = event.serialize()
+        data_length = len(data_bytes)
+        
+        with open(temp_path, 'w+b') as f:
+            f.truncate(data_length)
+            
+            # Memory map and write data
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+                mm[:data_length] = data_bytes
+                mm.flush()
         
         # Rename the request file to a permanent name
-        final_request_filename = f'cc_event_req_{self.region_id}_{event.request_id}.mem'
-        final_request_path = self.temp_dir / final_request_filename
-        request_path.rename(final_request_path)
+        temp_path.rename(final_path)
     
     def _wait_for_response(self, request_id: str, timeout: float = -1.0) -> Event:
         event_dir = self.temp_dir
@@ -56,8 +70,9 @@ class MemoryClient(BaseClient):
         start_time = time.time()
         while timeout < 0 or time.time() - start_time < timeout:
             if response_path.exists():
-                with open(response_path, 'rb') as f:
-                    response_data = f.read()
+                with open(response_path, 'r+b') as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        response_data = mm.read()
                 response_path.unlink(missing_ok=True)
 
                 # Deserialize Event
