@@ -8,10 +8,9 @@ from starlette.responses import Response
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 
-from .common import wait
-from .base import BaseServer
-from .event_queue import EventQueue
-from ..event import Event, EventTag
+from ..util.wait import wait
+from ..base import BaseServer
+from ..event import Event, EventTag, EventQueue
 
 # Logging Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

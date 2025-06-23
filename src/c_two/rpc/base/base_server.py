@@ -1,5 +1,4 @@
-from ..event import Event
-from .event_queue import EventQueue
+from ..event import Event, EventQueue
 
 class BaseServer:
     def __init__(self, bind_address: str, event_queue: EventQueue | None = None):

@@ -17,15 +17,3 @@ class BaseClient:
     @staticmethod
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
         raise NotImplementedError('This method should be implemented by subclasses.')
-    
-    @staticmethod
-    def shutdown_by_process(process: subprocess.Popen, timeout: float = 1.0) -> bool:
-        """
-        Shutdown the CRM service by terminating the process.
-        
-        Note:
-        This method can only be used if the CRM server process is started with a subprocess.
-        It will attempt to gracefully terminate the process, and if that fails, it will forcefully
-        kill the process after a timeout.
-        """
-        raise NotImplementedError('This method should be implemented by subclasses.')

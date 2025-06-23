@@ -9,14 +9,15 @@ import component as com
 
 if __name__ == '__main__':
     
+    MEMORY_ADDRESS = 'memory://test'
     IPC_ADDRESS = 'ipc:///tmp/zmq_test'
     TCP_ADDRESS = 'tcp://localhost:5555'
     HTTP_ADDRESS = 'http://localhost:5556'
 
-    TEST_ADDRESS = IPC_ADDRESS
+    TEST_ADDRESS = MEMORY_ADDRESS
 
     # Check if CRM is running
-    if cc.message.Client.ping(TEST_ADDRESS):
+    if cc.rpc.Client.ping(TEST_ADDRESS):
         print('CRM is running!\n')
     else:
         print('CRM is not running!\n')

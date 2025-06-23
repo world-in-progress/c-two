@@ -1,10 +1,11 @@
 import zmq
-from ... import error
-from .base import BaseClient
-from ..util.encoding import add_length_prefix, parse_message
-from ..event import Event, EventTag, PingEvent, ShutdownEvent
 
-class TcpClient(BaseClient):
+from ... import error
+from ..base import BaseClient
+from ..event import Event, EventTag
+from ..util.encoding import add_length_prefix, parse_message
+
+class ZmqClient(BaseClient):
     def __init__(self, server_address: str):
         super().__init__(server_address)
         
@@ -66,7 +67,7 @@ class TcpClient(BaseClient):
         socket.connect(server_address)
         
         try:
-            socket.send(PingEvent)
+            socket.send(Event(tag=EventTag.PING).serialize())
             
             response = socket.recv()
             if Event.deserialize(response).tag == EventTag.PONG:
@@ -88,7 +89,7 @@ class TcpClient(BaseClient):
         socket.connect(server_address)
         
         try:
-            socket.send(ShutdownEvent)
+            socket.send(Event(tag=EventTag.SHUTDOWN_FROM_CLIENT).serialize())
             response = socket.recv()
             if Event.deserialize(response).tag == EventTag.SHUTDOWN_ACK:
                 return True

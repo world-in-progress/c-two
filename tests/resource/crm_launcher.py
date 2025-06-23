@@ -15,11 +15,12 @@ TEST_DIR = Path(os.getcwd()).resolve() / 'tests'
 MOCK_CRM_LAUNCHER_PY = TEST_DIR / 'crm.test.py'
 CRM_PROCESS: subprocess.Popen = None
     
+MEMORY_ADDRESS = 'memory://test'
 IPC_ADDRESS = 'ipc:///tmp/zmq_test'
 TCP_ADDRESS = 'tcp://localhost:5555'
 HTTP_ADDRESS = 'http://localhost:5556'
 
-TEST_ADDRESS = HTTP_ADDRESS
+TEST_ADDRESS = MEMORY_ADDRESS
 
 def start_mock_crm():
     global CRM_PROCESS
@@ -39,14 +40,14 @@ def start_mock_crm():
         **kwargs
     )
 
-    while cc.message.Client.ping(TEST_ADDRESS) is False:
+    while cc.rpc.Client.ping(TEST_ADDRESS) is False:
         pass
 
     logger.info(f'Mock CRM process started with PID: {CRM_PROCESS.pid}')
 
 def stop_mock_crm():
     global CRM_PROCESS
-    if cc.message.Client.shutdown(TEST_ADDRESS, 0.5):
+    if cc.rpc.Client.shutdown(TEST_ADDRESS, 0.5):
         
         logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
     else:
@@ -54,7 +55,7 @@ def stop_mock_crm():
 
 def stop_mock_crm_by_process():
     global CRM_PROCESS
-    if cc.message.Client.shutdown_by_process(CRM_PROCESS, 2.0):
+    if cc.rpc.Client.shutdown_by_process(CRM_PROCESS, 2.0):
         logger.info(f'Mock CRM process stopped with PID: {CRM_PROCESS.pid}')
     else:
         logger.error('Failed to stop the Mock CRM process.')

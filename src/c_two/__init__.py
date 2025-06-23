@@ -1,8 +1,7 @@
+from . import rpc
 from . import mcp
 from . import crm
-from . import error
 from . import compo
-from . import message
+from . import error
 from .crm.meta import icrm, iicrm
-from .message.transferable import transfer, auto_transfer, Transferable, transferable
-
+from .rpc.transferable import transfer, auto_transfer, Transferable, transferable

@@ -1,6 +1,6 @@
 from inspect import isfunction
 from typing import TypeVar, cast
-from ..message.transferable import auto_transfer
+from ..rpc.transferable import auto_transfer
 
 T = TypeVar('T')
 

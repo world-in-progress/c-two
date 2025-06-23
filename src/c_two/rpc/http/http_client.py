@@ -1,8 +1,9 @@
 import requests
 
 from ... import error
-from .base import BaseClient
-from ..event import Event, EventTag, PingEvent, ShutdownEvent
+from ..base import BaseClient
+from ..event import Event, EventTag
+from ..util.encoding import add_length_prefix, parse_message
 
 class HttpClient(BaseClient):
     def __init__(self, server_address: str):
@@ -17,7 +18,6 @@ class HttpClient(BaseClient):
     
     def _send_request(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a request to the CRM service and get the response synchronously."""
-        from ..util.encoding import add_length_prefix, parse_message
         
         # Serialize request
         try:
@@ -70,7 +70,7 @@ class HttpClient(BaseClient):
         try:
             response = requests.post(
                 server_address, 
-                data=PingEvent,
+                data=Event(tag=EventTag.PING).serialize(),
                 headers={'Content-Type': 'application/octet-stream'},
                 timeout=timeout
             )
@@ -89,7 +89,7 @@ class HttpClient(BaseClient):
         try:
             response = requests.post(
                 server_address, 
-                data=ShutdownEvent,
+                data=Event(tag=EventTag.SHUTDOWN_FROM_CLIENT).serialize(),
                 headers={'Content-Type': 'application/octet-stream'},
                 timeout=timeout
             )

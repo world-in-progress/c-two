@@ -1,7 +1,7 @@
 import queue
 import threading
 
-from ..event import Event, EventTag, CompletionType
+from .event import Event, EventTag, CompletionType
 
 class EventQueue:
     def __init__(self):
