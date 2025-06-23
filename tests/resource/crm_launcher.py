@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 import c_two as cc
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 TEST_DIR = Path(os.getcwd()).resolve() / 'tests'
@@ -62,4 +62,4 @@ def stop_mock_crm_by_process():
 
 if __name__ == '__main__':
     start_mock_crm()
-    stop_mock_crm()
+    stop_mock_crm_by_process()

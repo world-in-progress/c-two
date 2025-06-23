@@ -7,7 +7,6 @@ from typing import Type, TypeVar, get_type_hints, get_origin, get_args
 
 T = TypeVar('T')
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def generate_crm_template(icrm_class: Type[T], output_path: str | Path) -> None:

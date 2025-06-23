@@ -10,7 +10,6 @@ from ..base import BaseClient
 from ..event import Event, EventTag
 from ..util.encoding import add_length_prefix, parse_message
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class MemoryClient(BaseClient):
@@ -20,7 +19,7 @@ class MemoryClient(BaseClient):
         self.region_id = server_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
-        self.server_info = None
+        self.server_info: dict = {}
 
     def _create_method_event(self, method_name: str, data: bytes | None = None) -> Event:
         """Create a Event for the given method."""
@@ -71,7 +70,11 @@ class MemoryClient(BaseClient):
         try:
             with open(self.control_file, 'r') as f:
                 self.server_info = json.load(f)
-            return True
+                
+            if self.server_info.get('status', '') != 'running':
+                return False
+            else:
+                return True
         except Exception:
             return False
         

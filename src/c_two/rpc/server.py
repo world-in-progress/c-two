@@ -11,8 +11,6 @@ from .zmq import ZmqServer
 from .http import HttpServer
 from .memory import MemoryServer
 
-# Logging Configuration ###################################################################
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Define Stage and State structures for Server ############################################

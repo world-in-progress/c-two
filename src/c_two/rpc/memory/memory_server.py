@@ -1,4 +1,5 @@
 import os
+import enum
 import json
 import logging
 import tempfile
@@ -8,20 +9,22 @@ from pathlib import Path
 from ..base import BaseServer
 from ..event import Event, EventTag, EventQueue
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class MemoryServerState(enum.Enum):
+    STOPPED = 'stopped'
+    RUNNING = 'running'
 
 class MemoryServer(BaseServer):
 
     def __init__(self, bind_address, event_queue: EventQueue | None = None):
         super().__init__(bind_address, event_queue)
         
-        self.region_id = bind_address.replace('memory://', '')
-        self.control_file = None
-        self.active_memory_files: set[str] = set()
         self.shutdown_event = threading.Event()
-        
+        self.region_id = bind_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
+        self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
+        
         
         # Pre-cleanup the temp directory
         self._cleanup_temp_dir()
@@ -42,21 +45,20 @@ class MemoryServer(BaseServer):
         except Exception as e:
             logger.error(f'Failed to clean up temp dir {self.temp_dir}: {e}')
 
-    def _create_control_file(self):
-        control_filename = f'cc_memory_server_{self.region_id}.ctrl'
-        self.control_file = self.temp_dir / control_filename
-        logger.info(f'Creating control file at {self.control_file}')
+    def _create_control_file(self, state: MemoryServerState = MemoryServerState.RUNNING):
         
         # Write the server information to the control file
         server_info = {
             'server_pid': os.getpid(),
             'bind_address': self.bind_address,
             'temp_dir': str(self.temp_dir),
-            'status': 'running'
+            'status': state.value
         }
         
         with open(self.control_file, 'w') as f:
             json.dump(server_info, f, indent=4)
+        
+        logger.debug(f'Created or Updated control file at {self.control_file}')
     
     def _poll_memory_events(self) -> Event | None:
         event_dir = self.temp_dir
@@ -123,6 +125,7 @@ class MemoryServer(BaseServer):
         self._create_response_file(event)
     
     def shutdown(self):
+        self._create_control_file(MemoryServerState.STOPPED)
         self.shutdown_event.set()
     
     def destroy(self):

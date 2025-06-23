@@ -12,8 +12,6 @@ from ..util.wait import wait
 from ..base import BaseServer
 from ..event import Event, EventTag, EventQueue
 
-# Logging Configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 MAXIMUM_WAIT_TIMEOUT = 0.1

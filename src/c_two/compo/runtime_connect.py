@@ -11,8 +11,6 @@ _local = threading.local()
 
 T = TypeVar('T')
 
-# Logging Configuration ###########################################################
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 @overload
