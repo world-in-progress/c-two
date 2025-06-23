@@ -31,9 +31,6 @@ class MemoryServer(BaseServer):
         
         # Create the temp directory if it doesn't exist
         self.temp_dir.mkdir(exist_ok=True, parents=True)
-        
-        # Create the control file
-        self._create_control_file()
     
     def _cleanup_temp_dir(self):
         try:
@@ -104,7 +101,10 @@ class MemoryServer(BaseServer):
         server_thread = threading.Thread(target=self._serve)
         server_thread.daemon = True
         server_thread.start()
-    
+        
+        # Create the control file
+        self._create_control_file()
+        
     def _create_response_file(self, event: Event):
         event_dir = self.temp_dir
         
