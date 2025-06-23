@@ -1,16 +1,45 @@
+import enum
 import logging
 import threading
-from . import common
-from .tcp_server import TcpServer
-from .http_server import HttpServer
-from .event_queue import EventQueue
-from ..util.encoding import parse_message
-from .state import ServerState, ServerStage
-from ..event import Event, EventTag, CompletionType
 
-# Logging Configuration ###########################################################
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from .util.wait import wait
+from .util.encoding import parse_message
+from .event import Event, EventTag, EventQueue, CompletionType
+
+from .base import BaseServer
+from .zmq import ZmqServer
+from .http import HttpServer
+from .memory import MemoryServer
+
 logger = logging.getLogger(__name__)
+
+# Define Stage and State structures for Server ############################################
+@enum.unique
+class ServerStage(enum.Enum):
+    STOPPED = "stopped"
+    STARTED = "started"
+    GRACE = "grace"
+
+class ServerState(object):
+    crm: object | None
+    stage: ServerStage
+    server: BaseServer
+    lock: threading.RLock
+    event_queue: EventQueue
+    server_deallocated: bool
+    termination_event: threading.Event
+    shutdown_events: list[threading.Event]
+
+    def __init__(self, server: BaseServer, event_queue: EventQueue, crm: object):
+        self.crm = crm
+        self.server = server
+        self.event_queue = event_queue
+
+        self.lock = threading.RLock()
+        self.server_deallocated = False
+        self.stage = ServerStage.STOPPED
+        self.termination_event = threading.Event()
+        self.shutdown_events = [self.termination_event]
 
 def _stop_serving(state: ServerState) -> bool:
     # Destroy the server
@@ -129,9 +158,11 @@ class Server:
         
         # Check bind_address protocol and create appropriate server
         if bind_address.startswith(('tcp://', 'ipc://')):
-            self.server = TcpServer(bind_address)
+            self.server = ZmqServer(bind_address)
         elif bind_address.startswith('http://'):
             self.server = HttpServer(bind_address)
+        elif bind_address.startswith('memory://'):
+            self.server = MemoryServer(bind_address)
         else:
             # TODO: Handle other protocols if needed
             raise ValueError(f'Unsupported protocol in bind_address: {bind_address}')
@@ -154,7 +185,7 @@ class Server:
         _stop(self._state)
     
     def wait_for_termination(self, timeout: float | None = None) -> bool:
-        return common.wait(
+        return wait(
             self._state.termination_event.wait,
             self._state.termination_event.is_set,
             timeout=timeout

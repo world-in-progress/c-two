@@ -3,8 +3,6 @@ import logging
 from mcp.server.fastmcp import FastMCP
 from ..compo.runtime_connect import connect_crm
 
-# Logging Configuration ###########################################################
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 _MCP_FUNCTION_REGISTRY: dict = {}

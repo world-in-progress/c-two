@@ -10,8 +10,6 @@ from typing import get_type_hints, get_args, get_origin, Any, Callable
 from .. import error
 from .util.encoding import add_length_prefix
 
-# Logging Configuration ###########################################################
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Global Caches ###################################################################

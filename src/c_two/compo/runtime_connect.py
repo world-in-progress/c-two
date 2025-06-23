@@ -2,17 +2,15 @@ import inspect
 import logging
 import threading
 from functools import wraps
-from typing import ContextManager, Generator, Type, TypeVar, Union, cast, overload
 from contextlib import contextmanager
+from typing import ContextManager, Generator, Type, TypeVar, cast, overload
 
-from ..message.client import Client
+from ..rpc import Client
 
 _local = threading.local()
 
 T = TypeVar('T')
 
-# Logging Configuration ###########################################################
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 @overload

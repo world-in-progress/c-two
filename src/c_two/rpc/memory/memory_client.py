@@ -1,0 +1,163 @@
+import json
+import time
+import uuid
+import mmap
+import logging
+import tempfile
+from pathlib import Path
+
+from ... import error
+from ..base import BaseClient
+from ..event import Event, EventTag
+from ..util.encoding import add_length_prefix, parse_message
+
+logger = logging.getLogger(__name__)
+
+class MemoryClient(BaseClient):
+    def __init__(self, server_address: str):
+        super().__init__(server_address)
+        
+        self.region_id = server_address.replace('memory://', '')
+        self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
+        self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
+        self.server_info: dict = {}
+
+    def _create_method_event(self, method_name: str, data: bytes | None = None) -> Event:
+        """Create a Event for the given method."""
+        try:
+            serialized_method_name = method_name.encode('utf-8')
+            serialized_data = b'' if data is None else data
+            request_id = str(uuid.uuid4())
+            combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
+            event = Event(tag=EventTag.CRM_CALL, data=combined_request, request_id=request_id)
+        except Exception as e:
+            raise error.CRMSerializeOutput(f'Error occurred when serializing request: {e}')
+
+        return event
+
+    def _create_request_file(self, event: Event):
+        """Create a request file for the given Event."""
+        # Create the response paths
+        temp_filename = f'cc_event_req_{self.region_id}_{event.request_id}.temp'
+        final_filename = f'cc_event_req_{self.region_id}_{event.request_id}.mem'
+        temp_path = self.temp_dir / temp_filename
+        final_path = self.temp_dir / final_filename
+        
+        # Ensure response file does not exist
+        temp_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
+
+        # Serialize the event to bytes
+        data_bytes = event.serialize()
+        data_length = len(data_bytes)
+        
+        with open(temp_path, 'w+b') as f:
+            f.truncate(data_length)
+            
+            # Memory map and write data
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+                mm[:data_length] = data_bytes
+                mm.flush()
+        
+        # Rename the request file to a permanent name
+        temp_path.rename(final_path)
+    
+    def _wait_for_response(self, request_id: str, timeout: float = -1.0) -> Event:
+        event_dir = self.temp_dir
+        response_filename = f'cc_event_resp_{self.region_id}_{request_id}.mem'
+        response_path = event_dir / response_filename
+        
+        start_time = time.time()
+        while timeout < 0 or time.time() - start_time < timeout:
+            if response_path.exists():
+                with open(response_path, 'r+b') as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        response_data = mm.read()
+                response_path.unlink(missing_ok=True)
+
+                # Deserialize Event
+                event = Event.deserialize(response_data)
+                return event
+        
+        raise TimeoutError(f'Response timeout for request {request_id}')
+    
+    def connect(self) -> bool:
+        try:
+            with open(self.control_file, 'r') as f:
+                self.server_info = json.load(f)
+                
+            if self.server_info.get('status', '') != 'running':
+                return False
+            else:
+                return True
+        except Exception:
+            return False
+        
+    def call(self, method_name, data: bytes | None = None, timeout: float = -1.0) -> bytes:
+        if not self.connect():
+            raise error.CompoClientError(f'Failed to connect to memory server at {self.server_address}')
+
+        # Create an event for the method call
+        event = self._create_method_event(method_name, data)
+        request_id = event.request_id
+        
+        # Create request file
+        self._create_request_file(event)
+
+        # Wait for response
+        event = self._wait_for_response(request_id, timeout)
+        if event.tag != EventTag.CRM_REPLY:
+            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
+        
+        # Deserialize error and result (same as TcpClient)
+        sub_responses = parse_message(event.data)
+        if len(sub_responses) != 2:
+            raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
+
+        err = error.CCError.deserialize(sub_responses[0])
+        if err:
+            raise err
+        
+        return sub_responses[1]
+    
+    def terminate(self):
+        pass
+    
+    @staticmethod
+    def ping(server_address: str, timeout: float = 0.5) -> bool:
+        try:
+            client = MemoryClient(server_address)
+            return client.connect()
+        except Exception as e:
+            logger.error(f'Failed to ping memory server at {server_address}: {e}')
+            return False
+    
+    @staticmethod
+    def shutdown(server_address: str, timeout: float = 0.5):
+        """Send a shutdown command to the Memory server."""
+        try:
+            client = MemoryClient(server_address)
+            
+            # Check if the server is running
+            if not client.connect():
+                return True # server is not runnning, return True
+            
+            # Create shutdown event
+            request_id = str(uuid.uuid4())
+            shutdown_event = Event(tag=EventTag.SHUTDOWN_FROM_CLIENT, request_id=request_id)
+            
+            # Create request file
+            client._create_request_file(shutdown_event)
+            
+            # Wait for shutdown acknowledgment
+            event = client._wait_for_response(request_id, timeout=timeout)
+
+            # Check the shutdown acknowledgment
+            if event.tag == EventTag.SHUTDOWN_ACK:
+                return True
+            else:
+                raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.SHUTDOWN_ACK}')
+
+        except Exception as e:
+            logger.error(str(e))
+            return False

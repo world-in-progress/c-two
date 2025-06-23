@@ -1,17 +1,14 @@
 import zmq
 import logging
 import threading
-from .base import BaseServer
-from ..event import Event, EventTag
-from .event_queue import EventQueue
+from ..base import BaseServer
+from ..event import Event, EventTag, EventQueue
 
-# Logging Configuration ###########################################################
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 MAXIMUM_WAIT_TIMEOUT = 0.1
 
-class TcpServer(BaseServer):
+class ZmqServer(BaseServer):
     def __init__(self, bind_address: str, event_queue: EventQueue | None = None):
         super().__init__(bind_address, event_queue)
 

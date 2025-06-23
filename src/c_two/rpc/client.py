@@ -3,24 +3,24 @@ import sys
 import signal
 import subprocess
 
-from .base import BaseClient
-from .tcp_client import TcpClient
-from .http_client import HttpClient
+from .zmq import ZmqClient
+from .http import HttpClient
+from .memory import MemoryClient
 
 def _get_client_class(server_address: str):
     """Determine the client class based on the server address."""
     if server_address.startswith(('tcp://', 'ipc://')):
-        return TcpClient
+        return ZmqClient
     elif server_address.startswith('http://'):
         return HttpClient
+    elif server_address.startswith('memory://'):
+        return MemoryClient
     else:
         # TODO: Handle other protocols if needed
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
 
-class Client(BaseClient):
+class Client:
     def __init__(self, server_address: str):
-        super().__init__(server_address)
-
         # Check server_address use TCP or IPC protocol
         client_class = _get_client_class(server_address)
         if client_class:
@@ -45,6 +45,14 @@ class Client(BaseClient):
     
     @staticmethod
     def shutdown_by_process(process: subprocess.Popen, timeout: float = 1.0) -> bool:
+        """
+        Shutdown the CRM service by terminating the process.
+        
+        Note:
+        This method can only be used if the CRM server process is started with a subprocess.
+        It will attempt to gracefully terminate the process, and if that fails, it will forcefully
+        kill the process after a timeout.
+        """
         if not process:
             return True
             

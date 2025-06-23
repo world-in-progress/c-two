@@ -1,20 +1,23 @@
 import os
 import sys
-import signal
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 import c_two as cc
 
+import logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 if __name__ == '__main__':
     
     from crm import Grid
     
+    MEMORY_ADDRESS = 'memory://test'
     IPC_ADDRESS = 'ipc:///tmp/zmq_test'
     TCP_ADDRESS = 'tcp://localhost:5555'
     HTTP_ADDRESS = 'http://localhost:5556'
 
-    TEST_ADDRESS = HTTP_ADDRESS
+    TEST_ADDRESS = MEMORY_ADDRESS
 
     # Grid parameters
     epsg = 2326
@@ -30,7 +33,7 @@ if __name__ == '__main__':
     crm = Grid(epsg, bounds, first_size, subdivide_rules)
     
     # Create CRM server
-    server = cc.message.Server(TEST_ADDRESS, crm)
+    server = cc.rpc.Server(TEST_ADDRESS, crm)
 
     # Run CRM server and handle termination gracefully
     server.start()

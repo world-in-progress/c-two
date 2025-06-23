@@ -1,15 +1,8 @@
 from inspect import isfunction
-from typing import TypeVar, cast, Protocol
-from ..message.transferable import auto_transfer, transfer
-
-class HasConnect(Protocol):
-    @staticmethod
-    def connect(address: str) -> any:
-        ...
-
+from typing import TypeVar, cast
+from ..rpc.transferable import auto_transfer
 
 T = TypeVar('T')
-ConnecttableT = TypeVar('ConnecttableT', bound=HasConnect)
 
 class ICRMMeta(type):
     """

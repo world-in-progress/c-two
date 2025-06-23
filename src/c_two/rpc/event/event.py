@@ -1,8 +1,9 @@
 from __future__ import annotations
 from enum import Enum, unique
 from dataclasses import dataclass
-from .. import error
-from .util.encoding import add_length_prefix, parse_message
+
+from ... import error
+from ..util.encoding import add_length_prefix, parse_message
 
 class CompletionType(Enum):
     OP_REQUEST = 'op_request'       # request for a queue operation
@@ -46,6 +47,3 @@ class Event:
 
         except Exception as e:
             raise error.EventDeserializeError(f'Error occurred when deserialize event: {e}')
-
-PingEvent = Event(tag=EventTag.PING, data=None).serialize()
-ShutdownEvent = Event(tag=EventTag.SHUTDOWN_FROM_CLIENT, data=None).serialize()
