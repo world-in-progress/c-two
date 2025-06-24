@@ -1,5 +1,9 @@
 # C-Two (0.1.24)
 
+<p align="center">
+<img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/logo.png">
+</p>
+
 C-Two is a **type-safe Remote Procedure Call (RPC) framework** designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method invocation between client **Components** and **Core Resource Models (CRM)** with automatic serialization and protocol-agnostic communication.
 
 ## Framework Overview
