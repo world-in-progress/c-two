@@ -1,4 +1,6 @@
-# C-Two (0.1.24)
+# C-Two (Greenhouse v0.2.0)
+
+[![PyPI version](https://badge.fury.io/py/c-two.svg)](https://badge.fury.io/py/c-two)
 
 <p align="center">
 <img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/logo.png">
