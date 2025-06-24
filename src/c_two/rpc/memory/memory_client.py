@@ -17,21 +17,21 @@ class MemoryClient(BaseClient):
     def __init__(self, server_address: str):
         super().__init__(server_address)
         
+        self.server_info: dict = {}
         self.region_id = server_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
-        self.server_info: dict = {}
 
     def _create_method_event(self, method_name: str, data: bytes | None = None) -> Event:
         """Create a Event for the given method."""
         try:
-            serialized_method_name = method_name.encode('utf-8')
-            serialized_data = b'' if data is None else data
             request_id = str(uuid.uuid4())
+            serialized_data = b'' if data is None else data
+            serialized_method_name = method_name.encode('utf-8')
             combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
             event = Event(tag=EventTag.CRM_CALL, data=combined_request, request_id=request_id)
         except Exception as e:
-            raise error.CRMSerializeOutput(f'Error occurred when serializing request: {e}')
+            raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}')
 
         return event
 
@@ -93,7 +93,7 @@ class MemoryClient(BaseClient):
         except Exception:
             return False
         
-    def call(self, method_name, data: bytes | None = None, timeout: float = -1.0) -> bytes:
+    def call(self, method_name, data: bytes | None = None) -> bytes:
         if not self.connect():
             raise error.CompoClientError(f'Failed to connect to memory server at {self.server_address}')
 
@@ -105,11 +105,11 @@ class MemoryClient(BaseClient):
         self._create_request_file(event)
 
         # Wait for response
-        event = self._wait_for_response(request_id, timeout)
+        event = self._wait_for_response(request_id)
         if event.tag != EventTag.CRM_REPLY:
             raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
         
-        # Deserialize error and result (same as TcpClient)
+        # Deserialize error and result
         sub_responses = parse_message(event.data)
         if len(sub_responses) != 2:
             raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')

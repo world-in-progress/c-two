@@ -21,10 +21,6 @@ def connect_crm(address: str) -> ContextManager[Client]:
 def connect_crm(address: str, icrm_class: Type[T]) -> ContextManager[T]:
     ...
 
-@overload
-def connect_crm(crm_instance, icrm_class: Type[T]) -> ContextManager[T]:
-    ...
-
 @contextmanager
 def connect_crm(address: str, icrm_class: Type[T] = None) -> Generator[Client | T, None, None]:
     """

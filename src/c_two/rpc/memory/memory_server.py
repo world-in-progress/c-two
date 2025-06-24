@@ -7,10 +7,13 @@ import tempfile
 import threading
 from pathlib import Path
 
+from ..util.wait import wait
 from ..base import BaseServer
 from ..event import Event, EventTag, EventQueue
 
 logger = logging.getLogger(__name__)
+
+MAXIMUM_WAIT_TIMEOUT = 0.1
 
 class MemoryServerState(enum.Enum):
     STOPPED = 'stopped'
@@ -21,7 +24,9 @@ class MemoryServer(BaseServer):
     def __init__(self, bind_address, event_queue: EventQueue | None = None):
         super().__init__(bind_address, event_queue)
         
-        self.shutdown_event = threading.Event()
+        self._shutdown_event = threading.Event()
+        self._server_started = threading.Event()
+        
         self.region_id = bind_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
@@ -43,8 +48,7 @@ class MemoryServer(BaseServer):
             logger.error(f'Failed to clean up temp dir {self.temp_dir}: {e}')
 
     def _create_control_file(self, state: MemoryServerState = MemoryServerState.RUNNING):
-        
-        # Write the server information to the control file
+        # Write the server information to the temporary control file
         server_info = {
             'server_pid': os.getpid(),
             'bind_address': self.bind_address,
@@ -52,8 +56,14 @@ class MemoryServer(BaseServer):
             'status': state.value
         }
         
-        with open(self.control_file, 'w') as f:
+        temp_control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.temp'
+        with open(temp_control_file, 'w') as f:
             json.dump(server_info, f, indent=4)
+        
+        # Rename the temporary control file to the final name
+        if self.control_file.exists():
+            self.control_file.unlink(missing_ok=True)
+        temp_control_file.rename(self.control_file)
         
         logger.debug(f'Created or Updated control file at {self.control_file}')
     
@@ -86,13 +96,12 @@ class MemoryServer(BaseServer):
         return None
     
     def _serve(self):
-        # Create the control file
-        self._create_control_file()
+        self._server_started.set()
         
         # Start the service loop
         while True:
             # Check if the shutdown event is set
-            if self.shutdown_event.is_set():
+            if self._shutdown_event.is_set():
                 self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
                 break
             
@@ -107,6 +116,16 @@ class MemoryServer(BaseServer):
         server_thread = threading.Thread(target=self._serve)
         server_thread.daemon = True
         server_thread.start()
+        
+        # Wait for the server to start
+        wait(
+            self._server_started.wait(),
+            self._server_started.is_set,
+            MAXIMUM_WAIT_TIMEOUT
+        )
+        
+        # Create the control file
+        self._create_control_file()
         
     def _create_response_file(self, event: Event):
         event_dir = self.temp_dir
@@ -142,7 +161,7 @@ class MemoryServer(BaseServer):
     
     def shutdown(self):
         self._create_control_file(MemoryServerState.STOPPED)
-        self.shutdown_event.set()
+        self._shutdown_event.set()
     
     def destroy(self):
         self._cleanup_temp_dir()
