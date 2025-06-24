@@ -9,8 +9,8 @@ class HttpClient(BaseClient):
     def __init__(self, server_address: str):
         super().__init__(server_address)
         
-        self.server_address = server_address
         self.session = requests.Session()
+        self.server_address = server_address
     
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         """Call a method on the CRM instance via HTTP, blocking like local function call."""
@@ -44,12 +44,12 @@ class HttpClient(BaseClient):
         except requests.RequestException as e:
             raise error.CompoClientError(f'HTTP request failed: {e}')
         
-        # Deserialize Event (same as TcpClient)
+        # Deserialize Event
         event = Event.deserialize(full_response)
         if event.tag != EventTag.CRM_REPLY:
             raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
-        
-        # Deserialize error and result (same as TcpClient)
+
+        # Deserialize error and result
         sub_responses = parse_message(event.data)
         if len(sub_responses) != 2:
             raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')

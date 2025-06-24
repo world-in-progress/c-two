@@ -6,11 +6,14 @@ C-Two is a **type-safe Remote Procedure Call (RPC) framework** designed for dist
 
 C-Two addresses the complexity of distributed computing by implementing a clear separation of concerns through interface-based programming and automatic type marshalling. The framework enables developers to write distributed applications using familiar local programming patterns while maintaining type safety across network boundaries.
 
+Unlike traditional stateless RPC frameworks, C-Two is specifically designed for **resource-oriented computing**, where computational resources maintain state and provide domain-specific operations. This approach is particularly valuable for geographic information systems, scientific computing, and other domains requiring persistent resource management with distributed access patterns.
+
 ### Core Architectural Principles
 
+- **Resource-Oriented Design**: Focus on stateful computational resources rather than stateless function calls
 - **Interface Segregation**: Clean separation between interface definitions (ICRM) and implementations (CRM)
-- **Type Safety**: Compile-time and runtime type checking with automatic serialization inference
-- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (IPC, TCP, HTTP, MCP)
+- **Type Safety**: Compile-time and runtime type checking with automatic or customized serialization inference
+- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (Memory, IPC, TCP, HTTP, MCP)
 - **Resource Isolation**: Encapsulation of computational resources behind well-defined interfaces
 
 ## Architecture
@@ -23,10 +26,10 @@ The framework implements a three-tier architecture:
 Client-side computational units that consume remote resources through Interface of Core Resource Models (ICRM), providing network transparency for distributed operations.
 
 ### CRM Layer
-Server-side Core Resource Models implementing domain-specific business logic and resource management, exposed through standardized ICRM interfaces.
+Server-side Core Resource Models implementing domain-specific business logic and resource management, exposed through standardized ICRM interfaces. CRMs maintain persistent state and provide resource-specific operations.
 
 ### Transport Layer
-Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (IPC, TCP, HTTP, MCP) with automatic protocol detection, connection management and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
+Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
 
 ## Installation
 
@@ -183,11 +186,14 @@ Deploy the CRM as a networked service with automatic protocol detection:
 # Resource initialization and server configuration
 grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
 
-# IPC / TCP server (high-performance, low-latency)
-server = cc.message.Server("tcp://localhost:5555", grid)
-# or
+# TCP server (network-based, cross-machine)
+server = cc.rpc.Server("tcp://localhost:5555", grid)
+
 # HTTP server (web-compatible, cross-platform)
-server = cc.message.Server("http://localhost:8000", grid)
+server = cc.rpc.Server("http://localhost:8000", grid)
+
+# Memory server (shared memory, high-performance local communication)
+server = cc.rpc.Server("memory://grid_region", grid)
 
 # Same server lifecycle management regardless of protocol
 server.start()
@@ -211,14 +217,20 @@ The framework provides seamless protocol-transparent connectivity to CRM service
 
 #### Script-Based Component Approach
 ```python
-# IPC / TCP connection (high-performance)
+# TCP connection (network-based)
 with cc.compo.runtime.connect_crm('tcp://localhost:5555', IGrid) as grid:
     infos = grid.get_grid_infos(1, [0, 1, 2])
     keys = grid.subdivide_grids([1, 1], [0, 1])
     print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
 
-# HTTP connection (web-compatible) - same interface, same code
+# HTTP connection (web-compatible)
 with cc.compo.runtime.connect_crm('http://localhost:8000', IGrid) as grid:
+    infos = grid.get_grid_infos(1, [0, 1, 2])
+    keys = grid.subdivide_grids([1, 1], [0, 1])
+    print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
+
+# Memory connection (shared memory, high-performance local)
+with cc.compo.runtime.connect_crm('memory://grid_region', IGrid) as grid:
     infos = grid.get_grid_infos(1, [0, 1, 2])
     keys = grid.subdivide_grids([1, 1], [0, 1])
     print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
@@ -234,11 +246,12 @@ def process_grids(grid: IGrid, target_level: int) -> list[str]:
     return grid.subdivide_grids([target_level] * len(candidates), candidates)
 
 # Protocol is determined automatically by the address
-result = process_grids(1, crm_address='tcp://localhost:5555')  # Uses TCP
-result = process_grids(1, crm_address='http://localhost:8000')  # Uses HTTP
+result = process_grids(1, crm_address='tcp://localhost:5555')     # Uses TCP
+result = process_grids(1, crm_address='http://localhost:8000')    # Uses HTTP
+result = process_grids(1, crm_address='memory://grid_region')     # Uses Memory
 
 # Or using a context manager with automatic protocol detection
-with cc.compo.runtime.connect_crm('tcp://localhost:5555'):
+with cc.compo.runtime.connect_crm('memory://grid_region'):
     result = process_grids(1)
 ```
 
@@ -257,17 +270,17 @@ if __name__ == '__main__':
     mcp.run()
 ```
 
+
 ## Application Domains
 
-C-Two is particularly suited for:
+C-Two is designed for resource-oriented distributed computing, particularly suitable for:
 
-- **Distributed Scientific Computing**: High-performance computing applications requiring resource distribution
-- **Web-Based Applications**: HTTP protocol support enables seamless web service integration
-- **Microservices Architecture**: Type-safe inter-service communication with flexible protocol selection
-- **Computational Resource Management**: Systems requiring dynamic resource allocation and computation distribution
-- **Cross-Platform Integration**: Unified interface supporting multiple transport protocols
-- **System Integration**: Applications requiring protocol-agnostic communication with external systems
-- **Modular Component Systems**: Reusable computational components across different resource implementations and protocols
+- **Geographic Information Systems**: Spatial data processing, map tile generation, geographic analysis with distributed resource access
+- **Scientific Computing**: Computational models requiring persistent state and distributed access to computational resources
+- **Simulation Systems**: Multi-agent simulations with distributed resource management and state synchronization
+- **Data Processing Pipelines**: Stateful data transformation services with distributed coordination
+- **Computational Resource Management**: Systems requiring dynamic allocation and distributed access to computational resources
+- **Microservices with State**: Service architectures where services maintain persistent computational state
 
 ## Framework Components
 
@@ -278,7 +291,7 @@ C-Two is particularly suited for:
 - **`@auto_transfer`**: Automatic serialization based on type annotations
 - **`@connect`**: Connection injection for component functions
 
-### Runtime Components
+### Runtime Communication
 - **`connect_crm`**: Context manager for CRM connection lifecycle management with automatic protocol detection
 - **`Server`**: CRM service deployment infrastructure with multi-protocol support
 - **`Client`**: Remote resource access client with transparent protocol handling
@@ -290,8 +303,8 @@ C-Two is particularly suited for:
 
 - Python ≥ 3.10
 - Type annotation support
-- Network connectivity for distributed deployment
+- Network connectivity for distributed deployment (TCP, HTTP protocols)
 
 ---
 
-*C-Two provides a principled approach to distributed computing through type-safe abstractions and protocol-agnostic communication, enabling developers to build robust distributed systems with familiar programming patterns.*
+*C-Two provides a principled approach to distributed resource computing through type-safe abstractions and protocol-agnostic communication, enabling developers to build robust distributed systems with persistent computational resources.*
