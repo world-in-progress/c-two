@@ -21,13 +21,9 @@ def _get_client_class(server_address: str):
 
 class Client:
     def __init__(self, server_address: str):
-        # Check server_address use TCP or IPC protocol
+        # Determine the client class based on the server address
         client_class = _get_client_class(server_address)
-        if client_class:
-            self._client = client_class(server_address)
-        else:
-            # TODO: Handle other protocols if needed
-            pass
+        self._client = client_class(server_address)
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         return self._client.call(method_name, data)

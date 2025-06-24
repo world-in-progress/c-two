@@ -72,24 +72,49 @@ class MemoryServer(BaseServer):
         event_pattern = f'cc_event_req_{self.region_id}_'
         
         try:
+            request_files = []
             for filename in os.listdir(str(event_dir)):
                 if filename.startswith(event_pattern) and filename.endswith('.mem'):
-                    file_path = event_dir / filename
+                    try:
+                        file_path = event_dir / filename
+                        stat = file_path.stat()
+                        request_files.append((file_path, stat.st_mtime, filename))
+                    except FileNotFoundError:
+                        # File was deleted while checking, skip it
+                        continue
 
-                    # Parse request information from the file name
-                    request_id = filename.replace(event_pattern, '').replace('.mem', '')
-                    
-                    # Read event data from the file
-                    with open(file_path, 'r+b') as f:
-                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                            data_bytes = mm.read()
-                            event = Event.deserialize(data_bytes)
-                            event.request_id = request_id
-                    
-                    # Clean up the file after processing
-                    file_path.unlink(missing_ok=True)
-                    return event
+            # If no request files, return None
+            if not request_files:
+                return None
+            
+            # Process the earliest file
+            request_files.sort(key=lambda x: x[1]) # sort by modification time
+            file_path, _, filename = request_files[0]
+            
+            # Parse request information from the file name
+            request_id = filename.replace(event_pattern, '').replace('.mem', '')
+            
+            try:
+                # Read event data from the file
+                with open(file_path, 'r+b') as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        data_bytes = mm.read()
+                        event = Event.deserialize(data_bytes)
+                        event.request_id = request_id
                 
+                # Clean up the file after processing
+                file_path.unlink(missing_ok=True)
+                return event
+            
+            except FileNotFoundError:
+                # File was deleted while reading, return None
+                return None
+            
+            except Exception as e:
+                # Delete the corrupted file, return None
+                file_path.unlink(missing_ok=True)
+                return None
+            
         except Exception as e:
             logger.error(f'Error polling memory events: {e}')
             

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import pickle
 import inspect
 import logging
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Global Caches ###################################################################
 
-_TRANSFERABLE_MAP: dict[str, 'Transferable'] = {}
+_TRANSFERABLE_MAP: dict[str, Transferable] = {}
 _TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
 
 # Definition of Transferable ######################################################
@@ -42,18 +43,25 @@ class TransferableMeta(ABCMeta):
         if name != 'Transferable' and hasattr(cls, 'serialize') and hasattr(cls, 'deserialize'):
             if not is_dataclass(cls):
                 cls = dataclass(cls)
+
+            # Register the class except for classes in 'Default' module
+            if cls.__module__ != 'Default':
+                # Register the class in the global transferable map
+                full_name = f'{cls.__module__}.{cls.__name__}' if cls.__module__ else cls.__name__
+                _TRANSFERABLE_MAP[full_name] = cls
                 
-            _TRANSFERABLE_MAP[name] = cls
-            
-            serialize_func = attrs['serialize']
-            serialize_sig = list(inspect.signature(serialize_func).parameters.values())
-            serialize_param_map = {}
-            for param in serialize_sig:
-                serialize_param_map[param.name] = param.annotation
-            _TRANSFERABLE_INFOS.append({
-                'name': name,
-                'param_map': serialize_param_map
-            })
+                # Register the class in the global transferable information list
+                serialize_func = attrs['serialize']
+                serialize_sig = list(inspect.signature(serialize_func).parameters.values())
+                serialize_param_map = {}
+                for param in serialize_sig:
+                    serialize_param_map[param.name] = param.annotation
+                _TRANSFERABLE_INFOS.append({
+                    'name': full_name,
+                    'param_map': serialize_param_map
+                })
+
+                logger.debug(f'Registered transferable: {full_name}')
         return cls
 
 class Transferable(metaclass=TransferableMeta):
@@ -114,6 +122,8 @@ def defaultTransferableFactory(func, is_input: bool):
         
         # Define the dynamic transferable class for input
         class DynamicInputTransferable(Transferable):
+            __module__ = 'Default'  # mark as default
+            
             def serialize(*args) -> bytes:
                 """
                 Default serialization for function input parameters using pickle
@@ -194,6 +204,7 @@ def defaultTransferableFactory(func, is_input: bool):
             class_name,
             (Transferable,),
             {
+                '__module__': 'Default',  # mark as default
                 'serialize': staticmethod(serialize_func),
                 'deserialize': staticmethod(deserialize_func)
             }
@@ -211,8 +222,8 @@ def defaultTransferableFactory(func, is_input: bool):
 # Transferable-related interfaces #################################################
 
 def register_transferable(transferable: Transferable):
-    name = transferable.__name__
-    _TRANSFERABLE_MAP[name] = transferable
+    full_name = f'{transferable.__module__}.{transferable.__name__}' if transferable.__module__ else transferable.__name__
+    _TRANSFERABLE_MAP[full_name] = transferable
 
 def get_transferable(transferable_name: str) -> Transferable | None:
     name = transferable_name
@@ -225,23 +236,22 @@ def transferable(cls: type) -> type:
     A decorator to make a class automatically inherit from Transferable.
     """
     # Dynamically create a new class that inherits from both the original class and Transferable
-    return type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
+    new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
+    new_cls.__module__ = cls.__module__  # preserve the original module
+    new_cls.__qualname__ = cls.__qualname__  # preserve the original qualified name
+    return new_cls
 
-def transfer(input: str | None = None, output: str | None = None) -> callable:
-    
+def transfer(input: Transferable | None = None, output: Transferable | None = None) -> callable:
+
     def decorator(func: callable) -> callable:
         
         def com_to_crm(*args: any) -> any:
             method_name = func.__name__
             
             # Get transferable
-            if input is not None and input not in _TRANSFERABLE_MAP:
-                raise ValueError(f'No transferable defined for method: {input}')
-            if output is not None and output not in _TRANSFERABLE_MAP:
-                raise ValueError(f'No transferable defined for method: {output}')
-            input_transferable = None if input is None else _TRANSFERABLE_MAP[input].serialize
-            output_transferable = None if output is None else _TRANSFERABLE_MAP[output].deserialize
-            
+            input_transferable = input.serialize if input else None
+            output_transferable = output.deserialize if output else None
+
             # Convert input and run method
             if len(args) < 1:
                 raise ValueError('Instance method requires self, but only get one argument.')
@@ -264,13 +274,9 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
         def crm_to_com(*args: any) -> tuple[any, any]:
             
             # Get transferable
-            if input is not None and input not in _TRANSFERABLE_MAP:
-                raise ValueError(f'No transferable defined for method: {input}')
-            if output is not None and output not in _TRANSFERABLE_MAP:
-                raise ValueError(f'No transferable defined for method: {output}')
-            input_transferable = None if input is None else _TRANSFERABLE_MAP[input].deserialize
-            output_transferable = None if output is None else _TRANSFERABLE_MAP[output].serialize
-            
+            input_transferable = input.deserialize if input else None
+            output_transferable = output.serialize if output else None
+
             # Convert input and run method
             try:
                 if len(args) < 1:
@@ -333,12 +339,10 @@ def transfer(input: str | None = None, output: str | None = None) -> callable:
     return decorator
 
 def auto_transfer(direction: str, func = None) -> callable:
-
     def create_wrapper(func: callable) -> callable:
-
         # --- Input Matching using Pydantic Model Comparison ---
         input_model = _create_pydantic_model_from_func_sig(func)
-        input_transferable_name = None
+        input_transferable: Transferable | None = None
 
         if input_model is not None:
             # Get fields from the generated Pydantic model
@@ -352,44 +356,46 @@ def auto_transfer(direction: str, func = None) -> callable:
 
                 # Match if both are empty
                 if is_empty_input and is_empty_registered:
-                    input_transferable_name = info['name']
+                    input_transferable = get_transferable(info['name'])
                     break
 
                 # Match if field names and types align
                 if not is_empty_input and not is_empty_registered:
                     # Compare names first
                     if set(input_model_fields.keys()) == set(registered_param_map.keys()):
-                        # Compare types (more robustly)
+                        # Compare types
                         match = True
                         for name, field_info in input_model_fields.items():
                             # Get the type annotation from Pydantic's FieldInfo
                             pydantic_type = field_info.annotation
                             registered_type = registered_param_map.get(name)
-                            # Simple type comparison (might need refinement for complex types like generics)
+                            # Simple type comparison (TODO: might need refinement for complex types like generics)
                             if pydantic_type != registered_type:
                                 match = False
                                 break
                         if match:
-                            input_transferable_name = info['name']
+                            input_transferable = get_transferable(info['name'])
                             break
 
-            # If no matching transferable found, create a default one
-            if input_transferable_name is None and not is_empty_input:
+            # If no matching transferable found, create a default one (not registered and only used in this function)
+            if input_transferable is None and not is_empty_input:
                 input_transferable = defaultTransferableFactory(func, is_input=True)
-                input_transferable_name = input_transferable.__name__
-                register_transferable(input_transferable)
 
         # --- Output Matching (compares types directly) ---
         type_hints = get_type_hints(func)
-        output_transferable_name = None
+        output_transferable: Transferable | None = None
+        
         if 'return' in type_hints:
             return_type = type_hints['return']
             if return_type is None or return_type is type(None):
-                 output_transferable_name = None
+                 output_transferable = None
             else:
                 return_type_name = getattr(return_type, '__name__', str(return_type))
-                if return_type_name in _TRANSFERABLE_MAP:
-                    output_transferable_name = return_type_name
+                return_type_module = getattr(return_type, '__module__', None)
+                return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
+                
+                if return_type_full_name in _TRANSFERABLE_MAP:
+                    output_transferable = get_transferable(return_type_full_name)
                 else:
                     origin = get_origin(return_type)
                     args = get_args(return_type)
@@ -404,17 +410,15 @@ def auto_transfer(direction: str, func = None) -> callable:
                             registered_param_map = info.get('param_map', {})
                             registered_output_types = list(registered_param_map.values())
                             if expected_output_types == registered_output_types:
-                                output_transferable_name = info['name']
+                                output_transferable = get_transferable(info['name'])
                                 break
                 
-                # If no matching transferable found, create a default one
-                if output_transferable_name is None and not (return_type is None or return_type is type(None)):
+                # If no matching transferable found, create a default one (not registered and only used in this function)
+                if output_transferable is None and not (return_type is None or return_type is type(None)):
                     output_transferable = defaultTransferableFactory(func, is_input=False)
-                    output_transferable_name = output_transferable.__name__
-                    register_transferable(output_transferable)
 
         # --- Wrapping ---
-        transfer_decorator = transfer(input=input_transferable_name, output=output_transferable_name)
+        transfer_decorator = transfer(input=input_transferable, output=output_transferable)
         wrapped_func = transfer_decorator(func)
 
         @wraps(func)
