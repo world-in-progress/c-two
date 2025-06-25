@@ -47,8 +47,7 @@ class TransferableMeta(ABCMeta):
             # Register the class except for classes in 'Default' module
             if cls.__module__ != 'Default':
                 # Register the class in the global transferable map
-                full_name = f'{cls.__module__}.{cls.__name__}' if cls.__module__ else cls.__name__
-                _TRANSFERABLE_MAP[full_name] = cls
+                full_name = register_transferable(cls)
                 
                 # Register the class in the global transferable information list
                 serialize_func = attrs['serialize']
@@ -221,9 +220,10 @@ def defaultTransferableFactory(func, is_input: bool):
 
 # Transferable-related interfaces #################################################
 
-def register_transferable(transferable: Transferable):
+def register_transferable(transferable: Transferable) -> str:
     full_name = f'{transferable.__module__}.{transferable.__name__}' if transferable.__module__ else transferable.__name__
     _TRANSFERABLE_MAP[full_name] = transferable
+    return full_name
 
 def get_transferable(transferable_name: str) -> Transferable | None:
     name = transferable_name

@@ -13,7 +13,8 @@ from .memory import MemoryServer
 
 logger = logging.getLogger(__name__)
 
-# Define Stage and State structures for Server ############################################
+# Stage and State structures for Server ###############################
+
 @enum.unique
 class ServerStage(enum.Enum):
     STOPPED = "stopped"
@@ -41,6 +42,8 @@ class ServerState(object):
         self.termination_event = threading.Event()
         self.shutdown_events = [self.termination_event]
 
+# Common Server Operations ############################################
+
 def _stop_serving(state: ServerState) -> bool:
     # Destroy the server
     state.server.cancel_all_calls()
@@ -55,14 +58,14 @@ def _stop_serving(state: ServerState) -> bool:
 
 def _process_event_and_continue(state: ServerState, event: Event) -> bool:
     """
-    Process the received event and return the response.
+    Process the received event and determine if server should continue running.
     
     Args:
-        event (Event): The received event.
-        crm_instance (object): The CRM instance to call the method on.
+        state (ServerState): The server state containing all necessary information.
+        event (Event): The received event to process.
         
     Returns:
-        Event: The response event.
+        bool: True if server should continue running, False if it should stop.
     """
     should_continue = True
     
@@ -150,9 +153,13 @@ def _start(state: ServerState) -> None:
         thread.daemon = True
         thread.start()
 
+# Server Interface ####################################################
+
 class Server:
-    _state: ServerState
-    
+    """
+    A generic server interface that can handle different types of servers
+    (ZMQ, HTTP, Memory) based on the provided bind address.
+    """
     def __init__(self, bind_address: str, crm: object, name: str = ''):
         self.name = name if name != '' else 'CRM Server'
         
