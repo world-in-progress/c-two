@@ -60,6 +60,39 @@ class HttpClient(BaseClient):
         
         return sub_responses[1]
     
+    def relay(self, event_bytes: bytes) -> bytes:
+        # Send POST request with serialized event as body
+        try:
+            response = self.session.post(
+                self.server_address, 
+                data=event_bytes,
+                headers={'Content-Type': 'application/octet-stream'}
+            )
+            
+            if response.status_code != 200:
+                raise error.CompoClientError(f'HTTP error {response.status_code}')
+                
+            full_response = response.content
+            
+        except requests.RequestException as e:
+            raise error.CompoClientError(f'HTTP request failed: {e}')
+        
+        # Deserialize Event
+        event = Event.deserialize(full_response)
+        if event.tag != EventTag.CRM_REPLY:
+            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
+
+        # Deserialize error and result
+        sub_responses = parse_message(event.data)
+        if len(sub_responses) != 2:
+            raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
+
+        err = error.CCError.deserialize(sub_responses[0])
+        if err:
+            raise err
+        
+        return sub_responses[1]
+    
     def terminate(self):
         """Close the HTTP session."""
         self.session.close()
