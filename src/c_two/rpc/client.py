@@ -31,6 +31,9 @@ class Client:
     def terminate(self):
         self._client.terminate()
     
+    def relay(self, event_bytes: bytes) -> bytes:
+        return self._client.relay(event_bytes)
+    
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         return _get_client_class(server_address).ping(server_address, timeout)

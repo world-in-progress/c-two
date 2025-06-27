@@ -294,10 +294,6 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 err = None
                 
             except Exception as e:
-                error_context = 'input deserialization at CRM side' if 'args_converted' not in locals() else \
-                                'CRM function execution' if 'result' not in locals() else \
-                                'output serialization at CRM side'
-                logger.error(f'Error during {error_context}:\n{e}')
                 result = None
                 if 'args_converted' not in locals():
                     err = error.CRMDeserializeInput(str(e))

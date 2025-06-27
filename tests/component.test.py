@@ -17,7 +17,7 @@ if __name__ == '__main__':
     HTTP_ADDRESS = 'http://localhost:5556/?node-key=tempParentPath_tempChildPath'
     HTTP_ADDRESS = 'http://localhost:5556/api/?node-key=tempParentPath_tempChildPath'
 
-    TEST_ADDRESS = HTTP_ADDRESS
+    TEST_ADDRESS = MEMORY_ADDRESS
 
     # Check if CRM is running
     if cc.rpc.Client.ping(TEST_ADDRESS):
@@ -31,6 +31,8 @@ if __name__ == '__main__':
     # connect_crm returns an ICRM instance that can be used directly.
     # This approach is particularly useful for component scripts.
     with cc.compo.runtime.connect_crm(TEST_ADDRESS, com.IGrid) as grid:
+        grid.no_hello('world')
+        
         print(grid.hello('World'))
         # Check grid 1-0
         parent: com.GridAttribute = grid.get_grid_infos(1, [0])[0]

@@ -270,6 +270,9 @@ class IGrid:
         
     def hello(self, name: str) -> str:
         ...
+    
+    def no_hello(self, message: str) -> str | None:
+        ...
 
 # Helpers ##################################################
 

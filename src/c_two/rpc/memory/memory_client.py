@@ -123,6 +123,49 @@ class MemoryClient(BaseClient):
     def terminate(self):
         pass
     
+    def relay(self, event_bytes: bytes) -> bytes:
+        request_id = str(uuid.uuid4())
+        
+        # Create the response paths
+        temp_filename = f'cc_event_req_{self.region_id}_{request_id}.temp'
+        final_filename = f'cc_event_req_{self.region_id}_{request_id}.mem'
+        temp_path = self.temp_dir / temp_filename
+        final_path = self.temp_dir / final_filename
+        
+        # Ensure response file does not exist
+        temp_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
+
+        # Write the event bytes to a temporary file
+        data_length = len(event_bytes)
+        
+        with open(temp_path, 'w+b') as f:
+            f.truncate(data_length)
+            
+            # Memory map and write data
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+                mm[:data_length] = event_bytes
+                mm.flush()
+        
+        # Rename the request file to a permanent name
+        temp_path.rename(final_path)
+
+        # Wait for response
+        event = self._wait_for_response(request_id)
+        if event.tag != EventTag.CRM_REPLY:
+            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
+        
+        # Deserialize error and result
+        sub_responses = parse_message(event.data)
+        if len(sub_responses) != 2:
+            raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
+
+        err = error.CCError.deserialize(sub_responses[0])
+        if err:
+            raise err
+        
+        return sub_responses[1]
+    
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         try:

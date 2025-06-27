@@ -10,6 +10,9 @@ class BaseClient:
     def terminate(self):
         raise NotImplementedError('This method should be implemented by subclasses.')
     
+    def relay(self, event_bytes: bytes) -> bytes:
+        raise NotImplementedError('This method should be implemented by subclasses.')
+    
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         raise NotImplementedError('This method should be implemented by subclasses.')
