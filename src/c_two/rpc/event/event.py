@@ -43,6 +43,9 @@ class Event:
                 raise ValueError('Event content is empty')
 
             tag_bytes, data = parse_message(content)
+            # 打印为16进制
+            print('tag:', tag_bytes.hex())
+            print('data:', data.hex())
             return Event(tag=EventTag(tag_bytes.tobytes().decode('utf-8')), data=data)
 
         except Exception as e:
