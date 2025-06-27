@@ -148,6 +148,10 @@ def defaultTransferableFactory(func, is_input: bool):
                 Returns either the original dict mapping or tuple of args.
                 """
                 try:
+                    # Handle None case
+                    if not data:
+                        return None
+                    
                     unpickled = pickle.loads(data)
                     
                     if isinstance(unpickled, dict):
@@ -196,7 +200,7 @@ def defaultTransferableFactory(func, is_input: bool):
             serialize_func = lambda *args: pickle.dumps(args)
         else:
             serialize_func = lambda arg: pickle.dumps(arg)
-        deserialize_func = lambda data: pickle.loads(data)
+        deserialize_func = lambda data: pickle.loads(data) if data else None # handle None case
 
         # Define the dynamic transferable class for output
         DynamicOutputTransferable = type(
