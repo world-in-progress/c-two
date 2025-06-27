@@ -1,9 +1,11 @@
 from __future__ import annotations
 from enum import Enum, unique
 from dataclasses import dataclass
-
+import logging
 from ... import error
 from ..util.encoding import add_length_prefix, parse_message
+
+logger = logging.getLogger(__name__)
 
 class CompletionType(Enum):
     OP_REQUEST = 'op_request'       # request for a queue operation
@@ -43,9 +45,9 @@ class Event:
                 raise ValueError('Event content is empty')
 
             tag_bytes, data = parse_message(content)
-            # 打印为16进制
-            print('tag:', tag_bytes.hex())
-            print('data:', data.hex())
+            
+            logger.info('tag: %s', tag_bytes.hex())
+            logger.info('data: %s', data.hex())
             return Event(tag=EventTag(tag_bytes.tobytes().decode('utf-8')), data=data)
 
         except Exception as e:
