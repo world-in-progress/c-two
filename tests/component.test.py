@@ -18,7 +18,7 @@ if __name__ == '__main__':
     HTTP_ADDRESS = 'http://localhost:5556/?node-key=tempParentPath_tempChildPath'
     HTTP_ADDRESS = 'http://localhost:5556/api/?node-key=tempParentPath_tempChildPath'
 
-    TEST_ADDRESS = MEMORY_ADDRESS
+    TEST_ADDRESS = TCP_ADDRESS
 
     # Check if CRM is running
     if cc.rpc.Client.ping(TEST_ADDRESS):
