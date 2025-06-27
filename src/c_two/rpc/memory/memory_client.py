@@ -151,20 +151,19 @@ class MemoryClient(BaseClient):
         temp_path.rename(final_path)
 
         # Wait for response
-        event = self._wait_for_response(request_id)
-        if event.tag != EventTag.CRM_REPLY:
-            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
+        event_dir = self.temp_dir
+        response_filename = f'cc_event_resp_{self.region_id}_{request_id}.mem'
+        response_path = event_dir / response_filename
         
-        # Deserialize error and result
-        sub_responses = parse_message(event.data)
-        if len(sub_responses) != 2:
-            raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
+        while True:
+            if response_path.exists():
+                with open(response_path, 'r+b') as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        response_data = mm.read()
+                response_path.unlink(missing_ok=True)
 
-        err = error.CCError.deserialize(sub_responses[0])
-        if err:
-            raise err
-        
-        return sub_responses[1]
+                # Return Event bytes
+                return response_data
     
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
