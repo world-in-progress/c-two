@@ -20,8 +20,8 @@ class HttpServer(BaseServer):
     def __init__(self, bind_address: str, event_queue: EventQueue | None = None):
         super().__init__(bind_address, event_queue)
         
-        # Parse bind address (e.g., "http://0.0.0.0:8000" -> host="0.0.0.0", port=8000)
-        self.host, self.port = self._parse_bind_address(bind_address)
+        # Parse bind address (e.g., "http://0.0.0.0:8000/path" -> host="0.0.0.0", port=8000, path="/path")
+        self.host, self.port, self.path = self._parse_bind_address(bind_address)
         
         self.app = None
         self.server = None
@@ -30,21 +30,29 @@ class HttpServer(BaseServer):
         self._shutdown_event = threading.Event()
         self.response_futures: dict[str, asyncio.Future] = {}
         
-    def _parse_bind_address(self, bind_address: str) -> tuple[str, int]:
-        """Parse HTTP bind address like 'http://0.0.0.0:8000'"""
+    def _parse_bind_address(self, bind_address: str) -> tuple[str, int, str]:
+        """Parse HTTP bind address like 'http://0.0.0.0:8000/path?query=value'"""
         if bind_address.startswith('http://'):
             address = bind_address[7:]  # remove 'http://'
         else:
             address = bind_address
+        
+        # Split address and path (including query parameters)
+        if '/' in address:
+            address_part, path = address.split('/', 1)
+            path = '/' + path  # ensure path starts with /
+        else:
+            address_part = address
+            path = '/'
             
-        if ':' in address:
-            host, port_str = address.rsplit(':', 1)
+        if ':' in address_part:
+            host, port_str = address_part.rsplit(':', 1)
             port = int(port_str)
         else:
-            host = address
+            host = address_part
             port = 8000
             
-        return host, port
+        return host, port, path
     
     def _create_app(self) -> Starlette:
         """Create Starlette application with single POST handler"""
@@ -55,6 +63,16 @@ class HttpServer(BaseServer):
                 # Check if shutdown is requested
                 if self._shutdown_event.is_set():
                     return Response(b'Server is shutting down', status_code=503)
+                
+                # Validate query parameters if specified in bind_address
+                if '?' in self.path:
+                    expected_query = self.path.split('?', 1)[1]
+                    actual_query = str(request.url.query)
+                    if actual_query != expected_query:
+                        return Response(
+                            f'Query parameters mismatch. Expected: {expected_query}, Got: {actual_query}'.encode(), 
+                            status_code=400
+                        )
                 
                 # Get request body as bytes
                 body = await request.body()
@@ -91,9 +109,15 @@ class HttpServer(BaseServer):
                 logger.error(f'Error handling HTTP request: {e}')
                 return Response(f'Error: {e}'.encode(), status_code=500)
         
-        # Single route for all requests
+        # Create route that matches the exact path (including query parameters)
+        # Split path and query for route configuration
+        if '?' in self.path:
+            route_path = self.path.split('?')[0]  # Use only the path part for routing
+        else:
+            route_path = self.path
+            
         routes = [
-            Route('/', handle_request, methods=['POST']),
+            Route(route_path, handle_request, methods=['POST']),
         ]
         
         app = Starlette(routes=routes)
@@ -137,7 +161,7 @@ class HttpServer(BaseServer):
             )
             self.server = uvicorn.Server(config)
 
-            logger.info(f'Starting HTTP server on {self.host}:{self.port}')
+            logger.info(f'Starting HTTP server on {self.host}:{self.port}{self.path}')
             
             # Signal that server is ready
             self._server_started.set()
@@ -181,7 +205,7 @@ class HttpServer(BaseServer):
             MAXIMUM_WAIT_TIMEOUT,
         )
         
-        logger.info(f'HTTP server thread started for {self.host}:{self.port}')
+        logger.info(f'HTTP server thread started for {self.host}:{self.port}{self.path}')
     
     def reply(self, event: Event):
         """Send reply to HTTP client - this is the ONLY place that responds to clients"""

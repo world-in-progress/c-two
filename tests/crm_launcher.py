@@ -18,9 +18,11 @@ CRM_PROCESS: subprocess.Popen = None
 MEMORY_ADDRESS = 'memory://test'
 IPC_ADDRESS = 'ipc:///tmp/zmq_test'
 TCP_ADDRESS = 'tcp://localhost:5555'
-HTTP_ADDRESS = 'http://localhost:5556'
+HTTP_ADDRESS = 'http://localhost:5556/?node-key=tempParentPath_tempChildPath'
+HTTP_ADDRESS = 'http://localhost:5556/hahaha'
+HTTP_ADDRESS = 'http://localhost:5556/api/?node-key=tempParentPath_tempChildPath'
 
-TEST_ADDRESS = MEMORY_ADDRESS
+TEST_ADDRESS = HTTP_ADDRESS
 
 def start_mock_crm():
     global CRM_PROCESS
