@@ -5,11 +5,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 import c_two as cc
 
-import component as com
+# import component as com
+from ihello import IHello
 
 if __name__ == '__main__':
     
-    MEMORY_ADDRESS = 'memory://test'
+    MEMORY_ADDRESS = 'memory://root_hello'
     IPC_ADDRESS = 'ipc:///tmp/zmq_test'
     TCP_ADDRESS = 'tcp://localhost:5555'
     HTTP_ADDRESS = 'http://localhost:5556'
