@@ -494,7 +494,7 @@ class Grid(IGrid):
     def hello(self, name: str) -> str:
         return f'Hello, {name}!'
     
-    def no_hello(self, message: str) -> str | None:
+    def none_hello(self, message: str) -> str | None:
         if message == 'world':
             return None
         return f'Hello, {message}!'
