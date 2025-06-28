@@ -360,37 +360,37 @@ def auto_transfer(direction: str, func = None) -> callable:
             input_model_fields = getattr(input_model, 'model_fields', {})
 
             is_empty_input = not bool(input_model_fields)
+            if not is_empty_input:
+                for info in _TRANSFERABLE_INFOS:
+                    # Safe matching, ensure module names match
+                    if info.get('module') != func.__module__:
+                        continue
+                    
+                    registered_param_map = info.get('param_map', {})
+                    is_empty_registered = not bool(registered_param_map)
 
-            for info in _TRANSFERABLE_INFOS:
-                # Safe matching, ensure module names match
-                if info.get('module') != func.__module__:
-                    continue
-                
-                registered_param_map = info.get('param_map', {})
-                is_empty_registered = not bool(registered_param_map)
+                    # Match if both are empty
+                    # if is_empty_input and is_empty_registered:
+                    #     input_transferable = get_transferable(info['name'])
+                    #     break
 
-                # Match if both are empty
-                if is_empty_input and is_empty_registered:
-                    input_transferable = get_transferable(info['name'])
-                    break
-
-                # Match if field names and types align
-                if not is_empty_input and not is_empty_registered:
-                    # Compare names first
-                    if set(input_model_fields.keys()) == set(registered_param_map.keys()):
-                        # Compare types
-                        match = True
-                        for name, field_info in input_model_fields.items():
-                            # Get the type annotation from Pydantic's FieldInfo
-                            pydantic_type = field_info.annotation
-                            registered_type = registered_param_map.get(name)
-                            # Simple type comparison (TODO: might need refinement for complex types like generics)
-                            if pydantic_type != registered_type:
-                                match = False
+                    # Match if field names and types align
+                    if not is_empty_input and not is_empty_registered:
+                        # Compare names first
+                        if set(input_model_fields.keys()) == set(registered_param_map.keys()):
+                            # Compare types
+                            match = True
+                            for name, field_info in input_model_fields.items():
+                                # Get the type annotation from Pydantic's FieldInfo
+                                pydantic_type = field_info.annotation
+                                registered_type = registered_param_map.get(name)
+                                # Simple type comparison (TODO: might need refinement for complex types like generics)
+                                if pydantic_type != registered_type:
+                                    match = False
+                                    break
+                            if match:
+                                input_transferable = get_transferable(info['name'])
                                 break
-                        if match:
-                            input_transferable = get_transferable(info['name'])
-                            break
 
             # If no matching transferable found, create a default one (not registered and only used in this function)
             if input_transferable is None and not is_empty_input:
@@ -438,14 +438,14 @@ def auto_transfer(direction: str, func = None) -> callable:
         transfer_decorator = transfer(input=input_transferable, output=output_transferable)
         wrapped_func = transfer_decorator(func)
 
-        @wraps(func)
-        def final_wrapper(*args, **kwargs):
-             return wrapped_func(*args, **kwargs)
+        # @wraps(func)
+        # def final_wrapper(*args, **kwargs):
+        #      return wrapped_func(*args, **kwargs)
             
         if direction == '->':
-            return final_wrapper
+            return wrapped_func
         elif direction == '<-':
-            func.__wrapped__ = final_wrapper
+            func.__wrapped__ = wrapped_func
             return func
         else:
             raise ValueError(f'Invalid direction value: {direction}. Expected "->" or "<-".')
