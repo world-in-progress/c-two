@@ -268,7 +268,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 result_bytes = obj.client.call(method_name, args_converted)
                 logger.info('Deserializing result ...')
                 logger.info(f'Result bytes content is {result_bytes.hex()}')  # Log the hex representation of result bytes
-                bytes_data = bytes.fromhex(result_bytes.hex()) if isinstance(result_bytes, memoryview) else result_bytes
+                bytes_data = bytes.fromhex(result_bytes.hex())
                 import pickle
                 logger.info (f'Pickled results is {pickle.loads(bytes_data)}')
                 result =  None if not output_transferable else output_transferable(result_bytes)
