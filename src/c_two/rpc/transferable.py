@@ -273,6 +273,10 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             try:
                 args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 result_bytes = obj.client.call(method_name, args_converted)
+                logger.info('-OUT- Deserializing result ...')
+                logger.info(f'-OUT- Result bytes content is {result_bytes.hex()}')  # Log the hex representation of result bytes
+                bytes_data = bytes.fromhex(result_bytes.hex())
+                logger.info (f'-OUT- Pickled results is {pickle.loads(bytes_data)}')
                 return None if not output_transferable else output_transferable(result_bytes)
             except Exception as e:
                 if 'args_converted' not in locals():
