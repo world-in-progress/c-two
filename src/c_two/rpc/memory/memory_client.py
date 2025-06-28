@@ -80,6 +80,7 @@ class MemoryClient(BaseClient):
                 # Deserialize Event
                 logger.info('Deserializing event ...')
                 event = Event.deserialize(response_data)
+                logger.info(f'Received event: {event.tag}, Request ID: {event.request_id}')
                 return event
         
         raise TimeoutError(f'Response timeout for request {request_id}')
@@ -120,6 +121,7 @@ class MemoryClient(BaseClient):
 
         logger.info('Deserializing error ...')
         err = error.CCError.deserialize(sub_responses[0])
+        logger.info(f'Error: {err}')
         if err:
             raise err
 
