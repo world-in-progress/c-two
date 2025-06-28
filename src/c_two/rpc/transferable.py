@@ -88,6 +88,24 @@ class Transferable(metaclass=TransferableMeta):
 
 # Default Transferable Creation Factory ###########################################
 
+def _default_serialize_func(*args):
+    """Default serialization function for output transferables."""
+    try:
+        if len(args) == 1:
+            return pickle.dumps(args[0])
+        else:
+            return pickle.dumps(args)
+    except Exception as e:
+        logger.error(f'Failed to serialize output data: {e}')
+        raise
+    
+def _default_deserialize_func(data: memoryview | None):
+    logger.info('Deserializing result ...')
+    logger.info(f'Result bytes content is {data.hex()}')  # Log the hex representation of result bytes
+    bytes_data = bytes.fromhex(data.hex())
+    logger.info (f'Pickled results is {pickle.loads(bytes_data)}')
+    return pickle.loads(bytes_data) if bytes_data else None
+
 def defaultTransferableFactory(func, is_input: bool):
     """
     Factory function to dynamically create a Transferable class for a given function.
@@ -192,22 +210,16 @@ def defaultTransferableFactory(func, is_input: bool):
         # Create dynamic class name for output
         class_name = f'Default{func.__name__.title()}OutputTransferable'
         
-        def default_deserialize_func(data: memoryview | None):
-            logger.info('Deserializing result ...')
-            logger.info(f'Result bytes content is {data.hex()}')  # Log the hex representation of result bytes
-            bytes_data = bytes.fromhex(data.hex())
-            logger.info (f'Pickled results is {pickle.loads(bytes_data)}')
-            return pickle.loads(bytes_data) if bytes_data else None
-        
         # Create transferable for function return value
         type_hints = get_type_hints(func)
         return_type = type_hints['return']
-        origin = get_origin(return_type)
-        if origin is tuple:
-            serialize_func = lambda *args: pickle.dumps(args)
-        else:
-            serialize_func = lambda arg: pickle.dumps(arg)
-        deserialize_func = default_deserialize_func
+        # origin = get_origin(return_type)
+        # if origin is tuple:
+        #     serialize_func = lambda *args: pickle.dumps(args)
+        # else:
+        #     serialize_func = lambda arg: pickle.dumps(arg)
+        serialize_func = _default_serialize_func
+        deserialize_func = _default_deserialize_func
 
         # Define the dynamic transferable class for output
         DynamicOutputTransferable = type(

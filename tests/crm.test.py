@@ -21,7 +21,7 @@ if __name__ == '__main__':
     HTTP_ADDRESS = 'http://localhost:5556'
     HTTP_ADDRESS = 'http://localhost:5556/api/?node-key=tempParentPath_tempChildPath'
 
-    TEST_ADDRESS = TCP_ADDRESS
+    TEST_ADDRESS = MEMORY_ADDRESS
 
     # Grid parameters
     # epsg = 2326
