@@ -1,4 +1,3 @@
-import os
 import json
 import time
 import uuid
@@ -165,7 +164,7 @@ class MemoryClient(BaseClient):
 
                 # Return Event bytes
                 return response_data
-    
+
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         try:
