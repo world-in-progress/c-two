@@ -78,6 +78,7 @@ class MemoryClient(BaseClient):
                 response_path.unlink(missing_ok=True)
 
                 # Deserialize Event
+                logger.info('Deserializing event ...')
                 event = Event.deserialize(response_data)
                 return event
         
@@ -112,14 +113,17 @@ class MemoryClient(BaseClient):
             raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
         
         # Deserialize error and result
+        logger.info('Deserializing sub response ...')
         sub_responses = parse_message(event.data)
         if len(sub_responses) != 2:
             raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
 
+        logger.info('Deserializing error ...')
         err = error.CCError.deserialize(sub_responses[0])
         if err:
             raise err
-        
+
+        logger.info('Deserializing result ...')
         return sub_responses[1]
     
     def terminate(self):
