@@ -29,7 +29,6 @@ class MemoryServer(BaseServer):
         
         self.region_id = bind_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
-        # self.temp_dir = Path(os.getcwd()) / 'temp' / f'{self.region_id}'
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
         
         # Pre-cleanup the temp directory

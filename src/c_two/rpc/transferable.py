@@ -99,13 +99,9 @@ def _default_serialize_func(*args):
     except Exception as e:
         logger.error(f'Failed to serialize output data: {e}')
         raise
-    
+
 def _default_deserialize_func(data: memoryview | None):
-    logger.info('Deserializing result ...')
-    logger.info(f'Result bytes content is {data.hex()}')  # Log the hex representation of result bytes
-    bytes_data = bytes.fromhex(data.hex())
-    logger.info (f'Pickled results is {pickle.loads(bytes_data)}')
-    return pickle.loads(bytes_data) if bytes_data else None
+    return pickle.loads(data) if data else None
 
 def defaultTransferableFactory(func, is_input: bool):
     """
@@ -214,11 +210,6 @@ def defaultTransferableFactory(func, is_input: bool):
         # Create transferable for function return value
         type_hints = get_type_hints(func)
         return_type = type_hints['return']
-        # origin = get_origin(return_type)
-        # if origin is tuple:
-        #     serialize_func = lambda *args: pickle.dumps(args)
-        # else:
-        #     serialize_func = lambda arg: pickle.dumps(arg)
         serialize_func = _default_serialize_func
         deserialize_func = _default_deserialize_func
 
@@ -286,11 +277,6 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             try:
                 args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 result_bytes = obj.client.call(method_name, args_converted)
-                logger.info('-OUT- Deserializing result ...')
-                logger.info(f'-OUT- Result bytes content is {result_bytes.hex()}')  # log the hex representation of result bytes
-                bytes_data = bytes.fromhex(result_bytes.hex())
-                logger.info (f'-OUT- Pickled results is {pickle.loads(bytes_data)}')
-                logger.info(f'-OUT- output_transferable code is {output_transferable}')
                 return None if not output_transferable else output_transferable(result_bytes)
             except Exception as e:
                 if 'args_converted' not in locals():

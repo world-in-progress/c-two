@@ -21,7 +21,6 @@ class MemoryClient(BaseClient):
         self.server_info: dict = {}
         self.region_id = server_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
-        # self.temp_dir = Path(os.getcwd()) / 'temp' / f'{self.region_id}'
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
 
     def _create_method_event(self, method_name: str, data: bytes | None = None) -> Event:
@@ -78,9 +77,7 @@ class MemoryClient(BaseClient):
                 response_path.unlink(missing_ok=True)
 
                 # Deserialize Event
-                logger.info('Deserializing event ...')
                 event = Event.deserialize(response_data)
-                logger.info(f'Received event: {event.tag}, Request ID: {event.request_id}')
                 return event
         
         raise TimeoutError(f'Response timeout for request {request_id}')
@@ -114,14 +111,11 @@ class MemoryClient(BaseClient):
             raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
         
         # Deserialize error and result
-        logger.info('Deserializing sub response ...')
         sub_responses = parse_message(event.data)
         if len(sub_responses) != 2:
             raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
 
-        logger.info('Deserializing error ...')
         err = error.CCError.deserialize(sub_responses[0])
-        logger.info(f'Error: {err}')
         if err:
             raise err
 

@@ -45,9 +45,6 @@ class Event:
                 raise ValueError('Event content is empty')
 
             tag_bytes, data = parse_message(content)
-            
-            logger.info('tag: %s', tag_bytes.hex())
-            logger.info('data: %s', data.hex())
             return Event(tag=EventTag(tag_bytes.tobytes().decode('utf-8')), data=data)
 
         except Exception as e:
