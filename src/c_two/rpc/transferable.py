@@ -192,6 +192,13 @@ def defaultTransferableFactory(func, is_input: bool):
         # Create dynamic class name for output
         class_name = f'Default{func.__name__.title()}OutputTransferable'
         
+        def default_deserialize_func(data: memoryview | None):
+            logger.info('Deserializing result ...')
+            logger.info(f'Result bytes content is {data.hex()}')  # Log the hex representation of result bytes
+            bytes_data = bytes.fromhex(data.hex())
+            logger.info (f'Pickled results is {pickle.loads(bytes_data)}')
+            return pickle.loads(bytes_data) if bytes_data else None
+        
         # Create transferable for function return value
         type_hints = get_type_hints(func)
         return_type = type_hints['return']
@@ -200,7 +207,7 @@ def defaultTransferableFactory(func, is_input: bool):
             serialize_func = lambda *args: pickle.dumps(args)
         else:
             serialize_func = lambda arg: pickle.dumps(arg)
-        deserialize_func = lambda data: pickle.loads(data) if data else None # handle None case
+        deserialize_func = default_deserialize_func
 
         # Define the dynamic transferable class for output
         DynamicOutputTransferable = type(
@@ -266,14 +273,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             try:
                 args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 result_bytes = obj.client.call(method_name, args_converted)
-                logger.info('Deserializing result ...')
-                logger.info(f'Result bytes content is {result_bytes.hex()}')  # Log the hex representation of result bytes
-                bytes_data = bytes.fromhex(result_bytes.hex())
-                import pickle
-                logger.info (f'Pickled results is {pickle.loads(bytes_data)}')
-                result =  None if not output_transferable else output_transferable(result_bytes)
-                logger.info(f'Result: {result}')
-                return result
+                return None if not output_transferable else output_transferable(result_bytes)
             except Exception as e:
                 if 'args_converted' not in locals():
                     raise error.CompoSerializeInput(str(e))
