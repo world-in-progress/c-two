@@ -57,6 +57,7 @@ class TransferableMeta(ABCMeta):
                     serialize_param_map[param.name] = param.annotation
                 _TRANSFERABLE_INFOS.append({
                     'name': full_name,
+                    'module': cls.__module__,
                     'param_map': serialize_param_map
                 })
 
@@ -286,7 +287,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 result_bytes = obj.client.call(method_name, args_converted)
                 logger.info('-OUT- Deserializing result ...')
-                logger.info(f'-OUT- Result bytes content is {result_bytes.hex()}')  # Log the hex representation of result bytes
+                logger.info(f'-OUT- Result bytes content is {result_bytes.hex()}')  # log the hex representation of result bytes
                 bytes_data = bytes.fromhex(result_bytes.hex())
                 logger.info (f'-OUT- Pickled results is {pickle.loads(bytes_data)}')
                 logger.info(f'-OUT- output_transferable code is {output_transferable}')
@@ -375,6 +376,10 @@ def auto_transfer(direction: str, func = None) -> callable:
             is_empty_input = not bool(input_model_fields)
 
             for info in _TRANSFERABLE_INFOS:
+                # Safe matching, ensure module names match
+                if info.get('module') != func.__module__:
+                    continue
+                
                 registered_param_map = info.get('param_map', {})
                 is_empty_registered = not bool(registered_param_map)
 
@@ -431,6 +436,8 @@ def auto_transfer(direction: str, func = None) -> callable:
 
                     if expected_output_types:
                         for info in _TRANSFERABLE_INFOS:
+                            if info.get('module') != func.__module__:
+                                continue
                             registered_param_map = info.get('param_map', {})
                             registered_output_types = list(registered_param_map.values())
                             if expected_output_types == registered_output_types:
