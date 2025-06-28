@@ -273,7 +273,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             try:
                 args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 result_bytes = obj.client.call(method_name, args_converted)
-                return None if not output_transferable else output_transferable(result_bytes)
+                return None if not output_transferable else output_transferable(result_bytes.tobytes())
             except Exception as e:
                 if 'args_converted' not in locals():
                     raise error.CompoSerializeInput(str(e))
