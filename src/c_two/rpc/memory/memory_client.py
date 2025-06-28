@@ -125,7 +125,6 @@ class MemoryClient(BaseClient):
         if err:
             raise err
 
-        logger.info('Deserializing result ...')
         return sub_responses[1]
     
     def terminate(self):

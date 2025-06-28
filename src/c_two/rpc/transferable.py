@@ -277,6 +277,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 logger.info(f'-OUT- Result bytes content is {result_bytes.hex()}')  # Log the hex representation of result bytes
                 bytes_data = bytes.fromhex(result_bytes.hex())
                 logger.info (f'-OUT- Pickled results is {pickle.loads(bytes_data)}')
+                logger.info(f'-OUT- output_transferable code is {output_transferable}')
                 return None if not output_transferable else output_transferable(result_bytes)
             except Exception as e:
                 if 'args_converted' not in locals():
