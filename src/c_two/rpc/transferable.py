@@ -267,6 +267,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 result_bytes = obj.client.call(method_name, args_converted)
                 logger.info('Deserializing result ...')
+                logger.info(f'Result bytes content is {result_bytes}')
                 result =  None if not output_transferable else output_transferable(result_bytes)
                 logger.info(f'Result: {result}')
                 return result
