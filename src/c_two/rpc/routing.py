@@ -7,7 +7,7 @@ async def routing(server_address: str, event_bytes: bytes, timeout: float = 10.0
     elif server_address.startswith('http://'):
         return # TODO: Implement HTTP routing
     elif server_address.startswith('memory://'):
-        return memory_routing(server_address, event_bytes, timeout)
+        return await memory_routing(server_address, event_bytes, timeout)
     else:
         # TODO: Handle other protocols if needed
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
