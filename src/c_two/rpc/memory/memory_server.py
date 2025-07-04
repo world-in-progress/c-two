@@ -162,15 +162,19 @@ class MemoryServer(BaseServer):
                     self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
                     break
                 
-                # Wait for new event file creation notification
-                with event_handler.condition:
-                    if event_handler.condition.wait(MAXIMUM_WAIT_TIMEOUT):
-                        if event_handler.file_received:
-                            event = self._poll_memory_events()
-                            if event:
-                                self.event_queue.put(event)
-                                if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
-                                    break
+                # Try to poll for memory events
+                event = self._poll_memory_events()
+                if event:
+                    self.event_queue.put(event)
+                    if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
+                        break
+                else:
+                    # Wait for new event file creation notification
+                    with event_handler.condition:
+                        if event_handler.condition.wait(MAXIMUM_WAIT_TIMEOUT):
+                            if event_handler.file_received:
+                                    event_handler.file_received = False
+                                    continue  # file was received, continue to poll again
         finally:
             observer.stop()
             observer.join()
