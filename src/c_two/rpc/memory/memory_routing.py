@@ -10,7 +10,7 @@ from ... import error
 
 logger = logging.getLogger(__name__)
 
-async def memory_routing(server_address: str, event_bytes: bytes, timeout: float = 10.0) -> bytes:
+async def memory_routing(server_address: str, event_bytes: bytes, timeout: float = -1.0) -> bytes:
     """Relay event bytes to memory server and get response bytes asynchronously."""
 
     request_id = uuid.uuid4()
@@ -87,7 +87,7 @@ async def memory_routing(server_address: str, event_bytes: bytes, timeout: float
                 response_data = await loop.run_in_executor(None, read_response)
                 return response_data
             
-            if (loop.time() - start_time) > timeout:
+            if timeout > 0 and (loop.time() - start_time) > timeout:
                 raise asyncio.TimeoutError('Waiting for response timed out.')
                 
             await asyncio.sleep(poll_interval)

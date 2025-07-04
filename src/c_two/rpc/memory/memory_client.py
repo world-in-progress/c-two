@@ -5,12 +5,10 @@ import mmap
 import logging
 import tempfile
 from pathlib import Path
-from watchdog.observers import Observer
 
 from ... import error
 from ..base import BaseClient
 from ..event import Event, EventTag
-from .event_handler import MemoryEventHandler
 from ..util.encoding import add_length_prefix, parse_message
 
 logger = logging.getLogger(__name__)
@@ -68,33 +66,36 @@ class MemoryClient(BaseClient):
         event_dir = self.temp_dir
         response_filename = f'cc_event_resp_{self.region_id}_{request_id}.mem'
         response_path = event_dir / response_filename
-    
-        # Setup file system watcher for the specific response file
-        event_handler = MemoryEventHandler(f'cc_event_resp_{self.region_id}_{request_id}', '.mem')
-        observer = Observer()
-        observer.schedule(event_handler, str(event_dir), recursive=False)
-        observer.start()
         
-        try:
-            # Wait for event file creation notification
-            with event_handler.condition:
-                remaining_timeout = None if timeout < 0 else timeout
-                if event_handler.condition.wait(remaining_timeout):
-                    if event_handler.file_received and response_path.exists():
-                        with open(response_path, 'r+b') as f:
-                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                                response_data = mm.read()
-                        response_path.unlink(missing_ok=True)
+        start_time = time.time()
+        poll_interval = 0.001  # start with 1ms
+        max_interval = 0.1     # max 100ms
+        
+        while True:
+            # Check if server is closed unexpectedly
+            if not self.temp_dir.exists():
+                raise error.CompoClientError(f'Memory server at {self.server_address} is not running or has been closed unexpectedly.')
+            
+            if response_path.exists():
+                try:
+                    with open(response_path, 'r+b') as f:
+                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                            response_data = mm.read()
+                    response_path.unlink(missing_ok=True)
 
-                        # Deserialize Event
-                        event = Event.deserialize(response_data)
-                        return event
-                else:
-                    raise TimeoutError(f'Response timeout for request {request_id}')
-        
-        finally:
-            observer.stop()
-            observer.join()
+                    # Deserialize Event
+                    event = Event.deserialize(response_data)
+                    return event
+                except Exception as e:
+                    raise error.CompoClientError(f'Failed to read response file: {e}')
+            
+            if timeout > 0 and (time.time() - start_time) > timeout:
+                raise error.CompoClientError(f'Response timeout for request {request_id}')
+                
+            time.sleep(poll_interval)
+            
+            # Exponential backoff for polling interval
+            poll_interval = min(poll_interval * 1.5, max_interval)
     
     def connect(self) -> bool:
         try:
