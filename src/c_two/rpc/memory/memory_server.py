@@ -6,14 +6,16 @@ import logging
 import tempfile
 import threading
 from pathlib import Path
+from watchdog.observers import Observer
 
 from ..util.wait import wait
 from ..base import BaseServer
 from ..event import Event, EventTag, EventQueue
+from .event_handler import MemoryEventHandler
 
 logger = logging.getLogger(__name__)
 
-MAXIMUM_WAIT_TIMEOUT = 0.1
+MAXIMUM_WAIT_TIMEOUT = 1
 
 class MemoryServerState(enum.Enum):
     STOPPED = 'stopped'
@@ -29,6 +31,7 @@ class MemoryServer(BaseServer):
         
         self.region_id = bind_address.replace('memory://', '')
         self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
+        logger.info(self.temp_dir)
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
         
         # Pre-cleanup the temp directory
@@ -123,20 +126,40 @@ class MemoryServer(BaseServer):
     def _serve(self):
         self._server_started.set()
         
+        # Setup file system watcher
+        event_handler = MemoryEventHandler(f'cc_event_req_{self.region_id}_', '.mem')
+        observer = Observer()
+        observer.schedule(event_handler, str(self.temp_dir), recursive=False)
+        observer.start()
+        
         # Start the service loop
-        while True:
-            # Check if the shutdown event is set
-            if self._shutdown_event.is_set():
-                self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
-                break
-            
-            # Pool for memory events
-            event = self._poll_memory_events()
-            if event:
-                self.event_queue.put(event)
-                if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
+        try:
+            while True:
+                # Check if server is closed unexpectedly
+                if not self.temp_dir.exists():
+                    logger.error(f'Temporary directory {self.temp_dir} does not exist. Shutting down server.')
+                    self._shutdown_event.set()
+                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
                     break
-    
+                
+                # Check if the shutdown event is set
+                if self._shutdown_event.is_set():
+                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
+                    break
+                
+                # Wait for new event file creation notification
+                with event_handler.condition:
+                    if event_handler.condition.wait(MAXIMUM_WAIT_TIMEOUT):
+                        if event_handler.file_received:
+                            event = self._poll_memory_events()
+                            if event:
+                                self.event_queue.put(event)
+                                if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
+                                    break
+        finally:
+            observer.stop()
+            observer.join()
+
     def start(self):
         server_thread = threading.Thread(target=self._serve)
         server_thread.daemon = True
