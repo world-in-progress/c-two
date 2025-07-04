@@ -5,10 +5,12 @@ import mmap
 import logging
 import tempfile
 from pathlib import Path
+from watchdog.observers import Observer
 
 from ... import error
 from ..base import BaseClient
 from ..event import Event, EventTag
+from .event_handler import MemoryEventHandler
 from ..util.encoding import add_length_prefix, parse_message
 
 logger = logging.getLogger(__name__)
@@ -66,20 +68,33 @@ class MemoryClient(BaseClient):
         event_dir = self.temp_dir
         response_filename = f'cc_event_resp_{self.region_id}_{request_id}.mem'
         response_path = event_dir / response_filename
+    
+        # Setup file system watcher for the specific response file
+        event_handler = MemoryEventHandler(f'cc_event_resp_{self.region_id}_{request_id}', '.mem')
+        observer = Observer()
+        observer.schedule(event_handler, str(event_dir), recursive=False)
+        observer.start()
         
-        start_time = time.time()
-        while timeout < 0 or time.time() - start_time < timeout:
-            if response_path.exists():
-                with open(response_path, 'r+b') as f:
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        response_data = mm.read()
-                response_path.unlink(missing_ok=True)
+        try:
+            # Wait for event file creation notification
+            with event_handler.condition:
+                remaining_timeout = None if timeout < 0 else timeout
+                if event_handler.condition.wait(remaining_timeout):
+                    if event_handler.file_received and response_path.exists():
+                        with open(response_path, 'r+b') as f:
+                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                                response_data = mm.read()
+                        response_path.unlink(missing_ok=True)
 
-                # Deserialize Event
-                event = Event.deserialize(response_data)
-                return event
+                        # Deserialize Event
+                        event = Event.deserialize(response_data)
+                        return event
+                else:
+                    raise TimeoutError(f'Response timeout for request {request_id}')
         
-        raise TimeoutError(f'Response timeout for request {request_id}')
+        finally:
+            observer.stop()
+            observer.join()
     
     def connect(self) -> bool:
         try:

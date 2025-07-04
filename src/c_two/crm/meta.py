@@ -103,7 +103,7 @@ def iicrm(cls):
             break
     
     if base_class is None:
-        raise TypeError(f"{cls.__name__} must inherit from a class decorated with @icrm.")
+        raise TypeError(f'{cls.__name__} must inherit from a class decorated with @icrm.')
     
     # Check for unimplemented methods
     for name, value in base_class.__dict__.items():
@@ -113,6 +113,9 @@ def iicrm(cls):
     # Decorate implemented methods with @auto_transfer
     for name, value in cls.__dict__.items():
         if isfunction(value) and name in base_class.__dict__:
+            # Ensure the module is set as the base class module
+            # So that the auto_transfer decorator can find the correct module
+            value.__module__ = base_class.__module__
             setattr(cls, name, auto_transfer('<-', value))
 
     return cls

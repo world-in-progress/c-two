@@ -369,11 +369,6 @@ def auto_transfer(direction: str, func = None) -> callable:
                     registered_param_map = info.get('param_map', {})
                     is_empty_registered = not bool(registered_param_map)
 
-                    # Match if both are empty
-                    # if is_empty_input and is_empty_registered:
-                    #     input_transferable = get_transferable(info['name'])
-                    #     break
-
                     # Match if field names and types align
                     if not is_empty_input and not is_empty_registered:
                         # Compare names first
@@ -437,10 +432,6 @@ def auto_transfer(direction: str, func = None) -> callable:
         # --- Wrapping ---
         transfer_decorator = transfer(input=input_transferable, output=output_transferable)
         wrapped_func = transfer_decorator(func)
-
-        # @wraps(func)
-        # def final_wrapper(*args, **kwargs):
-        #      return wrapped_func(*args, **kwargs)
             
         if direction == '->':
             return wrapped_func
