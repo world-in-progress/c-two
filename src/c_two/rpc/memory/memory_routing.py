@@ -1,3 +1,4 @@
+import os
 import json
 import uuid
 import mmap
@@ -15,7 +16,16 @@ async def memory_routing(server_address: str, event_bytes: bytes, timeout: float
 
     request_id = uuid.uuid4()
     region_id = server_address.replace('memory://', '')
-    temp_dir = Path(tempfile.gettempdir()) / f'{region_id}'
+        
+    # Get temp directory from environment variable or use default
+    memory_temp_dir = os.getenv('MEMORY_TEMP_DIR', None)
+    if memory_temp_dir:
+        base_temp_dir = Path(memory_temp_dir)
+        base_temp_dir.mkdir(exist_ok=True, parents=True)
+    else:
+        base_temp_dir = Path(tempfile.gettempdir())
+    temp_dir = base_temp_dir / f'{region_id}'
+    
     control_file = temp_dir / f'cc_memory_server_{region_id}.ctrl'
     
     loop = asyncio.get_event_loop()
