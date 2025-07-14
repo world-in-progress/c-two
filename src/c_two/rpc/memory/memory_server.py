@@ -5,6 +5,7 @@ import mmap
 import logging
 import tempfile
 import threading
+from dotenv import load_dotenv
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -13,6 +14,7 @@ from ..util.wait import wait
 from ..base import BaseServer
 from ..event import Event, EventTag, EventQueue
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 MAXIMUM_WAIT_TIMEOUT = 1
@@ -45,8 +47,16 @@ class MemoryServer(BaseServer):
         self._server_started = threading.Event()
         
         self.region_id = bind_address.replace('memory://', '')
-        self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
-        logger.info(self.temp_dir)
+        
+        # Get temp directory from environment variable or use default
+        memory_temp_dir = os.getenv('MEMORY_TEMP_DIR', None)
+        if memory_temp_dir:
+            base_temp_dir = Path(memory_temp_dir)
+            base_temp_dir.mkdir(exist_ok=True, parents=True)
+        else:
+            base_temp_dir = Path(tempfile.gettempdir())
+        self.temp_dir = base_temp_dir / f'{self.region_id}'
+        
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
         
         # Pre-cleanup the temp directory
