@@ -1,3 +1,4 @@
+import os
 import json
 import time
 import uuid
@@ -19,7 +20,16 @@ class MemoryClient(BaseClient):
         
         self.server_info: dict = {}
         self.region_id = server_address.replace('memory://', '')
-        self.temp_dir = Path(tempfile.gettempdir()) / f'{self.region_id}'
+        
+        # Get temp directory from environment variable or use default
+        memory_temp_dir = os.getenv('MEMORY_TEMP_DIR', None)
+        if memory_temp_dir:
+            base_temp_dir = Path(memory_temp_dir)
+            base_temp_dir.mkdir(exist_ok=True, parents=True)
+        else:
+            base_temp_dir = Path(tempfile.gettempdir())
+        self.temp_dir = base_temp_dir / f'{self.region_id}'
+        
         self.control_file = self.temp_dir / f'cc_memory_server_{self.region_id}.ctrl'
 
     def _create_method_event(self, method_name: str, data: bytes | None = None) -> Event:
