@@ -20,22 +20,33 @@ class CRMAnalyzer(ast.NodeVisitor):
             self.imports.add(node.module)
         self.generic_visit(node)
     
+    def _get_decorator_name(self, decorator):
+        """Recursively extract decorator name from AST node"""
+        if isinstance(decorator, ast.Name):
+            return decorator.id
+        elif isinstance(decorator, ast.Attribute):
+            # Handle nested attributes like module.submodule.decorator
+            value_name = self._get_decorator_name(decorator.value)
+            if value_name:
+                return f"{value_name}.{decorator.attr}"
+            else:
+                return decorator.attr
+        else:
+            return None
+    
     def visit_FunctionDef(self, node):
-        # 检查装饰器
         for decorator in node.decorator_list:
-            if isinstance(decorator, ast.Name):
-                self.current_decorators.append(decorator.id)
-            elif isinstance(decorator, ast.Attribute):
-                self.current_decorators.append(f"{decorator.value.id}.{decorator.attr}")
+            decorator_name = self._get_decorator_name(decorator)
+            if decorator_name:
+                self.current_decorators.append(decorator_name)
         self.generic_visit(node)
     
     def visit_ClassDef(self, node):
         decorators = []
         for decorator in node.decorator_list:
-            if isinstance(decorator, ast.Name):
-                decorators.append(decorator.id)
-            elif isinstance(decorator, ast.Attribute):
-                decorators.append(f"{decorator.value.id}.{decorator.attr}")
+            decorator_name = self._get_decorator_name(decorator)
+            if decorator_name:
+                decorators.append(decorator_name)
         
         # 检测ICRM和CRM类
         if any(d in ['cc.icrm', 'icrm'] for d in decorators):
