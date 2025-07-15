@@ -41,6 +41,55 @@ class CRMDockerBuilder:
             return base_image.split(':')[1].split('-')[0]
         return '3.11'
     
+    def _detect_entry_points(self, analysis: dict[str, any]) -> list[dict[str, str]]:
+        """检测CRM入口点"""
+        entry_points = []
+        
+        if not analysis['crm_classes']:
+            return entry_points
+        
+        # Re-scan files to get class-to-file mapping
+        class_file_mapping = {}
+        analyzer = CRMAnalyzer()
+        
+        for py_file in self.project_path.rglob('*.py'):
+            if py_file.name.startswith('.'):
+                continue
+                
+            file_analysis = analyzer.analyze_file(py_file)
+            
+            # Map each CRM class to its file
+            for crm_class in file_analysis['crm_classes']:
+                relative_path = py_file.relative_to(self.project_path)
+                class_file_mapping[crm_class] = relative_path
+        
+        # Generate entry points for each CRM class
+        for crm_class in analysis['crm_classes']:
+            if crm_class not in class_file_mapping:
+                continue
+                
+            file_path = class_file_mapping[crm_class]
+            
+            # Convert file path to module path
+            module_path = str(file_path.with_suffix(''))
+            module_path = module_path.replace('/', '.').replace('\\', '.')
+            
+            # Generate import statement
+            import_statement = f"from {module_path} import {crm_class}"
+            
+            # Generate initialization code
+            initialization_code = f"crm = {crm_class}()"
+            
+            entry_points.append({
+                'class_name': crm_class,
+                'import_statement': import_statement,
+                'initialization_code': initialization_code,
+                'file_path': str(file_path),
+                'module_path': module_path
+            })
+        
+        return entry_points
+    
     def _analyze_project(self) -> dict[str, any]:
         """分析CRM项目"""
         analysis = {
