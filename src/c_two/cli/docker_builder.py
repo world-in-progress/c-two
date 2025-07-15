@@ -36,6 +36,11 @@ class CRMDockerBuilder:
             
             return image.id
     
+    def _detect_python_version(self, base_image: str) -> str:
+        if base_image.startswith('python:'):
+            return base_image.split(':')[1].split('-')[0]
+        return '3.11'
+    
     def _analyze_project(self) -> dict[str, any]:
         """分析CRM项目"""
         analysis = {
