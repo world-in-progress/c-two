@@ -211,6 +211,7 @@ class MemoryClient(BaseClient):
                 return True # server is not runnning, return True
             
             # Create shutdown event
+            temp_dir = client.temp_dir
             request_id = str(uuid.uuid4())
             shutdown_event = Event(tag=EventTag.SHUTDOWN_FROM_CLIENT, request_id=request_id)
             
@@ -218,13 +219,44 @@ class MemoryClient(BaseClient):
             client._create_request_file(shutdown_event)
             
             # Wait for shutdown acknowledgment
-            event = client._wait_for_response(request_id, timeout=timeout)
+            response_filename = f'cc_event_resp_{client.region_id}_{request_id}.mem'
+            response_path = temp_dir / response_filename
+            
+            start_time = time.time()
+            poll_interval = 0.001  # start with 1ms
+            max_interval = 0.1     # max 100ms
+            
+            while True:
+                # Check if server is closed unexpectedly
+                if not client.temp_dir.exists():
+                    return True # server is not running or has been closed
 
-            # Check the shutdown acknowledgment
-            if event.tag == EventTag.SHUTDOWN_ACK:
-                return True
-            else:
-                raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.SHUTDOWN_ACK}')
+                if response_path.exists():
+                    try:
+                        with open(response_path, 'r+b') as f:
+                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                                response_data = mm.read()
+                        response_path.unlink(missing_ok=True)
+
+                        # Deserialize Event
+                        event = Event.deserialize(response_data)
+                        
+                        # Check the shutdown acknowledgment
+                        if event.tag == EventTag.SHUTDOWN_ACK:
+                            return True
+                        else:
+                            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.SHUTDOWN_ACK}')
+                        
+                    except Exception as e:
+                        raise error.CompoClientError(f'Failed to read response file: {e}')
+                
+                if timeout > 0 and (time.time() - start_time) > timeout:
+                    raise error.CompoClientError(f'Response timeout for request {request_id}')
+                    
+                time.sleep(poll_interval)
+                
+                # Exponential backoff for polling interval
+                poll_interval = min(poll_interval * 1.5, max_interval)
 
         except Exception as e:
             logger.error(str(e))
