@@ -49,7 +49,7 @@ class CRMDockerBuilder:
             'icrm_classes': [],
             'entry_points': [],
             'dependencies': set(),
-            'python_version': self._detect_python_version()
+            'python_version': self._detect_python_version(self._prepare_build_contextbase_image)
         }
         
         # 扫描Python文件找到CRM类
