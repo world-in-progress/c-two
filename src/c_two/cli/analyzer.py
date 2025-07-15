@@ -1,4 +1,5 @@
 import ast
+from pathlib import Path
 
 class CRMAnalyzer(ast.NodeVisitor):
     """AST分析器，用于检测CRM和ICRM类"""
@@ -43,3 +44,19 @@ class CRMAnalyzer(ast.NodeVisitor):
             self.crm_classes.append(node.name)
             
         self.generic_visit(node)
+    
+    
+    def analyze_file(self, file_path: Path) -> dict[str, any]:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            try:
+                tree = ast.parse(f.read())
+            except SyntaxError:
+                return {'crm_classes': [], 'icrm_classes': [], 'imports': set()}
+        
+        self.visit(tree)
+        
+        return {
+            'crm_classes': self.crm_classes,
+            'icrm_classes': self.icrm_classes,
+            'imports': self.imports
+        }
