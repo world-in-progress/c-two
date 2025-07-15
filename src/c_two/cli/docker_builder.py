@@ -170,14 +170,14 @@ class CRMDockerBuilder:
         # 环境特定的安装步骤
         if env_type == 'uv':
             dockerfile_parts.extend([
-                "# Install uv",
-                "RUN pip install uv",
+                "# Install uv with specific version",
+                "RUN pip install uv>=0.1.0",
                 "",
                 "# Copy dependency files",
                 "COPY pyproject.toml uv.lock ./",
                 "",
-                "# Install dependencies",
-                "RUN uv sync --frozen",
+                "# Install dependencies with verbose output",
+                "RUN uv sync --frozen --verbose",
                 "",
             ])
         elif env_type == 'poetry':
