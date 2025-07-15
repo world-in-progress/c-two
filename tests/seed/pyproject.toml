@@ -1,0 +1,15 @@
+[project]
+name = "seed"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "c-two>=0.2.0",
+    "numpy>=2.2.6",
+    "pandas>=2.3.1",
+    "pyarrow>=20.0.0",
+]
+
+[tool.uv.sources]
+c-two = { git = "https://github.com/YcSoku/c-two.git", branch = "dev_feature" }
