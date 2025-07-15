@@ -76,17 +76,17 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
     
     # Process SHUTDOWN event
     elif event.tag is EventTag.SHUTDOWN_FROM_CLIENT or event.tag is EventTag.SHUTDOWN_FROM_SERVER:
-        # Send shutdown acknowledgment if Shutdown event comes from client
-        if event.tag is EventTag.SHUTDOWN_FROM_CLIENT:
-            logger.info('Received shutdown request from client, shutting down server...')
-            state.server.reply(Event(tag=EventTag.SHUTDOWN_ACK, request_id=event.request_id))
-
-        # If the CRM instance has a terminate method, call it
-        if state.crm and hasattr(state.crm, 'terminate'):
-            state.crm.terminate()
-            state.crm = None
-        
         with state.lock:
+            # If the CRM instance has a terminate method, call it
+            if state.crm and hasattr(state.crm, 'terminate'):
+                state.crm.terminate()
+                state.crm = None
+            
+            # Send shutdown acknowledgment if Shutdown event comes from client
+            if event.tag is EventTag.SHUTDOWN_FROM_CLIENT:
+                logger.info('Received shutdown request from client, shutting down server...')
+                state.server.reply(Event(tag=EventTag.SHUTDOWN_ACK, request_id=event.request_id))
+        
             if _stop_serving(state):
                 should_continue = False
     
