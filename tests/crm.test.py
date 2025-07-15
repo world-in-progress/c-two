@@ -11,7 +11,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 if __name__ == '__main__':
     
     from crm import Grid
-    # from hello import Hello
     
     MEMORY_ADDRESS = 'memory://root_hello'
     IPC_ADDRESS = 'ipc:///tmp/zmq_test'
@@ -35,7 +34,6 @@ if __name__ == '__main__':
     # Init CRM
     grid_file_path='./grids.arrow'
     crm = Grid(epsg, bounds, first_size, subdivide_rules)
-    # crm = Hello()
     
     # Create CRM server
     server = cc.rpc.Server(TEST_ADDRESS, crm)

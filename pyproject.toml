@@ -1,7 +1,7 @@
 [project]
 name = "c-two"
-version = "0.2.0"
-description = "A python server to support communication between CRM and Component processes."
+version = "0.2.1"
+description = "A resource-rpc framework for distributed resource computation with type-safe and protocol-agnostic communication."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

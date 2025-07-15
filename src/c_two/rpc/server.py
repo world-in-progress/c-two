@@ -9,6 +9,7 @@ from .event import Event, EventTag, EventQueue, CompletionType
 from .base import BaseServer
 from .zmq import ZmqServer
 from .http import HttpServer
+from .thread import ThreadServer
 from .memory import MemoryServer
 
 logger = logging.getLogger(__name__)
@@ -170,6 +171,8 @@ class Server:
             self.server = HttpServer(bind_address)
         elif bind_address.startswith('memory://'):
             self.server = MemoryServer(bind_address)
+        elif bind_address.startswith('thread://'):
+            self.server = ThreadServer(bind_address)
         else:
             # TODO: Handle other protocols if needed
             raise ValueError(f'Unsupported protocol in bind_address: {bind_address}')

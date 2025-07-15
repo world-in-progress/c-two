@@ -6,6 +6,7 @@ import subprocess
 from .zmq import ZmqClient
 from .http import HttpClient
 from .memory import MemoryClient
+from .thread import ThreadClient
 
 def _get_client_class(server_address: str):
     """Determine the client class based on the server address."""
@@ -15,6 +16,8 @@ def _get_client_class(server_address: str):
         return HttpClient
     elif server_address.startswith('memory://'):
         return MemoryClient
+    elif server_address.startswith('thread://'):
+        return ThreadClient
     else:
         # TODO: Handle other protocols if needed
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
