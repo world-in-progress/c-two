@@ -117,8 +117,7 @@ class ThreadClient(BaseClient):
         server = get_server(thread_id)
         
         if not server:
-            return False
-        
+            return True
         try:
             # Send shutdown event
             shutdown_event = Event(tag=EventTag.SHUTDOWN_FROM_CLIENT, request_id=str(uuid.uuid4()))
