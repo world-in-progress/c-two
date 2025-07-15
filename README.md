@@ -1,4 +1,4 @@
-# C-Two (Greenhouse v0.2.0)
+# C-Two (Greenhouse v0.2.1)
 
 [![PyPI version](https://badge.fury.io/py/c-two.svg)](https://badge.fury.io/py/c-two)
 
@@ -19,7 +19,7 @@ Unlike traditional stateless RPC frameworks, C-Two is specifically designed for 
 - **Resource-Oriented Design**: Focus on stateful computational resources rather than stateless function calls
 - **Interface Segregation**: Clean separation between interface definitions (ICRM) and implementations (CRM)
 - **Type Safety**: Compile-time and runtime type checking with automatic or customized serialization inference
-- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (Memory, IPC, TCP, HTTP, MCP)
+- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (Thread, Memory, IPC, TCP, HTTP, MCP)
 - **Resource Isolation**: Encapsulation of computational resources behind well-defined interfaces
 
 ## Architecture
@@ -35,7 +35,7 @@ Client-side computational units that consume remote resources through Interface 
 Server-side Core Resource Models implementing domain-specific business logic and resource management, exposed through standardized ICRM interfaces. CRMs maintain persistent state and provide resource-specific operations.
 
 ### Transport Layer
-Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
+Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Thread, Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
 
 ## Installation
 
@@ -192,6 +192,9 @@ Deploy the CRM as a networked service with automatic protocol detection:
 # Resource initialization and server configuration
 grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
 
+# Thread server (in-process, thread-safe communication)
+server = cc.rpc.Server("thread://grid_processor", grid)
+
 # TCP server (network-based, cross-machine)
 server = cc.rpc.Server("tcp://localhost:5555", grid)
 
@@ -235,6 +238,12 @@ with cc.compo.runtime.connect_crm('http://localhost:8000', IGrid) as grid:
     keys = grid.subdivide_grids([1, 1], [0, 1])
     print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
 
+# Thread connection (in-process, thread-safe)
+with cc.compo.runtime.connect_crm('thread://grid_region', IGrid) as grid:
+    infos = grid.get_grid_infos(1, [0, 1, 2])
+    keys = grid.subdivide_grids([1, 1], [0, 1])
+    print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
+
 # Memory connection (shared memory, high-performance local)
 with cc.compo.runtime.connect_crm('memory://grid_region', IGrid) as grid:
     infos = grid.get_grid_infos(1, [0, 1, 2])
@@ -252,12 +261,13 @@ def process_grids(grid: IGrid, target_level: int) -> list[str]:
     return grid.subdivide_grids([target_level] * len(candidates), candidates)
 
 # Protocol is determined automatically by the address
-result = process_grids(1, crm_address='tcp://localhost:5555')     # Uses TCP
-result = process_grids(1, crm_address='http://localhost:8000')    # Uses HTTP
-result = process_grids(1, crm_address='memory://grid_region')     # Uses Memory
+result = process_grids(1, crm_address='tcp://localhost:5555')         # Uses TCP
+result = process_grids(1, crm_address='http://localhost:8000')        # Uses HTTP
+result = process_grids(1, crm_address='thread://grid_region')      # Uses Thread
+result = process_grids(1, crm_address='memory://grid_region')         # Uses Memory
 
 # Or using a context manager with automatic protocol detection
-with cc.compo.runtime.connect_crm('memory://grid_region'):
+with cc.compo.runtime.connect_crm('thread://grid_processor'):
     result = process_grids(1)
 ```
 
