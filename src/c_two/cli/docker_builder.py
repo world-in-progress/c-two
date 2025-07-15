@@ -61,6 +61,33 @@ class CRMDockerBuilder:
         
         return analysis
     
+    
+    def _detect_environment(self) -> dict[str, any]:
+        """检测项目环境（uv、conda、poetry）"""
+        env_info = {'type': 'unknown', 'files': [], 'python_version': None}
+        
+        # 检测uv
+        if (self.project_path / 'uv.lock').exists():
+            env_info['type'] = 'uv'
+            env_info['files'] = ['pyproject.toml', 'uv.lock']
+            
+        # 检测poetry
+        elif (self.project_path / 'poetry.lock').exists():
+            env_info['type'] = 'poetry'
+            env_info['files'] = ['pyproject.toml', 'poetry.lock']
+            
+        # 检测conda
+        elif (self.project_path / 'environment.yml').exists():
+            env_info['type'] = 'conda'
+            env_info['files'] = ['environment.yml']
+            
+        # 检测requirements.txt
+        elif (self.project_path / 'requirements.txt').exists():
+            env_info['type'] = 'pip'
+            env_info['files'] = ['requirements.txt']
+            
+        return env_info
+    
     def _generate_dockerfile(self, analysis: dict[str, any]) -> str:
         """生成优化的Dockerfile"""
         env_type = analysis['environment']['type']
