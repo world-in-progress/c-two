@@ -12,21 +12,20 @@ class CRMDockerBuilder:
         self.docker_client = docker.from_env()
         
     def build_image(self, image_tag: str) -> str:
-        """构建Docker镜像"""
         with tempfile.TemporaryDirectory() as temp_dir:
             build_context = Path(temp_dir)
             
-            # 分析项目
+            # Analyze the project to gather necessary information
             analysis = self._analyze_project()
-            
-            # 准备构建上下文
+
+            # Prepare the build context
             self._prepare_build_context(build_context, analysis)
-            
-            # 生成Dockerfile
+
+            # Generate Dockerfile
             dockerfile_content = self._generate_dockerfile(analysis)
             (build_context / 'Dockerfile').write_text(dockerfile_content)
-            
-            # 构建镜像
+
+            # Build the image
             image, logs = self.docker_client.images.build(
                 path=str(build_context),
                 tag=image_tag,
@@ -91,7 +90,7 @@ class CRMDockerBuilder:
         return entry_points
     
     def _analyze_project(self) -> dict[str, any]:
-        """分析CRM项目"""
+        """Analyze the CRM project"""
         analysis = {
             'environment': self._detect_environment(),
             'crm_classes': [],
@@ -100,8 +99,8 @@ class CRMDockerBuilder:
             'dependencies': set(),
             'python_version': self._detect_python_version(self.base_image)
         }
-        
-        # 扫描Python文件找到CRM类
+
+        # Scan Python files to find CRM classes
         analyzer = CRMAnalyzer()
         for py_file in self.project_path.rglob('*.py'):
             if py_file.name.startswith('.'):
@@ -109,33 +108,33 @@ class CRMDockerBuilder:
             file_analysis = analyzer.analyze_file(py_file)
             analysis['crm_classes'].extend(file_analysis['crm_classes'])
             analysis['icrm_classes'].extend(file_analysis['icrm_classes'])
-        
-        # 自动检测入口点
+
+        # Automatically detect entry points
         analysis['entry_points'] = self._detect_entry_points(analysis)
         
         return analysis
     
     
     def _detect_environment(self) -> dict[str, any]:
-        """检测项目环境（uv、conda、poetry）"""
+        """Detect the project environment (uv, conda, poetry)"""
         env_info = {'type': 'unknown', 'files': [], 'python_version': None}
-        
-        # 检测uv
+
+        # Detect uv
         if (self.project_path / 'uv.lock').exists():
             env_info['type'] = 'uv'
             env_info['files'] = ['pyproject.toml', 'uv.lock']
             
-        # 检测poetry
+        # Detect poetry
         elif (self.project_path / 'poetry.lock').exists():
             env_info['type'] = 'poetry'
             env_info['files'] = ['pyproject.toml', 'poetry.lock']
-            
-        # 检测conda
+
+        # Detect conda
         elif (self.project_path / 'environment.yml').exists():
             env_info['type'] = 'conda'
             env_info['files'] = ['environment.yml']
-            
-        # 检测requirements.txt
+
+        # Detect requirements.txt
         elif (self.project_path / 'requirements.txt').exists():
             env_info['type'] = 'pip'
             env_info['files'] = ['requirements.txt']
@@ -143,11 +142,11 @@ class CRMDockerBuilder:
         return env_info
     
     def _generate_dockerfile(self, analysis: dict[str, any]) -> str:
-        """生成优化的Dockerfile"""
+        """Generate an optimized Dockerfile"""
         env_type = analysis['environment']['type']
         python_version = analysis.get('python_version', '3.11')
-        
-        # 基础镜像选择
+
+        # Base image selection
         if env_type == 'conda':
             base_image = f'continuumio/miniconda3:latest'
         else:
@@ -166,8 +165,8 @@ class CRMDockerBuilder:
             "    && rm -rf /var/lib/apt/lists/*",
             "",
         ]
-        
-        # 环境特定的安装步骤
+
+        # Environment-specific installation steps
         if env_type == 'uv':
             dockerfile_parts.extend([
                 "# Install uv with specific version",
@@ -212,8 +211,8 @@ class CRMDockerBuilder:
                 "RUN pip install --no-cache-dir -r requirements.txt",
                 "",
             ])
-        
-        # 复制应用代码
+
+        # Copy application code
         dockerfile_parts.extend([
             "# Copy application code",
             "COPY . .",
@@ -238,34 +237,34 @@ class CRMDockerBuilder:
         return '\n'.join(dockerfile_parts)
 
     def _prepare_build_context(self, build_context: Path, analysis: dict[str, any]):
-        """准备Docker构建上下文"""
-        # 复制项目文件
+        """Prepare Docker build context"""
+        # Copy project files
         shutil.copytree(
             self.project_path, 
             build_context / 'app',
             ignore=shutil.ignore_patterns('.git', '__pycache__', '*.pyc', '.pytest_cache')
         )
-        
-        # 移动文件到根目录
+
+        # Move files to root directory
         for item in (build_context / 'app').iterdir():
             shutil.move(str(item), str(build_context / item.name))
         (build_context / 'app').rmdir()
-        
-        # 生成entrypoint.py
+
+        # Generate entrypoint.py
         entrypoint_content = self._generate_entrypoint(analysis)
         (build_context / 'entrypoint.py').write_text(entrypoint_content)
-        
-        # 生成.dockerignore
+
+        # Generate .dockerignore
         dockerignore_content = self._generate_dockerignore()
         (build_context / '.dockerignore').write_text(dockerignore_content)
     
     def _generate_entrypoint(self, analysis: dict[str, any]) -> str:
-        """生成Docker entrypoint脚本"""
+        """Generate Docker entrypoint script"""
         entry_points = analysis.get('entry_points', [])
         if not entry_points:
             raise ValueError("No CRM entry points detected")
-        
-        # 使用第一个检测到的CRM类
+
+        # Use the first detected CRM class
         primary_crm = entry_points[0]
         
         return f'''#!/usr/bin/env python3
@@ -364,7 +363,7 @@ if __name__ == '__main__':
 '''
     
     def _generate_dockerignore(self) -> str:
-        """生成.dockerignore文件"""
+        """Generate .dockerignore file"""
         return '''
 .git
 .gitignore
@@ -406,7 +405,7 @@ Thumbs.db
 '''
 
     def push_image(self, image_tag: str, registry: str | None = None):
-        """推送镜像到registry"""
+        """Push image to registry"""
         if registry:
             # Tag for specific registry
             registry_tag = f"{registry}/{image_tag}"

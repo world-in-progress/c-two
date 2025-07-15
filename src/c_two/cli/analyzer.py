@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 
 class CRMAnalyzer(ast.NodeVisitor):
-    """AST分析器，用于检测CRM和ICRM类"""
+    """Analyze CRM classes and imports in Python files."""
     
     def __init__(self):
         self.crm_classes = []
@@ -47,8 +47,8 @@ class CRMAnalyzer(ast.NodeVisitor):
             decorator_name = self._get_decorator_name(decorator)
             if decorator_name:
                 decorators.append(decorator_name)
-        
-        # 检测ICRM和CRM类
+
+        # Detect ICRM and CRM classes
         if any(d in ['cc.icrm', 'icrm'] for d in decorators):
             self.icrm_classes.append(node.name)
         elif any(d in ['cc.iicrm', 'iicrm'] for d in decorators):

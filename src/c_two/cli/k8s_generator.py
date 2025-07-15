@@ -1,14 +1,13 @@
 # src/c_two/cli/k8s_generator.py
 import yaml
-from typing import Dict, Any, List
 
 class K8sManifestGenerator:
     def __init__(self, project_path: str):
         self.project_path = project_path
         
     def generate_manifests(self, name: str, image: str, port: int, 
-                         replicas: int, namespace: str) -> Dict[str, str]:
-        """生成完整的Kubernetes部署清单"""
+                         replicas: int, namespace: str) -> dict[str, str]:
+        """Generate complete Kubernetes deployment manifests"""
         manifests = {}
         
         # Deployment
@@ -21,7 +20,7 @@ class K8sManifestGenerator:
             name, port, namespace
         )
         
-        # ConfigMap (可选)
+        # ConfigMap (optional)
         manifests['configmap.yaml'] = self._generate_configmap(
             name, namespace
         )
@@ -164,7 +163,7 @@ class K8sManifestGenerator:
         return yaml.dump(service, default_flow_style=False)
     
     def _generate_hpa(self, name: str, namespace: str) -> str:
-        """生成HPA清单"""
+        """Generate HPA manifest"""
         hpa = {
             'apiVersion': 'autoscaling/v2',
             'kind': 'HorizontalPodAutoscaler',
