@@ -24,3 +24,7 @@ dev = [
     "pandas>=2.2.3",
     "pyarrow>=19.0.1",
 ]
+
+[project.scripts]
+crmseeding = "c_two.cli.seeding:cli"
+scrm = "c_two.cli.seeding:cli"
