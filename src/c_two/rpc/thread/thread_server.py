@@ -16,55 +16,16 @@ class ThreadServer(BaseServer):
         # Extract thread_id from address like 'thread://cc_thread_12345'
         self.thread_id = bind_address.replace('thread://', '')
         
-        # Thread-safe queues for communication
-        self.request_queue: queue.Queue[Event] = queue.Queue()
         self.responses: dict[str, Event] = {}
         self.response_lock = threading.RLock()
-        
-        # Server state management
-        self._shutdown_event = threading.Event()
-        self._server_started = threading.Event()
         
         # Response notification mechanism
         self.response_condition: dict[str, threading.Condition] = {}
         self.conditions_lock = threading.Lock()
     
-    def _serve(self):
-        self._server_started.set()
-        
-        while True:
-            try:
-                if self._shutdown_event.is_set():
-                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
-                    break
-                
-                # Wait for requests with timeout
-                event = self.request_queue.get(timeout=0.1)
-                
-                if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
-                    self.event_queue.put(event)
-                    break
-                
-                # Put event into the event queue for processing
-                self.event_queue.put(event)
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f'Error in thread server loop: {e}')
-                break
-    
     def start(self):
         # Register this server in the global server registry
         register_server(self.thread_id, self)
-        
-        # Start the server thread
-        server_thread = threading.Thread(target=self._serve)
-        server_thread.daemon = True
-        server_thread.start()
-        
-        # Wait for the server to start
-        self._server_started.wait()
     
     def reply(self, event: Event) -> None:
         if not event.request_id:
@@ -84,8 +45,6 @@ class ThreadServer(BaseServer):
 
     def shutdown(self):
         """Shutdown the thread server."""
-        self._shutdown_event.set()
-        
         # Unregister the server from the global registry
         unregister_server(self.thread_id)
     
@@ -101,12 +60,8 @@ class ThreadServer(BaseServer):
         # Unregister the server from the global registry
         unregister_server(self.thread_id)
         
-        # Clear the request queue
-        while not self.request_queue.empty():
-            try:
-                self.request_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Clear the event queue
+        self.event_queue.shutdown()
         
         # Notify all waiting clients
         with self.conditions_lock:
@@ -117,7 +72,7 @@ class ThreadServer(BaseServer):
     def put_request(self, event: Event):
         """Put a request into the server's queue (called by clients)."""
         try:
-            self.request_queue.put(event)
+            self.event_queue.put(event)
         except queue.Full:
             raise error.CRMServerError(f'Request queue is full for thread server {self.thread_id}')
     
