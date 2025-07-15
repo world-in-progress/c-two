@@ -5,8 +5,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 import c_two as cc
 
+import time
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 if __name__ == '__main__':
     
@@ -41,9 +43,9 @@ if __name__ == '__main__':
 
     # Check if CRM is running
     if cc.rpc.Client.ping(TEST_ADDRESS):
-        print('CRM is running!\n')
+        logger.info('CRM is running!\n')
     else:
-        print('CRM is not running!\n')
+        logger.error('CRM is not running!\n')
         sys.exit(1)
     
     # One way to use connect_crm:
@@ -51,11 +53,11 @@ if __name__ == '__main__':
     # connect_crm returns an ICRM instance that can be used directly.
     # This approach is particularly useful for component scripts.
     with cc.compo.runtime.connect_crm(TEST_ADDRESS, IGrid) as grid:
-        print(grid.hello('World'))
+        logger.info(grid.hello('World'))
         # Check grid 1-0
         parent: com.GridAttribute = grid.get_grid_infos(1, [0])[0]
-        print('Parent checked by ICRM instance:', parent.activate, parent.level, parent.global_id, parent.local_id, parent.elevation, parent.min_x, parent.min_y, parent.max_x, parent.max_y)
-    
+        logger.info('Parent checked by ICRM instance: %s', parent)
+        
     # Alternative way to use connect_crm:
     # When providing only the address, connect_crm returns a Client instance.
     # While the client is rarely needed directly, it's used internally by the runtime.
@@ -69,19 +71,25 @@ if __name__ == '__main__':
         
         # Check grid 1-0 and children:
         parent = com.get_grid_infos(1, [0])[0]
-        print('Parent:', parent.activate, parent.level, parent.global_id, parent.local_id, parent.elevation, parent.min_x, parent.min_y, parent.max_x, parent.max_y)
-        
+        logger.info('Parent: %s', parent)
+
         children = com.get_grid_infos(2, [int(key.split('-')[1]) for key in keys])
         for child in children:
-            print('Child:', child.activate, child.level, child.global_id, child.local_id, child.elevation, child.min_x, child.min_y, child.max_x, child.max_y)
-            
+            logger.info('Child: %s', child)
+
         # Check get parents
         levels = [1] + [2] * len(keys)
         global_ids = [0] + [int(key.split('-')[1]) for key in keys]
         parents = com.get_parent_keys(levels, global_ids)
         for parent in parents:
-            print('Parent:', parent)
-        
+            logger.info('Parent: %s', parent)
+
         # Test get_active_grid_infos
         levels, global_ids = com.get_active_grid_infos()
-        print(len(levels), len(global_ids))
+        logger.info('Active grid infos - Levels: %d, Global IDs: %d', len(levels), len(global_ids))
+
+    # Run the server and wait for termination
+    while cc.rpc.Client.shutdown(TEST_ADDRESS) is False:
+        logger.info('Waiting for CRM to shutdown...')
+        time.sleep(1)
+    logger.info('CRM shutdown successfully')

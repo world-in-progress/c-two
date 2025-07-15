@@ -42,7 +42,7 @@ class ThreadServer(BaseServer):
                 event = self.request_queue.get(timeout=0.1)
                 
                 if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
-                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_CLIENT))
+                    self.event_queue.put(event)
                     break
                 
                 # Put event into the event queue for processing
@@ -98,6 +98,9 @@ class ThreadServer(BaseServer):
             self.response_condition.clear()
     
     def cancel_all_calls(self):
+        # Unregister the server from the global registry
+        unregister_server(self.thread_id)
+        
         # Clear the request queue
         while not self.request_queue.empty():
             try:
