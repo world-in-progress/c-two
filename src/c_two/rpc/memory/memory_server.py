@@ -5,7 +5,6 @@ import mmap
 import logging
 import tempfile
 import threading
-from dotenv import load_dotenv
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -14,7 +13,6 @@ from ..util.wait import wait
 from ..base import BaseServer
 from ..event import Event, EventTag, EventQueue
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
 MAXIMUM_WAIT_TIMEOUT = 1
