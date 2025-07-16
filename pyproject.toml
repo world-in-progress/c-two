@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.2.1"
+version = "0.2.2"
 description = "A resource-rpc framework for distributed resource computation with type-safe and protocol-agnostic communication."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -9,7 +9,6 @@ dependencies = [
     "docker>=7.1.0",
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
-    "pyyaml>=6.0.2",
     "pyzmq>=27.0.0",
     "requests>=2.32.4",
     "starlette>=0.46.0",
@@ -25,6 +24,8 @@ dev = [
     "pyarrow>=19.0.1",
 ]
 
+[tool.uv]
+package = true
+
 [project.scripts]
-crmseeding = "c_two.cli.seeding:cli"
-scrm = "c_two.cli.seeding:cli"
+c2 = "c_two.cli:cli"
