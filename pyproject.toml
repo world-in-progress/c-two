@@ -28,4 +28,4 @@ dev = [
 package = true
 
 [project.scripts]
-c2 = "c_two.cli:cli"
+c3 = "c_two.cli:cli"
