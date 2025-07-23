@@ -9,7 +9,7 @@ from . import error
 from .crm.meta import icrm, iicrm
 from .rpc.transferable import transfer, auto_transfer, Transferable, transferable
 
-__version__ = '0.2.2'
+__version__ = '0.2.3'
 
 LOGO_ASCII ="""
                                                   
