@@ -82,7 +82,7 @@ def icrm(cls: T) -> T:
 
     return cast(T, NewClass)
 
-def iicrm(cls):
+def iicrm(cls: T) -> T:
     """
     Implementation of ICRM (IICRM) decorator
     --

@@ -6,11 +6,12 @@ from abc import ABCMeta
 from functools import wraps
 from pydantic import BaseModel, create_model
 from dataclasses import dataclass, is_dataclass
-from typing import get_type_hints, get_args, get_origin, Any, Callable
+from typing import get_type_hints, get_args, get_origin, Any, Callable, TypeVar
 
 from .. import error
 from .util.encoding import add_length_prefix
 
+T = TypeVar('T')
 logger = logging.getLogger(__name__)
 
 # Global Caches ###################################################################
@@ -246,7 +247,7 @@ def get_transferable(transferable_name: str) -> Transferable | None:
 
 # Transferable-related decorators #################################################
 
-def transferable(cls: type) -> type:
+def transferable(cls: T) -> T:
     """
     A decorator to make a class automatically inherit from Transferable.
     """
