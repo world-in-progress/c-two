@@ -1,4 +1,4 @@
-# C-Two (Greenhouse v0.2.4)
+# C-Two (Greenhouse v0.2.5)
 
 [![PyPI version](https://badge.fury.io/py/c-two.svg)](https://badge.fury.io/py/c-two)
 
