@@ -54,7 +54,7 @@ def icrm(cls: T) -> T:
     decorated_methods = {}
     for name, value in cls.__dict__.items():
         if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__'):
-            decorated_methods[name] = auto_transfer('->', value)
+            decorated_methods[name] = auto_transfer(cls, '->', value)
     
     # Define a new class with ICRMMeta metaclass that inherits from the original class
     class_name = cls.__name__
@@ -116,6 +116,6 @@ def iicrm(cls: T) -> T:
             # Ensure the module is set as the base class module
             # So that the auto_transfer decorator can find the correct module
             value.__module__ = base_class.__module__
-            setattr(cls, name, auto_transfer('<-', value))
+            setattr(cls, name, auto_transfer(cls, '<-', value))
 
     return cls

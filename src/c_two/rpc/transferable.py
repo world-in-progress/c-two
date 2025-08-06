@@ -6,7 +6,7 @@ from abc import ABCMeta
 from functools import wraps
 from pydantic import BaseModel, create_model
 from dataclasses import dataclass, is_dataclass
-from typing import get_type_hints, get_args, get_origin, Any, Callable, TypeVar
+from typing import get_type_hints, get_args, get_origin, Any, Callable, TypeVar, Type
 
 from .. import error
 from .util.encoding import add_length_prefix
@@ -16,8 +16,22 @@ logger = logging.getLogger(__name__)
 
 # Global Caches ###################################################################
 
+_WRAPPED_FUNCTIONS: dict[tuple, callable] = {}
 _TRANSFERABLE_MAP: dict[str, Transferable] = {}
 _TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
+
+# Wrapped Function Registering Tool ###############################################
+
+def _get_function_key(cls: object, func_name: str) -> str:
+    return f'{cls.__module__}.{cls.__name__}.{func_name}'
+
+def register_wrapped_function(cls: Type[T], func: callable, wrapped: callable) -> None:
+    key = _get_function_key(cls, func.__name__)
+    _WRAPPED_FUNCTIONS[key] = wrapped
+
+def get_wrapped_function(cls: Type[T], func_name: str) -> callable | None:
+    key = _get_function_key(cls, func_name)
+    return _WRAPPED_FUNCTIONS.get(key)
 
 # Definition of Transferable ######################################################
 
@@ -247,7 +261,7 @@ def get_transferable(transferable_name: str) -> Transferable | None:
 
 # Transferable-related decorators #################################################
 
-def transferable(cls: T) -> T:
+def transferable(cls: Type[T]) -> Type[T]:
     """
     A decorator to make a class automatically inherit from Transferable.
     """
@@ -350,7 +364,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
     
     return decorator
 
-def auto_transfer(direction: str, func = None) -> callable:
+def auto_transfer(cls: Type[T], direction: str, func = None) -> callable:
     def create_wrapper(func: callable) -> callable:
         # --- Input Matching using Pydantic Model Comparison ---
         input_model = _create_pydantic_model_from_func_sig(func)
@@ -437,7 +451,8 @@ def auto_transfer(direction: str, func = None) -> callable:
         if direction == '->':
             return wrapped_func
         elif direction == '<-':
-            func.__wrapped__ = wrapped_func
+            # Register the wrapped function for later retrieval
+            register_wrapped_function(cls, func, wrapped_func)
             return func
         else:
             raise ValueError(f'Invalid direction value: {direction}. Expected "->" or "<-".')

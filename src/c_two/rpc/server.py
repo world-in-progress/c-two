@@ -11,6 +11,7 @@ from .zmq import ZmqServer
 from .http import HttpServer
 from .thread import ThreadServer
 from .memory import MemoryServer
+from .transferable import get_wrapped_function
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +103,11 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
         args_bytes = sub_messages[1]
         
         # Call method wrapped from CRM method
-        method = getattr(crm, method_name)
-        response = method.__wrapped__(crm, args_bytes)
+        method = get_wrapped_function(crm.__class__, method_name)
+        if method is None:
+            raise ValueError(f'No wrapped function found for method: {crm.__module__}.{crm.__name__}.{method_name}')
+
+        response = method(crm, args_bytes)
         
         # Create a serialized response based on the serialized_error and serialized_result
         state.server.reply(Event(tag=EventTag.CRM_REPLY, data=response, request_id=event.request_id))
