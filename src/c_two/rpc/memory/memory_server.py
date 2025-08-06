@@ -47,9 +47,9 @@ class MemoryServer(BaseServer):
         self.region_id = bind_address.replace('memory://', '')
         
         # Get temp directory from environment variable or use default
-        memory_temp_path = os.getenv('MEMORY_TEMP_PATH', None)
-        if memory_temp_path:
-            base_temp_dir = Path(memory_temp_path)
+        memory_temp_dir = os.getenv('MEMORY_TEMP_DIR', None)
+        if memory_temp_dir:
+            base_temp_dir = Path(memory_temp_dir)
             base_temp_dir.mkdir(exist_ok=True, parents=True)
         else:
             base_temp_dir = Path(tempfile.gettempdir())
