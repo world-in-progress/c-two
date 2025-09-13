@@ -11,7 +11,7 @@ class ICRMMeta(type):
     A metaclass for ICRM (Interface of Core Resource Model) classes that automatically sets a 'direction' attribute on new classes.
     Direction rules:
     - If a class explicitly defines its own 'direction', that value is preserved
-    - If a class inherits from an ICRM class with direction '->', it gets assigned the direction '<-', meaning it is an implementation of the ICRM  (aka CRM or IICRM)  
+    - If a class inherits from an ICRM class with direction '->', it gets assigned the direction '<-', meaning it is an implementation of the ICRM  (aka CRM)  
     - Otherwise, it defaults to direction '->' (becoming a base ICRM class)
     
     This metaclass helps distinguish between ICRM interfaces ('->' direction) and their implementations (CRM, '<-' direction).
@@ -94,7 +94,7 @@ def icrm(cls: T, *, namespace: str = 'cc', version: str = '0.1.0') -> T:
 
 def crm(cls: T) -> T:
     """
-    Implementation of ICRM (IICRM) decorator
+    Implementation of ICRM (CRM) decorator
     --
     A decorator for classes that implement an ICRM interface.
     
@@ -102,8 +102,6 @@ def crm(cls: T) -> T:
     1. The decorated class has a 'terminate' method
     2. The decorated class properly implements all methods defined in its ICRM parent class
     3. All implemented methods are automatically decorated with @auto_transfer
-    
-    Note: The name 'iicrm' is used because 'crm' is already used as a sub-module name in c-two.
     """
     # Validate that the class has a terminate method
     if not hasattr(cls, 'terminate'):

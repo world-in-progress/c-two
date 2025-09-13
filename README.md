@@ -93,10 +93,10 @@ class IGrid:
 
 ### 2. Resource Model Implementation (CRM)
 
-Implement the Core Resource Model using the `@iicrm` decorator:
+Implement the Core Resource Model using the `@crm` decorator:
 
 ```python
-@cc.iicrm
+@cc.crm
 class Grid(IGrid):
     def __init__(self, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]]):
         self.epsg = epsg
@@ -302,7 +302,7 @@ C-Two is designed for resource-oriented distributed computing, particularly suit
 
 ### Core Decorators
 - **`@icrm`**: Interface definition for remote resource specifications
-- **`@iicrm`**: Implementation marker for Core Resource Models
+- **`@crm`**: Implementation marker for Core Resource Models
 - **`@transferable`**: Custom serializable data type definition
 - **`@auto_transfer`**: Automatic serialization based on type annotations
 - **`@connect`**: Connection injection for component functions

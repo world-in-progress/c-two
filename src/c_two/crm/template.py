@@ -280,7 +280,7 @@ def _generate_template_content_ast(icrm_name: str, crm_name: str, methods: list,
     # Start building the template
     lines = import_lines + [
         '',
-        '@cc.iicrm',
+        '@cc.crm',
         f'class {crm_name}({icrm_name}):',
         '    """',
         '    This is an auto-generated template. Please implement the methods below.',
