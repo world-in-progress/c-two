@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 import c_two as cc
 from ihello import IHello
 
-@cc.iicrm
+@cc.crm
 class Hello(IHello):
 
     def greeting(self, name: str) -> str:

@@ -31,7 +31,7 @@ GRID_SCHEMA: pa.Schema = pa.schema([
     (ATTR_ELEVATION, pa.float64())
 ])
 
-@cc.iicrm
+@cc.crm
 class Grid(IGrid):
     """
     CRM

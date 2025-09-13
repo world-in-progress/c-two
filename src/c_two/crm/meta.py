@@ -11,7 +11,7 @@ class ICRMMeta(type):
     A metaclass for ICRM (Interface of Core Resource Model) classes that automatically sets a 'direction' attribute on new classes.
     Direction rules:
     - If a class explicitly defines its own 'direction', that value is preserved
-    - If a class inherits from an ICRM class with direction '->', it gets assigned the direction '<-', meaning it is an implementation of the ICRM  (aka CRM or IICRM)  
+    - If a class inherits from an ICRM class with direction '->', it gets assigned the direction '<-', meaning it is an implementation of the ICRM  (aka CRM)  
     - Otherwise, it defaults to direction '->' (becoming a base ICRM class)
     
     This metaclass helps distinguish between ICRM interfaces ('->' direction) and their implementations (CRM, '<-' direction).
@@ -34,8 +34,8 @@ class ICRMMeta(type):
         
         cls = super().__new__(mcs, name, bases, attrs, **kwargs)
         return cls
-    
-def icrm(cls: T) -> T:
+
+def icrm(cls: T, *, namespace: str = 'cc', version: str = '0.1.0') -> T:
     """
     Interface of Core Resource Model (ICRM) decorator
     --
@@ -44,16 +44,23 @@ def icrm(cls: T) -> T:
     This function transforms the given class by applying the ICRMMeta metaclass,
     making it a proper ICRM that other classes can implement.  
     Additionally, it decorates all member functions of the class with @auto_transfer,
-    so that they can be automatically transferred between Component and CRM.
+    so that their input parameters and return values can be automatically transferred between Component and CRM.
     
     Returns:
         A class that has all the attributes of the original class plus a static
         'connect' method that creates and returns instances connected to a remote service.
     """
+    # Validate namespace and version
+    if not namespace:
+        raise ValueError('Namespace of ICRM cannot be empty.')
+    if not version:
+        raise ValueError('Version of ICRM cannot be empty (version example: "1.0.0").')
+    if not isinstance(version, str) or not version.count('.') == 2:
+        raise ValueError('Version must be a string in the format "major.minor.patch".')
     
     decorated_methods = {}
     for name, value in cls.__dict__.items():
-        if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__'):
+        if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__', '__tag__'):
             decorated_methods[name] = auto_transfer(cls, '->', value)
     
     # Define a new class with ICRMMeta metaclass that inherits from the original class
@@ -61,39 +68,44 @@ def icrm(cls: T) -> T:
     bases = (cls,)
     
     # Create the new class
-    NewClass = ICRMMeta(class_name, bases, {
+    new_cls = ICRMMeta(class_name, bases, {
         **{k: v for k, v in cls.__dict__.items() 
-           if k not in decorated_methods and k not in ('__dict__', '__weakref__')},
+        if k not in decorated_methods and k not in ('__dict__', '__weakref__')},
         **decorated_methods
     })
     
     # Copy over type hints explicitly to help type checkers
     try:
-        NewClass.__annotations__ = getattr(cls, '__annotations__', {})
+        new_cls.__annotations__ = getattr(cls, '__annotations__', {})
     except (AttributeError, TypeError):
         pass
     
     # Copy docstring, module name etc.
     for attr in ['__doc__', '__module__', '__qualname__']:
         try:
-            setattr(NewClass, attr, getattr(cls, attr))
+            setattr(new_cls, attr, getattr(cls, attr))
         except (AttributeError, TypeError):
             pass
+    
+    # Add static tag attributes
+    setattr(new_cls, '__tag__', f'{namespace}/{class_name}/{version}')
 
-    return cast(T, NewClass)
+    return new_cls
 
-def iicrm(cls: T) -> T:
+def crm(cls: T) -> T:
     """
-    Implementation of ICRM (IICRM) decorator
+    Implementation of ICRM (CRM) decorator
     --
     A decorator for classes that implement an ICRM interface.
     
     This decorator ensures that:
-    1. The decorated class properly implements all methods defined in its ICRM parent class
-    2. All implemented methods are automatically decorated with @auto_transfer
-    
-    Note: The name 'iicrm' is used because 'crm' is already used as a sub-module name in c-two.
+    1. The decorated class has a 'terminate' method
+    2. The decorated class properly implements all methods defined in its ICRM parent class
+    3. All implemented methods are automatically decorated with @auto_transfer
     """
+    # Validate that the class has a terminate method
+    if not hasattr(cls, 'terminate'):
+        raise TypeError(f'Class {cls.__name__} does not have a "terminate" method, which is required for CRM functionality.')
     
     # Get the base class decorated with @icrm
     base_class = None
