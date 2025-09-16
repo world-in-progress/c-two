@@ -1,6 +1,7 @@
 import enum
 import logging
 import threading
+from typing import TypeVar, Type
 
 from .util.wait import wait
 from .util.encoding import parse_message
@@ -11,20 +12,22 @@ from .zmq import ZmqServer
 from .http import HttpServer
 from .thread import ThreadServer
 from .memory import MemoryServer
-from .transferable import get_wrapped_function
 
+CRM = TypeVar('CRM')
+ICRM = TypeVar('ICRM')
 logger = logging.getLogger(__name__)
 
 # Stage and State structures for Server ###############################
 
 @enum.unique
 class ServerStage(enum.Enum):
-    STOPPED = "stopped"
-    STARTED = "started"
-    GRACE = "grace"
+    GRACE = 'grace'
+    STOPPED = 'stopped'
+    STARTED = 'started'
 
-class ServerState(object):
-    crm: object | None
+class ServerState:
+    crm: CRM
+    icrm: ICRM
     stage: ServerStage
     server: BaseServer
     lock: threading.RLock
@@ -33,8 +36,9 @@ class ServerState(object):
     termination_event: threading.Event
     shutdown_events: list[threading.Event]
 
-    def __init__(self, server: BaseServer, event_queue: EventQueue, crm: object):
+    def __init__(self, server: BaseServer, event_queue: EventQueue, crm: CRM, icrm: ICRM):
         self.crm = crm
+        self.icrm = icrm
         self.server = server
         self.event_queue = event_queue
 
@@ -93,7 +97,8 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
     
     # Process CRM_CALL event
     elif event.tag is EventTag.CRM_CALL:
-        crm = state.crm
+        # crm = state.crm
+        iicrm = state.icrm
         sub_messages = parse_message(event.data)
 
         # Get method name
@@ -103,11 +108,12 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
         args_bytes = sub_messages[1]
         
         # Call method wrapped from CRM method
-        method = get_wrapped_function(crm.__class__, method_name)
+        # method = get_wrapped_function(crm.__class__, method_name)
+        method = getattr(iicrm, method_name, None)
         if method is None:
-            raise ValueError(f'No wrapped function found for method: {crm.__module__}.{crm.__name__}.{method_name}')
+            raise ValueError(f'No wrapped function found for method: {iicrm.__module__}.{iicrm.__name__}.{method_name}')
 
-        response = method(crm, args_bytes)
+        response = method(args_bytes)
         
         # Create a serialized response based on the serialized_error and serialized_result
         state.server.reply(Event(tag=EventTag.CRM_REPLY, data=response, request_id=event.request_id))
@@ -165,7 +171,7 @@ class Server:
     A generic server interface that can handle different types of servers
     (ZMQ, HTTP, Memory) based on the provided bind address.
     """
-    def __init__(self, bind_address: str, crm: object, name: str = ''):
+    def __init__(self, bind_address: str, icrm_cls: Type[ICRM], crm: CRM, name: str = ''):
         self.name = name if name != '' else 'CRM Server'
         
         # Check bind_address protocol and create appropriate server
@@ -184,9 +190,15 @@ class Server:
         # Create an event queue for the server
         event_queue = EventQueue()
         self.server.register_queue(event_queue)
+        
+        # Create the inverted ICRM object
+        icrm = icrm_cls()
+        icrm.crm = crm
+        icrm.direction = '<-'
 
         # Create the server state
         self._state = ServerState(
+            icrm=icrm,
             crm=crm,
             server=self.server,
             event_queue=event_queue

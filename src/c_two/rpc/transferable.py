@@ -16,22 +16,8 @@ logger = logging.getLogger(__name__)
 
 # Global Caches ###################################################################
 
-_WRAPPED_FUNCTIONS: dict[tuple, callable] = {}
 _TRANSFERABLE_MAP: dict[str, Transferable] = {}
 _TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
-
-# Wrapped Function Registering Tool ###############################################
-
-def _get_function_key(cls: object, func_name: str) -> str:
-    return f'{cls.__module__}.{cls.__name__}.{func_name}'
-
-def register_wrapped_function(cls: Type[T], func: callable, wrapped: callable) -> None:
-    key = _get_function_key(cls, func.__name__)
-    _WRAPPED_FUNCTIONS[key] = wrapped
-
-def get_wrapped_function(cls: Type[T], func_name: str) -> callable | None:
-    key = _get_function_key(cls, func_name)
-    return _WRAPPED_FUNCTIONS.get(key)
 
 # Definition of Transferable ######################################################
 
@@ -118,7 +104,7 @@ def _default_serialize_func(*args):
 def _default_deserialize_func(data: memoryview | None):
     return pickle.loads(data) if data else None
 
-def defaultTransferableFactory(func, is_input: bool):
+def create_default_transferable(func, is_input: bool):
     """
     Factory function to dynamically create a Transferable class for a given function.
 
@@ -132,7 +118,6 @@ def defaultTransferableFactory(func, is_input: bool):
     Returns:
         A dynamically created Transferable class
     """
-    
     if is_input:
         # Create dynamic class name for input
         class_name = f'Default{func.__name__.title()}InputTransferable'
@@ -255,9 +240,8 @@ def register_transferable(transferable: Transferable) -> str:
     _TRANSFERABLE_MAP[full_name] = transferable
     return full_name
 
-def get_transferable(transferable_name: str) -> Transferable | None:
-    name = transferable_name
-    return None if name not in _TRANSFERABLE_MAP else _TRANSFERABLE_MAP[name]
+def get_transferable(full_name: str) -> Transferable | None:
+    return None if full_name not in _TRANSFERABLE_MAP else _TRANSFERABLE_MAP[full_name]
 
 # Transferable-related decorators #################################################
 
@@ -274,27 +258,31 @@ def transferable(cls: Type[T]) -> Type[T]:
 def transfer(input: Transferable | None = None, output: Transferable | None = None) -> callable:
 
     def decorator(func: callable) -> callable:
+        method_name = func.__name__
         
         def com_to_crm(*args: any) -> any:
-            method_name = func.__name__
-            
             # Get transferable
             input_transferable = input.serialize if input else None
             output_transferable = output.deserialize if output else None
 
-            # Convert input and run method
-            if len(args) < 1:
-                raise ValueError('Instance method requires self, but only get one argument.')
-            
-            obj = args[0]
-            request = args[1:] if len(args) > 1 else None
-            
             try:
-                args_converted = input_transferable(*request) if (request is not None and input_transferable is not None) else None
-                result_bytes = obj.client.call(method_name, args_converted)
+                if len(args) < 1:
+                    raise ValueError('Instance method requires self, but only get one argument.')
+                
+                # Parse input args
+                icrm = args[0]
+                client = icrm.client
+                request = args[1:] if len(args) > 1 else None
+                
+                # Serialize input args if input_transferable is provided
+                serialized_args = input_transferable(*request) if (request is not None and input_transferable is not None) else None
+                
+                # Run method remotely and deserialize output if output_transferable is provided
+                result_bytes = client.call(method_name, serialized_args)
                 return None if not output_transferable else output_transferable(result_bytes)
+            
             except Exception as e:
-                if 'args_converted' not in locals():
+                if 'serialized_args' not in locals():
                     raise error.CompoSerializeInput(str(e))
                 elif 'result_bytes' not in locals():
                     raise error.CompoCRMCalling(str(e))
@@ -302,30 +290,36 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                     raise error.CompoDeserializeOutput(str(e))
         
         def crm_to_com(*args: any) -> tuple[any, any]:
-            
             # Get transferable
             input_transferable = input.deserialize if input else None
             output_transferable = output.serialize if output else None
 
-            # Convert input and run method
             try:
                 if len(args) < 1:
                     raise ValueError('Instance method requires self, but only get one argument.')
                 
-                obj = args[0]
+                # Parse input args
+                iicrm = args[0]
+                crm = iicrm.crm
                 request = args[1] if len(args) > 1 else None
                 
-                args_converted = input_transferable(request) if (request is not None and input_transferable is not None) else tuple()
-                # If args_converted is not a tuple, convert it to a tuple
-                if not isinstance(args_converted, tuple):
-                    args_converted = (args_converted,)
-                
-                result = func(obj, *args_converted)
+                # Deserialize input args if input_transferable is provided
+                # And if deserialized_args is not a tuple, convert it to a tuple
+                deserialized_args = input_transferable(request) if (request is not None and input_transferable is not None) else tuple()
+                if not isinstance(deserialized_args, tuple):
+                    deserialized_args = (deserialized_args,)
+
+                # Call CRM method with the same name
+                crm_method = getattr(crm, method_name, None)
+                if crm_method is None:
+                    raise ValueError(f'Method "{method_name}" not found on CRM class.')
+
+                result = crm_method(*deserialized_args)
                 err = None
                 
             except Exception as e:
                 result = None
-                if 'args_converted' not in locals():
+                if 'deserialized_args' not in locals():
                     err = error.CRMDeserializeInput(str(e))
                 elif 'result' not in locals():
                     err = error.CRMExecuteFunction(str(e))
@@ -349,22 +343,22 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             if not args:
                 raise ValueError('No arguments provided to determine direction.')
             
-            obj = args[0]
-            if not hasattr(obj, 'direction'):
-                raise AttributeError('The object does not have a "direction" attribute.')
+            icrm = args[0]
+            if not hasattr(icrm, 'direction'):
+                raise AttributeError('The ICRM instance does not have a "direction" attribute.')
             
-            if obj.direction == '->':
+            if icrm.direction == '->':
                 return com_to_crm(*args)
-            elif obj.direction == '<-':
+            elif icrm.direction == '<-':
                 return crm_to_com(*args)
             else:
-                raise ValueError(f'Invalid direction value: {obj.direction}. Expected "->" or "<-".')
+                raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
         
         return transfer_wrapper
     
     return decorator
 
-def auto_transfer(cls: Type[T], direction: str, func = None) -> callable:
+def auto_transfer(func: callable | None = None) -> callable:
     def create_wrapper(func: callable) -> callable:
         # --- Input Matching using Pydantic Model Comparison ---
         input_model = _create_pydantic_model_from_func_sig(func)
@@ -404,7 +398,7 @@ def auto_transfer(cls: Type[T], direction: str, func = None) -> callable:
 
             # If no matching transferable found, create a default one (not registered and only used in this function)
             if input_transferable is None and not is_empty_input:
-                input_transferable = defaultTransferableFactory(func, is_input=True)
+                input_transferable = create_default_transferable(func, is_input=True)
 
         # --- Output Matching (compares types directly) ---
         type_hints = get_type_hints(func)
@@ -442,20 +436,12 @@ def auto_transfer(cls: Type[T], direction: str, func = None) -> callable:
                 
                 # If no matching transferable found, create a default one (not registered and only used in this function)
                 if output_transferable is None and not (return_type is None or return_type is type(None)):
-                    output_transferable = defaultTransferableFactory(func, is_input=False)
+                    output_transferable = create_default_transferable(func, is_input=False)
 
         # --- Wrapping ---
         transfer_decorator = transfer(input=input_transferable, output=output_transferable)
         wrapped_func = transfer_decorator(func)
-            
-        if direction == '->':
-            return wrapped_func
-        elif direction == '<-':
-            # Register the wrapped function for later retrieval
-            register_wrapped_function(cls, func, wrapped_func)
-            return func
-        else:
-            raise ValueError(f'Invalid direction value: {direction}. Expected "->" or "<-".')
+        return wrapped_func
 
     if func is None:
         return create_wrapper
