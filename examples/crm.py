@@ -1,10 +1,9 @@
 import os
-import c_two as cc
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
-from icrm import IGrid, GridSchema, GridAttribute
+from icrm import GridSchema, GridAttribute
 
 # Const ##############################
 
@@ -31,7 +30,6 @@ GRID_SCHEMA: pa.Schema = pa.schema([
     (ATTR_ELEVATION, pa.float64())
 ])
 
-# @cc.crm
 class Grid:
     """
     CRM

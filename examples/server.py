@@ -1,27 +1,15 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
-import c_two as cc
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
-import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import c_two as cc
+from crm import Grid
+from icrm import IGrid
+from example_addresses import EXAMPLE_ADDRESS
 
 if __name__ == '__main__':
-    from icrm import IGrid
-    from crm import Grid
-    
-    MEMORY_ADDRESS = 'memory://root_hello'
-    IPC_ADDRESS = 'ipc:///tmp/zmq_test'
-    TCP_ADDRESS = 'tcp://localhost:5555'
-    HTTP_ADDRESS = 'http://localhost:5556/?node-key=tempParentPath_tempChildPath'
-    HTTP_ADDRESS = 'http://localhost:5556/hahaha'
-    HTTP_ADDRESS = 'http://localhost:5556'
-    HTTP_ADDRESS = 'http://localhost:5556/api/?node-key=tempParentPath_tempChildPath'
-
-    TEST_ADDRESS = MEMORY_ADDRESS
-
     # Grid parameters
     epsg = 2326
     first_size = [64.0, 64.0]
@@ -32,11 +20,10 @@ if __name__ == '__main__':
     ]
     
     # Init CRM
-    grid_file_path='./grids.arrow'
     crm = Grid(epsg, bounds, first_size, subdivide_rules)
     
     # Create CRM server
-    server = cc.rpc.Server(TEST_ADDRESS, IGrid, crm)
+    server = cc.rpc.Server(EXAMPLE_ADDRESS, IGrid, crm)
 
     # Run CRM server and handle termination gracefully
     server.start()

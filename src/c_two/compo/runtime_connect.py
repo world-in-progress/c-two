@@ -9,7 +9,7 @@ from ..rpc import Client
 
 _local = threading.local()
 
-T = TypeVar('T')
+ICRM = TypeVar('ICRM')
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +18,11 @@ def connect_crm(address: str) -> ContextManager[Client]:
     ...
 
 @overload
-def connect_crm(address: str, icrm_class: Type[T]) -> ContextManager[T]:
+def connect_crm(address: str, icrm_class: Type[ICRM]) -> ContextManager[ICRM]:
     ...
 
 @contextmanager
-def connect_crm(address: str, icrm_class: Type[T] = None) -> Generator[Client | T, None, None]:
+def connect_crm(address: str, icrm_class: Type[ICRM] = None) -> Generator[Client | ICRM, None, None]:
     """
     Context manager to connect to a CRM server.
     
@@ -42,9 +42,10 @@ def connect_crm(address: str, icrm_class: Type[T] = None) -> Generator[Client | 
             if icrm_class is not None:
                 icrm = icrm_class()
                 icrm.client = client
-                yield cast(T, icrm)
+                yield icrm
             else:
                 yield client
+                
         except Exception as e:
             logger.error(f'Error occurred when connecting to CRM:\n{e}')
         finally:

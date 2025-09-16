@@ -5,8 +5,9 @@ from . import rpc
 from . import mcp
 from . import compo
 from . import error
-from .crm.meta import icrm, crm
-from .rpc.transferable import transfer, auto_transfer, Transferable, transferable
+from .compo import runtime
+from .crm.meta import icrm
+from .rpc.transferable import transferable
 
 __version__ = '0.2.5'
 
