@@ -6,21 +6,22 @@
 <img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/logo.png">
 </p> 
 
-C-Two is a **type-safe Remote Procedure Call (RPC) framework**, making it possible for resource-oriented classes to be remotely invoked across different processes or machines. It is specifically suited for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method calling between **Components** and **Core Resource Models (CRMs)** with automatic serialization and protocol-agnostic communication.
+C-Two is a **Remote Procedure Call (RPC) framework** that enables resource-oriented classes to be remotely invoked across different processes or machines. It is specifically designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method calling between **Components** and **Core Resource Models (CRMs)** with automatic serialization and protocol-agnostic communication.
 
 ## Framework Overview
 
 **The design philosophy of C-Two is not to define services, but to empower resources.**
 
-In common scientific computation, resources encapsulating complex state and domain-specific operations need to be highly cohesive into specific units or interaction models. We call these resource-oriented abstractions as **Core Resource Models (CRMs)**. From the perspective of business logic, projects are not interested in where the resources are located and where they come from, but rather in how to interact with them and implement their high-level logic. We call these resource consumers as **Components**. C-Two can provide CRM location transparency and status source transparency, so that components can interact with CRMs as if they were local objects. This approach is particularly valuable for geographic information systems, scientific computing, and other domains requiring persistent resource management with distributed access patterns.
+In scientific computation, resources that encapsulate complex state and domain-specific operations need to be organized into cohesive units or interaction models. We call these resource-oriented abstractions **Core Resource Models (CRMs)**. From a business logic perspective, applications care more about how to interact with resources and implement high-level logic, rather than where the resources are located or where they originate. We call these resource consumers **Components**. C-Two provides location transparency and uniform resource access for CRMs, allowing components to interact with them as if they were local objects. This approach is particularly valuable for geographic information systems, scientific computing, and other domains that require persistent resource management with distributed access patterns.
 
-C-Two addresses the complexity of distributed computing by implementing a clear separation of concerns through interface-based programming and automatic type marshalling. The framework enables developers to write distributed applications using familiar local programming patterns while maintaining type safety across network boundaries.
+C-Two addresses the complexity of distributed computing by implementing a clear separation of concerns through interface-based programming and automatic type marshalling. The framework enables developers to write distributed applications using familiar local programming patterns.
+
+This framework tries to transform isolated computational models into reusable, network-addressable assets, fostering long-term knowledge accumulation over short-term service proliferation.
 
 ### Core Architectural Principles
 
 - **Resource-Oriented Design**: Focus on stateful computational resources rather than stateless function calls
 - **Interface Segregation**: Clean separation between interface definitions (ICRM) and implementations (CRM)
-- **Type Safety**: Compile-time and runtime type checking with automatic or customized serialization inference
 - **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (Thread, Memory, IPC, TCP, HTTP)
 
 ## Architecture
@@ -33,10 +34,10 @@ The framework implements a three-tier architecture:
 Client-side computational units that consume remote resources through Interface of Core Resource Models (ICRM), providing network transparency for distributed operations.
 
 ### CRM Layer
-Server-side CRMs maintaining persistent state and implementing domain-specific, low-level resource management, exposed through standardized ICRM interfaces.
+Server-side CRMs that maintain persistent state and implement domain-specific resource management, exposed through standardized ICRM interfaces.
 
 ### Transport Layer
-Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Thread, Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
+Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Thread, Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management, and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
 
 ## Technical Requirements
 
@@ -82,8 +83,7 @@ uv sync
 
 ### 1. Resource Model Implementation (CRM)
 
-Implement the CRM, which is just a regular Python class that can maintain resource state and implement domain-specific logic.
-The only difference is that the CRM class must have a member function `terminate()` to handle resource cleanup when the CRM is released.
+Implement the CRM as a regular Python class that maintains resource state and implements domain-specific logic.
 
 ```python
 from dataclasses import dataclass
@@ -102,19 +102,19 @@ class Grid:
         pass
     
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        # Logic implementation of retrieving grid information
+        # Implement grid information retrieval logic
         pass
     
     def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
-        # Logic implementation of subdivision algorithm
+        # Implement grid subdivision algorithm
         pass
     
     def delete_grids(self, levels: list[int], global_ids: list[int]) -> None:
-        # Logic implementation of delete operation
+        # Implement grid deletion logic
         pass
 
     def terminate(self):
-        # Logic implementation of resource cleanup
+        # Implement resource cleanup logic
         pass
 
 ```
@@ -122,7 +122,7 @@ class Grid:
 ### 2. Interface Definition (ICRM)
 
 Define remote interfaces using the `@icrm` decorator to establish contracts for distributed communication.
-There is no need to demonstrate all methods of the CRM, only those that need to be exposed remotely.
+You only need to expose the CRM methods that will be accessed remotely, not all methods.
 
 ```python
 import c_two as cc
@@ -149,8 +149,8 @@ class IGrid:
 
 ### 3. Custom Data Type Definition (Optional)
 
-Define serializable data structures using the `@transferable` decorator with any necessary serialization logic.
-In this example, we modify the `GridAttribute` and create `GridAttributes` in ICRM file, to use Apache Arrow for efficient serialization.
+Define serializable data structures using the `@transferable` decorator with custom serialization logic.
+In this example, we modify `GridAttribute` and create `GridAttributes` in the ICRM file to use Apache Arrow for efficient serialization.
 
 ```python
 import c_two as cc
@@ -231,7 +231,7 @@ def deserialize_to_rows(serialized_data: bytes) -> dict:
 ### 4. Server Deployment
 
 Deploy the CRM as a networked service with automatic protocol detection.
-Services are only accessible through the defined ICRM interfaces.
+Services are accessible only through the defined ICRM interfaces.
 
 ```python
 import c_two as cc
@@ -241,26 +241,27 @@ from icrm import IGrid
 # Resource initialization and server configuration
 grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
 
-# Thread server (in-process, thread-safe communication)
-server = cc.rpc.Server("thread://grid_processor", IGrid, grid)
+# Create server configuration
+config = cc.rpc.ServerConfig(
+    name='GridProcessor',
+    crm=grid,
+    icrm=IGrid,
+    on_shutdown=grid.terminate,
+    bind_address='thread://grid_processor',     # thread server (in-process, thread-safe communication)
+    # bind_address='memory://grid_processor',   # memory server (shared memory, high-performance local communication)
+    # bind_address='ipc:///tmp/grid_processor', # IPC server (inter-process communication for Unix-like systems, local machine)
+    # bind_address='tcp://localhost:5555',      # TCP server (network-based, cross-machine)
+    # bind_address='http://localhost:8000',     # HTTP server (web-compatible, cross-platform)
+)
 
-# Memory server (shared memory, high-performance local communication)
-server = cc.rpc.Server("memory://grid_processor", IGrid, grid)
-
-# IPC server (inter-process communication for Unix-like systems, local machine)
-server = cc.rpc.Server("ipc:///tmp/grid_processor", IGrid, grid)
-
-# TCP server (network-based, cross-machine)
-server = cc.rpc.Server("tcp://localhost:5555", IGrid, grid)
-
-# HTTP server (web-compatible, cross-platform)
-server = cc.rpc.Server("http://localhost:8000", IGrid, grid)
+# Init server
+server = cc.rpc.Server(config)
 
 # Same server lifecycle management regardless of protocol
 server.start()
 print('CRM server is running. Press Ctrl+C to stop.')
 try:
-    # Wait for server termination with a timeout or not
+    # Wait for server termination with optional timeout
     server.wait_for_termination(timeout=10)
     print('Timeout reached, stopping CRM server...')
 except KeyboardInterrupt:
@@ -272,7 +273,7 @@ finally:
 
 ### 5. Client Implementation
 
-The framework provides seamless protocol-transparent connectivity to CRM services.
+The framework provides seamless, protocol-transparent connectivity to CRM services.
 
 #### Script-Based Component Approach
 ```python
@@ -313,14 +314,16 @@ def process_grids(grid: IGrid, target_level: int) -> list[str]:
     candidates = [info.global_id for info in infos if hasattr(info, 'elevation') and info.elevation > 0]
     return grid.subdivide_grids([target_level] * len(candidates), candidates)
 
-# Protocol is determined automatically by the address
+# Protocol is automatically determined by the address
 result = process_grids(1, crm_address='thread://grid_processor')      # use Thread
 result = process_grids(1, crm_address='memory://grid_processor')      # use Memory
 result = process_grids(1, crm_address='ipc:///tmp/grid_processor')    # use IPC
 result = process_grids(1, crm_address='tcp://localhost:5555')         # use TCP
 result = process_grids(1, crm_address='http://localhost:8000')        # use HTTP
 
-# Or using a context manager with automatic protocol detection
+# OR ##################################################
+
+# Using a context manager with automatic protocol detection
 with cc.compo.connect_crm('thread://grid_processor'):
     result = process_grids(1)
 ```

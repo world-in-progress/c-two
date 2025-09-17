@@ -20,10 +20,19 @@ if __name__ == '__main__':
     ]
     
     # Init CRM
-    crm = Grid(epsg, bounds, first_size, subdivide_rules)
+    grid = Grid(epsg, bounds, first_size, subdivide_rules)
+    
+    # Make server config
+    config = cc.rpc.ServerConfig(
+        name='CRM Server',
+        bind_address=EXAMPLE_ADDRESS,
+        crm=grid,
+        icrm_cls=IGrid,
+        on_shutdown=grid.terminate
+    )
     
     # Create CRM server
-    server = cc.rpc.Server(EXAMPLE_ADDRESS, IGrid, crm)
+    server = cc.rpc.Server(config)
 
     # Run CRM server and handle termination gracefully
     server.start()
