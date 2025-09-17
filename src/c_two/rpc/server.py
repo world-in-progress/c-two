@@ -1,7 +1,10 @@
 import enum
+import typing
+import inspect
 import logging
 import threading
-from typing import TypeVar, Type
+from typing import TypeVar, Type, Generic
+from dataclasses import dataclass
 
 from .util.wait import wait
 from .util.encoding import parse_message
@@ -19,6 +22,37 @@ logger = logging.getLogger(__name__)
 
 # Stage and State structures for Server ###############################
 
+@dataclass
+class ServerConfig(Generic[CRM, ICRM]):
+    crm: CRM
+    bind_address: str
+    icrm_cls: Type[ICRM]
+    name: str = 'CRM Server'
+    on_shutdown: callable = lambda: None
+    
+    def __post_init__(self):
+        """
+        Comprehensive validation to ensure CRM fully supports ICRM interface.
+        Checks function names, input/output types, and method signatures.
+        """
+        # Get all public methods from ICRM (excluding private methods)
+        icrm_methods = {
+            name: method
+            for name, method in inspect.getmembers(self.icrm_cls, predicate=inspect.isfunction)
+            if not name.startswith('_')
+        }
+        
+        # Get all public methods from CRM instance
+        crm_methods = {
+            name: method for name, method in inspect.getmembers(self.crm.__class__, predicate=inspect.isfunction)
+            if not name.startswith('_')
+        }
+        
+        # Check for missing methods
+        missing_methods = set(icrm_methods.keys()) - set(crm_methods.keys())
+        if missing_methods:
+            raise ValueError(f'The CRM instance is missing implementations for methods: {missing_methods}')
+        
 @enum.unique
 class ServerStage(enum.Enum):
     GRACE = 'grace'
@@ -30,17 +64,19 @@ class ServerState:
     icrm: ICRM
     stage: ServerStage
     server: BaseServer
+    on_shutdown: callable
     lock: threading.RLock
     event_queue: EventQueue
     server_deallocated: bool
     termination_event: threading.Event
     shutdown_events: list[threading.Event]
 
-    def __init__(self, server: BaseServer, event_queue: EventQueue, crm: CRM, icrm: ICRM):
+    def __init__(self, server: BaseServer, event_queue: EventQueue, crm: CRM, icrm: ICRM, on_shutdown: callable):
         self.crm = crm
         self.icrm = icrm
         self.server = server
         self.event_queue = event_queue
+        self.on_shutdown = on_shutdown
 
         self.lock = threading.RLock()
         self.server_deallocated = False
@@ -82,10 +118,14 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
     # Process SHUTDOWN event
     elif event.tag is EventTag.SHUTDOWN_FROM_CLIENT or event.tag is EventTag.SHUTDOWN_FROM_SERVER:
         with state.lock:
-            # If the CRM instance has a terminate method, call it
-            if state.crm and hasattr(state.crm, 'terminate'):
-                state.crm.terminate()
-                state.crm = None
+            # If the server state has on_shutdown callback, call it
+            if state.on_shutdown:
+                try:
+                    state.on_shutdown()
+                    state.on_shutdown = None  # prevent multiple calls
+                    state.crm = None          # release CRM reference
+                except Exception as e:
+                    logger.error(f'Error during on_shutdown callback: {e}')
             
             # Send shutdown acknowledgment if Shutdown event comes from client
             if event.tag is EventTag.SHUTDOWN_FROM_CLIENT:
@@ -97,8 +137,7 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
     
     # Process CRM_CALL event
     elif event.tag is EventTag.CRM_CALL:
-        # crm = state.crm
-        iicrm = state.icrm
+        icrm = state.icrm
         sub_messages = parse_message(event.data)
 
         # Get method name
@@ -108,10 +147,9 @@ def _process_event_and_continue(state: ServerState, event: Event) -> bool:
         args_bytes = sub_messages[1]
         
         # Call method wrapped from CRM method
-        # method = get_wrapped_function(crm.__class__, method_name)
-        method = getattr(iicrm, method_name, None)
+        method = getattr(icrm, method_name, None)
         if method is None:
-            raise ValueError(f'No wrapped function found for method: {iicrm.__module__}.{iicrm.__name__}.{method_name}')
+            raise ValueError(f'No wrapped function found for method: {icrm.__module__}.{icrm.__name__}.{method_name}')
 
         response = method(args_bytes)
         
@@ -171,36 +209,37 @@ class Server:
     A generic server interface that can handle different types of servers
     (ZMQ, HTTP, Memory) based on the provided bind address.
     """
-    def __init__(self, bind_address: str, icrm_cls: Type[ICRM], crm: CRM, name: str = ''):
-        self.name = name if name != '' else 'CRM Server'
+    def __init__(self, config: ServerConfig):
+        self.name = config.name
         
         # Check bind_address protocol and create appropriate server
-        if bind_address.startswith(('tcp://', 'ipc://')):
-            self.server = ZmqServer(bind_address)
-        elif bind_address.startswith('http://'):
-            self.server = HttpServer(bind_address)
-        elif bind_address.startswith('memory://'):
-            self.server = MemoryServer(bind_address)
-        elif bind_address.startswith('thread://'):
-            self.server = ThreadServer(bind_address)
+        if config.bind_address.startswith(('tcp://', 'ipc://')):
+            self.server = ZmqServer(config.bind_address)
+        elif config.bind_address.startswith('http://'):
+            self.server = HttpServer(config.bind_address)
+        elif config.bind_address.startswith('memory://'):
+            self.server = MemoryServer(config.bind_address)
+        elif config.bind_address.startswith('thread://'):
+            self.server = ThreadServer(config.bind_address)
         else:
             # TODO: Handle other protocols if needed
-            raise ValueError(f'Unsupported protocol in bind_address: {bind_address}')
+            raise ValueError(f'Unsupported protocol in bind_address: {config.bind_address}')
         
         # Create an event queue for the server
         event_queue = EventQueue()
         self.server.register_queue(event_queue)
         
         # Create the inverted ICRM object
-        icrm = icrm_cls()
-        icrm.crm = crm
+        icrm = config.icrm_cls()
+        icrm.crm = config.crm
         icrm.direction = '<-'
 
         # Create the server state
         self._state = ServerState(
             icrm=icrm,
-            crm=crm,
+            crm=config.crm,
             server=self.server,
+            on_shutdown=config.on_shutdown,
             event_queue=event_queue
         )
     

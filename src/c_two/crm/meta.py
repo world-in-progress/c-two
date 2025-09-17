@@ -19,7 +19,7 @@ class ICRMMeta(type):
         cls = super().__new__(mcs, name, bases, attrs, **kwargs)
         return cls
 
-def icrm(*, namespace: str = 'cc', version: str = '0.1.0') -> Type[ICRM]:
+def icrm(*, namespace: str = 'cc', version: str = '0.1.0'):
     """
     Interface of Core Resource Model (ICRM) decorator
     --
@@ -34,7 +34,7 @@ def icrm(*, namespace: str = 'cc', version: str = '0.1.0') -> Type[ICRM]:
         A class that has all the attributes of the original class plus a static
         'connect' method that creates and returns instances connected to a remote service.
     """
-    def icrm_wrapper(cls: Type[ICRM]) -> Type[ICRM]:
+    def icrm_wrapper(cls: Type[ICRM]) -> ICRMMeta:
         # Validate namespace and version
         if not namespace:
             raise ValueError('Namespace of ICRM cannot be empty.')

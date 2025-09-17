@@ -1,5 +1,5 @@
 MEMORY_ADDRESS = 'memory://root_hello'
-IPC_ADDRESS = 'ipc:///tmp/zmq_test'
+IPC_ADDRESS = 'ipc:///tmp/zmq_demo'
 TCP_ADDRESS = 'tcp://localhost:5555'
 HTTP_ADDRESS = 'http://localhost:5556'
 # HTTP_ADDRESS = 'http://localhost:5556/hahaha'

@@ -24,6 +24,8 @@ def generate_crm_template(icrm_class: Type[T], output_path: str | Path) -> None:
     
     # Get source file path
     source_file = inspect.getsourcefile(icrm_class)
+    if not source_file:
+        raise ValueError(f'Could not retrieve source file for {icrm_class.__name__}')
     
     # Parse source code using AST
     with open(source_file, 'r') as f:
@@ -123,7 +125,7 @@ def _extract_method_from_ast(class_node: ast.ClassDef) -> list[dict]:
             method_info = {
                 'name': node.name,
                 'args': _format_arguments(node.args),
-                'returns': _format_return_annotation(node.returns),
+                'returns': _format_return_annotation(node.returns) if node.returns else '',
                 'docstring': ast.get_docstring(node) or '',
             }
             methods.append(method_info)
