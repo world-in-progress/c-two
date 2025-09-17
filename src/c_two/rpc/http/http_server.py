@@ -112,7 +112,7 @@ class HttpServer(BaseServer):
         # Create route that matches the exact path (including query parameters)
         # Split path and query for route configuration
         if '?' in self.path:
-            route_path = self.path.split('?')[0]  # Use only the path part for routing
+            route_path = self.path.split('?')[0]  # use only the path part for routing
         else:
             route_path = self.path
             

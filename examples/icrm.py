@@ -215,7 +215,7 @@ class GridKeys:
 
 # Define ICRM ###########################################################
 
-@cc.icrm(namespace='CC_Example', version='0.1.0')
+@cc.icrm(namespace='cc.demo', version='0.1.0')
 class IGrid:
     """
     IGrid
