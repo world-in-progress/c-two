@@ -1,6 +1,8 @@
 import os
 import sys
+import logging
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
@@ -22,28 +24,17 @@ if __name__ == '__main__':
     # Init CRM
     grid = Grid(epsg, bounds, first_size, subdivide_rules)
     
-    # Make server config
+    # Create server config
     config = cc.rpc.ServerConfig(
-        name='CRM Server',
-        bind_address=EXAMPLE_ADDRESS,
+        name='Grid Processor',
         crm=grid,
-        icrm_cls=IGrid,
-        on_shutdown=grid.terminate
+        icrm=IGrid,
+        on_shutdown=grid.terminate,
+        bind_address=EXAMPLE_ADDRESS
     )
     
     # Create CRM server
     server = cc.rpc.Server(config)
 
-    # Run CRM server and handle termination gracefully
+    # Run CRM server
     server.start()
-    print('CRM server is running. Press Ctrl+C to stop.')
-    try:
-        server.wait_for_termination()
-        print('Timeout reached, stopping CRM server...')
-        
-    except KeyboardInterrupt:
-        print('Stopping CRM server...')
-
-    finally:
-        server.stop()
-        print('CRM server stopped.')

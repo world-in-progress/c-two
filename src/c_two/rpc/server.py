@@ -25,20 +25,24 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ServerConfig(Generic[CRM, ICRM]):
     crm: CRM
+    icrm: Type[ICRM]
     bind_address: str
-    icrm_cls: Type[ICRM]
-    name: str = 'CRM Server'
+    name: str = ''
     on_shutdown: callable = lambda: None
     
     def __post_init__(self):
         """
+        Set default name if not provided.
         Comprehensive validation to ensure CRM fully supports ICRM interface.
-        Checks function names, input/output types, and method signatures.
         """
+        # Set default name if not provided
+        if not self.name:
+            self.name = f'{self.crm.__class__.__name__}'
+        
         # Get all public methods from ICRM (excluding private methods)
         icrm_methods = {
             name: method
-            for name, method in inspect.getmembers(self.icrm_cls, predicate=inspect.isfunction)
+            for name, method in inspect.getmembers(self.icrm, predicate=inspect.isfunction)
             if not name.startswith('_')
         }
         
@@ -230,7 +234,7 @@ class Server:
         self.server.register_queue(event_queue)
         
         # Create the inverted ICRM object
-        icrm = config.icrm_cls()
+        icrm = config.icrm()
         icrm.crm = config.crm
         icrm.direction = '<-'
 
@@ -243,9 +247,21 @@ class Server:
             event_queue=event_queue
         )
     
-    def start(self) -> None:
+    def start(self, timeout: float | None = None) -> None:
         _start(self._state)
-    
+        logger.info(f'CRM server "{self.name}" is running. Press Ctrl+C to stop.')
+        
+        try:
+            self.wait_for_termination(timeout)
+            logger.info(f'Timeout reached, stopping CRM server "{self.name}"...')
+            
+        except KeyboardInterrupt:
+            logger.info(f'Stopping CRM server "{self.name}"...')
+
+        finally:
+            self.stop()
+            logger.info(f'CRM server "{self.name}" stopped.')
+
     def stop(self) -> None:
         _stop(self._state)
     
