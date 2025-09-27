@@ -1,7 +1,7 @@
 [project]
 name = "c-two"
-version = "0.2.5"
-description = "A resource-rpc framework for distributed resource computation with type-safe and protocol-agnostic communication."
+version = "0.2.6"
+description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
