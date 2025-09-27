@@ -9,7 +9,7 @@ from .compo import runtime
 from .crm.meta import icrm
 from .rpc.transferable import transferable
 
-__version__ = '0.2.5'
+__version__ = '0.2.6'
 
 LOGO_ASCII ="""
                                                   
