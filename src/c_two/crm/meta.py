@@ -34,7 +34,7 @@ def icrm(*, namespace: str = 'cc', version: str = '0.1.0'):
         A class that has all the attributes of the original class plus a static
         'connect' method that creates and returns instances connected to a remote service.
     """
-    def icrm_wrapper(cls: Type[ICRM]) -> ICRMMeta:
+    def icrm_wrapper(cls: Type[ICRM]) -> Type[ICRM]:
         # Validate namespace and version
         if not namespace:
             raise ValueError('Namespace of ICRM cannot be empty.')

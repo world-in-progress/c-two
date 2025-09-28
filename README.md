@@ -1,4 +1,4 @@
-# C-Two (Greenhouse v0.2.6)
+# C-Two (Greenhouse v0.2.7)
 
 [![PyPI version](https://badge.fury.io/py/c-two.svg)](https://badge.fury.io/py/c-two)
 
@@ -8,10 +8,8 @@
 
 C-Two is a **Remote Procedure Call (RPC) framework** that enables resource-oriented classes to be remotely invoked across different processes or machines. It is specifically designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method calling between **Components** and **Core Resource Models (CRMs)** with automatic serialization and protocol-agnostic communication.
 
-## What's New in v0.2.6
-- More convenient implementation for Core Resource Models (no need to inherit from a base ICRM class and decorate with `@iicrm`).
-- More specific ICRM identification with namespace and versioning support.
-- Servers now support graceful shutdown with cleanup callbacks.
+## What's New in v0.2.7
+- Fixed a bug in the `@icrm` decorator that made type hinting into ICRMMeta forcefully.
 
 ## WIP
 - Support for function validation between CRM and ICRM.
