@@ -105,6 +105,8 @@ class HttpClient(BaseClient):
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
         """Send a shutdown command to the HTTP server."""
         try:
+            if timeout <= 0.0:
+                timeout = None
             response = requests.post(
                 server_address, 
                 data=Event(tag=EventTag.SHUTDOWN_FROM_CLIENT).serialize(),
