@@ -60,8 +60,10 @@ class ThreadClient(BaseClient):
             
             return sub_responses[1]
                 
+        except error.CCBaseError:
+            raise  # Don't re-wrap already-classified errors
         except Exception as e:
-            raise error.CompoClientError(f'Thread call failed: {e}')
+            raise error.CompoClientError(f'Thread call failed: {e}') from e
 
     def relay(self, event_bytes: bytes) -> bytes:
         """Relay raw event bytes to the server."""
@@ -82,8 +84,10 @@ class ThreadClient(BaseClient):
             
             return response.serialize()
             
+        except error.CCBaseError:
+            raise  # Don't re-wrap already-classified errors
         except Exception as e:
-            raise error.CompoClientError(f'Thread relay failed: {e}')
+            raise error.CompoClientError(f'Thread relay failed: {e}') from e
     
     def terminate(self):
         # For thread client, no persistent connection to clean up

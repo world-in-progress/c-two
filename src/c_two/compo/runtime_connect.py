@@ -35,25 +35,23 @@ def connect_crm(address: str, icrm_class: Type[ICRM] = None) -> Generator[Client
     """
     if isinstance(address, str):
         # Remote CRM server connection logic
+        client = Client(address)
+        old_client = getattr(_local, 'current_client', None)
+        _local.current_client = client
         try:
-            client = Client(address)
-            old_client = getattr(_local, 'current_client', None)
-            _local.current_client = client
             if icrm_class is not None:
                 icrm = icrm_class()
                 icrm.client = client
                 yield icrm
             else:
                 yield client
-                
-        except Exception as e:
-            logger.error(f'Error occurred when connecting to CRM:\n{e}')
         finally:
             if old_client is not None:
                 _local.current_client = old_client
             else:
-                delattr(_local, 'current_client')
-                client.terminate()
+                if hasattr(_local, 'current_client'):
+                    delattr(_local, 'current_client')
+            client.terminate()
 
 def get_current_client():
     """

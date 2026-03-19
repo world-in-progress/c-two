@@ -1,4 +1,5 @@
 import pytest
+import c_two.error as error
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
     CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
@@ -144,3 +145,53 @@ class TestErrorSubclasses:
         assert isinstance(err, CCError)
         assert isinstance(err, CCBaseError)
         assert isinstance(err, Exception)
+
+
+ALL_SUBCLASSES = [
+    error.CRMDeserializeInput,
+    error.CRMSerializeOutput,
+    error.CRMExecuteFunction,
+    error.CRMServerError,
+    error.CompoSerializeInput,
+    error.CompoDeserializeOutput,
+    error.CompoCRMCalling,
+    error.CompoClientError,
+    error.EventSerializeError,
+    error.EventDeserializeError,
+]
+
+
+class TestSubclassDeserialization:
+    @pytest.mark.parametrize("subclass", ALL_SUBCLASSES, ids=lambda c: c.__name__)
+    def test_each_subclass_round_trip(self, subclass):
+        original = subclass(message='test detail')
+        data = CCError.serialize(original)
+        result = CCError.deserialize(memoryview(data))
+        assert isinstance(result, subclass)
+        assert result.code == original.code
+        assert 'test detail' in result.message
+
+    def test_generic_ccerror_round_trip(self):
+        original = CCError(ERROR_Code.ERROR_UNKNOWN, 'generic')
+        data = CCError.serialize(original)
+        result = CCError.deserialize(memoryview(data))
+        assert type(result) is CCError
+        assert result.code == ERROR_Code.ERROR_UNKNOWN
+        assert result.message == 'generic'
+
+    @pytest.mark.parametrize("subclass", ALL_SUBCLASSES, ids=lambda c: c.__name__)
+    def test_none_message_produces_description(self, subclass):
+        err = subclass(message=None)
+        assert err.message != ''
+
+
+class TestErrorCodeToClass:
+    def test_code_to_class_registry_complete(self):
+        expected_codes = {code for code in ERROR_Code if code != ERROR_Code.ERROR_UNKNOWN}
+        assert set(error._CODE_TO_CLASS.keys()) == expected_codes
+
+    def test_unknown_code_deserializes_to_base(self):
+        result = CCError.deserialize(memoryview(b'0:some message'))
+        assert type(result) is CCError
+        assert result.code == ERROR_Code.ERROR_UNKNOWN
+        assert result.message == 'some message'
