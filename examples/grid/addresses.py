@@ -1,0 +1,5 @@
+THREAD_ADDRESS = 'thread://grid_example'
+MEMORY_ADDRESS = 'memory://grid_example'
+IPC_ADDRESS = 'ipc:///tmp/c2_grid_example'
+TCP_ADDRESS = 'tcp://localhost:15555'
+HTTP_ADDRESS = 'http://localhost:15556'
