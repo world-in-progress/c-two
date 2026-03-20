@@ -116,7 +116,7 @@ class GridInfo:
     def serialize(level: int, global_id: int) -> bytes:
         schema = pa.schema([
             pa.field('level', pa.int8()),
-            pa.field('global_id', pa.pa.int32())
+            pa.field('global_id', pa.int32())
         ])
         
         data = {
