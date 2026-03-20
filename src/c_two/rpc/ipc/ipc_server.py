@@ -19,6 +19,7 @@ import logging
 import os
 import struct
 import tempfile
+import hashlib
 import threading
 import time
 import uuid
@@ -48,8 +49,11 @@ class IPCConfig:
 
 
 def _shm_name(region_id: str, request_id: str, direction: str) -> str:
-    ts = int(time.monotonic() * 1000) & 0xFFFFFFFF
-    return f'cc_{region_id}_{request_id}_{direction}_{ts}'
+    # macOS limits POSIX SHM names to 31 chars (excluding leading /)
+    raw = f'{region_id}_{request_id}_{direction}'.encode()
+    h = hashlib.md5(raw).hexdigest()[:16]
+    d = direction[0]
+    return f'cc{d}_{h}'
 
 
 def _encode_frame(request_id: str, flags: int, payload: bytes) -> bytes:
