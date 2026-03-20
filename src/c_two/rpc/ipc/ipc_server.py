@@ -99,6 +99,86 @@ def _read_and_release_shm(name: str, size: int) -> bytes:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 helpers — scatter-write & zero-copy read
+# ---------------------------------------------------------------------------
+
+def _scatter_write_event_to_shm(
+    name: str,
+    tag: 'EventTag',
+    data: bytes | memoryview,
+) -> tuple[shared_memory.SharedMemory, int]:
+    """Write Event(tag, data) directly to SHM without intermediate serialization.
+
+    Produces the same binary layout as ``_write_shm(name, Event(tag, data=data).serialize())``
+    but with only ONE copy of *data* into the SHM buffer.
+    """
+    tag_bytes = tag.value.encode('utf-8')
+    tag_len = len(tag_bytes)
+    data_len = len(data)
+    total = 8 + tag_len + 8 + data_len
+
+    shm = shared_memory.SharedMemory(name=name, create=True, size=total)
+    buf = shm.buf
+    offset = 0
+
+    struct.pack_into('>Q', buf, offset, tag_len);  offset += 8
+    buf[offset:offset + tag_len] = tag_bytes;       offset += tag_len
+    struct.pack_into('>Q', buf, offset, data_len);  offset += 8
+    if data_len > 0:
+        buf[offset:offset + data_len] = data
+    return shm, total
+
+
+def _scatter_write_event_multi_to_shm(
+    name: str,
+    tag: 'EventTag',
+    messages: list[bytes | memoryview],
+) -> tuple[shared_memory.SharedMemory, int]:
+    """Scatter-write an Event whose data is ``concat(add_length_prefix(m) for m in messages)``.
+
+    Equivalent to building ``combined = add_length_prefix(m0) + add_length_prefix(m1) + ...``
+    then ``_write_shm(name, Event(tag, data=combined).serialize())``, but avoids **all**
+    intermediate allocations — only one copy of each message into the SHM buffer.
+    """
+    tag_bytes = tag.value.encode('utf-8')
+    tag_len = len(tag_bytes)
+    data_size = sum(8 + len(m) for m in messages)
+    total = 8 + tag_len + 8 + data_size
+
+    shm = shared_memory.SharedMemory(name=name, create=True, size=total)
+    buf = shm.buf
+    offset = 0
+
+    struct.pack_into('>Q', buf, offset, tag_len);   offset += 8
+    buf[offset:offset + tag_len] = tag_bytes;        offset += tag_len
+    struct.pack_into('>Q', buf, offset, data_size);  offset += 8
+
+    for msg in messages:
+        msg_len = len(msg)
+        struct.pack_into('>Q', buf, offset, msg_len); offset += 8
+        if msg_len > 0:
+            buf[offset:offset + msg_len] = msg
+            offset += msg_len
+
+    return shm, total
+
+
+def _open_shm_zero_copy(name: str, size: int) -> tuple[shared_memory.SharedMemory, memoryview]:
+    """Open SHM and return ``(handle, memoryview)``.  Caller owns the lifecycle."""
+    shm = shared_memory.SharedMemory(name=name, create=False)
+    return shm, memoryview(shm.buf[:size])
+
+
+def _release_shm(shm: shared_memory.SharedMemory) -> None:
+    """Close and unlink a SHM segment, ignoring errors."""
+    try:
+        shm.close()
+        shm.unlink()
+    except Exception:
+        pass
+
+
 async def _read_frame(reader: asyncio.StreamReader) -> bytes | None:
     header = await reader.readexactly(4)
     total_len = struct.unpack('<I', header)[0]
@@ -157,21 +237,26 @@ class IPCv2Server(BaseServer):
             logger.warning('IPCv2Server.reply: event missing request_id')
             return
 
-        response_bytes = event.serialize()
         request_id = event.request_id
+        data = event.data if event.data is not None else b''
         flags = _FLAG_RESPONSE
-        payload = response_bytes
 
-        if len(response_bytes) >= self._config.shm_threshold:
+        # Estimate serialized size (tag overhead ≈ 30 bytes)
+        estimated_size = len(data) + 30
+
+        if estimated_size >= self._config.shm_threshold:
+            # OPT-5: Scatter-write Event directly to SHM (1 copy of data)
             shm_name = _shm_name(self.region_id, request_id, 'resp')
-            shm = _write_shm(shm_name, response_bytes)
+            shm, written = _scatter_write_event_to_shm(shm_name, event.tag, data)
             shm.close()  # close our handle; client takes ownership
-            size_header = struct.pack('<Q', len(response_bytes))
+            size_header = struct.pack('<Q', written)
             payload = (shm_name.encode('utf-8') + b'\x00' + size_header)
             flags |= _FLAG_SHM
 
             with self._shm_lock:
                 self._our_shm_segments[shm_name] = time.monotonic()
+        else:
+            payload = event.serialize()
 
         frame = _encode_frame(request_id, flags, payload)
 
@@ -194,7 +279,7 @@ class IPCv2Server(BaseServer):
             os.unlink(self._socket_path)
         except FileNotFoundError:
             pass
-        # Clean up any leftover SHM segments we created
+        # Clean up any leftover response SHM segments
         with self._shm_lock:
             for name in list(self._our_shm_segments):
                 try:

@@ -28,6 +28,7 @@ from .ipc_server import (
     _decode_frame,
     _encode_frame,
     _read_and_release_shm,
+    _scatter_write_event_multi_to_shm,
     _shm_name,
     _write_shm,
 )
@@ -120,31 +121,36 @@ class IPCv2Client(BaseClient):
                         raise
             raise error.CompoClientError('IPC v2 connection failed after retry')
 
-    def _create_method_event(self, method_name: str, data: bytes | None = None) -> Event:
-        try:
-            request_id = str(uuid.uuid4())
-            serialized_data = b'' if data is None else data
-            serialized_method_name = method_name.encode('utf-8')
-            combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
-            return Event(tag=EventTag.CRM_CALL, data=combined_request, request_id=request_id)
-        except Exception as e:
-            raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}')
-
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
-        event = self._create_method_event(method_name, data)
-        event_bytes = event.serialize()
-        request_id = event.request_id
+        request_id = str(uuid.uuid4())
+        method_bytes = method_name.encode('utf-8')
+        args = data if data is not None else b''
         flags = 0
 
-        if len(event_bytes) >= self._config.shm_threshold:
+        # Estimate serialized Event size (tag ~8B + prefixes 32B + method + args)
+        estimated_event_size = 48 + len(method_bytes) + len(args)
+
+        if estimated_event_size >= self._config.shm_threshold:
+            # OPT-5: Scatter-write request Event directly to SHM (1 copy of args)
             shm_name = _shm_name(self.region_id, request_id, 'req')
-            shm = _write_shm(shm_name, event_bytes)
-            shm.close()
-            size_header = struct.pack('<Q', len(event_bytes))
+            try:
+                request_shm, written = _scatter_write_event_multi_to_shm(
+                    shm_name, EventTag.CRM_CALL, [method_bytes, args]
+                )
+                request_shm.close()  # server takes ownership
+            except Exception as e:
+                raise error.CompoSerializeInput(f'Error writing request to SHM: {e}')
+            size_header = struct.pack('<Q', written)
             payload = shm_name.encode('utf-8') + b'\x00' + size_header
             flags |= _FLAG_SHM
         else:
-            payload = event_bytes
+            # Inline path
+            try:
+                combined = add_length_prefix(method_bytes) + add_length_prefix(args)
+                event = Event(tag=EventTag.CRM_CALL, data=combined, request_id=request_id)
+                payload = event.serialize()
+            except Exception as e:
+                raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}')
 
         try:
             resp_rid, resp_flags, resp_payload = self._send_and_recv(request_id, flags, payload)
