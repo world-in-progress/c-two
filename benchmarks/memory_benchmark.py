@@ -164,6 +164,8 @@ def _start_server(protocol: str) -> tuple:
         address = f'thread://bench_{idx}'
     elif protocol == 'memory':
         address = f'memory://bench_{idx}'
+    elif protocol == 'ipc-v2':
+        address = f'ipc-v2://bench_{idx}'
     else:
         raise ValueError(f'Unknown protocol: {protocol}')
 
