@@ -23,8 +23,9 @@
 |------|----------------|---------|
 | 64B 延迟 | ~31ms | <1ms |
 | 1GB 吞吐 | ~774 MB/s | >1.5 GB/s |
-| Windows | 未验证 | 第一阶段 |
-| 平台兼容 | macOS/Linux | macOS/Linux/Windows |
+| macOS/Linux | Phase 1-2 优先实现 | UDS + SharedMemory |
+| Windows | 未验证 | Phase 3 适配（需实机验证，预留接口） |
+| 平台兼容 | macOS/Linux | macOS/Linux → Windows |
 
 ## 双面架构
 
@@ -68,7 +69,7 @@ flags:
 **实现**: `multiprocessing.shared_memory.SharedMemory`
 
 - **跨平台**: Python 3.8+ 标准库，Windows/Linux/macOS 均支持
-- **生命周期**: 请求方创建 → 接收方读取 → 请求方释放
+- **生命周期**: 所有权转移 — 请求方创建 → 通过控制面发送引用 → 接收方获得所有权并负责释放
 - **命名**: `cc_shm_{region_id}_{request_id}_{direction}`
 
 ### 自适应切换策略
@@ -101,11 +102,14 @@ Worker 启动时创建 IPC 服务端并将地址注册到 Router。
 1. Worker 启动 → 创建 UDS/loopback 监听 → 注册到 Router
 2. Router 收到外部 HTTP 请求 → 查路由表 → 获取 Worker IPC 地址
 3. Router 通过 IPC 控制面发送请求
-4. 若大载荷：Router 创建 SharedMemory → 写入数据 → 控制面发送 shm 引用
-5. Worker 从控制面读取请求 → 若 shm 引用则从 SharedMemory 读取
-6. Worker 处理完成 → 通过控制面发送响应（同样适用 shm 策略）
-7. Router 读取响应 → 返回 HTTP
+4. 若大载荷：Router 创建 SharedMemory → 写入数据 → 控制面发送 shm 引用 → 所有权转移至 Worker
+5. Worker 从控制面读取请求 → 若 shm 引用则从 SharedMemory 读取 → 读取完毕后释放该 SharedMemory
+6. Worker 处理完成 → 通过控制面发送响应（同样适用 shm + 所有权转移策略）
+7. Router 读取响应 shm → 释放 → 返回 HTTP
 ```
+
+> **所有权转移原则**: 创建方写入数据并发送引用后即放弃控制权，接收方负责读取并释放。
+> 无需额外的 ACK 往返，降低控制面延迟。崩溃场景通过 SHM 命名中的时间戳 + 定期 GC 扫描兜底。
 
 ## Windows 兼容方案
 
@@ -135,17 +139,24 @@ ipc-v2:// > memory:// > thread://（仅同进程）
 
 ## 实现分阶段
 
-### Phase 1: 控制面 socket 化
-- 用 `asyncio` stream server (UDS/TCP) 替换文件轮询
+### Phase 1: 控制面 socket 化 (macOS/Linux)
+- 用 `asyncio` stream server (UDS) 替换文件轮询
 - 小载荷直接内联传输
 - 预期收益: 64B 延迟从 31ms 降至 <1ms
 
-### Phase 2: SharedMemory 数据面
-- 大载荷走 SharedMemory
+### Phase 2: SharedMemory 数据面 (macOS/Linux)
+- 大载荷走 SharedMemory（所有权转移语义）
 - 实现 SharedMemory pool 复用
+- SHM 命名嵌入时间戳，附带后台 GC 扫描清理泄漏段
 - 预期收益: 1GB 吞吐从 774 MB/s 提升至 >1.5 GB/s
 
-### Phase 3: 自适应与监控
+### Phase 3: Windows 适配
+- 控制面: TCP `127.0.0.1` loopback（替代 UDS）
+- 数据面: SharedMemory（Windows 原生支持，无需额外处理）
+- 需在 Windows 环境实机验证，当前阶段预留接口但不实现
+- 运行时自动检测平台，选择 UDS 或 TCP loopback
+
+### Phase 4: 自适应与监控
 - 运行时统计驱动阈值调整
 - 健康检查 / 连接复用 / 背压传播
 - Router 级流量可观测性
