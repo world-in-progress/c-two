@@ -34,11 +34,14 @@ class ConcurrencyMode(enum.Enum):
 class ConcurrencyConfig:
     mode: ConcurrencyMode | str = ConcurrencyMode.EXCLUSIVE
     max_workers: int | None = None
+    max_pending: int | None = None
 
     def __post_init__(self):
         object.__setattr__(self, 'mode', ConcurrencyMode(self.mode))
         if self.max_workers is not None and self.max_workers < 1:
             raise ValueError('max_workers must be at least 1 when provided.')
+        if self.max_pending is not None and self.max_pending < 1:
+            raise ValueError('max_pending must be at least 1 when provided.')
 
 
 @dataclass
@@ -133,6 +136,10 @@ class _Scheduler:
         self._rw_lock = _WriterPriorityReadWriteLock()
         self._state_lock = threading.Lock()
         self._shutdown = False
+        self._pending_count = 0
+        self._max_pending = config.max_pending
+        self._drain_event = threading.Event()
+        self._drain_event.set()
 
         effective_max_workers = config.max_workers
         if effective_max_workers is None and config.mode is ConcurrencyMode.EXCLUSIVE:
@@ -142,6 +149,11 @@ class _Scheduler:
             max_workers=effective_max_workers,
             thread_name_prefix='c_two_worker',
         )
+
+    @property
+    def pending_count(self) -> int:
+        with self._state_lock:
+            return self._pending_count
 
     def submit(
         self,
@@ -153,7 +165,15 @@ class _Scheduler:
     ) -> None:
         with self._state_lock:
             if self._shutdown:
-                raise RuntimeError('Cannot schedule CRM calls after scheduler shutdown has started.')
+                raise error.CRMServerError('Server is shutting down, no new calls accepted.')
+
+            if self._max_pending is not None and self._pending_count >= self._max_pending:
+                raise error.CRMServerError(
+                    f'Server is at capacity ({self._max_pending} pending calls). Try again later.'
+                )
+
+            self._pending_count += 1
+            self._drain_event.clear()
 
         future = self._executor.submit(
             self._execute,
@@ -162,7 +182,7 @@ class _Scheduler:
             get_method_access(method),
         )
         future.add_done_callback(
-            lambda completed: self._complete_request(
+            lambda completed: self._on_task_done(
                 request_id=request_id,
                 future=completed,
                 reply=reply,
@@ -175,6 +195,7 @@ class _Scheduler:
                 return
             self._shutdown = True
 
+        self._drain_event.wait()
         self._executor.shutdown(wait=True)
 
     def _execute(
@@ -203,6 +224,21 @@ class _Scheduler:
             return
 
         yield
+
+    def _on_task_done(
+        self,
+        *,
+        request_id: str,
+        future: Future[bytes],
+        reply: Callable[[Event], None],
+    ) -> None:
+        try:
+            self._complete_request(request_id=request_id, future=future, reply=reply)
+        finally:
+            with self._state_lock:
+                self._pending_count -= 1
+                if self._pending_count == 0:
+                    self._drain_event.set()
 
     def _complete_request(
         self,
@@ -283,7 +319,7 @@ def _validate_concurrency_support(server: BaseServer, config: ConcurrencyConfig)
     )
 
 
-def _stop_serving(state: ServerState) -> bool:
+def _stop_serving(state: ServerState) -> None:
     state.scheduler.shutdown()
     state.server.cancel_all_calls()
     state.server.destroy()
@@ -292,72 +328,80 @@ def _stop_serving(state: ServerState) -> bool:
         shutdown_event.set()
 
     state.stage = ServerStage.STOPPED
-    return True
+
+
+def _handle_shutdown(state: ServerState, event: Event) -> None:
+    with state.lock:
+        if state.on_shutdown:
+            try:
+                state.on_shutdown()
+                state.on_shutdown = None
+                state.crm = None
+            except Exception as exc:
+                logger.error(f'Error during on_shutdown callback: {exc}')
+
+        if event.tag is EventTag.SHUTDOWN_FROM_CLIENT:
+            logger.info('Received shutdown request from client, shutting down server...')
+            state.server.reply(Event(tag=EventTag.SHUTDOWN_ACK, request_id=event.request_id))
+
+        _stop_serving(state)
+
+
+def _dispatch_crm_call(state: ServerState, event: Event) -> None:
+    if state.stage is not ServerStage.STARTED:
+        state.server.reply(
+            Event(
+                tag=EventTag.CRM_REPLY,
+                data=_serialize_server_error(
+                    error.CRMServerError('Server is shutting down, no new calls accepted.')
+                ),
+                request_id=event.request_id,
+            )
+        )
+        return
+
+    try:
+        icrm = state.icrm
+        sub_messages = parse_message(event.data)
+
+        method_name = sub_messages[0].tobytes().decode('utf-8')
+        args_bytes = sub_messages[1]
+
+        method = getattr(icrm, method_name, None)
+        if method is None:
+            raise error.CRMServerError(
+                f'No wrapped function found for method: {icrm.__module__}.{icrm.__name__}.{method_name}'
+            )
+
+        state.scheduler.submit(
+            request_id=event.request_id,
+            method=method,
+            args_bytes=args_bytes,
+            reply=state.server.reply,
+        )
+    except Exception as exc:
+        state.server.reply(
+            Event(
+                tag=EventTag.CRM_REPLY,
+                data=_serialize_server_error(exc),
+                request_id=event.request_id,
+            )
+        )
 
 
 def _process_event_and_continue(state: ServerState, event: Event) -> bool:
-    """
-    Process the received event and determine if server should continue running.
-
-    Args:
-        state (ServerState): The server state containing all necessary information.
-        event (Event): The received event to process.
-
-    Returns:
-        bool: True if server should continue running, False if it should stop.
-    """
-    should_continue = True
-
     if event.tag is EventTag.PING:
         state.server.reply(Event(tag=EventTag.PONG, request_id=event.request_id))
+        return True
 
-    elif event.tag is EventTag.SHUTDOWN_FROM_CLIENT or event.tag is EventTag.SHUTDOWN_FROM_SERVER:
-        with state.lock:
-            if state.on_shutdown:
-                try:
-                    state.on_shutdown()
-                    state.on_shutdown = None
-                    state.crm = None
-                except Exception as exc:
-                    logger.error(f'Error during on_shutdown callback: {exc}')
+    if event.tag is EventTag.SHUTDOWN_FROM_CLIENT or event.tag is EventTag.SHUTDOWN_FROM_SERVER:
+        _handle_shutdown(state, event)
+        return False
 
-            if event.tag is EventTag.SHUTDOWN_FROM_CLIENT:
-                logger.info('Received shutdown request from client, shutting down server...')
-                state.server.reply(Event(tag=EventTag.SHUTDOWN_ACK, request_id=event.request_id))
+    if event.tag is EventTag.CRM_CALL:
+        _dispatch_crm_call(state, event)
 
-            if _stop_serving(state):
-                should_continue = False
-
-    elif event.tag is EventTag.CRM_CALL:
-        try:
-            icrm = state.icrm
-            sub_messages = parse_message(event.data)
-
-            method_name = sub_messages[0].tobytes().decode('utf-8')
-            args_bytes = sub_messages[1]
-
-            method = getattr(icrm, method_name, None)
-            if method is None:
-                raise error.CRMServerError(
-                    f'No wrapped function found for method: {icrm.__module__}.{icrm.__name__}.{method_name}'
-                )
-
-            state.scheduler.submit(
-                request_id=event.request_id,
-                method=method,
-                args_bytes=args_bytes,
-                reply=state.server.reply,
-            )
-        except Exception as exc:
-            state.server.reply(
-                Event(
-                    tag=EventTag.CRM_REPLY,
-                    data=_serialize_server_error(exc),
-                    request_id=event.request_id,
-                )
-            )
-
-    return should_continue
+    return True
 
 
 def _serve(state: ServerState):

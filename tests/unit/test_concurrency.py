@@ -42,6 +42,18 @@ class TestConcurrencyConfig:
         with pytest.raises(ValueError, match='max_workers'):
             ConcurrencyConfig(max_workers=0)
 
+    def test_invalid_max_pending_raises(self):
+        with pytest.raises(ValueError, match='max_pending'):
+            ConcurrencyConfig(max_pending=0)
+
+    def test_max_pending_accepts_positive(self):
+        config = ConcurrencyConfig(max_pending=10)
+        assert config.max_pending == 10
+
+    def test_max_pending_none_means_unlimited(self):
+        config = ConcurrencyConfig()
+        assert config.max_pending is None
+
 
 class TestProtocolGuard:
     def test_http_rejects_concurrent_scheduler_before_transport_hardening(self):

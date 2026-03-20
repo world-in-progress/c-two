@@ -198,3 +198,113 @@ class TestReadParallelScheduler:
         assert crm.events.index('end:r1') < crm.events.index('start:w1')
         assert crm.events.index('start:w1') < crm.events.index('end:w1')
         assert crm.events.index('end:w1') < crm.events.index('start:r2')
+
+
+class TestBackpressure:
+    def test_rejects_when_at_capacity(self):
+        """When max_pending is exceeded, new calls receive an error reply."""
+        address = f'thread://backpressure_{_next_id()}'
+        crm = ConcurrencyProbe()
+        server = cc.rpc.Server(ServerConfig(
+            name='BackpressureProbe',
+            crm=crm,
+            icrm=IConcurrencyProbe,
+            bind_address=address,
+            concurrency=ConcurrencyConfig(
+                mode=ConcurrencyMode.READ_PARALLEL,
+                max_workers=4,
+                max_pending=2,
+            ),
+        ))
+        _start(server._state)
+
+        for _ in range(50):
+            try:
+                if cc.rpc.Client.ping(address, timeout=0.5):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+        results: queue.Queue[tuple[str, str | Exception]] = queue.Queue()
+
+        def slow_read(name: str):
+            try:
+                result = _read_call(address, name, 0.5)
+                results.put(('ok', result))
+            except Exception as exc:
+                results.put(('error', exc))
+
+        t1 = threading.Thread(target=slow_read, args=('fill1',))
+        t2 = threading.Thread(target=slow_read, args=('fill2',))
+        t1.start()
+        t2.start()
+
+        # Wait for both reads to be actively executing
+        assert crm.wait_for_marker('start:fill1', timeout=3.0)
+        assert crm.wait_for_marker('start:fill2', timeout=3.0)
+
+        # Third call should be rejected (2 pending, max_pending=2)
+        try:
+            overflow_result = _read_call(address, 'overflow', 0.01)
+            got_error = False
+        except Exception:
+            got_error = True
+
+        t1.join()
+        t2.join()
+
+        assert got_error, 'Expected backpressure rejection for overflow call'
+
+        try:
+            cc.rpc.Client.shutdown(address, timeout=2.0)
+        except Exception:
+            pass
+        time.sleep(0.1)
+        try:
+            server.stop()
+        except Exception:
+            pass
+
+    def test_accepts_after_drain(self):
+        """After pending tasks complete, new calls are accepted again."""
+        address = f'thread://backpressure_drain_{_next_id()}'
+        crm = ConcurrencyProbe()
+        server = cc.rpc.Server(ServerConfig(
+            name='BackpressureDrain',
+            crm=crm,
+            icrm=IConcurrencyProbe,
+            bind_address=address,
+            concurrency=ConcurrencyConfig(
+                mode=ConcurrencyMode.READ_PARALLEL,
+                max_workers=4,
+                max_pending=1,
+            ),
+        ))
+        _start(server._state)
+
+        for _ in range(50):
+            try:
+                if cc.rpc.Client.ping(address, timeout=0.5):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+        # Fill to capacity and let it complete
+        result1 = _read_call(address, 'first', 0.01)
+        assert result1 == 'first'
+
+        # Should succeed because previous task drained
+        result2 = _read_call(address, 'second', 0.01)
+        assert result2 == 'second'
+
+        try:
+            cc.rpc.Client.shutdown(address, timeout=2.0)
+        except Exception:
+            pass
+        time.sleep(0.1)
+        try:
+            server.stop()
+        except Exception:
+            pass
