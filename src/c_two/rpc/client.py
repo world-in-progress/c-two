@@ -5,6 +5,7 @@ import subprocess
 
 from .zmq import ZmqClient
 from .http import HttpClient
+from .ipc import IPCv2Client
 from .memory import MemoryClient
 from .thread import ThreadClient
 
@@ -18,8 +19,9 @@ def _get_client_class(server_address: str):
         return MemoryClient
     elif server_address.startswith('thread://'):
         return ThreadClient
+    elif server_address.startswith('ipc-v2://'):
+        return IPCv2Client
     else:
-        # TODO: Handle other protocols if needed
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
 
 class Client:

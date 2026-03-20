@@ -12,6 +12,7 @@ from ..crm.meta import MethodAccess, get_method_access
 from .base import BaseServer
 from .event import CompletionType, Event, EventQueue, EventTag
 from .http import HttpServer
+from .ipc import IPCv2Server
 from .memory import MemoryServer
 from .thread import ThreadServer
 from .util.encoding import add_length_prefix, parse_message
@@ -309,13 +310,13 @@ def _validate_concurrency_support(server: BaseServer, config: ConcurrencyConfig)
     if config.mode is ConcurrencyMode.EXCLUSIVE:
         return
 
-    if isinstance(server, (ThreadServer, MemoryServer, HttpServer)):
+    if isinstance(server, (ThreadServer, MemoryServer, HttpServer, IPCv2Server)):
         return
 
     protocol = server.bind_address.split('://', 1)[0]
     raise ValueError(
         f'Concurrency mode "{config.mode.value}" is not yet supported for "{protocol}://" servers. '
-        'Use "thread://", "memory://", or "http://" until the transport reply path is hardened.'
+        'Use "thread://", "memory://", "http://", or "ipc-v2://" until the transport reply path is hardened.'
     )
 
 
@@ -465,6 +466,8 @@ class Server:
             self.server = MemoryServer(config.bind_address)
         elif config.bind_address.startswith('thread://'):
             self.server = ThreadServer(config.bind_address)
+        elif config.bind_address.startswith('ipc-v2://'):
+            self.server = IPCv2Server(config.bind_address)
         else:
             raise ValueError(f'Unsupported protocol in bind_address: {config.bind_address}')
 
