@@ -1,6 +1,7 @@
 import queue
 import logging
 import threading
+from dataclasses import dataclass
 
 from ... import error
 from ..base import BaseServer
@@ -9,6 +10,11 @@ from . import register_server, unregister_server
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class _PendingResponse:
+    ready: threading.Event
+    response: Event | None = None
+
 class ThreadServer(BaseServer):
     def __init__(self, bind_address: str, event_queue: EventQueue | None = None):
         super().__init__(bind_address, event_queue)
@@ -16,12 +22,8 @@ class ThreadServer(BaseServer):
         # Extract thread_id from address like 'thread://cc_thread_12345'
         self.thread_id = bind_address.replace('thread://', '')
         
-        self.responses: dict[str, Event] = {}
-        self.response_lock = threading.RLock()
-        
-        # Response notification mechanism
-        self.response_condition: dict[str, threading.Condition] = {}
-        self.conditions_lock = threading.Lock()
+        self._pending_responses: dict[str, _PendingResponse] = {}
+        self._pending_lock = threading.RLock()
     
     def start(self):
         # Register this server in the global server registry
@@ -31,17 +33,15 @@ class ThreadServer(BaseServer):
         if not event.request_id:
             logger.warning('Reply event missing request_id')
             return
-        
-        # Store the response
-        with self.response_lock:
-            self.responses[event.request_id] = event
-        
-        # Notify waiting client
-        with self.conditions_lock:
-            condition = self.response_condition.get(event.request_id)
-            if condition:
-                with condition:
-                    condition.notify()
+
+        with self._pending_lock:
+            pending = self._pending_responses.get(event.request_id)
+            if pending is None:
+                pending = _PendingResponse(ready=threading.Event())
+                self._pending_responses[event.request_id] = pending
+
+            pending.response = event
+            pending.ready.set()
 
     def shutdown(self):
         """Shutdown the thread server."""
@@ -49,12 +49,8 @@ class ThreadServer(BaseServer):
         unregister_server(self.thread_id)
     
     def destroy(self):
-        # Clear all responses and conditions
-        with self.response_lock:
-            self.responses.clear()
-        
-        with self.conditions_lock:
-            self.response_condition.clear()
+        with self._pending_lock:
+            self._pending_responses.clear()
     
     def cancel_all_calls(self):
         # Unregister the server from the global registry
@@ -64,10 +60,9 @@ class ThreadServer(BaseServer):
         self.event_queue.shutdown()
         
         # Notify all waiting clients
-        with self.conditions_lock:
-            for condition in self.response_condition.values():
-                with condition:
-                    condition.notify_all()
+        with self._pending_lock:
+            for pending in self._pending_responses.values():
+                pending.ready.set()
 
     def put_request(self, event: Event):
         """Put a request into the server's queue (called by clients)."""
@@ -78,25 +73,23 @@ class ThreadServer(BaseServer):
     
     def get_response(self, request_id: str, timeout: float = -1.0) -> Event | None:
         """Get a response for a specific request ID (called by clients)."""
-        # Create a condition for this request if it doesn't exist
-        with self.conditions_lock:
-            if request_id not in self.response_condition:
-                self.response_condition[request_id] = threading.Condition()
-            condition = self.response_condition[request_id]
-        
-        # Wait for the response
-        with condition:
-            while request_id not in self.responses:
-                if not condition.wait(timeout if timeout > 0 else None):
-                    # Timeout reached
-                    break
-            
-            # Check if the response is available
-            with self.response_lock:
-                response = self.responses.pop(request_id, None)
-        
-        # Clean up the condition
-        with self.conditions_lock:
-            self.response_condition.pop(request_id, None)
-        
-        return response
+        with self._pending_lock:
+            pending = self._pending_responses.get(request_id)
+            if pending is None:
+                pending = _PendingResponse(ready=threading.Event())
+                self._pending_responses[request_id] = pending
+
+            if pending.response is not None:
+                response = pending.response
+                self._pending_responses.pop(request_id, None)
+                return response
+
+            ready = pending.ready
+
+        ready.wait(timeout if timeout > 0 else None)
+
+        with self._pending_lock:
+            pending = self._pending_responses.pop(request_id, None)
+            if pending is None:
+                return None
+            return pending.response

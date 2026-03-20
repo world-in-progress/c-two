@@ -1,8 +1,34 @@
+import enum
 from inspect import isfunction
-from typing import TypeVar, Type
+from typing import TypeVar, Type, Callable
 from ..rpc.transferable import auto_transfer
 
 ICRM = TypeVar('ICRM')
+_METHOD_ACCESS_ATTR = '__cc_method_access__'
+
+@enum.unique
+class MethodAccess(enum.Enum):
+    READ = 'read'
+    WRITE = 'write'
+
+def _set_method_access(func: Callable, access: MethodAccess) -> Callable:
+    if not callable(func):
+        raise TypeError('Method access decorators can only be applied to callables.')
+
+    setattr(func, _METHOD_ACCESS_ATTR, access)
+    return func
+
+def read(func: Callable) -> Callable:
+    return _set_method_access(func, MethodAccess.READ)
+
+def write(func: Callable) -> Callable:
+    return _set_method_access(func, MethodAccess.WRITE)
+
+def get_method_access(func: Callable) -> MethodAccess:
+    access = getattr(func, _METHOD_ACCESS_ATTR, MethodAccess.WRITE)
+    if isinstance(access, MethodAccess):
+        return access
+    return MethodAccess(access)
 
 class ICRMMeta(type):
     """

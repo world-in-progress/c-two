@@ -6,7 +6,7 @@ from . import mcp
 from . import compo
 from . import error
 from .compo import runtime
-from .crm.meta import icrm
+from .crm.meta import icrm, read, write
 from .rpc.transferable import transferable
 
 __version__ = '0.2.7'
