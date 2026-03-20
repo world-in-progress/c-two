@@ -309,13 +309,13 @@ def _validate_concurrency_support(server: BaseServer, config: ConcurrencyConfig)
     if config.mode is ConcurrencyMode.EXCLUSIVE:
         return
 
-    if isinstance(server, (ThreadServer, MemoryServer)):
+    if isinstance(server, (ThreadServer, MemoryServer, HttpServer)):
         return
 
     protocol = server.bind_address.split('://', 1)[0]
     raise ValueError(
         f'Concurrency mode "{config.mode.value}" is not yet supported for "{protocol}://" servers. '
-        'Use "thread://" or "memory://" until the transport reply path is hardened.'
+        'Use "thread://", "memory://", or "http://" until the transport reply path is hardened.'
     )
 
 

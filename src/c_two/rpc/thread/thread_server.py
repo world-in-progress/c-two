@@ -59,9 +59,9 @@ class ThreadServer(BaseServer):
         # Clear the event queue
         self.event_queue.shutdown()
         
-        # Notify all waiting clients
+        # Notify all waiting clients (snapshot for free-threading safety)
         with self._pending_lock:
-            for pending in self._pending_responses.values():
+            for pending in list(self._pending_responses.values()):
                 pending.ready.set()
 
     def put_request(self, event: Event):

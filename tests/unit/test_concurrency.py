@@ -56,7 +56,7 @@ class TestConcurrencyConfig:
 
 
 class TestProtocolGuard:
-    def test_http_rejects_concurrent_scheduler_before_transport_hardening(self):
+    def test_http_allows_concurrent_scheduler(self):
         config = ServerConfig(
             crm=Hello(),
             icrm=IHello,
@@ -64,5 +64,17 @@ class TestProtocolGuard:
             concurrency=ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL, max_workers=4),
         )
 
-        with pytest.raises(ValueError, match='thread://.*memory://'):
+        # Should NOT raise — HttpServer reply path is now thread-safe
+        server = cc.rpc.Server(config)
+        assert server is not None
+
+    def test_zmq_rejects_concurrent_scheduler_before_transport_hardening(self):
+        config = ServerConfig(
+            crm=Hello(),
+            icrm=IHello,
+            bind_address='tcp://127.0.0.1:19002',
+            concurrency=ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL, max_workers=4),
+        )
+
+        with pytest.raises(ValueError, match='thread://.*memory://.*http://'):
             cc.rpc.Server(config)
