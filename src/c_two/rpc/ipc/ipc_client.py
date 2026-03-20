@@ -1,17 +1,17 @@
 """
 IPC v2 Client — connects to IPCv2Server via UDS control plane.
 
-Uses SharedMemory data plane for large payloads with ownership transfer:
+Uses raw synchronous sockets with persistent connection for minimal latency.
+SharedMemory data plane for large payloads with ownership transfer:
 client creates SHM → sends reference → server takes ownership and releases.
 """
 
-import asyncio
 import logging
 import os
+import socket as _socket
 import struct
 import tempfile
 import threading
-import time
 import uuid
 from multiprocessing import shared_memory
 
@@ -28,9 +28,7 @@ from .ipc_server import (
     _decode_frame,
     _encode_frame,
     _read_and_release_shm,
-    _read_frame,
     _shm_name,
-    _write_frame,
     _write_shm,
 )
 
@@ -42,6 +40,30 @@ def _resolve_socket_path(region_id: str) -> str:
     return os.path.join(tmpdir, f'cc_ipcv2_{region_id}.sock')
 
 
+def _recv_exact(sock: _socket.socket, n: int) -> bytes:
+    """Read exactly *n* bytes from a blocking socket."""
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    while pos < n:
+        nbytes = sock.recv_into(view[pos:])
+        if nbytes == 0:
+            raise ConnectionError('Connection closed by server')
+        pos += nbytes
+    return bytes(buf)
+
+
+def _send_frame_sync(sock: _socket.socket, frame: bytes) -> None:
+    sock.sendall(frame)
+
+
+def _recv_frame_sync(sock: _socket.socket) -> bytes:
+    header = _recv_exact(sock, 4)
+    total_len = struct.unpack('<I', header)[0]
+    body = _recv_exact(sock, total_len)
+    return header + body
+
+
 class IPCv2Client(BaseClient):
 
     def __init__(self, server_address: str, ipc_config: IPCConfig | None = None):
@@ -49,40 +71,54 @@ class IPCv2Client(BaseClient):
         self._config = ipc_config or IPCConfig()
         self.region_id = server_address.replace('ipc-v2://', '')
         self._socket_path = _resolve_socket_path(self.region_id)
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
+        self._sock: _socket.socket | None = None
         self._conn_lock = threading.Lock()
 
-    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        if self._loop is None or self._loop.is_closed():
-            self._loop = asyncio.new_event_loop()
-        return self._loop
+    # ------------------------------------------------------------------
+    # Persistent connection management
+    # ------------------------------------------------------------------
 
-    def _connect_sync(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        loop = self._ensure_loop()
-        reader, writer = loop.run_until_complete(
-            asyncio.open_unix_connection(path=self._socket_path)
-        )
-        return reader, writer
+    def _connect(self) -> _socket.socket:
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            sock.connect(self._socket_path)
+        except Exception:
+            sock.close()
+            raise
+        return sock
+
+    def _ensure_connection(self) -> _socket.socket:
+        if self._sock is not None:
+            return self._sock
+        self._sock = self._connect()
+        return self._sock
+
+    def _close_connection(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    # ------------------------------------------------------------------
+    # Core send/recv — raw synchronous socket, persistent connection
+    # ------------------------------------------------------------------
 
     def _send_and_recv(self, request_id: str, flags: int, payload: bytes) -> tuple[str, int, bytes]:
         with self._conn_lock:
-            loop = self._ensure_loop()
-            reader, writer = loop.run_until_complete(
-                asyncio.open_unix_connection(path=self._socket_path)
-            )
-            try:
-                frame = _encode_frame(request_id, flags, payload)
-                loop.run_until_complete(_write_frame(writer, frame))
-                raw = loop.run_until_complete(_read_frame(reader))
-                return _decode_frame(raw)
-            finally:
-                writer.close()
+            frame = _encode_frame(request_id, flags, payload)
+            for attempt in range(2):
                 try:
-                    loop.run_until_complete(writer.wait_closed())
-                except Exception:
-                    pass
+                    sock = self._ensure_connection()
+                    _send_frame_sync(sock, frame)
+                    raw = _recv_frame_sync(sock)
+                    return _decode_frame(raw)
+                except (ConnectionError, BrokenPipeError, OSError):
+                    self._close_connection()
+                    if attempt == 1:
+                        raise
+            raise error.CompoClientError('IPC v2 connection failed after retry')
 
     def _create_method_event(self, method_name: str, data: bytes | None = None) -> Event:
         try:
@@ -100,11 +136,10 @@ class IPCv2Client(BaseClient):
         request_id = event.request_id
         flags = 0
 
-        # Decide inline vs SHM
         if len(event_bytes) >= self._config.shm_threshold:
             shm_name = _shm_name(self.region_id, request_id, 'req')
             shm = _write_shm(shm_name, event_bytes)
-            shm.close()  # ownership transfers to server
+            shm.close()
             size_header = struct.pack('<Q', len(event_bytes))
             payload = shm_name.encode('utf-8') + b'\x00' + size_header
             flags |= _FLAG_SHM
@@ -116,7 +151,6 @@ class IPCv2Client(BaseClient):
         except Exception as exc:
             raise error.CompoClientError(f'IPC v2 call failed: {exc}') from exc
 
-        # Decode response
         if resp_flags & _FLAG_SHM:
             parts = resp_payload.split(b'\x00', 1)
             shm_name = parts[0].decode('utf-8')
@@ -169,9 +203,7 @@ class IPCv2Client(BaseClient):
         return resp_payload
 
     def terminate(self) -> None:
-        if self._loop is not None and not self._loop.is_closed():
-            self._loop.close()
-            self._loop = None
+        self._close_connection()
 
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
@@ -181,38 +213,24 @@ class IPCv2Client(BaseClient):
         if not os.path.exists(socket_path):
             return False
 
-        loop = asyncio.new_event_loop()
         try:
-            reader, writer = loop.run_until_complete(
-                asyncio.wait_for(
-                    asyncio.open_unix_connection(path=socket_path),
-                    timeout=timeout,
-                )
-            )
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(socket_path)
 
             request_id = str(uuid.uuid4())
             ping_event = Event(tag=EventTag.PING, request_id=request_id)
-            event_bytes = ping_event.serialize()
-            frame = _encode_frame(request_id, 0, event_bytes)
+            frame = _encode_frame(request_id, 0, ping_event.serialize())
 
-            loop.run_until_complete(_write_frame(writer, frame))
-            raw = loop.run_until_complete(
-                asyncio.wait_for(_read_frame(reader), timeout=timeout)
-            )
-            resp_rid, resp_flags, resp_payload = _decode_frame(raw)
+            _send_frame_sync(sock, frame)
+            raw = _recv_frame_sync(sock)
+            _, _, resp_payload = _decode_frame(raw)
             resp_event = Event.deserialize(resp_payload)
 
-            writer.close()
-            try:
-                loop.run_until_complete(writer.wait_closed())
-            except Exception:
-                pass
-
+            sock.close()
             return resp_event.tag == EventTag.PONG
         except Exception:
             return False
-        finally:
-            loop.close()
 
     @staticmethod
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
@@ -222,35 +240,21 @@ class IPCv2Client(BaseClient):
         if not os.path.exists(socket_path):
             return True
 
-        loop = asyncio.new_event_loop()
         try:
-            reader, writer = loop.run_until_complete(
-                asyncio.wait_for(
-                    asyncio.open_unix_connection(path=socket_path),
-                    timeout=timeout,
-                )
-            )
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(socket_path)
 
             request_id = str(uuid.uuid4())
             shutdown_event = Event(tag=EventTag.SHUTDOWN_FROM_CLIENT, request_id=request_id)
-            event_bytes = shutdown_event.serialize()
-            frame = _encode_frame(request_id, 0, event_bytes)
+            frame = _encode_frame(request_id, 0, shutdown_event.serialize())
 
-            loop.run_until_complete(_write_frame(writer, frame))
-            raw = loop.run_until_complete(
-                asyncio.wait_for(_read_frame(reader), timeout=timeout)
-            )
-            resp_rid, resp_flags, resp_payload = _decode_frame(raw)
+            _send_frame_sync(sock, frame)
+            raw = _recv_frame_sync(sock)
+            _, _, resp_payload = _decode_frame(raw)
             resp_event = Event.deserialize(resp_payload)
 
-            writer.close()
-            try:
-                loop.run_until_complete(writer.wait_closed())
-            except Exception:
-                pass
-
+            sock.close()
             return resp_event.tag == EventTag.SHUTDOWN_ACK
         except Exception:
             return False
-        finally:
-            loop.close()

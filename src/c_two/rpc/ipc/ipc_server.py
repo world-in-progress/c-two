@@ -37,7 +37,7 @@ _FLAG_SHM = 1 << 0
 _FLAG_RESPONSE = 1 << 1
 
 DEFAULT_INLINE_THRESHOLD = 1_048_576   # 1 MB
-DEFAULT_SHM_THRESHOLD = 8_388_608      # 8 MB
+DEFAULT_SHM_THRESHOLD = 1_048_576      # 1 MB — aligned with inline threshold
 SHM_GC_INTERVAL = 30.0                 # seconds
 SHM_MAX_AGE = 120.0                    # seconds before GC considers a segment leaked
 
