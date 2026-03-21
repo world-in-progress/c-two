@@ -71,7 +71,7 @@ class ThreadClient(BaseClient):
                 raise error.CompoClientError(f'Unexpected response tag: {response.tag}')
         
             # Deserialize error
-            sub_responses = parse_message(response.data)
+            sub_responses = parse_message(response.get_data())
             if len(sub_responses) != 2:
                 raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
             

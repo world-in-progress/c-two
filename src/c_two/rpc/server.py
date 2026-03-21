@@ -311,13 +311,25 @@ class _Scheduler:
 
         try:
             response = future.result()
-            if isinstance(response, memoryview):
-                response = response.tobytes()
+            if isinstance(response, tuple):
+                event = Event(
+                    tag=EventTag.CRM_REPLY,
+                    data_parts=list(response),
+                    request_id=request_id,
+                )
+            else:
+                if isinstance(response, memoryview):
+                    response = response.tobytes()
+                event = Event(tag=EventTag.CRM_REPLY, data=response, request_id=request_id)
         except Exception as exc:
-            response = _serialize_server_error(exc)
+            event = Event(
+                tag=EventTag.CRM_REPLY,
+                data=_serialize_server_error(exc),
+                request_id=request_id,
+            )
 
         try:
-            reply(Event(tag=EventTag.CRM_REPLY, data=response, request_id=request_id))
+            reply(event)
         except Exception:
             logger.exception('Failed to deliver CRM reply for request %s', request_id)
 

@@ -351,8 +351,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                     output_transferable(*result) if isinstance(result, tuple)
                     else output_transferable(result)
                 )
-            combined_response = add_length_prefix(serialized_error) + add_length_prefix(serialized_result)
-            return combined_response
+            return (serialized_error, serialized_result)
         
         @wraps(func)
         def transfer_wrapper(*args: any) -> any:

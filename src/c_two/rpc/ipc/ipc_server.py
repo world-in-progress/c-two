@@ -275,17 +275,25 @@ class IPCv2Server(BaseServer):
             return
 
         request_id = event.request_id
-        data = event.data if event.data is not None else b''
         flags = _FLAG_RESPONSE
 
-        # Estimate serialized size (tag overhead ≈ 30 bytes)
-        estimated_size = len(data) + 30
+        # Phase 4B: scatter-write response parts directly (avoid concat)
+        has_parts = event.data_parts is not None and event.data is None
+        if has_parts:
+            estimated_size = sum(8 + len(p) for p in event.data_parts) + 30
+        else:
+            data = event.data if event.data is not None else b''
+            estimated_size = len(data) + 30
 
         if estimated_size >= self._config.shm_threshold:
-            # OPT-5: Scatter-write Event directly to SHM (1 copy of data)
             shm_name = _shm_name(self.region_id, request_id, 'resp')
-            shm, written = _scatter_write_event_to_shm(shm_name, event.tag, data)
-            shm.close()  # close our handle; client takes ownership
+            if has_parts:
+                shm, written = _scatter_write_event_multi_to_shm(
+                    shm_name, event.tag, event.data_parts,
+                )
+            else:
+                shm, written = _scatter_write_event_to_shm(shm_name, event.tag, data)
+            shm.close()
             size_header = struct.pack('<Q', written)
             payload = (shm_name.encode('utf-8') + b'\x00' + size_header)
             flags |= _FLAG_SHM
