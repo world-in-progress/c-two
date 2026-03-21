@@ -69,10 +69,10 @@ def bench_adaptive() -> list[tuple[str, int]]:
             trace.append((label, ab.capacity))
             continue
         for _ in range(repeat):
-            buf = bytearray(size)  # simulate payload
-            view = ab.acquire(size)
+            buf_src = bytearray(size)  # simulate payload
+            dst = ab.acquire(size)
             # In real code, ctypes.memmove copies SHM→buffer here
-            ab.raw_buffer[:size] = buf
+            dst[:size] = buf_src
         trace.append((f'{label} ×{repeat}', ab.capacity))
 
     return trace

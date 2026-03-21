@@ -120,8 +120,7 @@ def _fast_read_shm(
     if adaptive_buf is None:
         adaptive_buf = AdaptiveBuffer()
 
-    view = adaptive_buf.acquire(size)
-    buf = adaptive_buf.raw_buffer
+    buf = adaptive_buf.acquire(size)
 
     shm = shared_memory.SharedMemory(name=name, create=False)
     try:

@@ -47,8 +47,9 @@ class TestGrow:
 
     def test_first_acquire_creates_buffer(self):
         ab = AdaptiveBuffer()
-        view = ab.acquire(100)
-        assert len(view) == 100
+        buf = ab.acquire(100)
+        assert isinstance(buf, bytearray)
+        assert len(buf) >= 100
         assert ab.capacity >= 100
 
     def test_grow_on_larger_request(self):
@@ -63,9 +64,8 @@ class TestGrow:
     def test_no_realloc_when_fits(self):
         ab = AdaptiveBuffer()
         ab.acquire(1 << 21)  # 2 MB
-        buf_id = id(ab.raw_buffer)
-        ab.acquire(1 << 20)  # 1 MB — still fits
-        assert id(ab.raw_buffer) == buf_id
+        buf_id = id(ab.acquire(1 << 21))
+        assert id(ab.acquire(1 << 20)) == buf_id  # 1 MB — still fits
 
     def test_min_size_floor(self):
         cfg = AdaptiveBufferConfig(min_size=4 << 20)  # 4 MB
@@ -184,14 +184,14 @@ class TestRelease:
         assert ab.capacity > 0
         ab.release()
         assert ab.capacity == 0
-        assert ab.raw_buffer is None
 
     def test_acquire_after_release(self):
         ab = AdaptiveBuffer()
         ab.acquire(4 << 20)
         ab.release()
-        view = ab.acquire(1 << 20)
-        assert len(view) == 1 << 20
+        buf = ab.acquire(1 << 20)
+        assert isinstance(buf, bytearray)
+        assert len(buf) >= 1 << 20
         assert ab.capacity >= 1 << 20
 
 

@@ -71,11 +71,11 @@ class AdaptiveBuffer:
     # Public API
     # ------------------------------------------------------------------
 
-    def acquire(self, size: int) -> memoryview:
-        """Return a ``memoryview`` of at least *size* bytes.
+    def acquire(self, size: int) -> bytearray:
+        """Ensure the internal buffer has at least *size* bytes and return it.
 
         The underlying ``bytearray`` may be reallocated (grow or shrink).
-        The returned ``memoryview`` is valid until the next ``acquire`` call.
+        The returned reference is valid until the next ``acquire`` call.
         """
         now = time.monotonic()
         self._last_access = now
@@ -88,7 +88,7 @@ class AdaptiveBuffer:
             self._buf = bytearray(new_cap)
             self._consecutive_small = 0
             self._recent_peak = size
-            return memoryview(self._buf)[:size]
+            return self._buf
 
         buf_len = len(buf)
 
@@ -110,7 +110,7 @@ class AdaptiveBuffer:
             self._consecutive_small = 0
             self._recent_peak = max(self._recent_peak, size)
 
-        return memoryview(self._buf)[:size]
+        return self._buf
 
     def maybe_decay(self) -> None:
         """Shrink or release the buffer if idle for too long.
@@ -143,11 +143,6 @@ class AdaptiveBuffer:
     def capacity(self) -> int:
         """Current buffer capacity in bytes (0 if released)."""
         return len(self._buf) if self._buf is not None else 0
-
-    @property
-    def raw_buffer(self) -> bytearray | None:
-        """Direct access to the underlying ``bytearray`` (for ``ctypes.memmove``)."""
-        return self._buf
 
     def stats(self) -> dict:
         """Return diagnostic snapshot."""
