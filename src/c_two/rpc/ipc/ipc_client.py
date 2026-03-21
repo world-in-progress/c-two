@@ -18,6 +18,7 @@ from multiprocessing import shared_memory
 from ... import error
 from ..base import BaseClient
 from ..event import Event, EventTag
+from ..util.adaptive_buffer import AdaptiveBuffer
 from ..util.encoding import add_length_prefix, parse_message
 from .ipc_server import (
     DEFAULT_INLINE_THRESHOLD,
@@ -75,7 +76,7 @@ class IPCv2Client(BaseClient):
         self._socket_path = _resolve_socket_path(self.region_id)
         self._sock: _socket.socket | None = None
         self._conn_lock = threading.Lock()
-        self._read_buf: bytearray | None = None  # reusable buffer for SHM reads
+        self._read_buf: AdaptiveBuffer = AdaptiveBuffer()  # adaptive buffer for SHM reads
 
     # ------------------------------------------------------------------
     # Persistent connection management
@@ -124,6 +125,8 @@ class IPCv2Client(BaseClient):
             raise error.CompoClientError('IPC v2 connection failed after retry')
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
+        self._read_buf.maybe_decay()
+
         request_id = str(uuid.uuid4())
         method_bytes = method_name.encode('utf-8')
         args = data if data is not None else b''
@@ -213,6 +216,7 @@ class IPCv2Client(BaseClient):
 
     def terminate(self) -> None:
         self._close_connection()
+        self._read_buf.release()
 
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:

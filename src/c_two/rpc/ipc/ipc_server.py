@@ -31,6 +31,7 @@ from pathlib import Path
 from ... import error
 from ..base import BaseServer
 from ..event import Event, EventQueue, EventTag
+from ..util.adaptive_buffer import AdaptiveBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -107,18 +108,24 @@ _FAST_READ_THRESHOLD = 1_048_576  # 1 MB — use native memcpy above this size
 def _fast_read_shm(
     name: str,
     size: int,
-    buf: bytearray | None = None,
-) -> tuple[memoryview, bytearray]:
-    """Read SHM using native memcpy into a reusable pre-allocated buffer.
+    adaptive_buf: 'AdaptiveBuffer | None' = None,
+) -> tuple[memoryview, 'AdaptiveBuffer']:
+    """Read SHM using native memcpy into an :class:`AdaptiveBuffer`.
 
     For large payloads, uses ctypes.memmove (~40 GB/s on M1 Max) instead of
     Python's ``bytes(shm.buf)`` (~6-25 GB/s) to avoid per-call mmap overhead.
 
-    Returns ``(data_view, buffer)`` — *buffer* should be passed back on the
+    The adaptive buffer grows when needed and shrinks when consecutive reads
+    are significantly smaller than capacity (see :mod:`~c_two.rpc.util.adaptive_buffer`).
+
+    Returns ``(data_view, adaptive_buf)`` — pass *adaptive_buf* back on the
     next call for reuse.
     """
-    if buf is None or len(buf) < size:
-        buf = bytearray(size)
+    if adaptive_buf is None:
+        adaptive_buf = AdaptiveBuffer()
+
+    view = adaptive_buf.acquire(size)
+    buf = adaptive_buf.raw_buffer
 
     shm = shared_memory.SharedMemory(name=name, create=False)
     try:
@@ -133,7 +140,7 @@ def _fast_read_shm(
     finally:
         shm.close()
         shm.unlink()
-    return memoryview(buf)[:size], buf
+    return memoryview(buf)[:size], adaptive_buf
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +260,10 @@ class IPCv2Server(BaseServer):
 
         # Track active client handler tasks for clean shutdown
         self._client_tasks: set[asyncio.Task] = set()
+
+        # Track active per-connection adaptive buffers for periodic decay
+        self._conn_buffers: set[AdaptiveBuffer] = set()
+        self._conn_buffers_lock = threading.Lock()
 
     def _resolve_socket_path(self) -> str:
         tmpdir = os.getenv('IPC_V2_SOCKET_DIR', tempfile.gettempdir())
@@ -396,7 +407,9 @@ class IPCv2Server(BaseServer):
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         self._client_tasks.add(task)
-        _read_buf: bytearray | None = None  # per-connection reusable buffer
+        _read_buf: AdaptiveBuffer = AdaptiveBuffer()  # per-connection adaptive buffer
+        with self._conn_buffers_lock:
+            self._conn_buffers.add(_read_buf)
         try:
             while not self._shutdown_event.is_set():
                 try:
@@ -445,6 +458,9 @@ class IPCv2Server(BaseServer):
                 await writer.wait_closed()
             except Exception:
                 pass
+            with self._conn_buffers_lock:
+                self._conn_buffers.discard(_read_buf)
+            _read_buf.release()
             self._client_tasks.discard(task)
 
     async def _shm_gc_loop(self) -> None:
@@ -462,6 +478,11 @@ class IPCv2Server(BaseServer):
                         pass
                     self._our_shm_segments.pop(name, None)
                     logger.debug(f'SHM GC: cleaned up stale segment {name}')
+
+            # Decay idle connection buffers
+            with self._conn_buffers_lock:
+                for abuf in self._conn_buffers:
+                    abuf.maybe_decay()
 
     @property
     def socket_path(self) -> str:
