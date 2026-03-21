@@ -35,15 +35,15 @@ logger = logging.getLogger(__name__)
 
 _FLAG_SHM = 1 << 0
 _FLAG_RESPONSE = 1 << 1
+_FAST_READ_THRESHOLD = 1_048_576            # 1 MB — use native memcpy above this size
 
-DEFAULT_SHM_THRESHOLD = 1_048_576      # 1 MB — aligned with inline threshold
-SHM_GC_INTERVAL = 30.0                 # seconds
-SHM_MAX_AGE = 120.0                    # seconds before GC considers a segment leaked
+SHM_GC_INTERVAL = 30.0                      # seconds
+SHM_MAX_AGE = 120.0                         # seconds before GC considers a segment leaked
 
-
-DEFAULT_MAX_FRAME_SIZE = 16_777_216     # 16 MB — inline frame upper bound
-DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_296  # 4 GB — SHM payload upper bound
-DEFAULT_MAX_PENDING_REQUESTS = 1024    # per-server total
+DEFAULT_SHM_THRESHOLD = 1_048_576           # 1 MB — aligned with inline threshold
+DEFAULT_MAX_FRAME_SIZE = 16_777_216         # 16 MB — inline frame upper bound
+DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_296    # 4 GB — SHM payload upper bound
+DEFAULT_MAX_PENDING_REQUESTS = 1024         # per-server total
 
 
 @dataclass
@@ -97,10 +97,6 @@ def _decode_frame(data: bytes) -> tuple[str, int, bytes]:
     return request_id, flags, payload
 
 
-# Phase 4A: native memcpy + pre-allocated buffer
-_FAST_READ_THRESHOLD = 1_048_576  # 1 MB — use native memcpy above this size
-
-
 def _fast_read_shm(
     name: str,
     size: int,
@@ -108,8 +104,8 @@ def _fast_read_shm(
 ) -> tuple[memoryview, 'AdaptiveBuffer']:
     """Read SHM using native memcpy into an :class:`AdaptiveBuffer`.
 
-    For large payloads, uses ctypes.memmove (~40 GB/s on M1 Max) instead of
-    Python's ``bytes(shm.buf)`` (~6-25 GB/s) to avoid per-call mmap overhead.
+    For large payloads, uses ctypes.memmove instead of
+    Python's ``bytes(shm.buf)`` to avoid per-call mmap overhead.
 
     The adaptive buffer grows when needed and shrinks when consecutive reads
     are significantly smaller than capacity (see :mod:`~c_two.rpc.util.adaptive_buffer`).
@@ -124,7 +120,7 @@ def _fast_read_shm(
 
     shm = shared_memory.SharedMemory(name=name, create=False)
     try:
-        # S4: validate SHM actual size covers the declared size
+        # Validate SHM actual size covers the declared size
         if shm.size < size:
             raise error.EventDeserializeError(
                 f'SHM segment {name!r} actual size {shm.size} < declared size {size}'
@@ -143,10 +139,6 @@ def _fast_read_shm(
         shm.unlink()
     return memoryview(buf)[:size], adaptive_buf
 
-
-# ---------------------------------------------------------------------------
-# Phase 3 helpers — scatter-write & zero-copy read
-# ---------------------------------------------------------------------------
 
 def _scatter_write_event_to_shm(
     name: str,
@@ -400,6 +392,10 @@ class IPCv2Server(BaseServer):
 
         self._server.close()
         await self._server.wait_closed()
+
+        # Notify the _serve loop that the server has shut down
+        if self.event_queue is not None:
+            self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
