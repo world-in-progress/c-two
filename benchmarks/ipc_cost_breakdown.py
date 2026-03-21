@@ -32,12 +32,22 @@ from c_two.rpc.util.encoding import add_length_prefix, parse_message
 from c_two.rpc.ipc.ipc_server import (
     _scatter_write_event_to_shm,
     _scatter_write_event_multi_to_shm,
-    _read_and_release_shm,
     _shm_name,
     _encode_frame,
     _decode_frame,
 )
 from c_two.rpc.ipc.ipc_client import _send_frame_sync, _recv_frame_sync
+
+
+def _read_and_release_shm(name: str, size: int) -> bytes:
+    """Read SHM segment and release it. Used only for benchmarking."""
+    shm = shared_memory.SharedMemory(name=name, create=False)
+    try:
+        result = bytes(shm.buf[:size])
+    finally:
+        shm.close()
+        shm.unlink()
+    return result
 
 # Also import the full RPC stack for end-to-end comparison
 import c_two as cc

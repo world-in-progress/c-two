@@ -82,7 +82,7 @@ def _decode_frame(data: bytes) -> tuple[str, int, bytes]:
     rid_len = struct.unpack_from('<I', data, offset)[0]
     offset += 4
 
-    # S1: validate rid_len doesn't overflow the frame
+    # Validate rid_len doesn't overflow the frame
     payload_len = total_len - 4 - rid_len - 4
     if rid_len > total_len - 8 or payload_len < 0:
         raise error.EventDeserializeError(
@@ -95,22 +95,6 @@ def _decode_frame(data: bytes) -> tuple[str, int, bytes]:
     offset += 4
     payload = data[offset:offset + payload_len]
     return request_id, flags, payload
-
-
-def _write_shm(name: str, data: bytes) -> shared_memory.SharedMemory:
-    shm = shared_memory.SharedMemory(name=name, create=True, size=len(data))
-    shm.buf[:len(data)] = data
-    return shm
-
-
-def _read_and_release_shm(name: str, size: int) -> bytes:
-    shm = shared_memory.SharedMemory(name=name, create=False)
-    try:
-        result = bytes(shm.buf[:size])
-    finally:
-        shm.close()
-        shm.unlink()
-    return result
 
 
 # Phase 4A: native memcpy + pre-allocated buffer
@@ -172,8 +156,8 @@ def _scatter_write_event_to_shm(
 ) -> tuple[shared_memory.SharedMemory, int]:
     """Write Event(tag, data) directly to SHM without intermediate serialization.
 
-    Produces the same binary layout as ``_write_shm(name, Event(tag, data=data).serialize())``
-    but with only ONE copy of *data* into the SHM buffer.
+    Produces the same binary layout as serializing ``Event(tag, data=data)``
+    into SHM but with only ONE copy of *data* into the SHM buffer.
     """
     tag_bytes = tag.value.encode('utf-8')
     tag_len = len(tag_bytes)
@@ -199,9 +183,9 @@ def _scatter_write_event_multi_to_shm(
 ) -> tuple[shared_memory.SharedMemory, int]:
     """Scatter-write an Event whose data is ``concat(add_length_prefix(m) for m in messages)``.
 
-    Equivalent to building ``combined = add_length_prefix(m0) + add_length_prefix(m1) + ...``
-    then ``_write_shm(name, Event(tag, data=combined).serialize())``, but avoids **all**
-    intermediate allocations — only one copy of each message into the SHM buffer.
+    Equivalent to building the combined prefixed messages then writing to SHM,
+    but avoids **all** intermediate allocations — only one copy of each message
+    into the SHM buffer.
     """
     tag_bytes = tag.value.encode('utf-8')
     tag_len = len(tag_bytes)

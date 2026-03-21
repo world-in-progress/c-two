@@ -28,10 +28,15 @@ from .ipc_server import (
     _fast_read_shm,
     _scatter_write_event_multi_to_shm,
     _shm_name,
-    _write_shm,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _write_shm(name: str, data: bytes) -> shared_memory.SharedMemory:
+    shm = shared_memory.SharedMemory(name=name, create=True, size=len(data))
+    shm.buf[:len(data)] = data
+    return shm
 
 
 def _resolve_socket_path(region_id: str) -> str:

@@ -31,7 +31,6 @@ from c_two.rpc.ipc.ipc_server import (
     _encode_frame,
     _fast_read_shm,
     _read_frame,
-    _write_shm,
 )
 from c_two.rpc.ipc.ipc_client import _recv_frame_sync
 
@@ -410,10 +409,17 @@ class TestDeadCodeRemoved:
         assert 'DEFAULT_INLINE_THRESHOLD' not in source
         assert '_FLAG_RESPONSE' not in source.split('from .ipc_server import')[1].split(')')[0] if 'from .ipc_server import' in source else True
 
-    def test_read_and_release_shm_still_in_server(self):
-        """_read_and_release_shm is used by benchmarks — must still exist in ipc_server."""
+    def test_write_shm_moved_to_client(self):
+        """_write_shm should be in ipc_client, not ipc_server."""
+        import c_two.rpc.ipc.ipc_server as server_mod
+        import c_two.rpc.ipc.ipc_client as client_mod
+        assert not hasattr(server_mod, '_write_shm')
+        assert hasattr(client_mod, '_write_shm')
+
+    def test_read_and_release_shm_moved_to_benchmarks(self):
+        """_read_and_release_shm should not be in ipc_server (moved to benchmarks)."""
         import c_two.rpc.ipc.ipc_server as mod
-        assert hasattr(mod, '_read_and_release_shm')
+        assert not hasattr(mod, '_read_and_release_shm')
 
 
 # ---------------------------------------------------------------------------
