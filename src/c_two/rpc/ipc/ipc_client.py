@@ -21,15 +21,11 @@ from ..event import Event, EventTag
 from ..util.adaptive_buffer import AdaptiveBuffer
 from ..util.encoding import add_length_prefix, parse_message
 from .ipc_server import (
-    DEFAULT_INLINE_THRESHOLD,
-    DEFAULT_SHM_THRESHOLD,
     IPCConfig,
-    _FLAG_RESPONSE,
     _FLAG_SHM,
     _decode_frame,
     _encode_frame,
     _fast_read_shm,
-    _read_and_release_shm,
     _scatter_write_event_multi_to_shm,
     _shm_name,
     _write_shm,
@@ -60,9 +56,20 @@ def _send_frame_sync(sock: _socket.socket, frame: bytes) -> None:
     sock.sendall(frame)
 
 
-def _recv_frame_sync(sock: _socket.socket) -> bytes:
+def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = 0) -> bytes:
     header = _recv_exact(sock, 4)
     total_len = struct.unpack('<I', header)[0]
+
+    # S2: reject oversized or undersized frames before allocation
+    if total_len < 8:
+        raise error.EventDeserializeError(
+            f'Frame too small: total_len={total_len} (minimum 8)'
+        )
+    if max_frame_size > 0 and total_len > max_frame_size:
+        raise error.EventDeserializeError(
+            f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
+        )
+
     body = _recv_exact(sock, total_len)
     return header + body
 
@@ -116,7 +123,7 @@ class IPCv2Client(BaseClient):
                 try:
                     sock = self._ensure_connection()
                     _send_frame_sync(sock, frame)
-                    raw = _recv_frame_sync(sock)
+                    raw = _recv_frame_sync(sock, self._config.max_frame_size)
                     return _decode_frame(raw)
                 except (ConnectionError, BrokenPipeError, OSError):
                     self._close_connection()
@@ -164,8 +171,14 @@ class IPCv2Client(BaseClient):
 
         if resp_flags & _FLAG_SHM:
             parts = resp_payload.split(b'\x00', 1)
+            if len(parts) != 2 or len(parts[1]) < 8:
+                raise error.EventDeserializeError('Malformed SHM reference in response frame')
             shm_name = parts[0].decode('utf-8')
             size = struct.unpack('<Q', parts[1])[0]
+            if size > self._config.max_payload_size:
+                raise error.EventDeserializeError(
+                    f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
+                )
             response_bytes, self._read_buf = _fast_read_shm(shm_name, size, self._read_buf)
         else:
             response_bytes = resp_payload
@@ -207,8 +220,14 @@ class IPCv2Client(BaseClient):
 
         if resp_flags & _FLAG_SHM:
             parts = resp_payload.split(b'\x00', 1)
+            if len(parts) != 2 or len(parts[1]) < 8:
+                raise error.EventDeserializeError('Malformed SHM reference in response frame')
             shm_name = parts[0].decode('utf-8')
             size = struct.unpack('<Q', parts[1])[0]
+            if size > self._config.max_payload_size:
+                raise error.EventDeserializeError(
+                    f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
+                )
             data, self._read_buf = _fast_read_shm(shm_name, size, self._read_buf)
             return bytes(data)
 
