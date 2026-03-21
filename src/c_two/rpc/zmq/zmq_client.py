@@ -24,7 +24,7 @@ class ZmqClient(BaseClient):
             combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
             event = Event(tag=EventTag.CRM_CALL, data=combined_request)
         except Exception as e:
-            raise error.CRMSerializeOutput(f'Error occurred when serializing request: {e}')
+            raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}') from e
         
         # Send request event
         self.socket.send(event.serialize())

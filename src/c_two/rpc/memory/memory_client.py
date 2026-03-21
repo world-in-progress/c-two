@@ -97,7 +97,7 @@ class MemoryClient(BaseClient):
                     event = Event.deserialize(response_data)
                     return event
                 except Exception as e:
-                    raise error.CompoClientError(f'Failed to read response file: {e}')
+                    raise error.CompoClientError(f'Failed to read response file: {e}') from e
             
             if timeout > 0 and (time.time() - start_time) > timeout:
                 raise error.CompoClientError(f'Response timeout for request {request_id}')
@@ -247,8 +247,10 @@ class MemoryClient(BaseClient):
                         else:
                             raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.SHUTDOWN_ACK}')
                         
+                    except error.CCBaseError:
+                        raise  # Don't re-wrap already-classified errors
                     except Exception as e:
-                        raise error.CompoClientError(f'Failed to read response file: {e}')
+                        raise error.CompoClientError(f'Failed to read response file: {e}') from e
                 
                 if timeout > 0 and (time.time() - start_time) > timeout:
                     raise error.CompoClientError(f'Response timeout for request {request_id}')

@@ -21,8 +21,17 @@ dev = [
     "numpy>=2.2.4",
     "openai>=1.76.0",
     "pandas>=2.2.3",
-    "pyarrow>=19.0.1",
+    "pyarrow>=23.0.1",
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+timeout = 30
 
 [tool.uv]
 package = true

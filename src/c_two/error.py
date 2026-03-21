@@ -71,54 +71,72 @@ class CCError(CCBaseError):
         code_value = int(parts[0])
         message = parts[1] if len(parts) > 1 else None
         
-        return CCError(ERROR_Code(code_value), message)
+        code = ERROR_Code(code_value)
+        subclass = _CODE_TO_CLASS.get(code, CCError)
+        obj = Exception.__new__(subclass)
+        obj.code = code
+        obj.message = message or 'Error occurred when using C-Two.'
+        return obj
 
 class CRMDeserializeInput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when deserializing input at CRM' + f':\n{message}' if message else ''
+        message = 'Error occurred when deserializing input at CRM' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING, message=message)
 
 class CRMSerializeOutput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when serializing output at CRM' + f':\n{message}' if message else ''
+        message = 'Error occurred when serializing output at CRM' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING, message=message)
 
 class CRMExecuteFunction(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when executing function at CRM' + f':\n{message}' if message else ''
+        message = 'Error occurred when executing function at CRM' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message=message)
 
 class CRMServerError(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred at CRM server' + f':\n{message}' if message else ''
+        message = 'Error occurred at CRM server' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_CRM_SERVER, message=message)
 
 class CompoSerializeInput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when serializing input at Compo' + f':\n{message}' if message else ''
+        message = 'Error occurred when serializing input at Compo' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_COMPO_INPUT_SERIALIZING, message=message)
         
 class CompoDeserializeOutput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when deserializing output at Compo' + f':\n{message}' if message else ''
+        message = 'Error occurred when deserializing output at Compo' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING, message=message)
         
 class CompoCRMCalling(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when calling CRM from Compo' + f':\n{message}' if message else ''
+        message = 'Error occurred when calling CRM from Compo' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_COMPO_CRM_CALLING, message=message)
         
 class CompoClientError(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred at Compo client' + f':\n{message}' if message else ''
+        message = 'Error occurred at Compo client' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_COMPO_CLIENT, message=message)
 
 class EventSerializeError(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when serializing event' + f':\n{message}' if message else ''
+        message = 'Error occurred when serializing event' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_EVENT_SERIALIZING, message=message)
 
 class EventDeserializeError(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when deserializing event' + f':\n{message}' if message else ''
+        message = 'Error occurred when deserializing event' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_EVENT_DESERIALIZING, message=message)
+
+_CODE_TO_CLASS: dict[int, type] = {
+    ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING:    CRMDeserializeInput,
+    ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING:     CRMSerializeOutput,
+    ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING:     CRMExecuteFunction,
+    ERROR_Code.ERROR_AT_CRM_SERVER:                 CRMServerError,
+    ERROR_Code.ERROR_AT_COMPO_INPUT_SERIALIZING:    CompoSerializeInput,
+    ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING: CompoDeserializeOutput,
+    ERROR_Code.ERROR_AT_COMPO_CRM_CALLING:          CompoCRMCalling,
+    ERROR_Code.ERROR_AT_COMPO_CLIENT:               CompoClientError,
+    ERROR_Code.ERROR_AT_EVENT_SERIALIZING:          EventSerializeError,
+    ERROR_Code.ERROR_AT_EVENT_DESERIALIZING:        EventDeserializeError,
+}

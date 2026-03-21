@@ -8,10 +8,11 @@ from .docker_builder import CRMImageBuilder
 @click.option('--image', '-i', default=None, help='Docker image name (e.g., my-registry/hello-crm:v1.0)')
 @click.option('--push', '-p', is_flag=True, help='Push image to registry after build')
 @click.option('--registry', '-r', help='Docker registry URL')
-def build(project_path: str, image: str | None, base_image: str, push: bool, registry: str | None):
+@click.option('--free-threading', '-t', is_flag=True, help='Use free-threading Python runtime (3.14t) for Worker')
+def build(project_path: str, image: str | None, base_image: str, push: bool, registry: str | None, free_threading: bool):
     """Build a Docker image for CRM project deployment"""
     try:
-        builder = CRMImageBuilder(project_path, base_image)
+        builder = CRMImageBuilder(project_path, base_image, free_threading=free_threading)
 
         # Build the Dockerfile
         builder.build_dockerfile()

@@ -5,6 +5,7 @@ import subprocess
 
 from .zmq import ZmqClient
 from .http import HttpClient
+from .ipc import IPCv2Client
 from .memory import MemoryClient
 from .thread import ThreadClient
 
@@ -18,8 +19,9 @@ def _get_client_class(server_address: str):
         return MemoryClient
     elif server_address.startswith('thread://'):
         return ThreadClient
+    elif server_address.startswith('ipc-v2://'):
+        return IPCv2Client
     else:
-        # TODO: Handle other protocols if needed
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
 
 class Client:
@@ -30,6 +32,14 @@ class Client:
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         return self._client.call(method_name, data)
+
+    def call_direct(self, method_name: str, args: tuple) -> any:
+        """Direct call — pass Python objects without serialization (thread:// only)."""
+        return self._client.call_direct(method_name, args)
+
+    @property
+    def supports_direct_call(self) -> bool:
+        return hasattr(self._client, 'call_direct')
 
     def terminate(self):
         self._client.terminate()

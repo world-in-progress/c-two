@@ -26,7 +26,7 @@ class HttpClient(BaseClient):
             combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
             event = Event(tag=EventTag.CRM_CALL, data=combined_request)
         except Exception as e:
-            raise error.CRMSerializeOutput(f'Error occurred when serializing request: {e}')
+            raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}') from e
         
         # Send POST request with serialized event as body
         try:
@@ -42,7 +42,7 @@ class HttpClient(BaseClient):
             full_response = response.content
             
         except requests.RequestException as e:
-            raise error.CompoClientError(f'HTTP request failed: {e}')
+            raise error.CompoClientError(f'HTTP request failed: {e}') from e
         
         # Deserialize Event
         event = Event.deserialize(full_response)
@@ -76,7 +76,7 @@ class HttpClient(BaseClient):
             return full_response
             
         except requests.RequestException as e:
-            raise error.CompoClientError(f'HTTP request failed: {e}')
+            raise error.CompoClientError(f'HTTP request failed: {e}') from e
     
     def terminate(self):
         """Close the HTTP session."""

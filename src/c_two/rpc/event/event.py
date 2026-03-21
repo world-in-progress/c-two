@@ -29,14 +29,24 @@ class Event:
     data: bytes | None = None
     completion_type: CompletionType = CompletionType.OP_REQUEST
     request_id: str | None = None
+    data_parts: list[bytes | memoryview] | None = None
 
     def serialize(self) -> bytes:
         try:
             tag_bytes = self.tag.value.encode('utf-8')
-            data_bytes = b'' if self.data is None else self.data
+            data_bytes = self.get_data()
             return add_length_prefix(tag_bytes) + add_length_prefix(data_bytes)
         except Exception as e:
             raise error.EventSerializeError(f'Error occurred when serialize event: {e}')
+
+    def get_data(self) -> bytes | memoryview:
+        """Return event data, lazily computing from data_parts if needed."""
+        if self.data is not None:
+            return self.data
+        if self.data_parts is not None:
+            self.data = b''.join(add_length_prefix(p) for p in self.data_parts)
+            return self.data
+        return b''
     
     @staticmethod
     def deserialize(content: bytes) -> Event:

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
-from icrm import IGrid, GridSchema, GridAttribute
+from examples.grid.icrm import IGrid, GridSchema, GridAttribute
 
 # Const ##############################
 
@@ -254,8 +254,8 @@ class Grid:
         buffer = self._redis_client.get(key)
         if buffer is None:
             return pd.DataFrame(columns=[ATTR_LEVEL, ATTR_GLOBAL_ID, ATTR_LOCAL_ID, ATTR_TYPE, 
-                                       ATTR_ELEVATION, ATTR_DELETED, ATTR_ACTIVATE, 
-                                       ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y])
+                                        ATTR_ELEVATION, ATTR_DELETED, ATTR_ACTIVATE, 
+                                        ATTR_MIN_X, ATTR_MIN_Y, ATTR_MAX_X, ATTR_MAX_Y])
         
         reader = ipc.open_stream(buffer)
         grid_record = reader.read_next_batch()
@@ -487,7 +487,6 @@ class Grid:
             tuple[list[int], list[int]]: active grids' global ids and levels
         """
         active_grids = self.grids[self.grids[ATTR_ACTIVATE] == True]
-        # print(active_grids.index.get_level_values(0).tolist(), active_grids.index.get_level_values(1).tolist())
         return active_grids.index.get_level_values(0).tolist(), active_grids.index.get_level_values(1).tolist()
 
     def hello(self, name: str) -> str:

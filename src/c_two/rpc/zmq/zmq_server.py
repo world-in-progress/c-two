@@ -1,4 +1,5 @@
 import zmq
+import queue
 import logging
 import threading
 from ..base import BaseServer
@@ -15,23 +16,51 @@ class ZmqServer(BaseServer):
         self.context = None
         self.socket = None
         self.shutdown_event = threading.Event()
+        self._reply_queue: queue.Queue[bytes] = queue.Queue()
+        self._serve_done = threading.Event()
+        self._serve_done.set()
     
     def _serve(self):
-        while True:
-            # Check if the shutdown event is set
-            if self.shutdown_event.is_set():
-                self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
-                break
-            
-            # Poll for events with a timeout
-            event = self._poll(timeout=MAXIMUM_WAIT_TIMEOUT)
-            if event is None:
-                continue
-            else:
+        self._serve_done.clear()
+        try:
+            while True:
+                if self.shutdown_event.is_set():
+                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
+                    return
+
+                event = self._poll(timeout=MAXIMUM_WAIT_TIMEOUT)
+                if event is None:
+                    continue
+
                 self.event_queue.put(event)
+
+                # REP socket requires exactly one send after each recv
+                reply_data = self._wait_for_reply()
+                if reply_data is not None:
+                    try:
+                        self.socket.send(reply_data)
+                    except Exception as e:
+                        if not self.shutdown_event.is_set():
+                            logger.error(f'Failed to send ZMQ reply: {e}')
+
                 if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
-                    break
-            
+                    return
+        finally:
+            self._serve_done.set()
+
+    def _wait_for_reply(self) -> bytes | None:
+        """Block until a reply is available or shutdown is signaled."""
+        while not self.shutdown_event.is_set():
+            try:
+                return self._reply_queue.get(timeout=MAXIMUM_WAIT_TIMEOUT)
+            except queue.Empty:
+                continue
+        # Drain one last time in case the reply arrived during shutdown
+        try:
+            return self._reply_queue.get_nowait()
+        except queue.Empty:
+            return None
+
     def start(self):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
@@ -64,19 +93,26 @@ class ZmqServer(BaseServer):
             return None
 
     def reply(self, event: Event):
-        self.socket.send(event.serialize())
+        """Thread-safe: queues the reply for the server thread to send."""
+        self._reply_queue.put(event.serialize())
     
     def shutdown(self):
         self.shutdown_event.set()
     
     def destroy(self):
-        self.socket.close()
-        self.context.term()
+        self._serve_done.wait(timeout=5.0)
+        try:
+            if self.socket and not self.socket.closed:
+                self.socket.setsockopt(zmq.LINGER, 0)
+                self.socket.close()
+        except Exception:
+            pass
+        try:
+            if self.context and not self.context.closed:
+                self.context.term()
+        except Exception:
+            pass
     
     def cancel_all_calls(self):
-        try:
-            self.socket.setsockopt(zmq.LINGER, 0)
-            self.socket.close()
-            
-        except Exception as e:
-            logger.error(f'Error cancelling ZMQ connections: {e}')
+        # Reply serialization is handled by the reply queue; nothing to cancel here
+        pass

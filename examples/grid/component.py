@@ -1,5 +1,5 @@
 import c_two as cc
-from icrm import IGrid, GridAttribute
+from examples.grid.icrm import IGrid, GridAttribute
 
 @cc.compo.runtime.connect
 def get_grid_infos(crm: IGrid, level: int, global_ids: list[int]) -> list[GridAttribute]:

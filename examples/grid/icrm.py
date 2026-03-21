@@ -15,14 +15,14 @@ class GridSchema:
     """
     epsg: int
     bounds: list[float]  # [min_x, min_y, max_x, max_y]
-    first_size: float
+    first_size: list[float]  # [width, height]
     subdivide_rules: list[list[int]]  # [(sub_width, sub_height), ...]
         
     def serialize(grid_schema: 'GridSchema') -> bytes:
         arrow_schema = pa.schema([
             pa.field('epsg', pa.int32()),
             pa.field('bounds', pa.list_(pa.float64())),
-            pa.field('first_size', pa.float64()),
+            pa.field('first_size', pa.list_(pa.float64())),
             pa.field('subdivide_rules', pa.list_(pa.list_(pa.int32())))
         ])
         
@@ -116,7 +116,7 @@ class GridInfo:
     def serialize(level: int, global_id: int) -> bytes:
         schema = pa.schema([
             pa.field('level', pa.int8()),
-            pa.field('global_id', pa.pa.int32())
+            pa.field('global_id', pa.int32())
         ])
         
         data = {
@@ -296,4 +296,3 @@ def deserialize_to_rows(serialized_data: bytes) -> dict:
         table = reader.read_all()
 
     return table.to_pylist()
-    

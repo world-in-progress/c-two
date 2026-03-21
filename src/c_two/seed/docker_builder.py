@@ -15,8 +15,9 @@ def generate_md5(input_string):
     return md5_hash
 
 class CRMImageBuilder:
-    def __init__(self, project_path: str, base_image: str):
+    def __init__(self, project_path: str, base_image: str, free_threading: bool = False):
         self.base_image = base_image
+        self.free_threading = free_threading
         self.project_path = Path(project_path)
         self.docker_client = docker.from_env()
     
@@ -363,6 +364,8 @@ Thumbs.db
         # Base image selection
         if env_type == 'conda':
             base_image = f'continuumio/miniconda3:latest'
+        elif self.free_threading:
+            base_image = self.base_image
         else:
             base_image = f'python:{python_version}-slim'
             
@@ -376,6 +379,14 @@ Thumbs.db
             f'FROM {base_image} AS builder',
             ''
         ]
+
+        # Add free-threading environment variables
+        if self.free_threading:
+            dockerfile_build_stage.extend([
+                '# Free-threading runtime: disable GIL for true parallelism',
+                'ENV PYTHON_GIL=0',
+                '',
+            ])
 
         # Add ARG and ENV for proxy settings if they exist
         if proxy_settings:
@@ -464,11 +475,21 @@ Thumbs.db
             'COPY --from=builder /app/.venv ./.venv',
             '',
             'ENV PATH="/app/.venv/bin:$PATH"',
+        ]
+
+        if self.free_threading:
+            dockerfile_final_stage.extend([
+                '',
+                '# Free-threading runtime: disable GIL for true parallelism',
+                'ENV PYTHON_GIL=0',
+            ])
+
+        dockerfile_final_stage.extend([
             '',
             'COPY . .',
             '',
             'ENTRYPOINT ["python", "main.py"]'
-        ]
+        ])
 
         # Handle main.py arguments
         default_params = []

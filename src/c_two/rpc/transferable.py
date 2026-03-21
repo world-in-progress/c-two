@@ -273,26 +273,41 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 icrm = args[0]
                 client = icrm.client
                 request = args[1:] if len(args) > 1 else None
+
+                # Thread fast path — skip all serialization/deserialization
+                if getattr(client, 'supports_direct_call', False):
+                    return client.call_direct(method_name, request or ())
                 
-                # Serialize input args if input_transferable is provided
+                # Standard cross-process path
+                stage = 'serialize_input'
                 serialized_args = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 
-                # Run method remotely and deserialize output if output_transferable is provided
+                # Call CRM
+                stage = 'call_crm'
                 result_bytes = client.call(method_name, serialized_args)
+                
+                # Deserialize output
+                stage = 'deserialize_output'
                 return None if not output_transferable else output_transferable(result_bytes)
             
+            except error.CCBaseError:
+                raise
             except Exception as e:
-                if 'serialized_args' not in locals():
-                    raise error.CompoSerializeInput(str(e))
-                elif 'result_bytes' not in locals():
-                    raise error.CompoCRMCalling(str(e))
+                if stage == 'serialize_input':
+                    raise error.CompoSerializeInput(str(e)) from e
+                elif stage == 'call_crm':
+                    raise error.CompoCRMCalling(str(e)) from e
                 else:
-                    raise error.CompoDeserializeOutput(str(e))
+                    raise error.CompoDeserializeOutput(str(e)) from e
         
         def crm_to_com(*args: any) -> tuple[any, any]:
             # Get transferable
             input_transferable = input.deserialize if input else None
             output_transferable = output.serialize if output else None
+
+            err = None
+            result = None
+            stage = 'deserialize_input'
 
             try:
                 if len(args) < 1:
@@ -314,14 +329,15 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 if crm_method is None:
                     raise ValueError(f'Method "{method_name}" not found on CRM class.')
 
+                stage = 'execute_function'
                 result = crm_method(*deserialized_args)
                 err = None
                 
             except Exception as e:
                 result = None
-                if 'deserialized_args' not in locals():
+                if stage == 'deserialize_input':
                     err = error.CRMDeserializeInput(str(e))
-                elif 'result' not in locals():
+                elif stage == 'execute_function':
                     err = error.CRMExecuteFunction(str(e))
                 else:
                     err = error.CRMSerializeOutput(str(e))
@@ -335,8 +351,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                     output_transferable(*result) if isinstance(result, tuple)
                     else output_transferable(result)
                 )
-            combined_response = add_length_prefix(serialized_error) + add_length_prefix(serialized_result)
-            return combined_response
+            return (serialized_error, serialized_result)
         
         @wraps(func)
         def transfer_wrapper(*args: any) -> any:
