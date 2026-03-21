@@ -6,6 +6,7 @@ from . import get_server
 from ..base import BaseClient
 from ..event import Event, EventTag
 from ..util.encoding import add_length_prefix, parse_message
+from .thread_server import DirectCallEvent
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,26 @@ class ThreadClient(BaseClient):
             raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}')
 
         return event
+
+    def call_direct(self, method_name: str, args: tuple) -> any:
+        """Direct call — pass Python objects without serialization (thread:// only)."""
+        server = get_server(self.thread_id)
+        if not server:
+            raise error.CompoClientError(f'Thread server {self.thread_id} not found.')
+
+        request_id = str(uuid.uuid4())
+        direct_event = DirectCallEvent(request_id=request_id, method_name=method_name, args=args)
+
+        try:
+            server.put_request(direct_event)
+            result, err = server.get_direct_response(request_id)
+            if err is not None:
+                raise err
+            return result
+        except error.CCBaseError:
+            raise
+        except Exception as e:
+            raise error.CompoClientError(f'Thread direct call failed: {e}') from e
 
     def call(self, method_name: str, data: bytes | None = None) -> Event:
         """Make a synchronous call to the server."""

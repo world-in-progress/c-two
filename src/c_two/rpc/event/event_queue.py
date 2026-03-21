@@ -21,8 +21,8 @@ class EventQueue:
             else:
                 event = self._queue.get(block=True, timeout=timeout)
             
-            event.completion_type = CompletionType.OP_COMPLETE
-            event.success = True
+            if hasattr(event, 'completion_type'):
+                event.completion_type = CompletionType.OP_COMPLETE
             return event
         except queue.Empty:
             return Event(

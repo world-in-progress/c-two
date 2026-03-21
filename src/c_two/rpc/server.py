@@ -5,7 +5,7 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Generic, Type, TypeVar
+from typing import Any, Callable, Generic, Type, TypeVar
 
 from .. import error
 from ..crm.meta import MethodAccess, get_method_access
@@ -15,6 +15,7 @@ from .http import HttpServer
 from .ipc import IPCv2Server
 from .memory import MemoryServer
 from .thread import ThreadServer
+from .thread.thread_server import DirectCallEvent
 from .util.encoding import add_length_prefix, parse_message
 from .util.wait import wait
 from .zmq import ZmqServer
@@ -190,6 +191,37 @@ class _Scheduler:
             )
         )
 
+    def submit_direct(
+        self,
+        *,
+        request_id: str,
+        crm_method: Callable,
+        args: tuple,
+        access_mode: MethodAccess,
+        reply_direct: Callable[[str, Any, Exception | None], None],
+    ) -> None:
+        """Submit a direct call — CRM method receives Python objects, returns Python objects."""
+        with self._state_lock:
+            if self._shutdown:
+                raise error.CRMServerError('Server is shutting down, no new calls accepted.')
+
+            if self._max_pending is not None and self._pending_count >= self._max_pending:
+                raise error.CRMServerError(
+                    f'Server is at capacity ({self._max_pending} pending calls). Try again later.'
+                )
+
+            self._pending_count += 1
+            self._drain_event.clear()
+
+        future = self._executor.submit(self._execute_direct, crm_method, args, access_mode)
+        future.add_done_callback(
+            lambda completed: self._on_task_done_direct(
+                request_id=request_id,
+                future=completed,
+                reply_direct=reply_direct,
+            )
+        )
+
     def shutdown(self) -> None:
         with self._state_lock:
             if self._shutdown:
@@ -207,6 +239,15 @@ class _Scheduler:
     ) -> bytes:
         with self._execution_guard(access_mode):
             return method(args_bytes)
+
+    def _execute_direct(
+        self,
+        crm_method: Callable,
+        args: tuple,
+        access_mode: MethodAccess,
+    ) -> Any:
+        with self._execution_guard(access_mode):
+            return crm_method(*args)
 
     @contextmanager
     def _execution_guard(self, access_mode: MethodAccess):
@@ -241,6 +282,23 @@ class _Scheduler:
                 if self._pending_count == 0:
                     self._drain_event.set()
 
+    def _on_task_done_direct(
+        self,
+        *,
+        request_id: str,
+        future: Future[Any],
+        reply_direct: Callable[[str, Any, Exception | None], None],
+    ) -> None:
+        try:
+            self._complete_direct_request(
+                request_id=request_id, future=future, reply_direct=reply_direct
+            )
+        finally:
+            with self._state_lock:
+                self._pending_count -= 1
+                if self._pending_count == 0:
+                    self._drain_event.set()
+
     def _complete_request(
         self,
         *,
@@ -262,6 +320,24 @@ class _Scheduler:
             reply(Event(tag=EventTag.CRM_REPLY, data=response, request_id=request_id))
         except Exception:
             logger.exception('Failed to deliver CRM reply for request %s', request_id)
+
+    def _complete_direct_request(
+        self,
+        *,
+        request_id: str,
+        future: Future[Any],
+        reply_direct: Callable[[str, Any, Exception | None], None],
+    ) -> None:
+        if future.cancelled():
+            return
+
+        try:
+            result = future.result()
+            reply_direct(request_id, result, None)
+        except error.CCBaseError as exc:
+            reply_direct(request_id, None, exc)
+        except Exception as exc:
+            reply_direct(request_id, None, error.CRMExecuteFunction(str(exc)))
 
 
 class ServerState:
@@ -390,7 +466,50 @@ def _dispatch_crm_call(state: ServerState, event: Event) -> None:
         )
 
 
-def _process_event_and_continue(state: ServerState, event: Event) -> bool:
+def _dispatch_direct_call(state: ServerState, event: DirectCallEvent) -> None:
+    """Dispatch a direct call — no serialization, Python objects passed directly to CRM."""
+    if state.stage is not ServerStage.STARTED:
+        state.server.reply_direct(
+            event.request_id, None,
+            error.CRMServerError('Server is shutting down, no new calls accepted.'),
+        )
+        return
+
+    try:
+        icrm = state.icrm
+        crm = state.crm
+
+        icrm_method = getattr(icrm, event.method_name, None)
+        if icrm_method is None:
+            raise error.CRMServerError(
+                f'No method found: {icrm.__module__}.{icrm.__name__}.{event.method_name}'
+            )
+
+        crm_method = getattr(crm, event.method_name, None)
+        if crm_method is None:
+            raise error.CRMServerError(
+                f'CRM method not found: {event.method_name}'
+            )
+
+        access_mode = get_method_access(icrm_method)
+        state.scheduler.submit_direct(
+            request_id=event.request_id,
+            crm_method=crm_method,
+            args=event.args,
+            access_mode=access_mode,
+            reply_direct=state.server.reply_direct,
+        )
+    except Exception as exc:
+        wrapped = exc if isinstance(exc, error.CCBaseError) else error.CRMExecuteFunction(str(exc))
+        state.server.reply_direct(event.request_id, None, wrapped)
+
+
+def _process_event_and_continue(state: ServerState, event: Event | DirectCallEvent) -> bool:
+    # Direct call fast path — no Event tag, no serialization
+    if isinstance(event, DirectCallEvent):
+        _dispatch_direct_call(state, event)
+        return True
+
     if event.tag is EventTag.PING:
         state.server.reply(Event(tag=EventTag.PONG, request_id=event.request_id))
         return True
@@ -409,7 +528,9 @@ def _serve(state: ServerState):
     while True:
         event = state.event_queue.poll(timeout=0.1)
 
-        if event.completion_type != CompletionType.OP_TIMEOUT:
+        # DirectCallEvent has no completion_type — always a real event
+        is_timeout = isinstance(event, Event) and event.completion_type == CompletionType.OP_TIMEOUT
+        if not is_timeout:
             if not _process_event_and_continue(state, event):
                 return
 

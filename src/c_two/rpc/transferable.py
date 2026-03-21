@@ -273,8 +273,12 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 icrm = args[0]
                 client = icrm.client
                 request = args[1:] if len(args) > 1 else None
+
+                # Thread fast path — skip all serialization/deserialization
+                if getattr(client, 'supports_direct_call', False):
+                    return client.call_direct(method_name, request or ())
                 
-                # Serialize input
+                # Standard cross-process path
                 stage = 'serialize_input'
                 serialized_args = input_transferable(*request) if (request is not None and input_transferable is not None) else None
                 

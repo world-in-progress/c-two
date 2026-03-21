@@ -33,6 +33,14 @@ class Client:
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         return self._client.call(method_name, data)
 
+    def call_direct(self, method_name: str, args: tuple) -> any:
+        """Direct call — pass Python objects without serialization (thread:// only)."""
+        return self._client.call_direct(method_name, args)
+
+    @property
+    def supports_direct_call(self) -> bool:
+        return hasattr(self._client, 'call_direct')
+
     def terminate(self):
         self._client.terminate()
     
