@@ -27,6 +27,7 @@ from .ipc_server import (
     _FLAG_SHM,
     _decode_frame,
     _encode_frame,
+    _fast_read_shm,
     _read_and_release_shm,
     _scatter_write_event_multi_to_shm,
     _shm_name,
@@ -74,6 +75,7 @@ class IPCv2Client(BaseClient):
         self._socket_path = _resolve_socket_path(self.region_id)
         self._sock: _socket.socket | None = None
         self._conn_lock = threading.Lock()
+        self._read_buf: bytearray | None = None  # reusable buffer for SHM reads
 
     # ------------------------------------------------------------------
     # Persistent connection management
@@ -161,7 +163,7 @@ class IPCv2Client(BaseClient):
             parts = resp_payload.split(b'\x00', 1)
             shm_name = parts[0].decode('utf-8')
             size = struct.unpack('<Q', parts[1])[0]
-            response_bytes = _read_and_release_shm(shm_name, size)
+            response_bytes, self._read_buf = _fast_read_shm(shm_name, size, self._read_buf)
         else:
             response_bytes = resp_payload
 
@@ -204,7 +206,8 @@ class IPCv2Client(BaseClient):
             parts = resp_payload.split(b'\x00', 1)
             shm_name = parts[0].decode('utf-8')
             size = struct.unpack('<Q', parts[1])[0]
-            return _read_and_release_shm(shm_name, size)
+            data, self._read_buf = _fast_read_shm(shm_name, size, self._read_buf)
+            return bytes(data)
 
         return resp_payload
 

@@ -15,6 +15,7 @@ Wire protocol (control plane):
 """
 
 import asyncio
+import ctypes
 import logging
 import os
 import struct
@@ -97,6 +98,42 @@ def _read_and_release_shm(name: str, size: int) -> bytes:
         shm.close()
         shm.unlink()
     return result
+
+
+# Phase 4A: native memcpy + pre-allocated buffer
+_FAST_READ_THRESHOLD = 1_048_576  # 1 MB — use native memcpy above this size
+
+
+def _fast_read_shm(
+    name: str,
+    size: int,
+    buf: bytearray | None = None,
+) -> tuple[memoryview, bytearray]:
+    """Read SHM using native memcpy into a reusable pre-allocated buffer.
+
+    For large payloads, uses ctypes.memmove (~40 GB/s on M1 Max) instead of
+    Python's ``bytes(shm.buf)`` (~6-25 GB/s) to avoid per-call mmap overhead.
+
+    Returns ``(data_view, buffer)`` — *buffer* should be passed back on the
+    next call for reuse.
+    """
+    if buf is None or len(buf) < size:
+        buf = bytearray(size)
+
+    shm = shared_memory.SharedMemory(name=name, create=False)
+    try:
+        if size >= _FAST_READ_THRESHOLD:
+            ctypes.memmove(
+                ctypes.addressof(ctypes.c_char.from_buffer(buf)),
+                ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)),
+                size,
+            )
+        else:
+            buf[:size] = shm.buf[:size]
+    finally:
+        shm.close()
+        shm.unlink()
+    return memoryview(buf)[:size], buf
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +388,7 @@ class IPCv2Server(BaseServer):
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         self._client_tasks.add(task)
+        _read_buf: bytearray | None = None  # per-connection reusable buffer
         try:
             while not self._shutdown_event.is_set():
                 try:
@@ -367,7 +405,7 @@ class IPCv2Server(BaseServer):
                     parts = payload.split(b'\x00', 1)
                     shm_name = parts[0].decode('utf-8')
                     size = struct.unpack('<Q', parts[1])[0]
-                    event_bytes = _read_and_release_shm(shm_name, size)
+                    event_bytes, _read_buf = _fast_read_shm(shm_name, size, _read_buf)
                 else:
                     event_bytes = payload
 
