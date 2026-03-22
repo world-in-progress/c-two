@@ -23,6 +23,7 @@ reference headers and the majority of target platforms.
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterable
 from ..event.msg_type import MsgType
 from ..event.envelope import Envelope
 
@@ -33,6 +34,13 @@ SIGNAL_SIZE = 1          # 1B type only
 
 MAX_METHOD_NAME_LEN = 255
 
+# Pre-encoded signal bytes (1 byte each)
+PING_BYTES = bytes([MsgType.PING])
+PONG_BYTES = bytes([MsgType.PONG])
+SHUTDOWN_CLIENT_BYTES = bytes([MsgType.SHUTDOWN_CLIENT])
+SHUTDOWN_SERVER_BYTES = bytes([MsgType.SHUTDOWN_SERVER])
+SHUTDOWN_ACK_BYTES = bytes([MsgType.SHUTDOWN_ACK])
+
 _SIGNAL_TYPES = frozenset({
     MsgType.PING,
     MsgType.PONG,
@@ -41,13 +49,6 @@ _SIGNAL_TYPES = frozenset({
     MsgType.SHUTDOWN_ACK,
 })
 
-# Pre-encoded signal bytes (1 byte each)
-PING_BYTES = bytes([MsgType.PING])
-PONG_BYTES = bytes([MsgType.PONG])
-SHUTDOWN_CLIENT_BYTES = bytes([MsgType.SHUTDOWN_CLIENT])
-SHUTDOWN_SERVER_BYTES = bytes([MsgType.SHUTDOWN_SERVER])
-SHUTDOWN_ACK_BYTES = bytes([MsgType.SHUTDOWN_ACK])
-
 _SIGNAL_BYTES_MAP = {
     MsgType.PING: PING_BYTES,
     MsgType.PONG: PONG_BYTES,
@@ -55,6 +56,39 @@ _SIGNAL_BYTES_MAP = {
     MsgType.SHUTDOWN_SERVER: SHUTDOWN_SERVER_BYTES,
     MsgType.SHUTDOWN_ACK: SHUTDOWN_ACK_BYTES,
 }
+
+# ---------------------------------------------------------------------------
+# Method-name pre-encoding cache
+# ---------------------------------------------------------------------------
+# Encode side: method_name str → pre-built call header bytes
+#   header = [1B CRM_CALL][2B method_len LE][method_name UTF-8]
+# Note: CRM_REPLY has no equivalent cache because its header contains
+# error_len which varies per response — there is no fixed string to
+# pre-encode (unlike the method name in CRM_CALL).
+_call_header_cache: dict[str, bytes] = {}
+
+
+def preregister_method(method_name: str) -> None:
+    """Pre-encode a method name for fast wire encoding.
+
+    Call at ICRM registration time to avoid repeated UTF-8 encoding
+    and struct packing on every RPC call.
+    """
+    if method_name in _call_header_cache:
+        return
+    method_bytes = method_name.encode('utf-8')
+    method_len = len(method_bytes)
+    header = bytearray(CALL_HEADER_FIXED + method_len)
+    header[0] = MsgType.CRM_CALL
+    struct.pack_into('<H', header, 1, method_len)
+    header[3:] = method_bytes
+    _call_header_cache[method_name] = bytes(header)
+
+
+def preregister_methods(method_names: Iterable[str]) -> None:
+    """Pre-encode multiple method names. Convenience wrapper."""
+    for name in method_names:
+        preregister_method(name)
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +113,16 @@ def encode_signal(msg_type: MsgType) -> bytes:
 
 def encode_call(method_name: str, payload: bytes | memoryview | None = None) -> bytearray:
     """Encode a CRM_CALL into a single contiguous bytearray."""
+    cached_header = _call_header_cache.get(method_name)
+    if cached_header is not None:
+        header_len = len(cached_header)
+        payload_len = len(payload) if payload else 0
+        buf = bytearray(header_len + payload_len)
+        buf[:header_len] = cached_header
+        if payload_len > 0:
+            buf[header_len:] = payload
+        return buf
+
     method_bytes = method_name.encode('utf-8')
     method_len = len(method_bytes)
     payload_len = len(payload) if payload else 0
@@ -124,6 +168,15 @@ def write_call_into(buf, offset: int,
 
     Returns the total number of bytes written.
     """
+    cached_header = _call_header_cache.get(method_name)
+    if cached_header is not None:
+        header_len = len(cached_header)
+        payload_len = len(payload) if payload else 0
+        buf[offset:offset + header_len] = cached_header
+        if payload_len > 0:
+            buf[offset + header_len:offset + header_len + payload_len] = payload
+        return header_len + payload_len
+
     method_bytes = method_name.encode('utf-8')
     method_len = len(method_bytes)
     payload_len = len(payload) if payload else 0
