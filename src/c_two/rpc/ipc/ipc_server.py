@@ -18,6 +18,7 @@ import asyncio
 import ctypes
 import logging
 import os
+import re
 import struct
 import tempfile
 import hashlib
@@ -43,6 +44,9 @@ _FAST_READ_THRESHOLD = 1_048_576            # 1 MB — use native memcpy above t
 SHM_GC_INTERVAL = 30.0                      # seconds
 SHM_MAX_AGE = 120.0                         # seconds before GC considers a segment leaked
 
+# B1: SHM name format — cc + direction char + _ + 16 hex chars (from _shm_name())
+_SHM_NAME_RE = re.compile(r'^cc[a-z]_[0-9a-f]{16}$')
+
 DEFAULT_SHM_THRESHOLD = 1_048_576           # 1 MB — aligned with inline threshold
 DEFAULT_MAX_FRAME_SIZE = 16_777_216         # 16 MB — inline frame upper bound
 DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_296    # 4 GB — SHM payload upper bound
@@ -65,38 +69,34 @@ def _shm_name(region_id: str, request_id: str, direction: str) -> str:
     return f'cc{d}_{h}'
 
 
-def _encode_frame(request_id: str, flags: int, payload: bytes) -> bytes:
+def _encode_frame(request_id: str, flags: int, payload: bytes | bytearray | memoryview) -> bytes:
     rid = request_id.encode('utf-8')
     rid_len = len(rid)
-    total_len = 4 + rid_len + 4 + len(payload)
-    return (
-        struct.pack('<I', total_len)
-        + struct.pack('<I', rid_len)
-        + rid
-        + struct.pack('<I', flags)
-        + payload
-    )
+    payload_len = len(payload)
+    total_len = 4 + rid_len + 4 + payload_len
+    buf = bytearray(4 + total_len)
+    struct.pack_into('<I', buf, 0, total_len)
+    struct.pack_into('<I', buf, 4, rid_len)
+    buf[8:8 + rid_len] = rid
+    struct.pack_into('<I', buf, 8 + rid_len, flags)
+    buf[12 + rid_len:12 + rid_len + payload_len] = payload
+    return bytes(buf)
 
 
-def _decode_frame(data: bytes) -> tuple[str, int, bytes]:
-    offset = 0
-    total_len = struct.unpack_from('<I', data, offset)[0]
-    offset += 4
-    rid_len = struct.unpack_from('<I', data, offset)[0]
-    offset += 4
-
-    # Validate rid_len doesn't overflow the frame
-    payload_len = total_len - 4 - rid_len - 4
-    if rid_len > total_len - 8 or payload_len < 0:
+def _decode_frame(body: bytes) -> tuple[str, int, bytes]:
+    body_len = len(body)
+    rid_len = struct.unpack_from('<I', body, 0)[0]
+    payload_len = body_len - 4 - rid_len - 4
+    if rid_len > body_len - 8 or payload_len < 0:
         raise error.EventDeserializeError(
-            f'Malformed frame: rid_len={rid_len} exceeds available space (total_len={total_len})'
+            f'Malformed frame: rid_len={rid_len} exceeds available space (total_len={body_len})'
         )
-
-    request_id = data[offset:offset + rid_len].decode('utf-8')
+    offset = 4
+    request_id = body[offset:offset + rid_len].decode('utf-8')
     offset += rid_len
-    flags = struct.unpack_from('<I', data, offset)[0]
+    flags = struct.unpack_from('<I', body, offset)[0]
     offset += 4
-    payload = data[offset:offset + payload_len]
+    payload = body[offset:offset + payload_len]
     return request_id, flags, payload
 
 
@@ -143,7 +143,7 @@ def _fast_read_shm(
     return memoryview(buf)[:size], adaptive_buf
 
 
-async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> bytes | None:
+async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> bytes:
     header = await reader.readexactly(4)
     total_len = struct.unpack('<I', header)[0]
 
@@ -157,8 +157,7 @@ async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAUL
             f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
         )
 
-    body = await reader.readexactly(total_len)
-    return header + body
+    return await reader.readexactly(total_len)
 
 
 async def _write_frame(writer: asyncio.StreamWriter, frame: bytes) -> None:
@@ -244,11 +243,9 @@ class IPCv2Server(BaseServer):
             result_bytes = event.data_parts[1] if len(event.data_parts) > 1 else b''
         else:
             data = event.data if event.data is not None else b''
-            if isinstance(data, memoryview):
-                data = bytes(data)
             parts = parse_message(data)
-            err_bytes = bytes(parts[0]) if len(parts) > 0 else b''
-            result_bytes = bytes(parts[1]) if len(parts) > 1 else b''
+            err_bytes = parts[0] if len(parts) > 0 else b''
+            result_bytes = parts[1] if len(parts) > 1 else b''
 
         err_len = len(err_bytes)
         result_len = len(result_bytes)
@@ -397,6 +394,8 @@ class IPCv2Server(BaseServer):
                     if len(parts) != 2 or len(parts[1]) < 8:
                         raise error.EventDeserializeError('Malformed SHM reference in request frame')
                     shm_name = parts[0].decode('utf-8')
+                    if not _SHM_NAME_RE.match(shm_name):
+                        raise error.EventDeserializeError(f'Invalid SHM name format: {shm_name!r}')
                     size = struct.unpack('<Q', parts[1])[0]
                     # S4: validate SHM payload size against config limit
                     if size > self._config.max_payload_size:
@@ -421,6 +420,16 @@ class IPCv2Server(BaseServer):
                             error.CCError.serialize(
                                 error.CRMServerError('Server overloaded: max pending requests exceeded')
                             ),
+                            b'',
+                        )
+                        err_frame = _encode_frame(request_id, _FLAG_RESPONSE, err_payload)
+                        await _write_frame(writer, err_frame)
+                        continue
+
+                    if request_id in self._pending:
+                        logger.warning(f'IPCv2Server: duplicate request_id={request_id}, rejecting')
+                        err_payload = encode_reply(
+                            error.CCError.serialize(error.CRMServerError('Duplicate request ID')),
                             b'',
                         )
                         err_frame = _encode_frame(request_id, _FLAG_RESPONSE, err_payload)

@@ -539,14 +539,9 @@ def _process_event_and_continue(state: ServerState, event: Event | DirectCallEve
 
 def _serve(state: ServerState):
     while True:
-        event = state.event_queue.poll(timeout=0.1)
-
-        # DirectCallEvent and Envelope have no completion_type
-        is_timeout = isinstance(event, Event) and event.completion_type == CompletionType.OP_TIMEOUT
-        if not is_timeout:
-            if not _process_event_and_continue(state, event):
-                return
-
+        event = state.event_queue.get()
+        if not _process_event_and_continue(state, event):
+            return
         event = None
 
 

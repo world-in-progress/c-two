@@ -21,6 +21,7 @@ from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
 from ..util.wire import encode_call, decode, call_wire_size, PING_BYTES, SHUTDOWN_CLIENT_BYTES
 from .ipc_server import (
+    DEFAULT_MAX_FRAME_SIZE,
     IPCConfig,
     _FLAG_SHM,
     _decode_frame,
@@ -60,7 +61,7 @@ def _send_frame_sync(sock: _socket.socket, frame: bytes) -> None:
     sock.sendall(frame)
 
 
-def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = 0) -> bytes:
+def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> bytes:
     header = _recv_exact(sock, 4)
     total_len = struct.unpack('<I', header)[0]
 
@@ -69,13 +70,12 @@ def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = 0) -> bytes:
         raise error.EventDeserializeError(
             f'Frame too small: total_len={total_len} (minimum 8)'
         )
-    if max_frame_size > 0 and total_len > max_frame_size:
+    if total_len > max_frame_size:
         raise error.EventDeserializeError(
             f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
         )
 
-    body = _recv_exact(sock, total_len)
-    return header + body
+    return _recv_exact(sock, total_len)
 
 
 class IPCv2Client(BaseClient):

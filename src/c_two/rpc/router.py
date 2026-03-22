@@ -164,7 +164,7 @@ class Router:
                 response_bytes = await loop.run_in_executor(
                     self._relay_pool, self._relay, worker.address, body,
                 )
-                return Response(content=response_bytes, media_type='application/octet-stream')
+                return Response(content=bytes(response_bytes), media_type='application/octet-stream')
             except Exception as exc:
                 logger.error('Router relay error for namespace=%s: %s', namespace, exc)
                 return Response(content=str(exc).encode(), status_code=502)

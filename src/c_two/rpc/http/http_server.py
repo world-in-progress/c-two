@@ -87,7 +87,7 @@ class HttpServer(BaseServer):
                     
                     try:
                         response_data = await future
-                        return Response(response_data, media_type='application/octet-stream')
+                        return Response(bytes(response_data), media_type='application/octet-stream')
                     except asyncio.CancelledError:
                         return Response(b'Request cancelled', status_code=499)
                     finally:

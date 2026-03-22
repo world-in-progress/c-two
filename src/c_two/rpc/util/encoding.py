@@ -30,7 +30,7 @@ def parse_message(full_message: bytes) -> list[memoryview]:
     return messages
 
 
-def event_to_wire_bytes(event) -> bytes:
+def event_to_wire_bytes(event) -> bytes | bytearray:
     """Convert a legacy Event reply to compact wire format bytes.
 
     Bridge function for the transitional period while the scheduler still

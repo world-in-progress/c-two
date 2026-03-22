@@ -31,6 +31,8 @@ CALL_HEADER_FIXED = 3    # 1B type + 2B method_len
 REPLY_HEADER_FIXED = 5   # 1B type + 4B error_len
 SIGNAL_SIZE = 1          # 1B type only
 
+MAX_METHOD_NAME_LEN = 255
+
 _SIGNAL_TYPES = frozenset({
     MsgType.PING,
     MsgType.PONG,
@@ -75,8 +77,8 @@ def encode_signal(msg_type: MsgType) -> bytes:
     return _SIGNAL_BYTES_MAP[msg_type]
 
 
-def encode_call(method_name: str, payload: bytes | memoryview | None = None) -> bytes:
-    """Encode a CRM_CALL into a single contiguous bytes object."""
+def encode_call(method_name: str, payload: bytes | memoryview | None = None) -> bytearray:
+    """Encode a CRM_CALL into a single contiguous bytearray."""
     method_bytes = method_name.encode('utf-8')
     method_len = len(method_bytes)
     payload_len = len(payload) if payload else 0
@@ -88,12 +90,12 @@ def encode_call(method_name: str, payload: bytes | memoryview | None = None) -> 
     buf[3:3 + method_len] = method_bytes
     if payload_len > 0:
         buf[3 + method_len:] = payload
-    return bytes(buf)
+    return buf
 
 
 def encode_reply(error_data: bytes | memoryview | None = None,
-                 result_data: bytes | memoryview | None = None) -> bytes:
-    """Encode a CRM_REPLY into a single contiguous bytes object."""
+                 result_data: bytes | memoryview | None = None) -> bytearray:
+    """Encode a CRM_REPLY into a single contiguous bytearray."""
     error_len = len(error_data) if error_data else 0
     result_len = len(result_data) if result_data else 0
     total = REPLY_HEADER_FIXED + error_len + result_len
@@ -105,7 +107,7 @@ def encode_reply(error_data: bytes | memoryview | None = None,
         buf[5:5 + error_len] = error_data
     if result_len > 0:
         buf[5 + error_len:] = result_data
-    return bytes(buf)
+    return buf
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +198,8 @@ def decode(buf: bytes | memoryview, total_size: int | None = None) -> Envelope:
         if total_size < CALL_HEADER_FIXED:
             raise ValueError(f'CRM_CALL too short ({total_size} < {CALL_HEADER_FIXED})')
         method_len = struct.unpack_from('<H', buf, 1)[0]
+        if method_len > MAX_METHOD_NAME_LEN:
+            raise ValueError(f'method_name too long: {method_len} > {MAX_METHOD_NAME_LEN}')
         header_end = CALL_HEADER_FIXED + method_len
         if total_size < header_end:
             raise ValueError(

@@ -46,47 +46,40 @@ class TestDecodeFrameValidation:
     """S1: _decode_frame must reject frames where rid_len overflows available space."""
 
     def test_rid_len_overflow(self):
-        """rid_len exceeds total_len - 8 → EventDeserializeError."""
-        total_len = 20
-        rid_len = 100  # way larger than total_len - 8 = 12
-        data = struct.pack('<I', total_len) + struct.pack('<I', rid_len) + b'\x00' * 100
+        """rid_len exceeds body_len - 8 → EventDeserializeError."""
+        rid_len = 100  # way larger than body_len - 8
+        body = struct.pack('<I', rid_len) + b'\x00' * 16  # body_len=20, 20-8=12 < 100
         with pytest.raises(error.EventDeserializeError, match='rid_len.*exceeds'):
-            _decode_frame(data)
+            _decode_frame(body)
 
-    def test_rid_len_equals_total_minus_8(self):
-        """rid_len == total_len - 8 → payload_len == 0, no flags space → should reject."""
-        # total_len = 4 (rid_len_field) + rid_len + 4 (flags) + payload_len
-        # If rid_len = total_len - 8 = total_len - 4(rid_field) - 4(flags),
-        # then payload_len = total_len - 4 - rid_len - 4 = 0 → valid edge case
+    def test_rid_len_equals_body_len_minus_8(self):
+        """rid_len == body_len - 8 → payload_len == 0 → valid edge case."""
         rid = b'abc'
         flags = 0
         payload = b''
-        total_len = 4 + len(rid) + 4 + len(payload)  # = 11
-        data = (
-            struct.pack('<I', total_len)
-            + struct.pack('<I', len(rid))
+        body = (
+            struct.pack('<I', len(rid))
             + rid
             + struct.pack('<I', flags)
             + payload
         )
-        # This should succeed — rid_len = 3, total_len - 8 = 3, payload_len = 0
-        request_id, f, p = _decode_frame(data)
+        # body_len = 11, rid_len = 3, body_len - 8 = 3, payload_len = 0
+        request_id, f, p = _decode_frame(body)
         assert request_id == 'abc'
         assert f == 0
         assert p == b''
 
     def test_rid_len_exceeds_by_one(self):
-        """rid_len = total_len - 7 → payload_len = -1 → reject."""
-        total_len = 11
-        rid_len = 4  # total_len - 8 = 3, but rid_len = 4
-        data = struct.pack('<I', total_len) + struct.pack('<I', rid_len) + b'\x00' * 20
+        """rid_len = body_len - 7 → payload_len = -1 → reject."""
+        rid_len = 4  # body_len - 8 = 3, but rid_len = 4
+        body = struct.pack('<I', rid_len) + b'\x00' * 7  # body_len = 11
         with pytest.raises(error.EventDeserializeError):
-            _decode_frame(data)
+            _decode_frame(body)
 
     def test_valid_roundtrip(self):
-        """Normal frame encode → decode should still work."""
+        """Normal frame encode → decode should still work (strip 4B header)."""
         frame = _encode_frame('req-001', 0, b'hello world')
-        rid, flags, payload = _decode_frame(frame)
+        rid, flags, payload = _decode_frame(frame[4:])
         assert rid == 'req-001'
         assert flags == 0
         assert payload == b'hello world'
@@ -190,13 +183,13 @@ class TestRecvFrameSyncBounds:
             client.close()
             server.close()
 
-    def test_no_limit_when_zero(self):
-        """max_frame_size=0 disables the upper bound check."""
+    def test_default_limit_accepts_small_frame(self):
+        """Default max_frame_size (from server) accepts normal-sized frames."""
         client, server = self._make_socket_pair()
         try:
             frame = _encode_frame('r1', 0, b'x' * 100)
             server.sendall(frame)
-            raw = _recv_frame_sync(client, max_frame_size=0)
+            raw = _recv_frame_sync(client)
             rid, _, payload = _decode_frame(raw)
             assert rid == 'r1'
         finally:
@@ -438,7 +431,7 @@ class TestSHMReferenceFormat:
         from c_two.rpc.ipc.ipc_server import _FLAG_SHM
         bad_payload = b'no_null_here'
         frame = _encode_frame('r1', _FLAG_SHM, bad_payload)
-        _, flags, payload = _decode_frame(frame)
+        _, flags, payload = _decode_frame(frame[4:])
         # Simulate server-side parsing
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 1  # confirms bug vector
@@ -452,7 +445,7 @@ class TestSHMReferenceFormat:
         from c_two.rpc.ipc.ipc_server import _FLAG_SHM
         bad_payload = b'shm_name\x00\x01\x02'  # only 2 bytes after null
         frame = _encode_frame('r1', _FLAG_SHM, bad_payload)
-        _, flags, payload = _decode_frame(frame)
+        _, flags, payload = _decode_frame(frame[4:])
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 2
         assert len(parts[1]) < 8  # confirms bug vector
@@ -466,7 +459,7 @@ class TestSHMReferenceFormat:
         size_bytes = struct.pack('<Q', 12345)
         good_payload = b'shm_name\x00' + size_bytes
         frame = _encode_frame('r1', _FLAG_SHM, good_payload)
-        _, flags, payload = _decode_frame(frame)
+        _, flags, payload = _decode_frame(frame[4:])
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 2 and len(parts[1]) >= 8
         shm_name = parts[0].decode('utf-8')
