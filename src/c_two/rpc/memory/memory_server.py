@@ -11,7 +11,11 @@ from watchdog.events import FileSystemEventHandler
 
 from ..util.wait import wait
 from ..base import BaseServer
-from ..event import Event, EventTag, EventQueue
+from ..event import Event, EventQueue
+from ..event.envelope import Envelope
+from ..event.msg_type import MsgType
+from ..util.wire import decode
+from ..util.encoding import event_to_wire_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +97,7 @@ class MemoryServer(BaseServer):
         
         logger.debug(f'Created or Updated control file at {self.control_file}')
     
-    def _poll_memory_events(self) -> Event | None:
+    def _poll_memory_events(self) -> Envelope | None:
         event_dir = self.temp_dir
         event_pattern = f'cc_event_req_{self.region_id}_'
         
@@ -106,38 +110,30 @@ class MemoryServer(BaseServer):
                         stat = file_path.stat()
                         request_files.append((file_path, stat.st_mtime, filename))
                     except FileNotFoundError:
-                        # File was deleted while checking, skip it
                         continue
 
-            # If no request files, return None
             if not request_files:
                 return None
             
-            # Process the earliest file
-            request_files.sort(key=lambda x: x[1]) # sort by modification time
+            request_files.sort(key=lambda x: x[1])
             file_path, _, filename = request_files[0]
             
-            # Parse request information from the file name
             request_id = filename.replace(event_pattern, '').replace('.mem', '')
             
             try:
-                # Read event data from the file
                 with open(file_path, 'r+b') as f:
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                         data_bytes = mm.read()
-                        event = Event.deserialize(data_bytes)
-                        event.request_id = request_id
+                        envelope = decode(data_bytes)
+                        envelope.request_id = request_id
                 
-                # Clean up the file after processing
                 file_path.unlink(missing_ok=True)
-                return event
+                return envelope
             
             except FileNotFoundError:
-                # File was deleted while reading, return None
                 return None
             
             except Exception as e:
-                # Delete the corrupted file, return None
                 file_path.unlink(missing_ok=True)
                 return None
             
@@ -161,20 +157,17 @@ class MemoryServer(BaseServer):
                 # Check if server is closed unexpectedly
                 if not self.temp_dir.exists():
                     logger.error(f'Temporary directory {self.temp_dir} does not exist. Shutting down server.')
-                    self._shutdown_event.set()
-                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
+                    self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
                     break
                 
-                # Check if the shutdown event is set
                 if self._shutdown_event.is_set():
-                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
+                    self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
                     break
                 
-                # Try to poll for memory events
-                event = self._poll_memory_events()
-                if event:
-                    self.event_queue.put(event)
-                    if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
+                envelope = self._poll_memory_events()
+                if envelope:
+                    self.event_queue.put(envelope)
+                    if envelope.msg_type == MsgType.SHUTDOWN_CLIENT:
                         break
                 else:
                     # Wait for new event file creation notification
@@ -202,37 +195,30 @@ class MemoryServer(BaseServer):
         # Create the control file
         self._create_control_file()
         
-    def _create_response_file(self, event: Event):
+    def _create_response_file(self, request_id: str, wire_bytes: bytes):
         event_dir = self.temp_dir
         
-        # Create the response paths
-        temp_filename = f'cc_event_resp_{self.region_id}_{event.request_id}.temp'
-        final_filename = f'cc_event_resp_{self.region_id}_{event.request_id}.mem'
+        temp_filename = f'cc_event_resp_{self.region_id}_{request_id}.temp'
+        final_filename = f'cc_event_resp_{self.region_id}_{request_id}.mem'
         temp_path = event_dir / temp_filename
         final_path = event_dir / final_filename
         
-        # Ensure response file does not exist
         temp_path.unlink(missing_ok=True)
         final_path.unlink(missing_ok=True)
 
-        # Serialize the event to bytes and write to the response file
-        data_bytes = event.serialize()
-        data_length = len(data_bytes)
+        data_length = len(wire_bytes)
         
-        # Write to a temporary file
         with open(temp_path, 'w+b') as f:
             f.truncate(data_length)
-            
-            # Memory map and write data
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
-                mm[:data_length] = data_bytes
+                mm[:data_length] = wire_bytes
                 mm.flush()
 
-        # Rename the response file to a permanent name
         temp_path.rename(final_path)
 
     def reply(self, event: Event):
-        self._create_response_file(event)
+        wire_bytes = event_to_wire_bytes(event)
+        self._create_response_file(event.request_id, wire_bytes)
     
     def shutdown(self):
         self._create_control_file(MemoryServerState.STOPPED)

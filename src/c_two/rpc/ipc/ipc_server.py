@@ -29,7 +29,10 @@ from multiprocessing import shared_memory
 from ... import error
 from ..base import BaseServer
 from ..event import Event, EventQueue, EventTag
+from ..event.envelope import Envelope
+from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
+from ..util.wire import encode_reply, encode_signal, decode, write_reply_into, reply_wire_size
 
 logger = logging.getLogger(__name__)
 
@@ -140,67 +143,6 @@ def _fast_read_shm(
     return memoryview(buf)[:size], adaptive_buf
 
 
-def _scatter_write_event_to_shm(
-    name: str,
-    tag: 'EventTag',
-    data: bytes | memoryview,
-) -> tuple[shared_memory.SharedMemory, int]:
-    """Write Event(tag, data) directly to SHM without intermediate serialization.
-
-    Produces the same binary layout as serializing ``Event(tag, data=data)``
-    into SHM but with only ONE copy of *data* into the SHM buffer.
-    """
-    tag_bytes = tag.value.encode('utf-8')
-    tag_len = len(tag_bytes)
-    data_len = len(data)
-    total = 8 + tag_len + 8 + data_len
-
-    shm = shared_memory.SharedMemory(name=name, create=True, size=total)
-    buf = shm.buf
-    offset = 0
-
-    struct.pack_into('>Q', buf, offset, tag_len);  offset += 8
-    buf[offset:offset + tag_len] = tag_bytes;       offset += tag_len
-    struct.pack_into('>Q', buf, offset, data_len);  offset += 8
-    if data_len > 0:
-        buf[offset:offset + data_len] = data
-    return shm, total
-
-
-def _scatter_write_event_multi_to_shm(
-    name: str,
-    tag: 'EventTag',
-    messages: list[bytes | memoryview],
-) -> tuple[shared_memory.SharedMemory, int]:
-    """Scatter-write an Event whose data is ``concat(add_length_prefix(m) for m in messages)``.
-
-    Equivalent to building the combined prefixed messages then writing to SHM,
-    but avoids **all** intermediate allocations — only one copy of each message
-    into the SHM buffer.
-    """
-    tag_bytes = tag.value.encode('utf-8')
-    tag_len = len(tag_bytes)
-    data_size = sum(8 + len(m) for m in messages)
-    total = 8 + tag_len + 8 + data_size
-
-    shm = shared_memory.SharedMemory(name=name, create=True, size=total)
-    buf = shm.buf
-    offset = 0
-
-    struct.pack_into('>Q', buf, offset, tag_len);   offset += 8
-    buf[offset:offset + tag_len] = tag_bytes;        offset += tag_len
-    struct.pack_into('>Q', buf, offset, data_size);  offset += 8
-
-    for msg in messages:
-        msg_len = len(msg)
-        struct.pack_into('>Q', buf, offset, msg_len); offset += 8
-        if msg_len > 0:
-            buf[offset:offset + msg_len] = msg
-            offset += msg_len
-
-    return shm, total
-
-
 async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> bytes | None:
     header = await reader.readexactly(4)
     total_len = struct.unpack('<I', header)[0]
@@ -269,6 +211,11 @@ class IPCv2Server(BaseServer):
         if not self._started.is_set():
             raise RuntimeError('IPCv2Server failed to start within 5 seconds.')
 
+    _event_tag_to_signal = {
+        EventTag.PONG: MsgType.PONG,
+        EventTag.SHUTDOWN_ACK: MsgType.SHUTDOWN_ACK,
+    }
+
     def reply(self, event: Event) -> None:
         if not event.request_id:
             logger.warning('IPCv2Server.reply: event missing request_id')
@@ -278,33 +225,48 @@ class IPCv2Server(BaseServer):
         flags = _FLAG_RESPONSE
         shm_name: str | None = None
 
-        # Phase 4B: scatter-write response parts directly (avoid concat)
+        # Signal replies (PONG, SHUTDOWN_ACK) → 1-byte wire signal
+        signal_type = self._event_tag_to_signal.get(event.tag)
+        if signal_type is not None:
+            payload = encode_signal(signal_type)
+            frame = _encode_frame(request_id, flags, payload)
+            with self._pending_lock:
+                fut = self._pending.pop(request_id, None)
+            if fut is not None and self._loop is not None:
+                self._loop.call_soon_threadsafe(fut.set_result, (frame, None))
+            return
+
+        # CRM_REPLY: extract error and result from scheduler Event
+        from ..util.encoding import parse_message
         has_parts = event.data_parts is not None and event.data is None
         if has_parts:
-            estimated_size = sum(8 + len(p) for p in event.data_parts) + 30
+            err_bytes = event.data_parts[0] if event.data_parts[0] else b''
+            result_bytes = event.data_parts[1] if len(event.data_parts) > 1 else b''
         else:
             data = event.data if event.data is not None else b''
-            estimated_size = len(data) + 30
+            if isinstance(data, memoryview):
+                data = bytes(data)
+            parts = parse_message(data)
+            err_bytes = bytes(parts[0]) if len(parts) > 0 else b''
+            result_bytes = bytes(parts[1]) if len(parts) > 1 else b''
 
-        if estimated_size >= self._config.shm_threshold:
+        err_len = len(err_bytes)
+        result_len = len(result_bytes)
+        total_wire = reply_wire_size(err_len, result_len)
+
+        if total_wire >= self._config.shm_threshold:
             shm_name = _shm_name(self.region_id, request_id, 'resp')
-            if has_parts:
-                shm, written = _scatter_write_event_multi_to_shm(
-                    shm_name, event.tag, event.data_parts,
-                )
-            else:
-                shm, written = _scatter_write_event_to_shm(shm_name, event.tag, data)
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total_wire)
+            write_reply_into(shm.buf, 0, err_bytes, result_bytes)
             shm.close()
-            size_header = struct.pack('<Q', written)
-            payload = (shm_name.encode('utf-8') + b'\x00' + size_header)
+            size_header = struct.pack('<Q', total_wire)
+            payload = shm_name.encode('utf-8') + b'\x00' + size_header
             flags |= _FLAG_SHM
         else:
-            payload = event.serialize()
+            payload = encode_reply(err_bytes, result_bytes)
 
         frame = _encode_frame(request_id, flags, payload)
 
-        # S6: pass (frame, shm_name) via future — GC timestamp registered
-        # by _handle_client after _write_frame succeeds
         with self._pending_lock:
             fut = self._pending.pop(request_id, None)
 
@@ -395,7 +357,7 @@ class IPCv2Server(BaseServer):
 
         # Notify the _serve loop that the server has shut down
         if self.event_queue is not None:
-            self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
+            self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -445,8 +407,8 @@ class IPCv2Server(BaseServer):
                 else:
                     event_bytes = payload
 
-                event = Event.deserialize(event_bytes)
-                event.request_id = request_id
+                envelope = decode(event_bytes)
+                envelope.request_id = request_id
 
                 # S3: enforce max pending requests
                 with self._pending_lock:
@@ -455,11 +417,13 @@ class IPCv2Server(BaseServer):
                             f'IPCv2Server: max pending requests ({self._config.max_pending_requests}) reached, '
                             f'rejecting request_id={request_id}'
                         )
-                        err_event = Event(tag=EventTag.CRM_REPLY, request_id=request_id)
-                        err_event.data = error.CCError.serialize(
-                            error.CRMServerError('Server overloaded: max pending requests exceeded')
+                        err_payload = encode_reply(
+                            error.CCError.serialize(
+                                error.CRMServerError('Server overloaded: max pending requests exceeded')
+                            ),
+                            b'',
                         )
-                        err_frame = _encode_frame(request_id, _FLAG_RESPONSE, err_event.serialize())
+                        err_frame = _encode_frame(request_id, _FLAG_RESPONSE, err_payload)
                         await _write_frame(writer, err_frame)
                         continue
 
@@ -469,7 +433,7 @@ class IPCv2Server(BaseServer):
                     conn_request_ids.add(request_id)
 
                 # Push into the event queue for the server's _serve loop
-                self.event_queue.put(event)
+                self.event_queue.put(envelope)
 
                 # Wait for reply() to provide the response frame and optional SHM name
                 try:

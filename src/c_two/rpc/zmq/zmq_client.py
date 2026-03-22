@@ -2,8 +2,11 @@ import zmq
 
 from ... import error
 from ..base import BaseClient
-from ..event import Event, EventTag
-from ..util.encoding import add_length_prefix, parse_message
+from ..event.msg_type import MsgType
+from ..util.wire import (
+    encode_call, decode,
+    PING_BYTES, SHUTDOWN_CLIENT_BYTES,
+)
 
 class ZmqClient(BaseClient):
     def __init__(self, server_address: str):
@@ -17,36 +20,24 @@ class ZmqClient(BaseClient):
 
     def _send_request(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a request to the CRM service and get the response synchronously."""
-        # Serialize
         try:
-            serialized_method_name = method_name.encode('utf-8')
-            serialized_data = b'' if data is None else data
-            combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
-            event = Event(tag=EventTag.CRM_CALL, data=combined_request)
+            wire_bytes = encode_call(method_name, data)
         except Exception as e:
             raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}') from e
         
-        # Send request event
-        self.socket.send(event.serialize())
-        
-        # Wait for response
+        self.socket.send(wire_bytes)
         full_response = self.socket.recv()
         
-        # Deserialize Event
-        event = Event.deserialize(full_response)
-        if event.tag != EventTag.CRM_REPLY:
-            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
+        env = decode(full_response)
+        if env.msg_type != MsgType.CRM_REPLY:
+            raise error.CompoClientError(f'Unexpected response type: {env.msg_type}')
         
-        # Deserialize error
-        sub_responses = parse_message(event.data)
-        if len(sub_responses) != 2:
-            raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
-
-        err = error.CCError.deserialize(sub_responses[0])
-        if err:
-            raise err
+        if env.error:
+            err = error.CCError.deserialize(env.error)
+            if err:
+                raise err
         
-        return sub_responses[1]
+        return env.payload if env.payload is not None else b''
     
     def terminate(self):
         self.socket.close()
@@ -60,12 +51,8 @@ class ZmqClient(BaseClient):
             raise e
 
     def relay(self, event_bytes: bytes) -> bytes:
-        # Send and get response
         self.socket.send(event_bytes)
-        
-        # Wait for response
         full_response = self.socket.recv()
-        
         return full_response
 
     @staticmethod
@@ -78,12 +65,9 @@ class ZmqClient(BaseClient):
         socket.connect(server_address)
         
         try:
-            socket.send(Event(tag=EventTag.PING).serialize())
-            
+            socket.send(PING_BYTES)
             response = socket.recv()
-            if Event.deserialize(response).tag == EventTag.PONG:
-                return True
-            return False
+            return decode(response).msg_type == MsgType.PONG
         except zmq.ZMQError:
             return False
         finally:
@@ -100,10 +84,9 @@ class ZmqClient(BaseClient):
         socket.connect(server_address)
         
         try:
-            socket.send(Event(tag=EventTag.SHUTDOWN_FROM_CLIENT).serialize())
+            socket.send(SHUTDOWN_CLIENT_BYTES)
             response = socket.recv()
-            if Event.deserialize(response).tag == EventTag.SHUTDOWN_ACK:
-                return True
+            return decode(response).msg_type == MsgType.SHUTDOWN_ACK
         except zmq.ZMQError:
             return False
         finally:

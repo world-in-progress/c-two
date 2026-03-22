@@ -20,6 +20,8 @@ import pytest
 
 from c_two import error
 from c_two.rpc.event import Event, EventQueue, EventTag
+from c_two.rpc.event.envelope import Envelope
+from c_two.rpc.event.msg_type import MsgType
 from c_two.rpc.ipc.ipc_server import (
     DEFAULT_MAX_FRAME_SIZE,
     DEFAULT_MAX_PAYLOAD_SIZE,
@@ -33,6 +35,7 @@ from c_two.rpc.ipc.ipc_server import (
     _read_frame,
 )
 from c_two.rpc.ipc.ipc_client import _recv_frame_sync
+from c_two.rpc.util.wire import encode_call
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +286,11 @@ class TestPendingCleanup:
             sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
             sock.connect(socket_path)
 
-            # Send a valid request frame
+            # Send a valid request frame (wire format: CRM_CALL)
             import uuid
             request_id = str(uuid.uuid4())
-            event = Event(tag=EventTag.CRM_CALL, data=b'\x00\x00\x00\x00\x00\x00\x00\x03foo\x00\x00\x00\x00\x00\x00\x00\x00', request_id=request_id)
-            frame = _encode_frame(request_id, 0, event.serialize())
+            call_bytes = encode_call('foo', b'')
+            frame = _encode_frame(request_id, 0, call_bytes)
             sock.sendall(frame)
 
             # Wait for the event to arrive in the queue
@@ -345,7 +348,7 @@ class TestSHMGCTimestampAfterSend:
 
             # Call reply with large data → triggers SHM path
             event = Event(tag=EventTag.CRM_REPLY, request_id=request_id)
-            event.data = b'\x00' * (2 * 1024 * 1024)  # 2 MB → SHM
+            event.data_parts = [b'', b'\x00' * (2 * 1024 * 1024)]  # empty error, 2 MB result → SHM
             server.reply(event)
 
             time.sleep(0.2)
