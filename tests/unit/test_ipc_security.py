@@ -86,8 +86,8 @@ class TestReadFrameBounds:
         """total_len < 12 → EventDeserializeError."""
         async def _run():
             reader = asyncio.StreamReader()
-            reader.feed_data(struct.pack('<I', 8))  # total_len = 8 < 12
-            reader.feed_data(b'\x00' * 8)
+            # Feed full 16B header: total_len=8 (too small), rid=0, flags=0
+            reader.feed_data(struct.pack('<IQI', 8, 0, 0))
             with pytest.raises(error.EventDeserializeError, match='too small'):
                 await _read_frame(reader, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
         asyncio.run(_run())
@@ -97,7 +97,8 @@ class TestReadFrameBounds:
         async def _run():
             max_size = 1024
             reader = asyncio.StreamReader()
-            reader.feed_data(struct.pack('<I', max_size + 1))
+            # Feed full 16B header: total_len > max_size, rid=0, flags=0
+            reader.feed_data(struct.pack('<IQI', max_size + 1, 0, 0))
             reader.feed_data(b'\x00' * (max_size + 1))
             with pytest.raises(error.EventDeserializeError, match='too large'):
                 await _read_frame(reader, max_frame_size=max_size)
@@ -109,8 +110,7 @@ class TestReadFrameBounds:
             frame = _encode_frame(1, 0, b'data')
             reader = asyncio.StreamReader()
             reader.feed_data(frame)
-            raw = await _read_frame(reader, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
-            rid, flags, payload = _decode_frame(raw)
+            rid, flags, payload = await _read_frame(reader, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
             assert rid == 1
             assert payload == b'data'
         asyncio.run(_run())
@@ -119,7 +119,8 @@ class TestReadFrameBounds:
         """total_len = 0 → too small."""
         async def _run():
             reader = asyncio.StreamReader()
-            reader.feed_data(struct.pack('<I', 0))
+            # Feed full 16B header with total_len=0
+            reader.feed_data(struct.pack('<IQI', 0, 0, 0))
             with pytest.raises(error.EventDeserializeError, match='too small'):
                 await _read_frame(reader, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
         asyncio.run(_run())
@@ -154,7 +155,8 @@ class TestRecvFrameSyncBounds:
         """total_len < 12 → EventDeserializeError."""
         client, server = self._make_socket_pair()
         try:
-            server.sendall(struct.pack('<I', 8) + b'\x00' * 8)
+            # Send full 16B header: total_len=8 (too small), rid=0, flags=0
+            server.sendall(struct.pack('<IQI', 8, 0, 0))
             with pytest.raises(error.EventDeserializeError, match='too small'):
                 _recv_frame_sync(client, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
         finally:
@@ -165,8 +167,8 @@ class TestRecvFrameSyncBounds:
         """total_len > max_frame_size → EventDeserializeError."""
         client, server = self._make_socket_pair()
         try:
-            server.sendall(struct.pack('<I', 2048))
-            # Don't need to send body — rejection happens before body read
+            # Send full 16B header: total_len=2048, rid=0, flags=0
+            server.sendall(struct.pack('<IQI', 2048, 0, 0))
             with pytest.raises(error.EventDeserializeError, match='too large'):
                 _recv_frame_sync(client, max_frame_size=1024)
         finally:
@@ -179,8 +181,7 @@ class TestRecvFrameSyncBounds:
         try:
             frame = _encode_frame(1, 0, b'x' * 100)
             server.sendall(frame)
-            raw = _recv_frame_sync(client)
-            rid, _, payload = _decode_frame(raw)
+            rid, _, payload = _recv_frame_sync(client)
             assert rid == 1
         finally:
             client.close()

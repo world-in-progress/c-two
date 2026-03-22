@@ -135,9 +135,10 @@ def _fast_read_shm(
     return memoryview(buf)[:size], adaptive_buf
 
 
-async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> bytes:
-    header = await reader.readexactly(4)
-    total_len = struct.unpack('<I', header)[0]
+async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
+    """Read a frame, returning (request_id, flags, payload) directly."""
+    header = await reader.readexactly(16)  # 4B total_len + 8B rid + 4B flags
+    total_len, request_id, flags = struct.unpack('<IQI', header)
 
     # S2: reject oversized or undersized frames before allocation
     if total_len < 12:
@@ -149,7 +150,9 @@ async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAUL
             f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
         )
 
-    return await reader.readexactly(total_len)
+    payload_len = total_len - 12
+    payload = await reader.readexactly(payload_len) if payload_len > 0 else b''
+    return request_id, flags, payload
 
 
 async def _write_frame(writer: asyncio.StreamWriter, frame: bytes) -> None:
@@ -380,11 +383,9 @@ class IPCv2Server(BaseServer):
                         pass
                     break
                 try:
-                    raw = read_task.result()
+                    request_id, flags, payload = read_task.result()
                 except (asyncio.IncompleteReadError, ConnectionResetError):
                     break
-
-                request_id, flags, payload = _decode_frame(raw)
                 str_rid = f'{conn_id}:{request_id}'
 
                 # Decode inline vs SHM request data

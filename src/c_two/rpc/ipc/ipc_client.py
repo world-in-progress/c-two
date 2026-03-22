@@ -23,7 +23,6 @@ from .ipc_server import (
     DEFAULT_MAX_FRAME_SIZE,
     IPCConfig,
     _FLAG_SHM,
-    _decode_frame,
     _encode_frame,
     _fast_read_shm,
     _shm_name,
@@ -60,9 +59,10 @@ def _send_frame_sync(sock: _socket.socket, frame: bytes) -> None:
     sock.sendall(frame)
 
 
-def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> bytes:
-    header = _recv_exact(sock, 4)
-    total_len = struct.unpack('<I', header)[0]
+def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
+    """Read a frame, returning (request_id, flags, payload) directly."""
+    header = _recv_exact(sock, 16)  # 4B total_len + 8B rid + 4B flags
+    total_len, request_id, flags = struct.unpack('<IQI', header)
 
     # S2: reject oversized or undersized frames before allocation
     if total_len < 12:
@@ -74,7 +74,9 @@ def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRA
             f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
         )
 
-    return _recv_exact(sock, total_len)
+    payload_len = total_len - 12
+    payload = _recv_exact(sock, payload_len) if payload_len > 0 else b''
+    return request_id, flags, payload
 
 
 class IPCv2Client(BaseClient):
@@ -127,8 +129,7 @@ class IPCv2Client(BaseClient):
                 try:
                     sock = self._ensure_connection()
                     _send_frame_sync(sock, frame)
-                    raw = _recv_frame_sync(sock, self._config.max_frame_size)
-                    return _decode_frame(raw)
+                    return _recv_frame_sync(sock, self._config.max_frame_size)
                 except (ConnectionError, BrokenPipeError, OSError):
                     self._close_connection()
                     if attempt == 1:
@@ -250,8 +251,7 @@ class IPCv2Client(BaseClient):
             frame = _encode_frame(request_id, 0, PING_BYTES)
 
             _send_frame_sync(sock, frame)
-            raw = _recv_frame_sync(sock)
-            _, _, resp_payload = _decode_frame(raw)
+            _, _, resp_payload = _recv_frame_sync(sock)
             env = decode(resp_payload)
 
             sock.close()
@@ -276,8 +276,7 @@ class IPCv2Client(BaseClient):
             frame = _encode_frame(request_id, 0, SHUTDOWN_CLIENT_BYTES)
 
             _send_frame_sync(sock, frame)
-            raw = _recv_frame_sync(sock)
-            _, _, resp_payload = _decode_frame(raw)
+            _, _, resp_payload = _recv_frame_sync(sock)
             env = decode(resp_payload)
 
             sock.close()
