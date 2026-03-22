@@ -12,7 +12,6 @@ import socket as _socket
 import struct
 import tempfile
 import threading
-import uuid
 from multiprocessing import shared_memory
 
 from ... import error
@@ -66,9 +65,9 @@ def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRA
     total_len = struct.unpack('<I', header)[0]
 
     # S2: reject oversized or undersized frames before allocation
-    if total_len < 8:
+    if total_len < 12:
         raise error.EventDeserializeError(
-            f'Frame too small: total_len={total_len} (minimum 8)'
+            f'Frame too small: total_len={total_len} (minimum 12)'
         )
     if total_len > max_frame_size:
         raise error.EventDeserializeError(
@@ -88,6 +87,7 @@ class IPCv2Client(BaseClient):
         self._sock: _socket.socket | None = None
         self._conn_lock = threading.Lock()
         self._read_buf: AdaptiveBuffer = AdaptiveBuffer()  # adaptive buffer for SHM reads
+        self._next_rid: int = 0
 
     # ------------------------------------------------------------------
     # Persistent connection management
@@ -120,7 +120,7 @@ class IPCv2Client(BaseClient):
     # Core send/recv — raw synchronous socket, persistent connection
     # ------------------------------------------------------------------
 
-    def _send_and_recv(self, request_id: str, flags: int, payload: bytes) -> tuple[str, int, bytes]:
+    def _send_and_recv(self, request_id: int, flags: int, payload: bytes) -> tuple[int, int, bytes]:
         with self._conn_lock:
             frame = _encode_frame(request_id, flags, payload)
             for attempt in range(2):
@@ -138,7 +138,8 @@ class IPCv2Client(BaseClient):
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         self._read_buf.maybe_decay()
 
-        request_id = str(uuid.uuid4())
+        request_id = self._next_rid
+        self._next_rid += 1
         method_bytes = method_name.encode('utf-8')
         args = data if data is not None else b''
         flags = 0
@@ -146,7 +147,7 @@ class IPCv2Client(BaseClient):
         estimated_wire_size = call_wire_size(len(method_bytes), len(args))
 
         if estimated_wire_size >= self._config.shm_threshold:
-            shm_name = _shm_name(self.region_id, request_id, 'req')
+            shm_name = _shm_name(self.region_id, str(request_id), 'req')
             try:
                 from ..util.wire import write_call_into
                 shm = shared_memory.SharedMemory(name=shm_name, create=True, size=estimated_wire_size)
@@ -194,11 +195,12 @@ class IPCv2Client(BaseClient):
         return env.payload if env.payload is not None else b''
 
     def relay(self, event_bytes: bytes) -> bytes:
-        request_id = str(uuid.uuid4())
+        request_id = self._next_rid
+        self._next_rid += 1
         flags = 0
 
         if len(event_bytes) >= self._config.shm_threshold:
-            shm_name = _shm_name(self.region_id, request_id, 'relay')
+            shm_name = _shm_name(self.region_id, str(request_id), 'relay')
             shm = _write_shm(shm_name, event_bytes)
             shm.close()
             size_header = struct.pack('<Q', len(event_bytes))
@@ -244,7 +246,7 @@ class IPCv2Client(BaseClient):
             sock.settimeout(timeout)
             sock.connect(socket_path)
 
-            request_id = str(uuid.uuid4())
+            request_id = 0
             frame = _encode_frame(request_id, 0, PING_BYTES)
 
             _send_frame_sync(sock, frame)
@@ -270,7 +272,7 @@ class IPCv2Client(BaseClient):
             sock.settimeout(timeout)
             sock.connect(socket_path)
 
-            request_id = str(uuid.uuid4())
+            request_id = 0
             frame = _encode_frame(request_id, 0, SHUTDOWN_CLIENT_BYTES)
 
             _send_frame_sync(sock, frame)

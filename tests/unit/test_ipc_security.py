@@ -1,7 +1,7 @@
 """Security unit tests for IPC v2 transport layer.
 
 Covers:
-    S1: _decode_frame rid_len validation
+    S1: _decode_frame body too small validation
     S2: _read_frame / _recv_frame_sync total_len bounds
     S3: IPCConfig defaults, max_pending enforcement
     S4: SHM size validation in _fast_read_shm
@@ -39,48 +39,38 @@ from c_two.rpc.util.wire import encode_call
 
 
 # ---------------------------------------------------------------------------
-# S1: _decode_frame — rid_len validation
+# S1: _decode_frame — body too small validation
 # ---------------------------------------------------------------------------
 
 class TestDecodeFrameValidation:
-    """S1: _decode_frame must reject frames where rid_len overflows available space."""
+    """S1: _decode_frame must reject bodies smaller than 12 bytes."""
 
-    def test_rid_len_overflow(self):
-        """rid_len exceeds body_len - 8 → EventDeserializeError."""
-        rid_len = 100  # way larger than body_len - 8
-        body = struct.pack('<I', rid_len) + b'\x00' * 16  # body_len=20, 20-8=12 < 100
-        with pytest.raises(error.EventDeserializeError, match='rid_len.*exceeds'):
+    def test_body_too_small(self):
+        """body < 12 bytes → EventDeserializeError."""
+        body = b'\x00' * 11
+        with pytest.raises(error.EventDeserializeError, match='too small'):
             _decode_frame(body)
 
-    def test_rid_len_equals_body_len_minus_8(self):
-        """rid_len == body_len - 8 → payload_len == 0 → valid edge case."""
-        rid = b'abc'
+    def test_empty_body(self):
+        """empty body → EventDeserializeError."""
+        with pytest.raises(error.EventDeserializeError, match='too small'):
+            _decode_frame(b'')
+
+    def test_body_exactly_12_bytes(self):
+        """body == 12 bytes → valid edge case (empty payload)."""
+        rid = 42
         flags = 0
-        payload = b''
-        body = (
-            struct.pack('<I', len(rid))
-            + rid
-            + struct.pack('<I', flags)
-            + payload
-        )
-        # body_len = 11, rid_len = 3, body_len - 8 = 3, payload_len = 0
+        body = struct.pack('<Q', rid) + struct.pack('<I', flags)
         request_id, f, p = _decode_frame(body)
-        assert request_id == 'abc'
+        assert request_id == 42
         assert f == 0
         assert p == b''
 
-    def test_rid_len_exceeds_by_one(self):
-        """rid_len = body_len - 7 → payload_len = -1 → reject."""
-        rid_len = 4  # body_len - 8 = 3, but rid_len = 4
-        body = struct.pack('<I', rid_len) + b'\x00' * 7  # body_len = 11
-        with pytest.raises(error.EventDeserializeError):
-            _decode_frame(body)
-
     def test_valid_roundtrip(self):
         """Normal frame encode → decode should still work (strip 4B header)."""
-        frame = _encode_frame('req-001', 0, b'hello world')
+        frame = _encode_frame(1, 0, b'hello world')
         rid, flags, payload = _decode_frame(frame[4:])
-        assert rid == 'req-001'
+        assert rid == 1
         assert flags == 0
         assert payload == b'hello world'
 
@@ -93,11 +83,11 @@ class TestReadFrameBounds:
     """S2: _read_frame must reject frames with total_len outside valid range."""
 
     def test_rejects_undersized_frame(self):
-        """total_len < 8 → EventDeserializeError."""
+        """total_len < 12 → EventDeserializeError."""
         async def _run():
             reader = asyncio.StreamReader()
-            reader.feed_data(struct.pack('<I', 4))  # total_len = 4 < 8
-            reader.feed_data(b'\x00' * 4)
+            reader.feed_data(struct.pack('<I', 8))  # total_len = 8 < 12
+            reader.feed_data(b'\x00' * 8)
             with pytest.raises(error.EventDeserializeError, match='too small'):
                 await _read_frame(reader, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
         asyncio.run(_run())
@@ -116,12 +106,12 @@ class TestReadFrameBounds:
     def test_accepts_valid_frame(self):
         """Frame within bounds should pass through."""
         async def _run():
-            frame = _encode_frame('r1', 0, b'data')
+            frame = _encode_frame(1, 0, b'data')
             reader = asyncio.StreamReader()
             reader.feed_data(frame)
             raw = await _read_frame(reader, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
             rid, flags, payload = _decode_frame(raw)
-            assert rid == 'r1'
+            assert rid == 1
             assert payload == b'data'
         asyncio.run(_run())
 
@@ -161,10 +151,10 @@ class TestRecvFrameSyncBounds:
         return client_sock, conn
 
     def test_rejects_undersized(self):
-        """total_len < 8 → EventDeserializeError."""
+        """total_len < 12 → EventDeserializeError."""
         client, server = self._make_socket_pair()
         try:
-            server.sendall(struct.pack('<I', 4) + b'\x00' * 4)
+            server.sendall(struct.pack('<I', 8) + b'\x00' * 8)
             with pytest.raises(error.EventDeserializeError, match='too small'):
                 _recv_frame_sync(client, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
         finally:
@@ -187,11 +177,11 @@ class TestRecvFrameSyncBounds:
         """Default max_frame_size (from server) accepts normal-sized frames."""
         client, server = self._make_socket_pair()
         try:
-            frame = _encode_frame('r1', 0, b'x' * 100)
+            frame = _encode_frame(1, 0, b'x' * 100)
             server.sendall(frame)
             raw = _recv_frame_sync(client)
             rid, _, payload = _decode_frame(raw)
-            assert rid == 'r1'
+            assert rid == 1
         finally:
             client.close()
             server.close()
@@ -280,8 +270,7 @@ class TestPendingCleanup:
             sock.connect(socket_path)
 
             # Send a valid request frame (wire format: CRM_CALL)
-            import uuid
-            request_id = str(uuid.uuid4())
+            request_id = 42
             call_bytes = encode_call('foo', b'')
             frame = _encode_frame(request_id, 0, call_bytes)
             sock.sendall(frame)
@@ -291,7 +280,7 @@ class TestPendingCleanup:
 
             # Verify there's a pending future
             with server._pending_lock:
-                assert request_id in server._pending
+                assert len(server._pending) == 1
 
             # Abruptly close the connection (handler still awaiting future)
             sock.close()
@@ -322,7 +311,7 @@ class TestSHMGCTimestampAfterSend:
 
         try:
             # Manually invoke reply() with a large payload that triggers SHM path
-            request_id = 'test-gc-rid'
+            request_id = '0:99'  # conn_id:wire_rid format (reply() extracts wire rid)
             # Create a pending future
             loop = server._loop
             fut = loop.call_soon_threadsafe(loop.create_future)
@@ -430,7 +419,7 @@ class TestSHMReferenceFormat:
         # Build a frame with _FLAG_SHM set but payload has no null byte
         from c_two.rpc.ipc.ipc_server import _FLAG_SHM
         bad_payload = b'no_null_here'
-        frame = _encode_frame('r1', _FLAG_SHM, bad_payload)
+        frame = _encode_frame(1, _FLAG_SHM, bad_payload)
         _, flags, payload = _decode_frame(frame[4:])
         # Simulate server-side parsing
         parts = payload.split(b'\x00', 1)
@@ -444,7 +433,7 @@ class TestSHMReferenceFormat:
         """Payload with \\x00 but fewer than 8 bytes after → EventDeserializeError."""
         from c_two.rpc.ipc.ipc_server import _FLAG_SHM
         bad_payload = b'shm_name\x00\x01\x02'  # only 2 bytes after null
-        frame = _encode_frame('r1', _FLAG_SHM, bad_payload)
+        frame = _encode_frame(1, _FLAG_SHM, bad_payload)
         _, flags, payload = _decode_frame(frame[4:])
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 2
@@ -458,7 +447,7 @@ class TestSHMReferenceFormat:
         from c_two.rpc.ipc.ipc_server import _FLAG_SHM
         size_bytes = struct.pack('<Q', 12345)
         good_payload = b'shm_name\x00' + size_bytes
-        frame = _encode_frame('r1', _FLAG_SHM, good_payload)
+        frame = _encode_frame(1, _FLAG_SHM, good_payload)
         _, flags, payload = _decode_frame(frame[4:])
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 2 and len(parts[1]) >= 8

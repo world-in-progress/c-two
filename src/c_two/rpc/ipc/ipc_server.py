@@ -6,7 +6,9 @@ Data plane: multiprocessing.shared_memory.SharedMemory for large payloads
 Ownership transfer: sender creates SHM → receiver reads and releases
 
 Wire protocol (control plane):
-    [4B total_len][4B request_id_len][request_id][4B flags][payload_or_shm_ref]
+    [4B total_len][8B request_id_u64][4B flags][payload_or_shm_ref]
+
+    total_len = 12 + payload_len  (fixed 16-byte header)
 
     flags (uint32, little-endian):
         bit 0: 0 = inline, 1 = shared_memory
@@ -69,34 +71,24 @@ def _shm_name(region_id: str, request_id: str, direction: str) -> str:
     return f'cc{d}_{h}'
 
 
-def _encode_frame(request_id: str, flags: int, payload: bytes | bytearray | memoryview) -> bytes:
-    rid = request_id.encode('utf-8')
-    rid_len = len(rid)
+def _encode_frame(request_id: int, flags: int, payload: bytes | bytearray | memoryview) -> bytes:
     payload_len = len(payload)
-    total_len = 4 + rid_len + 4 + payload_len
+    total_len = 12 + payload_len  # 8B rid + 4B flags + payload
     buf = bytearray(4 + total_len)
     struct.pack_into('<I', buf, 0, total_len)
-    struct.pack_into('<I', buf, 4, rid_len)
-    buf[8:8 + rid_len] = rid
-    struct.pack_into('<I', buf, 8 + rid_len, flags)
-    buf[12 + rid_len:12 + rid_len + payload_len] = payload
+    struct.pack_into('<Q', buf, 4, request_id)
+    struct.pack_into('<I', buf, 12, flags)
+    buf[16:16 + payload_len] = payload
     return bytes(buf)
 
 
-def _decode_frame(body: bytes) -> tuple[str, int, bytes]:
+def _decode_frame(body: bytes) -> tuple[int, int, bytes]:
     body_len = len(body)
-    rid_len = struct.unpack_from('<I', body, 0)[0]
-    payload_len = body_len - 4 - rid_len - 4
-    if rid_len > body_len - 8 or payload_len < 0:
-        raise error.EventDeserializeError(
-            f'Malformed frame: rid_len={rid_len} exceeds available space (total_len={body_len})'
-        )
-    offset = 4
-    request_id = body[offset:offset + rid_len].decode('utf-8')
-    offset += rid_len
-    flags = struct.unpack_from('<I', body, offset)[0]
-    offset += 4
-    payload = body[offset:offset + payload_len]
+    if body_len < 12:
+        raise error.EventDeserializeError(f'Frame body too small: {body_len} < 12')
+    request_id = struct.unpack_from('<Q', body, 0)[0]
+    flags = struct.unpack_from('<I', body, 8)[0]
+    payload = body[12:]
     return request_id, flags, payload
 
 
@@ -148,9 +140,9 @@ async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAUL
     total_len = struct.unpack('<I', header)[0]
 
     # S2: reject oversized or undersized frames before allocation
-    if total_len < 8:
+    if total_len < 12:
         raise error.EventDeserializeError(
-            f'Frame too small: total_len={total_len} (minimum 8)'
+            f'Frame too small: total_len={total_len} (minimum 12)'
         )
     if total_len > max_frame_size:
         raise error.EventDeserializeError(
@@ -183,6 +175,7 @@ class IPCv2Server(BaseServer):
         # Map request_id → asyncio.Future (set by reply(), awaited by handler)
         self._pending: dict[str, asyncio.Future] = {}
         self._pending_lock = threading.Lock()
+        self._next_conn_id: int = 0
 
         # Track SHM segments we created (for response direction) that haven't been picked up
         self._our_shm_segments: dict[str, float] = {}
@@ -221,6 +214,8 @@ class IPCv2Server(BaseServer):
             return
 
         request_id = event.request_id
+        # request_id format: "conn_id:wire_rid" — extract wire rid for frame encoding
+        int_rid = int(request_id.rsplit(':', 1)[1])
         flags = _FLAG_RESPONSE
         shm_name: str | None = None
 
@@ -228,7 +223,7 @@ class IPCv2Server(BaseServer):
         signal_type = self._event_tag_to_signal.get(event.tag)
         if signal_type is not None:
             payload = encode_signal(signal_type)
-            frame = _encode_frame(request_id, flags, payload)
+            frame = _encode_frame(int_rid, flags, payload)
             with self._pending_lock:
                 fut = self._pending.pop(request_id, None)
             if fut is not None and self._loop is not None:
@@ -262,7 +257,7 @@ class IPCv2Server(BaseServer):
         else:
             payload = encode_reply(err_bytes, result_bytes)
 
-        frame = _encode_frame(request_id, flags, payload)
+        frame = _encode_frame(int_rid, flags, payload)
 
         with self._pending_lock:
             fut = self._pending.pop(request_id, None)
@@ -362,6 +357,9 @@ class IPCv2Server(BaseServer):
         _read_buf: AdaptiveBuffer = AdaptiveBuffer()  # per-connection adaptive buffer
         with self._conn_buffers_lock:
             self._conn_buffers.add(_read_buf)
+        # Assign a unique connection ID so per-connection rid counters don't collide
+        conn_id = self._next_conn_id
+        self._next_conn_id += 1
         conn_request_ids: set[str] = set()  # S5: track per-connection request IDs
         # P2: event-driven shutdown — no polling timeout
         shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
@@ -387,6 +385,7 @@ class IPCv2Server(BaseServer):
                     break
 
                 request_id, flags, payload = _decode_frame(raw)
+                str_rid = f'{conn_id}:{request_id}'
 
                 # Decode inline vs SHM request data
                 if flags & _FLAG_SHM:
@@ -407,7 +406,7 @@ class IPCv2Server(BaseServer):
                     event_bytes = payload
 
                 envelope = decode(event_bytes)
-                envelope.request_id = request_id
+                envelope.request_id = str_rid
 
                 # S3: enforce max pending requests
                 with self._pending_lock:
@@ -426,7 +425,7 @@ class IPCv2Server(BaseServer):
                         await _write_frame(writer, err_frame)
                         continue
 
-                    if request_id in self._pending:
+                    if str_rid in self._pending:
                         logger.warning(f'IPCv2Server: duplicate request_id={request_id}, rejecting')
                         err_payload = encode_reply(
                             error.CCError.serialize(error.CRMServerError('Duplicate request ID')),
@@ -438,8 +437,8 @@ class IPCv2Server(BaseServer):
 
                     # Register a future for this request so reply() can resolve it
                     fut: asyncio.Future = self._loop.create_future()
-                    self._pending[request_id] = fut
-                    conn_request_ids.add(request_id)
+                    self._pending[str_rid] = fut
+                    conn_request_ids.add(str_rid)
 
                 # Push into the event queue for the server's _serve loop
                 self.event_queue.put(envelope)
@@ -450,7 +449,7 @@ class IPCv2Server(BaseServer):
                 except asyncio.CancelledError:
                     break
                 finally:
-                    conn_request_ids.discard(request_id)
+                    conn_request_ids.discard(str_rid)
 
                 await _write_frame(writer, response_frame)
 
