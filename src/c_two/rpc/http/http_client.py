@@ -2,8 +2,11 @@ import requests
 
 from ... import error
 from ..base import BaseClient
-from ..event import Event, EventTag
-from ..util.encoding import add_length_prefix, parse_message
+from ..event.msg_type import MsgType
+from ..util.wire import (
+    encode_call, decode,
+    PING_BYTES, SHUTDOWN_CLIENT_BYTES,
+)
 
 class HttpClient(BaseClient):
     def __init__(self, server_address: str):
@@ -19,20 +22,15 @@ class HttpClient(BaseClient):
     def _send_request(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a request to the CRM service and get the response synchronously."""
         
-        # Serialize request
         try:
-            serialized_method_name = method_name.encode('utf-8')
-            serialized_data = b'' if data is None else data
-            combined_request = add_length_prefix(serialized_method_name) + add_length_prefix(serialized_data)
-            event = Event(tag=EventTag.CRM_CALL, data=combined_request)
+            wire_bytes = encode_call(method_name, data)
         except Exception as e:
             raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}') from e
         
-        # Send POST request with serialized event as body
         try:
             response = self.session.post(
                 self.server_address, 
-                data=event.serialize(),
+                data=wire_bytes,
                 headers={'Content-Type': 'application/octet-stream'}
             )
             
@@ -44,24 +42,18 @@ class HttpClient(BaseClient):
         except requests.RequestException as e:
             raise error.CompoClientError(f'HTTP request failed: {e}') from e
         
-        # Deserialize Event
-        event = Event.deserialize(full_response)
-        if event.tag != EventTag.CRM_REPLY:
-            raise error.CompoClientError(f'Unexpected event tag: {event.tag}. Expected: {EventTag.CRM_REPLY}')
+        env = decode(full_response)
+        if env.msg_type != MsgType.CRM_REPLY:
+            raise error.CompoClientError(f'Unexpected response type: {env.msg_type}')
 
-        # Deserialize error and result
-        sub_responses = parse_message(event.data)
-        if len(sub_responses) != 2:
-            raise error.CompoDeserializeOutput(f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}')
-
-        err = error.CCError.deserialize(sub_responses[0])
-        if err:
-            raise err
+        if env.error:
+            err = error.CCError.deserialize(env.error)
+            if err:
+                raise err
         
-        return sub_responses[1]
+        return env.payload if env.payload is not None else b''
     
     def relay(self, event_bytes: bytes) -> bytes:
-        # Send POST request with serialized event as body
         try:
             response = self.session.post(
                 self.server_address, 
@@ -88,14 +80,13 @@ class HttpClient(BaseClient):
         try:
             response = requests.post(
                 server_address, 
-                data=Event(tag=EventTag.PING).serialize(),
+                data=PING_BYTES,
                 headers={'Content-Type': 'application/octet-stream'},
                 timeout=timeout
             )
             
             if response.status_code == 200:
-                event = Event.deserialize(response.content)
-                return event.tag == EventTag.PONG
+                return decode(response.content).msg_type == MsgType.PONG
             return False
             
         except requests.RequestException:
@@ -109,14 +100,13 @@ class HttpClient(BaseClient):
                 timeout = None
             response = requests.post(
                 server_address, 
-                data=Event(tag=EventTag.SHUTDOWN_FROM_CLIENT).serialize(),
+                data=SHUTDOWN_CLIENT_BYTES,
                 headers={'Content-Type': 'application/octet-stream'},
                 timeout=timeout
             )
             
             if response.status_code == 200:
-                event = Event.deserialize(response.content)
-                return event.tag == EventTag.SHUTDOWN_ACK
+                return decode(response.content).msg_type == MsgType.SHUTDOWN_ACK
             return False
             
         except requests.RequestException:

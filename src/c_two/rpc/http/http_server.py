@@ -10,7 +10,11 @@ from starlette.middleware.cors import CORSMiddleware
 
 from ..util.wait import wait
 from ..base import BaseServer
-from ..event import Event, EventTag, EventQueue
+from ..event import Event, EventQueue
+from ..event.envelope import Envelope
+from ..event.msg_type import MsgType
+from ..util.wire import decode
+from ..util.encoding import event_to_wire_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +75,7 @@ class HttpServer(BaseServer):
                 if not body:
                     return Response(b'Empty request body', status_code=400)
                 
-                event = Event.deserialize(body)
+                event = decode(body)
                 request_id = f'{threading.current_thread().ident}_{id(request)}'
                 event.request_id = request_id
                 
@@ -83,7 +87,7 @@ class HttpServer(BaseServer):
                     
                     try:
                         response_data = await future
-                        return Response(response_data, media_type='application/octet-stream')
+                        return Response(bytes(response_data), media_type='application/octet-stream')
                     except asyncio.CancelledError:
                         return Response(b'Request cancelled', status_code=499)
                     finally:
@@ -186,7 +190,7 @@ class HttpServer(BaseServer):
             logger.warning('Reply event missing request_id')
             return
 
-        response_data = event.serialize()
+        response_data = event_to_wire_bytes(event)
 
         if self.event_loop and not self.event_loop.is_closed():
             try:
@@ -207,7 +211,7 @@ class HttpServer(BaseServer):
             def shutdown_server():
                 try:
                     self._cleanup_futures_on_loop()
-                    self.event_queue.put(Event(tag=EventTag.SHUTDOWN_FROM_SERVER))
+                    self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
                     
                     if not self.server.should_exit:
                         self.server.should_exit = True

@@ -12,21 +12,19 @@ import socket as _socket
 import struct
 import tempfile
 import threading
-import uuid
 from multiprocessing import shared_memory
 
 from ... import error
 from ..base import BaseClient
-from ..event import Event, EventTag
+from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
-from ..util.encoding import add_length_prefix, parse_message
+from ..util.wire import encode_call, decode, call_wire_size, PING_BYTES, SHUTDOWN_CLIENT_BYTES
 from .ipc_server import (
+    DEFAULT_MAX_FRAME_SIZE,
     IPCConfig,
     _FLAG_SHM,
-    _decode_frame,
     _encode_frame,
     _fast_read_shm,
-    _scatter_write_event_multi_to_shm,
     _shm_name,
 )
 
@@ -61,22 +59,24 @@ def _send_frame_sync(sock: _socket.socket, frame: bytes) -> None:
     sock.sendall(frame)
 
 
-def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = 0) -> bytes:
-    header = _recv_exact(sock, 4)
-    total_len = struct.unpack('<I', header)[0]
+def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
+    """Read a frame, returning (request_id, flags, payload) directly."""
+    header = _recv_exact(sock, 16)  # 4B total_len + 8B rid + 4B flags
+    total_len, request_id, flags = struct.unpack('<IQI', header)
 
     # S2: reject oversized or undersized frames before allocation
-    if total_len < 8:
+    if total_len < 12:
         raise error.EventDeserializeError(
-            f'Frame too small: total_len={total_len} (minimum 8)'
+            f'Frame too small: total_len={total_len} (minimum 12)'
         )
-    if max_frame_size > 0 and total_len > max_frame_size:
+    if total_len > max_frame_size:
         raise error.EventDeserializeError(
             f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
         )
 
-    body = _recv_exact(sock, total_len)
-    return header + body
+    payload_len = total_len - 12
+    payload = _recv_exact(sock, payload_len) if payload_len > 0 else b''
+    return request_id, flags, payload
 
 
 class IPCv2Client(BaseClient):
@@ -89,6 +89,7 @@ class IPCv2Client(BaseClient):
         self._sock: _socket.socket | None = None
         self._conn_lock = threading.Lock()
         self._read_buf: AdaptiveBuffer = AdaptiveBuffer()  # adaptive buffer for SHM reads
+        self._next_rid: int = 0
 
     # ------------------------------------------------------------------
     # Persistent connection management
@@ -121,15 +122,14 @@ class IPCv2Client(BaseClient):
     # Core send/recv — raw synchronous socket, persistent connection
     # ------------------------------------------------------------------
 
-    def _send_and_recv(self, request_id: str, flags: int, payload: bytes) -> tuple[str, int, bytes]:
+    def _send_and_recv(self, request_id: int, flags: int, payload: bytes) -> tuple[int, int, bytes]:
         with self._conn_lock:
             frame = _encode_frame(request_id, flags, payload)
             for attempt in range(2):
                 try:
                     sock = self._ensure_connection()
                     _send_frame_sync(sock, frame)
-                    raw = _recv_frame_sync(sock, self._config.max_frame_size)
-                    return _decode_frame(raw)
+                    return _recv_frame_sync(sock, self._config.max_frame_size)
                 except (ConnectionError, BrokenPipeError, OSError):
                     self._close_connection()
                     if attempt == 1:
@@ -139,33 +139,29 @@ class IPCv2Client(BaseClient):
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         self._read_buf.maybe_decay()
 
-        request_id = str(uuid.uuid4())
+        request_id = self._next_rid
+        self._next_rid += 1
         method_bytes = method_name.encode('utf-8')
         args = data if data is not None else b''
         flags = 0
 
-        # Estimate serialized Event size (tag ~8B + prefixes 32B + method + args)
-        estimated_event_size = 48 + len(method_bytes) + len(args)
+        estimated_wire_size = call_wire_size(len(method_bytes), len(args))
 
-        if estimated_event_size >= self._config.shm_threshold:
-            # OPT-5: Scatter-write request Event directly to SHM (1 copy of args)
-            shm_name = _shm_name(self.region_id, request_id, 'req')
+        if estimated_wire_size >= self._config.shm_threshold:
+            shm_name = _shm_name(self.region_id, str(request_id), 'req')
             try:
-                request_shm, written = _scatter_write_event_multi_to_shm(
-                    shm_name, EventTag.CRM_CALL, [method_bytes, args]
-                )
-                request_shm.close()  # server takes ownership
+                from ..util.wire import write_call_into
+                shm = shared_memory.SharedMemory(name=shm_name, create=True, size=estimated_wire_size)
+                write_call_into(shm.buf, 0, method_name, args)
+                shm.close()
             except Exception as e:
                 raise error.CompoSerializeInput(f'Error writing request to SHM: {e}')
-            size_header = struct.pack('<Q', written)
+            size_header = struct.pack('<Q', estimated_wire_size)
             payload = shm_name.encode('utf-8') + b'\x00' + size_header
             flags |= _FLAG_SHM
         else:
-            # Inline path
             try:
-                combined = add_length_prefix(method_bytes) + add_length_prefix(args)
-                event = Event(tag=EventTag.CRM_CALL, data=combined, request_id=request_id)
-                payload = event.serialize()
+                payload = encode_call(method_name, args)
             except Exception as e:
                 raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}')
 
@@ -188,28 +184,24 @@ class IPCv2Client(BaseClient):
         else:
             response_bytes = resp_payload
 
-        response_event = Event.deserialize(response_bytes)
-        if response_event.tag != EventTag.CRM_REPLY:
-            raise error.CompoClientError(f'Unexpected response tag: {response_event.tag}')
+        env = decode(response_bytes)
+        if env.msg_type != MsgType.CRM_REPLY:
+            raise error.CompoClientError(f'Unexpected response type: {env.msg_type}')
 
-        sub_responses = parse_message(response_event.data)
-        if len(sub_responses) != 2:
-            raise error.CompoDeserializeOutput(
-                f'Expected exactly 2 sub-messages (error and result), got {len(sub_responses)}'
-            )
+        if env.error:
+            err = error.CCError.deserialize(env.error)
+            if err:
+                raise err
 
-        err = error.CCError.deserialize(sub_responses[0])
-        if err:
-            raise err
-
-        return sub_responses[1]
+        return env.payload if env.payload is not None else b''
 
     def relay(self, event_bytes: bytes) -> bytes:
-        request_id = str(uuid.uuid4())
+        request_id = self._next_rid
+        self._next_rid += 1
         flags = 0
 
         if len(event_bytes) >= self._config.shm_threshold:
-            shm_name = _shm_name(self.region_id, request_id, 'relay')
+            shm_name = _shm_name(self.region_id, str(request_id), 'relay')
             shm = _write_shm(shm_name, event_bytes)
             shm.close()
             size_header = struct.pack('<Q', len(event_bytes))
@@ -255,17 +247,15 @@ class IPCv2Client(BaseClient):
             sock.settimeout(timeout)
             sock.connect(socket_path)
 
-            request_id = str(uuid.uuid4())
-            ping_event = Event(tag=EventTag.PING, request_id=request_id)
-            frame = _encode_frame(request_id, 0, ping_event.serialize())
+            request_id = 0
+            frame = _encode_frame(request_id, 0, PING_BYTES)
 
             _send_frame_sync(sock, frame)
-            raw = _recv_frame_sync(sock)
-            _, _, resp_payload = _decode_frame(raw)
-            resp_event = Event.deserialize(resp_payload)
+            _, _, resp_payload = _recv_frame_sync(sock)
+            env = decode(resp_payload)
 
             sock.close()
-            return resp_event.tag == EventTag.PONG
+            return env.msg_type == MsgType.PONG
         except Exception:
             return False
 
@@ -282,16 +272,14 @@ class IPCv2Client(BaseClient):
             sock.settimeout(timeout)
             sock.connect(socket_path)
 
-            request_id = str(uuid.uuid4())
-            shutdown_event = Event(tag=EventTag.SHUTDOWN_FROM_CLIENT, request_id=request_id)
-            frame = _encode_frame(request_id, 0, shutdown_event.serialize())
+            request_id = 0
+            frame = _encode_frame(request_id, 0, SHUTDOWN_CLIENT_BYTES)
 
             _send_frame_sync(sock, frame)
-            raw = _recv_frame_sync(sock)
-            _, _, resp_payload = _decode_frame(raw)
-            resp_event = Event.deserialize(resp_payload)
+            _, _, resp_payload = _recv_frame_sync(sock)
+            env = decode(resp_payload)
 
             sock.close()
-            return resp_event.tag == EventTag.SHUTDOWN_ACK
+            return env.msg_type == MsgType.SHUTDOWN_ACK
         except Exception:
             return False

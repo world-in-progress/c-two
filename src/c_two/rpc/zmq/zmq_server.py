@@ -3,7 +3,11 @@ import queue
 import logging
 import threading
 from ..base import BaseServer
-from ..event import Event, EventTag, EventQueue
+from ..event import Event, EventQueue
+from ..event.envelope import Envelope
+from ..event.msg_type import MsgType
+from ..util.wire import decode
+from ..util.encoding import event_to_wire_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +29,14 @@ class ZmqServer(BaseServer):
         try:
             while True:
                 if self.shutdown_event.is_set():
-                    self.event_queue.put(Event(EventTag.SHUTDOWN_FROM_SERVER))
+                    self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
                     return
 
-                event = self._poll(timeout=MAXIMUM_WAIT_TIMEOUT)
-                if event is None:
+                envelope = self._poll(timeout=MAXIMUM_WAIT_TIMEOUT)
+                if envelope is None:
                     continue
 
-                self.event_queue.put(event)
+                self.event_queue.put(envelope)
 
                 # REP socket requires exactly one send after each recv
                 reply_data = self._wait_for_reply()
@@ -43,7 +47,7 @@ class ZmqServer(BaseServer):
                         if not self.shutdown_event.is_set():
                             logger.error(f'Failed to send ZMQ reply: {e}')
 
-                if event.tag == EventTag.SHUTDOWN_FROM_CLIENT:
+                if envelope.msg_type == MsgType.SHUTDOWN_CLIENT:
                     return
         finally:
             self._serve_done.set()
@@ -70,7 +74,7 @@ class ZmqServer(BaseServer):
         server_thread.daemon = True
         server_thread.start()
 
-    def _poll(self, timeout: float = 0.0) -> Event | None:
+    def _poll(self, timeout: float = 0.0) -> Envelope | None:
         if not self.socket or not self.context:
             return None
         
@@ -83,7 +87,7 @@ class ZmqServer(BaseServer):
             socks = dict(poller.poll(timeout))
             if self.socket in socks:
                 full_request = self.socket.recv(zmq.NOBLOCK)
-                return Event.deserialize(full_request)
+                return decode(full_request)
             
         except zmq.error.Again:
             return None
@@ -94,7 +98,7 @@ class ZmqServer(BaseServer):
 
     def reply(self, event: Event):
         """Thread-safe: queues the reply for the server thread to send."""
-        self._reply_queue.put(event.serialize())
+        self._reply_queue.put(event_to_wire_bytes(event))
     
     def shutdown(self):
         self.shutdown_event.set()

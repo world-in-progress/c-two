@@ -11,12 +11,14 @@ from .. import error
 from ..crm.meta import MethodAccess, get_method_access
 from .base import BaseServer
 from .event import CompletionType, Event, EventQueue, EventTag
+from .event.envelope import Envelope
+from .event.envelope import CompletionType as EnvelopeCompletionType
+from .event.msg_type import MsgType
 from .http import HttpServer
 from .ipc import IPCv2Server
 from .memory import MemoryServer
 from .thread import ThreadServer
 from .thread.thread_server import DirectCallEvent
-from .util.encoding import add_length_prefix, parse_message
 from .util.wait import wait
 from .zmq import ZmqServer
 
@@ -322,11 +324,7 @@ class _Scheduler:
                     response = response.tobytes()
                 event = Event(tag=EventTag.CRM_REPLY, data=response, request_id=request_id)
         except Exception as exc:
-            event = Event(
-                tag=EventTag.CRM_REPLY,
-                data=_serialize_server_error(exc),
-                request_id=request_id,
-            )
+            event = _make_error_reply(exc, request_id)
 
         try:
             reply(event)
@@ -388,10 +386,15 @@ class ServerState:
         self.shutdown_events = [self.termination_event]
 
 
-def _serialize_server_error(exc: Exception) -> bytes:
+def _make_error_reply(exc: Exception, request_id: str | None = None) -> Event:
+    """Create a CRM_REPLY Event for an error using data_parts (no add_length_prefix)."""
     server_error = exc if isinstance(exc, error.CCError) else error.CRMServerError(str(exc))
     serialized_error = error.CCError.serialize(server_error)
-    return add_length_prefix(serialized_error) + add_length_prefix(b'')
+    return Event(
+        tag=EventTag.CRM_REPLY,
+        data_parts=[serialized_error, b''],
+        request_id=request_id,
+    )
 
 
 def _validate_concurrency_support(server: BaseServer, config: ConcurrencyConfig) -> None:
@@ -436,25 +439,19 @@ def _handle_shutdown(state: ServerState, event: Event) -> None:
         _stop_serving(state)
 
 
-def _dispatch_crm_call(state: ServerState, event: Event) -> None:
+def _dispatch_crm_call(state: ServerState, envelope: Envelope) -> None:
+    """Dispatch a CRM call from an Envelope."""
     if state.stage is not ServerStage.STARTED:
-        state.server.reply(
-            Event(
-                tag=EventTag.CRM_REPLY,
-                data=_serialize_server_error(
-                    error.CRMServerError('Server is shutting down, no new calls accepted.')
-                ),
-                request_id=event.request_id,
-            )
-        )
+        state.server.reply(_make_error_reply(
+            error.CRMServerError('Server is shutting down, no new calls accepted.'),
+            envelope.request_id,
+        ))
         return
 
     try:
         icrm = state.icrm
-        sub_messages = parse_message(event.data)
-
-        method_name = sub_messages[0].tobytes().decode('utf-8')
-        args_bytes = sub_messages[1]
+        method_name = envelope.method_name
+        args_bytes = envelope.payload
 
         method = getattr(icrm, method_name, None)
         if method is None:
@@ -463,19 +460,13 @@ def _dispatch_crm_call(state: ServerState, event: Event) -> None:
             )
 
         state.scheduler.submit(
-            request_id=event.request_id,
+            request_id=envelope.request_id,
             method=method,
             args_bytes=args_bytes,
             reply=state.server.reply,
         )
     except Exception as exc:
-        state.server.reply(
-            Event(
-                tag=EventTag.CRM_REPLY,
-                data=_serialize_server_error(exc),
-                request_id=event.request_id,
-            )
-        )
+        state.server.reply(_make_error_reply(exc, envelope.request_id))
 
 
 def _dispatch_direct_call(state: ServerState, event: DirectCallEvent) -> None:
@@ -516,36 +507,41 @@ def _dispatch_direct_call(state: ServerState, event: DirectCallEvent) -> None:
         state.server.reply_direct(event.request_id, None, wrapped)
 
 
-def _process_event_and_continue(state: ServerState, event: Event | DirectCallEvent) -> bool:
+def _process_event_and_continue(state: ServerState, event: Event | DirectCallEvent | Envelope) -> bool:
     # Direct call fast path — no Event tag, no serialization
     if isinstance(event, DirectCallEvent):
         _dispatch_direct_call(state, event)
         return True
 
-    if event.tag is EventTag.PING:
-        state.server.reply(Event(tag=EventTag.PONG, request_id=event.request_id))
+    # Envelope — all transports now produce Envelope for requests
+    if isinstance(event, Envelope):
+        if event.msg_type == MsgType.PING:
+            state.server.reply(Event(tag=EventTag.PONG, request_id=event.request_id))
+            return True
+        if event.msg_type in (MsgType.SHUTDOWN_CLIENT, MsgType.SHUTDOWN_SERVER):
+            _handle_shutdown(state, Event(
+                tag=EventTag.SHUTDOWN_FROM_CLIENT if event.msg_type == MsgType.SHUTDOWN_CLIENT
+                else EventTag.SHUTDOWN_FROM_SERVER,
+                request_id=event.request_id,
+            ))
+            return False
+        if event.msg_type == MsgType.CRM_CALL:
+            _dispatch_crm_call(state, event)
         return True
 
+    # Event fallback — only from EventQueue internal signals (shutdown)
     if event.tag is EventTag.SHUTDOWN_FROM_CLIENT or event.tag is EventTag.SHUTDOWN_FROM_SERVER:
         _handle_shutdown(state, event)
         return False
-
-    if event.tag is EventTag.CRM_CALL:
-        _dispatch_crm_call(state, event)
 
     return True
 
 
 def _serve(state: ServerState):
     while True:
-        event = state.event_queue.poll(timeout=0.1)
-
-        # DirectCallEvent has no completion_type — always a real event
-        is_timeout = isinstance(event, Event) and event.completion_type == CompletionType.OP_TIMEOUT
-        if not is_timeout:
-            if not _process_event_and_continue(state, event):
-                return
-
+        event = state.event_queue.get()
+        if not _process_event_and_continue(state, event):
+            return
         event = None
 
 

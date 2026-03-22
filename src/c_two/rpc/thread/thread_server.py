@@ -7,6 +7,7 @@ from typing import Any
 from ... import error
 from ..base import BaseServer
 from ..event import Event, EventTag, EventQueue
+from ..event.envelope import Envelope
 from . import register_server, unregister_server
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ class ThreadServer(BaseServer):
             for pending in list(self._direct_pending.values()):
                 pending.ready.set()
 
-    def put_request(self, event: Event | DirectCallEvent):
+    def put_request(self, event: Event | DirectCallEvent | Envelope):
         """Put a request into the server's queue (called by clients)."""
         try:
             self.event_queue.put(event)

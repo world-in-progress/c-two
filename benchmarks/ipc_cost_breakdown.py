@@ -338,7 +338,7 @@ def bench_uds_roundtrip(rounds: int) -> dict:
 
     # Small payload: 30 bytes (typical SHM reference)
     small_payload = b'x' * 30
-    rid = 'test-rid'
+    rid = 1
     frame = _encode_frame(rid, 0, small_payload)
 
     def run():
