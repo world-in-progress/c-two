@@ -45,6 +45,11 @@ _FLAG_HANDSHAKE = 1 << 2
 _FLAG_POOL = 1 << 3
 _FAST_READ_THRESHOLD = 1_048_576            # 1 MB — use native memcpy above this size
 
+# Pre-compiled struct objects for hot-path frame encoding/decoding
+_FRAME_STRUCT = struct.Struct('<IQI')       # frame header: total_len(u32) + rid(u64) + flags(u32)
+_U64_STRUCT = struct.Struct('<Q')           # SHM data size (u64)
+_U32_STRUCT = struct.Struct('<I')           # error_len in reply header, segment_size in handshake
+
 SHM_GC_INTERVAL = 30.0                      # seconds
 SHM_MAX_AGE = 120.0                         # seconds before GC considers a segment leaked
 
@@ -101,10 +106,74 @@ def _encode_frame(request_id: int, flags: int, payload: bytes | bytearray | memo
             f'use SHM transport for payloads > {0xFFFFFFFF - 12} bytes'
         )
     buf = bytearray(4 + total_len)
-    struct.pack_into('<I', buf, 0, total_len)
-    struct.pack_into('<Q', buf, 4, request_id)
-    struct.pack_into('<I', buf, 12, flags)
+    _FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, flags)
     buf[16:16 + payload_len] = payload
+    return bytes(buf)
+
+
+def _encode_inline_call_frame(
+    request_id: int,
+    method_name: str,
+    args: bytes | memoryview,
+    call_header_cache: dict[str, bytes],
+) -> bytes:
+    """Single-allocation frame for inline CRM_CALL (eliminates encode_call + _encode_frame double copy)."""
+    cached_header = call_header_cache.get(method_name)
+    method_bytes: bytes | None = None
+    if cached_header is not None:
+        call_header_len = len(cached_header)
+    else:
+        method_bytes = method_name.encode('utf-8')
+        call_header_len = 3 + len(method_bytes)
+
+    args_len = len(args) if args else 0
+    wire_len = call_header_len + args_len
+    total_len = 12 + wire_len
+    buf = bytearray(4 + total_len)
+
+    # Frame header (16 bytes)
+    _FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, 0)
+
+    # Wire call message — directly into frame buffer
+    off = 16
+    if cached_header is not None:
+        buf[off:off + call_header_len] = cached_header
+    else:
+        buf[off] = MsgType.CRM_CALL
+        struct.pack_into('<H', buf, off + 1, len(method_bytes))
+        buf[off + 3:off + 3 + len(method_bytes)] = method_bytes
+
+    if args_len > 0:
+        buf[off + call_header_len:off + call_header_len + args_len] = args
+
+    return bytes(buf)
+
+
+def _encode_inline_reply_frame(
+    request_id: int,
+    flags: int,
+    err_bytes: bytes | memoryview,
+    result_bytes: bytes | memoryview,
+) -> bytes:
+    """Single-allocation frame for inline CRM_REPLY (eliminates encode_reply + _encode_frame double copy)."""
+    err_len = len(err_bytes) if err_bytes else 0
+    result_len = len(result_bytes) if result_bytes else 0
+    wire_len = 5 + err_len + result_len  # 1B type + 4B error_len + error + result
+    total_len = 12 + wire_len
+    buf = bytearray(4 + total_len)
+
+    # Frame header
+    _FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, flags)
+
+    # Wire reply message — directly into frame buffer
+    off = 16
+    buf[off] = MsgType.CRM_REPLY
+    _U32_STRUCT.pack_into(buf, off + 1, err_len)
+    if err_len > 0:
+        buf[off + 5:off + 5 + err_len] = err_bytes
+    if result_len > 0:
+        buf[off + 5 + err_len:off + 5 + err_len + result_len] = result_bytes
+
     return bytes(buf)
 
 
@@ -112,8 +181,7 @@ def _decode_frame(body: bytes) -> tuple[int, int, bytes]:
     body_len = len(body)
     if body_len < 12:
         raise error.EventDeserializeError(f'Frame body too small: {body_len} < 12')
-    request_id = struct.unpack_from('<Q', body, 0)[0]
-    flags = struct.unpack_from('<I', body, 8)[0]
+    request_id, flags = _U64_STRUCT.unpack_from(body, 0)[0], _U32_STRUCT.unpack_from(body, 8)[0]
     payload = body[12:]
     return request_id, flags, payload
 
@@ -196,7 +264,7 @@ def _read_from_pool_shm(
 async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
     """Read a frame, returning (request_id, flags, payload) directly."""
     header = await reader.readexactly(16)  # 4B total_len + 8B rid + 4B flags
-    total_len, request_id, flags = struct.unpack('<IQI', header)
+    total_len, request_id, flags = _FRAME_STRUCT.unpack(header)
 
     # S2: reject oversized or undersized frames before allocation
     if total_len < 12:
@@ -320,7 +388,7 @@ class IPCv2Server(BaseServer):
             pool_shm = self._conn_pool_shm.get(conn_id)
             if pool_shm is not None and total_wire <= pool_shm.size:
                 write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
-                payload = struct.pack('<Q', total_wire)
+                payload = _U64_STRUCT.pack(total_wire)
                 flags |= _FLAG_POOL
 
         if not (flags & _FLAG_POOL):
@@ -329,11 +397,19 @@ class IPCv2Server(BaseServer):
                 shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total_wire)
                 write_reply_into(shm.buf, 0, err_bytes, result_bytes)
                 shm.close()
-                size_header = struct.pack('<Q', total_wire)
+                size_header = _U64_STRUCT.pack(total_wire)
                 payload = shm_name.encode('utf-8') + b'\x00' + size_header
                 flags |= _FLAG_SHM
             else:
-                payload = encode_reply(err_bytes, result_bytes)
+                # Inline: single-alloc frame (eliminates encode_reply + _encode_frame double copy)
+                frame = _encode_inline_reply_frame(int_rid, flags, err_bytes, result_bytes)
+                with self._pending_lock:
+                    fut = self._pending.pop(request_id, None)
+                if fut is not None and self._loop is not None:
+                    self._loop.call_soon_threadsafe(fut.set_result, (frame, None))
+                else:
+                    logger.warning(f'IPCv2Server.reply: no pending future for request_id={request_id}')
+                return
 
         frame = _encode_frame(int_rid, flags, payload)
 
@@ -531,7 +607,7 @@ class IPCv2Server(BaseServer):
                         raise error.EventDeserializeError(
                             'Pool SHM frame received but no pool handshake was done'
                         )
-                    size = struct.unpack('<Q', payload[:8])[0]
+                    size = _U64_STRUCT.unpack(payload[:8])[0]
                     if size > pool_segment_size:
                         raise error.EventDeserializeError(
                             f'Pool payload size {size} exceeds segment size {pool_segment_size}'
@@ -546,7 +622,7 @@ class IPCv2Server(BaseServer):
                     shm_name = parts[0].decode('utf-8')
                     if not _SHM_NAME_RE.match(shm_name):
                         raise error.EventDeserializeError(f'Invalid SHM name format: {shm_name!r}')
-                    size = struct.unpack('<Q', parts[1])[0]
+                    size = _U64_STRUCT.unpack(parts[1])[0]
                     # S4: validate SHM payload size against config limit
                     if size > self._config.max_payload_size:
                         raise error.EventDeserializeError(
