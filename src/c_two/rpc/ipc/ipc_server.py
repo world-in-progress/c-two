@@ -55,7 +55,7 @@ _POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z]_[0-9a-f]{12}$')
 
 DEFAULT_SHM_THRESHOLD = 4_096               # 4 KB — pool wins above this (benchmark 2026-03)
 DEFAULT_MAX_FRAME_SIZE = 16_777_216         # 16 MB — inline frame upper bound
-DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_296    # 4 GB — SHM payload upper bound
+DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_283    # uint32_max - 12 (header) — SHM payload upper bound
 DEFAULT_MAX_PENDING_REQUESTS = 1024         # per-server total
 DEFAULT_POOL_SEGMENT_SIZE = 268_435_456     # 256 MB — per-connection pool SHM segment
 
@@ -294,21 +294,22 @@ class IPCv2Server(BaseServer):
         conn_id = int(request_id.rsplit(':', 1)[0])
         with self._conn_shm_lock:
             pool_shm = self._conn_pool_shm.get(conn_id)
+            if pool_shm is not None and total_wire <= pool_shm.size:
+                write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
+                payload = struct.pack('<Q', total_wire)
+                flags |= _FLAG_POOL
 
-        if pool_shm is not None and total_wire <= pool_shm.size:
-            write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
-            payload = struct.pack('<Q', total_wire)
-            flags |= _FLAG_POOL
-        elif total_wire >= self._config.shm_threshold:
-            shm_name = _shm_name(self.region_id, request_id, 'resp')
-            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total_wire)
-            write_reply_into(shm.buf, 0, err_bytes, result_bytes)
-            shm.close()
-            size_header = struct.pack('<Q', total_wire)
-            payload = shm_name.encode('utf-8') + b'\x00' + size_header
-            flags |= _FLAG_SHM
-        else:
-            payload = encode_reply(err_bytes, result_bytes)
+        if not (flags & _FLAG_POOL):
+            if total_wire >= self._config.shm_threshold:
+                shm_name = _shm_name(self.region_id, request_id, 'resp')
+                shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total_wire)
+                write_reply_into(shm.buf, 0, err_bytes, result_bytes)
+                shm.close()
+                size_header = struct.pack('<Q', total_wire)
+                payload = shm_name.encode('utf-8') + b'\x00' + size_header
+                flags |= _FLAG_SHM
+            else:
+                payload = encode_reply(err_bytes, result_bytes)
 
         frame = _encode_frame(int_rid, flags, payload)
 
@@ -455,6 +456,13 @@ class IPCv2Server(BaseServer):
                 if flags & _FLAG_HANDSHAKE:
                     try:
                         client_shm_name, seg_size = decode_handshake(payload)
+
+                        # Validate client-provided SHM name and segment size
+                        if not _POOL_SHM_NAME_RE.match(client_shm_name):
+                            raise ValueError(f'Invalid pool SHM name: {client_shm_name!r}')
+                        if seg_size == 0:
+                            raise ValueError('Pool segment size must be > 0')
+
                         seg_size = min(seg_size, self._config.pool_segment_size)
 
                         # Clean up old pool SHM if this is a re-handshake

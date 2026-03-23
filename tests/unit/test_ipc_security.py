@@ -206,7 +206,8 @@ class TestIPCConfigDefaults:
         assert DEFAULT_MAX_FRAME_SIZE == 16 * 1024 * 1024  # 16 MB
 
     def test_max_payload_size_default_reasonable(self):
-        assert DEFAULT_MAX_PAYLOAD_SIZE == 4 * 1024 * 1024 * 1024  # 4 GB
+        # uint32_max - 12 (frame header) to avoid overflow in _encode_frame
+        assert DEFAULT_MAX_PAYLOAD_SIZE == 0xFFFFFFFF - 12
 
     def test_max_pending_default_reasonable(self):
         assert DEFAULT_MAX_PENDING_REQUESTS == 1024
