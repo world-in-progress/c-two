@@ -68,6 +68,7 @@ class IPCConfig:
     max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
     pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
     pool_enabled: bool = True
+    pool_decay_seconds: float = 60.0  # idle time before pool SHM teardown (0 = no decay)
 
 
 def _shm_name(region_id: str, request_id: str, direction: str) -> str:
@@ -455,6 +456,12 @@ class IPCv2Server(BaseServer):
                     try:
                         client_shm_name, seg_size = decode_handshake(payload)
                         seg_size = min(seg_size, self._config.pool_segment_size)
+
+                        # Clean up old pool SHM if this is a re-handshake
+                        if pool_shm is not None:
+                            with self._conn_shm_lock:
+                                self._conn_pool_shm.pop(conn_id, None)
+                            close_pool_shm(pool_shm)
 
                         # Open client's SHM for both reading requests and writing responses
                         pool_shm = shared_memory.SharedMemory(

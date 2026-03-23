@@ -14,6 +14,7 @@ import socket as _socket
 import struct
 import tempfile
 import threading
+import time
 from multiprocessing import shared_memory
 
 from ... import error
@@ -117,6 +118,7 @@ class IPCv2Client(BaseClient):
         # Unified: single SHM for both request writes and response reads
         self._pool_shm: shared_memory.SharedMemory | None = None  # we created (owner)
         self._pool_segment_size: int = 0
+        self._pool_last_used: float = 0.0  # monotonic timestamp of last pool access
 
     # ------------------------------------------------------------------
     # Persistent connection management
@@ -160,6 +162,7 @@ class IPCv2Client(BaseClient):
 
         _, resp_seg_size = decode_handshake(resp_payload)
         self._pool_segment_size = min(seg_size, resp_seg_size)
+        self._pool_last_used = time.monotonic()
 
     def _ensure_connection(self) -> _socket.socket:
         if self._sock is not None:
@@ -181,6 +184,38 @@ class IPCv2Client(BaseClient):
         close_pool_shm(self._pool_shm, unlink=True)  # we created it
         self._pool_shm = None
         self._pool_segment_size = 0
+        self._pool_last_used = 0.0
+
+    def _maybe_decay_pool(self) -> None:
+        """Tear down pool SHM if idle beyond pool_decay_seconds.
+
+        Called at the start of call()/relay(). If the pool has been idle
+        too long, we release the SHM now. A subsequent large-payload call
+        will trigger a re-handshake via _ensure_pool().
+        """
+        decay = self._config.pool_decay_seconds
+        if decay <= 0 or self._pool_shm is None:
+            return
+        if time.monotonic() - self._pool_last_used > decay:
+            logger.debug('Pool SHM idle > %.0fs, tearing down', decay)
+            self._cleanup_pool()
+
+    def _ensure_pool(self, sock: _socket.socket) -> bool:
+        """Re-handshake to rebuild the pool if it was decayed.
+
+        Returns True if pool is available after this call.
+        """
+        if self._pool_shm is not None:
+            return True
+        if not self._config.pool_enabled:
+            return False
+        try:
+            self._do_pool_handshake(sock)
+            return True
+        except Exception as exc:
+            logger.warning('IPC v2 pool re-handshake failed: %s', exc)
+            self._cleanup_pool()
+            return False
 
     # ------------------------------------------------------------------
     # Core send/recv — raw synchronous socket, persistent connection
@@ -202,6 +237,7 @@ class IPCv2Client(BaseClient):
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         self._read_buf.maybe_decay()
+        self._maybe_decay_pool()
 
         request_id = self._next_rid
         self._next_rid += 1
@@ -210,6 +246,17 @@ class IPCv2Client(BaseClient):
         flags = 0
 
         estimated_wire_size = call_wire_size(len(method_bytes), len(args))
+
+        # Lazy re-handshake if pool was decayed but a large call needs it
+        if (
+            estimated_wire_size >= self._config.shm_threshold
+            and self._pool_shm is None
+            and self._config.pool_enabled
+            and self._sock is not None
+        ):
+            with self._conn_lock:
+                if self._pool_shm is None and self._sock is not None:
+                    self._ensure_pool(self._sock)
 
         if (
             estimated_wire_size >= self._config.shm_threshold
@@ -224,6 +271,7 @@ class IPCv2Client(BaseClient):
                 raise error.CompoSerializeInput(f'Error writing request to pool SHM: {e}')
             payload = struct.pack('<Q', estimated_wire_size)
             flags |= _FLAG_POOL
+            self._pool_last_used = time.monotonic()
         elif estimated_wire_size >= self._config.shm_threshold:
             # Fallback: per-request SHM (legacy path)
             shm_name = _shm_name(self.region_id, str(request_id), 'req')
@@ -288,10 +336,23 @@ class IPCv2Client(BaseClient):
         return env.payload if env.payload is not None else b''
 
     def relay(self, event_bytes: bytes) -> bytes:
+        self._maybe_decay_pool()
+
         request_id = self._next_rid
         self._next_rid += 1
         flags = 0
         data_len = len(event_bytes)
+
+        # Lazy re-handshake if pool was decayed but a large relay needs it
+        if (
+            data_len >= self._config.shm_threshold
+            and self._pool_shm is None
+            and self._config.pool_enabled
+            and self._sock is not None
+        ):
+            with self._conn_lock:
+                if self._pool_shm is None and self._sock is not None:
+                    self._ensure_pool(self._sock)
 
         if (
             data_len >= self._config.shm_threshold
@@ -302,6 +363,7 @@ class IPCv2Client(BaseClient):
             self._pool_shm.buf[:data_len] = event_bytes
             payload = struct.pack('<Q', data_len)
             flags |= _FLAG_POOL
+            self._pool_last_used = time.monotonic()
         elif data_len >= self._config.shm_threshold:
             shm_name = _shm_name(self.region_id, str(request_id), 'relay')
             shm = _write_shm(shm_name, event_bytes)

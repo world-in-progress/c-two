@@ -203,3 +203,74 @@ class TestIPCv2EdgeCases:
 
     def test_shutdown_nonexistent(self):
         assert cc.rpc.Client.shutdown('ipc-v2://nonexistent_server_xyz', timeout=0.3) is True
+
+
+class TestIPCv2PoolDecay:
+    """Pool SHM idle decay and re-handshake tests."""
+
+    def test_pool_decay_and_rehandshake(self, ipc_address):
+        """Pool should be torn down after idle timeout, rebuilt on demand."""
+        decay_config = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=4 * 1024 * 1024,
+            pool_decay_seconds=0.5,
+        )
+        server = _start_server(ipc_address, ipc_config=decay_config)
+        try:
+            # First call — establishes pool
+            with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=decay_config) as crm:
+                assert crm.greeting('before') == 'Hello, before!'
+
+            # Wait beyond decay timeout
+            time.sleep(0.8)
+
+            # Second call — pool decayed, triggers re-handshake
+            with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=decay_config) as crm:
+                assert crm.greeting('after') == 'Hello, after!'
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_pool_decay_mid_session(self, ipc_address):
+        """Pool decay during a persistent connection with multiple calls."""
+        decay_config = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=4 * 1024 * 1024,
+            pool_decay_seconds=0.3,
+        )
+        server = _start_server(ipc_address, ipc_config=decay_config)
+        try:
+            # 3 calls, with decay window between 2nd and 3rd
+            with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=decay_config) as crm:
+                assert crm.greeting('c1') == 'Hello, c1!'
+                assert crm.greeting('c2') == 'Hello, c2!'
+                time.sleep(0.5)  # trigger decay on next call
+                assert crm.greeting('c3') == 'Hello, c3!'
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_pool_decay_disabled(self, ipc_address):
+        """pool_decay_seconds=0 should keep pool alive indefinitely."""
+        no_decay_config = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=4 * 1024 * 1024,
+            pool_decay_seconds=0,
+        )
+        server = _start_server(ipc_address, ipc_config=no_decay_config)
+        try:
+            with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=no_decay_config) as crm:
+                assert crm.greeting('a') == 'Hello, a!'
+                time.sleep(0.5)
+                # Should still work without re-handshake (no decay)
+                assert crm.greeting('b') == 'Hello, b!'
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_unified_pool_single_shm(self, ipc_address):
+        """Unified bidirectional pool uses a single SHM per connection."""
+        config = IPCConfig(shm_threshold=16, pool_segment_size=4 * 1024 * 1024)
+        server = _start_server(ipc_address, ipc_config=config)
+        try:
+            with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=config) as crm:
+                assert crm.greeting('unified') == 'Hello, unified!'
+        finally:
+            _shutdown(ipc_address, server)
