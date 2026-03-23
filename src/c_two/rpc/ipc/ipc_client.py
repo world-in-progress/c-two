@@ -224,14 +224,18 @@ class IPCv2Client(BaseClient):
     def _send_recv_locked(self, request_id: int, flags: int, payload: bytes) -> tuple[int, int, bytes]:
         """Send frame and receive response. Caller MUST hold _conn_lock."""
         frame = _encode_frame(request_id, flags, payload)
-        for attempt in range(2):
+        # Pool-path frames reference data in pool SHM which is destroyed on
+        # reconnect — retry would send a stale frame reading from a zeroed
+        # or different SHM segment.  Only retry for inline / per-request SHM.
+        max_attempts = 1 if (flags & _FLAG_POOL) else 2
+        for attempt in range(max_attempts):
             try:
                 sock = self._ensure_connection()
                 _send_frame_sync(sock, frame)
                 return _recv_frame_sync(sock, self._config.max_frame_size)
             except (ConnectionError, BrokenPipeError, OSError):
                 self._close_connection()
-                if attempt == 1:
+                if attempt == max_attempts - 1:
                     raise
         raise error.CompoClientError('IPC v2 connection failed after retry')
 

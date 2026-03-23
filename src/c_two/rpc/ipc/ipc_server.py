@@ -70,6 +70,19 @@ class IPCConfig:
     pool_enabled: bool = True
     pool_decay_seconds: float = 60.0  # idle time before pool SHM teardown (0 = no decay)
 
+    def __post_init__(self) -> None:
+        if self.pool_segment_size > 0xFFFFFFFF:
+            raise ValueError(
+                f'pool_segment_size {self.pool_segment_size} exceeds uint32 max '
+                f'(handshake wire format is uint32)'
+            )
+        if self.pool_segment_size <= 0:
+            raise ValueError('pool_segment_size must be > 0')
+        if self.max_frame_size <= 16:
+            raise ValueError('max_frame_size must be > 16 (header size)')
+        if self.max_payload_size <= 0:
+            raise ValueError('max_payload_size must be > 0')
+
 
 def _shm_name(region_id: str, request_id: str, direction: str) -> str:
     # macOS limits POSIX SHM names to 31 chars (excluding leading /)
@@ -124,15 +137,15 @@ def _fast_read_shm(
     if adaptive_buf is None:
         adaptive_buf = AdaptiveBuffer()
 
-    buf = adaptive_buf.acquire(size)
-
     shm = shared_memory.SharedMemory(name=name, create=False, track=False)
     try:
-        # Validate SHM actual size covers the declared size
+        # Validate SHM actual size covers the declared size BEFORE allocating
         if shm.size < size:
             raise error.EventDeserializeError(
                 f'SHM segment {name!r} actual size {shm.size} < declared size {size}'
             )
+
+        buf = adaptive_buf.acquire(size)
 
         if size >= _FAST_READ_THRESHOLD:
             ctypes.memmove(
@@ -160,6 +173,11 @@ def _read_from_pool_shm(
     """
     if adaptive_buf is None:
         adaptive_buf = AdaptiveBuffer()
+
+    if size > len(shm_buf):
+        raise error.EventDeserializeError(
+            f'Pool read size {size} exceeds SHM buffer length {len(shm_buf)}'
+        )
 
     buf = adaptive_buf.acquire(size)
 
@@ -481,7 +499,8 @@ class IPCv2Server(BaseServer):
                         pool_shm = shared_memory.SharedMemory(
                             name=client_shm_name, create=False, track=False,
                         )
-                        pool_segment_size = seg_size
+                        # Cap negotiated size to actual SHM size (don't trust client declaration)
+                        pool_segment_size = min(seg_size, pool_shm.size)
 
                         # Register for reply() access from scheduler thread
                         with self._conn_shm_lock:
@@ -618,9 +637,11 @@ class IPCv2Server(BaseServer):
             _read_buf.release()
             self._client_tasks.discard(task)
             # Clean up pool SHM for this connection (close handle, client unlinks)
-            close_pool_shm(pool_shm)
+            # Pop from dict FIRST so reply() won't find the stale handle,
+            # then close the SHM handle outside the lock.
             with self._conn_shm_lock:
                 self._conn_pool_shm.pop(conn_id, None)
+            close_pool_shm(pool_shm)
 
     async def _shm_gc_loop(self) -> None:
         while True:
