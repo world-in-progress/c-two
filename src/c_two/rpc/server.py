@@ -315,9 +315,16 @@ class _Scheduler:
         try:
             response = future.result()
             if isinstance(response, tuple):
+                # Materialize any memoryview parts to bytes so they don't
+                # alias a shared buffer (e.g. pool SHM) that reply() may
+                # overwrite when writing the response back.
+                parts = [
+                    p.tobytes() if isinstance(p, memoryview) else p
+                    for p in response
+                ]
                 event = Event(
                     tag=EventTag.CRM_REPLY,
-                    data_parts=list(response),
+                    data_parts=parts,
                     request_id=request_id,
                 )
             else:
