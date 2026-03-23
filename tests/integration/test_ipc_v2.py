@@ -32,6 +32,8 @@ def _start_server(address, concurrency=None, ipc_config=None):
     )
     if concurrency:
         kwargs['concurrency'] = concurrency
+    if ipc_config:
+        kwargs['ipc_config'] = ipc_config
 
     server = Server(ServerConfig(**kwargs))
     _start(server._state)
@@ -107,6 +109,40 @@ class TestIPCv2SharedMemory:
             with cc.compo.runtime.connect_crm(ipc_address, IHello) as crm:
                 result = crm.greeting('world')
             assert result == 'Hello, world!'
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_pool_shm_path(self, ipc_address):
+        """Lower SHM threshold to force pool SHM usage for normal payloads."""
+        low_threshold_config = IPCConfig(shm_threshold=16, pool_segment_size=4 * 1024 * 1024)
+        server = _start_server(ipc_address, ipc_config=low_threshold_config)
+        try:
+            with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=low_threshold_config) as crm:
+                result = crm.greeting('pool')
+            assert result == 'Hello, pool!'
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_pool_shm_multiple_calls(self, ipc_address):
+        """Multiple calls reusing pool SHM segments."""
+        low_threshold_config = IPCConfig(shm_threshold=16, pool_segment_size=4 * 1024 * 1024)
+        server = _start_server(ipc_address, ipc_config=low_threshold_config)
+        try:
+            for i in range(10):
+                with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=low_threshold_config) as crm:
+                    result = crm.greeting(f'pool_{i}')
+                assert result == f'Hello, pool_{i}!'
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_pool_disabled_fallback(self, ipc_address):
+        """With pool disabled, should fall back to per-request SHM."""
+        no_pool_config = IPCConfig(shm_threshold=16, pool_enabled=False)
+        server = _start_server(ipc_address, ipc_config=no_pool_config)
+        try:
+            with cc.compo.runtime.connect_crm(ipc_address, IHello, ipc_config=no_pool_config) as crm:
+                result = crm.greeting('fallback')
+            assert result == 'Hello, fallback!'
         finally:
             _shutdown(ipc_address, server)
 
