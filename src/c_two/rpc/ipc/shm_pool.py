@@ -1,12 +1,13 @@
 """Pre-allocated SharedMemory management for IPC v2 transport.
 
 Eliminates per-RPC shm_open/ftruncate/mmap/munmap/shm_unlink syscalls
-by pre-allocating SHM segments during connection handshake and reusing
-them for the lifetime of the connection.
+by pre-allocating a single SHM segment during connection handshake and
+reusing it for the lifetime of the connection.
 
-Each connection gets a pair of fixed SHM segments:
-- C→S: client creates (writes), server opens (reads)
-- S→C: server creates (writes), client opens (reads)
+Each connection gets **one** shared SHM segment (unified bidirectional):
+- Client creates and owns (unlinks on disconnect)
+- Server opens the same segment with track=False
+- Synchronous RPC guarantees requests and responses never coexist
 
 If payload exceeds the segment size, falls back to per-request SHM.
 """

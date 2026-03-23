@@ -53,7 +53,7 @@ SHM_MAX_AGE = 120.0                         # seconds before GC considers a segm
 _SHM_NAME_RE = re.compile(r'^cc[a-z]_[0-9a-f]{16}$')
 _POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z]_[0-9a-f]{12}$')
 
-DEFAULT_SHM_THRESHOLD = 1_048_576           # 1 MB — aligned with inline threshold
+DEFAULT_SHM_THRESHOLD = 4_096               # 4 KB — pool wins above this (benchmark 2026-03)
 DEFAULT_MAX_FRAME_SIZE = 16_777_216         # 16 MB — inline frame upper bound
 DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_296    # 4 GB — SHM payload upper bound
 DEFAULT_MAX_PENDING_REQUESTS = 1024         # per-server total
@@ -218,9 +218,10 @@ class IPCv2Server(BaseServer):
         self._our_shm_segments: dict[str, float] = {}
         self._shm_lock = threading.Lock()
 
-        # Per-connection pool SHM for responses (conn_id → SharedMemory)
+        # Per-connection pool SHM (conn_id → SharedMemory)
+        # Unified: client-created SHM used for both request reads and response writes.
         # Written by reply() (scheduler thread), read by _handle_client (asyncio thread)
-        self._conn_resp_shm: dict[int, shared_memory.SharedMemory] = {}
+        self._conn_pool_shm: dict[int, shared_memory.SharedMemory] = {}
         self._conn_shm_lock = threading.Lock()
 
         # Track active client handler tasks for clean shutdown
@@ -291,10 +292,10 @@ class IPCv2Server(BaseServer):
         # Try pool SHM first (pre-allocated, zero syscalls)
         conn_id = int(request_id.rsplit(':', 1)[0])
         with self._conn_shm_lock:
-            resp_shm = self._conn_resp_shm.get(conn_id)
+            pool_shm = self._conn_pool_shm.get(conn_id)
 
-        if resp_shm is not None and total_wire <= resp_shm.size:
-            write_reply_into(resp_shm.buf, 0, err_bytes, result_bytes)
+        if pool_shm is not None and total_wire <= pool_shm.size:
+            write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
             payload = struct.pack('<Q', total_wire)
             flags |= _FLAG_POOL
         elif total_wire >= self._config.shm_threshold:
@@ -340,12 +341,12 @@ class IPCv2Server(BaseServer):
                     pass
             self._our_shm_segments.clear()
 
-        # Clean up any pool response SHM segments still registered
+        # Close pool SHM handles (client owns and unlinks these)
         from .shm_pool import close_pool_shm
         with self._conn_shm_lock:
-            for resp_shm in self._conn_resp_shm.values():
-                close_pool_shm(resp_shm, unlink=True)
-            self._conn_resp_shm.clear()
+            for pool_shm in self._conn_pool_shm.values():
+                close_pool_shm(pool_shm)
+            self._conn_pool_shm.clear()
 
         with self._pending_lock:
             self._pending.clear()
@@ -410,10 +411,7 @@ class IPCv2Server(BaseServer):
             self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        from .shm_pool import (
-            close_pool_shm, create_pool_shm, decode_handshake, encode_handshake,
-            pool_shm_name,
-        )
+        from .shm_pool import close_pool_shm, decode_handshake, encode_handshake
 
         task = asyncio.current_task()
         self._client_tasks.add(task)
@@ -426,8 +424,7 @@ class IPCv2Server(BaseServer):
         conn_request_ids: set[str] = set()  # S5: track per-connection request IDs
 
         # Pool state for this connection (set during handshake)
-        client_req_shm: shared_memory.SharedMemory | None = None  # reader handle
-        our_resp_shm: shared_memory.SharedMemory | None = None    # writer handle
+        pool_shm: shared_memory.SharedMemory | None = None  # unified bidirectional
         pool_segment_size: int = 0
 
         # P2: event-driven shutdown — no polling timeout
@@ -453,30 +450,24 @@ class IPCv2Server(BaseServer):
                 except (asyncio.IncompleteReadError, ConnectionResetError):
                     break
 
-                # ---- Pool handshake ----
+                # ---- Pool handshake (unified bidirectional) ----
                 if flags & _FLAG_HANDSHAKE:
                     try:
-                        client_req_name, seg_size = decode_handshake(payload)
+                        client_shm_name, seg_size = decode_handshake(payload)
                         seg_size = min(seg_size, self._config.pool_segment_size)
 
-                        # Open client's pre-allocated request SHM
-                        client_req_shm = shared_memory.SharedMemory(
-                            name=client_req_name, create=False, track=False,
+                        # Open client's SHM for both reading requests and writing responses
+                        pool_shm = shared_memory.SharedMemory(
+                            name=client_shm_name, create=False, track=False,
                         )
-
-                        # Create our response SHM for this connection
-                        resp_name = pool_shm_name(
-                            self.region_id, conn_id, 'resp',
-                        )
-                        our_resp_shm = create_pool_shm(resp_name, seg_size)
                         pool_segment_size = seg_size
 
                         # Register for reply() access from scheduler thread
                         with self._conn_shm_lock:
-                            self._conn_resp_shm[conn_id] = our_resp_shm
+                            self._conn_pool_shm[conn_id] = pool_shm
 
-                        # Send handshake response
-                        hs_payload = encode_handshake(resp_name, seg_size)
+                        # Send ACK with empty name → signals unified mode
+                        hs_payload = encode_handshake('', seg_size)
                         hs_frame = _encode_frame(
                             0, _FLAG_HANDSHAKE | _FLAG_RESPONSE, hs_payload,
                         )
@@ -486,11 +477,8 @@ class IPCv2Server(BaseServer):
                             'IPCv2Server: pool handshake failed for conn %d: %s',
                             conn_id, exc,
                         )
-                        # Fall back to non-pool mode for this connection
-                        close_pool_shm(client_req_shm)
-                        close_pool_shm(our_resp_shm, unlink=True)
-                        client_req_shm = None
-                        our_resp_shm = None
+                        close_pool_shm(pool_shm)
+                        pool_shm = None
                         pool_segment_size = 0
                     continue
 
@@ -498,8 +486,8 @@ class IPCv2Server(BaseServer):
 
                 # ---- Decode request data ----
                 if flags & _FLAG_POOL:
-                    # Pool path: read from pre-opened client request SHM
-                    if client_req_shm is None or len(payload) < 8:
+                    # Pool path: read from unified pool SHM
+                    if pool_shm is None or len(payload) < 8:
                         raise error.EventDeserializeError(
                             'Pool SHM frame received but no pool handshake was done'
                         )
@@ -509,7 +497,7 @@ class IPCv2Server(BaseServer):
                             f'Pool payload size {size} exceeds segment size {pool_segment_size}'
                         )
                     event_bytes, _read_buf = _read_from_pool_shm(
-                        client_req_shm.buf, size, _read_buf,
+                        pool_shm.buf, size, _read_buf,
                     )
                 elif flags & _FLAG_SHM:
                     parts = payload.split(b'\x00', 1)
@@ -608,11 +596,10 @@ class IPCv2Server(BaseServer):
                 self._conn_buffers.discard(_read_buf)
             _read_buf.release()
             self._client_tasks.discard(task)
-            # Clean up pool SHM for this connection
-            close_pool_shm(client_req_shm)  # close our reader handle (client unlinks)
+            # Clean up pool SHM for this connection (close handle, client unlinks)
+            close_pool_shm(pool_shm)
             with self._conn_shm_lock:
-                self._conn_resp_shm.pop(conn_id, None)
-            close_pool_shm(our_resp_shm, unlink=True)  # we created it, so unlink
+                self._conn_pool_shm.pop(conn_id, None)
 
     async def _shm_gc_loop(self) -> None:
         while True:

@@ -114,8 +114,8 @@ class IPCv2Client(BaseClient):
         self._next_rid: int = 0
 
         # Pool SHM state (set during handshake, cleared on disconnect)
-        self._pool_req_shm: shared_memory.SharedMemory | None = None   # we created (writer)
-        self._pool_resp_shm: shared_memory.SharedMemory | None = None  # server created (reader)
+        # Unified: single SHM for both request writes and response reads
+        self._pool_shm: shared_memory.SharedMemory | None = None  # we created (owner)
         self._pool_segment_size: int = 0
 
     # ------------------------------------------------------------------
@@ -141,28 +141,25 @@ class IPCv2Client(BaseClient):
         return sock
 
     def _do_pool_handshake(self, sock: _socket.socket) -> None:
-        """Exchange pool SHM metadata with the server."""
+        """Exchange pool SHM metadata with the server (unified bidirectional)."""
         seg_size = self._config.pool_segment_size
 
-        # Create our request pool SHM segment
-        req_name = _client_pool_shm_name(self.region_id)
-        self._pool_req_shm = create_pool_shm(req_name, seg_size)
+        # Create our pool SHM segment (used for both directions)
+        shm_name = _client_pool_shm_name(self.region_id)
+        self._pool_shm = create_pool_shm(shm_name, seg_size)
 
         # Send handshake frame
-        hs_payload = encode_handshake(req_name, seg_size)
+        hs_payload = encode_handshake(shm_name, seg_size)
         hs_frame = _encode_frame(0, _FLAG_HANDSHAKE, hs_payload)
         _send_frame_sync(sock, hs_frame)
 
-        # Receive server's handshake response
+        # Receive server's ACK (empty name → unified mode)
         _, resp_flags, resp_payload = _recv_frame_sync(sock, self._config.max_frame_size)
         if not (resp_flags & _FLAG_HANDSHAKE):
             raise error.CompoClientError('Expected pool handshake response from server')
 
-        resp_name, resp_seg_size = decode_handshake(resp_payload)
+        _, resp_seg_size = decode_handshake(resp_payload)
         self._pool_segment_size = min(seg_size, resp_seg_size)
-
-        # Open server's response pool SHM segment (read-only, server owns lifecycle)
-        self._pool_resp_shm = shared_memory.SharedMemory(name=resp_name, create=False, track=False)
 
     def _ensure_connection(self) -> _socket.socket:
         if self._sock is not None:
@@ -181,10 +178,8 @@ class IPCv2Client(BaseClient):
 
     def _cleanup_pool(self) -> None:
         """Release pool SHM resources."""
-        close_pool_shm(self._pool_req_shm, unlink=True)  # we created it
-        self._pool_req_shm = None
-        close_pool_shm(self._pool_resp_shm)  # server created, just close handle
-        self._pool_resp_shm = None
+        close_pool_shm(self._pool_shm, unlink=True)  # we created it
+        self._pool_shm = None
         self._pool_segment_size = 0
 
     # ------------------------------------------------------------------
@@ -218,13 +213,13 @@ class IPCv2Client(BaseClient):
 
         if (
             estimated_wire_size >= self._config.shm_threshold
-            and self._pool_req_shm is not None
+            and self._pool_shm is not None
             and estimated_wire_size <= self._pool_segment_size
         ):
             # Pool path: write into pre-allocated SHM (zero syscalls)
             try:
                 from ..util.wire import write_call_into
-                write_call_into(self._pool_req_shm.buf, 0, method_name, args)
+                write_call_into(self._pool_shm.buf, 0, method_name, args)
             except Exception as e:
                 raise error.CompoSerializeInput(f'Error writing request to pool SHM: {e}')
             payload = struct.pack('<Q', estimated_wire_size)
@@ -254,8 +249,8 @@ class IPCv2Client(BaseClient):
             raise error.CompoClientError(f'IPC v2 call failed: {exc}') from exc
 
         if resp_flags & _FLAG_POOL:
-            # Pool path: read from pre-opened server response SHM
-            if self._pool_resp_shm is None or len(resp_payload) < 8:
+            # Pool path: read from unified pool SHM (server wrote response here)
+            if self._pool_shm is None or len(resp_payload) < 8:
                 raise error.EventDeserializeError(
                     'Pool SHM response received but no pool handshake was done'
                 )
@@ -265,7 +260,7 @@ class IPCv2Client(BaseClient):
                     f'Pool response size {size} exceeds segment size {self._pool_segment_size}'
                 )
             response_bytes, self._read_buf = _read_from_pool_shm(
-                self._pool_resp_shm.buf, size, self._read_buf,
+                self._pool_shm.buf, size, self._read_buf,
             )
         elif resp_flags & _FLAG_SHM:
             parts = resp_payload.split(b'\x00', 1)
@@ -300,11 +295,11 @@ class IPCv2Client(BaseClient):
 
         if (
             data_len >= self._config.shm_threshold
-            and self._pool_req_shm is not None
+            and self._pool_shm is not None
             and data_len <= self._pool_segment_size
         ):
             # Pool path: write raw bytes into pre-allocated SHM
-            self._pool_req_shm.buf[:data_len] = event_bytes
+            self._pool_shm.buf[:data_len] = event_bytes
             payload = struct.pack('<Q', data_len)
             flags |= _FLAG_POOL
         elif data_len >= self._config.shm_threshold:
@@ -323,13 +318,13 @@ class IPCv2Client(BaseClient):
             raise error.CompoClientError(f'IPC v2 relay failed: {exc}') from exc
 
         if resp_flags & _FLAG_POOL:
-            if self._pool_resp_shm is None or len(resp_payload) < 8:
+            if self._pool_shm is None or len(resp_payload) < 8:
                 raise error.EventDeserializeError(
                     'Pool SHM response received but no pool handshake was done'
                 )
             size = struct.unpack('<Q', resp_payload[:8])[0]
             data, self._read_buf = _read_from_pool_shm(
-                self._pool_resp_shm.buf, size, self._read_buf,
+                self._pool_shm.buf, size, self._read_buf,
             )
             return bytes(data)
 
