@@ -23,6 +23,7 @@ import re
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 
 from ... import error
@@ -51,6 +52,18 @@ logger = logging.getLogger(__name__)
 #     or pool format — ccp + direction char + _ + 12 hex chars (from pool_shm_name())
 _SHM_NAME_RE = re.compile(r'^cc[a-z]_[0-9a-f]{16}$')
 _POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z]_[0-9a-f]{12}$')
+
+
+@dataclass
+class _ClientContext:
+    """Per-connection state for _handle_client."""
+    conn_id: int
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    read_buf: AdaptiveBuffer = field(default_factory=AdaptiveBuffer)
+    conn_request_ids: set[str] = field(default_factory=set)
+    pool_shm: shared_memory.SharedMemory | None = None
+    pool_segment_size: int = 0
 
 
 async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
@@ -135,6 +148,15 @@ class IPCv2Server(BaseServer):
         EventTag.SHUTDOWN_ACK: MsgType.SHUTDOWN_ACK,
     }
 
+    def _resolve_pending(self, request_id: str, frame: bytes, shm_name_val: str | None = None) -> None:
+        """Pop pending future and deliver response frame to the event loop."""
+        with self._pending_lock:
+            fut = self._pending.pop(request_id, None)
+        if fut is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(fut.set_result, (frame, shm_name_val))
+        else:
+            logger.warning(f'IPCv2Server.reply: no pending future for request_id={request_id}')
+
     def reply(self, event: Event) -> None:
         if not event.request_id:
             logger.warning('IPCv2Server.reply: event missing request_id')
@@ -151,10 +173,7 @@ class IPCv2Server(BaseServer):
         if signal_type is not None:
             payload = encode_signal(signal_type)
             frame = encode_frame(int_rid, flags, payload)
-            with self._pending_lock:
-                fut = self._pending.pop(request_id, None)
-            if fut is not None and self._loop is not None:
-                self._loop.call_soon_threadsafe(fut.set_result, (frame, None))
+            self._resolve_pending(request_id, frame)
             return
 
         # CRM_REPLY: extract error and result from scheduler Event
@@ -195,23 +214,11 @@ class IPCv2Server(BaseServer):
             else:
                 # Inline: single-alloc frame (eliminates encode_reply + encode_frame double copy)
                 frame = encode_inline_reply_frame(int_rid, flags, err_bytes, result_bytes)
-                with self._pending_lock:
-                    fut = self._pending.pop(request_id, None)
-                if fut is not None and self._loop is not None:
-                    self._loop.call_soon_threadsafe(fut.set_result, (frame, None))
-                else:
-                    logger.warning(f'IPCv2Server.reply: no pending future for request_id={request_id}')
+                self._resolve_pending(request_id, frame)
                 return
 
         frame = encode_frame(int_rid, flags, payload)
-
-        with self._pending_lock:
-            fut = self._pending.pop(request_id, None)
-
-        if fut is not None and self._loop is not None:
-            self._loop.call_soon_threadsafe(fut.set_result, (frame, resp_shm_name))
-        else:
-            logger.warning(f'IPCv2Server.reply: no pending future for request_id={request_id}')
+        self._resolve_pending(request_id, frame, resp_shm_name)
 
     def shutdown(self) -> None:
         if self._loop is not None:
@@ -305,21 +312,16 @@ class IPCv2Server(BaseServer):
             self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        from .shm_pool import close_pool_shm, decode_handshake, encode_handshake
-
+        """Orchestrator for a single client connection lifecycle."""
         task = asyncio.current_task()
         self._client_tasks.add(task)
-        _read_buf: AdaptiveBuffer = AdaptiveBuffer()  # per-connection adaptive buffer
-        with self._conn_buffers_lock:
-            self._conn_buffers.add(_read_buf)
-        # Assign a unique connection ID so per-connection rid counters don't collide
+
         conn_id = self._next_conn_id
         self._next_conn_id += 1
-        conn_request_ids: set[str] = set()  # S5: track per-connection request IDs
+        ctx = _ClientContext(conn_id=conn_id, reader=reader, writer=writer)
 
-        # Pool state for this connection (set during handshake)
-        pool_shm: shared_memory.SharedMemory | None = None  # unified bidirectional
-        pool_segment_size: int = 0
+        with self._conn_buffers_lock:
+            self._conn_buffers.add(ctx.read_buf)
 
         # P2: event-driven shutdown — no polling timeout
         shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
@@ -344,136 +346,25 @@ class IPCv2Server(BaseServer):
                 except (asyncio.IncompleteReadError, ConnectionResetError):
                     break
 
-                # ---- Pool handshake (unified bidirectional) ----
                 if flags & FLAG_HANDSHAKE:
-                    try:
-                        client_shm_name, seg_size = decode_handshake(payload)
-
-                        # Validate client-provided SHM name and segment size
-                        if not _POOL_SHM_NAME_RE.match(client_shm_name):
-                            raise ValueError(f'Invalid pool SHM name: {client_shm_name!r}')
-                        if seg_size == 0:
-                            raise ValueError('Pool segment size must be > 0')
-
-                        seg_size = min(seg_size, self._config.pool_segment_size)
-
-                        # Clean up old pool SHM if this is a re-handshake
-                        if pool_shm is not None:
-                            with self._conn_shm_lock:
-                                self._conn_pool_shm.pop(conn_id, None)
-                            close_pool_shm(pool_shm)
-
-                        # Open client's SHM for both reading requests and writing responses
-                        pool_shm = shared_memory.SharedMemory(
-                            name=client_shm_name, create=False, track=False,
-                        )
-                        # Cap negotiated size to actual SHM size (don't trust client declaration)
-                        pool_segment_size = min(seg_size, pool_shm.size)
-
-                        # Register for reply() access from scheduler thread
-                        with self._conn_shm_lock:
-                            self._conn_pool_shm[conn_id] = pool_shm
-
-                        # Send ACK with empty name → signals unified mode
-                        hs_payload = encode_handshake('', seg_size)
-                        hs_frame = encode_frame(
-                            0, FLAG_HANDSHAKE | FLAG_RESPONSE, hs_payload,
-                        )
-                        await _write_frame(writer, hs_frame)
-                    except Exception as exc:
-                        logger.warning(
-                            'IPCv2Server: pool handshake failed for conn %d: %s',
-                            conn_id, exc,
-                        )
-                        close_pool_shm(pool_shm)
-                        pool_shm = None
-                        pool_segment_size = 0
+                    await self._handle_pool_handshake(ctx, payload)
                     continue
 
                 str_rid = f'{conn_id}:{request_id}'
+                wire_bytes = self._decode_request(ctx, flags, payload)
 
-                # ---- Decode request data ----
-                if flags & FLAG_POOL:
-                    # Pool path: read from unified pool SHM
-                    if pool_shm is None or len(payload) < 8:
-                        raise error.EventDeserializeError(
-                            'Pool SHM frame received but no pool handshake was done'
-                        )
-                    size = U64_STRUCT.unpack(payload[:8])[0]
-                    if size > pool_segment_size:
-                        raise error.EventDeserializeError(
-                            f'Pool payload size {size} exceeds segment size {pool_segment_size}'
-                        )
-                    # Zero-copy: decode directly from SHM memoryview
-                    # Safe because client is blocked waiting for response
-                    event_bytes = pool_shm.buf[:size]
-                elif flags & FLAG_SHM:
-                    parts = payload.split(b'\x00', 1)
-                    if len(parts) != 2 or len(parts[1]) < 8:
-                        raise error.EventDeserializeError('Malformed SHM reference in request frame')
-                    req_shm_name = parts[0].decode('utf-8')
-                    if not _SHM_NAME_RE.match(req_shm_name):
-                        raise error.EventDeserializeError(f'Invalid SHM name format: {req_shm_name!r}')
-                    size = U64_STRUCT.unpack(parts[1])[0]
-                    # S4: validate SHM payload size against config limit
-                    if size > self._config.max_payload_size:
-                        raise error.EventDeserializeError(
-                            f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
-                        )
-                    event_bytes, _read_buf = fast_read_shm(req_shm_name, size, _read_buf)
-                else:
-                    event_bytes = payload
-
-                envelope = decode(event_bytes)
+                envelope = decode(wire_bytes)
                 envelope.request_id = str_rid
 
-                # S3: enforce max pending requests
-                with self._pending_lock:
-                    if len(self._pending) >= self._config.max_pending_requests:
-                        logger.warning(
-                            f'IPCv2Server: max pending requests ({self._config.max_pending_requests}) reached, '
-                            f'rejecting request_id={request_id}'
-                        )
-                        err_payload = encode_reply(
-                            error.CCError.serialize(
-                                error.CRMServerError('Server overloaded: max pending requests exceeded')
-                            ),
-                            b'',
-                        )
-                        err_frame = encode_frame(request_id, FLAG_RESPONSE, err_payload)
-                        await _write_frame(writer, err_frame)
-                        continue
-
-                    if str_rid in self._pending:
-                        logger.warning(f'IPCv2Server: duplicate request_id={request_id}, rejecting')
-                        err_payload = encode_reply(
-                            error.CCError.serialize(error.CRMServerError('Duplicate request ID')),
-                            b'',
-                        )
-                        err_frame = encode_frame(request_id, FLAG_RESPONSE, err_payload)
-                        await _write_frame(writer, err_frame)
-                        continue
-
-                    # Register a future for this request so reply() can resolve it
-                    fut: asyncio.Future = self._loop.create_future()
-                    self._pending[str_rid] = fut
-                    conn_request_ids.add(str_rid)
-
-                # Push into the event queue for the server's _serve loop
-                self.event_queue.put(envelope)
-
-                # Wait for reply() to provide the response frame and optional SHM name
-                try:
-                    response_frame, resp_shm_name = await fut
-                except asyncio.CancelledError:
-                    break
-                finally:
-                    conn_request_ids.discard(str_rid)
+                response_frame, resp_shm_name = await self._dispatch_request(
+                    ctx, str_rid, request_id, envelope, writer,
+                )
+                if response_frame is None:
+                    continue
 
                 await _write_frame(writer, response_frame)
 
                 # S6: register SHM GC timestamp *after* frame is sent to client
-                # (only for per-request fallback SHMs, not pool segments)
                 if resp_shm_name is not None:
                     with self._shm_lock:
                         self._our_shm_segments[resp_shm_name] = time.monotonic()
@@ -482,34 +373,172 @@ class IPCv2Server(BaseServer):
         except Exception as exc:
             logger.debug(f'IPCv2Server client handler error: {exc}')
         finally:
-            # P2: clean up shutdown waiter if still pending
-            if not shutdown_waiter.done():
-                shutdown_waiter.cancel()
-                try:
-                    await shutdown_waiter
-                except asyncio.CancelledError:
-                    pass
-            # S5: clean up all pending futures for this connection
-            with self._pending_lock:
-                for rid in conn_request_ids:
-                    fut = self._pending.pop(rid, None)
-                    if fut is not None and not fut.done():
-                        fut.cancel()
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            with self._conn_buffers_lock:
-                self._conn_buffers.discard(_read_buf)
-            _read_buf.release()
-            self._client_tasks.discard(task)
-            # Clean up pool SHM for this connection (close handle, client unlinks)
-            # Pop from dict FIRST so reply() won't find the stale handle,
-            # then close the SHM handle outside the lock.
+            await self._cleanup_connection(ctx, shutdown_waiter, task)
+
+    async def _handle_pool_handshake(self, ctx: _ClientContext, payload: bytes) -> None:
+        """Negotiate pool SHM with the client (unified bidirectional)."""
+        from .shm_pool import close_pool_shm, decode_handshake, encode_handshake
+        try:
+            client_shm_name, seg_size = decode_handshake(payload)
+
+            if not _POOL_SHM_NAME_RE.match(client_shm_name):
+                raise ValueError(f'Invalid pool SHM name: {client_shm_name!r}')
+            if seg_size == 0:
+                raise ValueError('Pool segment size must be > 0')
+
+            seg_size = min(seg_size, self._config.pool_segment_size)
+
+            # Clean up old pool SHM if this is a re-handshake
+            if ctx.pool_shm is not None:
+                with self._conn_shm_lock:
+                    self._conn_pool_shm.pop(ctx.conn_id, None)
+                close_pool_shm(ctx.pool_shm)
+
+            # Open client's SHM for both reading requests and writing responses
+            ctx.pool_shm = shared_memory.SharedMemory(
+                name=client_shm_name, create=False, track=False,
+            )
+            # Cap negotiated size to actual SHM size (don't trust client declaration)
+            ctx.pool_segment_size = min(seg_size, ctx.pool_shm.size)
+
+            # Register for reply() access from scheduler thread
             with self._conn_shm_lock:
-                self._conn_pool_shm.pop(conn_id, None)
-            close_pool_shm(pool_shm)
+                self._conn_pool_shm[ctx.conn_id] = ctx.pool_shm
+
+            # Send ACK with empty name → signals unified mode
+            hs_payload = encode_handshake('', seg_size)
+            hs_frame = encode_frame(
+                0, FLAG_HANDSHAKE | FLAG_RESPONSE, hs_payload,
+            )
+            await _write_frame(ctx.writer, hs_frame)
+        except Exception as exc:
+            logger.warning(
+                'IPCv2Server: pool handshake failed for conn %d: %s',
+                ctx.conn_id, exc,
+            )
+            close_pool_shm(ctx.pool_shm)
+            ctx.pool_shm = None
+            ctx.pool_segment_size = 0
+
+    def _decode_request(self, ctx: _ClientContext, flags: int, payload: bytes) -> bytes | memoryview:
+        """Resolve request wire bytes from inline, per-request SHM, or pool SHM."""
+        if flags & FLAG_POOL:
+            if ctx.pool_shm is None or len(payload) < 8:
+                raise error.EventDeserializeError(
+                    'Pool SHM frame received but no pool handshake was done'
+                )
+            size = U64_STRUCT.unpack(payload[:8])[0]
+            if size > ctx.pool_segment_size:
+                raise error.EventDeserializeError(
+                    f'Pool payload size {size} exceeds segment size {ctx.pool_segment_size}'
+                )
+            # Zero-copy: decode directly from SHM memoryview
+            # Safe because client is blocked waiting for response
+            return ctx.pool_shm.buf[:size]
+        elif flags & FLAG_SHM:
+            parts = payload.split(b'\x00', 1)
+            if len(parts) != 2 or len(parts[1]) < 8:
+                raise error.EventDeserializeError('Malformed SHM reference in request frame')
+            req_shm_name = parts[0].decode('utf-8')
+            if not _SHM_NAME_RE.match(req_shm_name):
+                raise error.EventDeserializeError(f'Invalid SHM name format: {req_shm_name!r}')
+            size = U64_STRUCT.unpack(parts[1])[0]
+            # S4: validate SHM payload size against config limit
+            if size > self._config.max_payload_size:
+                raise error.EventDeserializeError(
+                    f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
+                )
+            event_bytes, ctx.read_buf = fast_read_shm(req_shm_name, size, ctx.read_buf)
+            return event_bytes
+        else:
+            return payload
+
+    async def _dispatch_request(
+        self,
+        ctx: _ClientContext,
+        str_rid: str,
+        wire_rid: int,
+        envelope: Envelope,
+        writer: asyncio.StreamWriter,
+    ) -> tuple[bytes | None, str | None]:
+        """Register pending future, enqueue envelope, and await reply."""
+        # S3: enforce max pending requests
+        with self._pending_lock:
+            if len(self._pending) >= self._config.max_pending_requests:
+                logger.warning(
+                    f'IPCv2Server: max pending requests ({self._config.max_pending_requests}) reached, '
+                    f'rejecting request_id={wire_rid}'
+                )
+                err_payload = encode_reply(
+                    error.CCError.serialize(
+                        error.CRMServerError('Server overloaded: max pending requests exceeded')
+                    ),
+                    b'',
+                )
+                err_frame = encode_frame(wire_rid, FLAG_RESPONSE, err_payload)
+                await _write_frame(writer, err_frame)
+                return None, None
+
+            if str_rid in self._pending:
+                logger.warning(f'IPCv2Server: duplicate request_id={wire_rid}, rejecting')
+                err_payload = encode_reply(
+                    error.CCError.serialize(error.CRMServerError('Duplicate request ID')),
+                    b'',
+                )
+                err_frame = encode_frame(wire_rid, FLAG_RESPONSE, err_payload)
+                await _write_frame(writer, err_frame)
+                return None, None
+
+            fut: asyncio.Future = self._loop.create_future()
+            self._pending[str_rid] = fut
+            ctx.conn_request_ids.add(str_rid)
+
+        self.event_queue.put(envelope)
+
+        try:
+            response_frame, resp_shm_name = await fut
+        except asyncio.CancelledError:
+            raise
+        finally:
+            ctx.conn_request_ids.discard(str_rid)
+
+        return response_frame, resp_shm_name
+
+    async def _cleanup_connection(
+        self,
+        ctx: _ClientContext,
+        shutdown_waiter: asyncio.Future,
+        task: asyncio.Task,
+    ) -> None:
+        """Release all resources held by a client connection."""
+        from .shm_pool import close_pool_shm
+
+        # P2: clean up shutdown waiter if still pending
+        if not shutdown_waiter.done():
+            shutdown_waiter.cancel()
+            try:
+                await shutdown_waiter
+            except asyncio.CancelledError:
+                pass
+        # S5: clean up all pending futures for this connection
+        with self._pending_lock:
+            for rid in ctx.conn_request_ids:
+                fut = self._pending.pop(rid, None)
+                if fut is not None and not fut.done():
+                    fut.cancel()
+        ctx.writer.close()
+        try:
+            await ctx.writer.wait_closed()
+        except Exception:
+            pass
+        with self._conn_buffers_lock:
+            self._conn_buffers.discard(ctx.read_buf)
+        ctx.read_buf.release()
+        self._client_tasks.discard(task)
+        # Clean up pool SHM for this connection (close handle, client unlinks)
+        with self._conn_shm_lock:
+            self._conn_pool_shm.pop(ctx.conn_id, None)
+        close_pool_shm(ctx.pool_shm)
 
     async def _shm_gc_loop(self) -> None:
         while True:

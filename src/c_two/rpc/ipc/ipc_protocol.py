@@ -59,16 +59,16 @@ SHM_MAX_AGE = 120.0       # seconds — max time before SHM segment is considere
 class IPCConfig:
     """IPC v2 transport configuration.
 
-    Transport limits (affect correctness):
-        max_frame_size: Maximum size of an inline frame in bytes.
-        max_payload_size: Maximum size of an SHM payload in bytes.
-        max_pending_requests: Maximum number of in-flight requests per server.
+    Transport limits (affect correctness and compatibility):
+        max_frame_size: Maximum inline frame size in bytes (default 16 MB).
+        max_payload_size: Maximum SHM payload size (default 16 GB).
+        max_pending_requests: Server-side concurrent request limit (default 1024).
 
     Performance tuning:
-        shm_threshold: Inline vs SHM cutover point in bytes.
-        pool_enabled: Whether to use pool-based SHM pre-allocation.
-        pool_segment_size: Size of each pool SHM segment in bytes.
-        pool_decay_seconds: Idle time before pool SHM teardown (0 = no decay).
+        shm_threshold: Payload size cutover from inline to SHM (default 4 KB).
+        pool_enabled: Whether to use pre-allocated pool SHM (default True).
+        pool_segment_size: Size of each pool SHM segment (default 256 MB).
+        pool_decay_seconds: Idle seconds before pool teardown (default 60, 0=never).
     """
     shm_threshold: int = DEFAULT_SHM_THRESHOLD
     max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
@@ -90,6 +90,13 @@ class IPCConfig:
             raise ValueError('max_frame_size must be > 16 (header size)')
         if self.max_payload_size <= 0:
             raise ValueError('max_payload_size must be > 0')
+        if self.shm_threshold > self.max_frame_size:
+            raise ValueError(
+                f'shm_threshold ({self.shm_threshold}) must not exceed '
+                f'max_frame_size ({self.max_frame_size})'
+            )
+        if self.pool_segment_size > self.max_payload_size:
+            self.pool_segment_size = self.max_payload_size
 
 
 # ---------------------------------------------------------------------------
