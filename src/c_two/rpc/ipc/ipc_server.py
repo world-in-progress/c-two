@@ -280,12 +280,13 @@ class IPCv2Server(BaseServer):
             return
 
         # CRM_REPLY: extract error and result from scheduler Event
-        from ..util.encoding import parse_message
         has_parts = event.data_parts is not None and event.data is None
         if has_parts:
             err_bytes = event.data_parts[0] if event.data_parts[0] else b''
             result_bytes = event.data_parts[1] if len(event.data_parts) > 1 else b''
         else:
+            # Fallback: scheduler returned combined data (non-tuple CRM response)
+            from ..util.encoding import parse_message
             data = event.data if event.data is not None else b''
             parts = parse_message(data)
             err_bytes = parts[0] if len(parts) > 0 else b''
@@ -516,9 +517,9 @@ class IPCv2Server(BaseServer):
                         raise error.EventDeserializeError(
                             f'Pool payload size {size} exceeds segment size {pool_segment_size}'
                         )
-                    event_bytes, _read_buf = _read_from_pool_shm(
-                        pool_shm.buf, size, _read_buf,
-                    )
+                    # Zero-copy: decode directly from SHM memoryview
+                    # Safe because client is blocked waiting for response
+                    event_bytes = pool_shm.buf[:size]
                 elif flags & _FLAG_SHM:
                     parts = payload.split(b'\x00', 1)
                     if len(parts) != 2 or len(parts[1]) < 8:
