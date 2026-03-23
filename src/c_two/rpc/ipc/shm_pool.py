@@ -76,7 +76,7 @@ def pool_shm_name(region_id: str, conn_id: int, direction: str) -> str:
 def cleanup_stale_shm(name: str) -> None:
     """Remove a stale SHM segment if it exists (e.g. from a previous crash)."""
     try:
-        stale = shared_memory.SharedMemory(name=name, create=False)
+        stale = shared_memory.SharedMemory(name=name, create=False, track=False)
         stale.close()
         stale.unlink()
         logger.debug('Cleaned up stale pool SHM segment: %s', name)

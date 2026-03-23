@@ -120,7 +120,7 @@ def _fast_read_shm(
 
     buf = adaptive_buf.acquire(size)
 
-    shm = shared_memory.SharedMemory(name=name, create=False)
+    shm = shared_memory.SharedMemory(name=name, create=False, track=False)
     try:
         # Validate SHM actual size covers the declared size
         if shm.size < size:
@@ -333,7 +333,7 @@ class IPCv2Server(BaseServer):
         with self._shm_lock:
             for name in list(self._our_shm_segments):
                 try:
-                    shm = shared_memory.SharedMemory(name=name, create=False)
+                    shm = shared_memory.SharedMemory(name=name, create=False, track=False)
                     shm.close()
                     shm.unlink()
                 except FileNotFoundError:
@@ -461,7 +461,7 @@ class IPCv2Server(BaseServer):
 
                         # Open client's pre-allocated request SHM
                         client_req_shm = shared_memory.SharedMemory(
-                            name=client_req_name, create=False,
+                            name=client_req_name, create=False, track=False,
                         )
 
                         # Create our response SHM for this connection
@@ -622,7 +622,7 @@ class IPCv2Server(BaseServer):
                 stale = [n for n, ts in self._our_shm_segments.items() if now - ts > SHM_MAX_AGE]
                 for name in stale:
                     try:
-                        shm = shared_memory.SharedMemory(name=name, create=False)
+                        shm = shared_memory.SharedMemory(name=name, create=False, track=False)
                         shm.close()
                         shm.unlink()
                     except FileNotFoundError:

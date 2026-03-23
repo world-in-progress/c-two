@@ -161,8 +161,8 @@ class IPCv2Client(BaseClient):
         resp_name, resp_seg_size = decode_handshake(resp_payload)
         self._pool_segment_size = min(seg_size, resp_seg_size)
 
-        # Open server's response pool SHM segment (read-only)
-        self._pool_resp_shm = shared_memory.SharedMemory(name=resp_name, create=False)
+        # Open server's response pool SHM segment (read-only, server owns lifecycle)
+        self._pool_resp_shm = shared_memory.SharedMemory(name=resp_name, create=False, track=False)
 
     def _ensure_connection(self) -> _socket.socket:
         if self._sock is not None:
