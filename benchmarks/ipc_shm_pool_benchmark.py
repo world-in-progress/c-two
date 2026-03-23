@@ -207,9 +207,9 @@ def main() -> None:
 
     print('=' * 90)
     print('Notes:')
-    print('  - "pool" = pre-allocated SHM reused across calls (Phase 1 optimization)')
+    print('  - "pool" = unified bidirectional pre-allocated SHM (Phase 1.5)')
     print('  - "per-request" = shm_open/ftruncate/mmap/munmap/shm_unlink per call')
-    print('  - Payloads < 1 MB use inline transport (no SHM), so pool has no effect')
+    print('  - Default shm_threshold = 4 KB (payloads below use inline transport)')
     print('  - MB/s = round-trip throughput (payload × 2 × ops/s)')
     print('  - Δ avg = pool speedup vs per-request (> 1x = pool is faster)')
 
