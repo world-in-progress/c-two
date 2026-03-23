@@ -55,7 +55,7 @@ _POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z]_[0-9a-f]{12}$')
 
 DEFAULT_SHM_THRESHOLD = 4_096               # 4 KB — pool wins above this (benchmark 2026-03)
 DEFAULT_MAX_FRAME_SIZE = 16_777_216         # 16 MB — inline frame upper bound
-DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_283    # uint32_max - 12 (header) — SHM payload upper bound
+DEFAULT_MAX_PAYLOAD_SIZE = 17_179_869_184  # 16 GB — SHM payload upper bound (not constrained by uint32 frame)
 DEFAULT_MAX_PENDING_REQUESTS = 1024         # per-server total
 DEFAULT_POOL_SEGMENT_SIZE = 268_435_456     # 256 MB — per-connection pool SHM segment
 
@@ -82,6 +82,11 @@ def _shm_name(region_id: str, request_id: str, direction: str) -> str:
 def _encode_frame(request_id: int, flags: int, payload: bytes | bytearray | memoryview) -> bytes:
     payload_len = len(payload)
     total_len = 12 + payload_len  # 8B rid + 4B flags + payload
+    if total_len > 0xFFFFFFFF:
+        raise OverflowError(
+            f'Frame total_len {total_len} exceeds uint32 max; '
+            f'use SHM transport for payloads > {0xFFFFFFFF - 12} bytes'
+        )
     buf = bytearray(4 + total_len)
     struct.pack_into('<I', buf, 0, total_len)
     struct.pack_into('<Q', buf, 4, request_id)
