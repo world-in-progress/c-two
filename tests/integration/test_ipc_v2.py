@@ -12,7 +12,7 @@ import pytest
 import c_two as cc
 from c_two.rpc import ConcurrencyConfig, ConcurrencyMode, Server, ServerConfig
 from c_two.rpc.server import _start
-from c_two.rpc.ipc.ipc_server import IPCConfig
+from c_two.rpc.ipc.ipc_protocol import IPCConfig
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello

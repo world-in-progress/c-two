@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'))
 import c_two as cc                                        # noqa: E402
 from c_two.rpc import Server, ServerConfig                # noqa: E402
 from c_two.rpc.server import _start                       # noqa: E402
-from c_two.rpc.ipc.ipc_server import IPCConfig            # noqa: E402
+from c_two.rpc.ipc.ipc_protocol import IPCConfig            # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Benchmark CRM — simple echo

@@ -21,20 +21,13 @@ from ... import error
 from ..base import BaseClient
 from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
-from ..util.wire import encode_call, decode, call_wire_size, PING_BYTES, SHUTDOWN_CLIENT_BYTES, _call_header_cache
-from .ipc_server import (
-    DEFAULT_MAX_FRAME_SIZE,
-    IPCConfig,
-    _FLAG_HANDSHAKE,
-    _FLAG_POOL,
-    _FLAG_SHM,
-    _FRAME_STRUCT,
-    _U64_STRUCT,
-    _encode_frame,
-    _encode_inline_call_frame,
-    _fast_read_shm,
-    _read_from_pool_shm,
-    _shm_name,
+from ..util.wire import encode_call, decode, call_wire_size, PING_BYTES, SHUTDOWN_CLIENT_BYTES, get_call_header_cache
+from .ipc_protocol import (
+    FLAG_SHM, FLAG_POOL, FLAG_HANDSHAKE,
+    FRAME_STRUCT, U64_STRUCT, FRAME_HEADER_SIZE,
+    IPCConfig, DEFAULT_MAX_FRAME_SIZE,
+    encode_frame, encode_inline_call_frame,
+    fast_read_shm, read_from_pool_shm, shm_name,
 )
 from .shm_pool import (
     close_pool_shm,
@@ -85,7 +78,7 @@ def _send_frame_sync(sock: _socket.socket, frame: bytes) -> None:
     sock.sendall(frame)
 
 
-_HEADER_SIZE = _FRAME_STRUCT.size  # 16 bytes
+_HEADER_SIZE = FRAME_HEADER_SIZE  # 16 bytes
 
 
 def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
@@ -99,7 +92,7 @@ def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRA
         if nbytes == 0:
             raise ConnectionError('Connection closed by server')
         pos += nbytes
-    total_len, request_id, flags = _FRAME_STRUCT.unpack(hdr)
+    total_len, request_id, flags = FRAME_STRUCT.unpack(hdr)
 
     # S2: reject oversized or undersized frames before allocation
     if total_len < 12:
@@ -161,17 +154,17 @@ class IPCv2Client(BaseClient):
         seg_size = self._config.pool_segment_size
 
         # Create our pool SHM segment (used for both directions)
-        shm_name = _client_pool_shm_name(self.region_id)
-        self._pool_shm = create_pool_shm(shm_name, seg_size)
+        pool_name = _client_pool_shm_name(self.region_id)
+        self._pool_shm = create_pool_shm(pool_name, seg_size)
 
         # Send handshake frame
-        hs_payload = encode_handshake(shm_name, seg_size)
-        hs_frame = _encode_frame(0, _FLAG_HANDSHAKE, hs_payload)
+        hs_payload = encode_handshake(pool_name, seg_size)
+        hs_frame = encode_frame(0, FLAG_HANDSHAKE, hs_payload)
         _send_frame_sync(sock, hs_frame)
 
         # Receive server's ACK (empty name → unified mode)
         _, resp_flags, resp_payload = _recv_frame_sync(sock, self._config.max_frame_size)
-        if not (resp_flags & _FLAG_HANDSHAKE):
+        if not (resp_flags & FLAG_HANDSHAKE):
             raise error.CompoClientError('Expected pool handshake response from server')
 
         _, resp_seg_size = decode_handshake(resp_payload)
@@ -237,7 +230,7 @@ class IPCv2Client(BaseClient):
 
     def _send_recv_locked(self, request_id: int, flags: int, payload: bytes) -> tuple[int, int, bytes]:
         """Send frame and receive response. Caller MUST hold _conn_lock."""
-        frame = _encode_frame(request_id, flags, payload)
+        frame = encode_frame(request_id, flags, payload)
         return self._send_frame_recv_locked(frame, flags)
 
     def _send_frame_recv_locked(self, frame: bytes, flags: int = 0) -> tuple[int, int, bytes]:
@@ -245,7 +238,7 @@ class IPCv2Client(BaseClient):
         # Pool-path frames reference data in pool SHM which is destroyed on
         # reconnect — retry would send a stale frame reading from a zeroed
         # or different SHM segment.  Only retry for inline / per-request SHM.
-        max_attempts = 1 if (flags & _FLAG_POOL) else 2
+        max_attempts = 1 if (flags & FLAG_POOL) else 2
         for attempt in range(max_attempts):
             try:
                 sock = self._ensure_connection()
@@ -292,26 +285,26 @@ class IPCv2Client(BaseClient):
                     write_call_into(self._pool_shm.buf, 0, method_name, args)
                 except Exception as e:
                     raise error.CompoSerializeInput(f'Error writing request to pool SHM: {e}')
-                payload = _U64_STRUCT.pack(estimated_wire_size)
-                flags |= _FLAG_POOL
+                payload = U64_STRUCT.pack(estimated_wire_size)
+                flags |= FLAG_POOL
                 self._pool_last_used = time.monotonic()
             elif estimated_wire_size >= self._config.shm_threshold:
                 # Fallback: per-request SHM (legacy path)
-                shm_name = _shm_name(self.region_id, str(request_id), 'req')
+                req_shm_name = shm_name(self.region_id, str(request_id), 'req')
                 try:
                     from ..util.wire import write_call_into
-                    shm = shared_memory.SharedMemory(name=shm_name, create=True, size=estimated_wire_size)
+                    shm = shared_memory.SharedMemory(name=req_shm_name, create=True, size=estimated_wire_size)
                     write_call_into(shm.buf, 0, method_name, args)
                     shm.close()
                 except Exception as e:
                     raise error.CompoSerializeInput(f'Error writing request to SHM: {e}')
-                size_header = _U64_STRUCT.pack(estimated_wire_size)
-                payload = shm_name.encode('utf-8') + b'\x00' + size_header
-                flags |= _FLAG_SHM
+                size_header = U64_STRUCT.pack(estimated_wire_size)
+                payload = req_shm_name.encode('utf-8') + b'\x00' + size_header
+                flags |= FLAG_SHM
             else:
-                # Inline path: single-alloc frame (eliminates encode_call + _encode_frame double copy)
+                # Inline path: single-alloc frame (eliminates encode_call + encode_frame double copy)
                 try:
-                    frame = _encode_inline_call_frame(request_id, method_name, args, _call_header_cache)
+                    frame = encode_inline_call_frame(request_id, method_name, args, get_call_header_cache())
                 except Exception as e:
                     raise error.CompoSerializeInput(f'Error occurred when serializing request: {e}')
 
@@ -324,30 +317,30 @@ class IPCv2Client(BaseClient):
                 raise error.CompoClientError(f'IPC v2 call failed: {exc}') from exc
 
             # Read response (pool read must also be under lock)
-            if resp_flags & _FLAG_POOL:
+            if resp_flags & FLAG_POOL:
                 if self._pool_shm is None or len(resp_payload) < 8:
                     raise error.EventDeserializeError(
                         'Pool SHM response received but no pool handshake was done'
                     )
-                size = _U64_STRUCT.unpack(resp_payload[:8])[0]
+                size = U64_STRUCT.unpack(resp_payload[:8])[0]
                 if size > self._pool_segment_size:
                     raise error.EventDeserializeError(
                         f'Pool response size {size} exceeds segment size {self._pool_segment_size}'
                     )
-                response_bytes, self._read_buf = _read_from_pool_shm(
+                response_bytes, self._read_buf = read_from_pool_shm(
                     self._pool_shm.buf, size, self._read_buf,
                 )
-            elif resp_flags & _FLAG_SHM:
+            elif resp_flags & FLAG_SHM:
                 parts = resp_payload.split(b'\x00', 1)
                 if len(parts) != 2 or len(parts[1]) < 8:
                     raise error.EventDeserializeError('Malformed SHM reference in response frame')
-                shm_name = parts[0].decode('utf-8')
-                size = _U64_STRUCT.unpack(parts[1])[0]
+                resp_shm_name = parts[0].decode('utf-8')
+                size = U64_STRUCT.unpack(parts[1])[0]
                 if size > self._config.max_payload_size:
                     raise error.EventDeserializeError(
                         f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
                     )
-                response_bytes, self._read_buf = _fast_read_shm(shm_name, size, self._read_buf)
+                response_bytes, self._read_buf = fast_read_shm(resp_shm_name, size, self._read_buf)
             else:
                 response_bytes = resp_payload
 
@@ -389,16 +382,16 @@ class IPCv2Client(BaseClient):
             ):
                 # Pool path: write raw bytes into pre-allocated SHM
                 self._pool_shm.buf[:data_len] = event_bytes
-                payload = _U64_STRUCT.pack(data_len)
-                flags |= _FLAG_POOL
+                payload = U64_STRUCT.pack(data_len)
+                flags |= FLAG_POOL
                 self._pool_last_used = time.monotonic()
             elif data_len >= self._config.shm_threshold:
-                shm_name = _shm_name(self.region_id, str(request_id), 'relay')
-                shm = _write_shm(shm_name, event_bytes)
+                req_shm_name = shm_name(self.region_id, str(request_id), 'relay')
+                shm = _write_shm(req_shm_name, event_bytes)
                 shm.close()
-                size_header = _U64_STRUCT.pack(data_len)
-                payload = shm_name.encode('utf-8') + b'\x00' + size_header
-                flags |= _FLAG_SHM
+                size_header = U64_STRUCT.pack(data_len)
+                payload = req_shm_name.encode('utf-8') + b'\x00' + size_header
+                flags |= FLAG_SHM
             else:
                 payload = event_bytes
 
@@ -407,28 +400,28 @@ class IPCv2Client(BaseClient):
             except Exception as exc:
                 raise error.CompoClientError(f'IPC v2 relay failed: {exc}') from exc
 
-            if resp_flags & _FLAG_POOL:
+            if resp_flags & FLAG_POOL:
                 if self._pool_shm is None or len(resp_payload) < 8:
                     raise error.EventDeserializeError(
                         'Pool SHM response received but no pool handshake was done'
                     )
-                size = _U64_STRUCT.unpack(resp_payload[:8])[0]
-                data, self._read_buf = _read_from_pool_shm(
+                size = U64_STRUCT.unpack(resp_payload[:8])[0]
+                data, self._read_buf = read_from_pool_shm(
                     self._pool_shm.buf, size, self._read_buf,
                 )
                 return bytes(data)
 
-            if resp_flags & _FLAG_SHM:
+            if resp_flags & FLAG_SHM:
                 parts = resp_payload.split(b'\x00', 1)
                 if len(parts) != 2 or len(parts[1]) < 8:
                     raise error.EventDeserializeError('Malformed SHM reference in response frame')
-                shm_name = parts[0].decode('utf-8')
-                size = _U64_STRUCT.unpack(parts[1])[0]
+                resp_shm_name = parts[0].decode('utf-8')
+                size = U64_STRUCT.unpack(parts[1])[0]
                 if size > self._config.max_payload_size:
                     raise error.EventDeserializeError(
                         f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
                     )
-                data, self._read_buf = _fast_read_shm(shm_name, size, self._read_buf)
+                data, self._read_buf = fast_read_shm(resp_shm_name, size, self._read_buf)
                 return bytes(data)
 
             return resp_payload
@@ -451,7 +444,7 @@ class IPCv2Client(BaseClient):
             sock.connect(socket_path)
 
             request_id = 0
-            frame = _encode_frame(request_id, 0, PING_BYTES)
+            frame = encode_frame(request_id, 0, PING_BYTES)
 
             _send_frame_sync(sock, frame)
             _, _, resp_payload = _recv_frame_sync(sock)
@@ -476,7 +469,7 @@ class IPCv2Client(BaseClient):
             sock.connect(socket_path)
 
             request_id = 0
-            frame = _encode_frame(request_id, 0, SHUTDOWN_CLIENT_BYTES)
+            frame = encode_frame(request_id, 0, SHUTDOWN_CLIENT_BYTES)
 
             _send_frame_sync(sock, frame)
             _, _, resp_payload = _recv_frame_sync(sock)

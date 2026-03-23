@@ -91,6 +91,14 @@ def preregister_methods(method_names: Iterable[str]) -> None:
         preregister_method(name)
 
 
+def get_call_header_cache() -> dict[str, bytes]:
+    """Public accessor for the method-name → wire-header cache.
+
+    Used by IPC v2 transport for zero-copy inline frame encoding.
+    """
+    return _call_header_cache
+
+
 # ---------------------------------------------------------------------------
 # Size helpers
 # ---------------------------------------------------------------------------

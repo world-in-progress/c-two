@@ -29,12 +29,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 
 from c_two.rpc.event import Event, EventTag
 from c_two.rpc.util.encoding import add_length_prefix, parse_message
+from c_two.rpc.ipc.ipc_protocol import (
+    shm_name as _shm_name,
+    encode_frame as _encode_frame,
+    decode_frame as _decode_frame,
+)
 from c_two.rpc.ipc.ipc_server import (
     _scatter_write_event_to_shm,
     _scatter_write_event_multi_to_shm,
-    _shm_name,
-    _encode_frame,
-    _decode_frame,
 )
 from c_two.rpc.ipc.ipc_client import _send_frame_sync, _recv_frame_sync
 
