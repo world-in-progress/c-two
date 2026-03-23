@@ -5,7 +5,7 @@ import subprocess
 
 from .zmq import ZmqClient
 from .http import HttpClient
-from .ipc import IPCv2Client
+from .ipc import IPCv2Client, IPCConfig
 from .memory import MemoryClient
 from .thread import ThreadClient
 
@@ -25,10 +25,13 @@ def _get_client_class(server_address: str):
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
 
 class Client:
-    def __init__(self, server_address: str):
+    def __init__(self, server_address: str, *, ipc_config: IPCConfig | None = None):
         # Determine the client class based on the server address
         client_class = _get_client_class(server_address)
-        self._client = client_class(server_address)
+        if ipc_config is not None and client_class is IPCv2Client:
+            self._client = client_class(server_address, ipc_config=ipc_config)
+        else:
+            self._client = client_class(server_address)
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         return self._client.call(method_name, data)

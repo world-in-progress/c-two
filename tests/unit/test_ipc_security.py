@@ -206,7 +206,8 @@ class TestIPCConfigDefaults:
         assert DEFAULT_MAX_FRAME_SIZE == 16 * 1024 * 1024  # 16 MB
 
     def test_max_payload_size_default_reasonable(self):
-        assert DEFAULT_MAX_PAYLOAD_SIZE == 4 * 1024 * 1024 * 1024  # 4 GB
+        # 16 GB — SHM data validation limit, not constrained by uint32 wire frame
+        assert DEFAULT_MAX_PAYLOAD_SIZE == 16 * 1024 * 1024 * 1024  # 16 GB
 
     def test_max_pending_default_reasonable(self):
         assert DEFAULT_MAX_PENDING_REQUESTS == 1024

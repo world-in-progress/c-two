@@ -3,7 +3,6 @@ IPC v2 Server — UDS control plane with SharedMemory data plane.
 
 Control plane: asyncio Unix Domain Socket (Phase 1-2, macOS/Linux)
 Data plane: multiprocessing.shared_memory.SharedMemory for large payloads
-Ownership transfer: sender creates SHM → receiver reads and releases
 
 Wire protocol (control plane):
     [4B total_len][8B request_id_u64][4B flags][payload_or_shm_ref]
@@ -11,9 +10,10 @@ Wire protocol (control plane):
     total_len = 12 + payload_len  (fixed 16-byte header)
 
     flags (uint32, little-endian):
-        bit 0: 0 = inline, 1 = shared_memory
-        bit 1: 0 = request,  1 = response
-        bit 2-31: reserved
+        bit 0: per-request SHM (legacy fallback)
+        bit 1: response frame
+        bit 2: pool handshake
+        bit 3: pool SHM segment
 """
 
 import asyncio
@@ -41,18 +41,23 @@ logger = logging.getLogger(__name__)
 
 _FLAG_SHM = 1 << 0
 _FLAG_RESPONSE = 1 << 1
+_FLAG_HANDSHAKE = 1 << 2
+_FLAG_POOL = 1 << 3
 _FAST_READ_THRESHOLD = 1_048_576            # 1 MB — use native memcpy above this size
 
 SHM_GC_INTERVAL = 30.0                      # seconds
 SHM_MAX_AGE = 120.0                         # seconds before GC considers a segment leaked
 
 # B1: SHM name format — cc + direction char + _ + 16 hex chars (from _shm_name())
+#     or pool format — ccp + direction char + _ + 12 hex chars (from pool_shm_name())
 _SHM_NAME_RE = re.compile(r'^cc[a-z]_[0-9a-f]{16}$')
+_POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z]_[0-9a-f]{12}$')
 
-DEFAULT_SHM_THRESHOLD = 1_048_576           # 1 MB — aligned with inline threshold
+DEFAULT_SHM_THRESHOLD = 4_096               # 4 KB — pool wins above this (benchmark 2026-03)
 DEFAULT_MAX_FRAME_SIZE = 16_777_216         # 16 MB — inline frame upper bound
-DEFAULT_MAX_PAYLOAD_SIZE = 4_294_967_296    # 4 GB — SHM payload upper bound
+DEFAULT_MAX_PAYLOAD_SIZE = 17_179_869_184  # 16 GB — SHM payload upper bound (not constrained by uint32 frame)
 DEFAULT_MAX_PENDING_REQUESTS = 1024         # per-server total
+DEFAULT_POOL_SEGMENT_SIZE = 268_435_456     # 256 MB — per-connection pool SHM segment
 
 
 @dataclass
@@ -61,6 +66,9 @@ class IPCConfig:
     max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
     max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE
     max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
+    pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
+    pool_enabled: bool = True
+    pool_decay_seconds: float = 60.0  # idle time before pool SHM teardown (0 = no decay)
 
 
 def _shm_name(region_id: str, request_id: str, direction: str) -> str:
@@ -74,6 +82,11 @@ def _shm_name(region_id: str, request_id: str, direction: str) -> str:
 def _encode_frame(request_id: int, flags: int, payload: bytes | bytearray | memoryview) -> bytes:
     payload_len = len(payload)
     total_len = 12 + payload_len  # 8B rid + 4B flags + payload
+    if total_len > 0xFFFFFFFF:
+        raise OverflowError(
+            f'Frame total_len {total_len} exceeds uint32 max; '
+            f'use SHM transport for payloads > {0xFFFFFFFF - 12} bytes'
+        )
     buf = bytearray(4 + total_len)
     struct.pack_into('<I', buf, 0, total_len)
     struct.pack_into('<Q', buf, 4, request_id)
@@ -113,7 +126,7 @@ def _fast_read_shm(
 
     buf = adaptive_buf.acquire(size)
 
-    shm = shared_memory.SharedMemory(name=name, create=False)
+    shm = shared_memory.SharedMemory(name=name, create=False, track=False)
     try:
         # Validate SHM actual size covers the declared size
         if shm.size < size:
@@ -132,6 +145,33 @@ def _fast_read_shm(
     finally:
         shm.close()
         shm.unlink()
+    return memoryview(buf)[:size], adaptive_buf
+
+
+def _read_from_pool_shm(
+    shm_buf: memoryview,
+    size: int,
+    adaptive_buf: 'AdaptiveBuffer | None' = None,
+) -> tuple[memoryview, 'AdaptiveBuffer']:
+    """Read from a pre-opened pool SHM buffer into an :class:`AdaptiveBuffer`.
+
+    Unlike :func:`_fast_read_shm`, does **not** open or unlink the SHM — the
+    handle is assumed to be pre-opened and cached from the pool handshake.
+    """
+    if adaptive_buf is None:
+        adaptive_buf = AdaptiveBuffer()
+
+    buf = adaptive_buf.acquire(size)
+
+    if size >= _FAST_READ_THRESHOLD:
+        ctypes.memmove(
+            ctypes.addressof(ctypes.c_char.from_buffer(buf)),
+            ctypes.addressof(ctypes.c_char.from_buffer(shm_buf)),
+            size,
+        )
+    else:
+        buf[:size] = shm_buf[:size]
+
     return memoryview(buf)[:size], adaptive_buf
 
 
@@ -183,6 +223,12 @@ class IPCv2Server(BaseServer):
         # Track SHM segments we created (for response direction) that haven't been picked up
         self._our_shm_segments: dict[str, float] = {}
         self._shm_lock = threading.Lock()
+
+        # Per-connection pool SHM (conn_id → SharedMemory)
+        # Unified: client-created SHM used for both request reads and response writes.
+        # Written by reply() (scheduler thread), read by _handle_client (asyncio thread)
+        self._conn_pool_shm: dict[int, shared_memory.SharedMemory] = {}
+        self._conn_shm_lock = threading.Lock()
 
         # Track active client handler tasks for clean shutdown
         self._client_tasks: set[asyncio.Task] = set()
@@ -249,16 +295,26 @@ class IPCv2Server(BaseServer):
         result_len = len(result_bytes)
         total_wire = reply_wire_size(err_len, result_len)
 
-        if total_wire >= self._config.shm_threshold:
-            shm_name = _shm_name(self.region_id, request_id, 'resp')
-            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total_wire)
-            write_reply_into(shm.buf, 0, err_bytes, result_bytes)
-            shm.close()
-            size_header = struct.pack('<Q', total_wire)
-            payload = shm_name.encode('utf-8') + b'\x00' + size_header
-            flags |= _FLAG_SHM
-        else:
-            payload = encode_reply(err_bytes, result_bytes)
+        # Try pool SHM first (pre-allocated, zero syscalls)
+        conn_id = int(request_id.rsplit(':', 1)[0])
+        with self._conn_shm_lock:
+            pool_shm = self._conn_pool_shm.get(conn_id)
+            if pool_shm is not None and total_wire <= pool_shm.size:
+                write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
+                payload = struct.pack('<Q', total_wire)
+                flags |= _FLAG_POOL
+
+        if not (flags & _FLAG_POOL):
+            if total_wire >= self._config.shm_threshold:
+                shm_name = _shm_name(self.region_id, request_id, 'resp')
+                shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total_wire)
+                write_reply_into(shm.buf, 0, err_bytes, result_bytes)
+                shm.close()
+                size_header = struct.pack('<Q', total_wire)
+                payload = shm_name.encode('utf-8') + b'\x00' + size_header
+                flags |= _FLAG_SHM
+            else:
+                payload = encode_reply(err_bytes, result_bytes)
 
         frame = _encode_frame(int_rid, flags, payload)
 
@@ -281,16 +337,23 @@ class IPCv2Server(BaseServer):
             os.unlink(self._socket_path)
         except FileNotFoundError:
             pass
-        # Clean up any leftover response SHM segments
+        # Clean up any leftover per-request response SHM segments
         with self._shm_lock:
             for name in list(self._our_shm_segments):
                 try:
-                    shm = shared_memory.SharedMemory(name=name, create=False)
+                    shm = shared_memory.SharedMemory(name=name, create=False, track=False)
                     shm.close()
                     shm.unlink()
                 except FileNotFoundError:
                     pass
             self._our_shm_segments.clear()
+
+        # Close pool SHM handles (client owns and unlinks these)
+        from .shm_pool import close_pool_shm
+        with self._conn_shm_lock:
+            for pool_shm in self._conn_pool_shm.values():
+                close_pool_shm(pool_shm)
+            self._conn_pool_shm.clear()
 
         with self._pending_lock:
             self._pending.clear()
@@ -355,6 +418,8 @@ class IPCv2Server(BaseServer):
             self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        from .shm_pool import close_pool_shm, decode_handshake, encode_handshake
+
         task = asyncio.current_task()
         self._client_tasks.add(task)
         _read_buf: AdaptiveBuffer = AdaptiveBuffer()  # per-connection adaptive buffer
@@ -364,6 +429,11 @@ class IPCv2Server(BaseServer):
         conn_id = self._next_conn_id
         self._next_conn_id += 1
         conn_request_ids: set[str] = set()  # S5: track per-connection request IDs
+
+        # Pool state for this connection (set during handshake)
+        pool_shm: shared_memory.SharedMemory | None = None  # unified bidirectional
+        pool_segment_size: int = 0
+
         # P2: event-driven shutdown — no polling timeout
         shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
         try:
@@ -386,10 +456,70 @@ class IPCv2Server(BaseServer):
                     request_id, flags, payload = read_task.result()
                 except (asyncio.IncompleteReadError, ConnectionResetError):
                     break
+
+                # ---- Pool handshake (unified bidirectional) ----
+                if flags & _FLAG_HANDSHAKE:
+                    try:
+                        client_shm_name, seg_size = decode_handshake(payload)
+
+                        # Validate client-provided SHM name and segment size
+                        if not _POOL_SHM_NAME_RE.match(client_shm_name):
+                            raise ValueError(f'Invalid pool SHM name: {client_shm_name!r}')
+                        if seg_size == 0:
+                            raise ValueError('Pool segment size must be > 0')
+
+                        seg_size = min(seg_size, self._config.pool_segment_size)
+
+                        # Clean up old pool SHM if this is a re-handshake
+                        if pool_shm is not None:
+                            with self._conn_shm_lock:
+                                self._conn_pool_shm.pop(conn_id, None)
+                            close_pool_shm(pool_shm)
+
+                        # Open client's SHM for both reading requests and writing responses
+                        pool_shm = shared_memory.SharedMemory(
+                            name=client_shm_name, create=False, track=False,
+                        )
+                        pool_segment_size = seg_size
+
+                        # Register for reply() access from scheduler thread
+                        with self._conn_shm_lock:
+                            self._conn_pool_shm[conn_id] = pool_shm
+
+                        # Send ACK with empty name → signals unified mode
+                        hs_payload = encode_handshake('', seg_size)
+                        hs_frame = _encode_frame(
+                            0, _FLAG_HANDSHAKE | _FLAG_RESPONSE, hs_payload,
+                        )
+                        await _write_frame(writer, hs_frame)
+                    except Exception as exc:
+                        logger.warning(
+                            'IPCv2Server: pool handshake failed for conn %d: %s',
+                            conn_id, exc,
+                        )
+                        close_pool_shm(pool_shm)
+                        pool_shm = None
+                        pool_segment_size = 0
+                    continue
+
                 str_rid = f'{conn_id}:{request_id}'
 
-                # Decode inline vs SHM request data
-                if flags & _FLAG_SHM:
+                # ---- Decode request data ----
+                if flags & _FLAG_POOL:
+                    # Pool path: read from unified pool SHM
+                    if pool_shm is None or len(payload) < 8:
+                        raise error.EventDeserializeError(
+                            'Pool SHM frame received but no pool handshake was done'
+                        )
+                    size = struct.unpack('<Q', payload[:8])[0]
+                    if size > pool_segment_size:
+                        raise error.EventDeserializeError(
+                            f'Pool payload size {size} exceeds segment size {pool_segment_size}'
+                        )
+                    event_bytes, _read_buf = _read_from_pool_shm(
+                        pool_shm.buf, size, _read_buf,
+                    )
+                elif flags & _FLAG_SHM:
                     parts = payload.split(b'\x00', 1)
                     if len(parts) != 2 or len(parts[1]) < 8:
                         raise error.EventDeserializeError('Malformed SHM reference in request frame')
@@ -455,6 +585,7 @@ class IPCv2Server(BaseServer):
                 await _write_frame(writer, response_frame)
 
                 # S6: register SHM GC timestamp *after* frame is sent to client
+                # (only for per-request fallback SHMs, not pool segments)
                 if resp_shm_name is not None:
                     with self._shm_lock:
                         self._our_shm_segments[resp_shm_name] = time.monotonic()
@@ -485,6 +616,10 @@ class IPCv2Server(BaseServer):
                 self._conn_buffers.discard(_read_buf)
             _read_buf.release()
             self._client_tasks.discard(task)
+            # Clean up pool SHM for this connection (close handle, client unlinks)
+            close_pool_shm(pool_shm)
+            with self._conn_shm_lock:
+                self._conn_pool_shm.pop(conn_id, None)
 
     async def _shm_gc_loop(self) -> None:
         while True:
@@ -494,7 +629,7 @@ class IPCv2Server(BaseServer):
                 stale = [n for n, ts in self._our_shm_segments.items() if now - ts > SHM_MAX_AGE]
                 for name in stale:
                     try:
-                        shm = shared_memory.SharedMemory(name=name, create=False)
+                        shm = shared_memory.SharedMemory(name=name, create=False, track=False)
                         shm.close()
                         shm.unlink()
                     except FileNotFoundError:

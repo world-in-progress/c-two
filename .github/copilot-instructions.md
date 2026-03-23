@@ -6,7 +6,7 @@ C-Two is a **resource-oriented RPC framework** for Python that enables remote in
 
 The core abstraction is **not services, but resources**: CRMs (Core Resource Models) encapsulate persistent state and domain logic; Components consume them through ICRM interfaces with full location transparency.
 
-## Build & Run
+## Build, Test & Run
 
 Package manager: **uv** (not pip directly)
 
@@ -14,19 +14,25 @@ Package manager: **uv** (not pip directly)
 # Install dependencies
 uv sync
 
-# Run a specific test (tests are standalone scripts, not pytest)
-python tests/thread.test.py
+# Run the full test suite
+uv run pytest -q
+
+# Run a single test file
+uv run pytest tests/unit/test_encoding.py -q
+
+# Run a single test class or function
+uv run pytest tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 
 # Run examples (start server first, then client in separate terminal)
-python examples/server.py
-python examples/client.py
+uv run python examples/server.py
+uv run python examples/client.py
 
 # CLI tool (installed as `c3`)
 c3 --version
 c3 build <project_path> --base-image python:3.12-slim
 ```
 
-There is no pytest or unittest suite. Tests are manual scripts under `tests/` that set up a CRM server, run component calls, and verify results inline.
+Tests use **pytest** with a 30-second per-test timeout. Test fixtures are parameterized across transport protocols (thread, memory, ipc, tcp, http). Tests live under `tests/unit/` and `tests/integration/`, with shared fixtures in `tests/fixtures/`.
 
 ## Architecture
 
@@ -36,6 +42,7 @@ Three-tier design with strict separation:
 - **CRM**: A plain Python class holding state and implementing domain logic. Not decorated.
 - **ICRM**: An interface class decorated with `@cc.icrm(namespace='...', version='...')` that declares which CRM methods are remotely accessible. Only methods in the ICRM are exposed.
 - **`@transferable`**: Decorator for custom data types that need to cross the wire. Automatically makes classes into dataclasses and registers `serialize`/`deserialize` as static methods. Without `@transferable`, pickle is used as fallback.
+- **Method access**: ICRM methods can be annotated with `@cc.read` or `@cc.write` (default: write) to control concurrency — the scheduler allows parallel reads but exclusive writes.
 
 ### 2. Component Layer (`src/c_two/compo/`)
 - Components are client-side consumers of CRM resources.
@@ -46,19 +53,27 @@ Three-tier design with strict separation:
 Protocol is auto-detected from the address scheme:
 | Scheme | Transport | Use case |
 |---|---|---|
-| `thread://` | ThreadServer/Client | In-process, thread-safe |
+| `thread://` | ThreadServer/Client | In-process, skips serialization entirely |
 | `memory://` | MemoryServer/Client | Shared memory, local |
-| `ipc:///path` | ZmqServer/Client | Inter-process (Unix) |
+| `ipc:///path` | IpcServer/Client | Inter-process (UDS control + SHM data) |
 | `tcp://host:port` | ZmqServer/Client | Cross-machine |
 | `http://host:port` | HttpServer/Client | Web-compatible |
 
 The `Server` class in `rpc/server.py` and `Client` class in `rpc/client.py` are the unified entry points — they dispatch to protocol-specific implementations based on address prefix.
 
+### Wire Protocol (`src/c_two/rpc/util/wire.py`)
+The compact binary wire codec used by all non-thread transports. Little-endian format:
+- **CRM_CALL**: `[1B type][2B method_len LE][method_name UTF-8][payload]`
+- **CRM_REPLY**: `[1B type][4B error_len LE][error_bytes][result]`
+- **Signals**: `[1B type]` (PING, PONG, SHUTDOWN variants — pre-encoded singletons)
+
+Method names are **pre-encoded at ICRM registration time** (`preregister_methods()` in `meta.py`) to avoid repeated UTF-8 encoding and struct packing on every call. Decoding uses zero-copy `memoryview` slicing.
+
 ### Event System (`src/c_two/rpc/event/`)
-Communication uses an event-based model with `Event`, `EventTag`, and `EventQueue`. Event tags include `PING`, `PONG`, `CRM_CALL`, `CRM_REPLY`, `SHUTDOWN_FROM_CLIENT`, `SHUTDOWN_FROM_SERVER`, `SHUTDOWN_ACK`.
+Legacy communication layer using `Event`, `EventTag`, and `EventQueue`. Being migrated to the wire protocol — new code should use `wire.encode_call`/`wire.decode` directly. The bridge function `event_to_wire_bytes()` in `encoding.py` handles the transition.
 
 ### MCP Integration (`src/c_two/mcp/`)
-Bridges C-Two components to the Model Context Protocol. `register_mcp_tools_from_compo_module()` auto-registers all component functions in a module as MCP tools. Includes a `flow()` function for LLM-orchestrated multi-step operations.
+Bridges C-Two components to the Model Context Protocol. `register_mcp_tools_from_compo_module()` auto-registers all component functions in a module as MCP tools. Peripheral/experimental — not part of core framework concerns.
 
 ### Seed / CLI (`src/c_two/seed/`, `src/c_two/cli.py`)
 The `c3` CLI currently has one command: `build` — for generating Dockerfiles and building Docker images for CRM deployment.
@@ -120,6 +135,9 @@ Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Err
 - Transferable classes: descriptive data names (e.g., `GridAttribute`, `GridSchema`)
 - Address constants: `SCREAMING_SNAKE_CASE` (e.g., `MEMORY_ADDRESS`, `TCP_ADDRESS`)
 
+### Performance-Sensitive Code
+Wire codec and transport code (`rpc/util/`, `rpc/ipc/`) prioritize zero-copy (`memoryview`), single-allocation patterns (`bytearray` + `struct.pack_into`), and pre-computation. Avoid introducing intermediate `bytes` copies on the hot path. The `thread://` transport skips serialization entirely via `call_direct`.
+
 ## Python Version
 
-Requires Python ≥ 3.10. Uses modern type hints (`list[int]`, `str | None`, `tuple[...]`).
+Requires Python ≥ 3.10. Uses modern type hints (`list[int]`, `str | None`, `tuple[...]`). Free-threading (3.14t) is a target platform — be cautious with C extensions and GIL assumptions.

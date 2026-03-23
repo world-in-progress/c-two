@@ -35,7 +35,7 @@ def _ceil_size(size: int) -> int:
 class AdaptiveBufferConfig:
     """Tunable knobs for :class:`AdaptiveBuffer`."""
 
-    min_size: int = 1_048_576          # 1 MB — matches SHM threshold
+    min_size: int = 1_048_576          # 1 MB — minimum buffer allocation
     max_size: int = 4_294_967_296      # 4 GB
     shrink_threshold: float = 0.25     # usage ratio counted as "underused"
     shrink_after_n: int = 3            # consecutive underused reads before shrink

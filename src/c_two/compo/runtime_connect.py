@@ -22,20 +22,21 @@ def connect_crm(address: str, icrm_class: Type[ICRM]) -> ContextManager[ICRM]:
     ...
 
 @contextmanager
-def connect_crm(address: str, icrm_class: Type[ICRM] = None) -> Generator[Client | ICRM, None, None]:
+def connect_crm(address: str, icrm_class: Type[ICRM] = None, **kwargs) -> Generator[Client | ICRM, None, None]:
     """
     Context manager to connect to a CRM server.
     
     Args:
         address: The server address string
         icrm_class: The ICRM class to instantiate
+        **kwargs: Additional keyword arguments passed to Client (e.g., ipc_config)
         
     Yields:
         The connected client instance, or an ICRM instance if icrm_class is provided
     """
     if isinstance(address, str):
         # Remote CRM server connection logic
-        client = Client(address)
+        client = Client(address, **kwargs)
         old_client = getattr(_local, 'current_client', None)
         _local.current_client = client
         try:

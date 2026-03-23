@@ -15,7 +15,7 @@ from .event.envelope import Envelope
 from .event.envelope import CompletionType as EnvelopeCompletionType
 from .event.msg_type import MsgType
 from .http import HttpServer
-from .ipc import IPCv2Server
+from .ipc import IPCv2Server, IPCConfig
 from .memory import MemoryServer
 from .thread import ThreadServer
 from .thread.thread_server import DirectCallEvent
@@ -56,6 +56,7 @@ class ServerConfig(Generic[CRM, ICRM]):
     name: str = ''
     on_shutdown: callable = lambda: None
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
+    ipc_config: IPCConfig | None = None
 
     def __post_init__(self):
         """
@@ -596,7 +597,7 @@ class Server:
         elif config.bind_address.startswith('thread://'):
             self.server = ThreadServer(config.bind_address)
         elif config.bind_address.startswith('ipc-v2://'):
-            self.server = IPCv2Server(config.bind_address)
+            self.server = IPCv2Server(config.bind_address, ipc_config=config.ipc_config)
         else:
             raise ValueError(f'Unsupported protocol in bind_address: {config.bind_address}')
 
