@@ -384,3 +384,170 @@ class TestIPCv2PoolEnhancements:
                 assert crm.echo_none(huge) == huge
         finally:
             _shutdown(ipc_address, server)
+
+
+# ---------------------------------------------------------------------------
+# Bytes echo CRM for precise elastic expansion testing
+# ---------------------------------------------------------------------------
+
+@cc.icrm(namespace='test.echo_bytes', version='0.1.0')
+class IEchoBytes:
+    def echo(self, data: bytes) -> bytes:
+        ...
+
+
+class EchoBytes:
+    def echo(self, data: bytes) -> bytes:
+        return data
+
+
+def _start_echo_server(address, ipc_config):
+    server = Server(ServerConfig(
+        name='EchoElastic',
+        crm=EchoBytes(),
+        icrm=IEchoBytes,
+        bind_address=address,
+        ipc_config=ipc_config,
+    ))
+    _start(server._state)
+    for _ in range(50):
+        try:
+            if cc.rpc.Client.ping(address, timeout=0.5):
+                break
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return server
+
+
+class TestSegmentChainElasticity:
+    """Elastic expansion end-to-end with bytes echo.
+
+    Uses small segment sizes (64 KB) to trigger expansion without
+    allocating hundreds of megabytes in tests.  Both request and
+    response wire data must fit in the selected segment for pool path,
+    so the echo CRM is ideal: response is the same size as request data.
+    """
+
+    _SEG_SIZE = 64 * 1024       # 64 KB initial segment
+    _SERVER_SEG = 512 * 1024    # 512 KB — server never clamps expansion
+
+    @pytest.fixture
+    def echo_addr(self):
+        return f'ipc-v2://echo_{uuid.uuid4().hex[:8]}'
+
+    def test_small_payload_uses_initial_segment(self, echo_addr):
+        """Payload fitting the initial segment does not trigger expansion."""
+        srv_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        cli_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._SEG_SIZE, max_pool_segments=4,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(echo_addr, IEchoBytes, ipc_config=cli_cfg) as crm:
+                payload = b'\xAA' * 1024  # 1 KB — easily fits in 64 KB
+                result = crm.echo(payload)
+                assert result == payload
+        finally:
+            _shutdown(echo_addr, server)
+
+    def test_expansion_triggered_and_data_preserved(self, echo_addr):
+        """Payload exceeding initial segment triggers expansion; data round-trips intact."""
+        srv_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        cli_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._SEG_SIZE, max_pool_segments=4,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(echo_addr, IEchoBytes, ipc_config=cli_cfg) as crm:
+                # 100 KB payload — exceeds 64 KB segment → triggers expansion
+                payload = bytes(range(256)) * 400  # 100 KB, non-trivial pattern
+                result = crm.echo(payload)
+                assert result == payload
+        finally:
+            _shutdown(echo_addr, server)
+
+    def test_segment_reuse_after_expansion(self, echo_addr):
+        """After expanding to segment[1], a small payload still uses segment[0]."""
+        srv_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        cli_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._SEG_SIZE, max_pool_segments=4,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(echo_addr, IEchoBytes, ipc_config=cli_cfg) as crm:
+                # 1. Small (fits in segment[0])
+                small = b'\x01' * 1024
+                assert crm.echo(small) == small
+
+                # 2. Large (triggers expansion to segment[1])
+                large = b'\x02' * (100 * 1024)
+                assert crm.echo(large) == large
+
+                # 3. Small again (should still work — reuses segment[0])
+                assert crm.echo(small) == small
+        finally:
+            _shutdown(echo_addr, server)
+
+    def test_progressive_expansion_three_segments(self, echo_addr):
+        """Progressively larger payloads create a 3-segment chain."""
+        srv_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        cli_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._SEG_SIZE, max_pool_segments=4,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(echo_addr, IEchoBytes, ipc_config=cli_cfg) as crm:
+                # Segment[0] = 64 KB
+                p1 = b'\x10' * 1024          # 1 KB → fits [0]
+                assert crm.echo(p1) == p1
+
+                # Segment[1] ≈ 100 KB (max(64KB, wire_size))
+                p2 = b'\x20' * (80 * 1024)   # 80 KB → triggers expansion
+                assert crm.echo(p2) == p2
+
+                # Segment[2] ≈ 200 KB
+                p3 = b'\x30' * (150 * 1024)  # 150 KB → triggers second expansion
+                assert crm.echo(p3) == p3
+
+                # All sizes still work (each uses its segment)
+                assert crm.echo(p1) == p1
+                assert crm.echo(p2) == p2
+                assert crm.echo(p3) == p3
+        finally:
+            _shutdown(echo_addr, server)
+
+    def test_fallback_after_max_segments_exhausted(self, echo_addr):
+        """After max_pool_segments reached, oversized payload falls back to per-request SHM."""
+        srv_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        cli_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._SEG_SIZE, max_pool_segments=2,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(echo_addr, IEchoBytes, ipc_config=cli_cfg) as crm:
+                # Fill 2 segments
+                assert crm.echo(b'\x01' * 1024) == b'\x01' * 1024              # seg[0]
+                assert crm.echo(b'\x02' * (80 * 1024)) == b'\x02' * (80 * 1024)  # seg[1]
+
+                # This exceeds both segments; max_pool_segments=2 → per-request SHM
+                huge = b'\x03' * (200 * 1024)
+                assert crm.echo(huge) == huge  # must succeed, not crash
+        finally:
+            _shutdown(echo_addr, server)
+
+    def test_response_integrity_after_expansion(self, echo_addr):
+        """Server reply uses expanded segment — verifies reply() segment selection works."""
+        srv_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        cli_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._SEG_SIZE, max_pool_segments=4,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(echo_addr, IEchoBytes, ipc_config=cli_cfg) as crm:
+                # Send 100 KB — both request and response use expanded segment
+                payload = bytes(range(256)) * 400
+                for _ in range(10):  # repeat to confirm stability
+                    assert crm.echo(payload) == payload
+        finally:
+            _shutdown(echo_addr, server)
