@@ -10,6 +10,7 @@ import hashlib
 import os
 import struct
 from dataclasses import dataclass
+from enum import IntEnum
 from multiprocessing import shared_memory
 
 from ... import error
@@ -22,6 +23,8 @@ FLAG_SHM = 1 << 0            # Payload references a per-request SharedMemory seg
 FLAG_RESPONSE = 1 << 1       # Server→client direction marker
 FLAG_HANDSHAKE = 1 << 2      # Pool SHM handshake message
 FLAG_POOL = 1 << 3           # Payload references pre-allocated pool SharedMemory
+FLAG_CTRL = 1 << 4           # Control message (segment announce, consumed signal)
+FLAG_DISK_SPILL = 1 << 5     # Reserved for Phase 2 disk spillover
 
 # ---------------------------------------------------------------------------
 # Pre-compiled struct objects for hot-path encoding/decoding
@@ -45,6 +48,8 @@ DEFAULT_MAX_FRAME_SIZE = 16_777_216                  # 16 MB — max inline fram
 DEFAULT_MAX_PAYLOAD_SIZE = 17_179_869_184            # 16 GB — max SHM payload
 DEFAULT_MAX_PENDING_REQUESTS = 1024                  # per-server total
 DEFAULT_POOL_SEGMENT_SIZE = 268_435_456              # 256 MB — pool SHM segment
+DEFAULT_MAX_POOL_SEGMENTS = 4                        # max segments per pool
+DEFAULT_MAX_POOL_MEMORY = DEFAULT_POOL_SEGMENT_SIZE * DEFAULT_MAX_POOL_SEGMENTS  # 1 GB per pool
 
 # ---------------------------------------------------------------------------
 # SHM garbage collection tuning
@@ -71,6 +76,7 @@ class IPCConfig:
         pool_enabled: Whether to use pre-allocated pool SHM (default True).
         pool_segment_size: Size of each pool SHM segment (default 256 MB).
         pool_decay_seconds: Idle seconds before pool teardown (default 60, 0=never).
+        max_pool_memory: Memory budget per pool direction (default 1 GB).
 
     Heartbeat (server probes client liveness):
         heartbeat_interval: Seconds between PING probes (default 15; ≤0 disables).
@@ -83,7 +89,8 @@ class IPCConfig:
     pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
     pool_enabled: bool = True
     pool_decay_seconds: float = 60.0
-    max_pool_segments: int = 4
+    max_pool_segments: int = DEFAULT_MAX_POOL_SEGMENTS
+    max_pool_memory: int = DEFAULT_MAX_POOL_MEMORY
     heartbeat_interval: float = 15.0
     heartbeat_timeout: float = 30.0
 
@@ -109,6 +116,11 @@ class IPCConfig:
         if not (1 <= self.max_pool_segments <= 255):
             raise ValueError(
                 f'max_pool_segments must be >= 1 and <= 255, got {self.max_pool_segments}'
+            )
+        if self.max_pool_memory < self.pool_segment_size:
+            raise ValueError(
+                f'max_pool_memory ({self.max_pool_memory}) must be >= '
+                f'pool_segment_size ({self.pool_segment_size})'
             )
         if self.heartbeat_interval > 0 and self.heartbeat_timeout <= self.heartbeat_interval:
             raise ValueError(
@@ -138,11 +150,14 @@ def shm_name(region_id: str, request_id: str, direction: str) -> str:
 def extract_pid_from_shm_name(name: str) -> int | None:
     """Extract creator PID from a C-Two SHM name.
 
-    Handles both per-request (``cc{d}{pid}_{hash}``) and pool
-    (``ccp{d}{pid}_{hash}``) formats.  Returns ``None`` if *name*
-    does not match either pattern.
+    Handles per-request (``cc{d}{pid}_{hash}``), legacy pool
+    (``ccp{d}{pid}_{hash}``), and split pool
+    (``ccpo{pid}_{hash}``, ``ccps{pid}_{hash}``) formats.
+    Returns ``None`` if *name* does not match any pattern.
     """
-    if name.startswith('ccp'):
+    if name.startswith('ccpo') or name.startswith('ccps'):
+        rest = name[4:]   # skip 'ccpo' / 'ccps'
+    elif name.startswith('ccp'):
         rest = name[4:]   # skip 'ccp' + direction char
     elif name.startswith('cc'):
         rest = name[3:]   # skip 'cc' + direction char
@@ -155,6 +170,77 @@ def extract_pid_from_shm_name(name: str) -> int | None:
         return int(rest[:idx], 16)
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Segment state (for future full-duplex readiness)
+# ---------------------------------------------------------------------------
+
+class SegmentState(IntEnum):
+    """Per-segment state machine for pool SHM segments.
+
+    Half-duplex: transitions are immediate (write → FREE since reader
+    is blocked). Full-duplex (Phase 2): CONSUMED signal drives FREE.
+    """
+    FREE = 0
+    IN_USE = 1
+
+
+# ---------------------------------------------------------------------------
+# Control message codec
+# ---------------------------------------------------------------------------
+# CTRL frame: [16B frame header (rid=0, flags=FLAG_CTRL)][1B ctrl_type][payload]
+
+CTRL_SEGMENT_ANNOUNCE = 0x01   # Announce a new pool segment to peer
+CTRL_CONSUMED = 0x02           # Signal that a segment has been consumed
+
+# Pool direction byte values
+POOL_DIR_OUTBOUND = 0   # Client → Server (request direction)
+POOL_DIR_RESPONSE = 1   # Server → Client (response direction)
+
+_CTRL_ANNOUNCE_HEADER = struct.Struct('<BBBI')  # ctrl_type(1) + direction(1) + index(1) + size(4)
+
+
+def encode_ctrl_segment_announce(direction: int, index: int, size: int, name: str) -> bytes:
+    """Encode a CTRL_SEGMENT_ANNOUNCE message.
+
+    Format: ``[1B ctrl=0x01][1B direction][1B index][4B size LE][name UTF-8]``
+    """
+    name_bytes = name.encode('utf-8')
+    buf = bytearray(7 + len(name_bytes))
+    _CTRL_ANNOUNCE_HEADER.pack_into(buf, 0, CTRL_SEGMENT_ANNOUNCE, direction, index, size)
+    buf[7:] = name_bytes
+    return bytes(buf)
+
+
+def decode_ctrl_segment_announce(payload: bytes | memoryview) -> tuple[int, int, int, str]:
+    """Decode a CTRL_SEGMENT_ANNOUNCE message.
+
+    Returns ``(direction, segment_index, segment_size, shm_name)``.
+    """
+    if len(payload) < 7:
+        raise ValueError(f'CTRL_SEGMENT_ANNOUNCE too short: {len(payload)}')
+    _, direction, index, size = _CTRL_ANNOUNCE_HEADER.unpack_from(payload, 0)
+    name = bytes(payload[7:]).decode('utf-8')
+    return direction, index, size, name
+
+
+def encode_ctrl_consumed(direction: int, index: int) -> bytes:
+    """Encode a CTRL_CONSUMED message.
+
+    Format: ``[1B ctrl=0x02][1B direction][1B index]``
+    """
+    return bytes((CTRL_CONSUMED, direction, index))
+
+
+def decode_ctrl_consumed(payload: bytes | memoryview) -> tuple[int, int]:
+    """Decode a CTRL_CONSUMED message.
+
+    Returns ``(direction, segment_index)``.
+    """
+    if len(payload) < 3:
+        raise ValueError(f'CTRL_CONSUMED too short: {len(payload)}')
+    return int(payload[1]), int(payload[2])
 
 
 # ---------------------------------------------------------------------------

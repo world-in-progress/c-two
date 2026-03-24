@@ -4,6 +4,11 @@ IPC v2 Server — UDS control plane with SharedMemory data plane.
 Control plane: asyncio Unix Domain Socket (Phase 1-2, macOS/Linux)
 Data plane: multiprocessing.shared_memory.SharedMemory for large payloads
 
+Split pool architecture:
+    - Client Outbound Pool: client creates, client writes requests, server reads
+    - Server Response Pool: server creates, server writes responses, client reads
+    - Each side manages their own pool independently
+
 Wire protocol (control plane):
     [4B total_len][8B request_id_u64][4B flags][payload_or_shm_ref]
 
@@ -14,6 +19,7 @@ Wire protocol (control plane):
         bit 1: response frame
         bit 2: pool handshake
         bit 3: pool SHM segment
+        bit 4: control message (segment announce, consumed)
 """
 
 import asyncio
@@ -35,15 +41,20 @@ from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
 from ..util.wire import encode_reply, encode_signal, decode, write_reply_into, reply_wire_size, PING_BYTES
 from .ipc_protocol import (
-    FLAG_SHM, FLAG_POOL, FLAG_HANDSHAKE, FLAG_RESPONSE,
+    FLAG_SHM, FLAG_POOL, FLAG_HANDSHAKE, FLAG_RESPONSE, FLAG_CTRL,
     FRAME_STRUCT, U64_STRUCT, U32_STRUCT,
     FAST_READ_THRESHOLD, FRAME_HEADER_SIZE, POOL_PAYLOAD_HEADER_SIZE,
     SHM_GC_INTERVAL, SHM_MAX_AGE,
+    SegmentState,
+    CTRL_SEGMENT_ANNOUNCE, CTRL_CONSUMED,
+    POOL_DIR_OUTBOUND, POOL_DIR_RESPONSE,
     IPCConfig, DEFAULT_MAX_FRAME_SIZE,
     DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_SHM_THRESHOLD,
     DEFAULT_MAX_PENDING_REQUESTS, DEFAULT_POOL_SEGMENT_SIZE,
     encode_frame, decode_frame,
     encode_inline_reply_frame,
+    encode_ctrl_segment_announce, decode_ctrl_segment_announce,
+    encode_ctrl_consumed, decode_ctrl_consumed,
     shm_name, fast_read_shm, read_from_pool_shm,
 )
 
@@ -51,27 +62,54 @@ logger = logging.getLogger(__name__)
 
 # B1: SHM name format — cc + direction char + pid_hex(1-6) + _ + hash_hex
 #     or pool format — ccp + direction char + pid_hex(1-6) + _ + hash_hex
+#     or split pool — ccpo/ccps + pid_hex(1-6) + _ + hash_hex
 _SHM_NAME_RE = re.compile(r'^cc[a-z][0-9a-f]{1,6}_[0-9a-f]{10,15}$')
 _POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z][0-9a-f]{1,6}_[0-9a-f]{9,14}$')
+_SPLIT_POOL_SHM_RE = re.compile(r'^ccp[os][0-9a-f]{1,6}_[0-9a-f]{9,14}$')
+
+
+def _valid_pool_shm_name(name: str) -> bool:
+    """Validate a pool SHM name (legacy or split format)."""
+    return bool(_POOL_SHM_NAME_RE.match(name) or _SPLIT_POOL_SHM_RE.match(name))
 
 
 @dataclass
 class _ClientContext:
-    """Per-connection state for _handle_client."""
+    """Per-connection state for _handle_client.
+
+    Split pool architecture:
+        - client_pool_*: Client's outbound pool (server reads requests from these)
+        - resp_pool_*: Server's response pool (server writes responses to these)
+    """
     conn_id: int
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     read_buf: AdaptiveBuffer = field(default_factory=AdaptiveBuffer)
     conn_request_ids: set[str] = field(default_factory=set)
-    pool_shms: list[shared_memory.SharedMemory] = field(default_factory=list)
-    pool_segment_sizes: list[int] = field(default_factory=list)
+
+    # Client's outbound pool (client creates, server opens read-only)
+    client_pool_shms: list[shared_memory.SharedMemory] = field(default_factory=list)
+    client_pool_sizes: list[int] = field(default_factory=list)
+
+    # Server's response pool (server creates and manages)
+    resp_pool_shms: list[shared_memory.SharedMemory] = field(default_factory=list)
+    resp_pool_sizes: list[int] = field(default_factory=list)
+    resp_pool_names: list[str] = field(default_factory=list)
+    resp_pool_budget_used: int = 0
+
     last_activity: float = field(default_factory=time.monotonic)
     _heartbeat_task: asyncio.Task | None = None
 
-    def get_pool_shm(self, index: int) -> shared_memory.SharedMemory | None:
-        """Return the pool SHM at *index*, or None if out of range."""
-        if 0 <= index < len(self.pool_shms):
-            return self.pool_shms[index]
+    def get_client_pool_shm(self, index: int) -> shared_memory.SharedMemory | None:
+        """Return the client outbound pool SHM at *index*, or None."""
+        if 0 <= index < len(self.client_pool_shms):
+            return self.client_pool_shms[index]
+        return None
+
+    def get_resp_pool_shm(self, index: int) -> shared_memory.SharedMemory | None:
+        """Return the server response pool SHM at *index*, or None."""
+        if 0 <= index < len(self.resp_pool_shms):
+            return self.resp_pool_shms[index]
         return None
 
 
@@ -124,11 +162,16 @@ class IPCv2Server(BaseServer):
         self._our_shm_segments: dict[str, float] = {}
         self._shm_lock = threading.Lock()
 
-        # Per-connection pool SHM (conn_id → (shm_list, size_list))
-        # Unified: client-created SHM used for both request reads and response writes.
+        # Per-connection response pool (conn_id → (shm_list, size_list))
+        # Server-created SHM used for writing responses to the client.
         # Written by reply() (scheduler thread), read by _handle_client (asyncio thread)
-        self._conn_pool_shm: dict[int, tuple[list[shared_memory.SharedMemory], list[int]]] = {}
-        self._conn_shm_lock = threading.Lock()
+        self._conn_resp_pool: dict[int, tuple[list[shared_memory.SharedMemory], list[int]]] = {}
+        self._conn_resp_lock = threading.Lock()
+
+        # Per-connection pending CTRL frames to send before response
+        # Written by reply() (scheduler thread), read by _handle_client (asyncio thread)
+        self._conn_ctrl_frames: dict[int, list[bytes]] = {}
+        self._conn_ctrl_lock = threading.Lock()
 
         # Track active client handler tasks for clean shutdown
         self._client_tasks: set[asyncio.Task] = set()
@@ -172,7 +215,6 @@ class IPCv2Server(BaseServer):
             return
 
         request_id = event.request_id
-        # request_id format: "conn_id:wire_rid" — extract wire rid for frame encoding
         int_rid = int(request_id.rsplit(':', 1)[1])
         flags = FLAG_RESPONSE
         resp_shm_name: str | None = None
@@ -191,7 +233,6 @@ class IPCv2Server(BaseServer):
             err_bytes = event.data_parts[0] if event.data_parts[0] else b''
             result_bytes = event.data_parts[1] if len(event.data_parts) > 1 else b''
         else:
-            # Fallback: scheduler returned combined data (non-tuple CRM response)
             from ..util.encoding import parse_message
             data = event.data if event.data is not None else b''
             parts = parse_message(data)
@@ -202,18 +243,64 @@ class IPCv2Server(BaseServer):
         result_len = len(result_bytes)
         total_wire = reply_wire_size(err_len, result_len)
 
-        # Try pool SHM first (pre-allocated, zero syscalls)
+        # Try server's response pool first (pre-allocated, zero syscalls)
         conn_id = int(request_id.rsplit(':', 1)[0])
-        with self._conn_shm_lock:
-            pool_entry = self._conn_pool_shm.get(conn_id)
+        with self._conn_resp_lock:
+            pool_entry = self._conn_resp_pool.get(conn_id)
             if pool_entry is not None:
-                pool_shms, pool_sizes = pool_entry
-                for idx, (pool_shm, seg_size) in enumerate(zip(pool_shms, pool_sizes)):
+                resp_shms, resp_sizes = pool_entry
+                # First-fit: find a segment large enough
+                for idx, (pool_shm, seg_size) in enumerate(zip(resp_shms, resp_sizes)):
                     if total_wire <= seg_size:
                         write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
                         payload = struct.pack('<BQ', idx, total_wire)
                         flags |= FLAG_POOL
                         break
+
+                # Expansion: no segment fits, try to create a new one
+                if not (flags & FLAG_POOL) and total_wire >= self._config.shm_threshold:
+                    new_size = max(self._config.pool_segment_size, total_wire)
+                    # Check budget and segment count
+                    budget_used = sum(resp_sizes)
+                    can_expand = (
+                        len(resp_shms) < self._config.max_pool_segments
+                        and budget_used + new_size <= self._config.max_pool_memory
+                        and new_size <= self._config.max_payload_size
+                    )
+                    if can_expand:
+                        try:
+                            from .shm_pool import pool_shm_name_response, create_pool_shm
+                            new_name = pool_shm_name_response(
+                                self.region_id, conn_id * 1000 + len(resp_shms),
+                            )
+                            new_shm = create_pool_shm(new_name, new_size)
+                            new_seg_size = min(new_size, new_shm.size)
+                            new_index = len(resp_shms)
+
+                            resp_shms.append(new_shm)
+                            resp_sizes.append(new_seg_size)
+
+                            # Queue CTRL_SEGMENT_ANNOUNCE for the asyncio thread to send
+                            ctrl_payload = encode_ctrl_segment_announce(
+                                POOL_DIR_RESPONSE, new_index, new_seg_size, new_name,
+                            )
+                            ctrl_frame = encode_frame(0, FLAG_CTRL, ctrl_payload)
+                            with self._conn_ctrl_lock:
+                                self._conn_ctrl_frames.setdefault(conn_id, []).append(ctrl_frame)
+
+                            # Also track the name for cleanup
+                            # (We need ctx for this, but ctx is in asyncio thread.
+                            #  Store in a side dict for cleanup_connection to read.)
+                            with self._shm_lock:
+                                self._our_shm_segments[new_name] = 0.0  # 0.0 = pool, not timed
+
+                            # Write into the new segment
+                            if total_wire <= new_seg_size:
+                                write_reply_into(new_shm.buf, 0, err_bytes, result_bytes)
+                                payload = struct.pack('<BQ', new_index, total_wire)
+                                flags |= FLAG_POOL
+                        except Exception as exc:
+                            logger.warning('Server response pool expansion failed: %s', exc)
 
         if not (flags & FLAG_POOL):
             if total_wire >= self._config.shm_threshold:
@@ -225,7 +312,6 @@ class IPCv2Server(BaseServer):
                 payload = resp_shm_name.encode('utf-8') + b'\x00' + size_header
                 flags |= FLAG_SHM
             else:
-                # Inline: single-alloc frame (eliminates encode_reply + encode_frame double copy)
                 frame = encode_inline_reply_frame(int_rid, flags, err_bytes, result_bytes)
                 self._resolve_pending(request_id, frame)
                 return
@@ -255,13 +341,14 @@ class IPCv2Server(BaseServer):
                     pass
             self._our_shm_segments.clear()
 
-        # Close pool SHM handles (client owns and unlinks these)
+        # Close client outbound pool handles (client owns and unlinks these)
+        # Unlink server response pool handles (server owns these)
         from .shm_pool import close_pool_shm
-        with self._conn_shm_lock:
-            for pool_shm_list, _ in self._conn_pool_shm.values():
-                for pool_shm in pool_shm_list:
-                    close_pool_shm(pool_shm)
-            self._conn_pool_shm.clear()
+        with self._conn_resp_lock:
+            for resp_shms, _ in self._conn_resp_pool.values():
+                for pool_shm in resp_shms:
+                    close_pool_shm(pool_shm, unlink=True)
+            self._conn_resp_pool.clear()
 
         with self._pending_lock:
             self._pending.clear()
@@ -371,6 +458,10 @@ class IPCv2Server(BaseServer):
                     await self._handle_pool_handshake(ctx, payload)
                     continue
 
+                if flags & FLAG_CTRL:
+                    self._handle_ctrl_message(ctx, payload)
+                    continue
+
                 str_rid = f'{conn_id}:{request_id}'
                 wire_bytes = self._decode_request(ctx, flags, payload)
 
@@ -382,6 +473,14 @@ class IPCv2Server(BaseServer):
                 )
                 if response_frame is None:
                     continue
+
+                # Send any pending CTRL frames before the response
+                # (e.g. SEGMENT_ANNOUNCE for newly expanded response pool)
+                with self._conn_ctrl_lock:
+                    ctrl_frames = self._conn_ctrl_frames.pop(conn_id, None)
+                if ctrl_frames:
+                    for cf in ctrl_frames:
+                        await _write_frame(writer, cf)
 
                 await _write_frame(writer, response_frame)
 
@@ -422,72 +521,74 @@ class IPCv2Server(BaseServer):
             pass
 
     async def _handle_pool_handshake(self, ctx: _ClientContext, payload: bytes) -> None:
-        """Negotiate pool SHM with the client (unified bidirectional).
+        """Negotiate split pool with the client (v3 handshake).
 
-        Supports both initial handshake (segment_index=0) and append
-        handshake (segment_index>0) for dynamic pool expansion.
+        Client sends its outbound pool info; server creates response pool
+        and sends ACK with both negotiated sizes and response pool info.
         """
-        from .shm_pool import close_pool_shm, decode_handshake, encode_handshake
+        from .shm_pool import (
+            close_pool_shm, decode_handshake, encode_handshake_ack,
+            pool_shm_name_response, create_pool_shm,
+        )
         try:
             client_shm_name, seg_size, segment_index = decode_handshake(payload)
 
-            if not _POOL_SHM_NAME_RE.match(client_shm_name):
+            if not _valid_pool_shm_name(client_shm_name):
                 raise ValueError(f'Invalid pool SHM name: {client_shm_name!r}')
             if seg_size == 0:
                 raise ValueError('Pool segment size must be > 0')
 
-            if segment_index == 0:
-                # Initial handshake — clamp to server's default segment size
-                seg_size = min(seg_size, self._config.pool_segment_size)
-
-                # Clean up old pool SHMs if this is a re-handshake
-                if ctx.pool_shms:
-                    with self._conn_shm_lock:
-                        self._conn_pool_shm.pop(ctx.conn_id, None)
-                    for old_shm in ctx.pool_shms:
-                        close_pool_shm(old_shm)
-                    ctx.pool_shms.clear()
-                    ctx.pool_segment_sizes.clear()
-
-                # Open client's SHM for both reading requests and writing responses
-                shm = shared_memory.SharedMemory(
-                    name=client_shm_name, create=False, track=False,
+            if segment_index != 0:
+                # v3 does not use append handshake — expansion uses CTRL_SEGMENT_ANNOUNCE
+                raise ValueError(
+                    f'v3 handshake does not support segment_index > 0 '
+                    f'(got {segment_index}); use CTRL_SEGMENT_ANNOUNCE instead'
                 )
-                negotiated_size = min(seg_size, shm.size)
-                ctx.pool_shms.append(shm)
-                ctx.pool_segment_sizes.append(negotiated_size)
 
-                # Register for reply() access from scheduler thread
-                with self._conn_shm_lock:
-                    self._conn_pool_shm[ctx.conn_id] = (ctx.pool_shms, ctx.pool_segment_sizes)
-            else:
-                # Append handshake — add new segment to chain.
-                # Allow sizes larger than pool_segment_size (the whole
-                # point of expansion) but cap at max_payload_size.
-                seg_size = min(seg_size, self._config.max_payload_size)
+            # Initial handshake — clamp client's requested size to server's default
+            seg_size = min(seg_size, self._config.pool_segment_size)
 
-                if segment_index != len(ctx.pool_shms):
-                    raise ValueError(
-                        f'Expected segment_index {len(ctx.pool_shms)}, got {segment_index}'
-                    )
-                if segment_index >= self._config.max_pool_segments:
-                    raise ValueError(
-                        f'segment_index {segment_index} exceeds max_pool_segments '
-                        f'{self._config.max_pool_segments}'
-                    )
+            # Clean up old pools if this is a re-handshake
+            if ctx.client_pool_shms:
+                with self._conn_resp_lock:
+                    self._conn_resp_pool.pop(ctx.conn_id, None)
+                for old_shm in ctx.client_pool_shms:
+                    close_pool_shm(old_shm)
+                ctx.client_pool_shms.clear()
+                ctx.client_pool_sizes.clear()
+                for old_shm in ctx.resp_pool_shms:
+                    close_pool_shm(old_shm, unlink=True)
+                ctx.resp_pool_shms.clear()
+                ctx.resp_pool_sizes.clear()
+                ctx.resp_pool_names.clear()
+                ctx.resp_pool_budget_used = 0
 
-                shm = shared_memory.SharedMemory(
-                    name=client_shm_name, create=False, track=False,
-                )
-                negotiated_size = min(seg_size, shm.size)
-                ctx.pool_shms.append(shm)
-                ctx.pool_segment_sizes.append(negotiated_size)
+            # Open client's outbound pool (read-only from server's perspective)
+            client_shm = shared_memory.SharedMemory(
+                name=client_shm_name, create=False, track=False,
+            )
+            negotiated_size = min(seg_size, client_shm.size)
+            ctx.client_pool_shms.append(client_shm)
+            ctx.client_pool_sizes.append(negotiated_size)
 
-                # List reference in _conn_pool_shm is already shared
-                # (set during initial handshake), no need to re-register
+            # Create server's response pool segment[0]
+            resp_seg_size = self._config.pool_segment_size
+            resp_name = pool_shm_name_response(self.region_id, ctx.conn_id)
+            resp_shm = create_pool_shm(resp_name, resp_seg_size)
+            actual_resp_size = min(resp_seg_size, resp_shm.size)
+            ctx.resp_pool_shms.append(resp_shm)
+            ctx.resp_pool_sizes.append(actual_resp_size)
+            ctx.resp_pool_names.append(resp_name)
+            ctx.resp_pool_budget_used = actual_resp_size
 
-            # Send ACK with segment_index and negotiated size
-            hs_payload = encode_handshake('', negotiated_size, segment_index)
+            # Register response pool for reply() access from scheduler thread
+            with self._conn_resp_lock:
+                self._conn_resp_pool[ctx.conn_id] = (ctx.resp_pool_shms, ctx.resp_pool_sizes)
+
+            # Send v3 ACK with client negotiated size + server response pool info
+            hs_payload = encode_handshake_ack(
+                negotiated_size, actual_resp_size, resp_name,
+            )
             hs_frame = encode_frame(
                 0, FLAG_HANDSHAKE | FLAG_RESPONSE, hs_payload,
             )
@@ -498,22 +599,63 @@ class IPCv2Server(BaseServer):
                 ctx.conn_id, exc,
             )
 
+    def _handle_ctrl_message(self, ctx: _ClientContext, payload: bytes) -> None:
+        """Process a control message from the client."""
+        if len(payload) < 1:
+            logger.warning('Empty CTRL payload from conn %d', ctx.conn_id)
+            return
+        ctrl_type = payload[0]
+
+        if ctrl_type == CTRL_SEGMENT_ANNOUNCE:
+            direction, index, size, name = decode_ctrl_segment_announce(payload)
+            if direction != POOL_DIR_OUTBOUND:
+                logger.warning(
+                    'Server received SEGMENT_ANNOUNCE for direction=%d (expected outbound)',
+                    direction,
+                )
+                return
+            if not _valid_pool_shm_name(name):
+                logger.warning('Invalid pool SHM name in SEGMENT_ANNOUNCE: %r', name)
+                return
+            if index != len(ctx.client_pool_shms):
+                logger.warning(
+                    'SEGMENT_ANNOUNCE index mismatch: expected %d, got %d',
+                    len(ctx.client_pool_shms), index,
+                )
+                return
+            try:
+                shm = shared_memory.SharedMemory(name=name, create=False, track=False)
+                negotiated_size = min(size, shm.size)
+                ctx.client_pool_shms.append(shm)
+                ctx.client_pool_sizes.append(negotiated_size)
+            except Exception as exc:
+                logger.warning('Failed to open announced segment %r: %s', name, exc)
+
+        elif ctrl_type == CTRL_CONSUMED:
+            # Client consumed a response pool segment — in half-duplex this
+            # is redundant (segment is already free) but we accept it for
+            # protocol consistency and future full-duplex.
+            pass
+
+        else:
+            logger.warning('Unknown CTRL type %d from conn %d', ctrl_type, ctx.conn_id)
+
     def _decode_request(self, ctx: _ClientContext, flags: int, payload: bytes) -> bytes | memoryview:
-        """Resolve request wire bytes from inline, per-request SHM, or pool SHM."""
+        """Resolve request wire bytes from inline, per-request SHM, or client outbound pool."""
         if flags & FLAG_POOL:
-            if not ctx.pool_shms or len(payload) < POOL_PAYLOAD_HEADER_SIZE:
+            if not ctx.client_pool_shms or len(payload) < POOL_PAYLOAD_HEADER_SIZE:
                 raise error.EventDeserializeError(
                     'Pool SHM frame received but no pool handshake was done'
                 )
             segment_index = payload[0]
             size = U64_STRUCT.unpack(payload[1:9])[0]
-            pool_shm = ctx.get_pool_shm(segment_index)
+            pool_shm = ctx.get_client_pool_shm(segment_index)
             if pool_shm is None:
                 raise error.EventDeserializeError(
                     f'Pool segment_index {segment_index} out of range '
-                    f'(have {len(ctx.pool_shms)} segments)'
+                    f'(have {len(ctx.client_pool_shms)} segments)'
                 )
-            seg_size = ctx.pool_segment_sizes[segment_index]
+            seg_size = ctx.client_pool_sizes[segment_index]
             if size > seg_size:
                 raise error.EventDeserializeError(
                     f'Pool payload size {size} exceeds segment size {seg_size}'
@@ -629,11 +771,24 @@ class IPCv2Server(BaseServer):
             self._conn_buffers.discard(ctx.read_buf)
         ctx.read_buf.release()
         self._client_tasks.discard(task)
-        # Clean up pool SHM for this connection (close handles, client unlinks)
-        with self._conn_shm_lock:
-            self._conn_pool_shm.pop(ctx.conn_id, None)
-        for pool_shm in ctx.pool_shms:
+
+        # Clean up client outbound pool (close handles only — client unlinks)
+        for pool_shm in ctx.client_pool_shms:
             close_pool_shm(pool_shm)
+
+        # Clean up server response pool (close + unlink — server owns these)
+        with self._conn_resp_lock:
+            self._conn_resp_pool.pop(ctx.conn_id, None)
+        for pool_shm in ctx.resp_pool_shms:
+            close_pool_shm(pool_shm, unlink=True)
+        # Remove response pool names from GC tracking
+        with self._shm_lock:
+            for name in ctx.resp_pool_names:
+                self._our_shm_segments.pop(name, None)
+
+        # Clean up any pending CTRL frames
+        with self._conn_ctrl_lock:
+            self._conn_ctrl_frames.pop(ctx.conn_id, None)
 
     async def _shm_gc_loop(self) -> None:
         while True:

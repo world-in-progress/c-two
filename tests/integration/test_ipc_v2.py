@@ -551,3 +551,252 @@ class TestSegmentChainElasticity:
                     assert crm.echo(payload) == payload
         finally:
             _shutdown(echo_addr, server)
+
+
+# ---------------------------------------------------------------------------
+# Generator CRM for asymmetric (small-request → large-response) testing
+# ---------------------------------------------------------------------------
+
+@cc.icrm(namespace='test.generator', version='0.1.0')
+class IGenerator:
+    def generate(self, size: int) -> bytes:
+        ...
+
+
+class Generator:
+    def generate(self, size: int) -> bytes:
+        return b'\xBB' * size
+
+
+def _start_generator_server(address, ipc_config):
+    server = Server(ServerConfig(
+        name='Generator',
+        crm=Generator(),
+        icrm=IGenerator,
+        bind_address=address,
+        ipc_config=ipc_config,
+    ))
+    _start(server._state)
+    for _ in range(50):
+        try:
+            if cc.rpc.Client.ping(address, timeout=0.5):
+                break
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return server
+
+
+class TestSplitPool:
+    """Split pool architecture: separate client outbound + server response pools.
+
+    Uses small segment sizes (64 KB) so server auto-expansion is triggered
+    without consuming hundreds of MB in test runs.
+
+    Key scenarios:
+    - Asymmetric: small request → large response (server response pool expands)
+    - Symmetric echo: both pools exercise normally
+    - Budget exhaustion: large responses exceed budget → per-request SHM fallback
+    - Progressive expansion: increasingly large responses expand response pool
+    """
+
+    _SEG_SIZE = 64 * 1024       # 64 KB — small enough to trigger expansion
+    _SERVER_SEG = 64 * 1024     # Same — server starts small too
+    _MAX_SEGS = 4
+
+    @pytest.fixture
+    def gen_addr(self):
+        return f'ipc-v2://gen_{uuid.uuid4().hex[:8]}'
+
+    @pytest.fixture
+    def echo_addr(self):
+        return f'ipc-v2://spe_{uuid.uuid4().hex[:8]}'
+
+    def test_small_request_large_response(self, gen_addr):
+        """Small int request → large bytes response. Server response pool must expand."""
+        srv_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SERVER_SEG,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        cli_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SEG_SIZE,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        server = _start_generator_server(gen_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                gen_addr, IGenerator, ipc_config=cli_cfg,
+            ) as crm:
+                # 100 KB response exceeds server's initial 64 KB segment
+                result = crm.generate(100 * 1024)
+                assert len(result) == 100 * 1024
+                assert result == b'\xBB' * (100 * 1024)
+        finally:
+            _shutdown(gen_addr, server)
+
+    def test_progressive_response_expansion(self, gen_addr):
+        """Progressively larger responses force the server to add response segments."""
+        srv_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SERVER_SEG,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        cli_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SEG_SIZE,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        server = _start_generator_server(gen_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                gen_addr, IGenerator, ipc_config=cli_cfg,
+            ) as crm:
+                # Seg[0] = 64 KB — fits
+                r1 = crm.generate(1024)
+                assert len(r1) == 1024
+
+                # Exceeds seg[0] → server creates seg[1]
+                r2 = crm.generate(80 * 1024)
+                assert len(r2) == 80 * 1024
+
+                # Exceeds seg[1] → server creates seg[2]
+                r3 = crm.generate(150 * 1024)
+                assert len(r3) == 150 * 1024
+
+                # All sizes still work (server reuses appropriate segments)
+                assert len(crm.generate(1024)) == 1024
+                assert len(crm.generate(80 * 1024)) == 80 * 1024
+                assert len(crm.generate(150 * 1024)) == 150 * 1024
+        finally:
+            _shutdown(gen_addr, server)
+
+    def test_symmetric_echo_through_split_pools(self, echo_addr):
+        """Echo CRM exercises both outbound (request) and response pools."""
+        srv_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SERVER_SEG,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        cli_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SEG_SIZE,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                echo_addr, IEchoBytes, ipc_config=cli_cfg,
+            ) as crm:
+                # Request and response same size — both pools must expand
+                payload = b'\xCC' * (100 * 1024)
+                assert crm.echo(payload) == payload
+        finally:
+            _shutdown(echo_addr, server)
+
+    def test_server_budget_exhaustion_fallback(self, gen_addr):
+        """When server response pool budget is exhausted, falls back to per-request SHM."""
+        # Server has tight budget: 2 segments × 64 KB = 128 KB
+        srv_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SERVER_SEG,
+            max_pool_segments=2,
+            max_pool_memory=2 * self._SERVER_SEG,
+        )
+        cli_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SEG_SIZE,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        server = _start_generator_server(gen_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                gen_addr, IGenerator, ipc_config=cli_cfg,
+            ) as crm:
+                # Fill 2 server segments
+                assert len(crm.generate(1024)) == 1024         # seg[0]
+                assert len(crm.generate(80 * 1024)) == 80 * 1024  # seg[1]
+
+                # Exceeds both segments + budget → per-request SHM (must succeed)
+                big = crm.generate(200 * 1024)
+                assert len(big) == 200 * 1024
+        finally:
+            _shutdown(gen_addr, server)
+
+    def test_client_outbound_expansion_independent(self, echo_addr):
+        """Client outbound pool expansion is independent of server response pool."""
+        # Server starts big, client starts small
+        srv_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=256 * 1024,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        cli_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SEG_SIZE,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        server = _start_echo_server(echo_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                echo_addr, IEchoBytes, ipc_config=cli_cfg,
+            ) as crm:
+                # Client expands outbound pool; server already has enough response space
+                payload = b'\xDD' * (100 * 1024)
+                result = crm.echo(payload)
+                assert result == payload
+
+                # Even bigger — client expands again
+                payload2 = b'\xEE' * (200 * 1024)
+                result2 = crm.echo(payload2)
+                assert result2 == payload2
+        finally:
+            _shutdown(echo_addr, server)
+
+    def test_repeated_asymmetric_calls_stable(self, gen_addr):
+        """Repeated asymmetric calls are stable (no leaks or state corruption)."""
+        srv_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SERVER_SEG,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        cli_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SEG_SIZE,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        server = _start_generator_server(gen_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                gen_addr, IGenerator, ipc_config=cli_cfg,
+            ) as crm:
+                for _ in range(20):
+                    r = crm.generate(100 * 1024)
+                    assert len(r) == 100 * 1024
+        finally:
+            _shutdown(gen_addr, server)
+
+    def test_mixed_sizes_alternating(self, gen_addr):
+        """Alternating small and large responses reuse appropriate segments."""
+        srv_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SERVER_SEG,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        cli_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SEG_SIZE,
+            max_pool_segments=self._MAX_SEGS,
+        )
+        server = _start_generator_server(gen_addr, srv_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                gen_addr, IGenerator, ipc_config=cli_cfg,
+            ) as crm:
+                sizes = [1024, 80 * 1024, 512, 150 * 1024, 2048, 80 * 1024]
+                for size in sizes:
+                    r = crm.generate(size)
+                    assert len(r) == size
+        finally:
+            _shutdown(gen_addr, server)

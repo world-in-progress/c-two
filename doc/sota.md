@@ -328,3 +328,137 @@ P2 (Router/Worker架构引入后):
 不建议做:
   └─ 磁盘溢出 (留给CRM层/应用层)
 ```
+
+## 附录：Rust Routing Server 方案
+
+### 背景与动机
+
+SOTA设计中的跨节点HTTP路由链路为：`CRM Ref (Http client) → FastAPI → IPC-v2 → CRM Object → IPC-v2 → FastAPI → CRM Ref`。当前Python实现（`router.py`）使用Starlette + uvicorn + ThreadPoolExecutor(16)，存在以下瓶颈：
+
+- 每次relay都创建/销毁`Client`连接（`router.py:240-245`），无连接复用
+- ThreadPoolExecutor线程数固定，高并发下成为瓶颈
+- Python GIL导致即使是纯I/O转发也无法充分利用多核
+- Starlette的ASGI层引入额外的Python对象分配开销
+
+鉴于Routing Server的职责是**纯字节透传**——接收HTTP请求体的wire-format bytes，通过IPC-v2协议转发给CRM Server，等待响应后回传HTTP client——这恰好是Rust的最佳适用场景：纯I/O密集、无需理解业务语义、对延迟和吞吐量有极高要求。
+
+### 为什么必须实现完整的SHM Pool
+
+初始评估曾建议只实现inline路径（< 16MB），理由是"跨节点网络延迟会掩盖SHM开销"。但这一判断忽略了两个关键场景：
+
+1. **同节点HTTP relay**：典型部署模式下，Rust Routing Server和CRM Server在同一台机器上。HTTP → IPC-v2这段是本地通信，SHM pool的零系统调用优势直接生效。若routing server只走inline + per-request SHM，相当于在关键路径上人为引入5个系统调用（`shm_open`/`ftruncate`/`mmap`/`munmap`/`shm_unlink`），而这本可避免。
+
+2. **前端可视化直访大payload**：C-Two的目标之一是资源一致性访问。当接入fastdb并支持TypeScript的ICRM codegen + HTTP client后，前端（如WebGL/WebGPU可视化引擎）将直接通过HTTP访问CRM资源。GIS可视化中，一次tile请求返回的mesh/raster数据可能是几十MB甚至更大。链路为：
+
+```
+Browser (TS) → HTTP → Rust Routing Server → IPC-v2 (SHM pool) → CRM Server (Python)
+```
+
+此链路中Rust Routing Server是唯一可优化的性能瓶颈点（browser和CRM不可控），必须尽可能高效。SHM pool在这个场景下不是锦上添花，而是必要的。
+
+### 需要实现的IPC-v2协议范围
+
+Routing Server需要实现IPC-v2协议的**完整client子集**：
+
+**必须实现：**
+- Frame header编解码（16 bytes: `total_len` + `request_id` + `flags`）
+- UDS连接管理（`tokio::net::UnixStream`）
+- Pool SHM handshake（`FLAG_HANDSHAKE`）——创建pool segment、发送握手帧、接收ACK
+- Pool SHM读写（`FLAG_POOL`）——请求写入pool、从pool读取响应
+- Per-request SHM回退（`FLAG_SHM`）——pool满时的降级路径
+- Inline frame收发——小payload的快速路径
+- Socket path生成——必须与Python端`_resolve_socket_path(region_id)`完全一致
+
+**不需要实现：**
+- Wire format内部解析（`CRM_CALL`/`CRM_REPLY`的method name、error code等）——纯透传
+- Transferable序列化/反序列化——由CRM Server和Client各自处理
+- Scheduler/并发控制——routing server只是转发器
+
+### Rust技术栈
+
+```
+HTTP server:    axum (基于hyper + tokio, 零拷贝body处理)
+UDS client:     tokio::net::UnixStream (异步UDS)
+SHM操作:        nix crate (shm_open/mmap/munmap/shm_unlink POSIX API)
+连接池:         自建异步池 或 bb8/deadpool
+frame编解码:    手写 (trivial, ~100行)
+```
+
+### 相比当前Python实现的改进
+
+| 维度 | 当前Python (router.py) | Rust Routing Server |
+|------|----------------------|---------------------|
+| 并发模型 | ThreadPoolExecutor(16) + 同步socket | tokio async, 数千并发task |
+| 连接管理 | 每次relay创建/销毁Client | 持久异步连接池 |
+| SHM支持 | 完整（继承IPCv2Client） | 完整（Rust原生POSIX SHM） |
+| 内存开销 | 每线程~8MB栈 + Python对象 | 每task~几KB |
+| HTTP解析 | Starlette (Python ASGI) | hyper (零拷贝) |
+| 吞吐量 | ~1K-5K req/s (估计) | ~50K-200K req/s (估计) |
+| 尾延迟 | GIL + ThreadPool调度抖动 | 稳定，无GIL |
+| 部署 | 纯Python，零编译 | 需预编译二进制 |
+
+### 代码组织——按SDK标准设计
+
+既然Rust端要实现完整的IPC-v2 client（含SHM pool），这实质上是**C-Two的第一个非Python SDK**。建议从一开始就按可复用SDK的标准组织代码：
+
+```
+c-two-rs/
+├── crates/
+│   ├── c2-wire/        # wire format编解码 (frame header, flags, 常量)
+│   ├── c2-ipc/         # IPC-v2 client (UDS + SHM pool + handshake)
+│   └── c2-router/      # HTTP routing server (axum + c2-ipc)
+├── Cargo.toml          # workspace
+└── ...
+```
+
+这样`c2-wire`和`c2-ipc`将来可以被Rust/C++计算模型直接依赖，实现跨语言CRM Client。Routing Server只是这个SDK的第一个消费者。这也是C-Two走向跨语言生态的**最低风险切入点**——从一个职责明确、边界清晰的组件开始，逐步扩展。
+
+### 构建与分发——GitHub Action自动编译
+
+引入Rust编译链后，需要确保Python用户的安装体验不受影响。建议方案：
+
+**构建工具**：独立二进制（非PyO3扩展模块）。理由：
+- Routing Server作为独立进程运行，不需要嵌入Python解释器
+- 独立二进制方便Docker部署、systemd管理
+- 避免PyO3引入的Python ABI兼容性问题
+- Python侧通过`cc.router.start()`用`subprocess`启动，传入配置参数
+
+**分发方式**：参考`ruff`的模式——平台特定wheel中附带可执行文件，Python端提供thin wrapper调用。
+
+**GitHub Action配置**：
+
+```yaml
+# 触发条件：tag推送或pyproject.toml版本变更
+# 构建矩阵：
+strategy:
+  matrix:
+    os: [ubuntu-latest, macos-latest, windows-latest]
+    target: [x86_64, aarch64]
+    # aarch64使用cross-compilation (cross-rs或zig cc)
+
+# 步骤：
+# 1. cargo build --release (各平台)
+# 2. 将二进制打包进platform-specific wheel
+# 3. 发布到PyPI
+# Python用户: pip install c-two 自动获取预编译routing server
+```
+
+主流Rust-Python混合项目（cryptography、pydantic-core、ruff）均采用此模式，工具链成熟。
+
+### 风险与缓解
+
+| 风险 | 缓解措施 |
+|------|---------|
+| IPC-v2协议兼容性——UDS socket path生成须与Python端完全一致 | 共享协议常量文件，集成测试覆盖Python server ↔ Rust client互操作 |
+| SHM pool handshake实现偏差 | 编写Rust ↔ Python的端到端测试，验证pool创建、握手、读写、decay全流程 |
+| 跨平台SHM差异——macOS的POSIX SHM有32字符名称限制 | 复用Python端已有的`shm_name()`哈希截断逻辑 |
+| Windows不支持UDS+POSIX SHM | Windows上退化为TCP + named pipe，或不提供routing server（Windows非HPC主流部署平台） |
+| 维护成本——两套语言的IPC-v2实现 | 协议版本号管理，CI中Python↔Rust互操作测试作为必过门禁 |
+
+### 战略意义
+
+Rust Routing Server不仅是一个性能优化，更是C-Two架构演进的关键节点：
+
+1. **全栈资源访问层**：Browser (TS) → Rust Router → Python CRM，将C-Two的资源一致性访问从"Python内部"扩展到"全栈可达"
+2. **跨语言SDK的起点**：`c2-wire` + `c2-ipc` crate是未来Rust/C++ CRM Client的基础
+3. **性能关键路径的语言下沉**：把性能敏感的纯I/O组件下沉到系统语言，把业务逻辑留在Python的生产力优势中——这是现代Python生态（pydantic-core、ruff、polars）验证过的成功模式

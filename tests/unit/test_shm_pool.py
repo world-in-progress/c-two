@@ -12,6 +12,8 @@ from c_two.rpc.ipc.shm_pool import (
     decode_handshake,
     encode_handshake,
     pool_shm_name,
+    pool_shm_name_outbound,
+    pool_shm_name_response,
 )
 from c_two.rpc.ipc.ipc_protocol import (
     shm_name,
@@ -66,7 +68,7 @@ class TestHandshakeCodec:
     """Round-trip encoding/decoding of pool handshake payloads."""
 
     def test_round_trip(self):
-        name = 'ccpr_abcdef123456'
+        name = 'ccpo_abcdef123456'
         size = 268_435_456  # 256 MB
         payload = encode_handshake(name, size)
         decoded_name, decoded_size, decoded_index = decode_handshake(payload)
@@ -170,23 +172,23 @@ class TestPoolSHMLifecycle:
 # ---------------------------------------------------------------------------
 
 class TestHandshakeV2:
-    """Handshake v2 wire format with segment_index."""
+    """Handshake v3 wire format with segment_index (backward compat with v2 decode)."""
 
-    def test_v2_round_trip_with_index(self):
+    def test_v3_round_trip_with_index(self):
         payload = encode_handshake('pool_seg_3', 131072, segment_index=3)
         name, size, idx = decode_handshake(payload)
         assert name == 'pool_seg_3'
         assert size == 131072
         assert idx == 3
 
-    def test_v2_index_zero_equivalent_to_default(self):
+    def test_v3_index_zero_equivalent_to_default(self):
         explicit = encode_handshake('test', 4096, segment_index=0)
         default = encode_handshake('test', 4096)
         assert explicit == default
 
     def test_v1_decode_backward_compat(self):
         """Manually build a v1 payload and verify decode returns segment_index=0."""
-        shm_name_str = 'ccpr_oldformat'
+        shm_name_str = 'ccpo_oldformat'
         name_bytes = shm_name_str.encode('utf-8')
         buf = bytearray(5 + len(name_bytes))
         buf[0] = 1  # v1
@@ -197,9 +199,9 @@ class TestHandshakeV2:
         assert size == 8192
         assert idx == 0
 
-    def test_v2_short_payload_raises(self):
-        """v2 header needs 6 bytes; 3 bytes should raise."""
-        payload = bytes([2, 0, 0])  # version=2 but only 3 bytes total
+    def test_v3_short_payload_raises(self):
+        """v3 header needs 6 bytes; 3 bytes should raise."""
+        payload = bytes([3, 0, 0])  # version=3 but only 3 bytes total
         with pytest.raises(ValueError, match='too short'):
             decode_handshake(payload)
 
