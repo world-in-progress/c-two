@@ -21,7 +21,7 @@ from ... import error
 from ..base import BaseClient
 from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
-from ..util.wire import encode_call, decode, call_wire_size, write_call_into, PING_BYTES, PONG_BYTES, SHUTDOWN_CLIENT_BYTES, get_call_header_cache
+from ..util.wire import decode, call_wire_size, write_call_into, PING_BYTES, PONG_BYTES, SHUTDOWN_CLIENT_BYTES, get_call_header_cache
 from .ipc_protocol import (
     FLAG_SHM, FLAG_POOL, FLAG_HANDSHAKE,
     FRAME_STRUCT, U64_STRUCT, FRAME_HEADER_SIZE, POOL_PAYLOAD_HEADER_SIZE,
@@ -41,11 +41,8 @@ logger = logging.getLogger(__name__)
 # Module-level atomic counter for unique SHM names across concurrent clients
 _pool_id_counter = itertools.count(1)
 
-
-def _write_shm(name: str, data: bytes) -> shared_memory.SharedMemory:
-    shm = shared_memory.SharedMemory(name=name, create=True, size=len(data))
-    shm.buf[:len(data)] = data
-    return shm
+# Pre-built PONG frame for heartbeat auto-reply (allocated once)
+_PONG_FRAME = encode_frame(0, 0, PONG_BYTES)
 
 
 def _write_bytes_into(buf, offset: int, data: bytes) -> None:
@@ -98,7 +95,6 @@ def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRA
     If the server sends a PING probe, automatically replies with PONG
     and loops to read the actual response frame.
     """
-    _pong_frame = encode_frame(0, 0, PONG_BYTES)
     while True:
         # Read header directly into a reusable-pattern buffer (avoids _recv_exact alloc + bytes copy)
         hdr = bytearray(_HEADER_SIZE)
@@ -126,7 +122,7 @@ def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRA
 
         # Auto-reply to server heartbeat PINGs
         if payload == PING_BYTES:
-            _send_frame_sync(sock, _pong_frame)
+            _send_frame_sync(sock, _PONG_FRAME)
             continue
 
         return request_id, flags, payload

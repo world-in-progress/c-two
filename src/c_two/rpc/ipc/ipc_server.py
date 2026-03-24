@@ -44,7 +44,7 @@ from .ipc_protocol import (
     DEFAULT_MAX_PENDING_REQUESTS, DEFAULT_POOL_SEGMENT_SIZE,
     encode_frame, decode_frame,
     encode_inline_reply_frame,
-    shm_name, extract_pid_from_shm_name, fast_read_shm, read_from_pool_shm,
+    shm_name, fast_read_shm, read_from_pool_shm,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,14 +65,14 @@ class _ClientContext:
     conn_request_ids: set[str] = field(default_factory=set)
     pool_shms: list[shared_memory.SharedMemory] = field(default_factory=list)
     pool_segment_sizes: list[int] = field(default_factory=list)
+    last_activity: float = field(default_factory=time.monotonic)
+    _heartbeat_task: asyncio.Task | None = None
 
     def get_pool_shm(self, index: int) -> shared_memory.SharedMemory | None:
         """Return the pool SHM at *index*, or None if out of range."""
         if 0 <= index < len(self.pool_shms):
             return self.pool_shms[index]
         return None
-    last_activity: float = field(default_factory=time.monotonic)
-    _heartbeat_task: asyncio.Task | None = None
 
 
 async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
@@ -124,10 +124,10 @@ class IPCv2Server(BaseServer):
         self._our_shm_segments: dict[str, float] = {}
         self._shm_lock = threading.Lock()
 
-        # Per-connection pool SHM (conn_id → list[SharedMemory])
+        # Per-connection pool SHM (conn_id → (shm_list, size_list))
         # Unified: client-created SHM used for both request reads and response writes.
         # Written by reply() (scheduler thread), read by _handle_client (asyncio thread)
-        self._conn_pool_shm: dict[int, list[shared_memory.SharedMemory]] = {}
+        self._conn_pool_shm: dict[int, tuple[list[shared_memory.SharedMemory], list[int]]] = {}
         self._conn_shm_lock = threading.Lock()
 
         # Track active client handler tasks for clean shutdown
@@ -205,10 +205,11 @@ class IPCv2Server(BaseServer):
         # Try pool SHM first (pre-allocated, zero syscalls)
         conn_id = int(request_id.rsplit(':', 1)[0])
         with self._conn_shm_lock:
-            pool_shms = self._conn_pool_shm.get(conn_id)
-            if pool_shms is not None:
-                for idx, pool_shm in enumerate(pool_shms):
-                    if total_wire <= pool_shm.size:
+            pool_entry = self._conn_pool_shm.get(conn_id)
+            if pool_entry is not None:
+                pool_shms, pool_sizes = pool_entry
+                for idx, (pool_shm, seg_size) in enumerate(zip(pool_shms, pool_sizes)):
+                    if total_wire <= seg_size:
                         write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
                         payload = struct.pack('<BQ', idx, total_wire)
                         flags |= FLAG_POOL
@@ -257,7 +258,7 @@ class IPCv2Server(BaseServer):
         # Close pool SHM handles (client owns and unlinks these)
         from .shm_pool import close_pool_shm
         with self._conn_shm_lock:
-            for pool_shm_list in self._conn_pool_shm.values():
+            for pool_shm_list, _ in self._conn_pool_shm.values():
                 for pool_shm in pool_shm_list:
                     close_pool_shm(pool_shm)
             self._conn_pool_shm.clear()
@@ -435,10 +436,11 @@ class IPCv2Server(BaseServer):
             if seg_size == 0:
                 raise ValueError('Pool segment size must be > 0')
 
-            seg_size = min(seg_size, self._config.pool_segment_size)
-
             if segment_index == 0:
-                # Initial handshake — clean up old pool SHMs if this is a re-handshake
+                # Initial handshake — clamp to server's default segment size
+                seg_size = min(seg_size, self._config.pool_segment_size)
+
+                # Clean up old pool SHMs if this is a re-handshake
                 if ctx.pool_shms:
                     with self._conn_shm_lock:
                         self._conn_pool_shm.pop(ctx.conn_id, None)
@@ -457,9 +459,13 @@ class IPCv2Server(BaseServer):
 
                 # Register for reply() access from scheduler thread
                 with self._conn_shm_lock:
-                    self._conn_pool_shm[ctx.conn_id] = ctx.pool_shms
+                    self._conn_pool_shm[ctx.conn_id] = (ctx.pool_shms, ctx.pool_segment_sizes)
             else:
-                # Append handshake — add new segment to chain
+                # Append handshake — add new segment to chain.
+                # Allow sizes larger than pool_segment_size (the whole
+                # point of expansion) but cap at max_payload_size.
+                seg_size = min(seg_size, self._config.max_payload_size)
+
                 if segment_index != len(ctx.pool_shms):
                     raise ValueError(
                         f'Expected segment_index {len(ctx.pool_shms)}, got {segment_index}'
@@ -481,7 +487,7 @@ class IPCv2Server(BaseServer):
                 # (set during initial handshake), no need to re-register
 
             # Send ACK with segment_index and negotiated size
-            hs_payload = encode_handshake('', seg_size, segment_index)
+            hs_payload = encode_handshake('', negotiated_size, segment_index)
             hs_frame = encode_frame(
                 0, FLAG_HANDSHAKE | FLAG_RESPONSE, hs_payload,
             )
@@ -645,30 +651,11 @@ class IPCv2Server(BaseServer):
                     self._our_shm_segments.pop(name, None)
                     logger.debug(f'SHM GC: cleaned up stale segment {name}')
 
-                # PID-based orphan detection: immediately reclaim segments
-                # whose creator process is no longer alive.
-                orphans = []
-                for name in list(self._our_shm_segments):
-                    pid = extract_pid_from_shm_name(name)
-                    if pid is None:
-                        continue
-                    try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        orphans.append(name)
-                    except PermissionError:
-                        pass   # process exists (different user) — skip
-                    except OSError:
-                        pass   # unexpected OS error — fall back to timestamp GC
-                for name in orphans:
-                    try:
-                        shm = shared_memory.SharedMemory(name=name, create=False, track=False)
-                        shm.close()
-                        shm.unlink()
-                    except FileNotFoundError:
-                        pass
-                    self._our_shm_segments.pop(name, None)
-                    logger.debug(f'SHM GC: cleaned up orphan segment {name} (creator PID dead)')
+                # NOTE: PID-based orphan detection for _our_shm_segments is
+                # unnecessary — these are server-created segments whose
+                # embedded PID is always this process.  PID-based scanning
+                # of the filesystem (for client-created orphans) is deferred
+                # to the P1 memory-pressure monitor.
 
             # Decay idle connection buffers
             with self._conn_buffers_lock:

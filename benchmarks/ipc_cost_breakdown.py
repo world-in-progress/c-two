@@ -34,10 +34,6 @@ from c_two.rpc.ipc.ipc_protocol import (
     encode_frame as _encode_frame,
     decode_frame as _decode_frame,
 )
-from c_two.rpc.ipc.ipc_server import (
-    _scatter_write_event_to_shm,
-    _scatter_write_event_multi_to_shm,
-)
 from c_two.rpc.ipc.ipc_client import _send_frame_sync, _recv_frame_sync
 
 
@@ -248,37 +244,6 @@ def bench_event_deserialize_only(data: bytes, rounds: int) -> dict:
     serialized = event.serialize()
     def run():
         return Event.deserialize(serialized)
-    return summarize(bench(run, rounds))
-
-
-def bench_scatter_write(data: bytes, rounds: int) -> dict:
-    """Scatter-write Event to SHM (the actual IPC v2 write path)."""
-    method = b'echo'
-    counter = [0]
-    def run():
-        counter[0] += 1
-        name = f'bd_sw_{counter[0]:08x}'
-        shm, written = _scatter_write_event_multi_to_shm(
-            name, EventTag.CRM_CALL, [method, data]
-        )
-        shm.close()
-        shm.unlink()
-    return summarize(bench(run, rounds))
-
-
-def bench_scatter_write_then_read(data: bytes, rounds: int) -> dict:
-    """Scatter-write to SHM + bytes read back (one-way SHM path)."""
-    method = b'echo'
-    counter = [0]
-    def run():
-        counter[0] += 1
-        name = f'bd_sr_{counter[0]:08x}'
-        shm, written = _scatter_write_event_multi_to_shm(
-            name, EventTag.CRM_CALL, [method, data]
-        )
-        shm.close()
-        result = _read_and_release_shm(name, written)
-        return result
     return summarize(bench(run, rounds))
 
 
@@ -523,16 +488,14 @@ def run_all(sizes: list[int], base_rounds: int) -> None:
         ('3. SHM write only',              lambda d, r: bench_shm_write(d, r)),
         ('4. SHM read only (bytes copy)',  lambda d, r: bench_shm_read(d, r)),
         ('5. SHM full lifecycle',          lambda d, r: bench_shm_lifecycle(d, r)),
-        ('6. scatter-write → SHM',         lambda d, r: bench_scatter_write(d, r)),
-        ('7. scatter-write + read back',   lambda d, r: bench_scatter_write_then_read(d, r)),
-        ('8. bytes concat (1B + payload)', lambda d, r: bench_bytes_concat(d, r)),
-        ('9. Event.serialize()',           lambda d, r: bench_event_serialize_only(d, r)),
-        ('10. Event.deserialize()',        lambda d, r: bench_event_deserialize_only(d, r)),
-        ('11. Event round-trip',           lambda d, r: bench_event_roundtrip(d, r)),
-        ('12. UDS round-trip (30B)',       None),  # special: no data dependency
-        ('13. ThreadPool dispatch',        None),  # special: no data dependency
-        ('14. Full thread:// (serialized)',lambda d, r: bench_full_thread(d, r)),
-        ('15. Full IPC v2 echo',           lambda d, r: bench_full_ipc_v2(d, r)),
+        ('6. bytes concat (1B + payload)', lambda d, r: bench_bytes_concat(d, r)),
+        ('7. Event.serialize()',           lambda d, r: bench_event_serialize_only(d, r)),
+        ('8. Event.deserialize()',        lambda d, r: bench_event_deserialize_only(d, r)),
+        ('9. Event round-trip',           lambda d, r: bench_event_roundtrip(d, r)),
+        ('10. UDS round-trip (30B)',       None),  # special: no data dependency
+        ('11. ThreadPool dispatch',        None),  # special: no data dependency
+        ('12. Full thread:// (serialized)',lambda d, r: bench_full_thread(d, r)),
+        ('13. Full IPC v2 echo',           lambda d, r: bench_full_ipc_v2(d, r)),
     ]
 
     # Pre-run fixed-cost benchmarks
@@ -556,10 +519,10 @@ def run_all(sizes: list[int], base_rounds: int) -> None:
         print(' done')
 
         for name, factory in components:
-            if name == '12. UDS round-trip (30B)':
+            if name == '10. UDS round-trip (30B)':
                 results.setdefault(name, {})[size] = uds_result
                 continue
-            if name == '13. ThreadPool dispatch':
+            if name == '11. ThreadPool dispatch':
                 results.setdefault(name, {})[size] = dispatch_result
                 continue
 

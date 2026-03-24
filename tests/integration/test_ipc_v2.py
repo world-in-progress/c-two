@@ -274,3 +274,113 @@ class TestIPCv2PoolDecay:
                 assert crm.greeting('unified') == 'Hello, unified!'
         finally:
             _shutdown(ipc_address, server)
+
+
+class TestIPCv2PoolEnhancements:
+    """P0 SHM pool enhancements: segment chain expansion, heartbeat, decay, max segments.
+
+    Server uses a generous ``pool_segment_size`` so it does not clamp client
+    expansion requests.  The client uses a small, page-aligned segment size
+    (16 KB on ARM64 macOS) so oversized payloads trigger real expansion.
+    ``echo_none`` is used because its response wire-size is always smaller
+    than the request wire-size, avoiding segment-overflow on the reply path.
+    """
+
+    _PAGE = 16384  # ARM64 macOS page size
+    _SERVER_SEG = 256 * 1024  # 256 KB — generous upper bound
+
+    def test_segment_chain_expansion(self, ipc_address):
+        """Payload exceeding initial pool segment triggers chain expansion; RPCs succeed."""
+        server_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        client_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._PAGE, max_pool_segments=4,
+        )
+        server = _start_server(ipc_address, ipc_config=server_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                ipc_address, IHello, ipc_config=client_cfg,
+            ) as crm:
+                # Small payload — fits in segment[0] (16 KB)
+                assert crm.echo_none('small') == 'small'
+
+                # ~20 KB — exceeds segment[0], triggers expansion to segment[1]
+                big = 'A' * 20_000
+                assert crm.echo_none(big) == big
+
+                # ~50 KB — exceeds segment[1], triggers expansion to segment[2]
+                bigger = 'B' * 50_000
+                assert crm.echo_none(bigger) == bigger
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_heartbeat_keeps_connection(self, ipc_address):
+        """Connection survives idle period when heartbeat is active."""
+        config = IPCConfig(heartbeat_interval=1.0, heartbeat_timeout=3.0)
+        server = _start_server(ipc_address, ipc_config=config)
+        try:
+            with cc.compo.runtime.connect_crm(
+                ipc_address, IHello, ipc_config=config,
+            ) as crm:
+                assert crm.greeting('before') == 'Hello, before!'
+                # Idle longer than heartbeat_interval but shorter than timeout
+                time.sleep(2.0)
+                assert crm.greeting('after') == 'Hello, after!'
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_pool_decay_tail_segments(self, ipc_address):
+        """Tail segments decay after idle; re-expansion works on demand."""
+        server_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._SERVER_SEG,
+            pool_decay_seconds=1.0,
+        )
+        client_cfg = IPCConfig(
+            shm_threshold=16,
+            pool_segment_size=self._PAGE,
+            pool_decay_seconds=1.0,
+            max_pool_segments=4,
+        )
+        server = _start_server(ipc_address, ipc_config=server_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                ipc_address, IHello, ipc_config=client_cfg,
+            ) as crm:
+                # Trigger segment expansion with large payload
+                big = 'A' * 20_000
+                assert crm.echo_none(big) == big
+
+                # Exceed decay threshold
+                time.sleep(1.5)
+
+                # Small call — triggers decay check; tail segments should be reclaimed
+                assert crm.echo_none('tiny') == 'tiny'
+
+                # Large call again — re-expands if segments were decayed
+                assert crm.echo_none(big) == big
+        finally:
+            _shutdown(ipc_address, server)
+
+    def test_max_pool_segments_respected(self, ipc_address):
+        """Exceeding all pool segments falls back to per-request SHM, not crash."""
+        server_cfg = IPCConfig(shm_threshold=16, pool_segment_size=self._SERVER_SEG)
+        client_cfg = IPCConfig(
+            shm_threshold=16, pool_segment_size=self._PAGE, max_pool_segments=2,
+        )
+        server = _start_server(ipc_address, ipc_config=server_cfg)
+        try:
+            with cc.compo.runtime.connect_crm(
+                ipc_address, IHello, ipc_config=client_cfg,
+            ) as crm:
+                # Fits in segment[0] (16 KB)
+                assert crm.echo_none('hi') == 'hi'
+
+                # Exceeds segment[0] → triggers expansion to segment[1]
+                mid = 'M' * 20_000
+                assert crm.echo_none(mid) == mid
+
+                # Exceeds both segments; max_pool_segments=2 → per-request SHM fallback
+                huge = 'H' * 50_000
+                assert crm.echo_none(huge) == huge
+        finally:
+            _shutdown(ipc_address, server)

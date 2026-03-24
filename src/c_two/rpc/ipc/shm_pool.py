@@ -1,15 +1,22 @@
 """Pre-allocated SharedMemory management for IPC v2 transport.
 
 Eliminates per-RPC shm_open/ftruncate/mmap/munmap/shm_unlink syscalls
-by pre-allocating a single SHM segment during connection handshake and
-reusing it for the lifetime of the connection.
+by pre-allocating pool SHM segments during connection handshake and
+reusing them for the lifetime of the connection.
 
-Each connection gets **one** shared SHM segment (unified bidirectional):
-- Client creates and owns (unlinks on disconnect)
-- Server opens the same segment with track=False
+Each connection starts with **one** shared SHM segment (unified
+bidirectional) and can dynamically expand to multiple segments
+(**segment chain**) when a single segment cannot hold the payload:
+
+- Client creates and owns segments (unlinks on disconnect)
+- Server opens the same segments with track=False
 - Synchronous RPC guarantees requests and responses never coexist
+- Each RPC payload fits entirely in one segment (never split)
 
-If payload exceeds the segment size, falls back to per-request SHM.
+Handshake protocol v2 supports a ``segment_index`` field for
+appending new segments to an existing pool chain.
+
+If payload exceeds all pool segments, falls back to per-request SHM.
 """
 
 from __future__ import annotations

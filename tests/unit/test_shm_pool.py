@@ -13,6 +13,11 @@ from c_two.rpc.ipc.shm_pool import (
     encode_handshake,
     pool_shm_name,
 )
+from c_two.rpc.ipc.ipc_protocol import (
+    shm_name,
+    extract_pid_from_shm_name,
+)
+from c_two.rpc.ipc.ipc_client import _client_pool_shm_name
 
 pytestmark = pytest.mark.timeout(10)
 
@@ -158,3 +163,81 @@ class TestPoolSHMLifecycle:
                 reader.close()
         finally:
             close_pool_shm(writer, unlink=True)
+
+
+# ---------------------------------------------------------------------------
+# Handshake v2 encode/decode (segment chain)
+# ---------------------------------------------------------------------------
+
+class TestHandshakeV2:
+    """Handshake v2 wire format with segment_index."""
+
+    def test_v2_round_trip_with_index(self):
+        payload = encode_handshake('pool_seg_3', 131072, segment_index=3)
+        name, size, idx = decode_handshake(payload)
+        assert name == 'pool_seg_3'
+        assert size == 131072
+        assert idx == 3
+
+    def test_v2_index_zero_equivalent_to_default(self):
+        explicit = encode_handshake('test', 4096, segment_index=0)
+        default = encode_handshake('test', 4096)
+        assert explicit == default
+
+    def test_v1_decode_backward_compat(self):
+        """Manually build a v1 payload and verify decode returns segment_index=0."""
+        shm_name_str = 'ccpr_oldformat'
+        name_bytes = shm_name_str.encode('utf-8')
+        buf = bytearray(5 + len(name_bytes))
+        buf[0] = 1  # v1
+        struct.pack_into('<I', buf, 1, 8192)
+        buf[5:] = name_bytes
+        name, size, idx = decode_handshake(bytes(buf))
+        assert name == shm_name_str
+        assert size == 8192
+        assert idx == 0
+
+    def test_v2_short_payload_raises(self):
+        """v2 header needs 6 bytes; 3 bytes should raise."""
+        payload = bytes([2, 0, 0])  # version=2 but only 3 bytes total
+        with pytest.raises(ValueError, match='too short'):
+            decode_handshake(payload)
+
+
+# ---------------------------------------------------------------------------
+# PID-embedded SHM naming
+# ---------------------------------------------------------------------------
+
+class TestPIDEmbeddedNaming:
+    """PID extraction from per-request, pool, and client-pool SHM names."""
+
+    def test_extract_from_per_request_name(self):
+        name = shm_name('region1', 'req42', 'req')
+        pid = extract_pid_from_shm_name(name)
+        assert pid == os.getpid()
+
+    def test_extract_from_pool_name(self):
+        name = pool_shm_name('region1', 0, 'resp')
+        pid = extract_pid_from_shm_name(name)
+        assert pid == os.getpid()
+
+    def test_extract_from_client_pool_name(self):
+        name = _client_pool_shm_name('region1')
+        pid = extract_pid_from_shm_name(name)
+        assert pid == os.getpid()
+
+    def test_extract_returns_none_for_unknown_prefix(self):
+        assert extract_pid_from_shm_name('xyz_test') is None
+
+    def test_extract_returns_none_for_no_underscore(self):
+        assert extract_pid_from_shm_name('ccr1234') is None
+
+    def test_all_names_within_macos_limit(self):
+        """macOS POSIX SHM names must be ≤ 31 chars."""
+        names = [
+            shm_name('region', 'req1', 'req'),
+            pool_shm_name('region', 0, 'resp'),
+            _client_pool_shm_name('region'),
+        ]
+        for n in names:
+            assert len(n) <= 31, f'{n!r} is {len(n)} chars (> 31)'

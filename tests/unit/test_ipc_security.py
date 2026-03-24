@@ -398,12 +398,14 @@ class TestDeadCodeRemoved:
         assert 'DEFAULT_INLINE_THRESHOLD' not in source
         assert '_FLAG_RESPONSE' not in source.split('from .ipc_server import')[1].split(')')[0] if 'from .ipc_server import' in source else True
 
-    def test_write_shm_moved_to_client(self):
-        """_write_shm should be in ipc_client, not ipc_server."""
+    def test_write_shm_not_in_server(self):
+        """_write_shm should not be in ipc_server (removed as dead code)."""
         import c_two.rpc.ipc.ipc_server as server_mod
         import c_two.rpc.ipc.ipc_client as client_mod
         assert not hasattr(server_mod, '_write_shm')
-        assert hasattr(client_mod, '_write_shm')
+        # _write_shm was removed from client too — pool SHM and
+        # per-request SHM writes are handled inline via shm_writer callbacks.
+        assert not hasattr(client_mod, '_write_shm')
 
     def test_read_and_release_shm_moved_to_benchmarks(self):
         """_read_and_release_shm should not be in ipc_server (moved to benchmarks)."""
