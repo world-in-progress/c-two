@@ -7,6 +7,7 @@ without a circular or tight-coupling dependency.  All symbols are public
 
 import ctypes
 import hashlib
+import os
 import struct
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -34,6 +35,7 @@ U32_STRUCT = struct.Struct('<I')       # 4B unsigned 32-bit (error length, segme
 # ---------------------------------------------------------------------------
 FAST_READ_THRESHOLD = 1_048_576        # 1 MB — use ctypes.memmove above this size (benchmarked)
 FRAME_HEADER_SIZE = FRAME_STRUCT.size  # 16 bytes
+POOL_PAYLOAD_HEADER_SIZE = 9           # 1B segment_index + 8B data_size
 
 # ---------------------------------------------------------------------------
 # Default configuration values
@@ -69,6 +71,10 @@ class IPCConfig:
         pool_enabled: Whether to use pre-allocated pool SHM (default True).
         pool_segment_size: Size of each pool SHM segment (default 256 MB).
         pool_decay_seconds: Idle seconds before pool teardown (default 60, 0=never).
+
+    Heartbeat (server probes client liveness):
+        heartbeat_interval: Seconds between PING probes (default 15; ≤0 disables).
+        heartbeat_timeout: Seconds with no activity before declaring dead (default 30).
     """
     shm_threshold: int = DEFAULT_SHM_THRESHOLD
     max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
@@ -77,6 +83,9 @@ class IPCConfig:
     pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
     pool_enabled: bool = True
     pool_decay_seconds: float = 60.0
+    max_pool_segments: int = 4
+    heartbeat_interval: float = 15.0
+    heartbeat_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         if self.pool_segment_size > 0xFFFFFFFF:
@@ -97,6 +106,15 @@ class IPCConfig:
             )
         if self.pool_segment_size > self.max_payload_size:
             self.pool_segment_size = self.max_payload_size
+        if not (1 <= self.max_pool_segments <= 255):
+            raise ValueError(
+                f'max_pool_segments must be >= 1 and <= 255, got {self.max_pool_segments}'
+            )
+        if self.heartbeat_interval > 0 and self.heartbeat_timeout <= self.heartbeat_interval:
+            raise ValueError(
+                f'heartbeat_timeout ({self.heartbeat_timeout}) must be > '
+                f'heartbeat_interval ({self.heartbeat_interval})'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -104,14 +122,39 @@ class IPCConfig:
 # ---------------------------------------------------------------------------
 
 def shm_name(region_id: str, request_id: str, direction: str) -> str:
-    """Generate a per-request SHM segment name.
+    """Generate a per-request SHM segment name with embedded creator PID.
 
+    Format: ``cc{d}{pid_hex}_{hash_hex}`` — always exactly 20 chars.
     macOS limits POSIX SHM names to 31 chars (excluding leading ``/``).
     """
+    pid_hex = format(os.getpid(), 'x')
     raw = f'{region_id}_{request_id}_{direction}'.encode()
-    h = hashlib.md5(raw).hexdigest()[:16]
+    hash_len = 16 - len(pid_hex)
+    h = hashlib.md5(raw).hexdigest()[:hash_len]
     d = direction[0]
-    return f'cc{d}_{h}'
+    return f'cc{d}{pid_hex}_{h}'
+
+
+def extract_pid_from_shm_name(name: str) -> int | None:
+    """Extract creator PID from a C-Two SHM name.
+
+    Handles both per-request (``cc{d}{pid}_{hash}``) and pool
+    (``ccp{d}{pid}_{hash}``) formats.  Returns ``None`` if *name*
+    does not match either pattern.
+    """
+    if name.startswith('ccp'):
+        rest = name[4:]   # skip 'ccp' + direction char
+    elif name.startswith('cc'):
+        rest = name[3:]   # skip 'cc' + direction char
+    else:
+        return None
+    idx = rest.find('_')
+    if idx <= 0:
+        return None
+    try:
+        return int(rest[:idx], 16)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------

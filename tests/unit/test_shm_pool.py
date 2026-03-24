@@ -26,8 +26,10 @@ class TestPoolSHMName:
 
     def test_format(self):
         name = pool_shm_name('region1', 0, 'resp')
-        assert name.startswith('ccpr_')
-        assert len(name) == 17  # ccp + r + _ + 12 hex
+        assert name.startswith('ccpr')
+        assert name[3] == 'r'
+        assert '_' in name[4:]
+        assert len(name) == 20  # ccp + d + pid_hex + _ + hash_hex
 
     def test_direction_initial(self):
         req_name = pool_shm_name('r', 1, 'req')
@@ -62,22 +64,25 @@ class TestHandshakeCodec:
         name = 'ccpr_abcdef123456'
         size = 268_435_456  # 256 MB
         payload = encode_handshake(name, size)
-        decoded_name, decoded_size = decode_handshake(payload)
+        decoded_name, decoded_size, decoded_index = decode_handshake(payload)
         assert decoded_name == name
         assert decoded_size == size
+        assert decoded_index == 0
 
     def test_small_segment(self):
         payload = encode_handshake('test', 1024)
-        name, size = decode_handshake(payload)
+        name, size, index = decode_handshake(payload)
         assert name == 'test'
         assert size == 1024
+        assert index == 0
 
     def test_memoryview_input(self):
         payload = encode_handshake('test_name', 4096)
         mv = memoryview(payload)
-        name, size = decode_handshake(mv)
+        name, size, index = decode_handshake(mv)
         assert name == 'test_name'
         assert size == 4096
+        assert index == 0
 
     def test_too_short_raises(self):
         with pytest.raises(ValueError, match='too short'):

@@ -21,10 +21,10 @@ from ... import error
 from ..base import BaseClient
 from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
-from ..util.wire import encode_call, decode, call_wire_size, write_call_into, PING_BYTES, SHUTDOWN_CLIENT_BYTES, get_call_header_cache
+from ..util.wire import encode_call, decode, call_wire_size, write_call_into, PING_BYTES, PONG_BYTES, SHUTDOWN_CLIENT_BYTES, get_call_header_cache
 from .ipc_protocol import (
     FLAG_SHM, FLAG_POOL, FLAG_HANDSHAKE,
-    FRAME_STRUCT, U64_STRUCT, FRAME_HEADER_SIZE,
+    FRAME_STRUCT, U64_STRUCT, FRAME_HEADER_SIZE, POOL_PAYLOAD_HEADER_SIZE,
     IPCConfig, DEFAULT_MAX_FRAME_SIZE,
     encode_frame, encode_inline_call_frame,
     fast_read_shm, read_from_pool_shm, shm_name,
@@ -60,11 +60,16 @@ def _resolve_socket_path(region_id: str) -> str:
 
 
 def _client_pool_shm_name(region_id: str) -> str:
-    """Generate a globally unique SHM name for a client's request pool segment."""
+    """Generate a globally unique SHM name for a client's request pool segment.
+
+    Format: ``ccpr{pid_hex}_{hash_hex}`` — always exactly 20 chars.
+    """
+    pid_hex = format(os.getpid(), 'x')
     uid = next(_pool_id_counter)
     raw = f'{region_id}_cpid{os.getpid()}_c{uid}'.encode()
-    h = hashlib.md5(raw).hexdigest()[:12]
-    return f'ccpr_{h}'
+    hash_len = 15 - len(pid_hex)
+    h = hashlib.md5(raw).hexdigest()[:hash_len]
+    return f'ccpr{pid_hex}_{h}'
 
 
 def _recv_exact(sock: _socket.socket, n: int) -> bytes:
@@ -88,31 +93,43 @@ _HEADER_SIZE = FRAME_HEADER_SIZE  # 16 bytes
 
 
 def _recv_frame_sync(sock: _socket.socket, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
-    """Read a frame, returning (request_id, flags, payload) directly."""
-    # Read header directly into a reusable-pattern buffer (avoids _recv_exact alloc + bytes copy)
-    hdr = bytearray(_HEADER_SIZE)
-    hdr_view = memoryview(hdr)
-    pos = 0
-    while pos < _HEADER_SIZE:
-        nbytes = sock.recv_into(hdr_view[pos:])
-        if nbytes == 0:
-            raise ConnectionError('Connection closed by server')
-        pos += nbytes
-    total_len, request_id, flags = FRAME_STRUCT.unpack(hdr)
+    """Read a frame, returning (request_id, flags, payload) directly.
 
-    # S2: reject oversized or undersized frames before allocation
-    if total_len < 12:
-        raise error.EventDeserializeError(
-            f'Frame too small: total_len={total_len} (minimum 12)'
-        )
-    if total_len > max_frame_size:
-        raise error.EventDeserializeError(
-            f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
-        )
+    If the server sends a PING probe, automatically replies with PONG
+    and loops to read the actual response frame.
+    """
+    _pong_frame = encode_frame(0, 0, PONG_BYTES)
+    while True:
+        # Read header directly into a reusable-pattern buffer (avoids _recv_exact alloc + bytes copy)
+        hdr = bytearray(_HEADER_SIZE)
+        hdr_view = memoryview(hdr)
+        pos = 0
+        while pos < _HEADER_SIZE:
+            nbytes = sock.recv_into(hdr_view[pos:])
+            if nbytes == 0:
+                raise ConnectionError('Connection closed by server')
+            pos += nbytes
+        total_len, request_id, flags = FRAME_STRUCT.unpack(hdr)
 
-    payload_len = total_len - 12
-    payload = _recv_exact(sock, payload_len) if payload_len > 0 else b''
-    return request_id, flags, payload
+        # S2: reject oversized or undersized frames before allocation
+        if total_len < 12:
+            raise error.EventDeserializeError(
+                f'Frame too small: total_len={total_len} (minimum 12)'
+            )
+        if total_len > max_frame_size:
+            raise error.EventDeserializeError(
+                f'Frame too large: total_len={total_len} exceeds max_frame_size={max_frame_size}'
+            )
+
+        payload_len = total_len - 12
+        payload = _recv_exact(sock, payload_len) if payload_len > 0 else b''
+
+        # Auto-reply to server heartbeat PINGs
+        if payload == PING_BYTES:
+            _send_frame_sync(sock, _pong_frame)
+            continue
+
+        return request_id, flags, payload
 
 
 class IPCv2Client(BaseClient):
@@ -128,9 +145,10 @@ class IPCv2Client(BaseClient):
         self._next_rid: int = 0
 
         # Pool SHM state (set during handshake, cleared on disconnect)
-        # Unified: single SHM for both request writes and response reads
-        self._pool_shm: shared_memory.SharedMemory | None = None  # we created (owner)
-        self._pool_segment_size: int = 0
+        # Unified: SHM segments for both request writes and response reads
+        self._pool_shms: list[shared_memory.SharedMemory] = []
+        self._pool_segment_sizes: list[int] = []
+        self._pool_names: list[str] = []  # track names for unlinking
         self._pool_last_used: float = 0.0  # monotonic timestamp of last pool access
 
     # ------------------------------------------------------------------
@@ -161,21 +179,46 @@ class IPCv2Client(BaseClient):
 
         # Create our pool SHM segment (used for both directions)
         pool_name = _client_pool_shm_name(self.region_id)
-        self._pool_shm = create_pool_shm(pool_name, seg_size)
+        pool_shm = create_pool_shm(pool_name, seg_size)
 
-        # Send handshake frame
-        hs_payload = encode_handshake(pool_name, seg_size)
+        # Send handshake frame (segment_index=0 for initial)
+        hs_payload = encode_handshake(pool_name, seg_size, 0)
         hs_frame = encode_frame(0, FLAG_HANDSHAKE, hs_payload)
         _send_frame_sync(sock, hs_frame)
 
-        # Receive server's ACK (empty name → unified mode)
+        # Receive server's ACK
         _, resp_flags, resp_payload = _recv_frame_sync(sock, self._config.max_frame_size)
         if not (resp_flags & FLAG_HANDSHAKE):
             raise error.CompoClientError('Expected pool handshake response from server')
 
-        _, resp_seg_size = decode_handshake(resp_payload)
-        self._pool_segment_size = min(seg_size, resp_seg_size)
+        _, resp_seg_size, _ = decode_handshake(resp_payload)
+        negotiated_size = min(seg_size, resp_seg_size)
+
+        self._pool_shms = [pool_shm]
+        self._pool_segment_sizes = [negotiated_size]
+        self._pool_names = [pool_name]
         self._pool_last_used = time.monotonic()
+
+    def _do_pool_append_handshake(self, sock: _socket.socket, segment_size: int, index: int) -> None:
+        """Append a new pool SHM segment via handshake with the server."""
+        pool_name = _client_pool_shm_name(self.region_id)
+        pool_shm = create_pool_shm(pool_name, segment_size)
+
+        hs_payload = encode_handshake(pool_name, segment_size, index)
+        hs_frame = encode_frame(0, FLAG_HANDSHAKE, hs_payload)
+        _send_frame_sync(sock, hs_frame)
+
+        _, resp_flags, resp_payload = _recv_frame_sync(sock, self._config.max_frame_size)
+        if not (resp_flags & FLAG_HANDSHAKE):
+            close_pool_shm(pool_shm, unlink=True)
+            raise error.CompoClientError('Expected pool append handshake response from server')
+
+        _, resp_seg_size, _ = decode_handshake(resp_payload)
+        negotiated_size = min(segment_size, resp_seg_size)
+
+        self._pool_shms.append(pool_shm)
+        self._pool_segment_sizes.append(negotiated_size)
+        self._pool_names.append(pool_name)
 
     def _ensure_connection(self) -> _socket.socket:
         if self._sock is not None:
@@ -194,31 +237,39 @@ class IPCv2Client(BaseClient):
 
     def _cleanup_pool(self) -> None:
         """Release pool SHM resources."""
-        close_pool_shm(self._pool_shm, unlink=True)  # we created it
-        self._pool_shm = None
-        self._pool_segment_size = 0
+        for shm in self._pool_shms:
+            close_pool_shm(shm, unlink=True)
+        self._pool_shms.clear()
+        self._pool_segment_sizes.clear()
+        self._pool_names.clear()
         self._pool_last_used = 0.0
 
     def _maybe_decay_pool(self) -> None:
         """Tear down pool SHM if idle beyond pool_decay_seconds.
 
-        Called at the start of call()/relay(). If the pool has been idle
-        too long, we release the SHM now. A subsequent large-payload call
-        will trigger a re-handshake via _ensure_pool().
+        Called at the start of call()/relay(). Decays tail segments first
+        (keeps segment[0] always). Only fully decays if ALL segments are idle.
         """
         decay = self._config.pool_decay_seconds
-        if decay <= 0 or self._pool_shm is None:
+        if decay <= 0 or not self._pool_shms:
             return
         if time.monotonic() - self._pool_last_used > decay:
-            logger.debug('Pool SHM idle > %.0fs, tearing down', decay)
-            self._cleanup_pool()
+            # Decay tail segments first (keep segment[0])
+            while len(self._pool_shms) > 1:
+                shm = self._pool_shms.pop()
+                self._pool_segment_sizes.pop()
+                self._pool_names.pop()
+                close_pool_shm(shm, unlink=True)
+            # If still idle on next decay check, fully release
+            # For now, keep segment[0] — full decay only when explicitly disconnected
+            logger.debug('Pool SHM idle > %.0fs, decayed tail segments', decay)
 
     def _ensure_pool(self, sock: _socket.socket) -> bool:
         """Re-handshake to rebuild the pool if it was decayed.
 
         Returns True if pool is available after this call.
         """
-        if self._pool_shm is not None:
+        if self._pool_shms:
             return True
         if not self._config.pool_enabled:
             return False
@@ -277,29 +328,62 @@ class IPCv2Client(BaseClient):
         # Lazy re-handshake if pool was decayed but a large request needs it
         if (
             wire_size >= self._config.shm_threshold
-            and self._pool_shm is None
+            and not self._pool_shms
             and self._config.pool_enabled
             and self._sock is not None
         ):
             self._ensure_pool(self._sock)
 
-        if (
-            wire_size >= self._config.shm_threshold
-            and self._pool_shm is not None
-            and wire_size <= self._pool_segment_size
-        ):
-            # Pool path: write into pre-allocated SHM (zero syscalls)
-            try:
-                shm_writer(self._pool_shm.buf, 0)
-            except Exception as e:
-                raise error.CompoSerializeInput(
-                    f'Error writing request to pool SHM: {e}',
-                )
-            payload = U64_STRUCT.pack(wire_size)
-            flags = FLAG_POOL
-            self._pool_last_used = time.monotonic()
-            frame = encode_frame(request_id, flags, payload)
-        elif wire_size >= self._config.shm_threshold:
+        if wire_size >= self._config.shm_threshold and self._pool_shms:
+            # Pool path: find a segment that fits
+            pool_used = False
+            for idx, (shm, seg_size) in enumerate(
+                zip(self._pool_shms, self._pool_segment_sizes)
+            ):
+                if wire_size <= seg_size:
+                    try:
+                        shm_writer(shm.buf, 0)
+                    except Exception as e:
+                        raise error.CompoSerializeInput(
+                            f'Error writing request to pool SHM: {e}',
+                        )
+                    payload = struct.pack('<BQ', idx, wire_size)
+                    flags = FLAG_POOL
+                    self._pool_last_used = time.monotonic()
+                    frame = encode_frame(request_id, flags, payload)
+                    pool_used = True
+                    break
+
+            if not pool_used and len(self._pool_shms) < self._config.max_pool_segments:
+                # Expand: create a new segment large enough
+                new_size = max(self._config.pool_segment_size, wire_size)
+                new_index = len(self._pool_shms)
+                try:
+                    sock = self._ensure_connection()
+                    self._do_pool_append_handshake(sock, new_size, new_index)
+                except Exception as exc:
+                    logger.warning('IPC v2 pool append failed: %s', exc)
+                else:
+                    # Use the new segment
+                    new_shm = self._pool_shms[new_index]
+                    new_seg_size = self._pool_segment_sizes[new_index]
+                    if wire_size <= new_seg_size:
+                        try:
+                            shm_writer(new_shm.buf, 0)
+                        except Exception as e:
+                            raise error.CompoSerializeInput(
+                                f'Error writing request to pool SHM: {e}',
+                            )
+                        payload = struct.pack('<BQ', new_index, wire_size)
+                        flags = FLAG_POOL
+                        self._pool_last_used = time.monotonic()
+                        frame = encode_frame(request_id, flags, payload)
+                        pool_used = True
+
+            if pool_used:
+                return self._send_frame_recv_locked(frame, flags)
+
+        if wire_size >= self._config.shm_threshold:
             # Fallback: per-request SHM (legacy path)
             req_shm_name = shm_name(self.region_id, str(request_id), shm_direction)
             try:
@@ -336,18 +420,24 @@ class IPCv2Client(BaseClient):
         Must be called under ``_conn_lock`` for pool-SHM safety.
         """
         if resp_flags & FLAG_POOL:
-            if self._pool_shm is None or len(resp_payload) < 8:
+            if not self._pool_shms or len(resp_payload) < POOL_PAYLOAD_HEADER_SIZE:
                 raise error.EventDeserializeError(
                     'Pool SHM response received but no pool handshake was done'
                 )
-            size = U64_STRUCT.unpack(resp_payload[:8])[0]
-            if size > self._pool_segment_size:
+            segment_index = resp_payload[0]
+            size = U64_STRUCT.unpack(resp_payload[1:9])[0]
+            if segment_index >= len(self._pool_shms):
                 raise error.EventDeserializeError(
-                    f'Pool response size {size} exceeds segment size '
-                    f'{self._pool_segment_size}'
+                    f'Pool segment_index {segment_index} out of range '
+                    f'(have {len(self._pool_shms)} segments)'
+                )
+            seg_size = self._pool_segment_sizes[segment_index]
+            if size > seg_size:
+                raise error.EventDeserializeError(
+                    f'Pool response size {size} exceeds segment size {seg_size}'
                 )
             data, self._read_buf = read_from_pool_shm(
-                self._pool_shm.buf, size, self._read_buf,
+                self._pool_shms[segment_index].buf, size, self._read_buf,
             )
             return data
 

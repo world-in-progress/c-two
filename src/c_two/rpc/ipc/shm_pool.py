@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import struct
 from multiprocessing import shared_memory
 
@@ -24,35 +25,46 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Handshake wire format
 # ---------------------------------------------------------------------------
-# [1B version][4B segment_size LE][shm_name UTF-8]
+# v1: [1B version=1][4B segment_size LE][shm_name UTF-8]
+# v2: [1B version=2][1B segment_index][4B segment_size LE][shm_name UTF-8]
 
-_HANDSHAKE_VERSION = 1
-_HANDSHAKE_HEADER_SIZE = 5  # 1B version + 4B segment_size
+_HANDSHAKE_VERSION = 2
+_HANDSHAKE_V1_HEADER_SIZE = 5   # 1B version + 4B segment_size
+_HANDSHAKE_V2_HEADER_SIZE = 6   # 1B version + 1B segment_index + 4B segment_size
 
 
-def encode_handshake(shm_name: str, segment_size: int) -> bytes:
-    """Encode a pool handshake payload."""
+def encode_handshake(shm_name: str, segment_size: int, segment_index: int = 0) -> bytes:
+    """Encode a pool handshake payload (v2 format with segment index)."""
     name_bytes = shm_name.encode('utf-8')
-    buf = bytearray(_HANDSHAKE_HEADER_SIZE + len(name_bytes))
+    buf = bytearray(_HANDSHAKE_V2_HEADER_SIZE + len(name_bytes))
     buf[0] = _HANDSHAKE_VERSION
-    struct.pack_into('<I', buf, 1, segment_size)
-    buf[_HANDSHAKE_HEADER_SIZE:] = name_bytes
+    buf[1] = segment_index
+    struct.pack_into('<I', buf, 2, segment_size)
+    buf[_HANDSHAKE_V2_HEADER_SIZE:] = name_bytes
     return bytes(buf)
 
 
-def decode_handshake(payload: bytes | memoryview) -> tuple[str, int]:
-    """Decode a pool handshake payload.
+def decode_handshake(payload: bytes | memoryview) -> tuple[str, int, int]:
+    """Decode a pool handshake payload (v1 or v2).
 
-    Returns (shm_name, segment_size).
+    Returns (shm_name, segment_size, segment_index).
     """
-    if len(payload) < _HANDSHAKE_HEADER_SIZE:
+    if len(payload) < _HANDSHAKE_V1_HEADER_SIZE:
         raise ValueError(f'Handshake payload too short: {len(payload)}')
     version = payload[0] if isinstance(payload, (bytes, bytearray)) else int(payload[0])
-    if version != _HANDSHAKE_VERSION:
+    if version == 1:
+        segment_size = struct.unpack_from('<I', payload, 1)[0]
+        shm_name_str = bytes(payload[_HANDSHAKE_V1_HEADER_SIZE:]).decode('utf-8')
+        return shm_name_str, segment_size, 0
+    elif version == 2:
+        if len(payload) < _HANDSHAKE_V2_HEADER_SIZE:
+            raise ValueError(f'Handshake v2 payload too short: {len(payload)}')
+        segment_index = payload[1] if isinstance(payload, (bytes, bytearray)) else int(payload[1])
+        segment_size = struct.unpack_from('<I', payload, 2)[0]
+        shm_name_str = bytes(payload[_HANDSHAKE_V2_HEADER_SIZE:]).decode('utf-8')
+        return shm_name_str, segment_size, segment_index
+    else:
         raise ValueError(f'Unsupported handshake version: {version}')
-    segment_size = struct.unpack_from('<I', payload, 1)[0]
-    shm_name = bytes(payload[_HANDSHAKE_HEADER_SIZE:]).decode('utf-8')
-    return shm_name, segment_size
 
 
 # ---------------------------------------------------------------------------
@@ -62,12 +74,14 @@ def decode_handshake(payload: bytes | memoryview) -> tuple[str, int]:
 def pool_shm_name(region_id: str, conn_id: int, direction: str) -> str:
     """Generate a deterministic SHM name for a per-connection pool segment.
 
-    Format: ``ccp{d}_{12_hex}`` where d is the direction initial.
-    macOS POSIX SHM names are limited to 31 chars; this produces 16 chars.
+    Format: ``ccp{d}{pid_hex}_{hash_hex}`` — always exactly 20 chars.
+    macOS POSIX SHM names are limited to 31 chars; this produces 20 chars.
     """
+    pid_hex = format(os.getpid(), 'x')
     raw = f'{region_id}_c{conn_id}_{direction}'.encode()
-    h = hashlib.md5(raw).hexdigest()[:12]
-    return f'ccp{direction[0]}_{h}'
+    hash_len = 15 - len(pid_hex)
+    h = hashlib.md5(raw).hexdigest()[:hash_len]
+    return f'ccp{direction[0]}{pid_hex}_{h}'
 
 
 # ---------------------------------------------------------------------------
