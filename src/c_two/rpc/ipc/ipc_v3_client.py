@@ -11,6 +11,7 @@ Ownership model (consumer frees):
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import logging
 import os
 import socket as _socket
@@ -59,6 +60,18 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 _CRM_REPLY_TYPE = int(MsgType.CRM_REPLY)
 _U32_LE = struct.Struct('<I')
 
+# Warm response buffer: use memmove to pre-faulted buffer for large responses
+# to avoid page-fault overhead from fresh bytes() allocation (4-5x faster for >= 1GB).
+_WARM_BUF_THRESHOLD = 1 * 1024 * 1024  # 1MB
+
+_libc = ctypes.CDLL(ctypes.util.find_library('c'))
+_libc.memmove.restype = ctypes.c_void_p
+_libc.memmove.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+_libc.memset.restype = ctypes.c_void_p
+_libc.memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+_memmove = _libc.memmove
+_memset = _libc.memset
+
 
 def _resolve_socket_path(region_id: str) -> str:
     sock_dir = Path(_IPC_SOCK_DIR)
@@ -81,6 +94,12 @@ class IPCv3Client(BaseClient):
         self._buddy_pool = None  # c2_buddy.BuddyPoolHandle
         self._pool_handshake_done = False
         self._seg_views: list[memoryview] = []  # Cached segment data region views
+        self._seg_base_addrs: list[int] = []    # Cached segment data base addresses
+
+        # Warm response buffer: pre-allocated bytearray with touched pages
+        # to avoid page-fault overhead on large buddy response copies.
+        self._response_buf: bytearray | None = None
+        self._response_buf_addr: int = 0
 
     # ------------------------------------------------------------------
     # Connection management
@@ -168,14 +187,16 @@ class IPCv3Client(BaseClient):
         if not (flags & (1 << 2)):  # FLAG_HANDSHAKE
             logger.warning('Expected handshake ACK, got flags=%d', flags)
 
-        # Cache a persistent memoryview for each buddy segment data region.
+        # Cache a persistent memoryview and base address for each buddy segment data region.
         self._seg_views = []
+        self._seg_base_addrs = []
         for seg_idx in range(self._buddy_pool.segment_count()):
             base_addr, data_size = self._buddy_pool.seg_data_info(seg_idx)
             mv = memoryview(
                 (ctypes.c_char * data_size).from_address(base_addr)
             ).cast('B')
             self._seg_views.append(mv)
+            self._seg_base_addrs.append(base_addr)
 
         self._pool_handshake_done = True
         logger.debug('Buddy handshake complete, pool segment: %s', seg_name)
@@ -184,7 +205,18 @@ class IPCv3Client(BaseClient):
     # RPC call
     # ------------------------------------------------------------------
 
-    def call(self, method_name: str, data: bytes | None = None) -> bytes:
+    def _ensure_response_buf(self, needed: int) -> None:
+        """Ensure warm response buffer is large enough with pages pre-faulted."""
+        if self._response_buf is not None and len(self._response_buf) >= needed:
+            return
+        self._response_buf = bytearray(needed)
+        addr = ctypes.addressof(
+            (ctypes.c_char * needed).from_buffer(self._response_buf)
+        )
+        _memset(addr, 0, needed)
+        self._response_buf_addr = addr
+
+    def call(self, method_name: str, data: bytes | None = None) -> bytes | memoryview:
         """Send a CRM_CALL and return the response payload."""
         args = data if data is not None else b''
         method_bytes = method_name.encode('utf-8')
@@ -253,7 +285,21 @@ class IPCv3Client(BaseClient):
                 if err:
                     raise err
                 return b''
-            payload = bytes(mv[5:]) if total_size > 5 else b''
+            data_size = total_size - 5
+            if data_size == 0:
+                self._free_buddy_response(free_info)
+                return b''
+            if data_size >= _WARM_BUF_THRESHOLD:
+                # Large response: memmove from SHM to pre-faulted warm buffer.
+                # Avoids page-fault overhead from fresh bytes() allocation
+                # (4-5x faster for >= 1GB payloads).
+                seg_idx, data_offset, _, _, _, is_dedicated = free_info
+                self._ensure_response_buf(data_size)
+                src_addr = self._seg_base_addrs[seg_idx] + data_offset + 5
+                _memmove(self._response_buf_addr, src_addr, data_size)
+                self._free_buddy_response(free_info)
+                return memoryview(self._response_buf)[:data_size]
+            payload = bytes(mv[5:])
             self._free_buddy_response(free_info)
             return payload
         else:
@@ -351,7 +397,7 @@ class IPCv3Client(BaseClient):
                 if data_offset + data_size > len(seg_mv):
                     raise error.CompoClientError(f'Server response out of bounds: offset={data_offset} size={data_size} seg_len={len(seg_mv)}')
                 data_mv = seg_mv[data_offset : data_offset + data_size]
-                return data_mv, (seg_idx, free_offset, free_size, is_dedicated)
+                return data_mv, (seg_idx, data_offset, data_size, free_offset, free_size, is_dedicated)
             else:
                 # Skip PONG frames (heartbeat responses).
                 if len(payload) >= 1 and payload[0] == MsgType.PONG:
@@ -361,7 +407,7 @@ class IPCv3Client(BaseClient):
     def _free_buddy_response(self, free_info: tuple | None) -> None:
         """Free a buddy response block if applicable."""
         if free_info is not None:
-            seg_idx, free_offset, free_size, is_dedicated = free_info
+            seg_idx, _data_off, _data_sz, free_offset, free_size, is_dedicated = free_info
             try:
                 self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
             except Exception:
