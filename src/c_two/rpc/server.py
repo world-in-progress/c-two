@@ -629,6 +629,10 @@ class Server:
         # IPC v3 buddy allocator guarantees separate request/response SHM
         # blocks, so memoryview materialization is unnecessary in _complete_request.
         # The reply() method frees the request block AFTER writing the response.
+        # NOTE: materialize_response_views=False is a prerequisite for the
+        # zero-copy reuse optimization (BUDDY_REUSE path) in reply().
+        # If set to True, memoryview results are copied to bytes before reply(),
+        # which disables reuse detection (isinstance check fails on bytes).
         skip_materialize = config.bind_address.startswith('ipc-v3://')
 
         self._state = ServerState(
