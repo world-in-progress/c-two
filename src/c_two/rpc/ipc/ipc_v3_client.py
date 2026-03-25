@@ -1,7 +1,9 @@
 """IPC v3 client — synchronous UDS client with buddy-allocated SHM data plane.
 
-Full-duplex: client creates a shared buddy pool, server opens it.
-Both allocate/free blocks concurrently via the SHM-based spinlock.
+Request-response: the client sends a request and blocks until the server
+replies, giving serial request-response semantics. The client creates a
+shared buddy pool that the server opens. Both allocate/free blocks
+concurrently via the SHM-based spinlock.
 
 Ownership model (consumer frees):
 - Request blocks: client allocs, server frees via free_at after reading
@@ -220,13 +222,6 @@ class IPCv3Client(BaseClient):
         _memset(addr, 0, needed)
         self._response_buf_addr = addr
 
-    def _flush_deferred_response_free(self) -> None:
-        """Free the previous zero-copy SHM response block if pending."""
-        pending = self._deferred_response_free
-        if pending is not None:
-            self._deferred_response_free = None
-            self._free_buddy_response(pending)
-
     def call(self, method_name: str, data: bytes | None = None) -> bytes | memoryview:
         """Send a CRM_CALL and return the response payload.
 
@@ -239,9 +234,6 @@ class IPCv3Client(BaseClient):
         wire_size = call_wire_size(len(method_bytes), len(args))
 
         with self._conn_lock:
-            # Free the previous zero-copy SHM response block (if any).
-            self._flush_deferred_response_free()
-
             sock = self._ensure_connection()
             request_id = self._next_rid
             self._next_rid += 1

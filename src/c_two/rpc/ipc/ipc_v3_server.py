@@ -1,6 +1,8 @@
 """IPC v3 server — async UDS control plane with buddy-allocated SHM data plane.
 
-Full-duplex: client and server share a single buddy pool. Both allocate
+Request-response: the server read loop awaits each request's future before
+reading the next frame, giving serial request-response semantics per
+connection. Both client and server share a single buddy pool and allocate
 blocks for their data (requests/responses). The buddy allocator's SHM-based
 spinlock provides cross-process synchronization.
 
