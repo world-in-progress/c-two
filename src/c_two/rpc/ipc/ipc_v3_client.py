@@ -287,6 +287,10 @@ class IPCv3Client(BaseClient):
             err_len = _U32_LE.unpack_from(mv, 1)[0]
             if err_len > 0:
                 err_end = 5 + err_len
+                if err_end > total_size:
+                    self._free_buddy_response(free_info)
+                    raise error.CompoClientError(
+                        f'Corrupted CRM_REPLY: err_len={err_len} exceeds data size={total_size}')
                 err_bytes = bytes(mv[5:err_end])
                 self._free_buddy_response(free_info)
                 err = error.CCError.deserialize(err_bytes)
