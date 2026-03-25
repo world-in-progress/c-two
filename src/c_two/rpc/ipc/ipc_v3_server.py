@@ -160,6 +160,9 @@ class IPCv3Server(BaseServer):
                 conn.cleanup()
             self._connections.clear()
         with self._pending_lock:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.cancel()
             self._pending.clear()
 
     def cancel_all_calls(self) -> None:
