@@ -92,13 +92,18 @@ impl BuddyPool {
     pub fn new(config: PoolConfig) -> Self {
         let pid = std::process::id();
         let name_prefix = format!("/cc3b{:08x}", pid);
+        Self::new_with_prefix(config, name_prefix)
+    }
+
+    /// Create a new pool with a custom name prefix (for testing / multi-pool).
+    pub fn new_with_prefix(config: PoolConfig, name_prefix: String) -> Self {
         Self {
             config,
             segments: Vec::new(),
             dedicated: HashMap::new(),
             name_counter: AtomicU32::new(0),
             name_prefix,
-            next_dedicated_idx: 256, // Dedicated indices start at 256.
+            next_dedicated_idx: 256,
         }
     }
 
@@ -431,20 +436,29 @@ fn round_down_pow2(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering as AtOrd};
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn test_pool(config: PoolConfig) -> BuddyPool {
+        let id = TEST_COUNTER.fetch_add(1, AtOrd::Relaxed);
+        let prefix = format!("/cc3t{:04x}{:04x}", std::process::id() as u16, id);
+        BuddyPool::new_with_prefix(config, prefix)
+    }
 
     fn small_config() -> PoolConfig {
         PoolConfig {
-            segment_size: 64 * 1024,  // 64KB segments for testing.
+            segment_size: 64 * 1024,
             min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 2,
-            dedicated_gc_delay_secs: 0.0, // Instant GC for tests.
+            dedicated_gc_delay_secs: 0.0,
         }
     }
 
     #[test]
     fn test_basic_pool_alloc_free() {
-        let mut pool = BuddyPool::new(small_config());
+        let mut pool = test_pool(small_config());
         let a = pool.alloc(4096).unwrap();
         assert!(!a.is_dedicated);
         assert_eq!(pool.segment_count(), 1);
@@ -456,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_multiple_allocs() {
-        let mut pool = BuddyPool::new(small_config());
+        let mut pool = test_pool(small_config());
         let a = pool.alloc(4096).unwrap();
         let b = pool.alloc(4096).unwrap();
         assert_ne!(a.offset, b.offset);
@@ -466,12 +480,11 @@ mod tests {
 
     #[test]
     fn test_segment_expansion() {
-        let mut pool = BuddyPool::new(small_config());
-        // Fill up first segment, then allocate more to trigger expansion.
-        let a = pool.alloc(32 * 1024).unwrap(); // Takes most of segment.
+        let mut pool = test_pool(small_config());
+        let a = pool.alloc(32 * 1024).unwrap();
         assert_eq!(pool.segment_count(), 1);
 
-        let b = pool.alloc(32 * 1024).unwrap(); // Should create new segment.
+        let b = pool.alloc(32 * 1024).unwrap();
         assert!(pool.segment_count() >= 2 || b.is_dedicated);
 
         pool.free(&a);
@@ -481,15 +494,14 @@ mod tests {
     #[test]
     fn test_dedicated_fallback() {
         let config = PoolConfig {
-            segment_size: 32 * 1024,  // Tiny segments.
+            segment_size: 32 * 1024,
             min_block_size: 4096,
             max_segments: 1,
             max_dedicated_segments: 2,
             dedicated_gc_delay_secs: 0.0,
         };
-        let mut pool = BuddyPool::new(config);
+        let mut pool = test_pool(config);
 
-        // This is larger than one segment → dedicated.
         let a = pool.alloc(64 * 1024).unwrap();
         assert!(a.is_dedicated);
 
@@ -499,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_pool_stats() {
-        let mut pool = BuddyPool::new(small_config());
+        let mut pool = test_pool(small_config());
         let a = pool.alloc(4096).unwrap();
         let stats = pool.stats();
         assert!(stats.total_bytes > 0);
@@ -509,11 +521,10 @@ mod tests {
 
     #[test]
     fn test_data_ptr_read_write() {
-        let mut pool = BuddyPool::new(small_config());
+        let mut pool = test_pool(small_config());
         let a = pool.alloc(4096).unwrap();
         let ptr = pool.data_ptr(&a).unwrap();
         unsafe {
-            // Write a pattern.
             std::ptr::write_bytes(ptr, 0xAB, 100);
             assert_eq!(*ptr, 0xAB);
             assert_eq!(*ptr.add(99), 0xAB);
@@ -523,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_zero_alloc_fails() {
-        let mut pool = BuddyPool::new(small_config());
+        let mut pool = test_pool(small_config());
         assert!(pool.alloc(0).is_err());
     }
 }

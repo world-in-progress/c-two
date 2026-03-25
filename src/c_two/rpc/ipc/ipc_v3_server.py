@@ -132,12 +132,17 @@ class IPCv3Server(BaseServer):
             self._pending.clear()
 
     def cancel_all_calls(self) -> None:
-        if self._loop is None:
+        loop = self._loop
+        if loop is None:
             return
         with self._pending_lock:
-            for fut in self._pending.values():
-                self._loop.call_soon_threadsafe(fut.cancel)
+            futs = list(self._pending.values())
             self._pending.clear()
+        for fut in futs:
+            try:
+                loop.call_soon_threadsafe(fut.cancel)
+            except RuntimeError:
+                pass  # Loop already closed.
 
     # ------------------------------------------------------------------
     # reply() — called from scheduler thread
@@ -179,8 +184,12 @@ class IPCv3Server(BaseServer):
         if signal_payload is not None:
             int_rid = int(rid_key.rsplit(':', 1)[1])
             frame = encode_frame(int_rid, FLAG_RESPONSE, signal_payload)
-            if self._loop is not None:
-                self._loop.call_soon_threadsafe(self._resolve_future, fut, frame)
+            loop = self._loop
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(self._resolve_future, fut, frame)
+                except RuntimeError:
+                    pass
             return
 
         err_len = len(err_bytes)
@@ -194,13 +203,14 @@ class IPCv3Server(BaseServer):
 
         with self._conn_lock:
             conn = self._connections.get(conn_id)
+            buddy_pool = conn.buddy_pool if conn is not None and conn.handshake_done else None
 
-        if conn is not None and conn.buddy_pool is not None and total_wire > self._config.shm_threshold:
+        if buddy_pool is not None and total_wire > self._config.shm_threshold:
             try:
-                alloc = conn.buddy_pool.alloc(total_wire)
+                alloc = buddy_pool.alloc(total_wire)
                 wire_buf = bytearray(total_wire)
                 write_reply_into(wire_buf, 0, err_bytes, result_bytes)
-                conn.buddy_pool.write(alloc, bytes(wire_buf))
+                buddy_pool.write(alloc, bytes(wire_buf))
                 frame = encode_buddy_reply_frame(
                     int_rid, alloc.seg_idx, alloc.offset,
                     total_wire, alloc.is_dedicated,
@@ -213,8 +223,12 @@ class IPCv3Server(BaseServer):
         if frame is None:
             frame = encode_inline_reply_frame(int_rid, FLAG_RESPONSE, err_bytes, result_bytes)
 
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._resolve_future, fut, frame)
+        loop = self._loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._resolve_future, fut, frame)
+            except RuntimeError:
+                pass
 
     @staticmethod
     def _resolve_future(fut: asyncio.Future, frame: bytes) -> None:
@@ -251,10 +265,12 @@ class IPCv3Server(BaseServer):
         await self._shutdown_event.wait()
 
         # Graceful shutdown: cancel client tasks, close server.
-        for task in self._client_tasks:
+        tasks_snapshot = set(self._client_tasks)
+        for task in tasks_snapshot:
             task.cancel()
-        if self._client_tasks:
-            await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        if tasks_snapshot:
+            await asyncio.gather(*tasks_snapshot, return_exceptions=True)
+        self._client_tasks.clear()
         self._server.close()
         await self._server.wait_closed()
 

@@ -37,28 +37,33 @@ impl ShmSpinlock {
     /// Acquire the spinlock. Spins with progressive backoff.
     #[inline]
     pub fn lock(&self) {
+        if !self.try_lock_spins(10_000_000) {
+            panic!("ShmSpinlock: deadlock detected (>10M spins)");
+        }
+    }
+
+    /// Try to acquire the lock within a spin budget. Returns true on success.
+    #[inline]
+    pub fn try_lock_spins(&self, max_total_spins: u32) -> bool {
         let mut spins = 0u32;
         loop {
-            // Fast path: try to acquire immediately.
             if self
                 .atomic()
                 .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                return;
+                return true;
             }
             spins += 1;
+            if spins >= max_total_spins {
+                return false;
+            }
             if spins < 16 {
-                // Spin with CPU hint.
                 std::hint::spin_loop();
             } else if spins < MAX_SPINS {
-                // Yield to OS scheduler.
                 std::thread::yield_now();
             } else {
-                // Shouldn't happen in normal operation (critical section is ~50ns).
-                // Reset counter and keep trying — deadlock prevention by timeout
-                // is handled at the Python layer.
-                spins = 0;
+                spins = spins.wrapping_sub(MAX_SPINS);
                 std::thread::yield_now();
             }
         }
