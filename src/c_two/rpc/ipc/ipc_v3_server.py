@@ -143,6 +143,16 @@ class IPCv3Server(BaseServer):
             pass
         # Cancel all pending futures before clearing connections.
         self.cancel_all_calls()
+        # Drain deferred frees
+        with self._deferred_frees_lock:
+            deferred = dict(self._deferred_frees)
+            self._deferred_frees.clear()
+        for rid_key, info in deferred.items():
+            try:
+                pool, seg_idx, offset, data_size, is_dedicated = info[:5]
+                pool.free_at(seg_idx, offset, data_size, is_dedicated)
+            except Exception:
+                pass  # pool may already be destroyed
         with self._conn_lock:
             for conn in self._connections.values():
                 conn.cleanup()
