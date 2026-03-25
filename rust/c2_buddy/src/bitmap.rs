@@ -20,6 +20,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Layout in SHM: array of AtomicU64 words, each tracking 64 blocks.
 /// Bit = 1 means FREE, bit = 0 means USED (or non-existent).
+///
+/// # Safety
+///
+/// All methods on `LevelBitmap` assume the caller holds the segment's
+/// [`ShmSpinlock`](crate::spinlock::ShmSpinlock). The atomic operations
+/// provide cross-process visibility (shared-memory coherence), **not**
+/// lock-free concurrency — concurrent unsynchronized access is undefined
+/// behavior at the allocator level.
 pub struct LevelBitmap {
     /// Pointer to the first u64 word in SHM.
     base: *mut AtomicU64,
