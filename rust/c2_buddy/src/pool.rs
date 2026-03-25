@@ -1,0 +1,487 @@
+//! Multi-segment buddy pool with dedicated segment fallback.
+//!
+//! The pool manages multiple buddy-allocated SHM segments and automatically
+//! creates dedicated segments for oversized payloads. Implements the three-layer
+//! fallback strategy from buddy.md:
+//!   1. Try existing segments
+//!   2. Create new segment (up to max_segments)
+//!   3. Fall back to dedicated segment
+
+use crate::allocator::Allocation;
+use crate::segment::{DedicatedSegment, ShmSegment};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
+
+/// Configuration for the buddy pool.
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Size of each buddy segment (default 256MB).
+    pub segment_size: usize,
+    /// Minimum allocation block (default 4KB).
+    pub min_block_size: usize,
+    /// Maximum number of buddy segments (default 8).
+    pub max_segments: usize,
+    /// Maximum number of dedicated segments (default 4).
+    pub max_dedicated_segments: usize,
+    /// Delay before reclaiming empty dedicated segments (seconds).
+    pub dedicated_gc_delay_secs: f64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            segment_size: 256 * 1024 * 1024,
+            min_block_size: 4096,
+            max_segments: 8,
+            max_dedicated_segments: 4,
+            dedicated_gc_delay_secs: 5.0,
+        }
+    }
+}
+
+/// Result of a pool allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolAllocation {
+    /// Index of the segment (buddy or dedicated).
+    pub seg_idx: u16,
+    /// Offset within the segment's data region.
+    pub offset: u32,
+    /// Actual allocated size.
+    pub actual_size: u32,
+    /// Buddy level (only meaningful for buddy segments).
+    pub level: u16,
+    /// Whether this is a dedicated segment.
+    pub is_dedicated: bool,
+}
+
+/// Statistics about the pool.
+#[derive(Debug, Clone)]
+pub struct PoolStats {
+    pub total_segments: usize,
+    pub dedicated_segments: usize,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub alloc_count: u32,
+    pub fragmentation_ratio: f64,
+}
+
+/// Tracking info for a dedicated segment.
+struct DedicatedEntry {
+    segment: DedicatedSegment,
+    freed_at: Option<Instant>,
+}
+
+/// Multi-segment buddy pool.
+pub struct BuddyPool {
+    config: PoolConfig,
+    /// Buddy-managed segments.
+    segments: Vec<ShmSegment>,
+    /// Dedicated segments for oversized allocations. Key is segment index.
+    dedicated: HashMap<u16, DedicatedEntry>,
+    /// Counter for generating unique SHM names.
+    name_counter: AtomicU32,
+    /// Base name prefix for SHM segments (includes PID).
+    name_prefix: String,
+    /// Next dedicated segment index (offset from max_segments to avoid collision).
+    next_dedicated_idx: u16,
+}
+
+impl BuddyPool {
+    /// Create a new pool. Segments are lazily created on first alloc.
+    pub fn new(config: PoolConfig) -> Self {
+        let pid = std::process::id();
+        let name_prefix = format!("/cc3b{:08x}", pid);
+        Self {
+            config,
+            segments: Vec::new(),
+            dedicated: HashMap::new(),
+            name_counter: AtomicU32::new(0),
+            name_prefix,
+            next_dedicated_idx: 256, // Dedicated indices start at 256.
+        }
+    }
+
+    /// Allocate memory from the pool.
+    pub fn alloc(&mut self, size: usize) -> Result<PoolAllocation, String> {
+        if size == 0 {
+            return Err("cannot allocate 0 bytes".into());
+        }
+
+        let max_buddy_block = self.max_buddy_block_size();
+
+        if max_buddy_block > 0 && size <= max_buddy_block {
+            // Try buddy allocation.
+            self.alloc_buddy(size)
+        } else {
+            // Too large for buddy → dedicated segment.
+            self.alloc_dedicated(size)
+        }
+    }
+
+    /// Free a previously allocated block.
+    pub fn free(&mut self, alloc: &PoolAllocation) {
+        if alloc.is_dedicated {
+            self.free_dedicated(alloc.seg_idx);
+        } else {
+            self.free_buddy(alloc);
+        }
+    }
+
+    /// Get a raw pointer to data for a given allocation.
+    pub fn data_ptr(&self, alloc: &PoolAllocation) -> Result<*mut u8, String> {
+        if alloc.is_dedicated {
+            let entry = self
+                .dedicated
+                .get(&alloc.seg_idx)
+                .ok_or("invalid dedicated segment index")?;
+            Ok(entry.segment.data_ptr())
+        } else {
+            let seg = self
+                .segments
+                .get(alloc.seg_idx as usize)
+                .ok_or("invalid segment index")?;
+            Ok(seg.allocator().data_ptr(alloc.offset))
+        }
+    }
+
+    /// Get pool statistics.
+    pub fn stats(&self) -> PoolStats {
+        let mut total_bytes = 0u64;
+        let mut free_bytes = 0u64;
+        let mut alloc_count = 0u32;
+
+        for seg in &self.segments {
+            let a = seg.allocator();
+            total_bytes += a.data_size() as u64;
+            free_bytes += a.free_bytes();
+            alloc_count += a.alloc_count();
+        }
+
+        for entry in self.dedicated.values() {
+            total_bytes += entry.segment.size() as u64;
+            if entry.freed_at.is_none() {
+                alloc_count += 1;
+            }
+        }
+
+        let fragmentation_ratio = if total_bytes > 0 {
+            1.0 - (free_bytes as f64 / total_bytes as f64)
+        } else {
+            0.0
+        };
+
+        PoolStats {
+            total_segments: self.segments.len(),
+            dedicated_segments: self.dedicated.len(),
+            total_bytes,
+            free_bytes,
+            alloc_count,
+            fragmentation_ratio,
+        }
+    }
+
+    /// Run garbage collection on freed dedicated segments.
+    pub fn gc_dedicated(&mut self) {
+        let delay = std::time::Duration::from_secs_f64(self.config.dedicated_gc_delay_secs);
+        let now = Instant::now();
+        let to_remove: Vec<u16> = self
+            .dedicated
+            .iter()
+            .filter_map(|(&idx, entry)| {
+                if let Some(freed_at) = entry.freed_at {
+                    if now.duration_since(freed_at) >= delay {
+                        return Some(idx);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for idx in to_remove {
+            self.dedicated.remove(&idx); // Drop triggers munmap + shm_unlink.
+        }
+    }
+
+    /// Get the number of buddy segments.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Get a specific segment by index.
+    pub fn segment(&self, idx: usize) -> Option<&ShmSegment> {
+        self.segments.get(idx)
+    }
+
+    /// Destroy the pool, cleaning up all SHM segments.
+    pub fn destroy(&mut self) {
+        self.dedicated.clear();
+        self.segments.clear(); // Drop triggers munmap + shm_unlink for owned segments.
+    }
+
+    /// Get the SHM name for a buddy segment.
+    pub fn segment_name(&self, idx: usize) -> Option<&str> {
+        self.segments.get(idx).map(|s| s.name())
+    }
+
+    /// Get the SHM name for a dedicated segment.
+    pub fn dedicated_name(&self, idx: u16) -> Option<&str> {
+        self.dedicated.get(&idx).map(|e| e.segment.name())
+    }
+
+    /// Open an existing buddy segment (for the remote side of a connection).
+    pub fn open_segment(&mut self, name: &str, size: usize) -> Result<usize, String> {
+        let seg = ShmSegment::open(name, size)?;
+        let idx = self.segments.len();
+        self.segments.push(seg);
+        Ok(idx)
+    }
+
+    /// Open an existing dedicated segment.
+    pub fn open_dedicated(&mut self, name: &str, size: usize) -> Result<u16, String> {
+        let seg = DedicatedSegment::open(name, size)?;
+        let idx = self.next_dedicated_idx;
+        self.next_dedicated_idx += 1;
+        self.dedicated.insert(
+            idx,
+            DedicatedEntry {
+                segment: seg,
+                freed_at: None,
+            },
+        );
+        Ok(idx)
+    }
+
+    // --- Internal methods ---
+
+    fn max_buddy_block_size(&self) -> usize {
+        if self.segments.is_empty() && self.segments.len() < self.config.max_segments {
+            // If we can still create segments, max block = segment data size.
+            // Estimate: segment_size minus header overhead.
+            let overhead = 8192; // Conservative: 4KB header + bitmap.
+            if self.config.segment_size > overhead {
+                return round_down_pow2(self.config.segment_size - overhead);
+            }
+        }
+        // Return the data size of existing segments.
+        self.segments
+            .first()
+            .map(|s| s.allocator().data_size())
+            .unwrap_or(0)
+    }
+
+    fn alloc_buddy(&mut self, size: usize) -> Result<PoolAllocation, String> {
+        // Layer 1: Try existing segments.
+        for (idx, seg) in self.segments.iter().enumerate() {
+            if let Some(a) = seg.allocator().alloc(size) {
+                return Ok(PoolAllocation {
+                    seg_idx: idx as u16,
+                    offset: a.offset,
+                    actual_size: a.actual_size,
+                    level: a.level,
+                    is_dedicated: false,
+                });
+            }
+        }
+
+        // Layer 2: Create new segment.
+        if self.segments.len() < self.config.max_segments {
+            let seg = self.create_segment()?;
+            let idx = self.segments.len();
+            self.segments.push(seg);
+            if let Some(a) = self.segments[idx].allocator().alloc(size) {
+                return Ok(PoolAllocation {
+                    seg_idx: idx as u16,
+                    offset: a.offset,
+                    actual_size: a.actual_size,
+                    level: a.level,
+                    is_dedicated: false,
+                });
+            }
+        }
+
+        // Layer 3: Dedicated segment fallback.
+        self.alloc_dedicated(size)
+    }
+
+    fn alloc_dedicated(&mut self, size: usize) -> Result<PoolAllocation, String> {
+        // Check dedicated segment limit.
+        let active_dedicated = self
+            .dedicated
+            .values()
+            .filter(|e| e.freed_at.is_none())
+            .count();
+        if active_dedicated >= self.config.max_dedicated_segments {
+            // Try GC first.
+            self.gc_dedicated();
+            let active_after = self
+                .dedicated
+                .values()
+                .filter(|e| e.freed_at.is_none())
+                .count();
+            if active_after >= self.config.max_dedicated_segments {
+                return Err(format!(
+                    "dedicated segment limit reached ({} active)",
+                    active_after
+                ));
+            }
+        }
+
+        let name = self.next_name("d");
+        let seg = DedicatedSegment::create(&name, size)?;
+        let idx = self.next_dedicated_idx;
+        self.next_dedicated_idx += 1;
+
+        let alloc_size = seg.size() as u32;
+        self.dedicated.insert(
+            idx,
+            DedicatedEntry {
+                segment: seg,
+                freed_at: None,
+            },
+        );
+
+        Ok(PoolAllocation {
+            seg_idx: idx,
+            offset: 0,
+            actual_size: alloc_size,
+            level: 0,
+            is_dedicated: true,
+        })
+    }
+
+    fn free_buddy(&mut self, alloc: &PoolAllocation) {
+        if let Some(seg) = self.segments.get(alloc.seg_idx as usize) {
+            seg.allocator().free(alloc.offset, alloc.level);
+        }
+    }
+
+    fn free_dedicated(&mut self, seg_idx: u16) {
+        if let Some(entry) = self.dedicated.get_mut(&seg_idx) {
+            entry.freed_at = Some(Instant::now());
+        }
+    }
+
+    fn create_segment(&self) -> Result<ShmSegment, String> {
+        let name = self.next_name("b");
+        ShmSegment::create(&name, self.config.segment_size, self.config.min_block_size)
+    }
+
+    fn next_name(&self, tag: &str) -> String {
+        let counter = self.name_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{}_{}{:04x}", self.name_prefix, tag, counter)
+    }
+}
+
+impl Drop for BuddyPool {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
+fn round_down_pow2(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    1 << (usize::BITS - 1 - n.leading_zeros())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_config() -> PoolConfig {
+        PoolConfig {
+            segment_size: 64 * 1024,  // 64KB segments for testing.
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 2,
+            dedicated_gc_delay_secs: 0.0, // Instant GC for tests.
+        }
+    }
+
+    #[test]
+    fn test_basic_pool_alloc_free() {
+        let mut pool = BuddyPool::new(small_config());
+        let a = pool.alloc(4096).unwrap();
+        assert!(!a.is_dedicated);
+        assert_eq!(pool.segment_count(), 1);
+
+        pool.free(&a);
+        let stats = pool.stats();
+        assert_eq!(stats.alloc_count, 0);
+    }
+
+    #[test]
+    fn test_multiple_allocs() {
+        let mut pool = BuddyPool::new(small_config());
+        let a = pool.alloc(4096).unwrap();
+        let b = pool.alloc(4096).unwrap();
+        assert_ne!(a.offset, b.offset);
+        pool.free(&a);
+        pool.free(&b);
+    }
+
+    #[test]
+    fn test_segment_expansion() {
+        let mut pool = BuddyPool::new(small_config());
+        // Fill up first segment, then allocate more to trigger expansion.
+        let a = pool.alloc(32 * 1024).unwrap(); // Takes most of segment.
+        assert_eq!(pool.segment_count(), 1);
+
+        let b = pool.alloc(32 * 1024).unwrap(); // Should create new segment.
+        assert!(pool.segment_count() >= 2 || b.is_dedicated);
+
+        pool.free(&a);
+        pool.free(&b);
+    }
+
+    #[test]
+    fn test_dedicated_fallback() {
+        let config = PoolConfig {
+            segment_size: 32 * 1024,  // Tiny segments.
+            min_block_size: 4096,
+            max_segments: 1,
+            max_dedicated_segments: 2,
+            dedicated_gc_delay_secs: 0.0,
+        };
+        let mut pool = BuddyPool::new(config);
+
+        // This is larger than one segment → dedicated.
+        let a = pool.alloc(64 * 1024).unwrap();
+        assert!(a.is_dedicated);
+
+        pool.free(&a);
+        pool.gc_dedicated();
+    }
+
+    #[test]
+    fn test_pool_stats() {
+        let mut pool = BuddyPool::new(small_config());
+        let a = pool.alloc(4096).unwrap();
+        let stats = pool.stats();
+        assert!(stats.total_bytes > 0);
+        assert!(stats.alloc_count >= 1);
+        pool.free(&a);
+    }
+
+    #[test]
+    fn test_data_ptr_read_write() {
+        let mut pool = BuddyPool::new(small_config());
+        let a = pool.alloc(4096).unwrap();
+        let ptr = pool.data_ptr(&a).unwrap();
+        unsafe {
+            // Write a pattern.
+            std::ptr::write_bytes(ptr, 0xAB, 100);
+            assert_eq!(*ptr, 0xAB);
+            assert_eq!(*ptr.add(99), 0xAB);
+        }
+        pool.free(&a);
+    }
+
+    #[test]
+    fn test_zero_alloc_fails() {
+        let mut pool = BuddyPool::new(small_config());
+        assert!(pool.alloc(0).is_err());
+    }
+}
