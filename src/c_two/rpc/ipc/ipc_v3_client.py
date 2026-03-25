@@ -22,6 +22,7 @@ from pathlib import Path
 from ... import error
 from ..event.msg_type import MsgType
 from ..base.base_client import BaseClient
+from ..util.adaptive_buffer import AdaptiveBuffer
 from ..util.wire import (
     write_call_into,
     call_wire_size,

@@ -104,6 +104,20 @@ def _default_serialize_func(*args):
 def _default_deserialize_func(data: memoryview | None):
     return pickle.loads(data) if data else None
 
+def _is_single_bytes_param(func, filtered_params, type_hints) -> bool:
+    """Check if a function takes exactly one parameter of type bytes."""
+    if len(filtered_params) != 1:
+        return False
+    param_type = type_hints.get(filtered_params[0])
+    return param_type is bytes
+
+
+def _is_bytes_return(func) -> bool:
+    """Check if a function has return type bytes."""
+    type_hints = get_type_hints(func)
+    return type_hints.get('return') is bytes
+
+
 def create_default_transferable(func, is_input: bool):
     """
     Factory function to dynamically create a Transferable class for a given function.
@@ -133,65 +147,79 @@ def create_default_transferable(func, is_input: bool):
             if i == 0 and name in ('self', 'cls'):
                 continue
             filtered_params.append(name)
-        
-        # Define the dynamic transferable class for input
-        class DynamicInputTransferable(Transferable):
-            __module__ = 'Default'  # mark as default
-            
-            def serialize(*args) -> bytes:
-                """
-                Default serialization for function input parameters using pickle
-                """
-                try:
-                    # Create a mapping of parameter names to arguments
-                    args_dict = {}
-                    for i, arg in enumerate(args):
-                        if i < len(filtered_params):
-                            args_dict[filtered_params[i]] = arg
-                        else:
-                            args_dict[f'extra_arg_{i}'] = arg
-                    
-                    args_dict['__serialized__'] = True
-                    return pickle.dumps(args_dict)
-                except Exception:
-                    # Fallback to direct args serialization
-                    return pickle.dumps(args)
-            
-            def deserialize(data: memoryview | bytes):
-                """
-                Default deserialization for function input parameters using pickle
-                Returns either the original dict mapping or tuple of args.
-                """
-                try:
-                    # Handle None case
+
+        # Fast path: single bytes parameter — skip pickle entirely.
+        if _is_single_bytes_param(func, filtered_params, type_hints):
+            class DynamicInputTransferable(Transferable):
+                __module__ = 'Default'
+
+                def serialize(data) -> bytes:
+                    return data if isinstance(data, (bytes, memoryview)) else pickle.dumps(data)
+
+                def deserialize(data: memoryview | bytes):
                     if not data:
                         return None
-                    
-                    unpickled = pickle.loads(data)
-                    
-                    if isinstance(unpickled, dict):
-                        if '__serialized__' not in unpickled:
-                            return unpickled
+                    return bytes(data) if isinstance(data, memoryview) else data
 
-                        # If it's a dict (from serialize method), convert back to tuple
-                        del unpickled['__serialized__']
+        else:
+            # Define the dynamic transferable class for input
+            class DynamicInputTransferable(Transferable):
+                __module__ = 'Default'  # mark as default
+                
+                def serialize(*args) -> bytes:
+                    """
+                    Default serialization for function input parameters using pickle
+                    """
+                    try:
+                        # Create a mapping of parameter names to arguments
+                        args_dict = {}
+                        for i, arg in enumerate(args):
+                            if i < len(filtered_params):
+                                args_dict[filtered_params[i]] = arg
+                            else:
+                                args_dict[f'extra_arg_{i}'] = arg
                         
-                        # Preserve parameter order
-                        ordered_args = []
-                        for param_name in filtered_params:
-                            if param_name in unpickled:
-                                ordered_args.append(unpickled[param_name])
-                        # Add any extra arguments
-                        for key, value in unpickled.items():
-                            if key.startswith('extra_arg_'):
-                                ordered_args.append(value)
+                        args_dict['__serialized__'] = True
+                        return pickle.dumps(args_dict)
+                    except Exception:
+                        # Fallback to direct args serialization
+                        return pickle.dumps(args)
+                
+                def deserialize(data: memoryview | bytes):
+                    """
+                    Default deserialization for function input parameters using pickle
+                    Returns either the original dict mapping or tuple of args.
+                    """
+                    try:
+                        # Handle None case
+                        if not data:
+                            return None
                         
-                        return tuple(ordered_args) if len(ordered_args) != 1 else ordered_args[0]
-                    else:
-                        return unpickled
+                        unpickled = pickle.loads(data)
                         
-                except Exception as e:
-                    raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
+                        if isinstance(unpickled, dict):
+                            if '__serialized__' not in unpickled:
+                                return unpickled
+
+                            # If it's a dict (from serialize method), convert back to tuple
+                            del unpickled['__serialized__']
+                            
+                            # Preserve parameter order
+                            ordered_args = []
+                            for param_name in filtered_params:
+                                if param_name in unpickled:
+                                    ordered_args.append(unpickled[param_name])
+                            # Add any extra arguments
+                            for key, value in unpickled.items():
+                                if key.startswith('extra_arg_'):
+                                    ordered_args.append(value)
+                            
+                            return tuple(ordered_args) if len(ordered_args) != 1 else ordered_args[0]
+                        else:
+                            return unpickled
+                            
+                    except Exception as e:
+                        raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
         
         # Set the dynamic class properties
         DynamicInputTransferable._is_input = True
@@ -209,9 +237,15 @@ def create_default_transferable(func, is_input: bool):
         
         # Create transferable for function return value
         type_hints = get_type_hints(func)
-        return_type = type_hints['return']
-        serialize_func = _default_serialize_func
-        deserialize_func = _default_deserialize_func
+        return_type = type_hints.get('return')
+
+        # Fast path: bytes return type — skip pickle entirely.
+        if return_type is bytes:
+            serialize_func = staticmethod(lambda val: val if isinstance(val, bytes) else bytes(val) if isinstance(val, memoryview) else pickle.dumps(val))
+            deserialize_func = staticmethod(lambda data: bytes(data) if isinstance(data, memoryview) else data if isinstance(data, bytes) else pickle.loads(data) if data else None)
+        else:
+            serialize_func = staticmethod(_default_serialize_func)
+            deserialize_func = staticmethod(_default_deserialize_func)
 
         # Define the dynamic transferable class for output
         DynamicOutputTransferable = type(
@@ -219,8 +253,8 @@ def create_default_transferable(func, is_input: bool):
             (Transferable,),
             {
                 '__module__': 'Default',  # mark as default
-                'serialize': staticmethod(serialize_func),
-                'deserialize': staticmethod(deserialize_func)
+                'serialize': serialize_func,
+                'deserialize': deserialize_func,
             }
         )
         
