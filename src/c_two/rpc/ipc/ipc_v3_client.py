@@ -101,6 +101,10 @@ class IPCv3Client(BaseClient):
         self._response_buf: bytearray | None = None
         self._response_buf_addr: int = 0
 
+        # Deferred free: for zero-copy SHM responses, the buddy block is kept
+        # alive until the next call so the caller can read directly from SHM.
+        self._deferred_response_free: tuple | None = None
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -216,6 +220,13 @@ class IPCv3Client(BaseClient):
         _memset(addr, 0, needed)
         self._response_buf_addr = addr
 
+    def _flush_deferred_response_free(self) -> None:
+        """Free the previous zero-copy SHM response block if pending."""
+        pending = self._deferred_response_free
+        if pending is not None:
+            self._deferred_response_free = None
+            self._free_buddy_response(pending)
+
     def call(self, method_name: str, data: bytes | None = None) -> bytes | memoryview:
         """Send a CRM_CALL and return the response payload."""
         args = data if data is not None else b''
@@ -223,6 +234,9 @@ class IPCv3Client(BaseClient):
         wire_size = call_wire_size(len(method_bytes), len(args))
 
         with self._conn_lock:
+            # Free the previous zero-copy SHM response block (if any).
+            self._flush_deferred_response_free()
+
             sock = self._ensure_connection()
             request_id = self._next_rid
             self._next_rid += 1
@@ -290,15 +304,10 @@ class IPCv3Client(BaseClient):
                 self._free_buddy_response(free_info)
                 return b''
             if data_size >= _WARM_BUF_THRESHOLD:
-                # Large response: memmove from SHM to pre-faulted warm buffer.
-                # Avoids page-fault overhead from fresh bytes() allocation
-                # (4-5x faster for >= 1GB payloads).
-                seg_idx, data_offset, _, _, _, is_dedicated = free_info
-                self._ensure_response_buf(data_size)
-                src_addr = self._seg_base_addrs[seg_idx] + data_offset + 5
-                _memmove(self._response_buf_addr, src_addr, data_size)
-                self._free_buddy_response(free_info)
-                return memoryview(self._response_buf)[:data_size]
+                # Large response: return SHM memoryview directly (true zero-copy).
+                # The buddy block stays alive until the next call() frees it.
+                self._deferred_response_free = free_info
+                return mv[5:]
             payload = bytes(mv[5:])
             self._free_buddy_response(free_info)
             return payload
@@ -317,6 +326,7 @@ class IPCv3Client(BaseClient):
         wire_size = len(event_bytes)
 
         with self._conn_lock:
+            self._flush_deferred_response_free()
             sock = self._ensure_connection()
             request_id = self._next_rid
             self._next_rid += 1
@@ -363,6 +373,7 @@ class IPCv3Client(BaseClient):
 
     def terminate(self) -> None:
         with self._conn_lock:
+            self._flush_deferred_response_free()
             self._close_connection()
 
     # ------------------------------------------------------------------
