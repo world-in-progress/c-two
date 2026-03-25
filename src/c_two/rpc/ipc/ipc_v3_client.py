@@ -55,6 +55,10 @@ logger = logging.getLogger(__name__)
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
+# Pre-computed constants for inline CRM_REPLY parsing (avoids decode() overhead).
+_CRM_REPLY_TYPE = int(MsgType.CRM_REPLY)
+_U32_LE = struct.Struct('<I')
+
 
 def _resolve_socket_path(region_id: str) -> str:
     sock_dir = Path(_IPC_SOCK_DIR)
@@ -232,26 +236,35 @@ class IPCv3Client(BaseClient):
                 raise error.CompoClientError(f'IPC v3 call failed: {exc}') from exc
 
         # Decode wire message outside lock.
-        env = decode(response_data)
-        if env.msg_type != MsgType.CRM_REPLY:
+        if free_info is not None:
+            # Buddy zero-copy fast path: parse CRM_REPLY header inline to avoid
+            # decode() overhead (Envelope allocation, MsgType enum lookup, memoryview wrapping).
+            mv = response_data
+            total_size = len(mv)
+            if total_size < 5 or mv[0] != _CRM_REPLY_TYPE:
+                self._free_buddy_response(free_info)
+                raise error.CompoClientError(f'Unexpected buddy response type: 0x{mv[0]:02x}')
+            err_len = _U32_LE.unpack_from(mv, 1)[0]
+            if err_len > 0:
+                err_end = 5 + err_len
+                err_bytes = bytes(mv[5:err_end])
+                self._free_buddy_response(free_info)
+                err = error.CCError.deserialize(err_bytes)
+                if err:
+                    raise err
+                return b''
+            payload = bytes(mv[5:]) if total_size > 5 else b''
             self._free_buddy_response(free_info)
-            raise error.CompoClientError(f'Unexpected response type: {env.msg_type}')
-        if env.error:
-            self._free_buddy_response(free_info)
-            err = error.CCError.deserialize(env.error)
-            if err:
-                raise err
-        # For buddy zero-copy: payload is a memoryview into SHM. Copy to bytes
-        # (single copy from SHM) and then free the block. This avoids the
-        # double-copy that would happen through decode→memoryview→deserializer.
-        payload = env.payload
-        if payload is not None:
-            if isinstance(payload, memoryview):
-                payload = bytes(payload)
+            return payload
         else:
-            payload = b''
-        self._free_buddy_response(free_info)
-        return payload
+            env = decode(response_data)
+            if env.msg_type != MsgType.CRM_REPLY:
+                raise error.CompoClientError(f'Unexpected response type: {env.msg_type}')
+            if env.error:
+                err = error.CCError.deserialize(env.error)
+                if err:
+                    raise err
+            return env.payload if env.payload is not None else b''
 
     def relay(self, event_bytes: bytes) -> bytes:
         """Relay raw event bytes to the server."""
