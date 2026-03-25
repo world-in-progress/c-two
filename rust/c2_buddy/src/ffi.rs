@@ -156,8 +156,11 @@ impl PyPoolStats {
 
 /// The main buddy pool handle exposed to Python.
 ///
-/// Thread-safe via internal RwLock. Read-only operations (stats, segment_name,
-/// etc.) take a shared lock; mutating operations take an exclusive lock.
+/// Thread-safe via internal `RwLock`. Read-only operations (`stats`,
+/// `segment_name`, `segment_count`, `seg_data_info`, `data_addr`, `read_at`)
+/// take a shared read lock; mutating operations (`alloc`, `alloc_ptr`,
+/// `free`, `free_at`, `open_segment`, `gc`, `destroy`) take an exclusive
+/// write lock.  This allows concurrent readers without blocking.
 #[pyclass(name = "BuddyPoolHandle")]
 pub struct PyBuddyPoolHandle {
     pool: RwLock<BuddyPool>,
