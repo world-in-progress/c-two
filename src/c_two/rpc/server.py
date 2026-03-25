@@ -135,8 +135,9 @@ class _WriterPriorityReadWriteLock:
 
 
 class _Scheduler:
-    def __init__(self, config: ConcurrencyConfig):
+    def __init__(self, config: ConcurrencyConfig, *, materialize_response_views: bool = True):
         self._config = config
+        self._materialize_views = materialize_response_views
         self._exclusive_lock = threading.Lock()
         self._rw_lock = _WriterPriorityReadWriteLock()
         self._state_lock = threading.Lock()
@@ -315,20 +316,26 @@ class _Scheduler:
         try:
             response = future.result()
             if isinstance(response, tuple):
-                # Materialize any memoryview parts to bytes so they don't
-                # alias a shared buffer (e.g. pool SHM) that reply() may
-                # overwrite when writing the response back.
-                parts = [
-                    p.tobytes() if isinstance(p, memoryview) else p
-                    for p in response
-                ]
+                if self._materialize_views:
+                    # Materialize any memoryview parts to bytes so they don't
+                    # alias a shared buffer (e.g. pool SHM) that reply() may
+                    # overwrite when writing the response back.
+                    parts = [
+                        p.tobytes() if isinstance(p, memoryview) else p
+                        for p in response
+                    ]
+                else:
+                    # Buddy allocator: request and response blocks are separate
+                    # allocations — no aliasing possible. The caller (reply())
+                    # must free the request block AFTER writing the response.
+                    parts = list(response)
                 event = Event(
                     tag=EventTag.CRM_REPLY,
                     data_parts=parts,
                     request_id=request_id,
                 )
             else:
-                if isinstance(response, memoryview):
+                if isinstance(response, memoryview) and self._materialize_views:
                     response = response.tobytes()
                 event = Event(tag=EventTag.CRM_REPLY, data=response, request_id=request_id)
         except Exception as exc:
@@ -619,11 +626,16 @@ class Server:
         icrm.crm = config.crm
         icrm.direction = '<-'
 
+        # IPC v3 buddy allocator guarantees separate request/response SHM
+        # blocks, so memoryview materialization is unnecessary in _complete_request.
+        # The reply() method frees the request block AFTER writing the response.
+        skip_materialize = config.bind_address.startswith('ipc-v3://')
+
         self._state = ServerState(
             icrm=icrm,
             crm=config.crm,
             server=self.server,
-            scheduler=_Scheduler(config.concurrency),
+            scheduler=_Scheduler(config.concurrency, materialize_response_views=not skip_materialize),
             on_shutdown=config.on_shutdown,
             event_queue=event_queue,
         )

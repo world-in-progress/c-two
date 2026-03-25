@@ -186,17 +186,19 @@ class IPCv3Server(BaseServer):
 
         Called from the scheduler thread. Thread-safe via asyncio
         call_soon_threadsafe.
+
+        The deferred request block is freed AFTER write_reply_into so that
+        memoryview data_parts (pointing into the request SHM block) remain
+        valid during the SHM→SHM copy.
         """
         rid_key = event.request_id
         if not rid_key:
             return
 
-        # Free the deferred request block now — CRM is done with the data.
-        self._free_deferred(rid_key)
-
         with self._pending_lock:
             fut = self._pending.pop(rid_key, None)
         if fut is None:
+            self._free_deferred(rid_key)
             return
 
         # Parse composite key once: "conn_id:request_id"
@@ -219,6 +221,7 @@ class IPCv3Server(BaseServer):
         # Signal-type replies (PONG, SHUTDOWN_ACK).
         signal_payload = _SIGNAL_TAGS.get(event.tag)
         if signal_payload is not None:
+            self._free_deferred(rid_key)
             frame = encode_frame(int_rid, FLAG_RESPONSE, signal_payload)
             loop = self._loop
             if loop is not None:
@@ -240,6 +243,7 @@ class IPCv3Server(BaseServer):
 
         # Buddy alloc + SHM write outside conn_lock (only Rust mutex needed).
         frame: bytes | None = None
+        freed_deferred = False
         if buddy_pool is not None and total_wire > self._config.shm_threshold:
             try:
                 alloc = buddy_pool.alloc(total_wire)
@@ -255,9 +259,38 @@ class IPCv3Server(BaseServer):
                     int_rid, alloc.seg_idx, alloc.offset,
                     total_wire, alloc.is_dedicated,
                 )
-            except Exception as e:
-                logger.warning('Buddy alloc for reply failed, inline fallback: %s', e)
-                frame = None
+            except Exception:
+                # Alloc failed or dedicated — if result is memoryview into the
+                # request SHM block, materialize it, free the request block to
+                # reclaim space, and retry.
+                if isinstance(result_bytes, memoryview):
+                    result_bytes = bytes(result_bytes)
+                    result_len = len(result_bytes)
+                    total_wire = reply_wire_size(err_len, result_len)
+                self._free_deferred(rid_key)
+                freed_deferred = True
+                try:
+                    alloc = buddy_pool.alloc(total_wire)
+                    if alloc.is_dedicated:
+                        buddy_pool.free_at(
+                            alloc.seg_idx, alloc.offset, total_wire, True,
+                        )
+                        raise ValueError('dedicated segment, inline fallback')
+                    seg_mv = seg_views[alloc.seg_idx]
+                    shm_buf = seg_mv[alloc.offset : alloc.offset + total_wire]
+                    write_reply_into(shm_buf, 0, err_bytes, result_bytes)
+                    frame = encode_buddy_reply_frame(
+                        int_rid, alloc.seg_idx, alloc.offset,
+                        total_wire, alloc.is_dedicated,
+                    )
+                except Exception as e:
+                    logger.warning('Buddy alloc for reply failed, inline fallback: %s', e)
+                    frame = None
+
+        # Free the request block AFTER writing the response — result_bytes
+        # may be a memoryview into the request SHM block (zero-copy path).
+        if not freed_deferred:
+            self._free_deferred(rid_key)
 
         if frame is None:
             frame = encode_inline_reply_frame(int_rid, FLAG_RESPONSE, err_bytes, result_bytes)

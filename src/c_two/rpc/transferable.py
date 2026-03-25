@@ -149,6 +149,8 @@ def create_default_transferable(func, is_input: bool):
             filtered_params.append(name)
 
         # Fast path: single bytes parameter — skip pickle entirely.
+        # The deserializer returns the data as-is (including memoryview) to
+        # enable zero-copy reads when the transport provides memoryview.
         if _is_single_bytes_param(func, filtered_params, type_hints):
             class DynamicInputTransferable(Transferable):
                 __module__ = 'Default'
@@ -159,7 +161,7 @@ def create_default_transferable(func, is_input: bool):
                 def deserialize(data: memoryview | bytes):
                     if not data:
                         return None
-                    return bytes(data) if isinstance(data, memoryview) else data
+                    return data
 
         else:
             # Define the dynamic transferable class for input
@@ -240,8 +242,10 @@ def create_default_transferable(func, is_input: bool):
         return_type = type_hints.get('return')
 
         # Fast path: bytes return type — skip pickle entirely.
+        # The serializer passes memoryview through to enable zero-copy
+        # SHM→SHM writes in transports that support it (ipc-v3 buddy).
         if return_type is bytes:
-            serialize_func = staticmethod(lambda val: val if isinstance(val, bytes) else bytes(val) if isinstance(val, memoryview) else pickle.dumps(val))
+            serialize_func = staticmethod(lambda val: val if isinstance(val, (bytes, memoryview)) else pickle.dumps(val))
             deserialize_func = staticmethod(lambda data: bytes(data) if isinstance(data, memoryview) else data if isinstance(data, bytes) else pickle.loads(data) if data else None)
         else:
             serialize_func = staticmethod(_default_serialize_func)
