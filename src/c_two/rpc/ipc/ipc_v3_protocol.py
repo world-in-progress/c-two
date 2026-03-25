@@ -40,9 +40,15 @@ FLAG_BUDDY = 1 << 6   # Payload references a buddy-allocated SHM block
 #   - seg_idx:   buddy segment index (u16)
 #   - offset:    byte offset within the segment's data region (u32)
 #   - data_size: actual data size written (u32, not the allocation size)
-#   - flags:     bit 0 = is_dedicated
+#   - flags:     bit 0 = is_dedicated, bit 1 = reuse (zero-copy response in request block)
 BUDDY_PAYLOAD_STRUCT = struct.Struct('<HII B')
 BUDDY_PAYLOAD_SIZE = BUDDY_PAYLOAD_STRUCT.size   # 11 bytes
+
+# Zero-copy response reuse: when BUDDY_REUSE_FLAG is set, 8 extra bytes follow
+# the standard payload with the original allocation coordinates for freeing.
+BUDDY_REUSE_FLAG = 0x02
+BUDDY_REUSE_EXTRA = struct.Struct('<II')    # free_offset(4B) + free_size(4B)
+BUDDY_REUSE_EXTRA_SIZE = BUDDY_REUSE_EXTRA.size  # 8 bytes
 
 # ---------------------------------------------------------------------------
 # Handshake v4 (buddy pool)
@@ -69,15 +75,24 @@ def encode_buddy_payload(
     return BUDDY_PAYLOAD_STRUCT.pack(seg_idx, offset, data_size, flags)
 
 
-def decode_buddy_payload(payload: bytes | memoryview) -> tuple[int, int, int, bool]:
+def decode_buddy_payload(payload: bytes | memoryview) -> tuple[int, int, int, bool, int, int]:
     """Decode a FLAG_BUDDY payload header.
 
-    Returns (seg_idx, offset, data_size, is_dedicated).
+    Returns (seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size).
+    For normal frames free_offset == data_offset and free_size == data_size.
+    For reuse frames (BUDDY_REUSE_FLAG), free coordinates point to the original
+    allocation so the consumer can free the correct buddy block.
     """
     if len(payload) < BUDDY_PAYLOAD_SIZE:
         raise ValueError(f'Buddy payload too short: {len(payload)} < {BUDDY_PAYLOAD_SIZE}')
     seg_idx, offset, data_size, flags = BUDDY_PAYLOAD_STRUCT.unpack_from(payload, 0)
-    return seg_idx, offset, data_size, bool(flags & 1)
+    is_dedicated = bool(flags & 1)
+    if flags & BUDDY_REUSE_FLAG:
+        if len(payload) < BUDDY_PAYLOAD_SIZE + BUDDY_REUSE_EXTRA_SIZE:
+            raise ValueError('Buddy reuse payload too short')
+        free_offset, free_size = BUDDY_REUSE_EXTRA.unpack_from(payload, BUDDY_PAYLOAD_SIZE)
+        return seg_idx, offset, data_size, is_dedicated, free_offset, free_size
+    return seg_idx, offset, data_size, is_dedicated, offset, data_size
 
 
 def encode_buddy_call_frame(
@@ -105,6 +120,25 @@ def encode_buddy_reply_frame(
     """Encode a complete frame for a buddy-backed CRM_REPLY."""
     payload = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
     return encode_frame(request_id, FLAG_BUDDY | FLAG_RESPONSE, payload)
+
+
+def encode_buddy_reuse_reply_frame(
+    request_id: int,
+    seg_idx: int,
+    data_offset: int,
+    data_size: int,
+    free_offset: int,
+    free_size: int,
+) -> bytes:
+    """Encode a response that reuses the request's buddy block (zero-copy).
+
+    The data coordinates point to the CRM_REPLY header written in-place.
+    The free coordinates point to the original allocation for buddy freeing.
+    """
+    flags = BUDDY_REUSE_FLAG
+    buddy = BUDDY_PAYLOAD_STRUCT.pack(seg_idx, data_offset, data_size, flags)
+    extra = BUDDY_REUSE_EXTRA.pack(free_offset, free_size)
+    return encode_frame(request_id, FLAG_BUDDY | FLAG_RESPONSE, buddy + extra)
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ from .ipc_v3_protocol import (
     encode_buddy_handshake,
     decode_buddy_handshake,
     encode_buddy_reply_frame,
+    encode_buddy_reuse_reply_frame,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,7 +172,7 @@ class IPCv3Server(BaseServer):
         with self._deferred_frees_lock:
             info = self._deferred_frees.pop(str_rid, None)
         if info is not None:
-            pool, seg_idx, offset, size, is_dedicated = info
+            pool, seg_idx, offset, size, is_dedicated = info[:5]
             try:
                 pool.free_at(seg_idx, offset, size, is_dedicated)
             except Exception:
@@ -241,7 +242,43 @@ class IPCv3Server(BaseServer):
             buddy_pool = conn.buddy_pool if conn is not None and conn.handshake_done else None
             seg_views = conn.seg_views if conn is not None else []
 
-        # Buddy alloc + SHM write outside conn_lock (only Rust mutex needed).
+        # ---- Zero-copy reuse path ----
+        # When the CRM returns the exact input memoryview (echo pattern), skip
+        # allocation and copy entirely: overwrite the CRM_CALL header in-place
+        # with a CRM_REPLY header and point the response to the request block.
+        if (isinstance(result_bytes, memoryview) and err_len == 0
+                and buddy_pool is not None
+                and total_wire > self._config.shm_threshold):
+            with self._deferred_frees_lock:
+                info = self._deferred_frees.get(rid_key)
+            if info is not None and len(info) >= 8 and info[5] is not None:
+                (_pool, req_seg_idx, block_offset, alloc_size,
+                 _ded, payload_offset, payload_len, seg_obj) = info
+                if (len(result_bytes) == payload_len
+                        and req_seg_idx < len(seg_views)
+                        and result_bytes.obj is seg_obj):
+                    reply_start = payload_offset - REPLY_HEADER_FIXED
+                    if reply_start >= block_offset:
+                        seg_mv = seg_views[req_seg_idx]
+                        seg_mv[reply_start] = MsgType.CRM_REPLY
+                        struct.pack_into('<I', seg_mv, reply_start + 1, 0)
+                        reply_data_size = REPLY_HEADER_FIXED + payload_len
+                        frame = encode_buddy_reuse_reply_frame(
+                            int_rid, req_seg_idx, reply_start, reply_data_size,
+                            block_offset, alloc_size,
+                        )
+                        with self._deferred_frees_lock:
+                            self._deferred_frees.pop(rid_key, None)
+                        loop = self._loop
+                        if loop is not None:
+                            try:
+                                loop.call_soon_threadsafe(
+                                    self._resolve_future, fut, frame)
+                            except RuntimeError:
+                                pass
+                        return
+
+        # ---- Regular buddy alloc + copy path ----
         frame: bytes | None = None
         freed_deferred = False
         if buddy_pool is not None and total_wire > self._config.shm_threshold:
@@ -470,7 +507,7 @@ class IPCv3Server(BaseServer):
                 for k in deferred_keys:
                     info = self._deferred_frees.pop(k, None)
                     if info:
-                        pool, si, off, sz, ded = info
+                        pool, si, off, sz, ded = info[:5]
                         try:
                             pool.free_at(si, off, sz, ded)
                         except Exception:
@@ -491,7 +528,7 @@ class IPCv3Server(BaseServer):
         the block free until reply() — this avoids a full memcpy per request.
         """
         if flags & FLAG_BUDDY:
-            seg_idx, offset, data_size, is_dedicated = decode_buddy_payload(payload)
+            seg_idx, offset, data_size, is_dedicated, _, _ = decode_buddy_payload(payload)
             # Snapshot references under lock to protect against destroy() race.
             with self._conn_lock:
                 if conn.buddy_pool is None:
@@ -518,11 +555,25 @@ class IPCv3Server(BaseServer):
                 return None
             # Zero-copy: return memoryview into SHM, defer free until reply().
             if str_rid is not None:
+                wire_mv = seg_mv[offset : offset + data_size]
+                # Peek at CRM_CALL header to record payload position for
+                # zero-copy response reuse in reply().
+                payload_offset = None
+                payload_len = 0
+                seg_obj = None
+                if data_size >= 3 and wire_mv[0] == MsgType.CRM_CALL:
+                    method_len = struct.unpack_from('<H', wire_mv, 1)[0]
+                    hdr_end = 3 + method_len
+                    if data_size > hdr_end:
+                        payload_offset = offset + hdr_end
+                        payload_len = data_size - hdr_end
+                        seg_obj = seg_mv.obj
                 with self._deferred_frees_lock:
                     self._deferred_frees[str_rid] = (
                         buddy_pool, seg_idx, offset, data_size, is_dedicated,
+                        payload_offset, payload_len, seg_obj,
                     )
-                return seg_mv[offset : offset + data_size]
+                return wire_mv
             # Fallback: copy if no rid (shouldn't happen in normal flow).
             wire_bytes = bytes(seg_mv[offset : offset + data_size])
             try:

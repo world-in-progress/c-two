@@ -14,10 +14,12 @@ from c_two.rpc.ipc.ipc_v3_protocol import (
     decode_buddy_payload,
     encode_buddy_call_frame,
     encode_buddy_reply_frame,
+    encode_buddy_reuse_reply_frame,
     encode_ctrl_buddy_announce,
     decode_ctrl_buddy_announce,
     FLAG_BUDDY,
     BUDDY_PAYLOAD_SIZE,
+    BUDDY_REUSE_FLAG,
     HANDSHAKE_VERSION,
 )
 from tests.fixtures.hello import Hello
@@ -57,23 +59,45 @@ def _wait_for_shutdown(address: str, timeout: float = 5.0) -> None:
 class TestBuddyProtocol:
     def test_buddy_payload_roundtrip(self):
         encoded = encode_buddy_payload(3, 65536, 32768, False)
-        seg_idx, offset, data_size, is_ded = decode_buddy_payload(encoded)
+        seg_idx, offset, data_size, is_ded, free_off, free_sz = decode_buddy_payload(encoded)
         assert seg_idx == 3
         assert offset == 65536
         assert data_size == 32768
         assert is_ded is False
+        assert free_off == offset
+        assert free_sz == data_size
 
     def test_buddy_payload_dedicated(self):
         encoded = encode_buddy_payload(256, 0, 1048576, True)
-        seg_idx, offset, data_size, is_ded = decode_buddy_payload(encoded)
+        seg_idx, offset, data_size, is_ded, free_off, free_sz = decode_buddy_payload(encoded)
         assert seg_idx == 256
         assert offset == 0
         assert data_size == 1048576
         assert is_ded is True
+        assert free_off == offset
+        assert free_sz == data_size
 
     def test_buddy_payload_too_short(self):
         with pytest.raises(ValueError, match='too short'):
             decode_buddy_payload(b'\x00' * 5)
+
+    def test_buddy_reuse_payload_roundtrip(self):
+        """Test the extended reuse payload format with separate free coordinates."""
+        import struct
+        from c_two.rpc.ipc.ipc_v3_protocol import (
+            BUDDY_PAYLOAD_STRUCT, BUDDY_REUSE_EXTRA,
+        )
+        # Build a reuse payload manually.
+        flags = BUDDY_REUSE_FLAG
+        payload = BUDDY_PAYLOAD_STRUCT.pack(0, 1024, 500, flags)
+        payload += BUDDY_REUSE_EXTRA.pack(1000, 600)
+        seg_idx, data_off, data_sz, is_ded, free_off, free_sz = decode_buddy_payload(payload)
+        assert seg_idx == 0
+        assert data_off == 1024
+        assert data_sz == 500
+        assert is_ded is False
+        assert free_off == 1000
+        assert free_sz == 600
 
     def test_handshake_roundtrip(self):
         segments = [('/cc3b_test1', 268435456), ('/cc3b_test2', 134217728)]

@@ -306,21 +306,21 @@ class IPCv3Client(BaseClient):
             payload = self._recv_exact(payload_len) if payload_len > 0 else b''
 
             if flags & FLAG_BUDDY:
-                seg_idx, offset, data_size, is_dedicated = decode_buddy_payload(payload)
+                seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
                 if self._buddy_pool is None:
                     raise error.CompoClientError('Buddy response but no pool')
                 # Read directly from cached memoryview (no FFI for data copy).
                 if seg_idx >= len(self._seg_views):
                     raise error.CompoClientError(f'Invalid seg_idx {seg_idx} from server (max {len(self._seg_views)-1})')
                 seg_mv = self._seg_views[seg_idx]
-                if offset + data_size > len(seg_mv):
-                    raise error.CompoClientError(f'Server response out of bounds: offset={offset} size={data_size} seg_len={len(seg_mv)}')
-                data = bytes(seg_mv[offset : offset + data_size])
-                # Consumer frees response blocks.
+                if data_offset + data_size > len(seg_mv):
+                    raise error.CompoClientError(f'Server response out of bounds: offset={data_offset} size={data_size} seg_len={len(seg_mv)}')
+                data = bytes(seg_mv[data_offset : data_offset + data_size])
+                # Consumer frees the block (free coords may differ for reuse frames).
                 try:
-                    self._buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
+                    self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
                 except Exception:
-                    logger.warning('Failed to free buddy block seg=%d off=%d size=%d', seg_idx, offset, data_size, exc_info=True)
+                    logger.warning('Failed to free buddy block seg=%d off=%d size=%d', seg_idx, free_offset, free_size, exc_info=True)
                 return data
             else:
                 # Skip PONG frames (heartbeat responses).
