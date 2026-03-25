@@ -103,10 +103,6 @@ class IPCv3Client(BaseClient):
         self._response_buf: bytearray | None = None
         self._response_buf_addr: int = 0
 
-        # Deferred free: for zero-copy SHM responses, the buddy block is kept
-        # alive until the next call so the caller can read directly from SHM.
-        self._deferred_response_free: tuple | None = None
-
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -326,7 +322,6 @@ class IPCv3Client(BaseClient):
         wire_size = len(event_bytes)
 
         with self._conn_lock:
-            self._flush_deferred_response_free()
             sock = self._ensure_connection()
             request_id = self._next_rid
             self._next_rid += 1
@@ -373,7 +368,6 @@ class IPCv3Client(BaseClient):
 
     def terminate(self) -> None:
         with self._conn_lock:
-            self._flush_deferred_response_free()
             self._close_connection()
 
     # ------------------------------------------------------------------
