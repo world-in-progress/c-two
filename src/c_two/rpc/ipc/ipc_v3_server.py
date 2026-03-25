@@ -61,6 +61,12 @@ logger = logging.getLogger(__name__)
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
+# Pre-built mapping for signal-type replies (avoids dict creation per call).
+_SIGNAL_TAGS = {
+    EventTag.PONG: PONG_BYTES,
+    EventTag.SHUTDOWN_ACK: SHUTDOWN_ACK_BYTES,
+}
+
 
 def _resolve_socket_path(region_id: str) -> str:
     sock_dir = Path(_IPC_SOCK_DIR)
@@ -164,6 +170,11 @@ class IPCv3Server(BaseServer):
         if fut is None:
             return
 
+        # Parse composite key once: "conn_id:request_id"
+        sep = rid_key.rfind(':')
+        conn_id = int(rid_key[:sep])
+        int_rid = int(rid_key[sep + 1:])
+
         # Extract error and result bytes from the scheduler Event.
         has_parts = event.data_parts is not None and event.data is None
         if has_parts:
@@ -177,13 +188,8 @@ class IPCv3Server(BaseServer):
             result_bytes = parts[1] if len(parts) > 1 else b''
 
         # Signal-type replies (PONG, SHUTDOWN_ACK).
-        _signal_tags = {
-            EventTag.PONG: PONG_BYTES,
-            EventTag.SHUTDOWN_ACK: SHUTDOWN_ACK_BYTES,
-        }
-        signal_payload = _signal_tags.get(event.tag)
+        signal_payload = _SIGNAL_TAGS.get(event.tag)
         if signal_payload is not None:
-            int_rid = int(rid_key.rsplit(':', 1)[1])
             frame = encode_frame(int_rid, FLAG_RESPONSE, signal_payload)
             loop = self._loop
             if loop is not None:
@@ -196,10 +202,8 @@ class IPCv3Server(BaseServer):
         err_len = len(err_bytes)
         result_len = len(result_bytes)
         total_wire = reply_wire_size(err_len, result_len)
-        int_rid = int(rid_key.rsplit(':', 1)[1])
 
         # Try buddy pool for large responses.
-        conn_id = int(rid_key.rsplit(':', 1)[0])
         frame: bytes | None = None
 
         with self._conn_lock:
