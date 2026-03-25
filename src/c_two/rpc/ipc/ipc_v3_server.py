@@ -12,6 +12,7 @@ Ownership model (consumer frees):
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import os
 import struct
@@ -207,10 +208,11 @@ class IPCv3Server(BaseServer):
 
         if buddy_pool is not None and total_wire > self._config.shm_threshold:
             try:
-                alloc = buddy_pool.alloc(total_wire)
-                wire_buf = bytearray(total_wire)
-                write_reply_into(wire_buf, 0, err_bytes, result_bytes)
-                buddy_pool.write(alloc, bytes(wire_buf))
+                alloc, addr = buddy_pool.alloc_ptr(total_wire)
+                shm_buf = memoryview(
+                    (ctypes.c_char * total_wire).from_address(addr)
+                ).cast('B')
+                write_reply_into(shm_buf, 0, err_bytes, result_bytes)
                 frame = encode_buddy_reply_frame(
                     int_rid, alloc.seg_idx, alloc.offset,
                     total_wire, alloc.is_dedicated,
@@ -398,8 +400,13 @@ class IPCv3Server(BaseServer):
             if conn.buddy_pool is None:
                 logger.warning('Conn %d: buddy frame before handshake', conn.conn_id)
                 return None
-            # Read data from SHM (1 copy into Python bytes).
-            wire_bytes = conn.buddy_pool.read_at(seg_idx, offset, data_size, is_dedicated)
+            # Zero-copy read: create memoryview over SHM then copy to bytes.
+            addr = conn.buddy_pool.data_addr(seg_idx, offset, is_dedicated)
+            wire_bytes = bytes(
+                memoryview(
+                    (ctypes.c_char * data_size).from_address(addr)
+                ).cast('B')
+            )
             # Consumer frees: server frees request blocks after reading.
             try:
                 conn.buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)

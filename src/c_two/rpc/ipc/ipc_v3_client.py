@@ -10,6 +10,7 @@ Ownership model (consumer frees):
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import socket as _socket
@@ -178,10 +179,11 @@ class IPCv3Client(BaseClient):
                     )
                     sock.sendall(frame)
                 else:
-                    alloc = self._buddy_pool.alloc(wire_size)
-                    wire_buf = bytearray(wire_size)
-                    write_call_into(wire_buf, 0, method_name, args)
-                    self._buddy_pool.write(alloc, bytes(wire_buf))
+                    alloc, addr = self._buddy_pool.alloc_ptr(wire_size)
+                    shm_buf = memoryview(
+                        (ctypes.c_char * wire_size).from_address(addr)
+                    ).cast('B')
+                    write_call_into(shm_buf, 0, method_name, args)
 
                     frame = encode_buddy_call_frame(
                         request_id, alloc.seg_idx, alloc.offset,
@@ -223,8 +225,11 @@ class IPCv3Client(BaseClient):
                     frame = encode_frame(request_id, 0, event_bytes)
                     sock.sendall(frame)
                 else:
-                    alloc = self._buddy_pool.alloc(wire_size)
-                    self._buddy_pool.write(alloc, event_bytes)
+                    alloc, addr = self._buddy_pool.alloc_ptr(wire_size)
+                    shm_buf = memoryview(
+                        (ctypes.c_char * wire_size).from_address(addr)
+                    ).cast('B')
+                    shm_buf[:wire_size] = event_bytes
                     frame = encode_buddy_call_frame(
                         request_id, alloc.seg_idx, alloc.offset,
                         wire_size, alloc.is_dedicated,
@@ -264,8 +269,14 @@ class IPCv3Client(BaseClient):
                 seg_idx, offset, data_size, is_dedicated = decode_buddy_payload(payload)
                 if self._buddy_pool is None:
                     raise error.CompoClientError('Buddy response but no pool')
-                # Consumer reads and frees (client frees response blocks).
-                data = self._buddy_pool.read_at(seg_idx, offset, data_size, is_dedicated)
+                # Zero-copy read: memoryview over SHM → copy to bytes.
+                addr = self._buddy_pool.data_addr(seg_idx, offset, is_dedicated)
+                data = bytes(
+                    memoryview(
+                        (ctypes.c_char * data_size).from_address(addr)
+                    ).cast('B')
+                )
+                # Consumer frees response blocks.
                 try:
                     self._buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
                 except Exception:

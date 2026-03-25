@@ -174,6 +174,34 @@ impl PyBuddyPoolHandle {
         })
     }
 
+    /// Allocate `size` bytes and return (PoolAlloc, raw_address).
+    ///
+    /// The raw_address is a usize pointer into SHM that Python can use with
+    /// ctypes.memmove or (ctypes.c_char * size).from_address(addr) to write
+    /// directly into the SHM block — zero intermediate copies.
+    fn alloc_ptr(&self, size: usize) -> PyResult<(PyPoolAlloc, usize)> {
+        let mut pool = self.pool.lock().map_err(|e| {
+            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
+        })?;
+        let alloc = pool.alloc(size)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        let ptr = pool.data_ptr(&alloc)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok((PyPoolAlloc::from(alloc), ptr as usize))
+    }
+
+    /// Get the raw address for a (seg_idx, offset) pair — for remote reading.
+    ///
+    /// Returns the usize pointer that Python can pass to ctypes.memmove.
+    fn data_addr(&self, seg_idx: u16, offset: u32, is_dedicated: bool) -> PyResult<usize> {
+        let pool = self.pool.lock().map_err(|e| {
+            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
+        })?;
+        let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok(ptr as usize)
+    }
+
     /// Allocate `size` bytes from the pool.
     /// Returns a PoolAlloc with segment index, offset, actual size, level, and dedicated flag.
     fn alloc(&self, size: usize) -> PyResult<PyPoolAlloc> {
