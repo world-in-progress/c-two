@@ -45,7 +45,8 @@ impl ShmSpinlock {
     /// Try to acquire the lock within a spin budget. Returns true on success.
     #[inline]
     pub fn try_lock_spins(&self, max_total_spins: u32) -> bool {
-        let mut spins = 0u32;
+        let mut total = 0u32;
+        let mut phase = 0u32;
         loop {
             if self
                 .atomic()
@@ -54,16 +55,17 @@ impl ShmSpinlock {
             {
                 return true;
             }
-            spins += 1;
-            if spins >= max_total_spins {
+            total += 1;
+            if total >= max_total_spins {
                 return false;
             }
-            if spins < 16 {
+            phase += 1;
+            if phase < 16 {
                 std::hint::spin_loop();
-            } else if spins < MAX_SPINS {
+            } else if phase < MAX_SPINS {
                 std::thread::yield_now();
             } else {
-                spins = spins.wrapping_sub(MAX_SPINS);
+                phase = 0;
                 std::thread::yield_now();
             }
         }

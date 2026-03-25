@@ -66,8 +66,8 @@ pub struct Allocation {
 pub struct BuddyAllocator {
     /// Pointer to the beginning of the SHM mapping.
     base: *mut u8,
-    /// Total SHM size.
-    total_size: usize,
+    /// Total SHM size (retained for future stats/diagnostics).
+    _total_size: usize,
     /// Offset where data region begins.
     data_offset: usize,
     /// Size of the data region (power of two).
@@ -99,7 +99,9 @@ impl BuddyAllocator {
         let data_size = Self::round_down_pow2(total_size - data_offset);
 
         // Write header.
-        let header = &mut *(base as *mut SegmentHeader);
+        // SAFETY: caller guarantees `base` is a valid, writable SHM pointer
+        // with at least `total_size` bytes, aligned for SegmentHeader.
+        let header = unsafe { &mut *(base as *mut SegmentHeader) };
         header.magic = SEGMENT_MAGIC;
         header.version = SEGMENT_VERSION;
         header.total_size = total_size as u64;
@@ -112,32 +114,22 @@ impl BuddyAllocator {
         header.free_bytes = AtomicU64::new(data_size as u64);
 
         // Initialize spinlock.
-        let lock = ShmSpinlock::new(
-            base.add(std::mem::offset_of!(SegmentHeader, spinlock)),
-        );
+        // SAFETY: spinlock offset is within the header region.
+        let lock = unsafe {
+            ShmSpinlock::new(
+                base.add(std::mem::offset_of!(SegmentHeader, spinlock)),
+            )
+        };
         lock.init();
 
-        // Initialize bitmaps.
+        // Initialize bitmaps — SHM is zero-filled by ftruncate, so all bits
+        // start as "used" (0). Only level-0 needs one block marked free.
         let bitmaps = Self::create_bitmaps(base, data_size, min_block, levels);
-        for bm in &bitmaps {
-            // Only level 0 (the whole data region as one block) starts free.
-            // Other levels start all-used; they become free via splitting.
-        }
-        // Mark all bits used first.
-        for bm in &bitmaps {
-            // Initialize all as used (0).
-            for i in 0..bm.word_count() {
-                let word_ptr = base.add(Self::bitmap_data_offset())
-                    as *mut std::sync::atomic::AtomicU64;
-                // Already zeroed by SHM (ftruncate fills with zeros).
-            }
-        }
-        // Only the top level (level 0) has one free block.
         bitmaps[0].free_one(0);
 
         Self {
             base,
-            total_size,
+            _total_size: total_size,
             data_offset,
             data_size,
             min_block,
@@ -152,7 +144,8 @@ impl BuddyAllocator {
     /// # Safety
     /// `base` must point to a valid SHM region with a properly initialized header.
     pub unsafe fn attach(base: *mut u8, total_size: usize) -> Result<Self, &'static str> {
-        let header = &*(base as *const SegmentHeader);
+        // SAFETY: caller guarantees `base` is a valid, initialized SHM pointer.
+        let header = unsafe { &*(base as *const SegmentHeader) };
         if header.magic != SEGMENT_MAGIC {
             return Err("invalid segment magic");
         }
@@ -165,14 +158,17 @@ impl BuddyAllocator {
         let levels = header.max_levels as usize;
         let data_size = Self::round_down_pow2(total_size - data_offset);
 
-        let lock = ShmSpinlock::new(
-            base.add(std::mem::offset_of!(SegmentHeader, spinlock)),
-        );
+        // SAFETY: spinlock offset is within the validated header region.
+        let lock = unsafe {
+            ShmSpinlock::new(
+                base.add(std::mem::offset_of!(SegmentHeader, spinlock)),
+            )
+        };
         let bitmaps = Self::create_bitmaps(base, data_size, min_block, levels);
 
         Ok(Self {
             base,
-            total_size,
+            _total_size: total_size,
             data_offset,
             data_size,
             min_block,
@@ -445,7 +441,6 @@ mod tests {
     #[test]
     fn test_buddy_merge() {
         let (alloc, _buf) = make_allocator(128 * 1024, 4096); // 128KB, data ~64KB
-        let data_size = alloc.data_size();
         let initial_free = alloc.free_bytes();
 
         // Allocate two min-blocks that should be buddies.

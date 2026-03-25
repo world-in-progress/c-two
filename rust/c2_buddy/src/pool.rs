@@ -7,7 +7,6 @@
 //!   2. Create new segment (up to max_segments)
 //!   3. Fall back to dedicated segment
 
-use crate::allocator::Allocation;
 use crate::segment::{DedicatedSegment, ShmSegment};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -421,13 +420,6 @@ impl Drop for BuddyPool {
     fn drop(&mut self) {
         self.destroy();
     }
-}
-
-fn round_down_pow2(n: usize) -> usize {
-    if n == 0 {
-        return 0;
-    }
-    1 << (usize::BITS - 1 - n.leading_zeros())
 }
 
 #[cfg(test)]
