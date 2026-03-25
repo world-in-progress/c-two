@@ -78,6 +78,9 @@ impl ShmSpinlock {
     }
 
     /// Execute a closure while holding the lock.
+    ///
+    /// Uses an RAII guard so the lock is released even if `f` panics,
+    /// preventing permanent deadlock across all processes sharing the SHM.
     #[inline]
     pub fn with_lock<F, R>(&self, f: F) -> R
     where
