@@ -371,6 +371,22 @@ impl BuddyAllocator {
         data_offset
     }
 
+    /// Compute the minimum total SHM size needed so that the usable data region
+    /// is at least `min_data_capacity` bytes (after buddy power-of-2 rounding).
+    ///
+    /// Use this to avoid the 50% waste when `segment_size` is an exact power of
+    /// two (e.g. 1 GB) — the header pushes the data region below the next
+    /// power-of-two boundary.
+    pub fn required_shm_size(min_data_capacity: usize, min_block: usize) -> usize {
+        // Target data_size is the smallest power-of-2 >= min_data_capacity.
+        let data_size = min_data_capacity.next_power_of_two();
+        let bitmap_bytes =
+            crate::bitmap::total_bitmap_bytes(data_size, min_block);
+        let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
+        let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
+        data_offset + data_size
+    }
+
     fn count_levels(data_size: usize, min_block: usize) -> usize {
         crate::bitmap::num_levels(data_size, min_block)
     }

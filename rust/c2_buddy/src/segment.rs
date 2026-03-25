@@ -25,7 +25,12 @@ unsafe impl Sync for ShmSegment {}
 
 impl ShmSegment {
     /// Create a new SHM segment and initialize its buddy allocator.
+    ///
+    /// `size` is the *desired minimum data capacity*. The actual SHM will be
+    /// slightly larger to accommodate the header + bitmaps so the usable data
+    /// region is at least `size` bytes (after buddy power-of-2 rounding).
     pub fn create(name: &str, size: usize, min_block: usize) -> Result<Self, String> {
+        let actual_size = BuddyAllocator::required_shm_size(size, min_block);
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
 
         unsafe {
@@ -44,7 +49,7 @@ impl ShmSegment {
                 ));
             }
 
-            if libc::ftruncate(fd, size as libc::off_t) < 0 {
+            if libc::ftruncate(fd, actual_size as libc::off_t) < 0 {
                 let err = std::io::Error::last_os_error();
                 libc::close(fd);
                 libc::shm_unlink(c_name.as_ptr());
@@ -53,7 +58,7 @@ impl ShmSegment {
 
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
-                size,
+                actual_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd,
@@ -70,12 +75,12 @@ impl ShmSegment {
             }
 
             let base = ptr as *mut u8;
-            let allocator = BuddyAllocator::init(base, size, min_block);
+            let allocator = BuddyAllocator::init(base, actual_size, min_block);
 
             Ok(Self {
                 name: name.to_string(),
                 base,
-                size,
+                size: actual_size,
                 allocator,
                 is_owner: true,
             })

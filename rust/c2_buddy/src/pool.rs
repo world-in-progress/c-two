@@ -303,12 +303,9 @@ impl BuddyPool {
 
     fn max_buddy_block_size(&self) -> usize {
         if self.segments.is_empty() && self.segments.len() < self.config.max_segments {
-            // If we can still create segments, max block = segment data size.
-            // Estimate: segment_size minus header overhead.
-            let overhead = 8192; // Conservative: 4KB header + bitmap.
-            if self.config.segment_size > overhead {
-                return round_down_pow2(self.config.segment_size - overhead);
-            }
+            // ShmSegment::create auto-inflates so data region >= segment_size.
+            // The data region is segment_size.next_power_of_two().
+            return self.config.segment_size.next_power_of_two();
         }
         // Return the data size of existing segments.
         self.segments
@@ -480,7 +477,16 @@ mod tests {
 
     #[test]
     fn test_segment_expansion() {
-        let mut pool = test_pool(small_config());
+        // With auto-inflation, segment_size=64KB gives 64KB usable data.
+        // Use a smaller segment so two 32KB allocs trigger expansion.
+        let config = PoolConfig {
+            segment_size: 32 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 2,
+            dedicated_gc_delay_secs: 0.0,
+        };
+        let mut pool = test_pool(config);
         let a = pool.alloc(32 * 1024).unwrap();
         assert_eq!(pool.segment_count(), 1);
 

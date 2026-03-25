@@ -180,12 +180,22 @@ class IPCv3Client(BaseClient):
                     sock.sendall(frame)
                 else:
                     alloc, addr = self._buddy_pool.alloc_ptr(wire_size)
-                    shm_buf = memoryview(
-                        (ctypes.c_char * wire_size).from_address(addr)
-                    ).cast('B')
-                    write_call_into(shm_buf, 0, method_name, args)
+                    if alloc.is_dedicated:
+                        # Dedicated segments are process-local; server can't read.
+                        self._buddy_pool.free_at(
+                            alloc.seg_idx, alloc.offset, wire_size, True,
+                        )
+                        frame = encode_inline_call_frame(
+                            request_id, method_name, args, get_call_header_cache(),
+                        )
+                        sock.sendall(frame)
+                    else:
+                        shm_buf = memoryview(
+                            (ctypes.c_char * wire_size).from_address(addr)
+                        ).cast('B')
+                        write_call_into(shm_buf, 0, method_name, args)
 
-                    frame = encode_buddy_call_frame(
+                        frame = encode_buddy_call_frame(
                         request_id, alloc.seg_idx, alloc.offset,
                         wire_size, alloc.is_dedicated,
                     )
@@ -226,15 +236,22 @@ class IPCv3Client(BaseClient):
                     sock.sendall(frame)
                 else:
                     alloc, addr = self._buddy_pool.alloc_ptr(wire_size)
-                    shm_buf = memoryview(
-                        (ctypes.c_char * wire_size).from_address(addr)
-                    ).cast('B')
-                    shm_buf[:wire_size] = event_bytes
-                    frame = encode_buddy_call_frame(
-                        request_id, alloc.seg_idx, alloc.offset,
-                        wire_size, alloc.is_dedicated,
-                    )
-                    sock.sendall(frame)
+                    if alloc.is_dedicated:
+                        self._buddy_pool.free_at(
+                            alloc.seg_idx, alloc.offset, wire_size, True,
+                        )
+                        frame = encode_frame(request_id, 0, event_bytes)
+                        sock.sendall(frame)
+                    else:
+                        shm_buf = memoryview(
+                            (ctypes.c_char * wire_size).from_address(addr)
+                        ).cast('B')
+                        shm_buf[:wire_size] = event_bytes
+                        frame = encode_buddy_call_frame(
+                            request_id, alloc.seg_idx, alloc.offset,
+                            wire_size, alloc.is_dedicated,
+                        )
+                        sock.sendall(frame)
 
                 response_bytes = self._recv_response()
             except error.CCBaseError:

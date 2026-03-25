@@ -209,6 +209,12 @@ class IPCv3Server(BaseServer):
         if buddy_pool is not None and total_wire > self._config.shm_threshold:
             try:
                 alloc, addr = buddy_pool.alloc_ptr(total_wire)
+                if alloc.is_dedicated:
+                    # Dedicated segments are process-local; remote can't read.
+                    buddy_pool.free_at(
+                        alloc.seg_idx, alloc.offset, total_wire, True,
+                    )
+                    raise ValueError('dedicated segment, inline fallback')
                 shm_buf = memoryview(
                     (ctypes.c_char * total_wire).from_address(addr)
                 ).cast('B')
