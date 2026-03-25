@@ -34,18 +34,16 @@ impl ShmSegment {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
 
         unsafe {
-            // TOCTOU note: There is a small window between shm_unlink and
-            // shm_open(O_CREAT|O_EXCL) where another process could race to
-            // create a segment with the same name. PID-based naming (the
-            // name_prefix includes the creator's PID) mitigates this in
-            // practice, but it is not a guarantee under PID reuse.
-
             // Clean up stale segment if it exists.
             libc::shm_unlink(c_name.as_ptr());
 
+            // Use O_CREAT | O_RDWR without O_EXCL to avoid TOCTOU race:
+            // if another process creates the same name between unlink and open,
+            // we just open it rather than failing. init() will overwrite the
+            // header regardless.
             let fd = libc::shm_open(
                 c_name.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                libc::O_CREAT | libc::O_RDWR,
                 0o600,
             );
             if fd < 0 {
@@ -234,11 +232,13 @@ impl DedicatedSegment {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
 
         unsafe {
+            // Clean up stale segment if it exists.
             libc::shm_unlink(c_name.as_ptr());
 
+            // Use O_CREAT | O_RDWR without O_EXCL to avoid TOCTOU race.
             let fd = libc::shm_open(
                 c_name.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                libc::O_CREAT | libc::O_RDWR,
                 0o600,
             );
             if fd < 0 {
