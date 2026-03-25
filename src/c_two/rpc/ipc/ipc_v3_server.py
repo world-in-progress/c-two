@@ -354,7 +354,9 @@ class IPCv3Server(BaseServer):
                     break
 
                 writer.write(response_frame)
-                await writer.drain()
+                # Skip drain for small buddy frames — UDS kernel buffer handles them.
+                if len(response_frame) > 65536:
+                    await writer.drain()
 
         except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError,
                 asyncio.IncompleteReadError, OSError):
