@@ -159,7 +159,7 @@ def create_default_transferable(func, is_input: bool):
                     return data if isinstance(data, (bytes, memoryview)) else pickle.dumps(data)
 
                 def deserialize(data: memoryview | bytes):
-                    if not data:
+                    if data is None:
                         return None
                     return data
 
@@ -246,7 +246,7 @@ def create_default_transferable(func, is_input: bool):
         # SHM→SHM writes in transports that support it (ipc-v3 buddy).
         if return_type is bytes:
             serialize_func = staticmethod(lambda val: val if isinstance(val, (bytes, memoryview)) else pickle.dumps(val))
-            deserialize_func = staticmethod(lambda data: data if isinstance(data, (bytes, memoryview)) else pickle.loads(data) if data else None)
+            deserialize_func = staticmethod(lambda data: data if isinstance(data, (bytes, memoryview)) else pickle.loads(data) if data is not None else None)
         else:
             serialize_func = staticmethod(_default_serialize_func)
             deserialize_func = staticmethod(_default_deserialize_func)
