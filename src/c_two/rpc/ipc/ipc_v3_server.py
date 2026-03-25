@@ -309,10 +309,17 @@ class IPCv3Server(BaseServer):
             self._connections[conn_id] = conn
 
         try:
+            max_frame = self._config.max_frame_size
             while True:
-                request_id, flags, payload = await _read_frame(
-                    reader, self._config.max_frame_size,
-                )
+                # Inline frame read (avoids coroutine creation overhead).
+                header = await reader.readexactly(16)
+                total_len, request_id, flags = FRAME_STRUCT.unpack(header)
+                if total_len < 12:
+                    raise error.EventDeserializeError(f'Frame too small: {total_len}')
+                if total_len > max_frame:
+                    raise error.EventDeserializeError(f'Frame too large: {total_len}')
+                payload_len = total_len - 12
+                payload = await reader.readexactly(payload_len) if payload_len > 0 else b''
 
                 # Dispatch by flag.
                 if flags & (1 << 2):  # FLAG_HANDSHAKE
