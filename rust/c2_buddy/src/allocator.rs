@@ -388,7 +388,14 @@ impl BuddyAllocator {
     /// Convert a (level, block_index) to a byte offset in the data region.
     fn block_to_offset(&self, level: usize, block_idx: usize) -> u32 {
         let block_size = self.level_block_size(level);
-        (block_idx * block_size) as u32
+        let offset = block_idx * block_size;
+        // R-I3: Guard against u32 truncation on the computed offset.
+        debug_assert!(
+            offset <= u32::MAX as usize,
+            "block offset {} exceeds u32::MAX",
+            offset
+        );
+        offset as u32
     }
 
     /// Get the block size at a given level.
