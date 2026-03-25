@@ -156,7 +156,9 @@ def create_default_transferable(func, is_input: bool):
                 __module__ = 'Default'
 
                 def serialize(data) -> bytes:
-                    return data if isinstance(data, (bytes, memoryview)) else pickle.dumps(data)
+                    if isinstance(data, (bytes, memoryview)):
+                        return data
+                    raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(data).__name__}")
 
                 def deserialize(data: memoryview | bytes):
                     if data is None:
@@ -245,7 +247,11 @@ def create_default_transferable(func, is_input: bool):
         # The serializer passes memoryview through to enable zero-copy
         # SHM→SHM writes in transports that support it (ipc-v3 buddy).
         if return_type is bytes:
-            serialize_func = staticmethod(lambda val: val if isinstance(val, (bytes, memoryview)) else pickle.dumps(val))
+            def _bytes_output_serialize(val):
+                if isinstance(val, (bytes, memoryview)):
+                    return val
+                raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(val).__name__}")
+            serialize_func = staticmethod(_bytes_output_serialize)
             deserialize_func = staticmethod(lambda data: data if isinstance(data, (bytes, memoryview)) else pickle.loads(data) if data is not None else None)
         else:
             serialize_func = staticmethod(_default_serialize_func)
