@@ -15,6 +15,7 @@ import asyncio
 import ctypes
 import logging
 import os
+import re
 import struct
 import threading
 import time
@@ -60,6 +61,9 @@ from .ipc_v3_protocol import (
 logger = logging.getLogger(__name__)
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
+
+# Segment name validation: alphanumeric, underscore, dash, dot; optional leading slash.
+_SHM_NAME_RE = re.compile(r'^/?[A-Za-z0-9_.\-]{1,255}$')
 
 # Pre-built mapping for signal-type replies (avoids dict creation per call).
 _SIGNAL_TAGS = {
@@ -131,6 +135,8 @@ class IPCv3Server(BaseServer):
             os.unlink(self._socket_path)
         except OSError:
             pass
+        # Cancel all pending futures before clearing connections.
+        self.cancel_all_calls()
         with self._conn_lock:
             for conn in self._connections.values():
                 conn.cleanup()
@@ -348,6 +354,14 @@ class IPCv3Server(BaseServer):
                     break
 
                 # CRM_CALL: register future, enqueue, await reply.
+                with self._pending_lock:
+                    if len(self._pending) >= self._config.max_pending_requests:
+                        logger.warning(
+                            'Conn %d: pending requests limit reached (%d)',
+                            conn_id, self._config.max_pending_requests,
+                        )
+                        continue
+
                 str_rid = f'{conn_id}:{request_id}'
                 envelope.request_id = str_rid
 
@@ -400,15 +414,35 @@ class IPCv3Server(BaseServer):
         """Resolve wire bytes from a data frame. Handles buddy and inline."""
         if flags & FLAG_BUDDY:
             seg_idx, offset, data_size, is_dedicated = decode_buddy_payload(payload)
-            if conn.buddy_pool is None:
-                logger.warning('Conn %d: buddy frame before handshake', conn.conn_id)
+            # Snapshot references under lock to protect against destroy() race.
+            with self._conn_lock:
+                if conn.buddy_pool is None:
+                    logger.warning('Conn %d: buddy frame before handshake', conn.conn_id)
+                    return None
+                if seg_idx >= len(conn.seg_views):
+                    logger.warning(
+                        'Conn %d: invalid seg_idx %d (max %d)',
+                        conn.conn_id, seg_idx, len(conn.seg_views) - 1,
+                    )
+                    return None
+                seg_mv = conn.seg_views[seg_idx]
+                buddy_pool = conn.buddy_pool
+            # Bounds-check the read region within the segment.
+            if offset + data_size > len(seg_mv):
+                logger.warning(
+                    'Conn %d: buddy read OOB offset=%d size=%d seg_len=%d',
+                    conn.conn_id, offset, data_size, len(seg_mv),
+                )
+                try:
+                    buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
+                except Exception:
+                    pass
                 return None
             # Read from cached memoryview (no FFI for data copy).
-            seg_mv = conn.seg_views[seg_idx]
             wire_bytes = bytes(seg_mv[offset : offset + data_size])
             # Consumer frees: server frees request blocks after reading.
             try:
-                conn.buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
+                buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
             except Exception:
                 pass
             return wire_bytes
@@ -431,12 +465,25 @@ class IPCv3Server(BaseServer):
             logger.warning('Bad buddy handshake: %s', e)
             return
 
+        MAX_SEGMENTS = self._config.max_pool_segments
+        if len(segments) > MAX_SEGMENTS:
+            logger.warning(
+                'Conn %d: handshake seg_count %d exceeds limit %d',
+                conn.conn_id, len(segments), MAX_SEGMENTS,
+            )
+            return
+
+        for name, _size in segments:
+            if not _SHM_NAME_RE.match(name):
+                logger.warning('Conn %d: invalid segment name: %r', conn.conn_id, name)
+                return
+
         try:
             import c2_buddy
             conn.buddy_pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
                 segment_size=self._config.pool_segment_size,
                 min_block_size=4096,
-                max_segments=self._config.max_pool_segments,
+                max_segments=len(segments),
                 max_dedicated_segments=4,
             ))
             for name, size in segments:
@@ -455,7 +502,8 @@ class IPCv3Server(BaseServer):
 
             conn.handshake_done = True
         except Exception as e:
-            logger.error('Failed to open buddy segments: %s', e)
+            logger.error('Conn %d: handshake failed: %s', conn.conn_id, e)
+            conn.cleanup()
             return
 
         ack_payload = encode_buddy_handshake([])

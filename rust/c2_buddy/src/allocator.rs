@@ -95,8 +95,32 @@ impl BuddyAllocator {
         assert!(min_block.is_power_of_two());
         assert!(total_size >= HEADER_ALIGN + min_block);
 
+        // R-C3: Verify SHM base address is properly aligned for SegmentHeader.
+        assert!(
+            base as usize % std::mem::align_of::<SegmentHeader>() == 0,
+            "SHM base address must be aligned to SegmentHeader requirements"
+        );
+
+        // R-C4: Verify atomics are lock-free for cross-process SHM correctness.
+        // On stable Rust, is_lock_free() is unavailable; cfg!(target_has_atomic)
+        // verifies the platform supports native (lock-free) atomics.
+        assert!(
+            cfg!(target_has_atomic = "64"),
+            "AtomicU64 must be lock-free for cross-process SHM"
+        );
+        assert!(
+            cfg!(target_has_atomic = "32"),
+            "AtomicU32 must be lock-free for cross-process SHM"
+        );
+
         let data_offset = Self::compute_data_offset(total_size, min_block);
         let data_size = Self::round_down_pow2(total_size - data_offset);
+
+        // R-I3: Ensure data region offsets fit in u32.
+        assert!(
+            data_size <= u32::MAX as usize,
+            "segment data region exceeds 4GB offset limit"
+        );
 
         // Write header.
         // SAFETY: caller guarantees `base` is a valid, writable SHM pointer
@@ -191,8 +215,8 @@ impl BuddyAllocator {
     }
 
     /// Free a previously allocated block.
-    pub fn free(&self, offset: u32, level: u16) {
-        self.lock.with_lock(|| self.free_and_merge(offset, level));
+    pub fn free(&self, offset: u32, level: u16) -> Result<(), String> {
+        self.lock.with_lock(|| self.free_and_merge(offset, level))
     }
 
     /// Get a pointer to the data at the given offset within the data region.
@@ -267,10 +291,48 @@ impl BuddyAllocator {
         })
     }
 
-    fn free_and_merge(&self, offset: u32, level: u16) {
+    fn free_and_merge(&self, offset: u32, level: u16) -> Result<(), String> {
         let level = level as usize;
+
+        // R-I4: Validate level is within range.
+        if level >= self.levels {
+            return Err(format!(
+                "free: level {} exceeds max {}",
+                level,
+                self.levels - 1
+            ));
+        }
+
         let block_size = self.level_block_size(level);
+
+        // R-I4: Validate offset alignment.
+        if (offset as usize) % block_size != 0 {
+            return Err(format!(
+                "free: offset {} not aligned to block size {} at level {}",
+                offset, block_size, level
+            ));
+        }
+
         let block_idx = offset as usize / block_size;
+        let blocks_at_level = self.data_size / block_size;
+
+        // R-I4: Validate block index.
+        if block_idx >= blocks_at_level {
+            return Err(format!(
+                "free: block index {} out of range (max {}) at level {}",
+                block_idx,
+                blocks_at_level - 1,
+                level
+            ));
+        }
+
+        // R-C5: Double-free detection — block must be currently allocated.
+        if self.bitmaps[level].is_free(block_idx) {
+            return Err(format!(
+                "double free detected: block {} at level {} is already free",
+                block_idx, level
+            ));
+        }
 
         // Mark this block as free.
         self.bitmaps[level].free_one(block_idx);
@@ -295,6 +357,8 @@ impl BuddyAllocator {
             current_idx /= 2;
             self.bitmaps[current_level].free_one(current_idx);
         }
+
+        Ok(())
     }
 
     fn update_stats_alloc(&self, size: usize) {
@@ -305,6 +369,10 @@ impl BuddyAllocator {
 
     fn update_stats_free(&self, size: usize) {
         let header = unsafe { &*(self.base as *const SegmentHeader) };
+        debug_assert!(
+            header.alloc_count.load(Ordering::Relaxed) > 0,
+            "alloc_count underflow: cannot decrement below zero"
+        );
         header.alloc_count.fetch_sub(1, Ordering::Release);
         header.free_bytes.fetch_add(size as u64, Ordering::Release);
     }
@@ -414,7 +482,7 @@ mod tests {
         let (alloc, _buf) = make_allocator(64 * 1024, 4096); // 64KB total
         let a = alloc.alloc(4096).expect("alloc 4KB");
         assert_eq!(a.actual_size, 4096);
-        alloc.free(a.offset, a.level);
+        alloc.free(a.offset, a.level).unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
@@ -424,8 +492,8 @@ mod tests {
         let a = alloc.alloc(4096).unwrap();
         let b = alloc.alloc(4096).unwrap();
         assert_ne!(a.offset, b.offset);
-        alloc.free(a.offset, a.level);
-        alloc.free(b.offset, b.level);
+        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(b.offset, b.level).unwrap();
         assert_eq!(alloc.alloc_count(), 0);
     }
 
@@ -435,7 +503,7 @@ mod tests {
         // Request 5KB → rounds up to 8KB.
         let a = alloc.alloc(5000).unwrap();
         assert_eq!(a.actual_size, 8192);
-        alloc.free(a.offset, a.level);
+        alloc.free(a.offset, a.level).unwrap();
     }
 
     #[test]
@@ -448,8 +516,8 @@ mod tests {
         let b = alloc.alloc(4096).unwrap();
 
         // Free both — should merge back.
-        alloc.free(a.offset, a.level);
-        alloc.free(b.offset, b.level);
+        alloc.free(a.offset, a.level).unwrap();
+        alloc.free(b.offset, b.level).unwrap();
 
         // Free bytes should be restored.
         assert_eq!(alloc.free_bytes(), initial_free);
@@ -464,7 +532,7 @@ mod tests {
         assert!(a.is_some());
         // Second allocation should fail.
         assert!(alloc.alloc(4096).is_none());
-        alloc.free(a.unwrap().offset, a.unwrap().level);
+        alloc.free(a.unwrap().offset, a.unwrap().level).unwrap();
     }
 
     #[test]
@@ -491,7 +559,7 @@ mod tests {
         // Free alternating blocks to create fragmentation.
         for (i, a) in allocs.iter().enumerate() {
             if i % 2 == 0 {
-                alloc.free(a.offset, a.level);
+                alloc.free(a.offset, a.level).unwrap();
             }
         }
 

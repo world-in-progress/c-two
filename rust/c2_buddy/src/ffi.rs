@@ -11,7 +11,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Python-visible pool configuration.
 #[pyclass(name = "PoolConfig")]
@@ -88,7 +88,7 @@ impl From<&PyPoolConfig> for PoolConfig {
 #[derive(Debug, Clone)]
 pub struct PyPoolAlloc {
     #[pyo3(get)]
-    pub seg_idx: u16,
+    pub seg_idx: u32,
     #[pyo3(get)]
     pub offset: u32,
     #[pyo3(get)]
@@ -156,11 +156,11 @@ impl PyPoolStats {
 
 /// The main buddy pool handle exposed to Python.
 ///
-/// Thread-safe via internal Mutex. Callers from Python's free-threading
-/// mode can safely share this across threads.
+/// Thread-safe via internal RwLock. Read-only operations (stats, segment_name,
+/// etc.) take a shared lock; mutating operations take an exclusive lock.
 #[pyclass(name = "BuddyPoolHandle")]
 pub struct PyBuddyPoolHandle {
-    pool: Mutex<BuddyPool>,
+    pool: RwLock<BuddyPool>,
 }
 
 #[pymethods]
@@ -170,7 +170,7 @@ impl PyBuddyPoolHandle {
     fn new(config: Option<&PyPoolConfig>) -> PyResult<Self> {
         let cfg = config.map(PoolConfig::from).unwrap_or_default();
         Ok(Self {
-            pool: Mutex::new(BuddyPool::new(cfg)),
+            pool: RwLock::new(BuddyPool::new(cfg)),
         })
     }
 
@@ -180,7 +180,7 @@ impl PyBuddyPoolHandle {
     /// ctypes.memmove or (ctypes.c_char * size).from_address(addr) to write
     /// directly into the SHM block — zero intermediate copies.
     fn alloc_ptr(&self, size: usize) -> PyResult<(PyPoolAlloc, usize)> {
-        let mut pool = self.pool.lock().map_err(|e| {
+        let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let alloc = pool.alloc(size)
@@ -193,8 +193,8 @@ impl PyBuddyPoolHandle {
     /// Get the raw address for a (seg_idx, offset) pair — for remote reading.
     ///
     /// Returns the usize pointer that Python can pass to ctypes.memmove.
-    fn data_addr(&self, seg_idx: u16, offset: u32, is_dedicated: bool) -> PyResult<usize> {
-        let pool = self.pool.lock().map_err(|e| {
+    fn data_addr(&self, seg_idx: u32, offset: u32, is_dedicated: bool) -> PyResult<usize> {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
@@ -205,7 +205,7 @@ impl PyBuddyPoolHandle {
     /// Allocate `size` bytes from the pool.
     /// Returns a PoolAlloc with segment index, offset, actual size, level, and dedicated flag.
     fn alloc(&self, size: usize) -> PyResult<PyPoolAlloc> {
-        let mut pool = self.pool.lock().map_err(|e| {
+        let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         pool.alloc(size)
@@ -215,7 +215,7 @@ impl PyBuddyPoolHandle {
 
     /// Free a previously allocated block.
     fn free(&self, alloc: &PyPoolAlloc) -> PyResult<()> {
-        let mut pool = self.pool.lock().map_err(|e| {
+        let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let pa = PoolAllocation {
@@ -225,13 +225,14 @@ impl PyBuddyPoolHandle {
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
         };
-        pool.free(&pa);
+        pool.free(&pa)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(())
     }
 
     /// Write data into an allocated block.
     fn write(&self, alloc: &PyPoolAlloc, data: &[u8]) -> PyResult<()> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let pa = PoolAllocation {
@@ -253,7 +254,7 @@ impl PyBuddyPoolHandle {
 
     /// Read data from an allocated block as bytes.
     fn read<'py>(&self, py: Python<'py>, alloc: &PyPoolAlloc, size: usize) -> PyResult<Bound<'py, PyBytes>> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let pa = PoolAllocation {
@@ -281,7 +282,7 @@ impl PyBuddyPoolHandle {
         alloc: &PyPoolAlloc,
         size: usize,
     ) -> PyResult<Bound<'py, pyo3::types::PyMemoryView>> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let pa = PoolAllocation {
@@ -309,7 +310,7 @@ impl PyBuddyPoolHandle {
     /// Write data from a Python buffer (bytes-like) into an allocated block.
     /// Uses buffer protocol for zero-copy from Python side.
     fn write_from_buffer(&self, py: Python<'_>, data: PyBuffer<u8>, alloc: &PyPoolAlloc) -> PyResult<()> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let pa = PoolAllocation {
@@ -338,12 +339,12 @@ impl PyBuddyPoolHandle {
     fn read_at<'py>(
         &self,
         py: Python<'py>,
-        seg_idx: u16,
+        seg_idx: u32,
         offset: u32,
         size: usize,
         is_dedicated: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
@@ -359,21 +360,22 @@ impl PyBuddyPoolHandle {
     #[pyo3(name = "free_at")]
     fn free_at(
         &self,
-        seg_idx: u16,
+        seg_idx: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> PyResult<()> {
-        let mut pool = self.pool.lock().map_err(|e| {
+        let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
-        pool.free_at(seg_idx, offset, data_size, is_dedicated);
+        pool.free_at(seg_idx, offset, data_size, is_dedicated)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(())
     }
 
     /// Get pool statistics.
     fn stats(&self) -> PyResult<PyPoolStats> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let s = pool.stats();
@@ -389,7 +391,7 @@ impl PyBuddyPoolHandle {
 
     /// Number of buddy segments currently alive.
     fn segment_count(&self) -> PyResult<usize> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         Ok(pool.segment_count())
@@ -397,7 +399,7 @@ impl PyBuddyPoolHandle {
 
     /// Run garbage collection on freed dedicated segments.
     fn gc(&self) -> PyResult<()> {
-        let mut pool = self.pool.lock().map_err(|e| {
+        let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         pool.gc_dedicated();
@@ -406,7 +408,7 @@ impl PyBuddyPoolHandle {
 
     /// Get the SHM name for a buddy segment.
     fn segment_name(&self, idx: usize) -> PyResult<Option<String>> {
-        let pool = self.pool.lock().map_err(|e| {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         Ok(pool.segment_name(idx).map(|s| s.to_string()))
@@ -416,8 +418,8 @@ impl PyBuddyPoolHandle {
     ///
     /// Returns (data_base_addr, data_region_size).  Python creates a persistent
     /// memoryview from this instead of per-request ctypes arrays.
-    fn seg_data_info(&self, seg_idx: u16) -> PyResult<(usize, usize)> {
-        let pool = self.pool.lock().map_err(|e| {
+    fn seg_data_info(&self, seg_idx: u32) -> PyResult<(usize, usize)> {
+        let pool = self.pool.read().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         let (ptr, size) = pool.seg_data_info(seg_idx)
@@ -427,7 +429,7 @@ impl PyBuddyPoolHandle {
 
     /// Open a remote buddy segment (for the other side of a connection).
     fn open_segment(&self, name: &str, size: usize) -> PyResult<usize> {
-        let mut pool = self.pool.lock().map_err(|e| {
+        let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         pool.open_segment(name, size)
@@ -436,7 +438,7 @@ impl PyBuddyPoolHandle {
 
     /// Destroy the pool and all its SHM segments.
     fn destroy(&self) -> PyResult<()> {
-        let mut pool = self.pool.lock().map_err(|e| {
+        let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         pool.destroy();

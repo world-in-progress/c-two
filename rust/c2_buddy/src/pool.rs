@@ -43,7 +43,7 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct PoolAllocation {
     /// Index of the segment (buddy or dedicated).
-    pub seg_idx: u16,
+    pub seg_idx: u32,
     /// Offset within the segment's data region.
     pub offset: u32,
     /// Actual allocated size.
@@ -77,13 +77,13 @@ pub struct BuddyPool {
     /// Buddy-managed segments.
     segments: Vec<ShmSegment>,
     /// Dedicated segments for oversized allocations. Key is segment index.
-    dedicated: HashMap<u16, DedicatedEntry>,
+    dedicated: HashMap<u32, DedicatedEntry>,
     /// Counter for generating unique SHM names.
     name_counter: AtomicU32,
     /// Base name prefix for SHM segments (includes PID).
     name_prefix: String,
     /// Next dedicated segment index (offset from max_segments to avoid collision).
-    next_dedicated_idx: u16,
+    next_dedicated_idx: u32,
 }
 
 impl BuddyPool {
@@ -124,11 +124,12 @@ impl BuddyPool {
     }
 
     /// Free a previously allocated block.
-    pub fn free(&mut self, alloc: &PoolAllocation) {
+    pub fn free(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
         if alloc.is_dedicated {
             self.free_dedicated(alloc.seg_idx);
+            Ok(())
         } else {
-            self.free_buddy(alloc);
+            self.free_buddy(alloc)
         }
     }
 
@@ -189,7 +190,7 @@ impl BuddyPool {
     pub fn gc_dedicated(&mut self) {
         let delay = std::time::Duration::from_secs_f64(self.config.dedicated_gc_delay_secs);
         let now = Instant::now();
-        let to_remove: Vec<u16> = self
+        let to_remove: Vec<u32> = self
             .dedicated
             .iter()
             .filter_map(|(&idx, entry)| {
@@ -229,7 +230,7 @@ impl BuddyPool {
     }
 
     /// Get the SHM name for a dedicated segment.
-    pub fn dedicated_name(&self, idx: u16) -> Option<&str> {
+    pub fn dedicated_name(&self, idx: u32) -> Option<&str> {
         self.dedicated.get(&idx).map(|e| e.segment.name())
     }
 
@@ -242,10 +243,11 @@ impl BuddyPool {
     }
 
     /// Open an existing dedicated segment.
-    pub fn open_dedicated(&mut self, name: &str, size: usize) -> Result<u16, String> {
+    pub fn open_dedicated(&mut self, name: &str, size: usize) -> Result<u32, String> {
         let seg = DedicatedSegment::open(name, size)?;
         let idx = self.next_dedicated_idx;
-        self.next_dedicated_idx += 1;
+        self.next_dedicated_idx = self.next_dedicated_idx.checked_add(1)
+            .expect("dedicated segment index overflow");
         self.dedicated.insert(
             idx,
             DedicatedEntry {
@@ -260,16 +262,21 @@ impl BuddyPool {
     ///
     /// This recomputes the buddy level from the data size, enabling cross-process
     /// freeing where the remote side only knows (offset, data_size) from the wire.
-    pub fn free_at(&mut self, seg_idx: u16, offset: u32, data_size: u32, is_dedicated: bool) {
+    pub fn free_at(&mut self, seg_idx: u32, offset: u32, data_size: u32, is_dedicated: bool) -> Result<(), String> {
         if is_dedicated {
             self.free_dedicated(seg_idx);
+            Ok(())
         } else if let Some(seg) = self.segments.get(seg_idx as usize) {
             let actual_size = (data_size as usize)
                 .next_power_of_two()
                 .max(self.config.min_block_size);
             if let Some(level) = seg.allocator().size_to_level(actual_size) {
-                seg.allocator().free(offset, level as u16);
+                seg.allocator().free(offset, level as u16)
+            } else {
+                Err("could not determine buddy level for free_at".into())
             }
+        } else {
+            Err(format!("invalid segment index {}", seg_idx))
         }
     }
 
@@ -278,7 +285,7 @@ impl BuddyPool {
     /// Returns (data_base_addr, data_region_size) where data_base_addr is the
     /// raw pointer to offset 0 within the data region.  Useful for creating
     /// a persistent memoryview covering the whole data region.
-    pub fn seg_data_info(&self, seg_idx: u16) -> Result<(*mut u8, usize), String> {
+    pub fn seg_data_info(&self, seg_idx: u32) -> Result<(*mut u8, usize), String> {
         let seg = self
             .segments
             .get(seg_idx as usize)
@@ -293,7 +300,7 @@ impl BuddyPool {
     /// by the peer.
     pub fn data_ptr_at(
         &self,
-        seg_idx: u16,
+        seg_idx: u32,
         offset: u32,
         is_dedicated: bool,
     ) -> Result<*mut u8, String> {
@@ -332,7 +339,7 @@ impl BuddyPool {
         for (idx, seg) in self.segments.iter().enumerate() {
             if let Some(a) = seg.allocator().alloc(size) {
                 return Ok(PoolAllocation {
-                    seg_idx: idx as u16,
+                    seg_idx: idx as u32,
                     offset: a.offset,
                     actual_size: a.actual_size,
                     level: a.level,
@@ -348,7 +355,7 @@ impl BuddyPool {
             self.segments.push(seg);
             if let Some(a) = self.segments[idx].allocator().alloc(size) {
                 return Ok(PoolAllocation {
-                    seg_idx: idx as u16,
+                    seg_idx: idx as u32,
                     offset: a.offset,
                     actual_size: a.actual_size,
                     level: a.level,
@@ -387,8 +394,14 @@ impl BuddyPool {
         let name = self.next_name("d");
         let seg = DedicatedSegment::create(&name, size)?;
         let idx = self.next_dedicated_idx;
-        self.next_dedicated_idx += 1;
+        self.next_dedicated_idx = self.next_dedicated_idx.checked_add(1)
+            .expect("dedicated segment index overflow");
 
+        // R-I2: Guard against u32 truncation for dedicated segment size.
+        assert!(
+            seg.size() <= u32::MAX as usize,
+            "dedicated segment exceeds 4GB limit"
+        );
         let alloc_size = seg.size() as u32;
         self.dedicated.insert(
             idx,
@@ -407,13 +420,15 @@ impl BuddyPool {
         })
     }
 
-    fn free_buddy(&mut self, alloc: &PoolAllocation) {
+    fn free_buddy(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
         if let Some(seg) = self.segments.get(alloc.seg_idx as usize) {
-            seg.allocator().free(alloc.offset, alloc.level);
+            seg.allocator().free(alloc.offset, alloc.level)
+        } else {
+            Err(format!("invalid segment index {}", alloc.seg_idx))
         }
     }
 
-    fn free_dedicated(&mut self, seg_idx: u16) {
+    fn free_dedicated(&mut self, seg_idx: u32) {
         if let Some(entry) = self.dedicated.get_mut(&seg_idx) {
             entry.freed_at = Some(Instant::now());
         }
@@ -466,7 +481,7 @@ mod tests {
         assert!(!a.is_dedicated);
         assert_eq!(pool.segment_count(), 1);
 
-        pool.free(&a);
+        pool.free(&a).unwrap();
         let stats = pool.stats();
         assert_eq!(stats.alloc_count, 0);
     }
@@ -477,8 +492,8 @@ mod tests {
         let a = pool.alloc(4096).unwrap();
         let b = pool.alloc(4096).unwrap();
         assert_ne!(a.offset, b.offset);
-        pool.free(&a);
-        pool.free(&b);
+        pool.free(&a).unwrap();
+        pool.free(&b).unwrap();
     }
 
     #[test]
@@ -499,8 +514,8 @@ mod tests {
         let b = pool.alloc(32 * 1024).unwrap();
         assert!(pool.segment_count() >= 2 || b.is_dedicated);
 
-        pool.free(&a);
-        pool.free(&b);
+        pool.free(&a).unwrap();
+        pool.free(&b).unwrap();
     }
 
     #[test]
@@ -517,7 +532,7 @@ mod tests {
         let a = pool.alloc(64 * 1024).unwrap();
         assert!(a.is_dedicated);
 
-        pool.free(&a);
+        pool.free(&a).unwrap();
         pool.gc_dedicated();
     }
 
@@ -528,7 +543,7 @@ mod tests {
         let stats = pool.stats();
         assert!(stats.total_bytes > 0);
         assert!(stats.alloc_count >= 1);
-        pool.free(&a);
+        pool.free(&a).unwrap();
     }
 
     #[test]
@@ -541,7 +556,7 @@ mod tests {
             assert_eq!(*ptr, 0xAB);
             assert_eq!(*ptr.add(99), 0xAB);
         }
-        pool.free(&a);
+        pool.free(&a).unwrap();
     }
 
     #[test]

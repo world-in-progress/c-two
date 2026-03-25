@@ -84,9 +84,14 @@ impl ShmSpinlock {
         F: FnOnce() -> R,
     {
         self.lock();
-        let result = f();
-        self.unlock();
-        result
+        struct Guard<'a>(&'a ShmSpinlock);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.unlock();
+            }
+        }
+        let _guard = Guard(self);
+        f()
     }
 
     fn atomic(&self) -> &AtomicU32 {
@@ -144,5 +149,29 @@ mod tests {
         }
 
         assert_eq!(shared[1].load(AtOrd::SeqCst), 4000);
+    }
+
+    #[test]
+    fn test_spinlock_panic_safety() {
+        #[repr(C, align(4))]
+        struct Aligned([u8; 4]);
+        let mut buf = Aligned([0u8; 4]);
+        let spinlock = unsafe { ShmSpinlock::new(buf.0.as_mut_ptr()) };
+        spinlock.init();
+
+        // Panic inside with_lock — RAII guard must still unlock.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spinlock.with_lock(|| {
+                panic!("intentional panic inside with_lock");
+            });
+        }));
+        assert!(result.is_err(), "closure should have panicked");
+
+        // Lock must be reacquirable after panic-induced unlock.
+        assert!(
+            spinlock.try_lock_spins(1000),
+            "lock should be acquirable after panic"
+        );
+        spinlock.unlock();
     }
 }

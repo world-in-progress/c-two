@@ -88,12 +88,19 @@ class IPCv3Client(BaseClient):
         return sock
 
     def _ensure_connection(self) -> _socket.socket:
-        if self._sock is None:
-            self._sock = self._connect()
-            self._pool_handshake_done = False
-        if not self._pool_handshake_done and self._config.pool_enabled:
+        sock = self._sock
+        if sock is not None:
+            if not self._pool_handshake_done and self._config.pool_enabled:
+                self._do_buddy_handshake()
+            return sock
+        # Slow path: connect + handshake outside _conn_lock to avoid blocking
+        # other threads during network I/O (10s timeout, SHM allocation).
+        new_sock = self._connect()
+        self._pool_handshake_done = False
+        self._sock = new_sock
+        if self._config.pool_enabled:
             self._do_buddy_handshake()
-        return self._sock
+        return new_sock
 
     def _close_connection(self) -> None:
         if self._sock is not None:
@@ -127,7 +134,7 @@ class IPCv3Client(BaseClient):
         self._buddy_pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
             segment_size=self._config.pool_segment_size,
             min_block_size=4096,
-            max_segments=self._config.max_pool_segments,
+            max_segments=1,
             max_dedicated_segments=4,
         ))
 
@@ -202,13 +209,16 @@ class IPCv3Client(BaseClient):
                     else:
                         seg_mv = self._seg_views[alloc.seg_idx]
                         shm_buf = seg_mv[alloc.offset : alloc.offset + wire_size]
-                        write_call_into(shm_buf, 0, method_name, args)
-
-                        frame = encode_buddy_call_frame(
-                        request_id, alloc.seg_idx, alloc.offset,
-                        wire_size, alloc.is_dedicated,
-                    )
-                    sock.sendall(frame)
+                        try:
+                            write_call_into(shm_buf, 0, method_name, args)
+                            frame = encode_buddy_call_frame(
+                                request_id, alloc.seg_idx, alloc.offset,
+                                wire_size, alloc.is_dedicated,
+                            )
+                            sock.sendall(frame)
+                        except Exception:
+                            self._buddy_pool.free_at(alloc.seg_idx, alloc.offset, wire_size, alloc.is_dedicated)
+                            raise
                     # Note: server frees the request block after reading (consumer frees).
 
                 # Read response.
@@ -254,12 +264,16 @@ class IPCv3Client(BaseClient):
                     else:
                         seg_mv = self._seg_views[alloc.seg_idx]
                         shm_buf = seg_mv[alloc.offset : alloc.offset + wire_size]
-                        shm_buf[:wire_size] = event_bytes
-                        frame = encode_buddy_call_frame(
-                            request_id, alloc.seg_idx, alloc.offset,
-                            wire_size, alloc.is_dedicated,
-                        )
-                        sock.sendall(frame)
+                        try:
+                            shm_buf[:wire_size] = event_bytes
+                            frame = encode_buddy_call_frame(
+                                request_id, alloc.seg_idx, alloc.offset,
+                                wire_size, alloc.is_dedicated,
+                            )
+                            sock.sendall(frame)
+                        except Exception:
+                            self._buddy_pool.free_at(alloc.seg_idx, alloc.offset, wire_size, alloc.is_dedicated)
+                            raise
 
                 response_bytes = self._recv_response()
             except error.CCBaseError:
@@ -268,7 +282,7 @@ class IPCv3Client(BaseClient):
                 self._close_connection()
                 raise error.CompoClientError(f'IPC v3 relay failed: {exc}') from exc
 
-        return bytes(response_bytes)
+        return response_bytes
 
     def terminate(self) -> None:
         with self._conn_lock:
@@ -295,13 +309,17 @@ class IPCv3Client(BaseClient):
                 if self._buddy_pool is None:
                     raise error.CompoClientError('Buddy response but no pool')
                 # Read directly from cached memoryview (no FFI for data copy).
+                if seg_idx >= len(self._seg_views):
+                    raise error.CompoClientError(f'Invalid seg_idx {seg_idx} from server (max {len(self._seg_views)-1})')
                 seg_mv = self._seg_views[seg_idx]
+                if offset + data_size > len(seg_mv):
+                    raise error.CompoClientError(f'Server response out of bounds: offset={offset} size={data_size} seg_len={len(seg_mv)}')
                 data = bytes(seg_mv[offset : offset + data_size])
                 # Consumer frees response blocks.
                 try:
                     self._buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
                 except Exception:
-                    pass
+                    logger.warning('Failed to free buddy block seg=%d off=%d size=%d', seg_idx, offset, data_size, exc_info=True)
                 return data
             else:
                 # Skip PONG frames (heartbeat responses).
@@ -314,13 +332,18 @@ class IPCv3Client(BaseClient):
     # ------------------------------------------------------------------
 
     def _recv_exact(self, n: int) -> bytes:
-        data = bytearray()
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
+        data = self._sock.recv(n)
+        if len(data) == n:
+            return data
+        if not data:
+            raise ConnectionResetError('Server closed connection')
+        buf = bytearray(data)
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
             if not chunk:
                 raise ConnectionResetError('Server closed connection')
-            data.extend(chunk)
-        return bytes(data)
+            buf.extend(chunk)
+        return bytes(buf)
 
     # ------------------------------------------------------------------
     # Static methods (BaseClient interface)
@@ -332,8 +355,8 @@ class IPCv3Client(BaseClient):
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return False
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         try:
-            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
             sock.settimeout(timeout)
             sock.connect(socket_path)
             frame = encode_frame(0, 0, PING_BYTES)
@@ -342,11 +365,12 @@ class IPCv3Client(BaseClient):
             total_len, _rid, _flags = FRAME_STRUCT.unpack(header)
             payload_len = total_len - 12
             payload = _recv_exact_sock(sock, payload_len) if payload_len > 0 else b''
-            sock.close()
             env = decode(payload)
             return env.msg_type == MsgType.PONG
         except Exception:
             return False
+        finally:
+            sock.close()
 
     @staticmethod
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
@@ -354,8 +378,8 @@ class IPCv3Client(BaseClient):
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return True
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         try:
-            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
             sock.settimeout(timeout)
             sock.connect(socket_path)
             frame = encode_frame(0, 0, SHUTDOWN_CLIENT_BYTES)
@@ -364,11 +388,12 @@ class IPCv3Client(BaseClient):
             total_len, _rid, _flags = FRAME_STRUCT.unpack(header)
             payload_len = total_len - 12
             payload = _recv_exact_sock(sock, payload_len) if payload_len > 0 else b''
-            sock.close()
             env = decode(payload)
             return env.msg_type == MsgType.SHUTDOWN_ACK
         except Exception:
             return False
+        finally:
+            sock.close()
 
     @property
     def supports_direct_call(self) -> bool:

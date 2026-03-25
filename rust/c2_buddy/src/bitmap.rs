@@ -2,6 +2,17 @@
 //!
 //! Each level has a bitmap tracking free/used blocks. The bitmap is stored
 //! as an array of u64 words for efficient scanning via trailing_zeros().
+//!
+//! # Safety
+//!
+//! All bitmap operations (`alloc_one`, `free_one`, `mark_used`) **MUST** be
+//! called while holding the segment's `ShmSpinlock`. The spinlock is the
+//! actual synchronization primitive that guarantees mutual exclusion across
+//! processes.
+//!
+//! `alloc_one` uses CAS internally for historical reasons (it predates the
+//! spinlock design), but the spinlock is the authoritative guard. Do **NOT**
+//! call bitmap methods outside the spinlock critical section.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

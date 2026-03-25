@@ -90,9 +90,17 @@ def _fmt_size(n: int) -> str:
 
 
 def _percentile(data: list[float], pct: float) -> float:
-    idx = int(len(data) * pct / 100)
-    idx = min(idx, len(data) - 1)
-    return sorted(data)[idx]
+    if not data:
+        return 0.0
+    sorted_data = sorted(data)
+    k = (len(sorted_data) - 1) * (pct / 100.0)
+    f = int(k)
+    c = f + 1
+    if c >= len(sorted_data):
+        return sorted_data[-1]
+    d0 = sorted_data[f] * (c - k)
+    d1 = sorted_data[c] * (k - f)
+    return d0 + d1
 
 
 # ---------------------------------------------------------------------------

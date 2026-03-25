@@ -34,6 +34,12 @@ impl ShmSegment {
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
 
         unsafe {
+            // TOCTOU note: There is a small window between shm_unlink and
+            // shm_open(O_CREAT|O_EXCL) where another process could race to
+            // create a segment with the same name. PID-based naming (the
+            // name_prefix includes the creator's PID) mitigates this in
+            // practice, but it is not a guarantee under PID reuse.
+
             // Clean up stale segment if it exists.
             libc::shm_unlink(c_name.as_ptr());
 
@@ -108,7 +114,18 @@ impl ShmSegment {
                 return Err(format!("fstat failed: {err}"));
             }
             let actual_size = stat.st_size as usize;
-            let map_size = actual_size.max(expected_size);
+
+            // R-I6: Prevent SIGBUS by ensuring the SHM file is at least as
+            // large as the expected mapping size. If the file is smaller, mmap
+            // would succeed but accessing unmapped pages causes SIGBUS.
+            if actual_size < expected_size {
+                libc::close(fd);
+                return Err(format!(
+                    "SHM segment too small: actual size {} < expected {}",
+                    actual_size, expected_size
+                ));
+            }
+            let map_size = actual_size;
 
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
