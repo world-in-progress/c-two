@@ -223,7 +223,7 @@ class IPCv3Client(BaseClient):
                     # Note: server frees the request block after reading (consumer frees).
 
                 # Read response.
-                response_bytes = self._recv_response()
+                response_data, free_info = self._recv_response()
 
             except error.CCBaseError:
                 raise
@@ -232,14 +232,26 @@ class IPCv3Client(BaseClient):
                 raise error.CompoClientError(f'IPC v3 call failed: {exc}') from exc
 
         # Decode wire message outside lock.
-        env = decode(response_bytes)
+        env = decode(response_data)
         if env.msg_type != MsgType.CRM_REPLY:
+            self._free_buddy_response(free_info)
             raise error.CompoClientError(f'Unexpected response type: {env.msg_type}')
         if env.error:
+            self._free_buddy_response(free_info)
             err = error.CCError.deserialize(env.error)
             if err:
                 raise err
-        return env.payload if env.payload is not None else b''
+        # For buddy zero-copy: payload is a memoryview into SHM. Copy to bytes
+        # (single copy from SHM) and then free the block. This avoids the
+        # double-copy that would happen through decode→memoryview→deserializer.
+        payload = env.payload
+        if payload is not None:
+            if isinstance(payload, memoryview):
+                payload = bytes(payload)
+        else:
+            payload = b''
+        self._free_buddy_response(free_info)
+        return payload
 
     def relay(self, event_bytes: bytes) -> bytes:
         """Relay raw event bytes to the server."""
@@ -276,14 +288,19 @@ class IPCv3Client(BaseClient):
                             self._buddy_pool.free_at(alloc.seg_idx, alloc.offset, wire_size, alloc.is_dedicated)
                             raise
 
-                response_bytes = self._recv_response()
+                response_data, free_info = self._recv_response()
             except error.CCBaseError:
                 raise
             except Exception as exc:
                 self._close_connection()
                 raise error.CompoClientError(f'IPC v3 relay failed: {exc}') from exc
 
-        return response_bytes
+        # For buddy zero-copy responses, materialize to bytes before freeing.
+        if free_info is not None:
+            if isinstance(response_data, memoryview):
+                response_data = bytes(response_data)
+            self._free_buddy_response(free_info)
+        return response_data
 
     def terminate(self) -> None:
         with self._conn_lock:
@@ -293,8 +310,14 @@ class IPCv3Client(BaseClient):
     # Response handling
     # ------------------------------------------------------------------
 
-    def _recv_response(self) -> bytes | memoryview:
-        """Read a response frame and return decoded wire bytes."""
+    def _recv_response(self) -> tuple[bytes | memoryview, tuple | None]:
+        """Read a response frame and return (data, buddy_free_info).
+
+        For buddy frames: data is a zero-copy memoryview into SHM,
+        buddy_free_info is (seg_idx, free_offset, free_size, is_dedicated).
+        For inline frames: data is bytes, buddy_free_info is None.
+        The caller must free the buddy block after consuming the data.
+        """
         while True:
             header = self._recv_exact(16)
             total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -309,24 +332,28 @@ class IPCv3Client(BaseClient):
                 seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
                 if self._buddy_pool is None:
                     raise error.CompoClientError('Buddy response but no pool')
-                # Read directly from cached memoryview (no FFI for data copy).
                 if seg_idx >= len(self._seg_views):
                     raise error.CompoClientError(f'Invalid seg_idx {seg_idx} from server (max {len(self._seg_views)-1})')
                 seg_mv = self._seg_views[seg_idx]
                 if data_offset + data_size > len(seg_mv):
                     raise error.CompoClientError(f'Server response out of bounds: offset={data_offset} size={data_size} seg_len={len(seg_mv)}')
-                data = bytes(seg_mv[data_offset : data_offset + data_size])
-                # Consumer frees the block (free coords may differ for reuse frames).
-                try:
-                    self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
-                except Exception:
-                    logger.warning('Failed to free buddy block seg=%d off=%d size=%d', seg_idx, free_offset, free_size, exc_info=True)
-                return data
+                data_mv = seg_mv[data_offset : data_offset + data_size]
+                return data_mv, (seg_idx, free_offset, free_size, is_dedicated)
             else:
                 # Skip PONG frames (heartbeat responses).
                 if len(payload) >= 1 and payload[0] == MsgType.PONG:
                     continue
-                return payload
+                return payload, None
+
+    def _free_buddy_response(self, free_info: tuple | None) -> None:
+        """Free a buddy response block if applicable."""
+        if free_info is not None:
+            seg_idx, free_offset, free_size, is_dedicated = free_info
+            try:
+                self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+            except Exception:
+                logger.warning('Failed to free buddy block seg=%d off=%d size=%d',
+                               seg_idx, free_offset, free_size, exc_info=True)
 
     # ------------------------------------------------------------------
     # Low-level I/O
