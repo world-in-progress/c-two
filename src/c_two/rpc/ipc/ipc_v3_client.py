@@ -228,7 +228,12 @@ class IPCv3Client(BaseClient):
             self._free_buddy_response(pending)
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes | memoryview:
-        """Send a CRM_CALL and return the response payload."""
+        """Send a CRM_CALL and return the response payload.
+
+        Returns bytes for inline/small responses. For large buddy responses
+        (>= 1 MB), returns a memoryview into a client-owned warm buffer
+        (safe to hold — not backed by SHM).
+        """
         args = data if data is not None else b''
         method_bytes = method_name.encode('utf-8')
         wire_size = call_wire_size(len(method_bytes), len(args))
@@ -304,10 +309,13 @@ class IPCv3Client(BaseClient):
                 self._free_buddy_response(free_info)
                 return b''
             if data_size >= _WARM_BUF_THRESHOLD:
-                # Large response: return SHM memoryview directly (true zero-copy).
-                # The buddy block stays alive until the next call() frees it.
-                self._deferred_response_free = free_info
-                return mv[5:]
+                # Use warm buffer (memmove) to avoid page-fault overhead.
+                self._ensure_response_buf(data_size)
+                seg_idx, data_offset, _, _, _, is_dedicated = free_info
+                src_addr = self._seg_base_addrs[seg_idx] + data_offset + 5
+                _memmove(self._response_buf_addr, src_addr, data_size)
+                self._free_buddy_response(free_info)
+                return memoryview(self._response_buf)[:data_size]
             payload = bytes(mv[5:])
             self._free_buddy_response(free_info)
             return payload
