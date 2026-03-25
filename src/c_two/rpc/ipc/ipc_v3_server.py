@@ -259,8 +259,10 @@ class IPCv3Server(BaseServer):
         if (isinstance(result_bytes, memoryview) and err_len == 0
                 and buddy_pool is not None
                 and total_wire > self._config.shm_threshold):
+            # Atomically pop to avoid TOCTOU race: another thread could pop
+            # the same entry between a get() and a later pop().
             with self._deferred_frees_lock:
-                info = self._deferred_frees.get(rid_key)
+                info = self._deferred_frees.pop(rid_key, None)
             if info is not None and len(info) >= 8 and info[5] is not None:
                 (_pool, req_seg_idx, block_offset, alloc_size,
                  _ded, payload_offset, payload_len, seg_obj) = info
@@ -277,8 +279,6 @@ class IPCv3Server(BaseServer):
                             int_rid, req_seg_idx, reply_start, reply_data_size,
                             block_offset, alloc_size,
                         )
-                        with self._deferred_frees_lock:
-                            self._deferred_frees.pop(rid_key, None)
                         loop = self._loop
                         if loop is not None:
                             try:
@@ -287,6 +287,10 @@ class IPCv3Server(BaseServer):
                             except RuntimeError:
                                 pass
                         return
+                # Reuse failed — re-register deferred free so regular path
+                # or _free_deferred() can release the block.
+                with self._deferred_frees_lock:
+                    self._deferred_frees[rid_key] = info
 
         # ---- Regular buddy alloc + copy path ----
         frame: bytes | None = None
