@@ -304,24 +304,11 @@ class IPCv3Server(BaseServer):
             conn = BuddyConnection(conn_id, writer, self._config)
             self._connections[conn_id] = conn
 
-        shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
-
         try:
             while True:
-                read_task = asyncio.ensure_future(
-                    _read_frame(reader, self._config.max_frame_size)
+                request_id, flags, payload = await _read_frame(
+                    reader, self._config.max_frame_size,
                 )
-                done, _ = await asyncio.wait(
-                    {read_task, shutdown_waiter},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if shutdown_waiter in done:
-                    read_task.cancel()
-                    break
-                try:
-                    request_id, flags, payload = read_task.result()
-                except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
-                    break
 
                 # Dispatch by flag.
                 if flags & (1 << 2):  # FLAG_HANDSHAKE
@@ -369,13 +356,12 @@ class IPCv3Server(BaseServer):
                 writer.write(response_frame)
                 await writer.drain()
 
-        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError,
+                asyncio.IncompleteReadError, OSError):
             pass
         except Exception:
             logger.exception('Conn %d: unhandled error', conn_id)
         finally:
-            if not shutdown_waiter.done():
-                shutdown_waiter.cancel()
             writer.close()
             try:
                 await writer.wait_closed()
