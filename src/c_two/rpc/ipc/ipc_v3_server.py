@@ -403,13 +403,8 @@ class IPCv3Server(BaseServer):
             if conn.buddy_pool is None:
                 logger.warning('Conn %d: buddy frame before handshake', conn.conn_id)
                 return None
-            # Zero-copy read: create memoryview over SHM then copy to bytes.
-            addr = conn.buddy_pool.data_addr(seg_idx, offset, is_dedicated)
-            wire_bytes = bytes(
-                memoryview(
-                    (ctypes.c_char * data_size).from_address(addr)
-                ).cast('B')
-            )
+            # Read directly via Rust FFI — avoids ctypes array/memoryview overhead.
+            wire_bytes = conn.buddy_pool.read_at(seg_idx, offset, data_size, is_dedicated)
             # Consumer frees: server frees request blocks after reading.
             try:
                 conn.buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)

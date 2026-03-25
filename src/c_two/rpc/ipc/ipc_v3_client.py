@@ -286,13 +286,8 @@ class IPCv3Client(BaseClient):
                 seg_idx, offset, data_size, is_dedicated = decode_buddy_payload(payload)
                 if self._buddy_pool is None:
                     raise error.CompoClientError('Buddy response but no pool')
-                # Zero-copy read: memoryview over SHM → copy to bytes.
-                addr = self._buddy_pool.data_addr(seg_idx, offset, is_dedicated)
-                data = bytes(
-                    memoryview(
-                        (ctypes.c_char * data_size).from_address(addr)
-                    ).cast('B')
-                )
+                # Read directly via Rust FFI — avoids ctypes overhead.
+                data = self._buddy_pool.read_at(seg_idx, offset, data_size, is_dedicated)
                 # Consumer frees response blocks.
                 try:
                     self._buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
