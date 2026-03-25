@@ -15,7 +15,7 @@ from .event.envelope import Envelope
 from .event.envelope import CompletionType as EnvelopeCompletionType
 from .event.msg_type import MsgType
 from .http import HttpServer
-from .ipc import IPCv2Server, IPCConfig
+from .ipc import IPCv2Server, IPCConfig, IPCv3Server
 from .memory import MemoryServer
 from .thread import ThreadServer
 from .thread.thread_server import DirectCallEvent
@@ -605,6 +605,8 @@ class Server:
             self.server = ThreadServer(config.bind_address)
         elif config.bind_address.startswith('ipc-v2://'):
             self.server = IPCv2Server(config.bind_address, ipc_config=config.ipc_config)
+        elif config.bind_address.startswith('ipc-v3://'):
+            self.server = IPCv3Server(config.bind_address, ipc_config=config.ipc_config)
         else:
             raise ValueError(f'Unsupported protocol in bind_address: {config.bind_address}')
 

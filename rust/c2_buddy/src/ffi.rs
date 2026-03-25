@@ -303,6 +303,46 @@ impl PyBuddyPoolHandle {
         Ok(())
     }
 
+    /// Read data from a specific (seg_idx, offset) without a PoolAlloc object.
+    ///
+    /// Used by the remote side to read from SHM blocks allocated by the peer.
+    #[pyo3(name = "read_at")]
+    fn read_at<'py>(
+        &self,
+        py: Python<'py>,
+        seg_idx: u16,
+        offset: u32,
+        size: usize,
+        is_dedicated: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let pool = self.pool.lock().map_err(|e| {
+            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
+        })?;
+        let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, size) };
+        Ok(PyBytes::new(py, slice))
+    }
+
+    /// Free a block given (seg_idx, offset, data_size) without a PoolAlloc object.
+    ///
+    /// Used by the remote side to free SHM blocks after reading.
+    /// Recomputes the buddy level from data_size internally.
+    #[pyo3(name = "free_at")]
+    fn free_at(
+        &self,
+        seg_idx: u16,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> PyResult<()> {
+        let mut pool = self.pool.lock().map_err(|e| {
+            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
+        })?;
+        pool.free_at(seg_idx, offset, data_size, is_dedicated);
+        Ok(())
+    }
+
     /// Get pool statistics.
     fn stats(&self) -> PyResult<PyPoolStats> {
         let pool = self.pool.lock().map_err(|e| {

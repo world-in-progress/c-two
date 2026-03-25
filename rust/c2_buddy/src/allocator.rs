@@ -325,7 +325,7 @@ impl BuddyAllocator {
     }
 
     /// Convert a requested allocation size to its buddy level.
-    fn size_to_level(&self, actual_size: usize) -> Option<usize> {
+    pub fn size_to_level(&self, actual_size: usize) -> Option<usize> {
         if actual_size > self.data_size {
             return None;
         }

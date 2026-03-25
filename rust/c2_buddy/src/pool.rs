@@ -252,6 +252,48 @@ impl BuddyPool {
         Ok(idx)
     }
 
+    /// Free a block given its offset and the original requested data size.
+    ///
+    /// This recomputes the buddy level from the data size, enabling cross-process
+    /// freeing where the remote side only knows (offset, data_size) from the wire.
+    pub fn free_at(&mut self, seg_idx: u16, offset: u32, data_size: u32, is_dedicated: bool) {
+        if is_dedicated {
+            self.free_dedicated(seg_idx);
+        } else if let Some(seg) = self.segments.get(seg_idx as usize) {
+            let actual_size = (data_size as usize)
+                .next_power_of_two()
+                .max(self.config.min_block_size);
+            if let Some(level) = seg.allocator().size_to_level(actual_size) {
+                seg.allocator().free(offset, level as u16);
+            }
+        }
+    }
+
+    /// Get a raw pointer to data at a specific (seg_idx, offset) without a PoolAllocation.
+    ///
+    /// Used by the remote side of a connection to read from SHM blocks allocated
+    /// by the peer.
+    pub fn data_ptr_at(
+        &self,
+        seg_idx: u16,
+        offset: u32,
+        is_dedicated: bool,
+    ) -> Result<*mut u8, String> {
+        if is_dedicated {
+            let entry = self
+                .dedicated
+                .get(&seg_idx)
+                .ok_or("invalid dedicated segment index")?;
+            Ok(entry.segment.data_ptr())
+        } else {
+            let seg = self
+                .segments
+                .get(seg_idx as usize)
+                .ok_or("invalid segment index")?;
+            Ok(seg.allocator().data_ptr(offset))
+        }
+    }
+
     // --- Internal methods ---
 
     fn max_buddy_block_size(&self) -> usize {

@@ -50,8 +50,13 @@ def unique_ipc_v2_address():
     return f'ipc-v2://test_hello_{_next_id()}'
 
 
-@pytest.fixture(params=['thread', 'memory', 'tcp', 'http', 'ipc-v2'])
-def protocol_address(request, unique_thread_address, unique_memory_address, unique_tcp_address, unique_http_address, unique_ipc_v2_address):
+@pytest.fixture
+def unique_ipc_v3_address():
+    return f'ipc-v3://test_hello_{_next_id()}'
+
+
+@pytest.fixture(params=['thread', 'memory', 'tcp', 'http', 'ipc-v2', 'ipc-v3'])
+def protocol_address(request, unique_thread_address, unique_memory_address, unique_tcp_address, unique_http_address, unique_ipc_v2_address, unique_ipc_v3_address):
     """Parametrized fixture that provides a unique address for each protocol."""
     addresses = {
         'thread': unique_thread_address,
@@ -59,6 +64,7 @@ def protocol_address(request, unique_thread_address, unique_memory_address, uniq
         'tcp': unique_tcp_address,
         'http': unique_http_address,
         'ipc-v2': unique_ipc_v2_address,
+        'ipc-v3': unique_ipc_v3_address,
     }
     return addresses[request.param]
 
