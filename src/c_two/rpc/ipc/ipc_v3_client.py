@@ -137,6 +137,7 @@ class IPCv3Client(BaseClient):
             self._sock = None
         self._pool_handshake_done = False
         self._seg_views = []
+        self._seg_base_addrs = []
         if self._buddy_pool is not None:
             try:
                 self._buddy_pool.destroy()
