@@ -213,7 +213,7 @@ class IPCv3Server(BaseServer):
         frame: bytes | None = None
         if buddy_pool is not None and total_wire > self._config.shm_threshold:
             try:
-                alloc, addr = buddy_pool.alloc_ptr(total_wire)
+                alloc = buddy_pool.alloc(total_wire)
                 if alloc.is_dedicated:
                     buddy_pool.free_at(
                         alloc.seg_idx, alloc.offset, total_wire, True,

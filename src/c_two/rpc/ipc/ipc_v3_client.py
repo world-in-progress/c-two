@@ -190,9 +190,8 @@ class IPCv3Client(BaseClient):
                     )
                     sock.sendall(frame)
                 else:
-                    alloc, addr = self._buddy_pool.alloc_ptr(wire_size)
+                    alloc = self._buddy_pool.alloc(wire_size)
                     if alloc.is_dedicated:
-                        # Dedicated segments are process-local; server can't read.
                         self._buddy_pool.free_at(
                             alloc.seg_idx, alloc.offset, wire_size, True,
                         )
@@ -245,7 +244,7 @@ class IPCv3Client(BaseClient):
                     frame = encode_frame(request_id, 0, event_bytes)
                     sock.sendall(frame)
                 else:
-                    alloc, addr = self._buddy_pool.alloc_ptr(wire_size)
+                    alloc = self._buddy_pool.alloc(wire_size)
                     if alloc.is_dedicated:
                         self._buddy_pool.free_at(
                             alloc.seg_idx, alloc.offset, wire_size, True,
