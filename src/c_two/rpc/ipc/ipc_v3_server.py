@@ -112,7 +112,10 @@ class IPCv3Server(BaseServer):
 
     def shutdown(self) -> None:
         if self._loop is not None and self._shutdown_event is not None:
-            self._loop.call_soon_threadsafe(self._shutdown_event.set)
+            try:
+                self._loop.call_soon_threadsafe(self._shutdown_event.set)
+            except RuntimeError:
+                pass  # Event loop already closed.
 
     def destroy(self) -> None:
         if self._loop_thread is not None:
@@ -254,6 +257,10 @@ class IPCv3Server(BaseServer):
             await asyncio.gather(*self._client_tasks, return_exceptions=True)
         self._server.close()
         await self._server.wait_closed()
+
+        # Notify the _serve loop that the server has shut down.
+        if self.event_queue is not None:
+            self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
 
     # ------------------------------------------------------------------
     # Client connection handler
@@ -423,56 +430,6 @@ class IPCv3Server(BaseServer):
         ack_frame = encode_frame(0, 1 << 2, ack_payload)  # FLAG_HANDSHAKE
         writer.write(ack_frame)
         await writer.drain()
-
-    # ------------------------------------------------------------------
-    # Static ping/shutdown helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def ping(address: str, timeout: float = 1.0) -> bool:
-        import socket as _socket
-        region_id = address.replace('ipc-v3://', '')
-        socket_path = _resolve_socket_path(region_id)
-        if not os.path.exists(socket_path):
-            return False
-        try:
-            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            sock.connect(socket_path)
-            frame = encode_frame(0, 0, PING_BYTES)
-            sock.sendall(frame)
-            header = _recv_exact(sock, 4)
-            total_len = U32_STRUCT.unpack_from(header, 0)[0]
-            body = _recv_exact(sock, total_len)
-            _, _, resp_payload = decode_frame(body)
-            sock.close()
-            env = decode(resp_payload)
-            return env.msg_type == MsgType.PONG
-        except Exception:
-            return False
-
-    @staticmethod
-    def shutdown(address: str, timeout: float = 0.5) -> bool:
-        import socket as _socket
-        region_id = address.replace('ipc-v3://', '')
-        socket_path = _resolve_socket_path(region_id)
-        if not os.path.exists(socket_path):
-            return True
-        try:
-            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            sock.connect(socket_path)
-            frame = encode_frame(0, 0, SHUTDOWN_CLIENT_BYTES)
-            sock.sendall(frame)
-            header = _recv_exact(sock, 4)
-            total_len = U32_STRUCT.unpack_from(header, 0)[0]
-            body = _recv_exact(sock, total_len)
-            _, _, resp_payload = decode_frame(body)
-            sock.close()
-            env = decode(resp_payload)
-            return env.msg_type == MsgType.SHUTDOWN_ACK
-        except Exception:
-            return False
 
 
 class BuddyConnection:
