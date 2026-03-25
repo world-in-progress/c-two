@@ -369,11 +369,13 @@ impl BuddyAllocator {
 
     fn update_stats_free(&self, size: usize) {
         let header = unsafe { &*(self.base as *const SegmentHeader) };
-        debug_assert!(
-            header.alloc_count.load(Ordering::Relaxed) > 0,
-            "alloc_count underflow: cannot decrement below zero"
+        // R-I4: Use fetch_update for saturating decrement — prevents u32
+        // underflow if a double-free somehow bypasses bitmap validation.
+        let _ = header.alloc_count.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |prev| if prev > 0 { Some(prev - 1) } else { None },
         );
-        header.alloc_count.fetch_sub(1, Ordering::Release);
         header.free_bytes.fetch_add(size as u64, Ordering::Release);
     }
 
