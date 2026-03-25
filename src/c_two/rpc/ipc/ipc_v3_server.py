@@ -203,34 +203,32 @@ class IPCv3Server(BaseServer):
         result_len = len(result_bytes)
         total_wire = reply_wire_size(err_len, result_len)
 
-        # Try buddy pool for large responses.
-        frame: bytes | None = None
-
+        # Snapshot connection's buddy pool under lock, then release.
         with self._conn_lock:
             conn = self._connections.get(conn_id)
             buddy_pool = conn.buddy_pool if conn is not None and conn.handshake_done else None
 
-            if buddy_pool is not None and total_wire > self._config.shm_threshold:
-                try:
-                    alloc, addr = buddy_pool.alloc_ptr(total_wire)
-                    if alloc.is_dedicated:
-                        # Dedicated segments are process-local; remote can't read.
-                        buddy_pool.free_at(
-                            alloc.seg_idx, alloc.offset, total_wire, True,
-                        )
-                        raise ValueError('dedicated segment, inline fallback')
-                    shm_buf = memoryview(
-                        (ctypes.c_char * total_wire).from_address(addr)
-                    ).cast('B')
-                    write_reply_into(shm_buf, 0, err_bytes, result_bytes)
-                    frame = encode_buddy_reply_frame(
-                        int_rid, alloc.seg_idx, alloc.offset,
-                        total_wire, alloc.is_dedicated,
+        # Buddy alloc + SHM write outside conn_lock (only Rust mutex needed).
+        frame: bytes | None = None
+        if buddy_pool is not None and total_wire > self._config.shm_threshold:
+            try:
+                alloc, addr = buddy_pool.alloc_ptr(total_wire)
+                if alloc.is_dedicated:
+                    buddy_pool.free_at(
+                        alloc.seg_idx, alloc.offset, total_wire, True,
                     )
-                    # Note: client frees this block after reading via free_at.
-                except Exception as e:
-                    logger.warning('Buddy alloc for reply failed, inline fallback: %s', e)
-                    frame = None
+                    raise ValueError('dedicated segment, inline fallback')
+                shm_buf = memoryview(
+                    (ctypes.c_char * total_wire).from_address(addr)
+                ).cast('B')
+                write_reply_into(shm_buf, 0, err_bytes, result_bytes)
+                frame = encode_buddy_reply_frame(
+                    int_rid, alloc.seg_idx, alloc.offset,
+                    total_wire, alloc.is_dedicated,
+                )
+            except Exception as e:
+                logger.warning('Buddy alloc for reply failed, inline fallback: %s', e)
+                frame = None
 
         if frame is None:
             frame = encode_inline_reply_frame(int_rid, FLAG_RESPONSE, err_bytes, result_bytes)
