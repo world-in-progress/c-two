@@ -107,6 +107,11 @@ class IPCv3Server(BaseServer):
         self._pending: dict[str, asyncio.Future] = {}
         self._pending_lock = threading.Lock()
 
+        # Deferred buddy block frees: str_rid → (pool, seg_idx, offset, size, is_ded)
+        # Request blocks are freed after the CRM processes the data (in reply()).
+        self._deferred_frees: dict[str, tuple] = {}
+        self._deferred_frees_lock = threading.Lock()
+
         # Active client connection tasks for graceful shutdown.
         self._client_tasks: set[asyncio.Task] = set()
 
@@ -158,6 +163,21 @@ class IPCv3Server(BaseServer):
                 pass  # Loop already closed.
 
     # ------------------------------------------------------------------
+    # Deferred buddy block free
+    # ------------------------------------------------------------------
+
+    def _free_deferred(self, str_rid: str) -> None:
+        """Free a deferred buddy request block (if any) for this request ID."""
+        with self._deferred_frees_lock:
+            info = self._deferred_frees.pop(str_rid, None)
+        if info is not None:
+            pool, seg_idx, offset, size, is_dedicated = info
+            try:
+                pool.free_at(seg_idx, offset, size, is_dedicated)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
     # reply() — called from scheduler thread
     # ------------------------------------------------------------------
 
@@ -170,6 +190,9 @@ class IPCv3Server(BaseServer):
         rid_key = event.request_id
         if not rid_key:
             return
+
+        # Free the deferred request block now — CRM is done with the data.
+        self._free_deferred(rid_key)
 
         with self._pending_lock:
             fut = self._pending.pop(rid_key, None)
@@ -332,8 +355,12 @@ class IPCv3Server(BaseServer):
                 if flags & FLAG_CTRL:
                     continue
 
+                # Build composite request ID early so _resolve_request can
+                # register deferred frees keyed by it.
+                str_rid = f'{conn_id}:{request_id}'
+
                 # Resolve wire bytes from frame.
-                wire_bytes = self._resolve_request(conn, flags, payload)
+                wire_bytes = self._resolve_request(conn, flags, payload, str_rid)
                 if wire_bytes is None:
                     continue
 
@@ -342,11 +369,13 @@ class IPCv3Server(BaseServer):
 
                 # Handle signals (PING, SHUTDOWN).
                 if envelope.msg_type == MsgType.PING:
+                    self._free_deferred(str_rid)
                     pong_frame = encode_frame(request_id, FLAG_RESPONSE, PONG_BYTES)
                     writer.write(pong_frame)
                     await writer.drain()
                     continue
                 if envelope.msg_type in (MsgType.SHUTDOWN_CLIENT, MsgType.SHUTDOWN_SERVER):
+                    self._free_deferred(str_rid)
                     ack_frame = encode_frame(request_id, FLAG_RESPONSE, SHUTDOWN_ACK_BYTES)
                     writer.write(ack_frame)
                     await writer.drain()
@@ -360,9 +389,9 @@ class IPCv3Server(BaseServer):
                             'Conn %d: pending requests limit reached (%d)',
                             conn_id, self._config.max_pending_requests,
                         )
+                        self._free_deferred(str_rid)
                         continue
 
-                str_rid = f'{conn_id}:{request_id}'
                 envelope.request_id = str_rid
 
                 fut = self._loop.create_future()
@@ -402,6 +431,17 @@ class IPCv3Server(BaseServer):
                     f = self._pending.pop(k, None)
                     if f and not f.done():
                         f.cancel()
+            # Free any deferred buddy blocks for this connection.
+            with self._deferred_frees_lock:
+                deferred_keys = [k for k in self._deferred_frees if k.startswith(prefix)]
+                for k in deferred_keys:
+                    info = self._deferred_frees.pop(k, None)
+                    if info:
+                        pool, si, off, sz, ded = info
+                        try:
+                            pool.free_at(si, off, sz, ded)
+                        except Exception:
+                            pass
             conn.cleanup()
             self._client_tasks.discard(task)
 
@@ -410,8 +450,13 @@ class IPCv3Server(BaseServer):
         conn: BuddyConnection,
         flags: int,
         payload: bytes | memoryview,
-    ) -> bytes | None:
-        """Resolve wire bytes from a data frame. Handles buddy and inline."""
+        str_rid: str | None = None,
+    ) -> bytes | memoryview | None:
+        """Resolve wire bytes from a data frame. Handles buddy and inline.
+
+        For buddy frames, returns a zero-copy memoryview into SHM and defers
+        the block free until reply() — this avoids a full memcpy per request.
+        """
         if flags & FLAG_BUDDY:
             seg_idx, offset, data_size, is_dedicated = decode_buddy_payload(payload)
             # Snapshot references under lock to protect against destroy() race.
@@ -438,9 +483,15 @@ class IPCv3Server(BaseServer):
                 except Exception:
                     pass
                 return None
-            # Read from cached memoryview (no FFI for data copy).
+            # Zero-copy: return memoryview into SHM, defer free until reply().
+            if str_rid is not None:
+                with self._deferred_frees_lock:
+                    self._deferred_frees[str_rid] = (
+                        buddy_pool, seg_idx, offset, data_size, is_dedicated,
+                    )
+                return seg_mv[offset : offset + data_size]
+            # Fallback: copy if no rid (shouldn't happen in normal flow).
             wire_bytes = bytes(seg_mv[offset : offset + data_size])
-            # Consumer frees: server frees request blocks after reading.
             try:
                 buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
             except Exception:
