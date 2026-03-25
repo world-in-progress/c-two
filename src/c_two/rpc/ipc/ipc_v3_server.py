@@ -203,10 +203,11 @@ class IPCv3Server(BaseServer):
         result_len = len(result_bytes)
         total_wire = reply_wire_size(err_len, result_len)
 
-        # Snapshot connection's buddy pool under lock, then release.
+        # Snapshot connection's buddy pool + cached views under lock, then release.
         with self._conn_lock:
             conn = self._connections.get(conn_id)
             buddy_pool = conn.buddy_pool if conn is not None and conn.handshake_done else None
+            seg_views = conn.seg_views if conn is not None else []
 
         # Buddy alloc + SHM write outside conn_lock (only Rust mutex needed).
         frame: bytes | None = None
@@ -218,9 +219,8 @@ class IPCv3Server(BaseServer):
                         alloc.seg_idx, alloc.offset, total_wire, True,
                     )
                     raise ValueError('dedicated segment, inline fallback')
-                shm_buf = memoryview(
-                    (ctypes.c_char * total_wire).from_address(addr)
-                ).cast('B')
+                seg_mv = seg_views[alloc.seg_idx]
+                shm_buf = seg_mv[alloc.offset : alloc.offset + total_wire]
                 write_reply_into(shm_buf, 0, err_bytes, result_bytes)
                 frame = encode_buddy_reply_frame(
                     int_rid, alloc.seg_idx, alloc.offset,
@@ -403,8 +403,9 @@ class IPCv3Server(BaseServer):
             if conn.buddy_pool is None:
                 logger.warning('Conn %d: buddy frame before handshake', conn.conn_id)
                 return None
-            # Read directly via Rust FFI — avoids ctypes array/memoryview overhead.
-            wire_bytes = conn.buddy_pool.read_at(seg_idx, offset, data_size, is_dedicated)
+            # Read from cached memoryview (no FFI for data copy).
+            seg_mv = conn.seg_views[seg_idx]
+            wire_bytes = bytes(seg_mv[offset : offset + data_size])
             # Consumer frees: server frees request blocks after reading.
             try:
                 conn.buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)
@@ -442,6 +443,16 @@ class IPCv3Server(BaseServer):
                 conn.buddy_pool.open_segment(name, size)
                 conn.remote_segment_names.append(name)
                 conn.remote_segment_sizes.append(size)
+
+            # Cache persistent memoryview for each opened segment data region.
+            conn.seg_views = []
+            for seg_idx in range(conn.buddy_pool.segment_count()):
+                base_addr, data_size = conn.buddy_pool.seg_data_info(seg_idx)
+                mv = memoryview(
+                    (ctypes.c_char * data_size).from_address(base_addr)
+                ).cast('B')
+                conn.seg_views.append(mv)
+
             conn.handshake_done = True
         except Exception as e:
             logger.error('Failed to open buddy segments: %s', e)
@@ -459,7 +470,7 @@ class BuddyConnection:
     __slots__ = (
         'conn_id', 'writer', 'config', 'buddy_pool',
         'remote_segment_names', 'remote_segment_sizes',
-        'handshake_done', 'last_activity',
+        'handshake_done', 'last_activity', 'seg_views',
     )
 
     def __init__(self, conn_id: int, writer: asyncio.StreamWriter, config: IPCConfig):
@@ -471,8 +482,10 @@ class BuddyConnection:
         self.remote_segment_sizes: list[int] = []
         self.handshake_done = False
         self.last_activity = time.monotonic()
+        self.seg_views: list[memoryview] = []
 
     def cleanup(self) -> None:
+        self.seg_views = []
         if self.buddy_pool is not None:
             try:
                 self.buddy_pool.destroy()

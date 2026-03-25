@@ -273,6 +273,20 @@ impl BuddyPool {
         }
     }
 
+    /// Get the data region base address and size for a buddy segment.
+    ///
+    /// Returns (data_base_addr, data_region_size) where data_base_addr is the
+    /// raw pointer to offset 0 within the data region.  Useful for creating
+    /// a persistent memoryview covering the whole data region.
+    pub fn seg_data_info(&self, seg_idx: u16) -> Result<(*mut u8, usize), String> {
+        let seg = self
+            .segments
+            .get(seg_idx as usize)
+            .ok_or("invalid segment index")?;
+        let alloc = seg.allocator();
+        Ok((alloc.data_ptr(0), alloc.data_size()))
+    }
+
     /// Get a raw pointer to data at a specific (seg_idx, offset) without a PoolAllocation.
     ///
     /// Used by the remote side of a connection to read from SHM blocks allocated

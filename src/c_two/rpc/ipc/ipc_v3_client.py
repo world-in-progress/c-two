@@ -75,6 +75,7 @@ class IPCv3Client(BaseClient):
         # Buddy pool (owned by client, shared with server).
         self._buddy_pool = None  # c2_buddy.BuddyPoolHandle
         self._pool_handshake_done = False
+        self._seg_views: list[memoryview] = []  # Cached segment data region views
 
     # ------------------------------------------------------------------
     # Connection management
@@ -102,6 +103,7 @@ class IPCv3Client(BaseClient):
                 pass
             self._sock = None
         self._pool_handshake_done = False
+        self._seg_views = []
         if self._buddy_pool is not None:
             try:
                 self._buddy_pool.destroy()
@@ -154,6 +156,15 @@ class IPCv3Client(BaseClient):
         if not (flags & (1 << 2)):  # FLAG_HANDSHAKE
             logger.warning('Expected handshake ACK, got flags=%d', flags)
 
+        # Cache a persistent memoryview for each buddy segment data region.
+        self._seg_views = []
+        for seg_idx in range(self._buddy_pool.segment_count()):
+            base_addr, data_size = self._buddy_pool.seg_data_info(seg_idx)
+            mv = memoryview(
+                (ctypes.c_char * data_size).from_address(base_addr)
+            ).cast('B')
+            self._seg_views.append(mv)
+
         self._pool_handshake_done = True
         logger.debug('Buddy handshake complete, pool segment: %s', seg_name)
 
@@ -190,9 +201,8 @@ class IPCv3Client(BaseClient):
                         )
                         sock.sendall(frame)
                     else:
-                        shm_buf = memoryview(
-                            (ctypes.c_char * wire_size).from_address(addr)
-                        ).cast('B')
+                        seg_mv = self._seg_views[alloc.seg_idx]
+                        shm_buf = seg_mv[alloc.offset : alloc.offset + wire_size]
                         write_call_into(shm_buf, 0, method_name, args)
 
                         frame = encode_buddy_call_frame(
@@ -243,9 +253,8 @@ class IPCv3Client(BaseClient):
                         frame = encode_frame(request_id, 0, event_bytes)
                         sock.sendall(frame)
                     else:
-                        shm_buf = memoryview(
-                            (ctypes.c_char * wire_size).from_address(addr)
-                        ).cast('B')
+                        seg_mv = self._seg_views[alloc.seg_idx]
+                        shm_buf = seg_mv[alloc.offset : alloc.offset + wire_size]
                         shm_buf[:wire_size] = event_bytes
                         frame = encode_buddy_call_frame(
                             request_id, alloc.seg_idx, alloc.offset,
@@ -286,8 +295,9 @@ class IPCv3Client(BaseClient):
                 seg_idx, offset, data_size, is_dedicated = decode_buddy_payload(payload)
                 if self._buddy_pool is None:
                     raise error.CompoClientError('Buddy response but no pool')
-                # Read directly via Rust FFI — avoids ctypes overhead.
-                data = self._buddy_pool.read_at(seg_idx, offset, data_size, is_dedicated)
+                # Read directly from cached memoryview (no FFI for data copy).
+                seg_mv = self._seg_views[seg_idx]
+                data = bytes(seg_mv[offset : offset + data_size])
                 # Consumer frees response blocks.
                 try:
                     self._buddy_pool.free_at(seg_idx, offset, data_size, is_dedicated)

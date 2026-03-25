@@ -412,6 +412,19 @@ impl PyBuddyPoolHandle {
         Ok(pool.segment_name(idx).map(|s| s.to_string()))
     }
 
+    /// Get the data region base address and size for a buddy segment.
+    ///
+    /// Returns (data_base_addr, data_region_size).  Python creates a persistent
+    /// memoryview from this instead of per-request ctypes arrays.
+    fn seg_data_info(&self, seg_idx: u16) -> PyResult<(usize, usize)> {
+        let pool = self.pool.lock().map_err(|e| {
+            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
+        })?;
+        let (ptr, size) = pool.seg_data_info(seg_idx)
+            .map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok((ptr as usize, size))
+    }
+
     /// Open a remote buddy segment (for the other side of a connection).
     fn open_segment(&self, name: &str, size: usize) -> PyResult<usize> {
         let mut pool = self.pool.lock().map_err(|e| {
