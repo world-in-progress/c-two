@@ -168,6 +168,12 @@ impl BuddyAllocator {
     /// # Safety
     /// `base` must point to a valid SHM region with a properly initialized header.
     pub unsafe fn attach(base: *mut u8, total_size: usize) -> Result<Self, &'static str> {
+        // R-C3: Verify alignment for SegmentHeader access in attach path too.
+        assert!(
+            base as usize % std::mem::align_of::<SegmentHeader>() == 0,
+            "SHM base address must be aligned to SegmentHeader requirements"
+        );
+
         // SAFETY: caller guarantees `base` is a valid, initialized SHM pointer.
         let header = unsafe { &*(base as *const SegmentHeader) };
         if header.magic != SEGMENT_MAGIC {
