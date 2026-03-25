@@ -295,6 +295,22 @@ impl DedicatedSegment {
                 ));
             }
 
+            // R-I6: Validate actual SHM size before mapping to prevent SIGBUS.
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut stat) < 0 {
+                let err = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(format!("fstat failed: {err}"));
+            }
+            let actual_size = stat.st_size as usize;
+            if actual_size < size {
+                libc::close(fd);
+                return Err(format!(
+                    "dedicated SHM segment too small: actual {} < expected {}",
+                    actual_size, size
+                ));
+            }
+
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
                 size,
