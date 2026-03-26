@@ -321,9 +321,6 @@ class IPCv3Server(BaseServer):
                     if (blob_part.obj is seg_obj
                             and req_seg_idx < len(seg_views)
                             and hdr_len + blob_len == payload_len):
-                        # Verify blob is at the expected position: the output
-                        # header size must match the input header size so the
-                        # blob doesn't need to shift.
                         seg_mv = seg_views[req_seg_idx]
                         seg_addr = ctypes.addressof(
                             (ctypes.c_char * 1).from_buffer(seg_mv))
@@ -338,9 +335,6 @@ class IPCv3Server(BaseServer):
                                 seg_mv[reply_start] = MsgType.CRM_REPLY
                                 struct.pack_into('<I', seg_mv,
                                                  reply_start + 1, 0)
-                                # Write serialize header (overwrites the
-                                # original — may differ if CRM transformed
-                                # metadata fields).
                                 seg_mv[payload_offset:
                                        payload_offset + hdr_len] = hdr_part
                                 # Blob stays in place — zero copy!

@@ -451,41 +451,49 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
 
 def auto_transfer(func: callable | None = None) -> callable:
     def create_wrapper(func: callable) -> callable:
-        # --- Input Matching using Pydantic Model Comparison ---
+        # --- Input Matching ---
+        # Priority 1: Direct Transferable lookup — if the method has exactly
+        # one non-self parameter whose type is a registered Transferable,
+        # use it directly (same strategy as the output matcher).
         input_model = _create_pydantic_model_from_func_sig(func)
         input_transferable: Transferable | None = None
 
         if input_model is not None:
-            # Get fields from the generated Pydantic model
             input_model_fields = getattr(input_model, 'model_fields', {})
-
             is_empty_input = not bool(input_model_fields)
-            if not is_empty_input:
-                for info in _TRANSFERABLE_INFOS:
-                    # Safe matching, ensure module names match
-                    if info.get('module') != func.__module__:
-                        continue
-                    
-                    registered_param_map = info.get('param_map', {})
-                    is_empty_registered = not bool(registered_param_map)
 
-                    # Match if field names and types align
-                    if not is_empty_input and not is_empty_registered:
-                        # Compare names first
-                        if set(input_model_fields.keys()) == set(registered_param_map.keys()):
-                            # Compare types
-                            match = True
-                            for name, field_info in input_model_fields.items():
-                                # Get the type annotation from Pydantic's FieldInfo
-                                pydantic_type = field_info.annotation
-                                registered_type = registered_param_map.get(name)
-                                # Simple type comparison (TODO: might need refinement for complex types like generics)
-                                if pydantic_type != registered_type:
-                                    match = False
+            if not is_empty_input:
+                # Direct lookup: single-param whose type is a registered
+                # Transferable gets matched without fragile name/type
+                # comparison against serialize() signatures.
+                if len(input_model_fields) == 1:
+                    field_info = next(iter(input_model_fields.values()))
+                    param_type = field_info.annotation
+                    param_module = getattr(param_type, '__module__', None)
+                    param_name = getattr(param_type, '__name__', str(param_type))
+                    full_name = f'{param_module}.{param_name}' if param_module else param_name
+                    if full_name in _TRANSFERABLE_MAP:
+                        input_transferable = get_transferable(full_name)
+
+                # Priority 2: Field name+type comparison (legacy path).
+                if input_transferable is None:
+                    for info in _TRANSFERABLE_INFOS:
+                        if info.get('module') != func.__module__:
+                            continue
+                        registered_param_map = info.get('param_map', {})
+                        is_empty_registered = not bool(registered_param_map)
+                        if not is_empty_input and not is_empty_registered:
+                            if set(input_model_fields.keys()) == set(registered_param_map.keys()):
+                                match = True
+                                for name, fi in input_model_fields.items():
+                                    pydantic_type = fi.annotation
+                                    registered_type = registered_param_map.get(name)
+                                    if pydantic_type != registered_type:
+                                        match = False
+                                        break
+                                if match:
+                                    input_transferable = get_transferable(info['name'])
                                     break
-                            if match:
-                                input_transferable = get_transferable(info['name'])
-                                break
 
             # If no matching transferable found, create a default one (not registered and only used in this function)
             if input_transferable is None and not is_empty_input:
