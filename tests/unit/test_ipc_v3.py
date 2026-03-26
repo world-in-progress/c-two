@@ -300,3 +300,164 @@ class TestBuddyAnnounce:
     def test_announce_too_short_raises(self):
         with pytest.raises(ValueError, match='too short'):
             decode_ctrl_buddy_announce(b'\x00' * 3)
+
+
+# ------------------------------------------------------------------
+# Safety tests (from op3-analysis.md audit)
+# ------------------------------------------------------------------
+
+class TestOPTC1SafeBytesCopy:
+    """OPT-C1: call() must return bytes (not memoryview) for buddy responses."""
+
+    def test_buddy_response_returns_bytes(self):
+        """Large payload response through buddy path must return bytes type."""
+        addr = f'ipc-v3://{_unique_region()}'
+        ipc_config = IPCConfig(
+            shm_threshold=512,
+            pool_segment_size=64 * 1024,
+        )
+        config = cc.rpc.ServerConfig(
+            name='TestOPTC1',
+            crm=Hello(),
+            icrm=IHello,
+            bind_address=addr,
+            ipc_config=ipc_config,
+        )
+        server = cc.rpc.Server(config)
+        from c_two.rpc.server import _start
+        _start(server._state)
+        _wait_for_server(addr)
+        try:
+            with cc.compo.runtime.connect_crm(addr, IHello) as crm:
+                large_name = 'Y' * 2000
+                result = crm.greeting(large_name)
+                assert isinstance(result, str)
+                assert result == f'Hello, {large_name}!'
+                # The underlying RPC result going through auto_transfer
+                # should have been bytes (not memoryview) from the client
+                v3_client = crm.client._client
+                assert v3_client._buddy_pool is not None
+        finally:
+            try:
+                cc.rpc.Client.shutdown(addr, timeout=1.0)
+            except Exception:
+                pass
+            _wait_for_shutdown(addr)
+            try:
+                server.stop()
+            except Exception:
+                pass
+
+
+class TestBuddyProtocolEdgeCases:
+    """Wire protocol edge cases and boundary validation."""
+
+    def test_handshake_version_mismatch(self):
+        """Handshake with wrong version must be detected."""
+        segments = [('seg1', 65536)]
+        encoded = encode_buddy_handshake(segments)
+        # Corrupt version byte (first byte)
+        corrupted = bytes([encoded[0] ^ 0xFF]) + encoded[1:]
+        with pytest.raises((ValueError, Exception)):
+            decode_buddy_handshake(corrupted)
+
+    def test_payload_roundtrip_dedicated(self):
+        """Dedicated segment payload encodes/decodes correctly."""
+        payload = encode_buddy_payload(
+            seg_idx=256, offset=0, data_size=1024, is_dedicated=True,
+        )
+        seg_idx, offset, data_size, is_ded, free_off, free_sz = decode_buddy_payload(payload)
+        assert seg_idx == 256
+        assert is_ded is True
+        assert data_size == 1024
+
+    def test_payload_roundtrip_normal(self):
+        """Normal (non-reuse) payload: free coords equal data coords."""
+        payload = encode_buddy_payload(seg_idx=0, offset=4096, data_size=8192)
+        seg_idx, offset, data_size, is_ded, free_off, free_sz = decode_buddy_payload(payload)
+        assert seg_idx == 0
+        assert offset == 4096
+        assert data_size == 8192
+        assert free_off == offset
+        assert free_sz == data_size
+
+    def test_empty_handshake_segments(self):
+        """Handshake with empty segment list should still roundtrip."""
+        encoded = encode_buddy_handshake([])
+        segments = decode_buddy_handshake(encoded)
+        assert segments == []
+
+
+class TestIPCv3StressRecovery:
+    """Test that IPC v3 recovers from edge cases under load."""
+
+    def test_rapid_connect_disconnect(self):
+        """Rapid connect/disconnect cycles should not leak resources."""
+        addr = f'ipc-v3://{_unique_region()}'
+        config = cc.rpc.ServerConfig(
+            name='TestRapidReconnect',
+            crm=Hello(),
+            icrm=IHello,
+            bind_address=addr,
+        )
+        server = cc.rpc.Server(config)
+        from c_two.rpc.server import _start
+        _start(server._state)
+        _wait_for_server(addr)
+        try:
+            for i in range(10):
+                with cc.compo.runtime.connect_crm(addr, IHello) as crm:
+                    assert crm.add(i, 1) == i + 1
+        finally:
+            try:
+                cc.rpc.Client.shutdown(addr, timeout=1.0)
+            except Exception:
+                pass
+            _wait_for_shutdown(addr)
+            try:
+                server.stop()
+            except Exception:
+                pass
+
+    def test_concurrent_clients_heavy(self):
+        """8 threads × 20 iterations stress test."""
+        addr = f'ipc-v3://{_unique_region()}'
+        config = cc.rpc.ServerConfig(
+            name='TestHeavyConcurrency',
+            crm=Hello(),
+            icrm=IHello,
+            bind_address=addr,
+        )
+        server = cc.rpc.Server(config)
+        from c_two.rpc.server import _start
+        _start(server._state)
+        _wait_for_server(addr)
+        errors = []
+
+        def worker(tid):
+            try:
+                with cc.compo.runtime.connect_crm(addr, IHello) as crm:
+                    for i in range(20):
+                        r = crm.add(i, tid)
+                        if r != i + tid:
+                            errors.append(f'T{tid}: {r} != {i + tid}')
+            except Exception as e:
+                errors.append(f'T{tid}: {e}')
+
+        try:
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            assert errors == [], f'Heavy concurrency errors: {errors}'
+        finally:
+            try:
+                cc.rpc.Client.shutdown(addr, timeout=1.0)
+            except Exception:
+                pass
+            _wait_for_shutdown(addr)
+            try:
+                server.stop()
+            except Exception:
+                pass

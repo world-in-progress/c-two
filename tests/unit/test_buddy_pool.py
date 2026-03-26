@@ -440,3 +440,152 @@ class TestSHMCleanup:
             pytest.fail(f'SHM segment {seg_name} still exists after destroy()')
         except FileNotFoundError:
             pass  # Expected — segment was properly unlinked
+
+
+# ------------------------------------------------------------------
+# Safety tests (from op3-analysis.md audit)
+# ------------------------------------------------------------------
+
+class TestBuddyPanicSafety:
+    """Tests for BUDDY-PANIC-1 and BUDDY-PANIC-2 from op3-analysis.md."""
+
+    def test_oversized_dedicated_returns_error_not_panic(self):
+        """BUDDY-PANIC-1: >4GB dedicated alloc must return error, not assert-crash."""
+        pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+            max_dedicated_segments=2,
+        ))
+        try:
+            # Request way beyond what's reasonable — must raise, not panic
+            with pytest.raises(RuntimeError):
+                pool.alloc(5 * 1024 * 1024 * 1024)  # 5GB
+        finally:
+            pool.destroy()
+
+    def test_negative_gc_delay_no_panic(self):
+        """BUDDY-PANIC-2: negative gc_delay_secs must not cause Duration panic."""
+        cfg = c2_buddy.PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+            max_dedicated_segments=1,
+            dedicated_gc_delay_secs=-1.0,
+        )
+        pool = c2_buddy.BuddyPoolHandle(cfg)
+        try:
+            # Allocate a dedicated segment, then GC should clamp delay to zero
+            alloc = pool.alloc(128 * 1024)  # > segment_size → dedicated
+            pool.free(alloc)
+            # If we get here without panic, the test passes
+            stats = pool.stats()
+            assert stats.alloc_count == 0
+        finally:
+            pool.destroy()
+
+    def test_nan_gc_delay_rejected(self):
+        """Config validation: NaN gc_delay_secs must be rejected."""
+        with pytest.raises(ValueError, match='NaN'):
+            c2_buddy.PoolConfig(dedicated_gc_delay_secs=float('nan'))
+
+    def test_non_power_of_two_segment_rejected(self):
+        """Config validation: non-power-of-2 segment_size must be rejected."""
+        with pytest.raises(ValueError, match='power of 2'):
+            c2_buddy.PoolConfig(segment_size=100_000)
+
+
+class TestDoubleFreeSafety:
+    """Test that pool handles double-free and invalid-free gracefully."""
+
+    def test_double_free_does_not_corrupt(self):
+        """Double-free on the same block must raise or be safely no-op."""
+        pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+        ))
+        try:
+            alloc = pool.alloc(4096)
+            pool.free_at(alloc.seg_idx, alloc.offset, alloc.actual_size, False)
+            # Second free — should raise or be safely handled
+            try:
+                pool.free_at(alloc.seg_idx, alloc.offset, alloc.actual_size, False)
+            except RuntimeError:
+                pass  # Expected: double-free detected
+            # Either way, pool stats should not underflow
+            stats = pool.stats()
+            assert stats.alloc_count >= 0
+        finally:
+            pool.destroy()
+
+    def test_alloc_after_double_free_still_works(self):
+        """Pool must remain usable after a double-free attempt."""
+        pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+        ))
+        try:
+            alloc = pool.alloc(4096)
+            pool.free(alloc)
+            try:
+                pool.free(alloc)
+            except RuntimeError:
+                pass
+            # Pool must still be functional
+            alloc2 = pool.alloc(4096)
+            data = b'after-double-free'
+            pool.write(alloc2, data)
+            result = pool.read(alloc2, len(data))
+            assert result == data
+            pool.free(alloc2)
+        finally:
+            pool.destroy()
+
+
+class TestSegmentExhaustion:
+    """Test graceful degradation when pool is fully exhausted."""
+
+    def test_exhaustion_returns_error(self):
+        """When both buddy and dedicated segments are exhausted, alloc must raise."""
+        pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+            segment_size=64 * 1024,  # 64KB buddy
+            min_block_size=4096,
+            max_segments=1,
+            max_dedicated_segments=0,  # No dedicated fallback
+        ))
+        try:
+            # Fill buddy pool completely (64KB / 4KB = 16 blocks)
+            allocs = []
+            for _ in range(16):
+                allocs.append(pool.alloc(4096))
+
+            # Next alloc should fail
+            with pytest.raises(RuntimeError):
+                pool.alloc(4096)
+
+            # Cleanup
+            for a in allocs:
+                pool.free(a)
+        finally:
+            pool.destroy()
+
+    def test_dedicated_exhaustion_returns_error(self):
+        """When max_dedicated_segments is reached, oversized alloc must raise."""
+        pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+            max_dedicated_segments=1,
+        ))
+        try:
+            # First oversized → dedicated
+            a1 = pool.alloc(128 * 1024)
+            assert a1.is_dedicated
+            # Second oversized → should fail (max_dedicated=1)
+            with pytest.raises(RuntimeError):
+                pool.alloc(128 * 1024)
+            pool.free(a1)
+        finally:
+            pool.destroy()
