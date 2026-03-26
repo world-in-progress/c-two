@@ -317,13 +317,21 @@ class IPCv3Server(BaseServer):
                     total_wire, alloc.is_dedicated,
                 )
             except Exception:
-                # Alloc failed or dedicated — if result is memoryview into the
-                # request SHM block, materialize it, free the request block to
-                # reclaim space, and retry.
+                # Alloc failed or dedicated — materialize any references into
+                # the request SHM block before freeing it, then retry.
                 if isinstance(result_bytes, memoryview):
                     result_bytes = bytes(result_bytes)
-                    result_len = len(result_bytes)
-                    total_wire = reply_wire_size(err_len, result_len)
+                elif isinstance(result_bytes, (tuple, list)):
+                    # Scatter-write tuples may contain memoryview segments
+                    # pointing into the request SHM block — flatten to bytes
+                    # to avoid aliasing corruption when the retry alloc reuses
+                    # the same block.
+                    result_bytes = b''.join(
+                        bytes(s) if isinstance(s, memoryview) else s
+                        for s in result_bytes
+                    )
+                result_len = payload_total_size(result_bytes)
+                total_wire = reply_wire_size(err_len, result_len)
                 self._free_deferred(rid_key)
                 freed_deferred = True
                 try:
