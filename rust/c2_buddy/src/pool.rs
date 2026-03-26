@@ -188,7 +188,12 @@ impl BuddyPool {
 
     /// Run garbage collection on freed dedicated segments.
     pub fn gc_dedicated(&mut self) {
-        let delay = std::time::Duration::from_secs_f64(self.config.dedicated_gc_delay_secs);
+        let secs = self.config.dedicated_gc_delay_secs;
+        let delay = if secs < 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(secs)
+        };
         let now = Instant::now();
         let to_remove: Vec<u32> = self
             .dedicated
@@ -398,10 +403,11 @@ impl BuddyPool {
             .expect("dedicated segment index overflow");
 
         // R-I2: Guard against u32 truncation for dedicated segment size.
-        assert!(
-            seg.size() <= u32::MAX as usize,
-            "dedicated segment exceeds 4GB limit"
-        );
+        if seg.size() > u32::MAX as usize {
+            return Err(format!(
+                "dedicated segment size {} exceeds 4GB limit", seg.size()
+            ));
+        }
         let alloc_size = seg.size() as u32;
         self.dedicated.insert(
             idx,

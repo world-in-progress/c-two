@@ -54,6 +54,12 @@ impl PyPoolConfig {
                 "segment_size must be at least 2x min_block_size",
             ));
         }
+        if !segment_size.is_power_of_two() {
+            return Err(PyValueError::new_err("segment_size must be a power of 2"));
+        }
+        if dedicated_gc_delay_secs.is_nan() {
+            return Err(PyValueError::new_err("dedicated_gc_delay_secs must not be NaN"));
+        }
         Ok(Self {
             segment_size,
             min_block_size,
