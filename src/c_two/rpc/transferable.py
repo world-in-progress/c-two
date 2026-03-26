@@ -73,7 +73,13 @@ class Transferable(metaclass=TransferableMeta):
     Transferable classes are automatically converted to `dataclasses` and should implement the methods:
     - serialize: convert runtime `args` to `bytes` message
     - deserialize: convert `bytes` message to runtime `args`
+
+    Set ``__memoryview_aware__ = True`` on subclasses whose ``deserialize``
+    accepts ``memoryview`` directly (avoids a full ``bytes()`` copy on the
+    IPC hot path).
     """
+    __memoryview_aware__: bool = False
+
     def serialize(*args: any) -> bytes:
         """
         serialize is a static method, and the decorator @staticmethod is added in the metaclass.  
@@ -102,7 +108,14 @@ def _default_serialize_func(*args):
         raise
 
 def _default_deserialize_func(data: memoryview | None):
-    return pickle.loads(data) if data else None
+    # b'' is used as a wire sentinel for None results (see crm_to_com:
+    # serialized_result = b'' when result is None).  Must check both
+    # None *and* empty bytes so the sentinel round-trips correctly,
+    # while still allowing legitimate empty-bytes payloads when the
+    # serializer actually produces them (pickle.dumps(b'') is non-empty).
+    if data is None or len(data) == 0:
+        return None
+    return pickle.loads(data)
 
 def _is_single_bytes_param(func, filtered_params, type_hints) -> bool:
     """Check if a function takes exactly one parameter of type bytes."""
@@ -154,6 +167,7 @@ def create_default_transferable(func, is_input: bool):
         if _is_single_bytes_param(func, filtered_params, type_hints):
             class DynamicInputTransferable(Transferable):
                 __module__ = 'Default'
+                __memoryview_aware__ = True
 
                 def serialize(data) -> bytes:
                     if isinstance(data, (bytes, memoryview)):
@@ -195,8 +209,10 @@ def create_default_transferable(func, is_input: bool):
                     Returns either the original dict mapping or tuple of args.
                     """
                     try:
-                        # Handle None case
-                        if not data:
+                        # Handle None / empty-bytes sentinel.  The wire layer
+                        # sends b'' when no args are provided (request is None),
+                        # so we must treat empty bytes the same as None here.
+                        if data is None or len(data) == 0:
                             return None
                         
                         unpickled = pickle.loads(data)
@@ -258,14 +274,17 @@ def create_default_transferable(func, is_input: bool):
             deserialize_func = staticmethod(_default_deserialize_func)
 
         # Define the dynamic transferable class for output
+        attrs = {
+            '__module__': 'Default',
+            'serialize': serialize_func,
+            'deserialize': deserialize_func,
+        }
+        if return_type is bytes:
+            attrs['__memoryview_aware__'] = True
         DynamicOutputTransferable = type(
             class_name,
             (Transferable,),
-            {
-                '__module__': 'Default',  # mark as default
-                'serialize': serialize_func,
-                'deserialize': deserialize_func,
-            }
+            attrs,
         )
         
         # Set the dynamic class properties
@@ -332,7 +351,13 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 
                 # Deserialize output
                 stage = 'deserialize_output'
-                return None if not output_transferable else output_transferable(result_bytes)
+                if not output_transferable:
+                    return None
+                # Convert memoryview→bytes for legacy deserializers that don't handle memoryview.
+                if (not getattr(output, '__memoryview_aware__', False)
+                        and isinstance(result_bytes, memoryview)):
+                    result_bytes = bytes(result_bytes)
+                return output_transferable(result_bytes)
             
             except error.CCBaseError:
                 raise
@@ -364,7 +389,14 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 
                 # Deserialize input args if input_transferable is provided
                 # And if deserialized_args is not a tuple, convert it to a tuple
-                deserialized_args = input_transferable(request) if (request is not None and input_transferable is not None) else tuple()
+                if request is not None and input_transferable is not None:
+                    # Convert memoryview→bytes for legacy deserializers.
+                    if (not getattr(input, '__memoryview_aware__', False)
+                            and isinstance(request, memoryview)):
+                        request = bytes(request)
+                    deserialized_args = input_transferable(request)
+                else:
+                    deserialized_args = tuple()
                 if not isinstance(deserialized_args, tuple):
                     deserialized_args = (deserialized_args,)
 
