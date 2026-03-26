@@ -96,6 +96,7 @@ impl BuddyPool {
 
     /// Create a new pool with a custom name prefix (for testing / multi-pool).
     pub fn new_with_prefix(config: PoolConfig, name_prefix: String) -> Self {
+        Self::validate_config(&config).expect("invalid PoolConfig");
         Self {
             config,
             segments: Vec::new(),
@@ -104,6 +105,26 @@ impl BuddyPool {
             name_prefix,
             next_dedicated_idx: 256,
         }
+    }
+
+    /// Validate pool configuration, returning Err on invalid values.
+    pub fn validate_config(config: &PoolConfig) -> Result<(), String> {
+        if config.min_block_size == 0 || !config.min_block_size.is_power_of_two() {
+            return Err(format!(
+                "min_block_size must be a positive power of 2, got {}",
+                config.min_block_size
+            ));
+        }
+        if config.segment_size < 2 * config.min_block_size {
+            return Err(format!(
+                "segment_size ({}) must be >= 2 * min_block_size ({})",
+                config.segment_size, config.min_block_size
+            ));
+        }
+        if config.dedicated_gc_delay_secs.is_nan() {
+            return Err("dedicated_gc_delay_secs must not be NaN".into());
+        }
+        Ok(())
     }
 
     /// Allocate memory from the pool.
@@ -569,5 +590,56 @@ mod tests {
     fn test_zero_alloc_fails() {
         let mut pool = test_pool(small_config());
         assert!(pool.alloc(0).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid PoolConfig")]
+    fn test_validate_zero_min_block() {
+        let config = PoolConfig {
+            min_block_size: 0,
+            ..small_config()
+        };
+        test_pool(config);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid PoolConfig")]
+    fn test_validate_non_power_of_two_min_block() {
+        let config = PoolConfig {
+            min_block_size: 3000,
+            ..small_config()
+        };
+        test_pool(config);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid PoolConfig")]
+    fn test_validate_segment_too_small() {
+        let config = PoolConfig {
+            segment_size: 4096,
+            min_block_size: 4096,
+            ..small_config()
+        };
+        test_pool(config);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid PoolConfig")]
+    fn test_validate_nan_gc_delay() {
+        let config = PoolConfig {
+            dedicated_gc_delay_secs: f64::NAN,
+            ..small_config()
+        };
+        test_pool(config);
+    }
+
+    #[test]
+    fn test_validate_negative_gc_delay_ok() {
+        // Negative gc_delay is allowed (clamped to 0 at runtime)
+        let config = PoolConfig {
+            dedicated_gc_delay_secs: -1.0,
+            ..small_config()
+        };
+        let _pool = test_pool(config);
     }
 }
