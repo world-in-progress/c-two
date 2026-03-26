@@ -456,11 +456,26 @@ impl PyBuddyPoolHandle {
     }
 }
 
+/// Clean up stale SHM segments left by crashed processes.
+///
+/// Scans for SHM segments matching the "cc3b" prefix pattern, extracts the
+/// PID from each name, and unlinks segments whose owner is no longer alive.
+/// Returns the number of segments removed.
+///
+/// On macOS, returns 0 (POSIX SHM cannot be enumerated without /dev/shm).
+#[pyfunction]
+#[pyo3(signature = (prefix="cc3b"))]
+fn cleanup_stale_shm(prefix: &str) -> usize {
+    use crate::pool::BuddyPool;
+    BuddyPool::cleanup_stale_segments(prefix)
+}
+
 /// Register the c2_buddy Python module.
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPoolConfig>()?;
     m.add_class::<PyPoolAlloc>()?;
     m.add_class::<PyPoolStats>()?;
     m.add_class::<PyBuddyPoolHandle>()?;
+    m.add_function(wrap_pyfunction!(cleanup_stale_shm, m)?)?;
     Ok(())
 }

@@ -24,7 +24,7 @@ const RECOVERY_CHECK_SPINS: u32 = 5_000_000;
 
 /// Check if a process is alive using kill(pid, 0).
 #[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     // kill(pid, 0) returns 0 if the process exists and we can signal it,
     // or -1 with EPERM if it exists but we lack permission (still alive).
     // Returns -1 with ESRCH if the process does not exist.
@@ -37,7 +37,7 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_process_alive(_pid: u32) -> bool {
+pub(crate) fn is_process_alive(_pid: u32) -> bool {
     true // Conservative: assume alive on non-Unix
 }
 

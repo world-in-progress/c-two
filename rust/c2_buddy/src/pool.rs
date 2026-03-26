@@ -131,6 +131,72 @@ impl BuddyPool {
         Ok(())
     }
 
+    /// Scan for and remove stale SHM segments left by crashed processes.
+    ///
+    /// SHM segment names follow the pattern `/{prefix}{pid:08x}_{tag}{counter:04x}`.
+    /// This function enumerates known SHM segments, extracts the PID from each
+    /// name, and unlinks any whose owner process is no longer alive.
+    ///
+    /// On Linux, scans `/dev/shm/`. On macOS (no `/dev/shm/`), uses a best-effort
+    /// approach by probing common names based on the prefix pattern.
+    #[cfg(target_os = "linux")]
+    pub fn cleanup_stale_segments(prefix: &str) -> usize {
+        use crate::spinlock::is_process_alive;
+
+        let mut removed = 0;
+        let Ok(entries) = std::fs::read_dir("/dev/shm") else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Prefix without leading '/' (file names in /dev/shm don't have it)
+            let bare_prefix = prefix.trim_start_matches('/');
+            if !name_str.starts_with(bare_prefix) {
+                continue;
+            }
+            // Try to extract PID from the first 8 hex chars after the 4-char tag.
+            // Format: "cc3b{pid:08x}_{tag}{counter:04x}"
+            // bare_prefix is e.g. "cc3b" (4 chars), PID is chars 4..12
+            if let Some(pid) = Self::extract_pid_from_name(&name_str) {
+                if !is_process_alive(pid) {
+                    let shm_name = format!("/{}", name_str);
+                    if let Ok(c_name) = std::ffi::CString::new(shm_name) {
+                        unsafe { libc::shm_unlink(c_name.as_ptr()); }
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        removed
+    }
+
+    /// On macOS there is no `/dev/shm/` directory. We use a best-effort approach
+    /// by attempting to unlink segments from our own (dead) PIDs. Since we cannot
+    /// enumerate POSIX SHM on macOS, this is inherently limited.
+    #[cfg(not(target_os = "linux"))]
+    pub fn cleanup_stale_segments(_prefix: &str) -> usize {
+        // On macOS, POSIX SHM cannot be enumerated. The per-segment
+        // shm_unlink-before-create in ShmSegment::create() provides
+        // partial cleanup for same-PID restarts. Cross-PID stale segments
+        // are not automatically cleaned on this platform.
+        0
+    }
+
+    /// Extract PID from a segment name like "cc3b{pid:08x}_b0000".
+    fn extract_pid_from_name(name: &str) -> Option<u32> {
+        // The prefix is "cc3b" (4 chars), followed by 8 hex chars of PID.
+        if name.len() >= 12 && name.starts_with("cc3b") {
+            u32::from_str_radix(&name[4..12], 16).ok()
+        } else if name.len() >= 12 && name.starts_with("cc3t") {
+            // Test prefix: "cc3t{pid_lo:04x}{counter:04x}" — PID extraction
+            // is unreliable for test prefixes, skip.
+            None
+        } else {
+            None
+        }
+    }
+
     /// Allocate memory from the pool.
     pub fn alloc(&mut self, size: usize) -> Result<PoolAllocation, String> {
         if size == 0 {

@@ -286,22 +286,36 @@ class IPCv3Server(BaseServer):
                         and result_bytes.obj is seg_obj):
                     reply_start = payload_offset - REPLY_HEADER_FIXED
                     if reply_start >= block_offset:
-                        seg_mv = seg_views[req_seg_idx]
-                        seg_mv[reply_start] = MsgType.CRM_REPLY
-                        struct.pack_into('<I', seg_mv, reply_start + 1, 0)
-                        reply_data_size = REPLY_HEADER_FIXED + payload_len
-                        frame = encode_buddy_reuse_reply_frame(
-                            int_rid, req_seg_idx, reply_start, reply_data_size,
-                            block_offset, alloc_size,
-                        )
-                        loop = self._loop
-                        if loop is not None:
-                            try:
-                                loop.call_soon_threadsafe(
-                                    self._resolve_future, fut, frame)
-                            except RuntimeError:
-                                pass
-                        return
+                        # Re-check connection still valid under lock before
+                        # writing SHM — prevents race with per-connection
+                        # cleanup which unmaps the segment.
+                        with self._conn_lock:
+                            if conn_id not in self._connections:
+                                # Connection gone — fall through to
+                                # regular alloc+copy or inline.
+                                with self._deferred_frees_lock:
+                                    self._deferred_frees[rid_key] = info
+                                buddy_pool = None
+                            else:
+                                seg_mv = seg_views[req_seg_idx]
+                                seg_mv[reply_start] = MsgType.CRM_REPLY
+                                struct.pack_into('<I', seg_mv, reply_start + 1, 0)
+                        if buddy_pool is None:
+                            pass  # fall through below
+                        else:
+                            reply_data_size = REPLY_HEADER_FIXED + payload_len
+                            frame = encode_buddy_reuse_reply_frame(
+                                int_rid, req_seg_idx, reply_start, reply_data_size,
+                                block_offset, alloc_size,
+                            )
+                            loop = self._loop
+                            if loop is not None:
+                                try:
+                                    loop.call_soon_threadsafe(
+                                        self._resolve_future, fut, frame)
+                                except RuntimeError:
+                                    pass
+                            return
                 # Reuse failed — re-register deferred free so regular path
                 # or _free_deferred() can release the block.
                 with self._deferred_frees_lock:
@@ -340,27 +354,36 @@ class IPCv3Server(BaseServer):
                         if blob_seg_offset == expected_blob_offset:
                             reply_start = payload_offset - REPLY_HEADER_FIXED
                             if reply_start >= block_offset:
-                                # Write reply header (5 bytes).
-                                seg_mv[reply_start] = MsgType.CRM_REPLY
-                                struct.pack_into('<I', seg_mv,
-                                                 reply_start + 1, 0)
-                                seg_mv[payload_offset:
-                                       payload_offset + hdr_len] = hdr_part
-                                # Blob stays in place — zero copy!
-                                reply_data_size = (REPLY_HEADER_FIXED
-                                                   + hdr_len + blob_len)
-                                frame = encode_buddy_reuse_reply_frame(
-                                    int_rid, req_seg_idx, reply_start,
-                                    reply_data_size, block_offset, alloc_size,
-                                )
-                                loop = self._loop
-                                if loop is not None:
-                                    try:
-                                        loop.call_soon_threadsafe(
-                                            self._resolve_future, fut, frame)
-                                    except RuntimeError:
-                                        pass
-                                return
+                                # Re-check connection validity before SHM write.
+                                with self._conn_lock:
+                                    if conn_id not in self._connections:
+                                        with self._deferred_frees_lock:
+                                            self._deferred_frees[rid_key] = info
+                                        buddy_pool = None
+                                    else:
+                                        seg_mv[reply_start] = MsgType.CRM_REPLY
+                                        struct.pack_into('<I', seg_mv,
+                                                         reply_start + 1, 0)
+                                        seg_mv[payload_offset:
+                                               payload_offset + hdr_len] = hdr_part
+                                if buddy_pool is None:
+                                    pass  # fall through
+                                else:
+                                    # Blob stays in place — zero copy!
+                                    reply_data_size = (REPLY_HEADER_FIXED
+                                                       + hdr_len + blob_len)
+                                    frame = encode_buddy_reuse_reply_frame(
+                                        int_rid, req_seg_idx, reply_start,
+                                        reply_data_size, block_offset, alloc_size,
+                                    )
+                                    loop = self._loop
+                                    if loop is not None:
+                                        try:
+                                            loop.call_soon_threadsafe(
+                                                self._resolve_future, fut, frame)
+                                        except RuntimeError:
+                                            pass
+                                    return
                     # Scatter-reuse failed — re-register so regular path
                     # or _free_deferred() can release the block.
                     with self._deferred_frees_lock:
