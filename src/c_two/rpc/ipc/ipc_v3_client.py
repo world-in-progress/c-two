@@ -13,7 +13,6 @@ Ownership model (consumer frees):
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
 import logging
 import os
 import socket as _socket
@@ -63,17 +62,8 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 _CRM_REPLY_TYPE = int(MsgType.CRM_REPLY)
 _U32_LE = struct.Struct('<I')
 
-# Warm response buffer: use memmove to pre-faulted buffer for large responses
-# to avoid page-fault overhead from fresh bytes() allocation (4-5x faster for >= 1GB).
+# Large response threshold: above this we use buddy SHM path.
 _WARM_BUF_THRESHOLD = 1 * 1024 * 1024  # 1MB
-
-_libc = ctypes.CDLL(ctypes.util.find_library('c'))
-_libc.memmove.restype = ctypes.c_void_p
-_libc.memmove.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-_libc.memset.restype = ctypes.c_void_p
-_libc.memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
-_memmove = _libc.memmove
-_memset = _libc.memset
 
 
 def _resolve_socket_path(region_id: str) -> str:
@@ -98,11 +88,6 @@ class IPCv3Client(BaseClient):
         self._pool_handshake_done = False
         self._seg_views: list[memoryview] = []  # Cached segment data region views
         self._seg_base_addrs: list[int] = []    # Cached segment data base addresses
-
-        # Warm response buffer: pre-allocated bytearray with touched pages
-        # to avoid page-fault overhead on large buddy response copies.
-        self._response_buf: bytearray | None = None
-        self._response_buf_addr: int = 0
 
         # Deferred free: for scatter-reuse responses, keep the SHM block
         # alive until the next call so the caller gets a zero-copy
@@ -219,23 +204,16 @@ class IPCv3Client(BaseClient):
     # RPC call
     # ------------------------------------------------------------------
 
-    def _ensure_response_buf(self, needed: int) -> None:
-        """Ensure warm response buffer is large enough with pages pre-faulted."""
-        if self._response_buf is not None and len(self._response_buf) >= needed:
-            return
-        self._response_buf = bytearray(needed)
-        addr = ctypes.addressof(
-            (ctypes.c_char * needed).from_buffer(self._response_buf)
-        )
-        _memset(addr, 0, needed)
-        self._response_buf_addr = addr
-
     def call(self, method_name: str, data: bytes | None = None) -> bytes | memoryview:
         """Send a CRM_CALL and return the response payload.
 
-        Returns bytes for inline/small responses. For large buddy responses
-        (>= 1 MB), returns a memoryview into a client-owned warm buffer
-        (safe to hold — not backed by SHM).
+        Returns ``bytes`` for inline/small responses.  For large buddy
+        responses (≥ 1 MB), returns ``bytes`` copied from SHM by default
+        (safe to hold indefinitely).
+
+        When *_zero_copy* is enabled on the client, large responses return a
+        ``memoryview`` backed by SHM; it becomes invalid after the next
+        ``call()`` — callers must consume it before then.
         """
         args = data if data is not None else b''
         method_bytes = method_name.encode('utf-8')
@@ -347,11 +325,11 @@ class IPCv3Client(BaseClient):
                 self._free_buddy_response(free_info)
                 return b''
             if data_size >= _WARM_BUF_THRESHOLD:
-                # Deferred free: return memoryview directly into SHM,
-                # defer the buddy block free until the next call().
-                # This eliminates the warm buffer memmove copy.
-                self._deferred_response_free = free_info
-                return mv[5:]
+                # Default safe path: copy to bytes so caller can hold
+                # the result indefinitely without use-after-free risk.
+                payload = bytes(mv[5:])
+                self._free_buddy_response(free_info)
+                return payload
             payload = bytes(mv[5:])
             self._free_buddy_response(free_info)
             return payload
