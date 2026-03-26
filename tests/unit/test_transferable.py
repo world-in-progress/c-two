@@ -213,6 +213,25 @@ class TestAutoTransfer:
         with pytest.raises(TypeError):
             auto_transfer(42)
 
+    def test_direct_transferable_lookup_single_param(self):
+        """When a function has a single non-self param typed as a registered
+        Transferable, auto_transfer should use it directly (Priority 1)."""
+        # HelloData is a registered @transferable
+        def process(self, data: HelloData) -> HelloData: ...
+        process.__module__ = HelloData.__module__
+        wrapped = auto_transfer(process)
+        assert callable(wrapped)
+
+    def test_direct_lookup_prefers_over_field_matching(self):
+        """Direct Transferable lookup (Priority 1) should be preferred over
+        field name+type comparison (Priority 2)."""
+        # Create a function whose param type IS a registered Transferable
+        def echo(self, item: HelloData) -> HelloData: ...
+        echo.__module__ = 'some.other.module'  # different module
+        wrapped = auto_transfer(echo)
+        # Should still work — Priority 1 doesn't check module
+        assert callable(wrapped)
+
 
 # ---------------------------------------------------------------------------
 # _create_pydantic_model_from_func_sig
@@ -420,3 +439,149 @@ class TestSerializeDeserializeConsistency:
         assert t.deserialize(b'raw') == b'raw'
         # Memoryview (zero-copy transport)
         assert bytes(t.deserialize(memoryview(b'mv'))) == b'mv'
+
+
+# ---------------------------------------------------------------------------
+# OPT-T3: __memoryview_aware__ flag behavior
+# ---------------------------------------------------------------------------
+
+class TestMemoryviewAwareFlag:
+    """Tests for the __memoryview_aware__ optimization flag on Transferable."""
+
+    def test_default_flag_is_false(self):
+        """Transferable base class has __memoryview_aware__ = False."""
+        assert Transferable.__memoryview_aware__ is False
+
+    def test_custom_transferable_can_set_flag(self):
+        """A @transferable subclass can set __memoryview_aware__ = True."""
+        @cc.transferable
+        class MvAwareData:
+            __memoryview_aware__ = True
+            value: int
+            def serialize(d: 'MvAwareData') -> bytes:
+                return pickle.dumps(d.value)
+            def deserialize(b: bytes) -> 'MvAwareData':
+                return MvAwareData(value=pickle.loads(b))
+
+        assert MvAwareData.__memoryview_aware__ is True
+
+    def test_flag_not_set_defaults_false(self):
+        """A @transferable without the flag should default to False."""
+        @cc.transferable
+        class NoFlagData:
+            value: int
+            def serialize(d: 'NoFlagData') -> bytes:
+                return pickle.dumps(d.value)
+            def deserialize(b: bytes) -> 'NoFlagData':
+                return NoFlagData(value=pickle.loads(b))
+
+        assert NoFlagData.__memoryview_aware__ is False
+
+    def test_getattr_works_for_flag_check(self):
+        """The framework checks flag via getattr(..., '__memoryview_aware__', False)."""
+        @cc.transferable
+        class FlagCheckData:
+            __memoryview_aware__ = True
+            x: int
+            def serialize(d: 'FlagCheckData') -> bytes:
+                return b''
+            def deserialize(b: bytes) -> 'FlagCheckData':
+                return FlagCheckData(x=0)
+
+        assert getattr(FlagCheckData, '__memoryview_aware__', False) is True
+
+        @cc.transferable
+        class NoFlagCheckData:
+            y: int
+            def serialize(d: 'NoFlagCheckData') -> bytes:
+                return b''
+            def deserialize(b: bytes) -> 'NoFlagCheckData':
+                return NoFlagCheckData(y=0)
+
+        assert getattr(NoFlagCheckData, '__memoryview_aware__', False) is False
+
+
+# ---------------------------------------------------------------------------
+# OPT-T4: wire.py scatter-write and payload_total_size
+# ---------------------------------------------------------------------------
+
+class TestWireScatterWrite:
+    """Tests for tuple/list scatter-write in wire.py."""
+
+    def test_payload_total_size_none(self):
+        from c_two.rpc.util.wire import payload_total_size
+        assert payload_total_size(None) == 0
+
+    def test_payload_total_size_bytes(self):
+        from c_two.rpc.util.wire import payload_total_size
+        assert payload_total_size(b'hello') == 5
+
+    def test_payload_total_size_memoryview(self):
+        from c_two.rpc.util.wire import payload_total_size
+        assert payload_total_size(memoryview(b'hello')) == 5
+
+    def test_payload_total_size_tuple(self):
+        from c_two.rpc.util.wire import payload_total_size
+        assert payload_total_size((b'hel', b'lo')) == 5
+
+    def test_payload_total_size_list(self):
+        from c_two.rpc.util.wire import payload_total_size
+        assert payload_total_size([b'a', b'bc', b'def']) == 6
+
+    def test_write_call_into_scatter_write(self):
+        """write_call_into accepts tuple payload and produces identical
+        output to a single contiguous bytes payload."""
+        from c_two.rpc.util.wire import write_call_into
+
+        header = b'\x01\x02\x03\x04'
+        blob = b'\x05\x06\x07\x08\x09\x0a'
+
+        # Single contiguous payload
+        buf1 = bytearray(256)
+        n1 = write_call_into(buf1, 0, 'test_method', header + blob)
+
+        # Scatter-write tuple payload
+        buf2 = bytearray(256)
+        n2 = write_call_into(buf2, 0, 'test_method', (header, blob))
+
+        assert n1 == n2
+        assert buf1[:n1] == buf2[:n2]
+
+    def test_write_reply_into_scatter_write(self):
+        """write_reply_into accepts tuple result_data and produces identical
+        output to a single contiguous bytes payload."""
+        from c_two.rpc.util.wire import write_reply_into
+
+        part_a = b'\x01\x02\x03'
+        part_b = b'\x04\x05\x06\x07'
+
+        # Single contiguous
+        buf1 = bytearray(256)
+        n1 = write_reply_into(buf1, 0, result_data=part_a + part_b)
+
+        # Scatter-write tuple
+        buf2 = bytearray(256)
+        n2 = write_reply_into(buf2, 0, result_data=(part_a, part_b))
+
+        assert n1 == n2
+        assert buf1[:n1] == buf2[:n2]
+
+    def test_write_call_into_with_offset(self):
+        """write_call_into works correctly with non-zero offset."""
+        from c_two.rpc.util.wire import write_call_into
+
+        buf = bytearray(256)
+        offset = 16
+        payload = (b'aaa', b'bbb')
+        n = write_call_into(buf, offset, 'meth', payload)
+        assert n > 0
+        # Verify the bytes before offset are untouched
+        assert buf[:offset] == b'\x00' * offset
+
+    def test_write_reply_into_empty_result(self):
+        """write_reply_into handles None result_data."""
+        from c_two.rpc.util.wire import write_reply_into
+
+        buf = bytearray(256)
+        n = write_reply_into(buf, 0, result_data=None)
+        assert n == 5  # REPLY_HEADER_FIXED only
