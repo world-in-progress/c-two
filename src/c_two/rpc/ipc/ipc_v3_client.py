@@ -242,18 +242,44 @@ class IPCv3Client(BaseClient):
         wire_size = call_wire_size(len(method_bytes), payload_total_size(args))
 
         with self._conn_lock:
-            # Flush any deferred buddy free from the previous call.
+            # Try to reuse the deferred response block for the next request.
+            # When the server scatter-reused the request block, the same buddy
+            # block is still allocated — skip free+alloc and write directly.
             deferred = self._deferred_response_free
+            reused_block = False
             if deferred is not None:
                 self._deferred_response_free = None
-                self._free_buddy_response(deferred)
+                seg_idx_d, _, _, free_offset, free_size, is_ded = deferred
+                if (not is_ded
+                        and wire_size <= free_size
+                        and wire_size > self._config.shm_threshold
+                        and self._buddy_pool is not None
+                        and seg_idx_d < len(self._seg_views)):
+                    reused_block = True
+                else:
+                    self._free_buddy_response(deferred)
 
             sock = self._ensure_connection()
             request_id = self._next_rid
             self._next_rid += 1
 
             try:
-                if wire_size <= self._config.shm_threshold or self._buddy_pool is None:
+                if reused_block:
+                    # Fast path: reuse the deferred block (no alloc/free).
+                    seg_mv = self._seg_views[seg_idx_d]
+                    shm_buf = seg_mv[free_offset : free_offset + wire_size]
+                    try:
+                        write_call_into(shm_buf, 0, method_name, args)
+                        frame = encode_buddy_call_frame(
+                            request_id, seg_idx_d, free_offset,
+                            wire_size, False,
+                        )
+                        sock.sendall(frame)
+                    except Exception:
+                        # Block is still allocated; free it on error.
+                        self._buddy_pool.free_at(seg_idx_d, free_offset, free_size, False)
+                        raise
+                elif wire_size <= self._config.shm_threshold or self._buddy_pool is None:
                     # Flatten tuple payloads for inline frame encoder.
                     inline_args = b''.join(args) if isinstance(args, (list, tuple)) else args
                     frame = encode_inline_call_frame(
@@ -284,7 +310,6 @@ class IPCv3Client(BaseClient):
                         except Exception:
                             self._buddy_pool.free_at(alloc.seg_idx, alloc.offset, wire_size, alloc.is_dedicated)
                             raise
-                    # Note: server frees the request block after reading (consumer frees).
 
                 # Read response.
                 response_data, free_info = self._recv_response()
