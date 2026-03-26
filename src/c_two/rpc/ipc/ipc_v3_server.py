@@ -119,6 +119,9 @@ class IPCv3Server(BaseServer):
         # Active client connection tasks for graceful shutdown.
         self._client_tasks: set[asyncio.Task] = set()
 
+        # Set before cleanup to prevent reply() from writing to SHM.
+        self._shutting_down = False
+
     # ------------------------------------------------------------------
     # Lifecycle (BaseServer interface)
     # ------------------------------------------------------------------
@@ -138,6 +141,7 @@ class IPCv3Server(BaseServer):
                 pass  # Event loop already closed.
 
     def destroy(self) -> None:
+        self._shutting_down = True
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=3.0)
         try:
@@ -253,10 +257,15 @@ class IPCv3Server(BaseServer):
         total_wire = reply_wire_size(err_len, result_len)
 
         # Snapshot connection's buddy pool + cached views under lock, then release.
+        # If shutting down, skip SHM writes to prevent use-after-destroy.
         with self._conn_lock:
-            conn = self._connections.get(conn_id)
-            buddy_pool = conn.buddy_pool if conn is not None and conn.handshake_done else None
-            seg_views = conn.seg_views if conn is not None else []
+            if self._shutting_down:
+                buddy_pool = None
+                seg_views = []
+            else:
+                conn = self._connections.get(conn_id)
+                buddy_pool = conn.buddy_pool if conn is not None and conn.handshake_done else None
+                seg_views = conn.seg_views if conn is not None else []
 
         # ---- Zero-copy reuse path ----
         # When the CRM returns the exact input memoryview (echo pattern), skip
