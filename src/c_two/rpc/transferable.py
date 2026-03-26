@@ -180,9 +180,13 @@ def create_default_transferable(func, is_input: bool):
                     return data
 
         else:
-            # Define the dynamic transferable class for input
+            # Define the dynamic transferable class for input.
+            # pickle.loads() accepts memoryview since Python 3.8, so we
+            # can safely mark the default pickle-based class as
+            # memoryview-aware to avoid unnecessary bytes() conversion.
             class DynamicInputTransferable(Transferable):
                 __module__ = 'Default'  # mark as default
+                __memoryview_aware__ = True
                 
                 def serialize(*args) -> bytes:
                     """
@@ -276,11 +280,12 @@ def create_default_transferable(func, is_input: bool):
         # Define the dynamic transferable class for output
         attrs = {
             '__module__': 'Default',
+            '__memoryview_aware__': True,
             'serialize': serialize_func,
             'deserialize': deserialize_func,
         }
         if return_type is bytes:
-            attrs['__memoryview_aware__'] = True
+            pass  # already True above
         DynamicOutputTransferable = type(
             class_name,
             (Transferable,),
