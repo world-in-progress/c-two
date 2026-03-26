@@ -602,7 +602,7 @@ class Server:
     def __init__(self, config: ServerConfig):
         self.name = config.name
 
-        if config.bind_address.startswith(('tcp://', 'ipc://')):
+        if config.bind_address.startswith('tcp://'):
             self.server = ZmqServer(config.bind_address)
         elif config.bind_address.startswith('http://'):
             self.server = HttpServer(config.bind_address)
@@ -612,7 +612,7 @@ class Server:
             self.server = ThreadServer(config.bind_address)
         elif config.bind_address.startswith('ipc-v2://'):
             self.server = IPCv2Server(config.bind_address, ipc_config=config.ipc_config)
-        elif config.bind_address.startswith('ipc-v3://'):
+        elif config.bind_address.startswith(('ipc://', 'ipc-v3://')):
             self.server = IPCv3Server(config.bind_address, ipc_config=config.ipc_config)
         else:
             raise ValueError(f'Unsupported protocol in bind_address: {config.bind_address}')
@@ -633,7 +633,7 @@ class Server:
         # zero-copy reuse optimization (BUDDY_REUSE path) in reply().
         # If set to True, memoryview results are copied to bytes before reply(),
         # which disables reuse detection (isinstance check fails on bytes).
-        skip_materialize = config.bind_address.startswith('ipc-v3://')
+        skip_materialize = config.bind_address.startswith(('ipc://', 'ipc-v3://'))
 
         self._state = ServerState(
             icrm=icrm,

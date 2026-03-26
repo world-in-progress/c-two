@@ -93,7 +93,7 @@ class IPCv3Server(BaseServer):
     ):
         super().__init__(bind_address, event_queue)
         self._config = ipc_config or IPCConfig()
-        self.region_id = bind_address.replace('ipc-v3://', '')
+        self.region_id = bind_address.replace('ipc-v3://', '').replace('ipc://', '')
         self._socket_path = _resolve_socket_path(self.region_id)
 
         self._loop: asyncio.AbstractEventLoop | None = None

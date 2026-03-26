@@ -77,7 +77,7 @@ class IPCv3Client(BaseClient):
     def __init__(self, server_address: str, ipc_config: IPCConfig | None = None):
         super().__init__(server_address)
         self._config = ipc_config or IPCConfig()
-        self.region_id = server_address.replace('ipc-v3://', '')
+        self.region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
         self._socket_path = _resolve_socket_path(self.region_id)
         self._sock: _socket.socket | None = None
         self._conn_lock = threading.Lock()
@@ -469,7 +469,7 @@ class IPCv3Client(BaseClient):
 
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
-        region_id = server_address.replace('ipc-v3://', '')
+        region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return False
@@ -492,7 +492,7 @@ class IPCv3Client(BaseClient):
 
     @staticmethod
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
-        region_id = server_address.replace('ipc-v3://', '')
+        region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return True

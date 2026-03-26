@@ -11,7 +11,7 @@ from .thread import ThreadClient
 
 def _get_client_class(server_address: str):
     """Determine the client class based on the server address."""
-    if server_address.startswith(('tcp://', 'ipc://')):
+    if server_address.startswith('tcp://'):
         return ZmqClient
     elif server_address.startswith('http://'):
         return HttpClient
@@ -21,7 +21,7 @@ def _get_client_class(server_address: str):
         return ThreadClient
     elif server_address.startswith('ipc-v2://'):
         return IPCv2Client
-    elif server_address.startswith('ipc-v3://'):
+    elif server_address.startswith(('ipc://', 'ipc-v3://')):
         return IPCv3Client
     else:
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
