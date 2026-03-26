@@ -3,7 +3,8 @@
     "allow": [
       "Bash(ls:*)",
       "Bash(grep:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(uv run:*)"
     ]
   }
 }

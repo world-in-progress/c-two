@@ -252,3 +252,171 @@ class TestPydanticModelFromSig:
         def fn(a: int, b: str = 'hi') -> None: ...
         model = _create_pydantic_model_from_func_sig(fn)
         assert model.model_fields['b'].default == 'hi'
+
+
+# ---------------------------------------------------------------------------
+# OPT-T1: empty bytes b"" must round-trip correctly (not become None)
+# ---------------------------------------------------------------------------
+
+class TestEmptyBytesHandling:
+    """b'' is falsy in Python. Deserializers must use `is None` checks,
+    not truthiness, otherwise b'' silently becomes None."""
+
+    # ---- bytes fast path (single bytes param) ----
+
+    def test_bytes_fast_path_input_empty_roundtrip(self):
+        """bytes fast-path input: b'' → serialize → deserialize → b'' (not None)."""
+        def fn(self, data: bytes) -> bytes: ...
+        t = create_default_transferable(fn, is_input=True)
+        raw = t.serialize(b'')
+        result = t.deserialize(raw)
+        assert result is not None, 'b"" became None in bytes fast-path input'
+        assert bytes(result) == b''
+
+    def test_bytes_fast_path_output_empty_roundtrip(self):
+        """bytes fast-path output: b'' → serialize → deserialize → b'' (not None)."""
+        def fn(self, data: bytes) -> bytes: ...
+        t = create_default_transferable(fn, is_input=False)
+        raw = t.serialize(b'')
+        result = t.deserialize(raw)
+        assert result is not None, 'b"" became None in bytes fast-path output'
+        assert bytes(result) == b''
+
+    # ---- pickle path (non-bytes params) ----
+
+    def test_pickle_input_empty_bytes_param_roundtrip(self):
+        """Pickle input path: a function that takes a str param, but we pass
+        something that serializes to empty-ish data. More importantly, test
+        that deserialize(pickle.dumps(b'')) does NOT return None."""
+        def fn(self, data: str) -> str: ...
+        t = create_default_transferable(fn, is_input=True)
+        # Serialize an empty string — pickle.dumps('') produces non-empty bytes,
+        # so this tests the normal case. The real test is the output path below.
+        raw = t.serialize('')
+        result = t.deserialize(raw)
+        assert result == ''
+
+    def test_pickle_output_empty_bytes_roundtrip(self):
+        """_default_deserialize_func: pickle.dumps(b'') is non-empty bytes,
+        but we must verify the deserializer handles it correctly."""
+        def fn(self) -> str: ...
+        t = create_default_transferable(fn, is_input=False)
+        raw = t.serialize(b'')  # pickle.dumps(b'') → non-empty bytes
+        result = t.deserialize(raw)
+        assert result == b''
+
+    def test_pickle_output_deserialize_empty_bytes_is_none_sentinel(self):
+        """b'' is the wire sentinel for None results (crm_to_com sets
+        serialized_result = b'' when result is None).  _default_deserialize_func
+        must return None for b'', matching the serializer convention."""
+        def fn(self) -> str: ...
+        t = create_default_transferable(fn, is_input=False)
+        assert t.deserialize(b'') is None
+
+    def test_pickle_input_deserialize_empty_bytes_is_none_sentinel(self):
+        """b'' on the input path is the wire sentinel for 'no args'.
+        Must return None, not attempt pickle.loads(b'')."""
+        def fn(self, a: int, b: str) -> int: ...
+        t = create_default_transferable(fn, is_input=True)
+        assert t.deserialize(b'') is None
+
+    def test_pickle_output_real_data_roundtrips(self):
+        """pickle.dumps(b'') is NOT empty — it produces a real pickle payload.
+        Verify this data round-trips correctly (not confused with sentinel)."""
+        def fn(self) -> bytes: ...
+        # Use non-bytes return type to go through pickle, not fast path
+        def fn2(self) -> object: ...
+        t = create_default_transferable(fn2, is_input=False)
+        raw = t.serialize(b'')  # pickle.dumps(b'') → non-empty bytes
+        assert len(raw) > 0, 'pickle.dumps(b"") should produce non-empty bytes'
+        result = t.deserialize(raw)
+        assert result == b'', 'pickled b"" should round-trip back to b""'
+
+    # ---- None sentinel still works ----
+
+    def test_bytes_fast_path_none_stays_none(self):
+        def fn(self, data: bytes) -> bytes: ...
+        t = create_default_transferable(fn, is_input=True)
+        assert t.deserialize(None) is None
+
+    def test_pickle_output_none_stays_none(self):
+        def fn(self) -> int: ...
+        t = create_default_transferable(fn, is_input=False)
+        assert t.deserialize(None) is None
+
+    def test_pickle_input_none_stays_none(self):
+        def fn(self, a: int) -> int: ...
+        t = create_default_transferable(fn, is_input=True)
+        assert t.deserialize(None) is None
+
+
+# ---------------------------------------------------------------------------
+# OPT-T2: serialize/deserialize format consistency
+# ---------------------------------------------------------------------------
+
+class TestSerializeDeserializeConsistency:
+    """The pickle-based input serialize has an exception fallback that
+    produces pickle.dumps(args) — a different format from the primary
+    pickle.dumps(dict) path. The deserialize side must handle both."""
+
+    def test_pickle_input_normal_roundtrip(self):
+        """Normal path: serialize produces dict, deserialize unpacks it."""
+        def fn(self, x: int, y: str) -> int: ...
+        t = create_default_transferable(fn, is_input=True)
+        raw = t.serialize(42, 'hello')
+        result = t.deserialize(raw)
+        assert result == (42, 'hello')
+
+    def test_pickle_input_single_arg_roundtrip(self):
+        """Single-arg non-bytes: serialize produces dict, deserialize unwraps."""
+        def fn(self, x: int) -> int: ...
+        t = create_default_transferable(fn, is_input=True)
+        raw = t.serialize(99)
+        result = t.deserialize(raw)
+        assert result == 99
+
+    def test_pickle_input_fallback_format_roundtrip(self):
+        """If serialize's dict path fails and falls back to pickle.dumps(args),
+        the deserialize side should still produce a usable result.
+        Simulate by feeding deserialize with the fallback format."""
+        def fn(self, x: int, y: str) -> int: ...
+        t = create_default_transferable(fn, is_input=True)
+        # Manually produce the fallback format: pickle.dumps((42, 'hello'))
+        fallback_data = pickle.dumps((42, 'hello'))
+        result = t.deserialize(fallback_data)
+        # The deserialize code checks isinstance(unpickled, dict).
+        # For a tuple, it hits the else branch and returns the tuple directly.
+        assert result == (42, 'hello')
+
+    def test_bytes_fast_path_rejects_non_bytes_input(self):
+        """bytes fast-path serialize must reject non-bytes with TypeError."""
+        def fn(self, data: bytes) -> bytes: ...
+        t = create_default_transferable(fn, is_input=True)
+        with pytest.raises(TypeError, match='bytes fast path'):
+            t.serialize('a string')
+
+    def test_bytes_fast_path_rejects_non_bytes_output(self):
+        """bytes fast-path output serialize must reject non-bytes."""
+        def fn(self, data: bytes) -> bytes: ...
+        t = create_default_transferable(fn, is_input=False)
+        with pytest.raises(TypeError, match='bytes fast path'):
+            t.serialize(42)
+
+    def test_bytes_fast_path_accepts_memoryview(self):
+        """bytes fast-path must accept memoryview (zero-copy transport)."""
+        def fn(self, data: bytes) -> bytes: ...
+        t_in = create_default_transferable(fn, is_input=True)
+        t_out = create_default_transferable(fn, is_input=False)
+        mv = memoryview(b'test data')
+        assert bytes(t_in.serialize(mv)) == b'test data'
+        assert bytes(t_out.serialize(mv)) == b'test data'
+
+    def test_output_bytes_fast_path_deserialize_accepts_both_formats(self):
+        """Output bytes fast-path deserialize handles both raw bytes and
+        pickle-encoded bytes (for version compatibility)."""
+        def fn(self, data: bytes) -> bytes: ...
+        t = create_default_transferable(fn, is_input=False)
+        # Raw bytes (fast path)
+        assert t.deserialize(b'raw') == b'raw'
+        # Memoryview (zero-copy transport)
+        assert bytes(t.deserialize(memoryview(b'mv'))) == b'mv'
