@@ -298,6 +298,67 @@ class IPCv3Server(BaseServer):
                 with self._deferred_frees_lock:
                     self._deferred_frees[rid_key] = info
 
+        # ---- Scatter-reuse path for tuple serialize results ----
+        # When serialize returns (header_bytes, blob_memoryview) and the blob
+        # is a memoryview into the request SHM block at the correct offset,
+        # we only need to write the reply header (5 bytes) and the serialize
+        # header — the blob stays in-place.  This avoids materializing and
+        # copying 1GB+ of data on the response path.
+        if (isinstance(result_bytes, (tuple, list)) and len(result_bytes) == 2
+                and err_len == 0
+                and buddy_pool is not None
+                and total_wire > self._config.shm_threshold):
+            hdr_part, blob_part = result_bytes
+            if (isinstance(blob_part, memoryview)
+                    and isinstance(hdr_part, (bytes, bytearray))):
+                with self._deferred_frees_lock:
+                    info = self._deferred_frees.get(rid_key)
+                if info is not None and len(info) >= 8 and info[5] is not None:
+                    (_pool, req_seg_idx, block_offset, alloc_size,
+                     _ded, payload_offset, payload_len, seg_obj) = info
+                    hdr_len = len(hdr_part)
+                    blob_len = len(blob_part)
+                    if (blob_part.obj is seg_obj
+                            and req_seg_idx < len(seg_views)
+                            and hdr_len + blob_len == payload_len):
+                        # Verify blob is at the expected position: the output
+                        # header size must match the input header size so the
+                        # blob doesn't need to shift.
+                        seg_mv = seg_views[req_seg_idx]
+                        seg_addr = ctypes.addressof(
+                            (ctypes.c_char * 1).from_buffer(seg_mv))
+                        blob_addr = ctypes.addressof(
+                            (ctypes.c_char * 1).from_buffer(blob_part))
+                        blob_seg_offset = blob_addr - seg_addr
+                        expected_blob_offset = payload_offset + hdr_len
+                        if blob_seg_offset == expected_blob_offset:
+                            reply_start = payload_offset - REPLY_HEADER_FIXED
+                            if reply_start >= block_offset:
+                                # Write reply header (5 bytes).
+                                seg_mv[reply_start] = MsgType.CRM_REPLY
+                                struct.pack_into('<I', seg_mv,
+                                                 reply_start + 1, 0)
+                                # Write serialize header (overwrites the
+                                # original — may differ if CRM transformed
+                                # metadata fields).
+                                seg_mv[payload_offset:
+                                       payload_offset + hdr_len] = hdr_part
+                                # Blob stays in place — zero copy!
+                                reply_data_size = (REPLY_HEADER_FIXED
+                                                   + hdr_len + blob_len)
+                                frame = encode_buddy_reuse_reply_frame(
+                                    int_rid, req_seg_idx, reply_start,
+                                    reply_data_size, block_offset, alloc_size,
+                                )
+                                loop = self._loop
+                                if loop is not None:
+                                    try:
+                                        loop.call_soon_threadsafe(
+                                            self._resolve_future, fut, frame)
+                                    except RuntimeError:
+                                        pass
+                                return
+
         # ---- Regular buddy alloc + copy path ----
         frame: bytes | None = None
         freed_deferred = False
