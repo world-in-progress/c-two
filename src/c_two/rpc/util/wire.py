@@ -67,6 +67,10 @@ _SIGNAL_BYTES_MAP = {
 # pre-encode (unlike the method name in CRM_CALL).
 _call_header_cache: dict[str, bytes] = {}
 
+# Decode side: raw method_name bytes → decoded str
+# Avoids repeated bytes(memoryview[...]).decode('utf-8') on every CRM_CALL.
+_method_name_decode_cache: dict[bytes, str] = {}
+
 
 def preregister_method(method_name: str) -> None:
     """Pre-encode a method name for fast wire encoding.
@@ -294,7 +298,11 @@ def decode(buf: bytes | memoryview, total_size: int | None = None) -> Envelope:
             raise ValueError(
                 f'CRM_CALL truncated: need {header_end} bytes for header, got {total_size}'
             )
-        method_name = bytes(buf[3:header_end]).decode('utf-8')
+        method_raw = bytes(buf[3:header_end])
+        method_name = _method_name_decode_cache.get(method_raw)
+        if method_name is None:
+            method_name = method_raw.decode('utf-8')
+            _method_name_decode_cache[method_raw] = method_name
         payload = buf[header_end:total_size] if header_end < total_size else None
         return Envelope(msg_type=msg_type, method_name=method_name, payload=payload)
 
