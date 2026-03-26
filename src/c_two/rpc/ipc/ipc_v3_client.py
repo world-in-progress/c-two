@@ -104,6 +104,11 @@ class IPCv3Client(BaseClient):
         self._response_buf: bytearray | None = None
         self._response_buf_addr: int = 0
 
+        # Deferred free: for scatter-reuse responses, keep the SHM block
+        # alive until the next call so the caller gets a zero-copy
+        # memoryview into SHM (no warm-buffer memmove).
+        self._deferred_response_free: tuple | None = None
+
     # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
@@ -130,6 +135,11 @@ class IPCv3Client(BaseClient):
         return new_sock
 
     def _close_connection(self) -> None:
+        # Flush deferred free before closing pool.
+        deferred = self._deferred_response_free
+        if deferred is not None:
+            self._deferred_response_free = None
+            self._free_buddy_response(deferred)
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -232,6 +242,12 @@ class IPCv3Client(BaseClient):
         wire_size = call_wire_size(len(method_bytes), payload_total_size(args))
 
         with self._conn_lock:
+            # Flush any deferred buddy free from the previous call.
+            deferred = self._deferred_response_free
+            if deferred is not None:
+                self._deferred_response_free = None
+                self._free_buddy_response(deferred)
+
             sock = self._ensure_connection()
             request_id = self._next_rid
             self._next_rid += 1
@@ -306,13 +322,11 @@ class IPCv3Client(BaseClient):
                 self._free_buddy_response(free_info)
                 return b''
             if data_size >= _WARM_BUF_THRESHOLD:
-                # Use warm buffer (memmove) to avoid page-fault overhead.
-                self._ensure_response_buf(data_size)
-                seg_idx, data_offset, _, _, _, is_dedicated = free_info
-                src_addr = self._seg_base_addrs[seg_idx] + data_offset + 5
-                _memmove(self._response_buf_addr, src_addr, data_size)
-                self._free_buddy_response(free_info)
-                return memoryview(self._response_buf)[:data_size]
+                # Deferred free: return memoryview directly into SHM,
+                # defer the buddy block free until the next call().
+                # This eliminates the warm buffer memmove copy.
+                self._deferred_response_free = free_info
+                return mv[5:]
             payload = bytes(mv[5:])
             self._free_buddy_response(free_info)
             return payload
