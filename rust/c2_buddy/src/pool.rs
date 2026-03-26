@@ -409,8 +409,12 @@ impl BuddyPool {
     }
 
     fn alloc_buddy(&mut self, size: usize) -> Result<PoolAllocation, String> {
-        // Layer 1: Try existing segments.
+        // Layer 1: Try existing segments. Skip segments with insufficient free space
+        // to avoid unnecessary spinlock acquisition.
         for (idx, seg) in self.segments.iter().enumerate() {
+            if (seg.allocator().free_bytes() as usize) < size {
+                continue;
+            }
             if let Some(a) = seg.allocator().alloc(size) {
                 // Mark segment as active (not idle).
                 if idx < self.idle_since.len() {
