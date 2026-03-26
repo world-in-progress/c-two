@@ -33,6 +33,7 @@ from ..util.wire import (
     decode,
     write_reply_into,
     reply_wire_size,
+    payload_total_size,
     REPLY_HEADER_FIXED,
     PING_BYTES,
     PONG_BYTES,
@@ -248,7 +249,7 @@ class IPCv3Server(BaseServer):
             return
 
         err_len = len(err_bytes)
-        result_len = len(result_bytes)
+        result_len = payload_total_size(result_bytes)
         total_wire = reply_wire_size(err_len, result_len)
 
         # Snapshot connection's buddy pool + cached views under lock, then release.
@@ -349,7 +350,9 @@ class IPCv3Server(BaseServer):
             self._free_deferred(rid_key)
 
         if frame is None:
-            frame = encode_inline_reply_frame(int_rid, FLAG_RESPONSE, err_bytes, result_bytes)
+            # Flatten tuple payloads for inline frame encoder.
+            inline_result = b''.join(result_bytes) if isinstance(result_bytes, (list, tuple)) else result_bytes
+            frame = encode_inline_reply_frame(int_rid, FLAG_RESPONSE, err_bytes, inline_result)
 
         loop = self._loop
         if loop is not None:

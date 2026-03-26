@@ -29,6 +29,7 @@ from ..util.adaptive_buffer import AdaptiveBuffer
 from ..util.wire import (
     write_call_into,
     call_wire_size,
+    payload_total_size,
     decode,
     get_call_header_cache,
     PING_BYTES,
@@ -228,7 +229,7 @@ class IPCv3Client(BaseClient):
         """
         args = data if data is not None else b''
         method_bytes = method_name.encode('utf-8')
-        wire_size = call_wire_size(len(method_bytes), len(args))
+        wire_size = call_wire_size(len(method_bytes), payload_total_size(args))
 
         with self._conn_lock:
             sock = self._ensure_connection()
@@ -237,8 +238,10 @@ class IPCv3Client(BaseClient):
 
             try:
                 if wire_size <= self._config.shm_threshold or self._buddy_pool is None:
+                    # Flatten tuple payloads for inline frame encoder.
+                    inline_args = b''.join(args) if isinstance(args, (list, tuple)) else args
                     frame = encode_inline_call_frame(
-                        request_id, method_name, args, get_call_header_cache(),
+                        request_id, method_name, inline_args, get_call_header_cache(),
                     )
                     sock.sendall(frame)
                 else:
@@ -247,8 +250,9 @@ class IPCv3Client(BaseClient):
                         self._buddy_pool.free_at(
                             alloc.seg_idx, alloc.offset, wire_size, True,
                         )
+                        inline_args = b''.join(args) if isinstance(args, (list, tuple)) else args
                         frame = encode_inline_call_frame(
-                            request_id, method_name, args, get_call_header_cache(),
+                            request_id, method_name, inline_args, get_call_header_cache(),
                         )
                         sock.sendall(frame)
                     else:

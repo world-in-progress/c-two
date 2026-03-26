@@ -111,6 +111,19 @@ def reply_wire_size(error_len: int, result_len: int) -> int:
     return REPLY_HEADER_FIXED + error_len + result_len
 
 
+def payload_total_size(payload) -> int:
+    """Return total byte length of *payload*.
+
+    *payload* may be ``bytes``, ``memoryview``, a ``tuple``/``list`` of
+    such segments (scatter-write), or ``None``.
+    """
+    if payload is None:
+        return 0
+    if isinstance(payload, (list, tuple)):
+        return sum(len(s) for s in payload)
+    return len(payload)
+
+
 # ---------------------------------------------------------------------------
 # Encode — produce contiguous bytes (for stream transports)
 # ---------------------------------------------------------------------------
@@ -168,52 +181,67 @@ def encode_reply(error_data: bytes | memoryview | None = None,
 
 def write_call_into(buf, offset: int,
                     method_name: str,
-                    payload: bytes | memoryview | None = None) -> int:
+                    payload: bytes | memoryview | tuple | None = None) -> int:
     """Write a CRM_CALL message directly into *buf* starting at *offset*.
 
-    *buf* must support ``struct.pack_into`` and slice assignment
-    (``bytearray``, ``mmap``, ``SharedMemory.buf``, etc.).
+    *payload* may be a single ``bytes``/``memoryview`` or a ``tuple``/``list``
+    of segments (scatter-write — avoids concatenation copies).
 
     Returns the total number of bytes written.
     """
     cached_header = _call_header_cache.get(method_name)
     if cached_header is not None:
         header_len = len(cached_header)
-        payload_len = len(payload) if payload else 0
         buf[offset:offset + header_len] = cached_header
-        if payload_len > 0:
-            buf[offset + header_len:offset + header_len + payload_len] = payload
-        return header_len + payload_len
+        pos = offset + header_len
+    else:
+        method_bytes = method_name.encode('utf-8')
+        method_len = len(method_bytes)
+        buf[offset] = MsgType.CRM_CALL
+        struct.pack_into('<H', buf, offset + 1, method_len)
+        buf[offset + 3:offset + 3 + method_len] = method_bytes
+        pos = offset + CALL_HEADER_FIXED + method_len
 
-    method_bytes = method_name.encode('utf-8')
-    method_len = len(method_bytes)
-    payload_len = len(payload) if payload else 0
+    if payload is not None:
+        if isinstance(payload, (list, tuple)):
+            for segment in payload:
+                seg_len = len(segment)
+                buf[pos:pos + seg_len] = segment
+                pos += seg_len
+        else:
+            payload_len = len(payload)
+            buf[pos:pos + payload_len] = payload
+            pos += payload_len
 
-    buf[offset] = MsgType.CRM_CALL
-    struct.pack_into('<H', buf, offset + 1, method_len)
-    buf[offset + 3:offset + 3 + method_len] = method_bytes
-    if payload_len > 0:
-        buf[offset + 3 + method_len:offset + 3 + method_len + payload_len] = payload
-
-    return CALL_HEADER_FIXED + method_len + payload_len
+    return pos - offset
 
 
 def write_reply_into(buf, offset: int,
                      error_data: bytes | memoryview | None = None,
-                     result_data: bytes | memoryview | None = None) -> int:
+                     result_data: bytes | memoryview | tuple | None = None) -> int:
     """Write a CRM_REPLY message directly into *buf* starting at *offset*.
+
+    *result_data* may be a single ``bytes``/``memoryview`` or a
+    ``tuple``/``list`` of segments (scatter-write).
 
     Returns the total number of bytes written.
     """
     error_len = len(error_data) if error_data else 0
-    result_len = len(result_data) if result_data else 0
+    result_len = payload_total_size(result_data)
 
     buf[offset] = MsgType.CRM_REPLY
     struct.pack_into('<I', buf, offset + 1, error_len)
     if error_len > 0:
         buf[offset + 5:offset + 5 + error_len] = error_data
     if result_len > 0:
-        buf[offset + 5 + error_len:offset + 5 + error_len + result_len] = result_data
+        pos = offset + 5 + error_len
+        if isinstance(result_data, (list, tuple)):
+            for segment in result_data:
+                seg_len = len(segment)
+                buf[pos:pos + seg_len] = segment
+                pos += seg_len
+        else:
+            buf[pos:pos + result_len] = result_data
 
     return REPLY_HEADER_FIXED + error_len + result_len
 
