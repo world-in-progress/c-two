@@ -189,59 +189,22 @@ def create_default_transferable(func, is_input: bool):
                 __memoryview_aware__ = True
                 
                 def serialize(*args) -> bytes:
-                    """
-                    Default serialization for function input parameters using pickle
-                    """
+                    """Default serialization: pickle args directly as tuple."""
                     try:
-                        # Create a mapping of parameter names to arguments
-                        args_dict = {}
-                        for i, arg in enumerate(args):
-                            if i < len(filtered_params):
-                                args_dict[filtered_params[i]] = arg
-                            else:
-                                args_dict[f'extra_arg_{i}'] = arg
-                        
-                        args_dict['__serialized__'] = True
-                        return pickle.dumps(args_dict)
-                    except Exception:
-                        # Fallback to direct args serialization
+                        if len(args) == 1:
+                            return pickle.dumps(args[0])
                         return pickle.dumps(args)
+                    except Exception as e:
+                        logger.error(f'Failed to serialize input data: {e}')
+                        raise
                 
                 def deserialize(data: memoryview | bytes):
-                    """
-                    Default deserialization for function input parameters using pickle
-                    Returns either the original dict mapping or tuple of args.
-                    """
+                    """Default deserialization: unpickle and return value or tuple."""
                     try:
-                        # Handle None / empty-bytes sentinel.  The wire layer
-                        # sends b'' when no args are provided (request is None),
-                        # so we must treat empty bytes the same as None here.
                         if data is None or len(data) == 0:
                             return None
-                        
                         unpickled = pickle.loads(data)
-                        
-                        if isinstance(unpickled, dict):
-                            if '__serialized__' not in unpickled:
-                                return unpickled
-
-                            # If it's a dict (from serialize method), convert back to tuple
-                            del unpickled['__serialized__']
-                            
-                            # Preserve parameter order
-                            ordered_args = []
-                            for param_name in filtered_params:
-                                if param_name in unpickled:
-                                    ordered_args.append(unpickled[param_name])
-                            # Add any extra arguments
-                            for key, value in unpickled.items():
-                                if key.startswith('extra_arg_'):
-                                    ordered_args.append(value)
-                            
-                            return tuple(ordered_args) if len(ordered_args) != 1 else ordered_args[0]
-                        else:
-                            return unpickled
-                            
+                        return unpickled
                     except Exception as e:
                         raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
         
