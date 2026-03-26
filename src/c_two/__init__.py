@@ -8,6 +8,14 @@ from . import error
 from .compo import runtime
 from .crm.meta import icrm, read, write
 from .rpc.transferable import transferable
+from .rpc_v2.registry import (
+    register,
+    connect,
+    close,
+    unregister,
+    server_address,
+    shutdown,
+)
 
 __version__ = '0.2.7'
 
