@@ -582,4 +582,72 @@ mod tests {
         let x = alloc.alloc(4096);
         assert!(x.is_some());
     }
+
+    #[test]
+    fn test_double_free_returns_error() {
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        // Allocate two blocks so the first one's buddy is in use,
+        // preventing merge on free (which changes bitmap state).
+        let a = alloc.alloc(4096).unwrap();
+        let b = alloc.alloc(4096).unwrap();
+        alloc.free(a.offset, a.level).unwrap();
+        // Second free of the same block should fail.
+        let result = alloc.free(a.offset, a.level);
+        assert!(result.is_err(), "double free should return error");
+        assert!(
+            result.unwrap_err().contains("double free"),
+            "should report double free"
+        );
+        alloc.free(b.offset, b.level).unwrap();
+    }
+
+    #[test]
+    fn test_free_invalid_level() {
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let a = alloc.alloc(4096).unwrap();
+        let result = alloc.free(a.offset, 99);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("level"),
+            "should reject invalid level"
+        );
+        // Clean up properly.
+        alloc.free(a.offset, a.level).unwrap();
+    }
+
+    #[test]
+    fn test_free_invalid_offset() {
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let a = alloc.alloc(4096).unwrap();
+        // Misaligned offset.
+        let result = alloc.free(a.offset + 1, a.level);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("not aligned"),
+            "should reject misaligned offset"
+        );
+        alloc.free(a.offset, a.level).unwrap();
+    }
+
+    #[test]
+    fn test_merge_stress_various_free_orders() {
+        let (alloc, _buf) = make_allocator(256 * 1024, 4096);
+        let initial_free = alloc.free_bytes();
+
+        // Allocate many small blocks.
+        let mut allocs = Vec::new();
+        for _ in 0..8 {
+            if let Some(a) = alloc.alloc(4096) {
+                allocs.push(a);
+            }
+        }
+        assert!(allocs.len() >= 4);
+
+        // Free in reverse order — should still fully merge.
+        for a in allocs.iter().rev() {
+            alloc.free(a.offset, a.level).unwrap();
+        }
+        assert_eq!(alloc.free_bytes(), initial_free);
+        assert_eq!(alloc.alloc_count(), 0);
+    }
 }
