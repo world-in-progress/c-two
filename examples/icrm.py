@@ -222,6 +222,7 @@ class IGrid:
     =
     Interface of Core Resource Model (ICRM) specifies how to interact with CRM. 
     """
+    @cc.read
     def get_schema(self) -> GridSchema:
         """Method to get grid schema
 
@@ -229,7 +230,8 @@ class IGrid:
             GridSchema: grid schema
         """
         ...
-    
+
+    @cc.write
     def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
         """
         Subdivide grids by turning off parent grids' activate flag and activating children's activate flags
@@ -244,9 +246,11 @@ class IGrid:
         """
         ...
     
+    @cc.read
     def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
         ...
 
+    @cc.read
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
         """Method to get all attributes for provided grids having same level
 
@@ -260,6 +264,7 @@ class IGrid:
         """
         ...
     
+    @cc.read
     def get_active_grid_infos(self) -> tuple[list[int], list[int]]:
         """Method to get all active grids' global ids and levels
 
@@ -268,9 +273,11 @@ class IGrid:
         """
         ...
         
+    @cc.read
     def hello(self, name: str) -> str:
         ...
     
+    @cc.read
     def none_hello(self, message: str) -> str | None:
         ...
 
