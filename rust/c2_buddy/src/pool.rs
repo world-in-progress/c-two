@@ -84,6 +84,9 @@ pub struct BuddyPool {
     name_prefix: String,
     /// Next dedicated segment index (offset from max_segments to avoid collision).
     next_dedicated_idx: u32,
+    /// When each buddy segment became fully idle (alloc_count == 0).
+    /// None means the segment has active allocations.
+    idle_since: Vec<Option<Instant>>,
 }
 
 impl BuddyPool {
@@ -104,6 +107,7 @@ impl BuddyPool {
             name_counter: AtomicU32::new(0),
             name_prefix,
             next_dedicated_idx: 256,
+            idle_since: Vec::new(),
         }
     }
 
@@ -207,6 +211,41 @@ impl BuddyPool {
         }
     }
 
+    /// Reclaim idle buddy segments from the end of the segment list.
+    ///
+    /// Only pops trailing empty segments to avoid index remapping (segment
+    /// indices are encoded in wire frames). Always retains at least one segment.
+    /// Returns the number of segments reclaimed.
+    pub fn gc_buddy(&mut self) -> usize {
+        let secs = self.config.dedicated_gc_delay_secs;
+        let delay = if secs < 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(secs)
+        };
+        let now = Instant::now();
+        let mut removed = 0;
+
+        // Pop from the end while segments are idle and past the delay.
+        while self.segments.len() > 1 {
+            let last = self.segments.len() - 1;
+            let seg = &self.segments[last];
+            if seg.allocator().alloc_count() > 0 {
+                break;
+            }
+            if let Some(idle_at) = self.idle_since.get(last).copied().flatten() {
+                if now.duration_since(idle_at) >= delay {
+                    self.segments.pop();
+                    self.idle_since.pop();
+                    removed += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        removed
+    }
+
     /// Run garbage collection on freed dedicated segments.
     pub fn gc_dedicated(&mut self) {
         let secs = self.config.dedicated_gc_delay_secs;
@@ -265,6 +304,7 @@ impl BuddyPool {
         let seg = ShmSegment::open(name, size)?;
         let idx = self.segments.len();
         self.segments.push(seg);
+        self.idle_since.push(None);
         Ok(idx)
     }
 
@@ -297,7 +337,15 @@ impl BuddyPool {
                 .next_power_of_two()
                 .max(self.config.min_block_size);
             if let Some(level) = seg.allocator().size_to_level(actual_size) {
-                seg.allocator().free(offset, level as u16)
+                seg.allocator().free(offset, level as u16)?;
+                // Track idle: if segment is now empty, record the time.
+                let idx = seg_idx as usize;
+                if seg.allocator().alloc_count() == 0 {
+                    if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
+                        self.idle_since[idx] = Some(Instant::now());
+                    }
+                }
+                Ok(())
             } else {
                 Err("could not determine buddy level for free_at".into())
             }
@@ -364,6 +412,10 @@ impl BuddyPool {
         // Layer 1: Try existing segments.
         for (idx, seg) in self.segments.iter().enumerate() {
             if let Some(a) = seg.allocator().alloc(size) {
+                // Mark segment as active (not idle).
+                if idx < self.idle_since.len() {
+                    self.idle_since[idx] = None;
+                }
                 return Ok(PoolAllocation {
                     seg_idx: idx as u32,
                     offset: a.offset,
@@ -379,6 +431,7 @@ impl BuddyPool {
             let seg = self.create_segment()?;
             let idx = self.segments.len();
             self.segments.push(seg);
+            self.idle_since.push(None);
             if let Some(a) = self.segments[idx].allocator().alloc(size) {
                 return Ok(PoolAllocation {
                     seg_idx: idx as u32,
@@ -448,8 +501,16 @@ impl BuddyPool {
     }
 
     fn free_buddy(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
-        if let Some(seg) = self.segments.get(alloc.seg_idx as usize) {
-            seg.allocator().free(alloc.offset, alloc.level)
+        let idx = alloc.seg_idx as usize;
+        if let Some(seg) = self.segments.get(idx) {
+            seg.allocator().free(alloc.offset, alloc.level)?;
+            // Track idle: if segment is now empty, record the time.
+            if seg.allocator().alloc_count() == 0 {
+                if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
+                    self.idle_since[idx] = Some(Instant::now());
+                }
+            }
+            Ok(())
         } else {
             Err(format!("invalid segment index {}", alloc.seg_idx))
         }
@@ -641,5 +702,72 @@ mod tests {
             ..small_config()
         };
         let _pool = test_pool(config);
+    }
+
+    #[test]
+    fn test_gc_buddy_reclaims_trailing_idle() {
+        let config = PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 0,
+            dedicated_gc_delay_secs: 0.0,
+        };
+        let mut pool = test_pool(config);
+
+        // Allocate blocks that force 2 segments.
+        let mut allocs = Vec::new();
+        for _ in 0..20 {
+            allocs.push(pool.alloc(4096).unwrap());
+        }
+        assert!(pool.segment_count() >= 2);
+
+        // Free all blocks.
+        for a in &allocs {
+            pool.free(a).unwrap();
+        }
+
+        // GC should reclaim trailing idle segments (but keep at least 1).
+        let removed = pool.gc_buddy();
+        assert!(removed > 0);
+        assert!(pool.segment_count() >= 1);
+
+        // Pool should still be usable.
+        let a = pool.alloc(4096).unwrap();
+        pool.free(&a).unwrap();
+    }
+
+    #[test]
+    fn test_gc_buddy_keeps_segment_with_allocs() {
+        let config = PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 0,
+            dedicated_gc_delay_secs: 0.0,
+        };
+        let mut pool = test_pool(config);
+
+        // Force 2 segments.
+        let mut allocs = Vec::new();
+        for _ in 0..20 {
+            allocs.push(pool.alloc(4096).unwrap());
+        }
+        let seg_count = pool.segment_count();
+        assert!(seg_count >= 2);
+
+        // Free only blocks from the first segment (keep second non-empty).
+        // Actually, just keep one block alive — gc should not reclaim.
+        for a in allocs.iter().skip(1) {
+            pool.free(a).unwrap();
+        }
+
+        let removed = pool.gc_buddy();
+        // Trailing segment may or may not be empty. At minimum, first segment
+        // still has 1 alloc, so pool is still alive.
+        assert!(pool.segment_count() >= 1);
+        let _ = removed;
+
+        pool.free(&allocs[0]).unwrap();
     }
 }

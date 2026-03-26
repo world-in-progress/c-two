@@ -406,12 +406,13 @@ impl PyBuddyPoolHandle {
         Ok(pool.segment_count())
     }
 
-    /// Run garbage collection on freed dedicated segments.
+    /// Run garbage collection on freed dedicated segments and idle buddy segments.
     fn gc(&self) -> PyResult<()> {
         let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
         pool.gc_dedicated();
+        pool.gc_buddy();
         Ok(())
     }
 
