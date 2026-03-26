@@ -6,10 +6,10 @@ IPC v3 replaces the original file-based `memory://` transport with a Rust buddy 
 
 | Metric | memory:// | ipc:// (v3) | Improvement |
 |--------|-----------|-------------|-------------|
-| **Geomean P50 (≥10MB)** | 316.2 ms | 15.6 ms | **20.2×** |
-| **Peak throughput** | 0.52 GB/s | 10.01 GB/s | **19.3×** |
-| **Small payload latency (64B)** | 33.0 ms | 0.14 ms | **237×** |
-| **1GB round-trip** | 2,433 ms | 269 ms | **9.0×** |
+| **Geomean P50 (≥10MB)** | 384.8 ms | 35.8 ms | **10.7×** |
+| **Peak throughput** | 0.44 GB/s | 5.03 GB/s | **11.4×** |
+| **Small payload latency (64B)** | 31.1 ms | 0.12 ms | **271×** |
+| **1GB round-trip** | 3,827 ms | 729 ms | **5.3×** |
 
 ---
 
@@ -117,7 +117,7 @@ This converts the alloc-free-alloc-free pattern into a single long-lived allocat
 - **CPU**: Apple M-series ARM64
 - **Python**: 3.14t (free-threaded build)
 - **OS**: macOS (Darwin)
-- **Benchmark**: General `@transferable` round-trip (serialize → send → receive → deserialize)
+- **Benchmark**: General `@transferable` round-trip — multi-field struct serialization (struct.pack/unpack), CRM computes checksum + mutates fields (NOT a raw bytes echo)
 - **Rounds**: 100 (reduced to 30/20/10 for 50MB/100MB/500MB+)
 - **Warmup**: 5 rounds
 
@@ -125,56 +125,59 @@ This converts the alloc-free-alloc-free pattern into a single long-lived allocat
 
 | Size | memory P50 | ipc P50 | Speedup | mem ops/s | ipc ops/s | mem tput | ipc tput |
 |------|-----------|---------|---------|-----------|-----------|----------|----------|
-| 64B | 33.0 ms | 0.14 ms | **237×** | 30 | 7,179 | ~0 | ~0 |
-| 1KB | 30.0 ms | 0.18 ms | **167×** | 33 | 5,572 | ~0 | 0.01 GB/s |
-| 4KB | 32.0 ms | 0.20 ms | **159×** | 31 | 4,956 | ~0 | 0.02 GB/s |
-| 64KB | 30.2 ms | 0.18 ms | **166×** | 33 | 5,508 | ~0 | 0.34 GB/s |
-| 1MB | 38.0 ms | 0.28 ms | **135×** | 26 | 3,562 | 0.03 GB/s | 3.48 GB/s |
-| 10MB | 56.1 ms | 1.41 ms | **40×** | 18 | 707 | 0.17 GB/s | 6.91 GB/s |
-| 50MB | 118.1 ms | 5.02 ms | **24×** | 9 | 199 | 0.41 GB/s | 9.73 GB/s |
-| 100MB | 206.9 ms | 9.75 ms | **21×** | 5 | 103 | 0.47 GB/s | **10.01 GB/s** |
-| 500MB | 947.9 ms | 50.2 ms | **19×** | 1 | 20 | 0.52 GB/s | 9.72 GB/s |
-| 1GB | 2,433 ms | 269 ms | **9×** | 0.4 | 3.7 | 0.41 GB/s | 3.72 GB/s |
+| 64B | 31.1 ms | 0.12 ms | **271×** | 32 | 8,715 | ~0 | ~0 |
+| 1KB | 32.1 ms | 0.18 ms | **180×** | 31 | 5,602 | ~0 | 0.01 GB/s |
+| 4KB | 32.1 ms | 0.22 ms | **143×** | 31 | 4,465 | ~0 | 0.02 GB/s |
+| 64KB | 32.2 ms | 0.21 ms | **156×** | 31 | 4,830 | ~0 | 0.29 GB/s |
+| 1MB | 38.1 ms | 0.43 ms | **88×** | 26 | 2,309 | 0.03 GB/s | 2.25 GB/s |
+| 10MB | 65.7 ms | 2.87 ms | **23×** | 15 | 349 | 0.15 GB/s | 3.41 GB/s |
+| 50MB | 134.9 ms | 10.6 ms | **13×** | 7 | 94 | 0.36 GB/s | 4.60 GB/s |
+| 100MB | 224.4 ms | 19.4 ms | **12×** | 5 | 52 | 0.44 GB/s | **5.03 GB/s** |
+| 500MB | 1,108 ms | 136.6 ms | **8×** | 1 | 7 | 0.44 GB/s | 3.57 GB/s |
+| 1GB | 3,827 ms | 729 ms | **5×** | 0.3 | 1.4 | 0.26 GB/s | 1.37 GB/s |
 
-**Geomean P50 (≥10MB): memory=316.2ms → ipc-v3=15.6ms — 20.2× speedup**
+**Geomean P50 (≥10MB): memory=384.8ms → ipc-v3=35.8ms — 10.7× speedup**
 
 ### 3.2 Analysis
 
 **Small payloads (64B–64KB):**
-- memory:// latency is ~30ms regardless of size (polling-dominated)
-- ipc:// latency is 0.13–0.20ms (UDS round-trip dominated)
-- Speedup: **150–237×** — entirely due to eliminating filesystem polling
+- memory:// latency is ~31ms regardless of size (polling-dominated)
+- ipc:// latency is 0.12–0.22ms (UDS round-trip + struct pack/unpack)
+- Speedup: **143–271×** — entirely due to eliminating filesystem polling
 
 **Medium payloads (1MB–10MB):**
 - memory:// latency grows linearly with size (I/O-bound)
-- ipc:// latency is sub-2ms (SHM memcpy dominated, ~7 GB/s effective)
-- Speedup: **40–135×** — combines polling elimination + zero-copy SHM
+- ipc:// latency is sub-3ms (SHM memcpy + serialization dominated)
+- Speedup: **23–88×** — combines polling elimination + SHM zero-copy
 
 **Large payloads (50MB–100MB):**
-- Peak throughput zone for ipc:// at **~10 GB/s** (near DRAM bandwidth limit for a single-threaded Python process)
-- memory:// caps at 0.5 GB/s (filesystem bottleneck)
-- Speedup: **21–24×**
+- Peak throughput zone for ipc:// at **~5 GB/s** (includes serialization overhead)
+- memory:// caps at 0.44 GB/s (filesystem bottleneck)
+- Speedup: **12–13×** — serialization cost narrows the gap vs pure transport
 
 **Very large payloads (500MB–1GB):**
-- 1GB ipc:// drops to 3.72 GB/s due to TLB pressure and Python GC pauses
-- Still **9–19× faster** than memory://
-- memory:// shows high variance at 1GB (2,262–3,813ms) due to filesystem cache pressure
+- 1GB ipc:// at 729ms includes: 2× struct.pack, 2× struct.unpack, 2× SHM memcpy, CRM checksum
+- memory:// shows extreme variance at 1GB (3,322–6,787ms) due to filesystem cache pressure
+- Speedup: **5–8×** — serialization/deserialization of large payloads (bytes() copy on memoryview) becomes significant
 
-### 3.3 IPC v3 Latency Breakdown (100MB example)
+**Note on bytes-echo vs realistic scenario:**
+The bytes-echo benchmark (serialize = identity function, CRM = return input) yields ~20× geomean speedup. The realistic benchmark (struct packing, CRM processing, client-side deserialize) yields ~11× because serialization overhead is identical for both transports and proportionally reduces the transport advantage at large sizes. The absolute transport speedup is unchanged — the difference reflects the added constant-factor work.
+
+### 3.3 IPC v3 Latency Breakdown (100MB realistic example)
 
 | Component | Estimated Time |
 |-----------|---------------|
-| Wire encode (client) | ~0.3 ms |
+| Client struct.pack + payload concat | ~0.5 ms |
 | SHM write (memcpy to pool) | ~1.5 ms |
 | UDS control frame send/recv | ~0.1 ms |
-| Server SHM read (memoryview) | ~0 ms (zero-copy) |
-| CRM execute | ~0.01 ms |
-| Wire encode response | ~0.3 ms |
-| SHM write response | ~1.5 ms |
-| Client SHM read + deserialize | ~2.0 ms |
-| **Total** | **~9.7 ms** |
+| Server SHM read → struct.unpack | ~2.0 ms |
+| CRM checksum + field mutation | ~0.1 ms |
+| Server struct.pack + SHM write | ~2.0 ms |
+| Client SHM read + struct.unpack | ~2.0 ms |
+| bytes() materialization on memoryview | ~5.0 ms |
+| **Total** | **~19.4 ms** |
 
-The dominant cost at 100MB is the `memcpy` operations (SHM write on both sides), which are bounded by DRAM bandwidth.
+The dominant cost at 100MB is `bytes()` materialization from `memoryview` during deserialization, plus the `memcpy` operations for SHM writes. The struct.pack/unpack headers are negligible.
 
 ---
 
@@ -226,7 +229,7 @@ rust/c2_buddy/
 
 ## 6. Conclusion
 
-IPC v3 delivers a **20× geomean speedup** over the original `memory://` file-based transport for payloads ≥10MB, with peak throughput reaching **10 GB/s** at 100MB. The key architectural wins are:
+IPC v3 delivers a **10.7× geomean speedup** over the original `memory://` file-based transport for payloads ≥10MB in a realistic multi-field serialization scenario, with peak throughput reaching **5 GB/s** at 100MB. For small payloads, the advantage is **271×** due to eliminating filesystem polling entirely. The key architectural wins are:
 
 1. **Eliminating filesystem I/O** — shared memory + UDS replaces file polling
 2. **Zero-copy pipeline** — `memoryview` end-to-end avoids intermediate copies

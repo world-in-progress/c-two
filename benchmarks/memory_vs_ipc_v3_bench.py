@@ -1,8 +1,12 @@
 """Benchmark: memory:// vs ipc:// (v3) — general @transferable path.
 
+Uses a multi-field struct-based transferable with real serialization
+work (struct.pack/unpack + header construction) and a CRM method that
+performs actual computation (checksum + field mutation), NOT a raw
+bytes echo.
+
 Measures P50 latency, min/max latency, throughput, and ops/sec across
-payload sizes from 64B to 1GB. Uses realistic CRM with @transferable
-serialization (not echo-optimized).
+payload sizes from 64B to 1GB.
 
 Usage:
     uv run python benchmarks/memory_vs_ipc_v3_bench.py
@@ -12,6 +16,7 @@ import gc
 import math
 import os
 import statistics
+import struct
 import sys
 import time
 
@@ -23,29 +28,52 @@ from c_two.rpc.client import Client
 
 
 # ---------------------------------------------------------------------------
-# Transferable payload (general-purpose, not bytes-optimized)
+# Realistic multi-field transferable with struct serialization
 # ---------------------------------------------------------------------------
 
+_HDR = struct.Struct('<IIfI')  # seq(u32) + flags(u32) + timestamp(f32) + payload_len(u32) = 16B
+
 @cc.transferable
-class Payload:
-    raw: bytes
+class DataPacket:
+    """Multi-field packet with header + variable-length payload."""
+    seq: int
+    flags: int
+    timestamp: float
+    payload: bytes
 
-    def serialize(data: 'Payload') -> bytes:
-        return data.raw
+    def serialize(pkt: 'DataPacket') -> bytes:
+        hdr = _HDR.pack(pkt.seq, pkt.flags, pkt.timestamp, len(pkt.payload))
+        return hdr + pkt.payload
 
-    def deserialize(raw: bytes) -> 'Payload':
-        return Payload(raw=bytes(raw) if isinstance(raw, memoryview) else raw)
+    def deserialize(raw: bytes) -> 'DataPacket':
+        if isinstance(raw, memoryview):
+            raw = bytes(raw)
+        seq, flags, ts, plen = _HDR.unpack_from(raw)
+        payload = raw[_HDR.size : _HDR.size + plen]
+        return DataPacket(seq=seq, flags=flags, timestamp=ts, payload=payload)
 
 
-@cc.icrm(namespace='cc.bench.memvsipc', version='0.1.0')
+@cc.icrm(namespace='cc.bench.realistic', version='0.1.0')
 class IBenchCRM:
-    def echo_payload(self, data: Payload) -> Payload:
+    def process(self, pkt: DataPacket) -> DataPacket:
         ...
 
 
 class BenchCRM:
-    def echo_payload(self, data: Payload) -> Payload:
-        return data
+    """CRM with actual processing — not a trivial echo."""
+
+    def process(self, pkt: DataPacket) -> DataPacket:
+        # Compute a lightweight checksum over the first 1KB of payload
+        chunk = pkt.payload[:min(1024, len(pkt.payload))]
+        checksum = 0
+        for b in chunk:
+            checksum = (checksum + b) & 0xFFFFFFFF
+        return DataPacket(
+            seq=pkt.seq + 1,
+            flags=pkt.flags | (checksum & 0xFF),
+            timestamp=pkt.timestamp,
+            payload=pkt.payload,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -69,15 +97,17 @@ ROUNDS = 100
 WARMUP = 5
 
 
-def make_payload(size: int) -> Payload:
-    """Create a Payload of exactly `size` bytes."""
-    if size <= 4096:
-        return Payload(raw=os.urandom(size))
-    block = os.urandom(4096)
-    repeats = size // 4096
-    remainder = size % 4096
-    raw = block * repeats + block[:remainder]
-    return Payload(raw=raw)
+def make_payload(size: int) -> DataPacket:
+    """Create a DataPacket where total serialized size ≈ `size` bytes."""
+    payload_size = max(0, size - _HDR.size)  # subtract 16-byte header
+    if payload_size <= 4096:
+        blob = os.urandom(payload_size)
+    else:
+        block = os.urandom(4096)
+        repeats = payload_size // 4096
+        remainder = payload_size % 4096
+        blob = block * repeats + block[:remainder]
+    return DataPacket(seq=1, flags=0, timestamp=1.0, payload=blob)
 
 
 def run_protocol(protocol: str, address: str, sizes: list, rounds: int, warmup: int) -> dict:
@@ -128,24 +158,27 @@ def run_protocol(protocol: str, address: str, sizes: list, rounds: int, warmup: 
             actual_rounds = max(30, rounds // 3)
 
         payload = make_payload(size)
-        serialized = Payload.serialize(payload)
 
         # Warmup
         for _ in range(min(warmup, 3)):
             try:
-                client.call('echo_payload', serialized)
+                client.call('process', DataPacket.serialize(payload))
             except Exception as e:
                 print(f'  Warmup error at {label}: {e}')
                 break
 
-        # Benchmark
+        # Measure full round-trip: client serialize → transport → server
+        # deserialize → CRM process → server serialize → transport →
+        # client deserialize.
         latencies = []
         errors = 0
         for _ in range(actual_rounds):
             gc.disable()
             t0 = time.perf_counter()
             try:
-                resp = client.call('echo_payload', serialized)
+                serialized_req = DataPacket.serialize(payload)
+                resp_bytes = client.call('process', serialized_req)
+                result = DataPacket.deserialize(resp_bytes)
                 t1 = time.perf_counter()
                 latencies.append((t1 - t0) * 1000)  # ms
             except Exception:
@@ -175,7 +208,7 @@ def run_protocol(protocol: str, address: str, sizes: list, rounds: int, warmup: 
                 'throughput_gbs': 0, 'ops_per_sec': 0, 'errors': errors,
             }
 
-        del payload, serialized
+        del payload
         gc.collect()
 
         print(f'  {protocol} {label:>6s}: P50={results[label]["p50_ms"]:.3f}ms  '
