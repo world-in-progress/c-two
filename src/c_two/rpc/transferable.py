@@ -73,7 +73,13 @@ class Transferable(metaclass=TransferableMeta):
     Transferable classes are automatically converted to `dataclasses` and should implement the methods:
     - serialize: convert runtime `args` to `bytes` message
     - deserialize: convert `bytes` message to runtime `args`
+
+    Set ``__memoryview_aware__ = True`` on subclasses whose ``deserialize``
+    accepts ``memoryview`` directly (avoids a full ``bytes()`` copy on the
+    IPC hot path).
     """
+    __memoryview_aware__: bool = False
+
     def serialize(*args: any) -> bytes:
         """
         serialize is a static method, and the decorator @staticmethod is added in the metaclass.  
@@ -102,7 +108,28 @@ def _default_serialize_func(*args):
         raise
 
 def _default_deserialize_func(data: memoryview | None):
-    return pickle.loads(data) if data else None
+    # b'' is used as a wire sentinel for None results (see crm_to_com:
+    # serialized_result = b'' when result is None).  Must check both
+    # None *and* empty bytes so the sentinel round-trips correctly,
+    # while still allowing legitimate empty-bytes payloads when the
+    # serializer actually produces them (pickle.dumps(b'') is non-empty).
+    if data is None or len(data) == 0:
+        return None
+    return pickle.loads(data)
+
+def _is_single_bytes_param(func, filtered_params, type_hints) -> bool:
+    """Check if a function takes exactly one parameter of type bytes."""
+    if len(filtered_params) != 1:
+        return False
+    param_type = type_hints.get(filtered_params[0])
+    return param_type is bytes
+
+
+def _is_bytes_return(func) -> bool:
+    """Check if a function has return type bytes."""
+    type_hints = get_type_hints(func)
+    return type_hints.get('return') is bytes
+
 
 def create_default_transferable(func, is_input: bool):
     """
@@ -133,65 +160,53 @@ def create_default_transferable(func, is_input: bool):
             if i == 0 and name in ('self', 'cls'):
                 continue
             filtered_params.append(name)
-        
-        # Define the dynamic transferable class for input
-        class DynamicInputTransferable(Transferable):
-            __module__ = 'Default'  # mark as default
-            
-            def serialize(*args) -> bytes:
-                """
-                Default serialization for function input parameters using pickle
-                """
-                try:
-                    # Create a mapping of parameter names to arguments
-                    args_dict = {}
-                    for i, arg in enumerate(args):
-                        if i < len(filtered_params):
-                            args_dict[filtered_params[i]] = arg
-                        else:
-                            args_dict[f'extra_arg_{i}'] = arg
-                    
-                    args_dict['__serialized__'] = True
-                    return pickle.dumps(args_dict)
-                except Exception:
-                    # Fallback to direct args serialization
-                    return pickle.dumps(args)
-            
-            def deserialize(data: memoryview | bytes):
-                """
-                Default deserialization for function input parameters using pickle
-                Returns either the original dict mapping or tuple of args.
-                """
-                try:
-                    # Handle None case
-                    if not data:
-                        return None
-                    
-                    unpickled = pickle.loads(data)
-                    
-                    if isinstance(unpickled, dict):
-                        if '__serialized__' not in unpickled:
-                            return unpickled
 
-                        # If it's a dict (from serialize method), convert back to tuple
-                        del unpickled['__serialized__']
-                        
-                        # Preserve parameter order
-                        ordered_args = []
-                        for param_name in filtered_params:
-                            if param_name in unpickled:
-                                ordered_args.append(unpickled[param_name])
-                        # Add any extra arguments
-                        for key, value in unpickled.items():
-                            if key.startswith('extra_arg_'):
-                                ordered_args.append(value)
-                        
-                        return tuple(ordered_args) if len(ordered_args) != 1 else ordered_args[0]
-                    else:
+        # Fast path: single bytes parameter — skip pickle entirely.
+        # The deserializer returns the data as-is (including memoryview) to
+        # enable zero-copy reads when the transport provides memoryview.
+        if _is_single_bytes_param(func, filtered_params, type_hints):
+            class DynamicInputTransferable(Transferable):
+                __module__ = 'Default'
+                __memoryview_aware__ = True
+
+                def serialize(data) -> bytes:
+                    if isinstance(data, (bytes, memoryview)):
+                        return data
+                    raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(data).__name__}")
+
+                def deserialize(data: memoryview | bytes):
+                    if data is None:
+                        return None
+                    return data
+
+        else:
+            # Define the dynamic transferable class for input.
+            # pickle.loads() accepts memoryview since Python 3.8, so we
+            # can safely mark the default pickle-based class as
+            # memoryview-aware to avoid unnecessary bytes() conversion.
+            class DynamicInputTransferable(Transferable):
+                __module__ = 'Default'  # mark as default
+                __memoryview_aware__ = True
+                
+                def serialize(*args) -> bytes:
+                    """Default serialization: pickle args directly as tuple."""
+                    try:
+                        if len(args) == 1:
+                            return pickle.dumps(args[0])
+                        return pickle.dumps(args)
+                    except Exception as e:
+                        logger.error(f'Failed to serialize input data: {e}')
+                        raise
+                
+                def deserialize(data: memoryview | bytes):
+                    """Default deserialization: unpickle and return value or tuple."""
+                    try:
+                        if data is None or len(data) == 0:
+                            return None
+                        unpickled = pickle.loads(data)
                         return unpickled
-                        
-                except Exception as e:
-                    raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
+                    except Exception as e:
+                        raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
         
         # Set the dynamic class properties
         DynamicInputTransferable._is_input = True
@@ -209,19 +224,35 @@ def create_default_transferable(func, is_input: bool):
         
         # Create transferable for function return value
         type_hints = get_type_hints(func)
-        return_type = type_hints['return']
-        serialize_func = _default_serialize_func
-        deserialize_func = _default_deserialize_func
+        return_type = type_hints.get('return')
+
+        # Fast path: bytes return type — skip pickle entirely.
+        # The serializer passes memoryview through to enable zero-copy
+        # SHM→SHM writes in transports that support it (ipc-v3 buddy).
+        if return_type is bytes:
+            def _bytes_output_serialize(val):
+                if isinstance(val, (bytes, memoryview)):
+                    return val
+                raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(val).__name__}")
+            serialize_func = staticmethod(_bytes_output_serialize)
+            deserialize_func = staticmethod(lambda data: data if isinstance(data, (bytes, memoryview)) else pickle.loads(data) if data is not None else None)
+        else:
+            serialize_func = staticmethod(_default_serialize_func)
+            deserialize_func = staticmethod(_default_deserialize_func)
 
         # Define the dynamic transferable class for output
+        attrs = {
+            '__module__': 'Default',
+            '__memoryview_aware__': True,
+            'serialize': serialize_func,
+            'deserialize': deserialize_func,
+        }
+        if return_type is bytes:
+            pass  # already True above
         DynamicOutputTransferable = type(
             class_name,
             (Transferable,),
-            {
-                '__module__': 'Default',  # mark as default
-                'serialize': staticmethod(serialize_func),
-                'deserialize': staticmethod(deserialize_func)
-            }
+            attrs,
         )
         
         # Set the dynamic class properties
@@ -288,7 +319,13 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 
                 # Deserialize output
                 stage = 'deserialize_output'
-                return None if not output_transferable else output_transferable(result_bytes)
+                if not output_transferable:
+                    return None
+                # Convert memoryview→bytes for legacy deserializers that don't handle memoryview.
+                if (not getattr(output, '__memoryview_aware__', False)
+                        and isinstance(result_bytes, memoryview)):
+                    result_bytes = bytes(result_bytes)
+                return output_transferable(result_bytes)
             
             except error.CCBaseError:
                 raise
@@ -320,7 +357,14 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 
                 # Deserialize input args if input_transferable is provided
                 # And if deserialized_args is not a tuple, convert it to a tuple
-                deserialized_args = input_transferable(request) if (request is not None and input_transferable is not None) else tuple()
+                if request is not None and input_transferable is not None:
+                    # Convert memoryview→bytes for legacy deserializers.
+                    if (not getattr(input, '__memoryview_aware__', False)
+                            and isinstance(request, memoryview)):
+                        request = bytes(request)
+                    deserialized_args = input_transferable(request)
+                else:
+                    deserialized_args = tuple()
                 if not isinstance(deserialized_args, tuple):
                     deserialized_args = (deserialized_args,)
 
@@ -375,41 +419,49 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
 
 def auto_transfer(func: callable | None = None) -> callable:
     def create_wrapper(func: callable) -> callable:
-        # --- Input Matching using Pydantic Model Comparison ---
+        # --- Input Matching ---
+        # Priority 1: Direct Transferable lookup — if the method has exactly
+        # one non-self parameter whose type is a registered Transferable,
+        # use it directly (same strategy as the output matcher).
         input_model = _create_pydantic_model_from_func_sig(func)
         input_transferable: Transferable | None = None
 
         if input_model is not None:
-            # Get fields from the generated Pydantic model
             input_model_fields = getattr(input_model, 'model_fields', {})
-
             is_empty_input = not bool(input_model_fields)
-            if not is_empty_input:
-                for info in _TRANSFERABLE_INFOS:
-                    # Safe matching, ensure module names match
-                    if info.get('module') != func.__module__:
-                        continue
-                    
-                    registered_param_map = info.get('param_map', {})
-                    is_empty_registered = not bool(registered_param_map)
 
-                    # Match if field names and types align
-                    if not is_empty_input and not is_empty_registered:
-                        # Compare names first
-                        if set(input_model_fields.keys()) == set(registered_param_map.keys()):
-                            # Compare types
-                            match = True
-                            for name, field_info in input_model_fields.items():
-                                # Get the type annotation from Pydantic's FieldInfo
-                                pydantic_type = field_info.annotation
-                                registered_type = registered_param_map.get(name)
-                                # Simple type comparison (TODO: might need refinement for complex types like generics)
-                                if pydantic_type != registered_type:
-                                    match = False
+            if not is_empty_input:
+                # Direct lookup: single-param whose type is a registered
+                # Transferable gets matched without fragile name/type
+                # comparison against serialize() signatures.
+                if len(input_model_fields) == 1:
+                    field_info = next(iter(input_model_fields.values()))
+                    param_type = field_info.annotation
+                    param_module = getattr(param_type, '__module__', None)
+                    param_name = getattr(param_type, '__name__', str(param_type))
+                    full_name = f'{param_module}.{param_name}' if param_module else param_name
+                    if full_name in _TRANSFERABLE_MAP:
+                        input_transferable = get_transferable(full_name)
+
+                # Priority 2: Field name+type comparison (legacy path).
+                if input_transferable is None:
+                    for info in _TRANSFERABLE_INFOS:
+                        if info.get('module') != func.__module__:
+                            continue
+                        registered_param_map = info.get('param_map', {})
+                        is_empty_registered = not bool(registered_param_map)
+                        if not is_empty_input and not is_empty_registered:
+                            if set(input_model_fields.keys()) == set(registered_param_map.keys()):
+                                match = True
+                                for name, fi in input_model_fields.items():
+                                    pydantic_type = fi.annotation
+                                    registered_type = registered_param_map.get(name)
+                                    if pydantic_type != registered_type:
+                                        match = False
+                                        break
+                                if match:
+                                    input_transferable = get_transferable(info['name'])
                                     break
-                            if match:
-                                input_transferable = get_transferable(info['name'])
-                                break
 
             # If no matching transferable found, create a default one (not registered and only used in this function)
             if input_transferable is None and not is_empty_input:

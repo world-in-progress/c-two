@@ -1,21 +1,27 @@
 """Pre-allocated SharedMemory management for IPC v2 transport.
 
 Eliminates per-RPC shm_open/ftruncate/mmap/munmap/shm_unlink syscalls
-by pre-allocating a single SHM segment during connection handshake and
-reusing it for the lifetime of the connection.
+by pre-allocating pool SHM segments during connection handshake and
+reusing them for the lifetime of the connection.
 
-Each connection gets **one** shared SHM segment (unified bidirectional):
-- Client creates and owns (unlinks on disconnect)
-- Server opens the same segment with track=False
-- Synchronous RPC guarantees requests and responses never coexist
+**Split pool architecture** (Phase 1):
 
-If payload exceeds the segment size, falls back to per-request SHM.
+- Client Outbound Pool (``ccpo_``): client creates, writes requests;
+  server opens read-only.
+- Server Response Pool (``ccps_``): server creates, writes responses;
+  client opens read-only.
+- Each side manages their own pool independently (create, expand, unlink).
+- Expansion uses CTRL_SEGMENT_ANNOUNCE (no ACK, FIFO ordering).
+
+Handshake v3 carries bidirectional pool info: client sends outbound
+pool, server ACK includes response pool.  Backward-compatible with v2.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import struct
 from multiprocessing import shared_memory
 
@@ -24,50 +30,130 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Handshake wire format
 # ---------------------------------------------------------------------------
-# [1B version][4B segment_size LE][shm_name UTF-8]
+# v1: [1B version=1][4B segment_size LE][shm_name UTF-8]
+# v2: [1B version=2][1B segment_index][4B segment_size LE][shm_name UTF-8]
+# v3 client→server: [1B version=3][1B segment_index=0][4B seg_size LE][shm_name UTF-8]
+# v3 server→client: [1B version=3][1B segment_index=0][4B client_neg_size LE]
+#                    [4B server_seg_size LE][server_pool_name UTF-8]
 
-_HANDSHAKE_VERSION = 1
-_HANDSHAKE_HEADER_SIZE = 5  # 1B version + 4B segment_size
+_HANDSHAKE_VERSION = 3
+_HANDSHAKE_V1_HEADER_SIZE = 5   # 1B version + 4B segment_size
+_HANDSHAKE_V2_HEADER_SIZE = 6   # 1B version + 1B segment_index + 4B segment_size
+_HANDSHAKE_V3_HEADER_SIZE = 6   # same layout as v2 for client→server
+_HANDSHAKE_V3_ACK_HEADER_SIZE = 10  # 1B version + 1B index + 4B client_neg + 4B server_seg
 
 
-def encode_handshake(shm_name: str, segment_size: int) -> bytes:
-    """Encode a pool handshake payload."""
+def encode_handshake(shm_name: str, segment_size: int, segment_index: int = 0) -> bytes:
+    """Encode a pool handshake payload (v3 client→server format)."""
     name_bytes = shm_name.encode('utf-8')
-    buf = bytearray(_HANDSHAKE_HEADER_SIZE + len(name_bytes))
+    buf = bytearray(_HANDSHAKE_V3_HEADER_SIZE + len(name_bytes))
     buf[0] = _HANDSHAKE_VERSION
-    struct.pack_into('<I', buf, 1, segment_size)
-    buf[_HANDSHAKE_HEADER_SIZE:] = name_bytes
+    buf[1] = segment_index
+    struct.pack_into('<I', buf, 2, segment_size)
+    buf[_HANDSHAKE_V3_HEADER_SIZE:] = name_bytes
     return bytes(buf)
 
 
-def decode_handshake(payload: bytes | memoryview) -> tuple[str, int]:
-    """Decode a pool handshake payload.
+def encode_handshake_ack(
+    client_negotiated_size: int,
+    server_seg_size: int,
+    server_pool_name: str,
+    segment_index: int = 0,
+) -> bytes:
+    """Encode a v3 handshake ACK (server→client), carrying server pool info."""
+    name_bytes = server_pool_name.encode('utf-8')
+    buf = bytearray(_HANDSHAKE_V3_ACK_HEADER_SIZE + len(name_bytes))
+    buf[0] = _HANDSHAKE_VERSION
+    buf[1] = segment_index
+    struct.pack_into('<I', buf, 2, client_negotiated_size)
+    struct.pack_into('<I', buf, 6, server_seg_size)
+    buf[_HANDSHAKE_V3_ACK_HEADER_SIZE:] = name_bytes
+    return bytes(buf)
 
-    Returns (shm_name, segment_size).
+
+def decode_handshake(payload: bytes | memoryview) -> tuple[str, int, int]:
+    """Decode a pool handshake payload (v1, v2, or v3 client→server).
+
+    Returns (shm_name, segment_size, segment_index).
     """
-    if len(payload) < _HANDSHAKE_HEADER_SIZE:
+    if len(payload) < _HANDSHAKE_V1_HEADER_SIZE:
         raise ValueError(f'Handshake payload too short: {len(payload)}')
     version = payload[0] if isinstance(payload, (bytes, bytearray)) else int(payload[0])
-    if version != _HANDSHAKE_VERSION:
+    if version == 1:
+        segment_size = struct.unpack_from('<I', payload, 1)[0]
+        shm_name_str = bytes(payload[_HANDSHAKE_V1_HEADER_SIZE:]).decode('utf-8')
+        return shm_name_str, segment_size, 0
+    elif version in (2, 3):
+        if len(payload) < _HANDSHAKE_V2_HEADER_SIZE:
+            raise ValueError(f'Handshake v{version} payload too short: {len(payload)}')
+        segment_index = payload[1] if isinstance(payload, (bytes, bytearray)) else int(payload[1])
+        segment_size = struct.unpack_from('<I', payload, 2)[0]
+        shm_name_str = bytes(payload[_HANDSHAKE_V2_HEADER_SIZE:]).decode('utf-8')
+        return shm_name_str, segment_size, segment_index
+    else:
         raise ValueError(f'Unsupported handshake version: {version}')
-    segment_size = struct.unpack_from('<I', payload, 1)[0]
-    shm_name = bytes(payload[_HANDSHAKE_HEADER_SIZE:]).decode('utf-8')
-    return shm_name, segment_size
+
+
+def decode_handshake_ack(payload: bytes | memoryview) -> tuple[int, int, int, str]:
+    """Decode a v3 handshake ACK (server→client).
+
+    Returns (segment_index, client_negotiated_size, server_seg_size, server_pool_name).
+    For v2 ACK (empty name = legacy), returns server_seg_size=0, server_pool_name=''.
+    """
+    if len(payload) < _HANDSHAKE_V2_HEADER_SIZE:
+        raise ValueError(f'Handshake ACK too short: {len(payload)}')
+    version = payload[0] if isinstance(payload, (bytes, bytearray)) else int(payload[0])
+    segment_index = payload[1] if isinstance(payload, (bytes, bytearray)) else int(payload[1])
+
+    if version <= 2:
+        client_neg_size = struct.unpack_from('<I', payload, 2)[0]
+        return segment_index, client_neg_size, 0, ''
+
+    # v3 ACK: carries server pool info
+    if len(payload) < _HANDSHAKE_V3_ACK_HEADER_SIZE:
+        raise ValueError(f'Handshake v3 ACK too short: {len(payload)}')
+    client_neg_size = struct.unpack_from('<I', payload, 2)[0]
+    server_seg_size = struct.unpack_from('<I', payload, 6)[0]
+    server_pool_name = bytes(payload[_HANDSHAKE_V3_ACK_HEADER_SIZE:]).decode('utf-8')
+    return segment_index, client_neg_size, server_seg_size, server_pool_name
 
 
 # ---------------------------------------------------------------------------
-# SHM naming
+# SHM naming — split pool
 # ---------------------------------------------------------------------------
+
+def pool_shm_name_outbound(region_id: str, conn_id: int) -> str:
+    """Client outbound pool SHM name: ``ccpo{pid_hex}_{hash_hex}`` (20 chars)."""
+    pid_hex = format(os.getpid(), 'x')
+    raw = f'{region_id}_c{conn_id}_out'.encode()
+    hash_len = 15 - len(pid_hex)
+    h = hashlib.md5(raw).hexdigest()[:hash_len]
+    return f'ccpo{pid_hex}_{h}'
+
+
+def pool_shm_name_response(region_id: str, conn_id: int) -> str:
+    """Server response pool SHM name: ``ccps{pid_hex}_{hash_hex}`` (20 chars)."""
+    pid_hex = format(os.getpid(), 'x')
+    raw = f'{region_id}_c{conn_id}_resp'.encode()
+    hash_len = 15 - len(pid_hex)
+    h = hashlib.md5(raw).hexdigest()[:hash_len]
+    return f'ccps{pid_hex}_{h}'
+
 
 def pool_shm_name(region_id: str, conn_id: int, direction: str) -> str:
     """Generate a deterministic SHM name for a per-connection pool segment.
 
-    Format: ``ccp{d}_{12_hex}`` where d is the direction initial.
-    macOS POSIX SHM names are limited to 31 chars; this produces 16 chars.
+    Format: ``ccp{d}{pid_hex}_{hash_hex}`` — always exactly 20 chars.
+    macOS POSIX SHM names are limited to 31 chars; this produces 20 chars.
+
+    .. deprecated:: Use :func:`pool_shm_name_outbound` or
+       :func:`pool_shm_name_response` for split pool architecture.
     """
+    pid_hex = format(os.getpid(), 'x')
     raw = f'{region_id}_c{conn_id}_{direction}'.encode()
-    h = hashlib.md5(raw).hexdigest()[:12]
-    return f'ccp{direction[0]}_{h}'
+    hash_len = 15 - len(pid_hex)
+    h = hashlib.md5(raw).hexdigest()[:hash_len]
+    return f'ccp{direction[0]}{pid_hex}_{h}'
 
 
 # ---------------------------------------------------------------------------

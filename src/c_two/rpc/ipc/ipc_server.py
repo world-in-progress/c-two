@@ -4,6 +4,11 @@ IPC v2 Server — UDS control plane with SharedMemory data plane.
 Control plane: asyncio Unix Domain Socket (Phase 1-2, macOS/Linux)
 Data plane: multiprocessing.shared_memory.SharedMemory for large payloads
 
+Split pool architecture:
+    - Client Outbound Pool: client creates, client writes requests, server reads
+    - Server Response Pool: server creates, server writes responses, client reads
+    - Each side manages their own pool independently
+
 Wire protocol (control plane):
     [4B total_len][8B request_id_u64][4B flags][payload_or_shm_ref]
 
@@ -14,19 +19,18 @@ Wire protocol (control plane):
         bit 1: response frame
         bit 2: pool handshake
         bit 3: pool SHM segment
+        bit 4: control message (segment announce, consumed)
 """
 
 import asyncio
-import ctypes
 import logging
 import os
 import re
 import struct
 import tempfile
-import hashlib
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 
 from ... import error
@@ -35,236 +39,84 @@ from ..event import Event, EventQueue, EventTag
 from ..event.envelope import Envelope
 from ..event.msg_type import MsgType
 from ..util.adaptive_buffer import AdaptiveBuffer
-from ..util.wire import encode_reply, encode_signal, decode, write_reply_into, reply_wire_size
+from ..util.wire import encode_reply, encode_signal, decode, write_reply_into, reply_wire_size, PING_BYTES
+from .ipc_protocol import (
+    FLAG_SHM, FLAG_POOL, FLAG_HANDSHAKE, FLAG_RESPONSE, FLAG_CTRL,
+    FRAME_STRUCT, U64_STRUCT, U32_STRUCT,
+    FAST_READ_THRESHOLD, FRAME_HEADER_SIZE, POOL_PAYLOAD_HEADER_SIZE,
+    SHM_GC_INTERVAL, SHM_MAX_AGE,
+    SegmentState,
+    CTRL_SEGMENT_ANNOUNCE, CTRL_CONSUMED,
+    POOL_DIR_OUTBOUND, POOL_DIR_RESPONSE,
+    IPCConfig, DEFAULT_MAX_FRAME_SIZE,
+    DEFAULT_MAX_PAYLOAD_SIZE, DEFAULT_SHM_THRESHOLD,
+    DEFAULT_MAX_PENDING_REQUESTS, DEFAULT_POOL_SEGMENT_SIZE,
+    encode_frame, decode_frame,
+    encode_inline_reply_frame,
+    encode_ctrl_segment_announce, decode_ctrl_segment_announce,
+    encode_ctrl_consumed, decode_ctrl_consumed,
+    shm_name, fast_read_shm, read_from_pool_shm,
+)
 
 logger = logging.getLogger(__name__)
 
-_FLAG_SHM = 1 << 0
-_FLAG_RESPONSE = 1 << 1
-_FLAG_HANDSHAKE = 1 << 2
-_FLAG_POOL = 1 << 3
-_FAST_READ_THRESHOLD = 1_048_576            # 1 MB — use native memcpy above this size
+# B1: SHM name format — cc + direction char + pid_hex(1-6) + _ + hash_hex
+#     or pool format — ccp + direction char + pid_hex(1-6) + _ + hash_hex
+#     or split pool — ccpo/ccps + pid_hex(1-6) + _ + hash_hex
+_SHM_NAME_RE = re.compile(r'^cc[a-z][0-9a-f]{1,6}_[0-9a-f]{10,15}$')
+_POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z][0-9a-f]{1,6}_[0-9a-f]{9,14}$')
+_SPLIT_POOL_SHM_RE = re.compile(r'^ccp[os][0-9a-f]{1,6}_[0-9a-f]{9,14}$')
 
-# Pre-compiled struct objects for hot-path frame encoding/decoding
-_FRAME_STRUCT = struct.Struct('<IQI')       # frame header: total_len(u32) + rid(u64) + flags(u32)
-_U64_STRUCT = struct.Struct('<Q')           # SHM data size (u64)
-_U32_STRUCT = struct.Struct('<I')           # error_len in reply header, segment_size in handshake
 
-SHM_GC_INTERVAL = 30.0                      # seconds
-SHM_MAX_AGE = 120.0                         # seconds before GC considers a segment leaked
-
-# B1: SHM name format — cc + direction char + _ + 16 hex chars (from _shm_name())
-#     or pool format — ccp + direction char + _ + 12 hex chars (from pool_shm_name())
-_SHM_NAME_RE = re.compile(r'^cc[a-z]_[0-9a-f]{16}$')
-_POOL_SHM_NAME_RE = re.compile(r'^ccp[a-z]_[0-9a-f]{12}$')
-
-DEFAULT_SHM_THRESHOLD = 4_096               # 4 KB — pool wins above this (benchmark 2026-03)
-DEFAULT_MAX_FRAME_SIZE = 16_777_216         # 16 MB — inline frame upper bound
-DEFAULT_MAX_PAYLOAD_SIZE = 17_179_869_184  # 16 GB — SHM payload upper bound (not constrained by uint32 frame)
-DEFAULT_MAX_PENDING_REQUESTS = 1024         # per-server total
-DEFAULT_POOL_SEGMENT_SIZE = 268_435_456     # 256 MB — per-connection pool SHM segment
+def _valid_pool_shm_name(name: str) -> bool:
+    """Validate a pool SHM name (legacy or split format)."""
+    return bool(_POOL_SHM_NAME_RE.match(name) or _SPLIT_POOL_SHM_RE.match(name))
 
 
 @dataclass
-class IPCConfig:
-    shm_threshold: int = DEFAULT_SHM_THRESHOLD
-    max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
-    max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE
-    max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
-    pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
-    pool_enabled: bool = True
-    pool_decay_seconds: float = 60.0  # idle time before pool SHM teardown (0 = no decay)
+class _ClientContext:
+    """Per-connection state for _handle_client.
 
-    def __post_init__(self) -> None:
-        if self.pool_segment_size > 0xFFFFFFFF:
-            raise ValueError(
-                f'pool_segment_size {self.pool_segment_size} exceeds uint32 max '
-                f'(handshake wire format is uint32)'
-            )
-        if self.pool_segment_size <= 0:
-            raise ValueError('pool_segment_size must be > 0')
-        if self.max_frame_size <= 16:
-            raise ValueError('max_frame_size must be > 16 (header size)')
-        if self.max_payload_size <= 0:
-            raise ValueError('max_payload_size must be > 0')
-
-
-def _shm_name(region_id: str, request_id: str, direction: str) -> str:
-    # macOS limits POSIX SHM names to 31 chars (excluding leading /)
-    raw = f'{region_id}_{request_id}_{direction}'.encode()
-    h = hashlib.md5(raw).hexdigest()[:16]
-    d = direction[0]
-    return f'cc{d}_{h}'
-
-
-def _encode_frame(request_id: int, flags: int, payload: bytes | bytearray | memoryview) -> bytes:
-    payload_len = len(payload)
-    total_len = 12 + payload_len  # 8B rid + 4B flags + payload
-    if total_len > 0xFFFFFFFF:
-        raise OverflowError(
-            f'Frame total_len {total_len} exceeds uint32 max; '
-            f'use SHM transport for payloads > {0xFFFFFFFF - 12} bytes'
-        )
-    buf = bytearray(4 + total_len)
-    _FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, flags)
-    buf[16:16 + payload_len] = payload
-    return bytes(buf)
-
-
-def _encode_inline_call_frame(
-    request_id: int,
-    method_name: str,
-    args: bytes | memoryview,
-    call_header_cache: dict[str, bytes],
-) -> bytes:
-    """Single-allocation frame for inline CRM_CALL (eliminates encode_call + _encode_frame double copy)."""
-    cached_header = call_header_cache.get(method_name)
-    method_bytes: bytes | None = None
-    if cached_header is not None:
-        call_header_len = len(cached_header)
-    else:
-        method_bytes = method_name.encode('utf-8')
-        call_header_len = 3 + len(method_bytes)
-
-    args_len = len(args) if args else 0
-    wire_len = call_header_len + args_len
-    total_len = 12 + wire_len
-    buf = bytearray(4 + total_len)
-
-    # Frame header (16 bytes)
-    _FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, 0)
-
-    # Wire call message — directly into frame buffer
-    off = 16
-    if cached_header is not None:
-        buf[off:off + call_header_len] = cached_header
-    else:
-        buf[off] = MsgType.CRM_CALL
-        struct.pack_into('<H', buf, off + 1, len(method_bytes))
-        buf[off + 3:off + 3 + len(method_bytes)] = method_bytes
-
-    if args_len > 0:
-        buf[off + call_header_len:off + call_header_len + args_len] = args
-
-    return bytes(buf)
-
-
-def _encode_inline_reply_frame(
-    request_id: int,
-    flags: int,
-    err_bytes: bytes | memoryview,
-    result_bytes: bytes | memoryview,
-) -> bytes:
-    """Single-allocation frame for inline CRM_REPLY (eliminates encode_reply + _encode_frame double copy)."""
-    err_len = len(err_bytes) if err_bytes else 0
-    result_len = len(result_bytes) if result_bytes else 0
-    wire_len = 5 + err_len + result_len  # 1B type + 4B error_len + error + result
-    total_len = 12 + wire_len
-    buf = bytearray(4 + total_len)
-
-    # Frame header
-    _FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, flags)
-
-    # Wire reply message — directly into frame buffer
-    off = 16
-    buf[off] = MsgType.CRM_REPLY
-    _U32_STRUCT.pack_into(buf, off + 1, err_len)
-    if err_len > 0:
-        buf[off + 5:off + 5 + err_len] = err_bytes
-    if result_len > 0:
-        buf[off + 5 + err_len:off + 5 + err_len + result_len] = result_bytes
-
-    return bytes(buf)
-
-
-def _decode_frame(body: bytes) -> tuple[int, int, bytes]:
-    body_len = len(body)
-    if body_len < 12:
-        raise error.EventDeserializeError(f'Frame body too small: {body_len} < 12')
-    request_id, flags = _U64_STRUCT.unpack_from(body, 0)[0], _U32_STRUCT.unpack_from(body, 8)[0]
-    payload = body[12:]
-    return request_id, flags, payload
-
-
-def _fast_read_shm(
-    name: str,
-    size: int,
-    adaptive_buf: 'AdaptiveBuffer | None' = None,
-) -> tuple[memoryview, 'AdaptiveBuffer']:
-    """Read SHM using native memcpy into an :class:`AdaptiveBuffer`.
-
-    For large payloads, uses ctypes.memmove instead of
-    Python's ``bytes(shm.buf)`` to avoid per-call mmap overhead.
-
-    The adaptive buffer grows when needed and shrinks when consecutive reads
-    are significantly smaller than capacity (see :mod:`~c_two.rpc.util.adaptive_buffer`).
-
-    Returns ``(data_view, adaptive_buf)`` — pass *adaptive_buf* back on the
-    next call for reuse.
+    Split pool architecture:
+        - client_pool_*: Client's outbound pool (server reads requests from these)
+        - resp_pool_*: Server's response pool (server writes responses to these)
     """
-    if adaptive_buf is None:
-        adaptive_buf = AdaptiveBuffer()
+    conn_id: int
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    read_buf: AdaptiveBuffer = field(default_factory=AdaptiveBuffer)
+    conn_request_ids: set[str] = field(default_factory=set)
 
-    shm = shared_memory.SharedMemory(name=name, create=False, track=False)
-    try:
-        # Validate SHM actual size covers the declared size BEFORE allocating
-        if shm.size < size:
-            raise error.EventDeserializeError(
-                f'SHM segment {name!r} actual size {shm.size} < declared size {size}'
-            )
+    # Client's outbound pool (client creates, server opens read-only)
+    client_pool_shms: list[shared_memory.SharedMemory] = field(default_factory=list)
+    client_pool_sizes: list[int] = field(default_factory=list)
 
-        buf = adaptive_buf.acquire(size)
+    # Server's response pool (server creates and manages)
+    resp_pool_shms: list[shared_memory.SharedMemory] = field(default_factory=list)
+    resp_pool_sizes: list[int] = field(default_factory=list)
+    resp_pool_names: list[str] = field(default_factory=list)
+    resp_pool_budget_used: int = 0
 
-        if size >= _FAST_READ_THRESHOLD:
-            ctypes.memmove(
-                ctypes.addressof(ctypes.c_char.from_buffer(buf)),
-                ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)),
-                size,
-            )
-        else:
-            buf[:size] = shm.buf[:size]
-    finally:
-        shm.close()
-        shm.unlink()
-    return memoryview(buf)[:size], adaptive_buf
+    last_activity: float = field(default_factory=time.monotonic)
+    _heartbeat_task: asyncio.Task | None = None
 
+    def get_client_pool_shm(self, index: int) -> shared_memory.SharedMemory | None:
+        """Return the client outbound pool SHM at *index*, or None."""
+        if 0 <= index < len(self.client_pool_shms):
+            return self.client_pool_shms[index]
+        return None
 
-def _read_from_pool_shm(
-    shm_buf: memoryview,
-    size: int,
-    adaptive_buf: 'AdaptiveBuffer | None' = None,
-) -> tuple[memoryview, 'AdaptiveBuffer']:
-    """Read from a pre-opened pool SHM buffer into an :class:`AdaptiveBuffer`.
-
-    Unlike :func:`_fast_read_shm`, does **not** open or unlink the SHM — the
-    handle is assumed to be pre-opened and cached from the pool handshake.
-    """
-    if adaptive_buf is None:
-        adaptive_buf = AdaptiveBuffer()
-
-    if size > len(shm_buf):
-        raise error.EventDeserializeError(
-            f'Pool read size {size} exceeds SHM buffer length {len(shm_buf)}'
-        )
-
-    buf = adaptive_buf.acquire(size)
-
-    if size >= _FAST_READ_THRESHOLD:
-        ctypes.memmove(
-            ctypes.addressof(ctypes.c_char.from_buffer(buf)),
-            ctypes.addressof(ctypes.c_char.from_buffer(shm_buf)),
-            size,
-        )
-    else:
-        buf[:size] = shm_buf[:size]
-
-    return memoryview(buf)[:size], adaptive_buf
+    def get_resp_pool_shm(self, index: int) -> shared_memory.SharedMemory | None:
+        """Return the server response pool SHM at *index*, or None."""
+        if 0 <= index < len(self.resp_pool_shms):
+            return self.resp_pool_shms[index]
+        return None
 
 
 async def _read_frame(reader: asyncio.StreamReader, max_frame_size: int = DEFAULT_MAX_FRAME_SIZE) -> tuple[int, int, bytes]:
     """Read a frame, returning (request_id, flags, payload) directly."""
     header = await reader.readexactly(16)  # 4B total_len + 8B rid + 4B flags
-    total_len, request_id, flags = _FRAME_STRUCT.unpack(header)
+    total_len, request_id, flags = FRAME_STRUCT.unpack(header)
 
     # S2: reject oversized or undersized frames before allocation
     if total_len < 12:
@@ -310,11 +162,16 @@ class IPCv2Server(BaseServer):
         self._our_shm_segments: dict[str, float] = {}
         self._shm_lock = threading.Lock()
 
-        # Per-connection pool SHM (conn_id → SharedMemory)
-        # Unified: client-created SHM used for both request reads and response writes.
+        # Per-connection response pool (conn_id → (shm_list, size_list))
+        # Server-created SHM used for writing responses to the client.
         # Written by reply() (scheduler thread), read by _handle_client (asyncio thread)
-        self._conn_pool_shm: dict[int, shared_memory.SharedMemory] = {}
-        self._conn_shm_lock = threading.Lock()
+        self._conn_resp_pool: dict[int, tuple[list[shared_memory.SharedMemory], list[int]]] = {}
+        self._conn_resp_lock = threading.Lock()
+
+        # Per-connection pending CTRL frames to send before response
+        # Written by reply() (scheduler thread), read by _handle_client (asyncio thread)
+        self._conn_ctrl_frames: dict[int, list[bytes]] = {}
+        self._conn_ctrl_lock = threading.Lock()
 
         # Track active client handler tasks for clean shutdown
         self._client_tasks: set[asyncio.Task] = set()
@@ -343,26 +200,31 @@ class IPCv2Server(BaseServer):
         EventTag.SHUTDOWN_ACK: MsgType.SHUTDOWN_ACK,
     }
 
+    def _resolve_pending(self, request_id: str, frame: bytes, shm_name_val: str | None = None) -> None:
+        """Pop pending future and deliver response frame to the event loop."""
+        with self._pending_lock:
+            fut = self._pending.pop(request_id, None)
+        if fut is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(fut.set_result, (frame, shm_name_val))
+        else:
+            logger.warning(f'IPCv2Server.reply: no pending future for request_id={request_id}')
+
     def reply(self, event: Event) -> None:
         if not event.request_id:
             logger.warning('IPCv2Server.reply: event missing request_id')
             return
 
         request_id = event.request_id
-        # request_id format: "conn_id:wire_rid" — extract wire rid for frame encoding
         int_rid = int(request_id.rsplit(':', 1)[1])
-        flags = _FLAG_RESPONSE
-        shm_name: str | None = None
+        flags = FLAG_RESPONSE
+        resp_shm_name: str | None = None
 
         # Signal replies (PONG, SHUTDOWN_ACK) → 1-byte wire signal
         signal_type = self._event_tag_to_signal.get(event.tag)
         if signal_type is not None:
             payload = encode_signal(signal_type)
-            frame = _encode_frame(int_rid, flags, payload)
-            with self._pending_lock:
-                fut = self._pending.pop(request_id, None)
-            if fut is not None and self._loop is not None:
-                self._loop.call_soon_threadsafe(fut.set_result, (frame, None))
+            frame = encode_frame(int_rid, flags, payload)
+            self._resolve_pending(request_id, frame)
             return
 
         # CRM_REPLY: extract error and result from scheduler Event
@@ -371,7 +233,6 @@ class IPCv2Server(BaseServer):
             err_bytes = event.data_parts[0] if event.data_parts[0] else b''
             result_bytes = event.data_parts[1] if len(event.data_parts) > 1 else b''
         else:
-            # Fallback: scheduler returned combined data (non-tuple CRM response)
             from ..util.encoding import parse_message
             data = event.data if event.data is not None else b''
             parts = parse_message(data)
@@ -382,44 +243,81 @@ class IPCv2Server(BaseServer):
         result_len = len(result_bytes)
         total_wire = reply_wire_size(err_len, result_len)
 
-        # Try pool SHM first (pre-allocated, zero syscalls)
+        # Try server's response pool first (pre-allocated, zero syscalls)
         conn_id = int(request_id.rsplit(':', 1)[0])
-        with self._conn_shm_lock:
-            pool_shm = self._conn_pool_shm.get(conn_id)
-            if pool_shm is not None and total_wire <= pool_shm.size:
-                write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
-                payload = _U64_STRUCT.pack(total_wire)
-                flags |= _FLAG_POOL
+        with self._conn_resp_lock:
+            pool_entry = self._conn_resp_pool.get(conn_id)
+            if pool_entry is not None:
+                resp_shms, resp_sizes = pool_entry
+                # First-fit: find a segment large enough
+                for idx, (pool_shm, seg_size) in enumerate(zip(resp_shms, resp_sizes)):
+                    if total_wire <= seg_size:
+                        write_reply_into(pool_shm.buf, 0, err_bytes, result_bytes)
+                        payload = struct.pack('<BQ', idx, total_wire)
+                        flags |= FLAG_POOL
+                        break
 
-        if not (flags & _FLAG_POOL):
+                # Expansion: no segment fits, try to create a new one
+                if not (flags & FLAG_POOL) and total_wire >= self._config.shm_threshold:
+                    new_size = max(self._config.pool_segment_size, total_wire)
+                    # Check budget and segment count
+                    budget_used = sum(resp_sizes)
+                    can_expand = (
+                        len(resp_shms) < self._config.max_pool_segments
+                        and budget_used + new_size <= self._config.max_pool_memory
+                        and new_size <= self._config.max_payload_size
+                    )
+                    if can_expand:
+                        try:
+                            from .shm_pool import pool_shm_name_response, create_pool_shm
+                            new_name = pool_shm_name_response(
+                                self.region_id, conn_id * 1000 + len(resp_shms),
+                            )
+                            new_shm = create_pool_shm(new_name, new_size)
+                            new_seg_size = min(new_size, new_shm.size)
+                            new_index = len(resp_shms)
+
+                            resp_shms.append(new_shm)
+                            resp_sizes.append(new_seg_size)
+
+                            # Queue CTRL_SEGMENT_ANNOUNCE for the asyncio thread to send
+                            ctrl_payload = encode_ctrl_segment_announce(
+                                POOL_DIR_RESPONSE, new_index, new_seg_size, new_name,
+                            )
+                            ctrl_frame = encode_frame(0, FLAG_CTRL, ctrl_payload)
+                            with self._conn_ctrl_lock:
+                                self._conn_ctrl_frames.setdefault(conn_id, []).append(ctrl_frame)
+
+                            # Also track the name for cleanup
+                            # (We need ctx for this, but ctx is in asyncio thread.
+                            #  Store in a side dict for cleanup_connection to read.)
+                            with self._shm_lock:
+                                self._our_shm_segments[new_name] = 0.0  # 0.0 = pool, not timed
+
+                            # Write into the new segment
+                            if total_wire <= new_seg_size:
+                                write_reply_into(new_shm.buf, 0, err_bytes, result_bytes)
+                                payload = struct.pack('<BQ', new_index, total_wire)
+                                flags |= FLAG_POOL
+                        except Exception as exc:
+                            logger.warning('Server response pool expansion failed: %s', exc)
+
+        if not (flags & FLAG_POOL):
             if total_wire >= self._config.shm_threshold:
-                shm_name = _shm_name(self.region_id, request_id, 'resp')
-                shm = shared_memory.SharedMemory(name=shm_name, create=True, size=total_wire)
+                resp_shm_name = shm_name(self.region_id, request_id, 'resp')
+                shm = shared_memory.SharedMemory(name=resp_shm_name, create=True, size=total_wire)
                 write_reply_into(shm.buf, 0, err_bytes, result_bytes)
                 shm.close()
-                size_header = _U64_STRUCT.pack(total_wire)
-                payload = shm_name.encode('utf-8') + b'\x00' + size_header
-                flags |= _FLAG_SHM
+                size_header = U64_STRUCT.pack(total_wire)
+                payload = resp_shm_name.encode('utf-8') + b'\x00' + size_header
+                flags |= FLAG_SHM
             else:
-                # Inline: single-alloc frame (eliminates encode_reply + _encode_frame double copy)
-                frame = _encode_inline_reply_frame(int_rid, flags, err_bytes, result_bytes)
-                with self._pending_lock:
-                    fut = self._pending.pop(request_id, None)
-                if fut is not None and self._loop is not None:
-                    self._loop.call_soon_threadsafe(fut.set_result, (frame, None))
-                else:
-                    logger.warning(f'IPCv2Server.reply: no pending future for request_id={request_id}')
+                frame = encode_inline_reply_frame(int_rid, flags, err_bytes, result_bytes)
+                self._resolve_pending(request_id, frame)
                 return
 
-        frame = _encode_frame(int_rid, flags, payload)
-
-        with self._pending_lock:
-            fut = self._pending.pop(request_id, None)
-
-        if fut is not None and self._loop is not None:
-            self._loop.call_soon_threadsafe(fut.set_result, (frame, shm_name))
-        else:
-            logger.warning(f'IPCv2Server.reply: no pending future for request_id={request_id}')
+        frame = encode_frame(int_rid, flags, payload)
+        self._resolve_pending(request_id, frame, resp_shm_name)
 
     def shutdown(self) -> None:
         if self._loop is not None:
@@ -443,12 +341,14 @@ class IPCv2Server(BaseServer):
                     pass
             self._our_shm_segments.clear()
 
-        # Close pool SHM handles (client owns and unlinks these)
+        # Close client outbound pool handles (client owns and unlinks these)
+        # Unlink server response pool handles (server owns these)
         from .shm_pool import close_pool_shm
-        with self._conn_shm_lock:
-            for pool_shm in self._conn_pool_shm.values():
-                close_pool_shm(pool_shm)
-            self._conn_pool_shm.clear()
+        with self._conn_resp_lock:
+            for resp_shms, _ in self._conn_resp_pool.values():
+                for pool_shm in resp_shms:
+                    close_pool_shm(pool_shm, unlink=True)
+            self._conn_resp_pool.clear()
 
         with self._pending_lock:
             self._pending.clear()
@@ -513,21 +413,20 @@ class IPCv2Server(BaseServer):
             self.event_queue.put(Envelope(msg_type=MsgType.SHUTDOWN_SERVER))
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        from .shm_pool import close_pool_shm, decode_handshake, encode_handshake
-
+        """Orchestrator for a single client connection lifecycle."""
         task = asyncio.current_task()
         self._client_tasks.add(task)
-        _read_buf: AdaptiveBuffer = AdaptiveBuffer()  # per-connection adaptive buffer
-        with self._conn_buffers_lock:
-            self._conn_buffers.add(_read_buf)
-        # Assign a unique connection ID so per-connection rid counters don't collide
+
         conn_id = self._next_conn_id
         self._next_conn_id += 1
-        conn_request_ids: set[str] = set()  # S5: track per-connection request IDs
+        ctx = _ClientContext(conn_id=conn_id, reader=reader, writer=writer)
 
-        # Pool state for this connection (set during handshake)
-        pool_shm: shared_memory.SharedMemory | None = None  # unified bidirectional
-        pool_segment_size: int = 0
+        with self._conn_buffers_lock:
+            self._conn_buffers.add(ctx.read_buf)
+
+        # Start heartbeat probe task if enabled
+        if self._config.heartbeat_interval > 0:
+            ctx._heartbeat_task = asyncio.create_task(self._heartbeat_loop(ctx))
 
         # P2: event-driven shutdown — no polling timeout
         shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
@@ -552,136 +451,40 @@ class IPCv2Server(BaseServer):
                 except (asyncio.IncompleteReadError, ConnectionResetError):
                     break
 
-                # ---- Pool handshake (unified bidirectional) ----
-                if flags & _FLAG_HANDSHAKE:
-                    try:
-                        client_shm_name, seg_size = decode_handshake(payload)
+                # Any received frame counts as activity
+                ctx.last_activity = time.monotonic()
 
-                        # Validate client-provided SHM name and segment size
-                        if not _POOL_SHM_NAME_RE.match(client_shm_name):
-                            raise ValueError(f'Invalid pool SHM name: {client_shm_name!r}')
-                        if seg_size == 0:
-                            raise ValueError('Pool segment size must be > 0')
+                if flags & FLAG_HANDSHAKE:
+                    await self._handle_pool_handshake(ctx, payload)
+                    continue
 
-                        seg_size = min(seg_size, self._config.pool_segment_size)
-
-                        # Clean up old pool SHM if this is a re-handshake
-                        if pool_shm is not None:
-                            with self._conn_shm_lock:
-                                self._conn_pool_shm.pop(conn_id, None)
-                            close_pool_shm(pool_shm)
-
-                        # Open client's SHM for both reading requests and writing responses
-                        pool_shm = shared_memory.SharedMemory(
-                            name=client_shm_name, create=False, track=False,
-                        )
-                        # Cap negotiated size to actual SHM size (don't trust client declaration)
-                        pool_segment_size = min(seg_size, pool_shm.size)
-
-                        # Register for reply() access from scheduler thread
-                        with self._conn_shm_lock:
-                            self._conn_pool_shm[conn_id] = pool_shm
-
-                        # Send ACK with empty name → signals unified mode
-                        hs_payload = encode_handshake('', seg_size)
-                        hs_frame = _encode_frame(
-                            0, _FLAG_HANDSHAKE | _FLAG_RESPONSE, hs_payload,
-                        )
-                        await _write_frame(writer, hs_frame)
-                    except Exception as exc:
-                        logger.warning(
-                            'IPCv2Server: pool handshake failed for conn %d: %s',
-                            conn_id, exc,
-                        )
-                        close_pool_shm(pool_shm)
-                        pool_shm = None
-                        pool_segment_size = 0
+                if flags & FLAG_CTRL:
+                    self._handle_ctrl_message(ctx, payload)
                     continue
 
                 str_rid = f'{conn_id}:{request_id}'
+                wire_bytes = self._decode_request(ctx, flags, payload)
 
-                # ---- Decode request data ----
-                if flags & _FLAG_POOL:
-                    # Pool path: read from unified pool SHM
-                    if pool_shm is None or len(payload) < 8:
-                        raise error.EventDeserializeError(
-                            'Pool SHM frame received but no pool handshake was done'
-                        )
-                    size = _U64_STRUCT.unpack(payload[:8])[0]
-                    if size > pool_segment_size:
-                        raise error.EventDeserializeError(
-                            f'Pool payload size {size} exceeds segment size {pool_segment_size}'
-                        )
-                    # Zero-copy: decode directly from SHM memoryview
-                    # Safe because client is blocked waiting for response
-                    event_bytes = pool_shm.buf[:size]
-                elif flags & _FLAG_SHM:
-                    parts = payload.split(b'\x00', 1)
-                    if len(parts) != 2 or len(parts[1]) < 8:
-                        raise error.EventDeserializeError('Malformed SHM reference in request frame')
-                    shm_name = parts[0].decode('utf-8')
-                    if not _SHM_NAME_RE.match(shm_name):
-                        raise error.EventDeserializeError(f'Invalid SHM name format: {shm_name!r}')
-                    size = _U64_STRUCT.unpack(parts[1])[0]
-                    # S4: validate SHM payload size against config limit
-                    if size > self._config.max_payload_size:
-                        raise error.EventDeserializeError(
-                            f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
-                        )
-                    event_bytes, _read_buf = _fast_read_shm(shm_name, size, _read_buf)
-                else:
-                    event_bytes = payload
-
-                envelope = decode(event_bytes)
+                envelope = decode(wire_bytes)
                 envelope.request_id = str_rid
 
-                # S3: enforce max pending requests
-                with self._pending_lock:
-                    if len(self._pending) >= self._config.max_pending_requests:
-                        logger.warning(
-                            f'IPCv2Server: max pending requests ({self._config.max_pending_requests}) reached, '
-                            f'rejecting request_id={request_id}'
-                        )
-                        err_payload = encode_reply(
-                            error.CCError.serialize(
-                                error.CRMServerError('Server overloaded: max pending requests exceeded')
-                            ),
-                            b'',
-                        )
-                        err_frame = _encode_frame(request_id, _FLAG_RESPONSE, err_payload)
-                        await _write_frame(writer, err_frame)
-                        continue
+                response_frame, resp_shm_name = await self._dispatch_request(
+                    ctx, str_rid, request_id, envelope, writer,
+                )
+                if response_frame is None:
+                    continue
 
-                    if str_rid in self._pending:
-                        logger.warning(f'IPCv2Server: duplicate request_id={request_id}, rejecting')
-                        err_payload = encode_reply(
-                            error.CCError.serialize(error.CRMServerError('Duplicate request ID')),
-                            b'',
-                        )
-                        err_frame = _encode_frame(request_id, _FLAG_RESPONSE, err_payload)
-                        await _write_frame(writer, err_frame)
-                        continue
-
-                    # Register a future for this request so reply() can resolve it
-                    fut: asyncio.Future = self._loop.create_future()
-                    self._pending[str_rid] = fut
-                    conn_request_ids.add(str_rid)
-
-                # Push into the event queue for the server's _serve loop
-                self.event_queue.put(envelope)
-
-                # Wait for reply() to provide the response frame and optional SHM name
-                try:
-                    response_frame, resp_shm_name = await fut
-                except asyncio.CancelledError:
-                    break
-                finally:
-                    conn_request_ids.discard(str_rid)
+                # Send any pending CTRL frames before the response
+                # (e.g. SEGMENT_ANNOUNCE for newly expanded response pool)
+                with self._conn_ctrl_lock:
+                    ctrl_frames = self._conn_ctrl_frames.pop(conn_id, None)
+                if ctrl_frames:
+                    for cf in ctrl_frames:
+                        await _write_frame(writer, cf)
 
                 await _write_frame(writer, response_frame)
 
                 # S6: register SHM GC timestamp *after* frame is sent to client
-                # (only for per-request fallback SHMs, not pool segments)
                 if resp_shm_name is not None:
                     with self._shm_lock:
                         self._our_shm_segments[resp_shm_name] = time.monotonic()
@@ -690,34 +493,302 @@ class IPCv2Server(BaseServer):
         except Exception as exc:
             logger.debug(f'IPCv2Server client handler error: {exc}')
         finally:
-            # P2: clean up shutdown waiter if still pending
-            if not shutdown_waiter.done():
-                shutdown_waiter.cancel()
+            await self._cleanup_connection(ctx, shutdown_waiter, task)
+
+    async def _heartbeat_loop(self, ctx: _ClientContext) -> None:
+        """Periodically send PING frames and detect dead connections."""
+        interval = self._config.heartbeat_interval
+        timeout = self._config.heartbeat_timeout
+        ping_frame = encode_frame(0, 0, PING_BYTES)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                elapsed = time.monotonic() - ctx.last_activity
+                if elapsed >= timeout:
+                    logger.debug(
+                        'IPCv2Server: conn %d heartbeat timeout (%.1fs idle)',
+                        ctx.conn_id, elapsed,
+                    )
+                    # Force-close the transport to unblock the read loop
+                    ctx.writer.close()
+                    return
                 try:
-                    await shutdown_waiter
-                except asyncio.CancelledError:
-                    pass
-            # S5: clean up all pending futures for this connection
-            with self._pending_lock:
-                for rid in conn_request_ids:
-                    fut = self._pending.pop(rid, None)
-                    if fut is not None and not fut.done():
-                        fut.cancel()
-            writer.close()
+                    await _write_frame(ctx.writer, ping_frame)
+                except (ConnectionError, OSError):
+                    ctx.writer.close()
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def _handle_pool_handshake(self, ctx: _ClientContext, payload: bytes) -> None:
+        """Negotiate split pool with the client (v3 handshake).
+
+        Client sends its outbound pool info; server creates response pool
+        and sends ACK with both negotiated sizes and response pool info.
+        """
+        from .shm_pool import (
+            close_pool_shm, decode_handshake, encode_handshake_ack,
+            pool_shm_name_response, create_pool_shm,
+        )
+        try:
+            client_shm_name, seg_size, segment_index = decode_handshake(payload)
+
+            if not _valid_pool_shm_name(client_shm_name):
+                raise ValueError(f'Invalid pool SHM name: {client_shm_name!r}')
+            if seg_size == 0:
+                raise ValueError('Pool segment size must be > 0')
+
+            if segment_index != 0:
+                # v3 does not use append handshake — expansion uses CTRL_SEGMENT_ANNOUNCE
+                raise ValueError(
+                    f'v3 handshake does not support segment_index > 0 '
+                    f'(got {segment_index}); use CTRL_SEGMENT_ANNOUNCE instead'
+                )
+
+            # Initial handshake — clamp client's requested size to server's default
+            seg_size = min(seg_size, self._config.pool_segment_size)
+
+            # Clean up old pools if this is a re-handshake
+            if ctx.client_pool_shms:
+                with self._conn_resp_lock:
+                    self._conn_resp_pool.pop(ctx.conn_id, None)
+                for old_shm in ctx.client_pool_shms:
+                    close_pool_shm(old_shm)
+                ctx.client_pool_shms.clear()
+                ctx.client_pool_sizes.clear()
+                for old_shm in ctx.resp_pool_shms:
+                    close_pool_shm(old_shm, unlink=True)
+                ctx.resp_pool_shms.clear()
+                ctx.resp_pool_sizes.clear()
+                ctx.resp_pool_names.clear()
+                ctx.resp_pool_budget_used = 0
+
+            # Open client's outbound pool (read-only from server's perspective)
+            client_shm = shared_memory.SharedMemory(
+                name=client_shm_name, create=False, track=False,
+            )
+            negotiated_size = min(seg_size, client_shm.size)
+            ctx.client_pool_shms.append(client_shm)
+            ctx.client_pool_sizes.append(negotiated_size)
+
+            # Create server's response pool segment[0]
+            resp_seg_size = self._config.pool_segment_size
+            resp_name = pool_shm_name_response(self.region_id, ctx.conn_id)
+            resp_shm = create_pool_shm(resp_name, resp_seg_size)
+            actual_resp_size = min(resp_seg_size, resp_shm.size)
+            ctx.resp_pool_shms.append(resp_shm)
+            ctx.resp_pool_sizes.append(actual_resp_size)
+            ctx.resp_pool_names.append(resp_name)
+            ctx.resp_pool_budget_used = actual_resp_size
+
+            # Register response pool for reply() access from scheduler thread
+            with self._conn_resp_lock:
+                self._conn_resp_pool[ctx.conn_id] = (ctx.resp_pool_shms, ctx.resp_pool_sizes)
+
+            # Send v3 ACK with client negotiated size + server response pool info
+            hs_payload = encode_handshake_ack(
+                negotiated_size, actual_resp_size, resp_name,
+            )
+            hs_frame = encode_frame(
+                0, FLAG_HANDSHAKE | FLAG_RESPONSE, hs_payload,
+            )
+            await _write_frame(ctx.writer, hs_frame)
+        except Exception as exc:
+            logger.warning(
+                'IPCv2Server: pool handshake failed for conn %d: %s',
+                ctx.conn_id, exc,
+            )
+
+    def _handle_ctrl_message(self, ctx: _ClientContext, payload: bytes) -> None:
+        """Process a control message from the client."""
+        if len(payload) < 1:
+            logger.warning('Empty CTRL payload from conn %d', ctx.conn_id)
+            return
+        ctrl_type = payload[0]
+
+        if ctrl_type == CTRL_SEGMENT_ANNOUNCE:
+            direction, index, size, name = decode_ctrl_segment_announce(payload)
+            if direction != POOL_DIR_OUTBOUND:
+                logger.warning(
+                    'Server received SEGMENT_ANNOUNCE for direction=%d (expected outbound)',
+                    direction,
+                )
+                return
+            if not _valid_pool_shm_name(name):
+                logger.warning('Invalid pool SHM name in SEGMENT_ANNOUNCE: %r', name)
+                return
+            if index != len(ctx.client_pool_shms):
+                logger.warning(
+                    'SEGMENT_ANNOUNCE index mismatch: expected %d, got %d',
+                    len(ctx.client_pool_shms), index,
+                )
+                return
             try:
-                await writer.wait_closed()
-            except Exception:
+                shm = shared_memory.SharedMemory(name=name, create=False, track=False)
+                negotiated_size = min(size, shm.size)
+                ctx.client_pool_shms.append(shm)
+                ctx.client_pool_sizes.append(negotiated_size)
+            except Exception as exc:
+                logger.warning('Failed to open announced segment %r: %s', name, exc)
+
+        elif ctrl_type == CTRL_CONSUMED:
+            # Client consumed a response pool segment — in half-duplex this
+            # is redundant (segment is already free) but we accept it for
+            # protocol consistency and future full-duplex.
+            pass
+
+        else:
+            logger.warning('Unknown CTRL type %d from conn %d', ctrl_type, ctx.conn_id)
+
+    def _decode_request(self, ctx: _ClientContext, flags: int, payload: bytes) -> bytes | memoryview:
+        """Resolve request wire bytes from inline, per-request SHM, or client outbound pool."""
+        if flags & FLAG_POOL:
+            if not ctx.client_pool_shms or len(payload) < POOL_PAYLOAD_HEADER_SIZE:
+                raise error.EventDeserializeError(
+                    'Pool SHM frame received but no pool handshake was done'
+                )
+            segment_index = payload[0]
+            size = U64_STRUCT.unpack(payload[1:9])[0]
+            pool_shm = ctx.get_client_pool_shm(segment_index)
+            if pool_shm is None:
+                raise error.EventDeserializeError(
+                    f'Pool segment_index {segment_index} out of range '
+                    f'(have {len(ctx.client_pool_shms)} segments)'
+                )
+            seg_size = ctx.client_pool_sizes[segment_index]
+            if size > seg_size:
+                raise error.EventDeserializeError(
+                    f'Pool payload size {size} exceeds segment size {seg_size}'
+                )
+            # Zero-copy: decode directly from SHM memoryview
+            # Safe because client is blocked waiting for response
+            return pool_shm.buf[:size]
+        elif flags & FLAG_SHM:
+            parts = payload.split(b'\x00', 1)
+            if len(parts) != 2 or len(parts[1]) < 8:
+                raise error.EventDeserializeError('Malformed SHM reference in request frame')
+            req_shm_name = parts[0].decode('utf-8')
+            if not _SHM_NAME_RE.match(req_shm_name):
+                raise error.EventDeserializeError(f'Invalid SHM name format: {req_shm_name!r}')
+            size = U64_STRUCT.unpack(parts[1])[0]
+            # S4: validate SHM payload size against config limit
+            if size > self._config.max_payload_size:
+                raise error.EventDeserializeError(
+                    f'SHM payload size {size} exceeds limit {self._config.max_payload_size}'
+                )
+            event_bytes, ctx.read_buf = fast_read_shm(req_shm_name, size, ctx.read_buf)
+            return event_bytes
+        else:
+            return payload
+
+    async def _dispatch_request(
+        self,
+        ctx: _ClientContext,
+        str_rid: str,
+        wire_rid: int,
+        envelope: Envelope,
+        writer: asyncio.StreamWriter,
+    ) -> tuple[bytes | None, str | None]:
+        """Register pending future, enqueue envelope, and await reply."""
+        # S3: enforce max pending requests
+        with self._pending_lock:
+            if len(self._pending) >= self._config.max_pending_requests:
+                logger.warning(
+                    f'IPCv2Server: max pending requests ({self._config.max_pending_requests}) reached, '
+                    f'rejecting request_id={wire_rid}'
+                )
+                err_payload = encode_reply(
+                    error.CCError.serialize(
+                        error.CRMServerError('Server overloaded: max pending requests exceeded')
+                    ),
+                    b'',
+                )
+                err_frame = encode_frame(wire_rid, FLAG_RESPONSE, err_payload)
+                await _write_frame(writer, err_frame)
+                return None, None
+
+            if str_rid in self._pending:
+                logger.warning(f'IPCv2Server: duplicate request_id={wire_rid}, rejecting')
+                err_payload = encode_reply(
+                    error.CCError.serialize(error.CRMServerError('Duplicate request ID')),
+                    b'',
+                )
+                err_frame = encode_frame(wire_rid, FLAG_RESPONSE, err_payload)
+                await _write_frame(writer, err_frame)
+                return None, None
+
+            fut: asyncio.Future = self._loop.create_future()
+            self._pending[str_rid] = fut
+            ctx.conn_request_ids.add(str_rid)
+
+        self.event_queue.put(envelope)
+
+        try:
+            response_frame, resp_shm_name = await fut
+        except asyncio.CancelledError:
+            raise
+        finally:
+            ctx.conn_request_ids.discard(str_rid)
+
+        return response_frame, resp_shm_name
+
+    async def _cleanup_connection(
+        self,
+        ctx: _ClientContext,
+        shutdown_waiter: asyncio.Future,
+        task: asyncio.Task,
+    ) -> None:
+        """Release all resources held by a client connection."""
+        from .shm_pool import close_pool_shm
+
+        # Cancel heartbeat task if running
+        if ctx._heartbeat_task is not None and not ctx._heartbeat_task.done():
+            ctx._heartbeat_task.cancel()
+            try:
+                await ctx._heartbeat_task
+            except asyncio.CancelledError:
                 pass
-            with self._conn_buffers_lock:
-                self._conn_buffers.discard(_read_buf)
-            _read_buf.release()
-            self._client_tasks.discard(task)
-            # Clean up pool SHM for this connection (close handle, client unlinks)
-            # Pop from dict FIRST so reply() won't find the stale handle,
-            # then close the SHM handle outside the lock.
-            with self._conn_shm_lock:
-                self._conn_pool_shm.pop(conn_id, None)
+
+        # P2: clean up shutdown waiter if still pending
+        if not shutdown_waiter.done():
+            shutdown_waiter.cancel()
+            try:
+                await shutdown_waiter
+            except asyncio.CancelledError:
+                pass
+        # S5: clean up all pending futures for this connection
+        with self._pending_lock:
+            for rid in ctx.conn_request_ids:
+                fut = self._pending.pop(rid, None)
+                if fut is not None and not fut.done():
+                    fut.cancel()
+        ctx.writer.close()
+        try:
+            await ctx.writer.wait_closed()
+        except Exception:
+            pass
+        with self._conn_buffers_lock:
+            self._conn_buffers.discard(ctx.read_buf)
+        ctx.read_buf.release()
+        self._client_tasks.discard(task)
+
+        # Clean up client outbound pool (close handles only — client unlinks)
+        for pool_shm in ctx.client_pool_shms:
             close_pool_shm(pool_shm)
+
+        # Clean up server response pool (close + unlink — server owns these)
+        with self._conn_resp_lock:
+            self._conn_resp_pool.pop(ctx.conn_id, None)
+        for pool_shm in ctx.resp_pool_shms:
+            close_pool_shm(pool_shm, unlink=True)
+        # Remove response pool names from GC tracking
+        with self._shm_lock:
+            for name in ctx.resp_pool_names:
+                self._our_shm_segments.pop(name, None)
+
+        # Clean up any pending CTRL frames
+        with self._conn_ctrl_lock:
+            self._conn_ctrl_frames.pop(ctx.conn_id, None)
 
     async def _shm_gc_loop(self) -> None:
         while True:
@@ -734,6 +805,12 @@ class IPCv2Server(BaseServer):
                         pass
                     self._our_shm_segments.pop(name, None)
                     logger.debug(f'SHM GC: cleaned up stale segment {name}')
+
+                # NOTE: PID-based orphan detection for _our_shm_segments is
+                # unnecessary — these are server-created segments whose
+                # embedded PID is always this process.  PID-based scanning
+                # of the filesystem (for client-created orphans) is deferred
+                # to the P1 memory-pressure monitor.
 
             # Decay idle connection buffers
             with self._conn_buffers_lock:

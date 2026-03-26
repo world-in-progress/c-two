@@ -1,10 +1,10 @@
 """Security unit tests for IPC v2 transport layer.
 
 Covers:
-    S1: _decode_frame body too small validation
+    S1: decode_frame body too small validation
     S2: _read_frame / _recv_frame_sync total_len bounds
     S3: IPCConfig defaults, max_pending enforcement
-    S4: SHM size validation in _fast_read_shm
+    S4: SHM size validation in fast_read_shm
     S5: Pending futures cleanup on disconnect
     S6: SHM GC timestamp-after-send
     C1-C4: Dead code removal verification
@@ -22,16 +22,18 @@ from c_two import error
 from c_two.rpc.event import Event, EventQueue, EventTag
 from c_two.rpc.event.envelope import Envelope
 from c_two.rpc.event.msg_type import MsgType
-from c_two.rpc.ipc.ipc_server import (
+from c_two.rpc.ipc.ipc_protocol import (
     DEFAULT_MAX_FRAME_SIZE,
     DEFAULT_MAX_PAYLOAD_SIZE,
     DEFAULT_MAX_PENDING_REQUESTS,
     DEFAULT_SHM_THRESHOLD,
     IPCConfig,
+    decode_frame,
+    encode_frame,
+    fast_read_shm,
+)
+from c_two.rpc.ipc.ipc_server import (
     IPCv2Server,
-    _decode_frame,
-    _encode_frame,
-    _fast_read_shm,
     _read_frame,
 )
 from c_two.rpc.ipc.ipc_client import _recv_frame_sync
@@ -39,37 +41,37 @@ from c_two.rpc.util.wire import encode_call
 
 
 # ---------------------------------------------------------------------------
-# S1: _decode_frame — body too small validation
+# S1: decode_frame — body too small validation
 # ---------------------------------------------------------------------------
 
 class TestDecodeFrameValidation:
-    """S1: _decode_frame must reject bodies smaller than 12 bytes."""
+    """S1: decode_frame must reject bodies smaller than 12 bytes."""
 
     def test_body_too_small(self):
         """body < 12 bytes → EventDeserializeError."""
         body = b'\x00' * 11
         with pytest.raises(error.EventDeserializeError, match='too small'):
-            _decode_frame(body)
+            decode_frame(body)
 
     def test_empty_body(self):
         """empty body → EventDeserializeError."""
         with pytest.raises(error.EventDeserializeError, match='too small'):
-            _decode_frame(b'')
+            decode_frame(b'')
 
     def test_body_exactly_12_bytes(self):
         """body == 12 bytes → valid edge case (empty payload)."""
         rid = 42
         flags = 0
         body = struct.pack('<Q', rid) + struct.pack('<I', flags)
-        request_id, f, p = _decode_frame(body)
+        request_id, f, p = decode_frame(body)
         assert request_id == 42
         assert f == 0
         assert p == b''
 
     def test_valid_roundtrip(self):
         """Normal frame encode → decode should still work (strip 4B header)."""
-        frame = _encode_frame(1, 0, b'hello world')
-        rid, flags, payload = _decode_frame(frame[4:])
+        frame = encode_frame(1, 0, b'hello world')
+        rid, flags, payload = decode_frame(frame[4:])
         assert rid == 1
         assert flags == 0
         assert payload == b'hello world'
@@ -107,7 +109,7 @@ class TestReadFrameBounds:
     def test_accepts_valid_frame(self):
         """Frame within bounds should pass through."""
         async def _run():
-            frame = _encode_frame(1, 0, b'data')
+            frame = encode_frame(1, 0, b'data')
             reader = asyncio.StreamReader()
             reader.feed_data(frame)
             rid, flags, payload = await _read_frame(reader, max_frame_size=DEFAULT_MAX_FRAME_SIZE)
@@ -179,7 +181,7 @@ class TestRecvFrameSyncBounds:
         """Default max_frame_size (from server) accepts normal-sized frames."""
         client, server = self._make_socket_pair()
         try:
-            frame = _encode_frame(1, 0, b'x' * 100)
+            frame = encode_frame(1, 0, b'x' * 100)
             server.sendall(frame)
             rid, _, payload = _recv_frame_sync(client)
             assert rid == 1
@@ -220,11 +222,11 @@ class TestIPCConfigDefaults:
 
 
 # ---------------------------------------------------------------------------
-# S4: SHM size validation in _fast_read_shm
+# S4: SHM size validation in fast_read_shm
 # ---------------------------------------------------------------------------
 
 class TestSHMSizeValidation:
-    """S4: _fast_read_shm must validate actual SHM size >= declared size."""
+    """S4: fast_read_shm must validate actual SHM size >= declared size."""
 
     def test_actual_shm_smaller_than_declared(self):
         """If declared size > actual SHM size → EventDeserializeError."""
@@ -237,7 +239,7 @@ class TestSHMSizeValidation:
         shm.close()
         declared_size = rounded_actual + 100  # exceeds even the rounded size
         with pytest.raises(error.EventDeserializeError, match='actual size'):
-            _fast_read_shm(shm_name, declared_size)
+            fast_read_shm(shm_name, declared_size)
 
     def test_exact_size_match_succeeds(self):
         """declared size == actual SHM size → should succeed."""
@@ -245,8 +247,8 @@ class TestSHMSizeValidation:
         size = 128
         shm = shared_memory.SharedMemory(name=shm_name, create=True, size=size)
         shm.buf[:size] = b'\xAB' * size
-        shm.close()  # close but don't unlink — _fast_read_shm will unlink
-        data, buf = _fast_read_shm(shm_name, size)
+        shm.close()  # close but don't unlink — fast_read_shm will unlink
+        data, buf = fast_read_shm(shm_name, size)
         assert bytes(data) == b'\xAB' * size
         buf.release()
 
@@ -274,7 +276,7 @@ class TestPendingCleanup:
             # Send a valid request frame (wire format: CRM_CALL)
             request_id = 42
             call_bytes = encode_call('foo', b'')
-            frame = _encode_frame(request_id, 0, call_bytes)
+            frame = encode_frame(request_id, 0, call_bytes)
             sock.sendall(frame)
 
             # Wait for the event to arrive in the queue
@@ -396,12 +398,14 @@ class TestDeadCodeRemoved:
         assert 'DEFAULT_INLINE_THRESHOLD' not in source
         assert '_FLAG_RESPONSE' not in source.split('from .ipc_server import')[1].split(')')[0] if 'from .ipc_server import' in source else True
 
-    def test_write_shm_moved_to_client(self):
-        """_write_shm should be in ipc_client, not ipc_server."""
+    def test_write_shm_not_in_server(self):
+        """_write_shm should not be in ipc_server (removed as dead code)."""
         import c_two.rpc.ipc.ipc_server as server_mod
         import c_two.rpc.ipc.ipc_client as client_mod
         assert not hasattr(server_mod, '_write_shm')
-        assert hasattr(client_mod, '_write_shm')
+        # _write_shm was removed from client too — pool SHM and
+        # per-request SHM writes are handled inline via shm_writer callbacks.
+        assert not hasattr(client_mod, '_write_shm')
 
     def test_read_and_release_shm_moved_to_benchmarks(self):
         """_read_and_release_shm should not be in ipc_server (moved to benchmarks)."""
@@ -418,11 +422,11 @@ class TestSHMReferenceFormat:
 
     def test_missing_null_separator(self):
         """Payload with no \\x00 → EventDeserializeError."""
-        # Build a frame with _FLAG_SHM set but payload has no null byte
-        from c_two.rpc.ipc.ipc_server import _FLAG_SHM
+        # Build a frame with FLAG_SHM set but payload has no null byte
+        from c_two.rpc.ipc.ipc_protocol import FLAG_SHM
         bad_payload = b'no_null_here'
-        frame = _encode_frame(1, _FLAG_SHM, bad_payload)
-        _, flags, payload = _decode_frame(frame[4:])
+        frame = encode_frame(1, FLAG_SHM, bad_payload)
+        _, flags, payload = decode_frame(frame[4:])
         # Simulate server-side parsing
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 1  # confirms bug vector
@@ -433,10 +437,10 @@ class TestSHMReferenceFormat:
 
     def test_incomplete_size_field(self):
         """Payload with \\x00 but fewer than 8 bytes after → EventDeserializeError."""
-        from c_two.rpc.ipc.ipc_server import _FLAG_SHM
+        from c_two.rpc.ipc.ipc_protocol import FLAG_SHM
         bad_payload = b'shm_name\x00\x01\x02'  # only 2 bytes after null
-        frame = _encode_frame(1, _FLAG_SHM, bad_payload)
-        _, flags, payload = _decode_frame(frame[4:])
+        frame = encode_frame(1, FLAG_SHM, bad_payload)
+        _, flags, payload = decode_frame(frame[4:])
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 2
         assert len(parts[1]) < 8  # confirms bug vector
@@ -446,11 +450,11 @@ class TestSHMReferenceFormat:
 
     def test_valid_shm_reference_accepted(self):
         """Well-formed SHM reference parses correctly."""
-        from c_two.rpc.ipc.ipc_server import _FLAG_SHM
+        from c_two.rpc.ipc.ipc_protocol import FLAG_SHM
         size_bytes = struct.pack('<Q', 12345)
         good_payload = b'shm_name\x00' + size_bytes
-        frame = _encode_frame(1, _FLAG_SHM, good_payload)
-        _, flags, payload = _decode_frame(frame[4:])
+        frame = encode_frame(1, FLAG_SHM, good_payload)
+        _, flags, payload = decode_frame(frame[4:])
         parts = payload.split(b'\x00', 1)
         assert len(parts) == 2 and len(parts[1]) >= 8
         shm_name = parts[0].decode('utf-8')

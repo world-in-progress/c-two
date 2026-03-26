@@ -67,6 +67,10 @@ _SIGNAL_BYTES_MAP = {
 # pre-encode (unlike the method name in CRM_CALL).
 _call_header_cache: dict[str, bytes] = {}
 
+# Decode side: raw method_name bytes → decoded str
+# Avoids repeated bytes(memoryview[...]).decode('utf-8') on every CRM_CALL.
+_method_name_decode_cache: dict[bytes, str] = {}
+
 
 def preregister_method(method_name: str) -> None:
     """Pre-encode a method name for fast wire encoding.
@@ -91,6 +95,14 @@ def preregister_methods(method_names: Iterable[str]) -> None:
         preregister_method(name)
 
 
+def get_call_header_cache() -> dict[str, bytes]:
+    """Public accessor for the method-name → wire-header cache.
+
+    Used by IPC v2 transport for zero-copy inline frame encoding.
+    """
+    return _call_header_cache
+
+
 # ---------------------------------------------------------------------------
 # Size helpers
 # ---------------------------------------------------------------------------
@@ -101,6 +113,19 @@ def call_wire_size(method_name_len: int, payload_len: int) -> int:
 
 def reply_wire_size(error_len: int, result_len: int) -> int:
     return REPLY_HEADER_FIXED + error_len + result_len
+
+
+def payload_total_size(payload) -> int:
+    """Return total byte length of *payload*.
+
+    *payload* may be ``bytes``, ``memoryview``, a ``tuple``/``list`` of
+    such segments (scatter-write), or ``None``.
+    """
+    if payload is None:
+        return 0
+    if isinstance(payload, (list, tuple)):
+        return sum(len(s) for s in payload)
+    return len(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -160,52 +185,67 @@ def encode_reply(error_data: bytes | memoryview | None = None,
 
 def write_call_into(buf, offset: int,
                     method_name: str,
-                    payload: bytes | memoryview | None = None) -> int:
+                    payload: bytes | memoryview | tuple | None = None) -> int:
     """Write a CRM_CALL message directly into *buf* starting at *offset*.
 
-    *buf* must support ``struct.pack_into`` and slice assignment
-    (``bytearray``, ``mmap``, ``SharedMemory.buf``, etc.).
+    *payload* may be a single ``bytes``/``memoryview`` or a ``tuple``/``list``
+    of segments (scatter-write — avoids concatenation copies).
 
     Returns the total number of bytes written.
     """
     cached_header = _call_header_cache.get(method_name)
     if cached_header is not None:
         header_len = len(cached_header)
-        payload_len = len(payload) if payload else 0
         buf[offset:offset + header_len] = cached_header
-        if payload_len > 0:
-            buf[offset + header_len:offset + header_len + payload_len] = payload
-        return header_len + payload_len
+        pos = offset + header_len
+    else:
+        method_bytes = method_name.encode('utf-8')
+        method_len = len(method_bytes)
+        buf[offset] = MsgType.CRM_CALL
+        struct.pack_into('<H', buf, offset + 1, method_len)
+        buf[offset + 3:offset + 3 + method_len] = method_bytes
+        pos = offset + CALL_HEADER_FIXED + method_len
 
-    method_bytes = method_name.encode('utf-8')
-    method_len = len(method_bytes)
-    payload_len = len(payload) if payload else 0
+    if payload is not None:
+        if isinstance(payload, (list, tuple)):
+            for segment in payload:
+                seg_len = len(segment)
+                buf[pos:pos + seg_len] = segment
+                pos += seg_len
+        else:
+            payload_len = len(payload)
+            buf[pos:pos + payload_len] = payload
+            pos += payload_len
 
-    buf[offset] = MsgType.CRM_CALL
-    struct.pack_into('<H', buf, offset + 1, method_len)
-    buf[offset + 3:offset + 3 + method_len] = method_bytes
-    if payload_len > 0:
-        buf[offset + 3 + method_len:offset + 3 + method_len + payload_len] = payload
-
-    return CALL_HEADER_FIXED + method_len + payload_len
+    return pos - offset
 
 
 def write_reply_into(buf, offset: int,
                      error_data: bytes | memoryview | None = None,
-                     result_data: bytes | memoryview | None = None) -> int:
+                     result_data: bytes | memoryview | tuple | None = None) -> int:
     """Write a CRM_REPLY message directly into *buf* starting at *offset*.
+
+    *result_data* may be a single ``bytes``/``memoryview`` or a
+    ``tuple``/``list`` of segments (scatter-write).
 
     Returns the total number of bytes written.
     """
     error_len = len(error_data) if error_data else 0
-    result_len = len(result_data) if result_data else 0
+    result_len = payload_total_size(result_data)
 
     buf[offset] = MsgType.CRM_REPLY
     struct.pack_into('<I', buf, offset + 1, error_len)
     if error_len > 0:
         buf[offset + 5:offset + 5 + error_len] = error_data
     if result_len > 0:
-        buf[offset + 5 + error_len:offset + 5 + error_len + result_len] = result_data
+        pos = offset + 5 + error_len
+        if isinstance(result_data, (list, tuple)):
+            for segment in result_data:
+                seg_len = len(segment)
+                buf[pos:pos + seg_len] = segment
+                pos += seg_len
+        else:
+            buf[pos:pos + result_len] = result_data
 
     return REPLY_HEADER_FIXED + error_len + result_len
 
@@ -258,7 +298,11 @@ def decode(buf: bytes | memoryview, total_size: int | None = None) -> Envelope:
             raise ValueError(
                 f'CRM_CALL truncated: need {header_end} bytes for header, got {total_size}'
             )
-        method_name = bytes(buf[3:header_end]).decode('utf-8')
+        method_raw = bytes(buf[3:header_end])
+        method_name = _method_name_decode_cache.get(method_raw)
+        if method_name is None:
+            method_name = method_raw.decode('utf-8')
+            _method_name_decode_cache[method_raw] = method_name
         payload = buf[header_end:total_size] if header_end < total_size else None
         return Envelope(msg_type=msg_type, method_name=method_name, payload=payload)
 

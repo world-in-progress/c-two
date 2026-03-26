@@ -1,5 +1,5 @@
 MEMORY_ADDRESS = 'memory://grid_processor'
-IPC_ADDRESS = 'ipc-v2://grid_processor'
+IPC_ADDRESS = 'ipc-v3://grid_processor'
 TCP_ADDRESS = 'tcp://localhost:5555'
 HTTP_ADDRESS = 'http://localhost:5556'
 # HTTP_ADDRESS = 'http://localhost:5556/hahaha'

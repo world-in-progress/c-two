@@ -5,13 +5,13 @@ import subprocess
 
 from .zmq import ZmqClient
 from .http import HttpClient
-from .ipc import IPCv2Client, IPCConfig
+from .ipc import IPCv2Client, IPCConfig, IPCv3Client
 from .memory import MemoryClient
 from .thread import ThreadClient
 
 def _get_client_class(server_address: str):
     """Determine the client class based on the server address."""
-    if server_address.startswith(('tcp://', 'ipc://')):
+    if server_address.startswith('tcp://'):
         return ZmqClient
     elif server_address.startswith('http://'):
         return HttpClient
@@ -21,6 +21,8 @@ def _get_client_class(server_address: str):
         return ThreadClient
     elif server_address.startswith('ipc-v2://'):
         return IPCv2Client
+    elif server_address.startswith(('ipc://', 'ipc-v3://')):
+        return IPCv3Client
     else:
         raise ValueError(f'Unsupported protocol in server_address: {server_address}')
 
@@ -28,7 +30,7 @@ class Client:
     def __init__(self, server_address: str, *, ipc_config: IPCConfig | None = None):
         # Determine the client class based on the server address
         client_class = _get_client_class(server_address)
-        if ipc_config is not None and client_class is IPCv2Client:
+        if ipc_config is not None and client_class in (IPCv2Client, IPCv3Client):
             self._client = client_class(server_address, ipc_config=ipc_config)
         else:
             self._client = client_class(server_address)
