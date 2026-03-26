@@ -312,7 +312,7 @@ class IPCv3Server(BaseServer):
             if (isinstance(blob_part, memoryview)
                     and isinstance(hdr_part, (bytes, bytearray))):
                 with self._deferred_frees_lock:
-                    info = self._deferred_frees.get(rid_key)
+                    info = self._deferred_frees.pop(rid_key, None)
                 if info is not None and len(info) >= 8 and info[5] is not None:
                     (_pool, req_seg_idx, block_offset, alloc_size,
                      _ded, payload_offset, payload_len, seg_obj) = info
@@ -352,6 +352,10 @@ class IPCv3Server(BaseServer):
                                     except RuntimeError:
                                         pass
                                 return
+                    # Scatter-reuse failed — re-register so regular path
+                    # or _free_deferred() can release the block.
+                    with self._deferred_frees_lock:
+                        self._deferred_frees[rid_key] = info
 
         # ---- Regular buddy alloc + copy path ----
         frame: bytes | None = None
