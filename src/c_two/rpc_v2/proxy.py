@@ -4,12 +4,14 @@ Implements the same interface as :class:`rpc.Client` — assign to
 ``icrm.client`` and the existing ``auto_transfer`` machinery works
 transparently.
 
-Two modes:
+Three modes:
 
 - **thread-local**: ``supports_direct_call = True``.  Calls CRM methods
   directly via ``call_direct(method_name, args)`` — zero serialization.
 - **ipc**: ``supports_direct_call = False``.  Delegates to a
   :class:`SharedClient` with routing-name-based ``call()`` / ``relay()``.
+- **http**: ``supports_direct_call = False``.  Delegates to an
+  :class:`HttpClient` for cross-node access via an HTTP relay.
 
 Usage::
 
@@ -24,6 +26,12 @@ Usage::
     icrm = IHello()
     icrm.client = proxy
     icrm.greeting('World')       # → shared_client.call('greeting', ..., name='hello')
+
+    # HTTP (cross-node via HttpClient):
+    proxy = ICRMProxy.http(http_client, 'hello')
+    icrm = IHello()
+    icrm.client = proxy
+    icrm.greeting('World')       # → http_client.call('greeting', ..., name='hello')
 """
 from __future__ import annotations
 
@@ -95,6 +103,28 @@ class ICRMProxy:
         proxy._on_terminate = on_terminate
         return proxy
 
+    @classmethod
+    def http(
+        cls,
+        http_client: Any,  # HttpClient — avoid circular import
+        name: str,
+        *,
+        on_terminate: Callable[[], None] | None = None,
+    ) -> ICRMProxy:
+        """Create an HTTP proxy (cross-node via HttpClient + relay).
+
+        Calls are sent to the relay server as
+        ``POST /{name}/{method_name}`` with the serialized payload.
+        """
+        proxy = object.__new__(cls)
+        proxy._mode = 'http'
+        proxy._crm = None
+        proxy._client = http_client
+        proxy._name = name
+        proxy._closed = False
+        proxy._on_terminate = on_terminate
+        return proxy
+
     # ------------------------------------------------------------------
     # Client interface (compatible with rpc.Client)
     # ------------------------------------------------------------------
@@ -105,14 +135,14 @@ class ICRMProxy:
         return self._mode == 'thread'
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
-        """Send a serialized CRM call (IPC mode).
+        """Send a serialized CRM call (IPC or HTTP mode).
 
         Raises :class:`NotImplementedError` in thread-local mode — use
         :meth:`call_direct` instead.
         """
         if self._closed:
             raise RuntimeError('Proxy is closed')
-        if self._mode == 'ipc':
+        if self._mode in ('ipc', 'http'):
             return self._client.call(method_name, data, name=self._name)
         raise NotImplementedError(
             'call() not available in thread-local mode; use call_direct()',
