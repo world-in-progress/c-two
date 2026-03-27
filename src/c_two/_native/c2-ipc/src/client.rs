@@ -257,19 +257,21 @@ impl IpcClient {
             self.pending.lock().unwrap().insert(rid, tx);
         }
 
-        // Build and send the frame.
+        // Build and send the frame using vectored I/O (avoids payload Vec).
         let ctrl = c2_wire::control::encode_call_control(route_name, method_idx);
-        let mut payload = Vec::with_capacity(ctrl.len() + data.len());
-        payload.extend_from_slice(&ctrl);
-        payload.extend_from_slice(data);
-
-        let frame_bytes =
-            frame::encode_frame(rid as u64, flags::FLAG_CALL_V2, &payload);
+        let payload_len = ctrl.len() + data.len();
+        let total_len = (12 + payload_len) as u32;
+        let mut hdr_buf = [0u8; frame::HEADER_SIZE];
+        hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
+        hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
+        hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
 
         {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
-            writer.write_all(&frame_bytes).await?;
+            writer.write_all(&hdr_buf).await?;
+            writer.write_all(&ctrl).await?;
+            writer.write_all(data).await?;
         }
 
         // Await response.
