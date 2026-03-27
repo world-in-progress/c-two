@@ -72,12 +72,13 @@ class HttpClient:
         self._base_url = base_url.rstrip('/')
         self._client = httpx.Client(
             base_url=self._base_url,
-            proxy=None,
-            timeout=httpx.Timeout(timeout),
-            limits=httpx.Limits(
-                max_connections=max_connections,
-                max_keepalive_connections=max_connections // 2,
+            transport=httpx.HTTPTransport(
+                limits=httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_connections // 2,
+                ),
             ),
+            timeout=httpx.Timeout(timeout),
         )
         self._closed = False
 
