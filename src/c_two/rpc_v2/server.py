@@ -168,7 +168,19 @@ class _FastDispatcher:
         access,
         future: asyncio.Future,
     ) -> None:
-        self._q.put((sched_execute, method, args_bytes, access, future))
+        self._q.put((sched_execute, method, args_bytes, access, future, None, None))
+
+    def submit_inline(
+        self,
+        sched_execute,
+        method,
+        args_bytes,
+        access,
+        request_id: int,
+        writer,
+    ) -> None:
+        """Fire-and-forget: worker builds inline reply frame and writes directly."""
+        self._q.put((sched_execute, method, args_bytes, access, None, request_id, writer))
 
     def shutdown(self) -> None:
         for _ in self._workers:
@@ -184,12 +196,54 @@ class _FastDispatcher:
             item = q.get()
             if item is _SENTINEL:
                 break
-            sched_execute, method, args_bytes, access, future = item
+            sched_execute, method, args_bytes, access, future, request_id, writer = item
             try:
                 result = sched_execute(method, args_bytes, access)
-                call_soon(future.set_result, result)
+                if future is not None:
+                    call_soon(future.set_result, result)
+                else:
+                    # Fire-and-forget: build reply and write directly
+                    self._write_inline_reply(call_soon, writer, request_id, result)
             except BaseException as exc:
-                call_soon(future.set_exception, exc)
+                if future is not None:
+                    call_soon(future.set_exception, exc)
+                else:
+                    self._write_error_reply(call_soon, writer, request_id, exc)
+
+    @staticmethod
+    def _write_inline_reply(call_soon, writer, request_id, result):
+        """Build inline reply frame from ICRM result and write."""
+        if isinstance(result, tuple):
+            err_part = result[0] if result[0] else b''
+            res_part = result[1] if len(result) > 1 and result[1] else b''
+            if isinstance(err_part, memoryview):
+                err_part = bytes(err_part)
+            if isinstance(res_part, memoryview):
+                res_part = bytes(res_part)
+        elif result is None:
+            res_part, err_part = b'', b''
+        elif isinstance(result, memoryview):
+            res_part, err_part = bytes(result), b''
+        else:
+            res_part, err_part = result, b''
+
+        if err_part:
+            frame = encode_v2_error_reply_frame(request_id, err_part)
+        else:
+            frame = encode_v2_inline_reply_frame(request_id, res_part)
+        call_soon(writer.write, frame)
+
+    @staticmethod
+    def _write_error_reply(call_soon, writer, request_id, exc):
+        """Build error reply frame from exception and write."""
+        try:
+            if hasattr(exc, 'serialize'):
+                err_bytes = exc.serialize()
+            else:
+                err_bytes = str(exc).encode('utf-8')
+        except Exception:
+            err_bytes = b'Internal server error'
+        call_soon(writer.write, encode_v2_error_reply_frame(request_id, err_bytes))
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +887,17 @@ class ServerV2:
             return
 
         method, access = entry
+
+        # For non-buddy calls with no SHM pool, fire-and-forget:
+        # the worker thread builds the reply frame and writes directly,
+        # avoiding Future creation + asyncio task resume overhead.
+        if not is_buddy and (conn.buddy_pool is None or not conn.buddy_pool):
+            self._dispatcher.submit_inline(
+                slot.scheduler.execute_fast, method, args_bytes, access,
+                request_id, writer,
+            )
+            return
+
         try:
             future = self._loop.create_future()
             self._dispatcher.submit(slot.scheduler.execute_fast, method, args_bytes, access, future)
