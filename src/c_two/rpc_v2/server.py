@@ -527,6 +527,9 @@ class ServerV2:
 
         try:
             max_frame = self._config.max_frame_size
+            slots = self._slots
+            default_name = self._default_name
+            dispatcher = self._dispatcher
             while True:
                 header = await reader.readexactly(16)
                 total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -553,6 +556,37 @@ class ServerV2:
                 is_v2_call = bool(flags & FLAG_CALL_V2)
                 is_buddy = bool(flags & FLAG_BUDDY)
 
+                # Fast inline path for v2 non-buddy calls:
+                # parse + dispatch table lookup + submit all without Task.
+                if is_v2_call and not is_buddy:
+                    name_len = payload[0]
+                    try:
+                        if name_len:
+                            route_name = payload[1:1 + name_len].decode('utf-8')
+                            method_idx = _U16.unpack_from(payload, 1 + name_len)[0]
+                            args_start = 3 + name_len
+                        else:
+                            route_name = ''
+                            method_idx = _U16.unpack_from(payload, 1)[0]
+                            args_start = 3
+                    except (struct.error, UnicodeDecodeError):
+                        continue
+                    args_bytes = payload[args_start:] if args_start < len(payload) else b''
+                    slot = (slots.get(route_name) if route_name
+                            else slots.get(default_name or ''))
+                    if slot is not None:
+                        method_name = slot.method_table._idx_to_name.get(method_idx)
+                        if method_name is not None:
+                            entry = slot._dispatch_table.get(method_name)
+                            if entry is not None:
+                                method, access = entry
+                                dispatcher.submit_inline(
+                                    slot.scheduler.execute_fast, method,
+                                    args_bytes, access, request_id, writer,
+                                )
+                                continue
+
+                # Fallback: full handler via Task for buddy, v1, or error paths.
                 if is_v2_call:
                     t = asyncio.create_task(
                         self._handle_v2_call(
