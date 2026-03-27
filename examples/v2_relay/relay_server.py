@@ -6,17 +6,17 @@ This process does NOT host any CRM — it only relays HTTP traffic.
 Usage (3-terminal workflow):
 
     # Terminal 1 — start the Grid CRM
-    uv run python examples/v2_grid_server.py
+    uv run python examples/v2_relay/resource.py
 
     # Terminal 2 — start this relay
-    uv run python examples/v2_relay_standalone.py
+    uv run python examples/v2_relay/relay_server.py
 
     # Terminal 3 — send HTTP requests
-    uv run python examples/v2_http_client.py
+    uv run python examples/v2_relay/http_client.py
 """
 import os, sys, signal, threading
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
 
 from c_two.rpc_v2.relay import RelayV2
 

@@ -1,23 +1,23 @@
 """Grid CRM server — standalone IPC process.
 
 Registers the Grid CRM over IPC v3.  A separate relay process
-(``v2_relay_standalone.py``) can then bridge HTTP traffic to this server.
+(``relay_server.py``) can then bridge HTTP traffic to this server.
 
 Usage (3-terminal workflow):
 
     # Terminal 1 — start the Grid CRM
-    uv run python examples/v2_grid_server.py
+    uv run python examples/v2_relay/resource.py
 
     # Terminal 2 — start the HTTP relay (connects to Grid's IPC)
-    uv run python examples/v2_relay_standalone.py
+    uv run python examples/v2_relay/relay_server.py
 
     # Terminal 3 — send HTTP requests
-    uv run python examples/v2_http_client.py
+    uv run python examples/v2_relay/http_client.py
 """
 import os, sys, signal, threading
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../examples/')))
 
 import c_two as cc
 from icrm import IGrid
