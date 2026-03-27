@@ -149,7 +149,7 @@ class _FastDispatcher:
     locks, and per-submission Future creation overhead.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, num_workers: int = 4) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, num_workers: int = 2) -> None:
         self._loop = loop
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._workers: list[threading.Thread] = []
