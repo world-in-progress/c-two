@@ -29,14 +29,14 @@ from .registry import (
     server_address,
     shutdown,
 )
-from .relay import RelayV2
+from .relay import RelayV2, UpstreamPool
 from .scheduler import Scheduler, ConcurrencyConfig, ConcurrencyMode
 from .server import ServerV2, CRMSlot
 
 __all__ = [
     'SharedClient', 'ClientPool',
     'HttpClient', 'HttpClientPool',
-    'RelayV2',
+    'RelayV2', 'UpstreamPool',
     'ServerV2', 'CRMSlot',
     'ICRMProxy',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
