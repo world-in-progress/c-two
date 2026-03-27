@@ -410,10 +410,10 @@ class SharedClient:
             method_bytes = method_name.encode('utf-8')
             wire_size = call_wire_size(len(method_bytes), payload_size)
 
-        # Allocate request ID.
+        # Allocate request ID (32-bit wrapping to match frame header).
         with self._rid_lock:
             rid = self._rid_counter
-            self._rid_counter += 1
+            self._rid_counter = (self._rid_counter + 1) & 0xFFFFFFFF
 
         # Register pending call.
         pending = PendingCall(rid)
@@ -453,7 +453,7 @@ class SharedClient:
 
         with self._rid_lock:
             rid = self._rid_counter
-            self._rid_counter += 1
+            self._rid_counter = (self._rid_counter + 1) & 0xFFFFFFFF
 
         pending = PendingCall(rid)
         with self._pending_lock:
@@ -669,8 +669,10 @@ class SharedClient:
                 else:
                     pending.set_result(result)
 
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            logger.debug('recv_loop: connection lost')
         except Exception:
-            logger.debug('recv_loop exiting due to exception', exc_info=True)
+            logger.error('recv_loop: unexpected error', exc_info=True)
         finally:
             # Wake up any remaining pending callers.
             with self._pending_lock:

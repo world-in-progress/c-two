@@ -361,11 +361,18 @@ class ServerV2:
             slot.scheduler.shutdown()
 
     def shutdown(self) -> None:
-        """Signal the server to shut down and wait for the loop thread."""
+        """Signal the server to shut down and wait for the loop thread.
+
+        Safe to call multiple times — subsequent calls are no-ops.
+        """
         if self._loop is not None and self._shutdown_event is not None:
-            self._loop.call_soon_threadsafe(self._shutdown_event.set)
+            try:
+                self._loop.call_soon_threadsafe(self._shutdown_event.set)
+            except RuntimeError:
+                pass  # Event loop already closed
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=5.0)
+            self._loop_thread = None
         try:
             os.unlink(self._socket_path)
         except OSError:
@@ -514,12 +521,18 @@ class ServerV2:
         writer.write(encode_frame(0, FLAG_HANDSHAKE, ack_payload))
         await writer.drain()
 
+    _MAX_CLIENT_SEGMENTS = 16
+
     def _open_segments(
         self,
         conn: _Connection,
         segments: list[tuple[str, int]],
     ) -> None:
         """Open the client's buddy SHM segments and cache memoryviews."""
+        if len(segments) > self._MAX_CLIENT_SEGMENTS:
+            logger.warning('Conn %d: too many segments (%d > %d), rejecting handshake',
+                           conn.conn_id, len(segments), self._MAX_CLIENT_SEGMENTS)
+            return
         for name, _ in segments:
             if not _SHM_NAME_RE.match(name):
                 logger.warning('Conn %d: invalid segment name: %r', conn.conn_id, name)
@@ -576,7 +589,12 @@ class ServerV2:
                     self._shutdown_event.set()
                 return
 
-            env = decode(payload)
+            try:
+                env = decode(payload)
+            except (ValueError, struct.error) as exc:
+                logger.warning('Conn %d: malformed v1 wire payload: %s',
+                               conn.conn_id, exc)
+                return
             if env.msg_type == MsgType.PING:
                 writer.write(encode_frame(request_id, FLAG_RESPONSE, PONG_BYTES))
                 await writer.drain()
@@ -603,16 +621,34 @@ class ServerV2:
         self, conn: _Connection, payload: bytes,
     ) -> tuple[str | None, bytes]:
         """Extract method_name + args from a v1 buddy frame, free request block."""
-        seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
-            decode_buddy_payload(payload)
-        )
+        try:
+            seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
+                decode_buddy_payload(payload)
+            )
+        except (struct.error, Exception) as exc:
+            logger.warning('Conn %d: malformed v1 buddy payload: %s',
+                           conn.conn_id, exc)
+            return None, b''
         if conn.buddy_pool is None or seg_idx >= len(conn.seg_views):
             return None, b''
 
         seg_mv = conn.seg_views[seg_idx]
+        if data_offset + data_size > len(seg_mv):
+            logger.warning('Conn %d: v1 buddy OOB: offset=%d + size=%d > seg_len=%d',
+                           conn.conn_id, data_offset, data_size, len(seg_mv))
+            return None, b''
         wire_mv = seg_mv[data_offset : data_offset + data_size]
 
-        env = decode(wire_mv)
+        try:
+            env = decode(wire_mv)
+        except (ValueError, struct.error) as exc:
+            logger.warning('Conn %d: malformed v1 wire data: %s',
+                           conn.conn_id, exc)
+            try:
+                conn.buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+            except Exception:
+                pass
+            return None, b''
         method_name = env.method_name
         args_bytes = bytes(env.payload) if env.payload is not None else b''
 
@@ -653,7 +689,17 @@ class ServerV2:
         else:
             if not payload:
                 return
-            route_name, method_idx, _consumed = decode_call_control(payload, 0)
+            try:
+                route_name, method_idx, _consumed = decode_call_control(payload, 0)
+            except (ValueError, struct.error) as exc:
+                logger.warning('Conn %d: malformed v2 call control: %s',
+                               conn.conn_id, exc)
+                err_frame = encode_v2_error_reply_frame(
+                    request_id, f'Malformed call control: {exc}'.encode('utf-8'),
+                )
+                writer.write(err_frame)
+                await writer.drain()
+                return
             args_bytes = bytes(payload[_consumed:]) if _consumed < len(payload) else b''
 
         slot = self._resolve_slot(route_name)
@@ -670,6 +716,12 @@ class ServerV2:
             method_name = slot.method_table.name_of(method_idx)
         except KeyError:
             logger.warning('Unknown method index %d for route %r', method_idx, route_name)
+            err_frame = encode_v2_error_reply_frame(
+                request_id,
+                f'Unknown method index {method_idx} for route {route_name!r}'.encode('utf-8'),
+            )
+            writer.write(err_frame)
+            await writer.drain()
             return
 
         result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
@@ -679,16 +731,30 @@ class ServerV2:
         self, conn: _Connection, payload: bytes,
     ) -> tuple[str, int, bytes | None]:
         """Extract route_name + method_idx + args from a v2 buddy frame."""
-        seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
-            decode_buddy_payload(payload)
-        )
+        try:
+            seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
+                decode_buddy_payload(payload)
+            )
+        except (struct.error, Exception) as exc:
+            logger.warning('Conn %d: malformed v2 buddy payload: %s',
+                           conn.conn_id, exc)
+            return '', -1, None
         if conn.buddy_pool is None or seg_idx >= len(conn.seg_views):
             return '', -1, None
 
         ctrl_offset = BUDDY_PAYLOAD_STRUCT.size
-        route_name, method_idx, _consumed = decode_call_control(payload, ctrl_offset)
+        try:
+            route_name, method_idx, _consumed = decode_call_control(payload, ctrl_offset)
+        except (ValueError, struct.error) as exc:
+            logger.warning('Conn %d: malformed v2 buddy call control: %s',
+                           conn.conn_id, exc)
+            return '', -1, None
 
         seg_mv = conn.seg_views[seg_idx]
+        if data_offset + data_size > len(seg_mv):
+            logger.warning('Conn %d: v2 buddy OOB: offset=%d + size=%d > seg_len=%d',
+                           conn.conn_id, data_offset, data_size, len(seg_mv))
+            return '', -1, None
         args_bytes = bytes(seg_mv[data_offset : data_offset + data_size])
 
         try:
@@ -718,7 +784,10 @@ class ServerV2:
                 return b'', str(err).encode('utf-8')
 
         access = get_method_access(method)
-        slot.scheduler.begin()
+        try:
+            slot.scheduler.begin()
+        except RuntimeError as exc:
+            return self._wrap_error(exc)
         loop = asyncio.get_running_loop()
         try:
             result = await loop.run_in_executor(
@@ -784,6 +853,11 @@ class ServerV2:
                     raise MemoryError('dedicated segment, fall back to inline')
 
                 seg_mv = conn.seg_views[alloc.seg_idx]
+                if alloc.offset + total_wire > len(seg_mv):
+                    conn.buddy_pool.free_at(
+                        alloc.seg_idx, alloc.offset, total_wire, alloc.is_dedicated,
+                    )
+                    raise MemoryError('reply offset OOB, fall back to inline')
                 write_reply_into(
                     seg_mv, alloc.offset,
                     err_bytes or None,
@@ -837,6 +911,11 @@ class ServerV2:
                     raise MemoryError('dedicated segment, fall back to inline')
 
                 seg_mv = conn.seg_views[alloc.seg_idx]
+                if alloc.offset + data_size > len(seg_mv):
+                    conn.buddy_pool.free_at(
+                        alloc.seg_idx, alloc.offset, data_size, alloc.is_dedicated,
+                    )
+                    raise MemoryError('reply offset OOB, fall back to inline')
                 seg_mv[alloc.offset : alloc.offset + data_size] = result_bytes
                 frame = encode_v2_buddy_reply_frame(
                     request_id, alloc.seg_idx, alloc.offset,

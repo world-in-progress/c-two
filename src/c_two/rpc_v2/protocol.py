@@ -47,6 +47,14 @@ STATUS_SUCCESS = 0x00     # Result data follows (inline or in buddy SHM)
 STATUS_ERROR   = 0x01     # Error data follows inline
 
 # ---------------------------------------------------------------------------
+# Handshake safety limits (prevent malicious payloads exhausting resources)
+# ---------------------------------------------------------------------------
+
+_MAX_HANDSHAKE_SEGMENTS = 16
+_MAX_HANDSHAKE_ROUTES   = 64
+_MAX_HANDSHAKE_METHODS  = 256
+
+# ---------------------------------------------------------------------------
 # Struct helpers
 # ---------------------------------------------------------------------------
 
@@ -192,30 +200,57 @@ def decode_v5_handshake(payload: bytes | memoryview) -> HandshakeV5:
         raise ValueError(f'Expected handshake v5 (version={HANDSHAKE_V5}), got {version}')
 
     off = 1
+    buf_len = len(buf)
+
+    if off + 2 > buf_len:
+        raise ValueError('Handshake v5 truncated: missing segment count')
     seg_count = _U16.unpack_from(buf, off)[0]; off += 2
+    if seg_count > _MAX_HANDSHAKE_SEGMENTS:
+        raise ValueError(f'Handshake v5 segment count {seg_count} exceeds limit {_MAX_HANDSHAKE_SEGMENTS}')
+
     segments: list[tuple[str, int]] = []
     for _ in range(seg_count):
+        if off + 5 > buf_len:
+            raise ValueError('Handshake v5 truncated in segment entry')
         size = _U32.unpack_from(buf, off)[0]; off += 4
         name_len = buf[off]; off += 1
+        if off + name_len > buf_len:
+            raise ValueError('Handshake v5 truncated in segment name')
         name = bytes(buf[off:off + name_len]).decode('utf-8'); off += name_len
         segments.append((name, size))
 
-    if off + 2 > len(buf):
+    if off + 2 > buf_len:
         raise ValueError('Handshake v5 missing capability_flags')
     cap_flags = _U16.unpack_from(buf, off)[0]; off += 2
 
     # Route section (optional — only present in server→client ACK).
     routes: list[RouteInfo] = []
-    if off + 2 <= len(buf):
+    if off + 2 <= buf_len:
         route_count = _U16.unpack_from(buf, off)[0]; off += 2
+        if route_count > _MAX_HANDSHAKE_ROUTES:
+            raise ValueError(f'Handshake v5 route count {route_count} exceeds limit {_MAX_HANDSHAKE_ROUTES}')
         for _ in range(route_count):
+            if off + 1 > buf_len:
+                raise ValueError('Handshake v5 truncated in route entry')
             r_len = buf[off]; off += 1
+            if off + r_len > buf_len:
+                raise ValueError('Handshake v5 truncated in route name')
             r_name = bytes(buf[off:off + r_len]).decode('utf-8'); off += r_len
+            if off + 2 > buf_len:
+                raise ValueError('Handshake v5 truncated: missing method count')
             m_count = _U16.unpack_from(buf, off)[0]; off += 2
+            if m_count > _MAX_HANDSHAKE_METHODS:
+                raise ValueError(f'Handshake v5 method count {m_count} exceeds limit {_MAX_HANDSHAKE_METHODS}')
             methods: list[MethodEntry] = []
             for mi in range(m_count):
+                if off + 1 > buf_len:
+                    raise ValueError('Handshake v5 truncated in method entry')
                 m_len = buf[off]; off += 1
+                if off + m_len > buf_len:
+                    raise ValueError('Handshake v5 truncated in method name')
                 m_name = bytes(buf[off:off + m_len]).decode('utf-8'); off += m_len
+                if off + 2 > buf_len:
+                    raise ValueError('Handshake v5 truncated: missing method index')
                 m_idx = _U16.unpack_from(buf, off)[0]; off += 2
                 methods.append(MethodEntry(name=m_name, index=m_idx))
             routes.append(RouteInfo(name=r_name, methods=methods))

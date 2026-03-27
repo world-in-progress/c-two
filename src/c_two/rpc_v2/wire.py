@@ -90,8 +90,19 @@ def decode_call_control(
     """Decode v2 call control payload.
 
     Returns ``(route_name, method_idx, bytes_consumed)``.
+
+    Raises ``ValueError`` if the buffer is too short.
     """
+    dlen = len(data)
+    if offset >= dlen:
+        raise ValueError('call control: offset beyond buffer')
     name_len = data[offset]
+    # Minimum remaining: 1B name_len + name_len + 2B method_idx
+    if offset + 1 + name_len + 2 > dlen:
+        raise ValueError(
+            f'call control: buffer too short for name_len={name_len} '
+            f'(need {1 + name_len + 2}, have {dlen - offset})'
+        )
     off = offset + 1
     if name_len > 0:
         name = bytes(data[off:off + name_len]).decode('utf-8')
@@ -131,11 +142,23 @@ def decode_reply_control(
     """Decode v2 reply control payload.
 
     Returns ``(status, error_data_or_none, bytes_consumed)``.
+
+    Raises ``ValueError`` if the buffer is too short.
     """
+    dlen = len(data)
+    if offset >= dlen:
+        raise ValueError('reply control: offset beyond buffer')
     status = data[offset]
     off = offset + 1
     if status == STATUS_ERROR:
+        if off + 4 > dlen:
+            raise ValueError('reply control: buffer too short for error length')
         err_len = _U32.unpack_from(data, off)[0]; off += 4
+        if off + err_len > dlen:
+            raise ValueError(
+                f'reply control: error data claims {err_len} bytes '
+                f'but only {dlen - off} available'
+            )
         error_data = bytes(data[off:off + err_len]); off += err_len
         return status, error_data, off - offset
     return status, None, off - offset
