@@ -51,6 +51,24 @@ pub fn encode_call_control(route_name: &str, method_idx: u16) -> Vec<u8> {
     buf
 }
 
+/// Encode v2 call control directly into a buffer at `offset`.
+///
+/// Returns the number of bytes written (1 + name_len + 2).
+pub fn encode_call_control_into(
+    buf: &mut [u8],
+    offset: usize,
+    route_name: &str,
+    method_idx: u16,
+) -> usize {
+    let name_bytes = route_name.as_bytes();
+    let len = 1 + name_bytes.len() + 2;
+    buf[offset] = name_bytes.len() as u8;
+    buf[offset + 1..offset + 1 + name_bytes.len()].copy_from_slice(name_bytes);
+    let idx_off = offset + 1 + name_bytes.len();
+    buf[idx_off..idx_off + 2].copy_from_slice(&method_idx.to_le_bytes());
+    len
+}
+
 /// Decode v2 call control from `buf[offset..]`.
 ///
 /// Returns `(control, bytes_consumed)`.

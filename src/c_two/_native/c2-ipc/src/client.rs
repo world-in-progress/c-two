@@ -258,10 +258,9 @@ impl IpcClient {
         }
 
         // Build and send the frame.
-        // For small payloads (≤1KB), build the entire frame on the stack
-        // to issue a single write_all. For large payloads, use 3 writes.
-        let ctrl = c2_wire::control::encode_call_control(route_name, method_idx);
-        let payload_len = ctrl.len() + data.len();
+        // Compute ctrl size: 1 byte name_len + name + 2 bytes method_idx
+        let ctrl_len = 1 + route_name.len() + 2;
+        let payload_len = ctrl_len + data.len();
         let total_len = (12 + payload_len) as u32;
         let frame_size = frame::HEADER_SIZE + payload_len;
 
@@ -270,22 +269,24 @@ impl IpcClient {
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
 
             if frame_size <= 1024 {
-                // Stack-allocate the entire frame (avoids heap + single syscall).
+                // Stack-allocate the entire frame (zero heap, single syscall).
                 let mut buf = [0u8; 1024];
                 buf[0..4].copy_from_slice(&total_len.to_le_bytes());
                 buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
                 buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
-                let mut off = frame::HEADER_SIZE;
-                buf[off..off + ctrl.len()].copy_from_slice(&ctrl);
-                off += ctrl.len();
-                buf[off..off + data.len()].copy_from_slice(data);
+                let ctrl_written = c2_wire::control::encode_call_control_into(
+                    &mut buf, frame::HEADER_SIZE, route_name, method_idx,
+                );
+                let data_off = frame::HEADER_SIZE + ctrl_written;
+                buf[data_off..data_off + data.len()].copy_from_slice(data);
                 writer.write_all(&buf[..frame_size]).await?;
             } else {
-                // Large payload: 3 writes, no heap allocation.
+                // Large payload: header+ctrl on stack, data separate write.
                 let mut hdr_buf = [0u8; frame::HEADER_SIZE];
                 hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
                 hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
                 hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
+                let ctrl = c2_wire::control::encode_call_control(route_name, method_idx);
                 writer.write_all(&hdr_buf).await?;
                 writer.write_all(&ctrl).await?;
                 writer.write_all(data).await?;
