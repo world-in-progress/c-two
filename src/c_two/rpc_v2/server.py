@@ -69,6 +69,7 @@ from .wire import (
     encode_v2_buddy_reply_frame,
     encode_v2_inline_reply_frame,
     encode_v2_error_reply_frame,
+    _U16,
 )
 from .scheduler import Scheduler, ConcurrencyConfig
 
@@ -719,43 +720,98 @@ class ServerV2:
         else:
             if not payload:
                 return
+            # Inline decode_call_control for speed (avoids function call +
+            # tuple allocation on the hot path).
+            name_len = payload[0]
             try:
-                route_name, method_idx, _consumed = decode_call_control(payload, 0)
-            except (ValueError, struct.error) as exc:
+                if name_len:
+                    route_name = payload[1:1 + name_len].decode('utf-8')
+                    method_idx = _U16.unpack_from(payload, 1 + name_len)[0]
+                    args_start = 3 + name_len
+                else:
+                    route_name = ''
+                    method_idx = _U16.unpack_from(payload, 1)[0]
+                    args_start = 3
+            except (struct.error, UnicodeDecodeError) as exc:
                 logger.warning('Conn %d: malformed v2 call control: %s',
                                conn.conn_id, exc)
-                err_frame = encode_v2_error_reply_frame(
+                writer.write(encode_v2_error_reply_frame(
                     request_id, f'Malformed call control: {exc}'.encode('utf-8'),
-                )
-                writer.write(err_frame)
+                ))
                 await writer.drain()
                 return
-            args_bytes = bytes(payload[_consumed:]) if _consumed < len(payload) else b''
+            args_bytes = payload[args_start:] if args_start < len(payload) else b''
 
-        slot = self._resolve_slot(route_name)
+        # Inline slot + method resolve.
+        slots = self._slots
+        slot = (slots.get(route_name) if route_name
+                else slots.get(self._default_name or ''))
         if slot is None:
             logger.warning('Unknown route name %r', route_name)
-            err_frame = encode_v2_error_reply_frame(
+            writer.write(encode_v2_error_reply_frame(
                 request_id, f'Unknown route name: {route_name}'.encode('utf-8'),
-            )
-            writer.write(err_frame)
+            ))
+            await writer.drain()
+            return
+
+        method_name = slot.method_table._idx_to_name.get(method_idx)
+        if method_name is None:
+            logger.warning('Unknown method index %d for route %r', method_idx, route_name)
+            writer.write(encode_v2_error_reply_frame(
+                request_id,
+                f'Unknown method index {method_idx} for route {route_name!r}'.encode('utf-8'),
+            ))
+            await writer.drain()
+            return
+
+        # Inline dispatch — avoids _dispatch() + _unpack_icrm_result() calls.
+        entry = slot._dispatch_table.get(method_name)
+        if entry is None:
+            err = error.CRMServerError(f'Method not found: {method_name}')
+            try:
+                err_bytes = err.serialize()
+            except Exception:
+                err_bytes = str(err).encode('utf-8')
+            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
+            await writer.drain()
+            return
+
+        method, access = entry
+        sched = slot.scheduler
+        try:
+            sched.begin()
+        except RuntimeError as exc:
+            err_bytes = self._wrap_error(exc)[1]
+            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
             await writer.drain()
             return
 
         try:
-            method_name = slot.method_table.name_of(method_idx)
-        except KeyError:
-            logger.warning('Unknown method index %d for route %r', method_idx, route_name)
-            err_frame = encode_v2_error_reply_frame(
-                request_id,
-                f'Unknown method index {method_idx} for route {route_name!r}'.encode('utf-8'),
+            result = await self._loop.run_in_executor(
+                sched.executor, sched.execute, method, args_bytes, access,
             )
-            writer.write(err_frame)
+        except Exception as exc:
+            err_bytes = self._wrap_error(exc)[1]
+            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
             await writer.drain()
             return
 
-        result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
-        await self._send_v2_reply(conn, request_id, result_bytes, err_bytes, writer)
+        # Inline unpack + send.
+        if isinstance(result, tuple):
+            err_part = result[0] if result[0] else b''
+            res_part = result[1] if len(result) > 1 and result[1] else b''
+            if isinstance(err_part, memoryview):
+                err_part = bytes(err_part)
+            if isinstance(res_part, memoryview):
+                res_part = bytes(res_part)
+        elif result is None:
+            res_part, err_part = b'', b''
+        elif isinstance(result, memoryview):
+            res_part, err_part = bytes(result), b''
+        else:
+            res_part, err_part = result, b''
+
+        await self._send_v2_reply(conn, request_id, res_part, err_part, writer)
 
     def _resolve_v2_buddy(
         self, conn: _Connection, payload: bytes,
