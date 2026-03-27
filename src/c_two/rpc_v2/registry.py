@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 from .config import settings
+from .http_client import HttpClientPool
 from .pool import ClientPool
 from .proxy import ICRMProxy
 from .scheduler import ConcurrencyConfig
@@ -110,6 +111,7 @@ class _ProcessRegistry:
         self._explicit_address: str | None = None
         self._explicit_ipc_config: IPCConfig | None = None
         self._pool = ClientPool()
+        self._http_pool = HttpClientPool()
 
     # ------------------------------------------------------------------
     # Public API
@@ -267,6 +269,14 @@ class _ProcessRegistry:
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
             proxy = ICRMProxy.thread_local(local.crm_instance)
+        elif address is not None and address.startswith(('http://', 'https://')):
+            # HTTP mode — cross-node via relay server.
+            client = self._http_pool.acquire(address)
+            proxy = ICRMProxy.http(
+                client,
+                name,
+                on_terminate=lambda addr=address: self._http_pool.release(addr),
+            )
         elif address is not None:
             # Remote IPC via pooled SharedClient.
             client = self._pool.acquire(address, try_v2=True)
@@ -339,6 +349,7 @@ class _ProcessRegistry:
                 log.warning('Error shutting down ServerV2', exc_info=True)
 
         self._pool.shutdown_all()
+        self._http_pool.shutdown_all()
 
     # ------------------------------------------------------------------
     # Internals
