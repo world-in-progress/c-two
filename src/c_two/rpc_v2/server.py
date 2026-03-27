@@ -833,18 +833,9 @@ class ServerV2:
             return
 
         method, access = entry
-        sched = slot.scheduler
-        try:
-            sched.begin()
-        except RuntimeError as exc:
-            err_bytes = self._wrap_error(exc)[1]
-            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
-            await writer.drain()
-            return
-
         try:
             future = self._loop.create_future()
-            self._dispatcher.submit(sched.execute, method, args_bytes, access, future)
+            self._dispatcher.submit(slot.scheduler.execute_fast, method, args_bytes, access, future)
             result = await future
         except Exception as exc:
             err_bytes = self._wrap_error(exc)[1]
@@ -926,14 +917,9 @@ class ServerV2:
                 return b'', str(err).encode('utf-8')
 
         method, access = entry
-        sched = slot.scheduler
-        try:
-            sched.begin()
-        except RuntimeError as exc:
-            return self._wrap_error(exc)
         try:
             future = self._loop.create_future()
-            self._dispatcher.submit(sched.execute, method, args_bytes, access, future)
+            self._dispatcher.submit(slot.scheduler.execute_fast, method, args_bytes, access, future)
             result = await future
         except Exception as exc:
             return self._wrap_error(exc)

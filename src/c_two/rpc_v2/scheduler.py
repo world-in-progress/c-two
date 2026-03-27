@@ -140,14 +140,19 @@ class Scheduler:
         if effective_workers is None and self._config.mode is ConcurrencyMode.EXCLUSIVE:
             effective_workers = 1
 
-        self._executor = ThreadPoolExecutor(
-            max_workers=effective_workers,
-            thread_name_prefix='c2v2_worker',
-        )
+        # Executor kept for backward compatibility (v1 dispatch path)
+        # but _FastDispatcher is the primary dispatch mechanism.
+        self._executor: ThreadPoolExecutor | None = None
+        self._executor_workers = effective_workers
 
     @property
     def executor(self) -> ThreadPoolExecutor:
-        """The underlying executor — pass to ``loop.run_in_executor()``."""
+        """The underlying executor — lazy creation for backward compatibility."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._executor_workers,
+                thread_name_prefix='c2v2_worker',
+            )
         return self._executor
 
     @property
@@ -165,12 +170,7 @@ class Scheduler:
         args_bytes: bytes | memoryview,
         access_mode: MethodAccess = MethodAccess.WRITE,
     ) -> Any:
-        """Execute *method(args_bytes)* with the appropriate concurrency guard.
-
-        Designed to be called from ``loop.run_in_executor(sched.executor,
-        sched.execute, method, args, access)``.  The pending counter is
-        incremented before submission and decremented here on completion.
-        """
+        """Execute *method(args_bytes)* with the appropriate concurrency guard."""
         try:
             if self._is_parallel:
                 return method(args_bytes)
@@ -189,12 +189,30 @@ class Scheduler:
                 if self._shutdown_flag and self._pending_count == 0:
                     self._drain_event.set()
 
-    def begin(self) -> None:
-        """Increment pending counter before dispatching to the executor.
+    def execute_fast(
+        self,
+        method: Callable[..., Any],
+        args_bytes: bytes | memoryview,
+        access_mode: MethodAccess = MethodAccess.WRITE,
+    ) -> Any:
+        """Like execute() but without pending-count tracking.
 
-        Must be called on the **caller** side (e.g. asyncio event loop thread)
-        before ``loop.run_in_executor(sched.executor, sched.execute, ...)``.
+        Used by _FastDispatcher where task lifecycle is managed by asyncio.
+        Caller must ensure shutdown() waits for tasks via other means.
         """
+        if self._is_parallel:
+            return method(args_bytes)
+        if self._is_exclusive:
+            with self._exclusive_lock:
+                return method(args_bytes)
+        if access_mode is MethodAccess.READ:
+            with self._rw_lock.read_lock():
+                return method(args_bytes)
+        with self._rw_lock.write_lock():
+            return method(args_bytes)
+
+    def begin(self) -> None:
+        """Increment pending counter before dispatching to the executor."""
         if self._shutdown_flag:
             raise RuntimeError('Scheduler is shut down')
         if self._has_capacity_limit:
@@ -219,7 +237,8 @@ class Scheduler:
                 return
             self._shutdown_flag = True
         self._drain_event.wait()
-        self._executor.shutdown(wait=True)
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
 
     # ------------------------------------------------------------------
     # Internal
