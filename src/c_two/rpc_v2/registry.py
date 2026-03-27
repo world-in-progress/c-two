@@ -215,7 +215,7 @@ class _ProcessRegistry:
                 self._server = ServerV2(bind_address=addr, ipc_config=ipc_cfg)
                 self._server_address = addr
                 # Share the same config with the client pool.
-                self._pool._default_config = ipc_cfg
+                self._pool.set_default_config(ipc_cfg)
 
             self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
             self._registrations[name] = _Registration(
@@ -226,7 +226,7 @@ class _ProcessRegistry:
             )
 
             # Start server if not yet running.
-            if not self._server._started.is_set():
+            if not self._server.is_started():
                 self._server.start()
 
         log.debug('Registered CRM %s at %s', name, self._server_address)

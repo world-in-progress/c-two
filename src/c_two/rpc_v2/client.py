@@ -472,6 +472,58 @@ class SharedClient:
         return pending.wait(timeout=30.0)
 
     # ------------------------------------------------------------------
+    # Buddy allocation helpers
+    # ------------------------------------------------------------------
+
+    def _try_buddy_alloc(self, size: int, label: str = '') -> tuple[object | None, memoryview | None]:
+        """Try buddy allocation with backpressure handling.
+
+        Returns ``(alloc, shm_buf)`` on success, or ``(None, None)`` when
+        the caller should fall back to inline transport.
+
+        Raises :class:`~c_two.error.MemoryPressureError` when buddy pool
+        is exhausted *and* the payload exceeds ``max_frame_size``.
+        """
+        if size <= self._config.shm_threshold or self._buddy_pool is None:
+            return None, None
+
+        with self._alloc_lock:
+            try:
+                alloc = self._buddy_pool.alloc(size)
+            except Exception:
+                alloc = None
+
+            if alloc is None:
+                if size <= self._config.max_frame_size:
+                    logger.debug('Buddy alloc failed for %d bytes, inline fallback%s', size, f' ({label})' if label else '')
+                    return None, None
+                raise error.MemoryPressureError(
+                    f'Buddy pool exhausted: cannot allocate {size} bytes; '
+                    f'payload exceeds inline limit ({self._config.max_frame_size})',
+                )
+
+            if alloc.is_dedicated:
+                self._buddy_pool.free_at(alloc.seg_idx, alloc.offset, size, True)
+                if size <= self._config.max_frame_size:
+                    logger.debug('Buddy alloc dedicated for %d bytes, inline fallback%s', size, f' ({label})' if label else '')
+                    return None, None
+                raise error.MemoryPressureError(
+                    f'Buddy pool exhausted (dedicated segment): cannot allocate {size} bytes; '
+                    f'payload exceeds inline limit ({self._config.max_frame_size})',
+                )
+
+            seg_mv = self._seg_views[alloc.seg_idx]
+            shm_buf = seg_mv[alloc.offset : alloc.offset + size]
+            return alloc, shm_buf
+
+    def _free_buddy(self, alloc: object, size: int) -> None:
+        """Free a buddy allocation (called on send failure)."""
+        with self._alloc_lock:
+            self._buddy_pool.free_at(
+                alloc.seg_idx, alloc.offset, size, alloc.is_dedicated,
+            )
+
+    # ------------------------------------------------------------------
     # Send helpers (called under _send_lock)
     # ------------------------------------------------------------------
 
@@ -481,64 +533,26 @@ class SharedClient:
         if sock is None:
             raise error.CompoClientError('Not connected')
 
-        if wire_size <= self._config.shm_threshold or self._buddy_pool is None:
+        alloc, shm_buf = self._try_buddy_alloc(wire_size, 'v1')
+
+        if alloc is None:
             inline_args = b''.join(args) if isinstance(args, (list, tuple)) else args
             frame = encode_inline_call_frame(
                 rid, method_name, inline_args, get_call_header_cache(),
             )
             sock.sendall(frame)
-        else:
-            with self._alloc_lock:
-                try:
-                    alloc = self._buddy_pool.alloc(wire_size)
-                except Exception:
-                    alloc = None
-                if alloc is None:
-                    # Buddy alloc failed — inline fallback or pressure error.
-                    if wire_size <= self._config.max_frame_size:
-                        logger.debug('Buddy alloc failed for %d bytes, using inline fallback (v1)', wire_size)
-                        inline_args = b''.join(args) if isinstance(args, (list, tuple)) else args
-                        frame = encode_inline_call_frame(
-                            rid, method_name, inline_args, get_call_header_cache(),
-                        )
-                        sock.sendall(frame)
-                        return
-                    raise error.MemoryPressureError(
-                        f'Buddy pool exhausted: cannot allocate {wire_size} bytes; '
-                        f'payload exceeds inline limit ({self._config.max_frame_size})',
-                    )
-                if alloc.is_dedicated:
-                    self._buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, wire_size, True,
-                    )
-                    if wire_size <= self._config.max_frame_size:
-                        inline_args = b''.join(args) if isinstance(args, (list, tuple)) else args
-                        frame = encode_inline_call_frame(
-                            rid, method_name, inline_args, get_call_header_cache(),
-                        )
-                        sock.sendall(frame)
-                        return
-                    raise error.MemoryPressureError(
-                        f'Buddy pool exhausted (dedicated segment): cannot allocate {wire_size} bytes; '
-                        f'payload exceeds inline limit ({self._config.max_frame_size})',
-                    )
+            return
 
-                seg_mv = self._seg_views[alloc.seg_idx]
-                shm_buf = seg_mv[alloc.offset : alloc.offset + wire_size]
-
-            try:
-                write_call_into(shm_buf, 0, method_name, args)
-                frame = encode_buddy_call_frame(
-                    rid, alloc.seg_idx, alloc.offset,
-                    wire_size, alloc.is_dedicated,
-                )
-                sock.sendall(frame)
-            except Exception:
-                with self._alloc_lock:
-                    self._buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, wire_size, alloc.is_dedicated,
-                    )
-                raise
+        try:
+            write_call_into(shm_buf, 0, method_name, args)
+            frame = encode_buddy_call_frame(
+                rid, alloc.seg_idx, alloc.offset,
+                wire_size, alloc.is_dedicated,
+            )
+            sock.sendall(frame)
+        except Exception:
+            self._free_buddy(alloc, wire_size)
+            raise
 
     def _send_request_v2(self, rid: int, method_name: str, args: bytes, payload_size: int, *, name: str | None = None) -> None:
         """Encode and send a v2 call frame. Called under _send_lock.
@@ -551,72 +565,35 @@ class SharedClient:
             raise error.CompoClientError('Not connected')
 
         route_name = name if name is not None else self._default_name
-        # Look up method table for the target route.
         table = self._name_tables.get(route_name, self._method_table)
         method_idx = table.index_of(method_name) if table else 0
 
-        if payload_size <= self._config.shm_threshold or self._buddy_pool is None:
-            # Inline: control + data in UDS frame.
+        alloc, shm_buf = self._try_buddy_alloc(payload_size, 'v2')
+
+        if alloc is None:
             inline_data = b''.join(args) if isinstance(args, (list, tuple)) else args
             frame = encode_v2_inline_call_frame(rid, route_name, method_idx, inline_data)
             sock.sendall(frame)
-        else:
-            # Buddy: pure payload in SHM, control in UDS frame.
-            with self._alloc_lock:
-                try:
-                    alloc = self._buddy_pool.alloc(payload_size)
-                except Exception:
-                    alloc = None
-                if alloc is None:
-                    if payload_size <= self._config.max_frame_size:
-                        logger.debug('Buddy alloc failed for %d bytes, using inline fallback (v2)', payload_size)
-                        inline_data = b''.join(args) if isinstance(args, (list, tuple)) else args
-                        frame = encode_v2_inline_call_frame(rid, route_name, method_idx, inline_data)
-                        sock.sendall(frame)
-                        return
-                    raise error.MemoryPressureError(
-                        f'Buddy pool exhausted: cannot allocate {payload_size} bytes; '
-                        f'payload exceeds inline limit ({self._config.max_frame_size})',
-                    )
-                if alloc.is_dedicated:
-                    self._buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, payload_size, True,
-                    )
-                    if payload_size <= self._config.max_frame_size:
-                        inline_data = b''.join(args) if isinstance(args, (list, tuple)) else args
-                        frame = encode_v2_inline_call_frame(rid, route_name, method_idx, inline_data)
-                        sock.sendall(frame)
-                        return
-                    raise error.MemoryPressureError(
-                        f'Buddy pool exhausted (dedicated segment): cannot allocate {payload_size} bytes; '
-                        f'payload exceeds inline limit ({self._config.max_frame_size})',
-                    )
+            return
 
-                seg_mv = self._seg_views[alloc.seg_idx]
-                shm_buf = seg_mv[alloc.offset : alloc.offset + payload_size]
-
-            try:
-                # Write pure payload at offset 0 (no wire header).
-                if isinstance(args, (list, tuple)):
-                    off = 0
-                    for part in args:
-                        part_len = len(part)
-                        shm_buf[off:off + part_len] = part
-                        off += part_len
-                else:
-                    shm_buf[:payload_size] = args
-                frame = encode_v2_buddy_call_frame(
-                    rid, alloc.seg_idx, alloc.offset,
-                    payload_size, alloc.is_dedicated,
-                    route_name, method_idx,
-                )
-                sock.sendall(frame)
-            except Exception:
-                with self._alloc_lock:
-                    self._buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, payload_size, alloc.is_dedicated,
-                    )
-                raise
+        try:
+            if isinstance(args, (list, tuple)):
+                off = 0
+                for part in args:
+                    part_len = len(part)
+                    shm_buf[off:off + part_len] = part
+                    off += part_len
+            else:
+                shm_buf[:payload_size] = args
+            frame = encode_v2_buddy_call_frame(
+                rid, alloc.seg_idx, alloc.offset,
+                payload_size, alloc.is_dedicated,
+                route_name, method_idx,
+            )
+            sock.sendall(frame)
+        except Exception:
+            self._free_buddy(alloc, payload_size)
+            raise
 
     def _send_relay(self, rid: int, event_bytes: bytes, wire_size: int) -> None:
         """Encode and send a relay frame. Called under _send_lock."""
@@ -624,54 +601,23 @@ class SharedClient:
         if sock is None:
             raise error.CompoClientError('Not connected')
 
-        if wire_size <= self._config.shm_threshold or self._buddy_pool is None:
+        alloc, shm_buf = self._try_buddy_alloc(wire_size, 'relay')
+
+        if alloc is None:
             frame = encode_frame(rid, 0, event_bytes)
             sock.sendall(frame)
-        else:
-            with self._alloc_lock:
-                try:
-                    alloc = self._buddy_pool.alloc(wire_size)
-                except Exception:
-                    alloc = None
-                if alloc is None:
-                    if wire_size <= self._config.max_frame_size:
-                        logger.debug('Buddy alloc failed for %d bytes, using inline fallback (relay)', wire_size)
-                        frame = encode_frame(rid, 0, event_bytes)
-                        sock.sendall(frame)
-                        return
-                    raise error.MemoryPressureError(
-                        f'Buddy pool exhausted: cannot allocate {wire_size} bytes; '
-                        f'payload exceeds inline limit ({self._config.max_frame_size})',
-                    )
-                if alloc.is_dedicated:
-                    self._buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, wire_size, True,
-                    )
-                    if wire_size <= self._config.max_frame_size:
-                        frame = encode_frame(rid, 0, event_bytes)
-                        sock.sendall(frame)
-                        return
-                    raise error.MemoryPressureError(
-                        f'Buddy pool exhausted (dedicated segment): cannot allocate {wire_size} bytes; '
-                        f'payload exceeds inline limit ({self._config.max_frame_size})',
-                    )
+            return
 
-                seg_mv = self._seg_views[alloc.seg_idx]
-                shm_buf = seg_mv[alloc.offset : alloc.offset + wire_size]
-
-            try:
-                shm_buf[:wire_size] = event_bytes
-                frame = encode_buddy_call_frame(
-                    rid, alloc.seg_idx, alloc.offset,
-                    wire_size, alloc.is_dedicated,
-                )
-                sock.sendall(frame)
-            except Exception:
-                with self._alloc_lock:
-                    self._buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, wire_size, alloc.is_dedicated,
-                    )
-                raise
+        try:
+            shm_buf[:wire_size] = event_bytes
+            frame = encode_buddy_call_frame(
+                rid, alloc.seg_idx, alloc.offset,
+                wire_size, alloc.is_dedicated,
+            )
+            sock.sendall(frame)
+        except Exception:
+            self._free_buddy(alloc, wire_size)
+            raise
 
     # ------------------------------------------------------------------
     # Background receive loop

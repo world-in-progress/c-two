@@ -50,7 +50,6 @@ STATUS_ERROR   = 0x01     # Error data follows inline
 # Struct helpers
 # ---------------------------------------------------------------------------
 
-_U8  = struct.Struct('<B')
 _U16 = struct.Struct('<H')
 _U32 = struct.Struct('<I')
 

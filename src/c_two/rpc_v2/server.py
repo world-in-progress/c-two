@@ -208,6 +208,10 @@ class ServerV2:
         self._conn_counter = 0
         self._client_tasks: list[asyncio.Task] = []
 
+    def is_started(self) -> bool:
+        """Return ``True`` if the server has started and is accepting connections."""
+        return self._started.is_set()
+
     # ------------------------------------------------------------------
     # CRM registration
     # ------------------------------------------------------------------

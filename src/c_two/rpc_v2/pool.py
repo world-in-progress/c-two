@@ -68,6 +68,10 @@ class ClientPool:
         if inst is not None:
             inst.shutdown_all()
 
+    def set_default_config(self, config: IPCConfig) -> None:
+        """Update the default IPC config for newly created clients."""
+        self._default_config = config
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
