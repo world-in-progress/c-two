@@ -530,6 +530,7 @@ class ServerV2:
             slots = self._slots
             default_name = self._default_name
             dispatcher = self._dispatcher
+            dispatch_cache: dict[tuple[bytes, int], tuple] = {}
             while True:
                 header = await reader.readexactly(16)
                 total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -562,16 +563,29 @@ class ServerV2:
                     name_len = payload[0]
                     try:
                         if name_len:
-                            route_name = payload[1:1 + name_len].decode('utf-8')
+                            route_key = payload[1:1 + name_len]
                             method_idx = _U16.unpack_from(payload, 1 + name_len)[0]
                             args_start = 3 + name_len
                         else:
-                            route_name = ''
+                            route_key = b''
                             method_idx = _U16.unpack_from(payload, 1)[0]
                             args_start = 3
                     except (struct.error, UnicodeDecodeError):
                         continue
                     args_bytes = payload[args_start:] if args_start < len(payload) else b''
+
+                    # Combined cache: (route_bytes, method_idx) → dispatch tuple
+                    cache_key = (bytes(route_key), method_idx)
+                    cached = dispatch_cache.get(cache_key)
+                    if cached is not None:
+                        exec_fast, method, access = cached
+                        dispatcher.submit_inline(
+                            exec_fast, method, args_bytes, access,
+                            request_id, writer,
+                        )
+                        continue
+
+                    route_name = route_key.decode('utf-8') if route_key else ''
                     slot = (slots.get(route_name) if route_name
                             else slots.get(default_name or ''))
                     if slot is not None:
@@ -580,6 +594,7 @@ class ServerV2:
                             entry = slot._dispatch_table.get(method_name)
                             if entry is not None:
                                 method, access = entry
+                                dispatch_cache[cache_key] = (slot.scheduler.execute_fast, method, access)
                                 dispatcher.submit_inline(
                                     slot.scheduler.execute_fast, method,
                                     args_bytes, access, request_id, writer,
