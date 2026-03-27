@@ -10,15 +10,19 @@ Then in another terminal:
     uv run python examples/v2_client.py
 """
 import os, sys, signal, threading
+
+# C2_IPC_ADDRESS must be set BEFORE importing c_two, because the pydantic
+# settings singleton is instantiated at import time and won't pick up env
+# vars that are set afterwards.
+BIND_ADDRESS = 'ipc-v3://v2_grid'
+os.environ['C2_IPC_ADDRESS'] = BIND_ADDRESS
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
 from icrm import IGrid
 from crm import Grid
-
-# Fixed address so the client knows where to connect.
-BIND_ADDRESS = 'ipc-v3://v2_grid'
 
 
 def main():
@@ -32,7 +36,7 @@ def main():
     grid = Grid(epsg, bounds, first_size, subdivide_rules)
 
     # Register — one line replaces ServerConfig + Server + start()
-    cc.register(IGrid, grid, bind_address=BIND_ADDRESS)
+    cc.register(IGrid, grid, name='grid')
     print(f'Grid CRM registered at {cc.server_address()}')
     print('Waiting for clients… (Ctrl-C to stop)\n')
 
@@ -42,7 +46,7 @@ def main():
     stop.wait()
 
     # Cleanup
-    cc.unregister(IGrid)
+    cc.unregister('grid')
     cc.shutdown()
     print('\nServer shut down.')
 

@@ -14,18 +14,18 @@ Usage::
 
     import c_two as cc
 
-    # Register a CRM in the current process
-    cc.register(IGrid, grid_instance)
+    # Register CRMs with explicit names
+    cc.register(IGrid, grid_instance, name='grid')
 
     # Connect (same process → thread-local, no serialization)
-    icrm = cc.connect(IGrid)
+    icrm = cc.connect(IGrid, name='grid')
     result = icrm.subdivide_grids([1], [0])
 
     # Close the connection
     cc.close(icrm)
 
     # Unregister when done
-    cc.unregister(IGrid)
+    cc.unregister('grid')
 
 Module-level functions (:func:`register`, :func:`connect`, etc.) delegate
 to the global :class:`_ProcessRegistry` singleton.
@@ -40,6 +40,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeVar
 
+from .config import settings
 from .pool import ClientPool
 from .proxy import ICRMProxy
 from .scheduler import ConcurrencyConfig
@@ -53,20 +54,10 @@ logger = logging.getLogger(__name__)
 class _Registration:
     """Bookkeeping for a locally registered CRM."""
 
-    namespace: str
+    name: str
     icrm_class: type
     crm_instance: object
     concurrency: ConcurrencyConfig | None
-
-
-def _extract_namespace(icrm_class: type) -> str:
-    """Extract namespace from ICRM ``__tag__`` (``namespace/class/version``)."""
-    tag = getattr(icrm_class, '__tag__', '')
-    if not tag:
-        raise ValueError(
-            f'{icrm_class.__name__} has no __tag__; decorate with @cc.icrm()',
-        )
-    return tag.split('/')[0]
 
 
 class _ProcessRegistry:
@@ -113,8 +104,8 @@ class _ProcessRegistry:
         icrm_class: type,
         crm_instance: object,
         *,
+        name: str,
         concurrency: ConcurrencyConfig | None = None,
-        bind_address: str | None = None,
     ) -> str:
         """Register a CRM, making it available via :func:`connect`.
 
@@ -127,31 +118,29 @@ class _ProcessRegistry:
             ``@cc.icrm``-decorated interface class.
         crm_instance:
             Concrete CRM object that implements *icrm_class*.
+        name:
+            Unique routing name for this CRM instance.
         concurrency:
             Optional concurrency configuration for the scheduler.
-        bind_address:
-            Override the auto-generated IPC address (only effective on
-            the first call that creates the server).
 
         Returns
         -------
         str
-            The namespace string extracted from *icrm_class*.
+            The *name* string (echoed back for convenience).
         """
-        namespace = _extract_namespace(icrm_class)
         with self._lock:
-            if namespace in self._registrations:
-                raise ValueError(f'Namespace already registered: {namespace!r}')
+            if name in self._registrations:
+                raise ValueError(f'Name already registered: {name!r}')
 
             # Lazy-init server on first registration.
             if self._server is None:
-                addr = bind_address or self._auto_address()
+                addr = settings.ipc_address or self._auto_address()
                 self._server = ServerV2(bind_address=addr)
                 self._server_address = addr
 
-            self._server.register_crm(icrm_class, crm_instance, concurrency)
-            self._registrations[namespace] = _Registration(
-                namespace=namespace,
+            self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
+            self._registrations[name] = _Registration(
+                name=name,
                 icrm_class=icrm_class,
                 crm_instance=crm_instance,
                 concurrency=concurrency,
@@ -161,18 +150,19 @@ class _ProcessRegistry:
             if not self._server._started.is_set():
                 self._server.start()
 
-        logger.debug('Registered CRM %s at %s', namespace, self._server_address)
-        return namespace
+        logger.debug('Registered CRM %s at %s', name, self._server_address)
+        return name
 
     def connect(
         self,
         icrm_class: type[ICRM],
         *,
+        name: str,
         address: str | None = None,
     ) -> ICRM:
         """Obtain an ICRM instance connected to a CRM.
 
-        **Thread preference**: when the target namespace is registered in
+        **Thread preference**: when the target *name* is registered in
         this process and no explicit *address* is given, returns a
         zero-serialization local proxy.
 
@@ -180,6 +170,8 @@ class _ProcessRegistry:
         ----------
         icrm_class:
             ``@cc.icrm``-decorated interface class.
+        name:
+            Routing name of the target CRM.
         address:
             Explicit IPC server address (e.g. ``'ipc-v3://remote'``).
             If ``None``, looks up the local registry.
@@ -190,10 +182,8 @@ class _ProcessRegistry:
             An ICRM instance with ``.client`` set to an
             :class:`ICRMProxy`.
         """
-        namespace = _extract_namespace(icrm_class)
-
         with self._lock:
-            local = self._registrations.get(namespace)
+            local = self._registrations.get(name)
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
@@ -203,12 +193,12 @@ class _ProcessRegistry:
             client = self._pool.acquire(address, try_v2=True)
             proxy = ICRMProxy.ipc(
                 client,
-                namespace,
+                name,
                 on_terminate=lambda addr=address: self._pool.release(addr),
             )
         else:
             raise LookupError(
-                f'Namespace {namespace!r} is not registered locally '
+                f'Name {name!r} is not registered locally '
                 f'and no address was provided',
             )
 
@@ -225,33 +215,28 @@ class _ProcessRegistry:
         if proxy is not None and hasattr(proxy, 'terminate'):
             proxy.terminate()
 
-    def unregister(self, icrm_class_or_namespace: type | str) -> None:
+    def unregister(self, name: str) -> None:
         """Remove a CRM from the registry and server.
 
         Parameters
         ----------
-        icrm_class_or_namespace:
-            Either the ICRM class or a namespace string.
+        name:
+            The routing name used during :func:`register`.
         """
-        if isinstance(icrm_class_or_namespace, str):
-            namespace = icrm_class_or_namespace
-        else:
-            namespace = _extract_namespace(icrm_class_or_namespace)
-
         with self._lock:
-            reg = self._registrations.pop(namespace, None)
+            reg = self._registrations.pop(name, None)
             if reg is None:
-                raise KeyError(f'Namespace not registered: {namespace!r}')
+                raise KeyError(f'Name not registered: {name!r}')
             if self._server is not None:
-                self._server.unregister_crm(namespace)
+                self._server.unregister_crm(name)
 
     def get_server_address(self) -> str | None:
         """IPC address of the auto-created server, or ``None``."""
         return self._server_address
 
     @property
-    def namespaces(self) -> list[str]:
-        """List of currently registered namespace strings."""
+    def names(self) -> list[str]:
+        """List of currently registered routing names."""
         with self._lock:
             return list(self._registrations.keys())
 
@@ -291,8 +276,8 @@ def register(
     icrm_class: type,
     crm_instance: object,
     *,
+    name: str,
     concurrency: ConcurrencyConfig | None = None,
-    bind_address: str | None = None,
 ) -> str:
     """Register a CRM in the current process.
 
@@ -301,21 +286,22 @@ def register(
     return _ProcessRegistry.get().register(
         icrm_class,
         crm_instance,
+        name=name,
         concurrency=concurrency,
-        bind_address=bind_address,
     )
 
 
 def connect(
     icrm_class: type[ICRM],
     *,
+    name: str,
     address: str | None = None,
 ) -> ICRM:
     """Obtain an ICRM proxy for a CRM.
 
     See :meth:`_ProcessRegistry.connect`.
     """
-    return _ProcessRegistry.get().connect(icrm_class, address=address)
+    return _ProcessRegistry.get().connect(icrm_class, name=name, address=address)
 
 
 def close(icrm: object) -> None:
@@ -326,12 +312,12 @@ def close(icrm: object) -> None:
     _ProcessRegistry.get().close(icrm)
 
 
-def unregister(icrm_class_or_namespace: type | str) -> None:
+def unregister(name: str) -> None:
     """Remove a CRM from the registry.
 
     See :meth:`_ProcessRegistry.unregister`.
     """
-    _ProcessRegistry.get().unregister(icrm_class_or_namespace)
+    _ProcessRegistry.get().unregister(name)
 
 
 def server_address() -> str | None:

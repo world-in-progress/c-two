@@ -32,8 +32,8 @@ class _DummySharedClient:
         self.calls: list[tuple] = []
         self.relays: list[bytes] = []
 
-    def call(self, method_name: str, data: bytes | None = None, *, namespace: str | None = None) -> bytes:
-        self.calls.append((method_name, data, namespace))
+    def call(self, method_name: str, data: bytes | None = None, *, name: str | None = None) -> bytes:
+        self.calls.append((method_name, data, name))
         return b'result'
 
     def relay(self, event_bytes: bytes) -> bytes:

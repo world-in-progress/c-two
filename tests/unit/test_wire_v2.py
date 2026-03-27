@@ -12,7 +12,7 @@ from c_two.rpc_v2.protocol import (
     STATUS_SUCCESS,
     STATUS_ERROR,
     MethodEntry,
-    NamespaceInfo,
+    RouteInfo,
     HandshakeV5,
     encode_v5_client_handshake,
     encode_v5_server_handshake,
@@ -40,35 +40,35 @@ from c_two.rpc.ipc.ipc_v3_protocol import FLAG_BUDDY, BUDDY_PAYLOAD_STRUCT
 
 class TestCallControl:
 
-    def test_encode_decode_with_namespace(self):
-        ns, idx = 'test.hello', 42
-        encoded = encode_call_control(ns, idx)
-        dec_ns, dec_idx, consumed = decode_call_control(encoded)
-        assert dec_ns == ns
+    def test_encode_decode_with_name(self):
+        name, idx = 'hello', 42
+        encoded = encode_call_control(name, idx)
+        dec_name, dec_idx, consumed = decode_call_control(encoded)
+        assert dec_name == name
         assert dec_idx == idx
         assert consumed == len(encoded)
 
-    def test_encode_decode_empty_namespace(self):
+    def test_encode_decode_empty_name(self):
         encoded = encode_call_control('', 7)
-        ns, idx, consumed = decode_call_control(encoded)
-        assert ns == ''
+        name, idx, consumed = decode_call_control(encoded)
+        assert name == ''
         assert idx == 7
-        assert consumed == 3  # 1B ns_len=0 + 2B idx
+        assert consumed == 3  # 1B name_len=0 + 2B idx
 
     def test_decode_at_offset(self):
         prefix = b'\xff\xfe'
         ctrl = encode_call_control('ns', 99)
         data = prefix + ctrl + b'\x00\x00'
-        ns, idx, consumed = decode_call_control(data, offset=len(prefix))
-        assert ns == 'ns'
+        name, idx, consumed = decode_call_control(data, offset=len(prefix))
+        assert name == 'ns'
         assert idx == 99
         assert consumed == len(ctrl)
 
-    def test_large_namespace(self):
-        ns = 'a' * 255  # max 1-byte length
-        encoded = encode_call_control(ns, 0)
-        dec_ns, dec_idx, consumed = decode_call_control(encoded)
-        assert dec_ns == ns
+    def test_large_name(self):
+        name = 'a' * 255  # max 1-byte length
+        encoded = encode_call_control(name, 0)
+        dec_name, dec_idx, consumed = decode_call_control(encoded)
+        assert dec_name == name
         assert dec_idx == 0
 
 
@@ -120,7 +120,7 @@ class TestV2FrameBuilders:
     def test_buddy_call_frame(self):
         frame = encode_v2_buddy_call_frame(
             request_id=7, seg_idx=0, offset=1024, data_size=8192,
-            is_dedicated=False, namespace='ns', method_idx=1,
+            is_dedicated=False, name='ns', method_idx=1,
         )
         total_len, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 7
@@ -219,42 +219,42 @@ class TestHandshakeV5:
         hs = decode_v5_handshake(encoded)
         assert hs.segments == segments
         assert hs.capability_flags == cap
-        assert hs.namespaces == []  # Client doesn't send namespaces
+        assert hs.routes == []  # Client doesn't send routes
 
     def test_server_handshake_roundtrip(self):
         segments = [('srv_seg', 134217728)]
         cap = CAP_CALL_V2 | CAP_METHOD_IDX
-        ns_info = NamespaceInfo(
-            namespace='test.hello',
+        route = RouteInfo(
+            name='hello',
             methods=[
                 MethodEntry(name='add', index=0),
                 MethodEntry(name='greeting', index=1),
             ],
         )
-        encoded = encode_v5_server_handshake(segments, cap, [ns_info])
+        encoded = encode_v5_server_handshake(segments, cap, [route])
         assert encoded[0] == HANDSHAKE_V5
         hs = decode_v5_handshake(encoded)
         assert hs.segments == segments
         assert hs.capability_flags == cap
-        assert len(hs.namespaces) == 1
-        ns = hs.namespaces[0]
-        assert ns.namespace == 'test.hello'
-        assert len(ns.methods) == 2
-        assert ns.method_by_name('add') == 0
-        assert ns.method_by_name('greeting') == 1
-        assert ns.method_by_index(0) == 'add'
+        assert len(hs.routes) == 1
+        r = hs.routes[0]
+        assert r.name == 'hello'
+        assert len(r.methods) == 2
+        assert r.method_by_name('add') == 0
+        assert r.method_by_name('greeting') == 1
+        assert r.method_by_index(0) == 'add'
 
-    def test_multi_segment_multi_namespace(self):
+    def test_multi_segment_multi_route(self):
         segs = [('s1', 100), ('s2', 200)]
-        ns1 = NamespaceInfo('ns.a', [MethodEntry('m1', 0)])
-        ns2 = NamespaceInfo('ns.b', [MethodEntry('m2', 0), MethodEntry('m3', 1)])
-        encoded = encode_v5_server_handshake(segs, CAP_CALL_V2, [ns1, ns2])
+        r1 = RouteInfo('route_a', [MethodEntry('m1', 0)])
+        r2 = RouteInfo('route_b', [MethodEntry('m2', 0), MethodEntry('m3', 1)])
+        encoded = encode_v5_server_handshake(segs, CAP_CALL_V2, [r1, r2])
         hs = decode_v5_handshake(encoded)
         assert len(hs.segments) == 2
-        assert len(hs.namespaces) == 2
-        assert hs.namespaces[0].namespace == 'ns.a'
-        assert hs.namespaces[1].namespace == 'ns.b'
-        assert len(hs.namespaces[1].methods) == 2
+        assert len(hs.routes) == 2
+        assert hs.routes[0].name == 'route_a'
+        assert hs.routes[1].name == 'route_b'
+        assert len(hs.routes[1].methods) == 2
 
     def test_empty_segments(self):
         encoded = encode_v5_client_handshake([], CAP_CALL_V2)

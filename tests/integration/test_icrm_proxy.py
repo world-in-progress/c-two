@@ -96,8 +96,8 @@ class TestICRMProxyIPC:
     def server_addr(self):
         addr = f'ipc-v3://{_unique_region()}'
         server = ServerV2(bind_address=addr)
-        server.register_crm(IHello, Hello())
-        server.register_crm(ICounter, Counter(initial=50))
+        server.register_crm(IHello, Hello(), name='hello')
+        server.register_crm(ICounter, Counter(initial=50), name='counter')
         server.start()
         _wait_for_server(addr)
         yield addr
@@ -107,7 +107,7 @@ class TestICRMProxyIPC:
         client = SharedClient(server_addr, try_v2=True)
         client.connect()
         try:
-            proxy = ICRMProxy.ipc(client, 'test.hello')
+            proxy = ICRMProxy.ipc(client, 'hello')
             icrm = IHello()
             icrm.client = proxy
             assert icrm.greeting('IPC') == 'Hello, IPC!'
@@ -119,7 +119,7 @@ class TestICRMProxyIPC:
         client = SharedClient(server_addr, try_v2=True)
         client.connect()
         try:
-            proxy = ICRMProxy.ipc(client, 'test.counter')
+            proxy = ICRMProxy.ipc(client, 'counter')
             icrm = ICounter()
             icrm.client = proxy
             assert icrm.get() == 50
@@ -132,8 +132,8 @@ class TestICRMProxyIPC:
         client = SharedClient(server_addr, try_v2=True)
         client.connect()
         try:
-            hello_proxy = ICRMProxy.ipc(client, 'test.hello')
-            counter_proxy = ICRMProxy.ipc(client, 'test.counter')
+            hello_proxy = ICRMProxy.ipc(client, 'hello')
+            counter_proxy = ICRMProxy.ipc(client, 'counter')
 
             hello = IHello()
             hello.client = hello_proxy

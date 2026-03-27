@@ -17,9 +17,9 @@ This separation eliminates:
 
 V2 Call Control (appended to buddy pointer, or prepended to inline data)::
 
-    [1B ns_len][namespace UTF-8][2B method_idx LE]
+    [1B name_len][route_name UTF-8][2B method_idx LE]
 
-    Total: 3 + ns_len bytes.  ns_len=0 → use connection default namespace.
+    Total: 3 + name_len bytes.  name_len=0 → use connection default route.
 
 V2 Reply Control::
 
@@ -66,17 +66,17 @@ _U32 = struct.Struct('<I')
 # ---------------------------------------------------------------------------
 
 
-def encode_call_control(namespace: str, method_idx: int) -> bytes:
+def encode_call_control(name: str, method_idx: int) -> bytes:
     """Encode v2 call control payload.
 
-    Format: ``[1B ns_len][namespace UTF-8][2B method_idx LE]``
+    Format: ``[1B name_len][route_name UTF-8][2B method_idx LE]``
     """
-    if namespace:
-        ns_b = namespace.encode('utf-8')
-        buf = bytearray(1 + len(ns_b) + 2)
-        buf[0] = len(ns_b)
-        buf[1:1 + len(ns_b)] = ns_b
-        _U16.pack_into(buf, 1 + len(ns_b), method_idx)
+    if name:
+        name_b = name.encode('utf-8')
+        buf = bytearray(1 + len(name_b) + 2)
+        buf[0] = len(name_b)
+        buf[1:1 + len(name_b)] = name_b
+        _U16.pack_into(buf, 1 + len(name_b), method_idx)
     else:
         buf = bytearray(3)
         buf[0] = 0
@@ -89,18 +89,18 @@ def decode_call_control(
 ) -> tuple[str, int, int]:
     """Decode v2 call control payload.
 
-    Returns ``(namespace, method_idx, bytes_consumed)``.
+    Returns ``(route_name, method_idx, bytes_consumed)``.
     """
-    ns_len = data[offset]
+    name_len = data[offset]
     off = offset + 1
-    if ns_len > 0:
-        namespace = bytes(data[off:off + ns_len]).decode('utf-8')
-        off += ns_len
+    if name_len > 0:
+        name = bytes(data[off:off + name_len]).decode('utf-8')
+        off += name_len
     else:
-        namespace = ''
+        name = ''
     method_idx = _U16.unpack_from(data, off)[0]
     off += 2
-    return namespace, method_idx, off - offset
+    return name, method_idx, off - offset
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ def encode_v2_buddy_call_frame(
     offset: int,
     data_size: int,
     is_dedicated: bool,
-    namespace: str,
+    name: str,
     method_idx: int,
 ) -> bytes:
     """Build a complete v2 buddy call frame.
@@ -164,7 +164,7 @@ def encode_v2_buddy_call_frame(
         [v2_call_control]
     """
     buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
-    ctrl = encode_call_control(namespace, method_idx)
+    ctrl = encode_call_control(name, method_idx)
     payload = buddy + ctrl
     flags = FLAG_BUDDY | FLAG_CALL_V2
     return encode_frame(request_id, flags, payload)
@@ -172,7 +172,7 @@ def encode_v2_buddy_call_frame(
 
 def encode_v2_inline_call_frame(
     request_id: int,
-    namespace: str,
+    name: str,
     method_idx: int,
     data: bytes | memoryview,
 ) -> bytes:
@@ -184,7 +184,7 @@ def encode_v2_inline_call_frame(
         [v2_call_control]
         [inline_data]
     """
-    ctrl = encode_call_control(namespace, method_idx)
+    ctrl = encode_call_control(name, method_idx)
     payload = ctrl + bytes(data) if data else ctrl
     return encode_frame(request_id, FLAG_CALL_V2, payload)
 

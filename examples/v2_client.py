@@ -18,7 +18,7 @@ SERVER_ADDRESS = 'ipc-v3://v2_grid'
 
 def main():
     # Connect to the remote server via IPC
-    grid = cc.connect(IGrid, address=SERVER_ADDRESS)
+    grid = cc.connect(IGrid, name='grid', address=SERVER_ADDRESS)
     print(f'Connected (mode: {grid.client._mode})\n')
 
     # Say hello

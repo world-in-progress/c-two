@@ -61,15 +61,19 @@ _U32 = struct.Struct('<I')
 
 @dataclass
 class MethodEntry:
-    """A single method in a namespace's method table."""
+    """A single method in a route's method table."""
     name: str
     index: int
 
 
 @dataclass
-class NamespaceInfo:
-    """Namespace + method table, exchanged during handshake v5."""
-    namespace: str
+class RouteInfo:
+    """Routing name + method table, exchanged during handshake v5.
+
+    The ``name`` field is the user-chosen CRM routing name (not the ICRM
+    namespace from ``__tag__``).
+    """
+    name: str
     methods: list[MethodEntry] = field(default_factory=list)
 
     def method_by_name(self, name: str) -> int | None:
@@ -90,7 +94,7 @@ class HandshakeV5:
     """Parsed handshake v5 payload."""
     segments: list[tuple[str, int]]   # [(shm_name, segment_size), ...]
     capability_flags: int = 0
-    namespaces: list[NamespaceInfo] = field(default_factory=list)
+    routes: list[RouteInfo] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +132,7 @@ def encode_v5_client_handshake(
 def encode_v5_server_handshake(
     segments: list[tuple[str, int]],
     capability_flags: int,
-    namespaces: list[NamespaceInfo],
+    routes: list[RouteInfo],
 ) -> bytes:
     """Encode server→client handshake v5 ACK.
 
@@ -138,9 +142,9 @@ def encode_v5_server_handshake(
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
         [2B capability_flags LE]
-        [2B namespace_count LE]
-        [per-namespace:
-            [1B ns_len][namespace UTF-8]
+        [2B route_count LE]
+        [per-route:
+            [1B name_len][route_name UTF-8]
             [2B method_count LE]
             [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
         ]
@@ -155,14 +159,14 @@ def encode_v5_server_handshake(
         parts.append(name_b)
     # Capabilities
     parts.append(_U16.pack(capability_flags))
-    # Namespaces + method tables
-    parts.append(_U16.pack(len(namespaces)))
-    for ns_info in namespaces:
-        ns_b = ns_info.namespace.encode('utf-8')
-        parts.append(bytes([len(ns_b)]))
-        parts.append(ns_b)
-        parts.append(_U16.pack(len(ns_info.methods)))
-        for m in ns_info.methods:
+    # Routes + method tables
+    parts.append(_U16.pack(len(routes)))
+    for route in routes:
+        route_b = route.name.encode('utf-8')
+        parts.append(bytes([len(route_b)]))
+        parts.append(route_b)
+        parts.append(_U16.pack(len(route.methods)))
+        for m in route.methods:
             m_b = m.name.encode('utf-8')
             parts.append(bytes([len(m_b)]))
             parts.append(m_b)
@@ -177,7 +181,7 @@ def encode_v5_server_handshake(
 def decode_v5_handshake(payload: bytes | memoryview) -> HandshakeV5:
     """Decode handshake v5 from either direction.
 
-    Client payloads have no namespace section (detected by exhausting bytes
+    Client payloads have no route section (detected by exhausting bytes
     after capability_flags).
     """
     buf = memoryview(payload) if not isinstance(payload, memoryview) else payload
@@ -201,13 +205,13 @@ def decode_v5_handshake(payload: bytes | memoryview) -> HandshakeV5:
         raise ValueError('Handshake v5 missing capability_flags')
     cap_flags = _U16.unpack_from(buf, off)[0]; off += 2
 
-    # Namespace section (optional — only present in server→client ACK).
-    namespaces: list[NamespaceInfo] = []
+    # Route section (optional — only present in server→client ACK).
+    routes: list[RouteInfo] = []
     if off + 2 <= len(buf):
-        ns_count = _U16.unpack_from(buf, off)[0]; off += 2
-        for _ in range(ns_count):
-            ns_len = buf[off]; off += 1
-            ns_name = bytes(buf[off:off + ns_len]).decode('utf-8'); off += ns_len
+        route_count = _U16.unpack_from(buf, off)[0]; off += 2
+        for _ in range(route_count):
+            r_len = buf[off]; off += 1
+            r_name = bytes(buf[off:off + r_len]).decode('utf-8'); off += r_len
             m_count = _U16.unpack_from(buf, off)[0]; off += 2
             methods: list[MethodEntry] = []
             for mi in range(m_count):
@@ -215,10 +219,10 @@ def decode_v5_handshake(payload: bytes | memoryview) -> HandshakeV5:
                 m_name = bytes(buf[off:off + m_len]).decode('utf-8'); off += m_len
                 m_idx = _U16.unpack_from(buf, off)[0]; off += 2
                 methods.append(MethodEntry(name=m_name, index=m_idx))
-            namespaces.append(NamespaceInfo(namespace=ns_name, methods=methods))
+            routes.append(RouteInfo(name=r_name, methods=methods))
 
     return HandshakeV5(
         segments=segments,
         capability_flags=cap_flags,
-        namespaces=namespaces,
+        routes=routes,
     )

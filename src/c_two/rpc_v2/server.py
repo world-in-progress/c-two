@@ -4,12 +4,11 @@ Compared to :class:`IPCv3Server`:
 
 - **No EventQueue**: direct CRM dispatch via ``ThreadPoolExecutor``.
 - **Handshake v5**: capability negotiation + method index exchange.
-- **Wire v2 frames**: control-plane routing (namespace + method index in UDS
-  inline frame, pure payload in buddy SHM).
+- **Wire v2 frames**: control-plane routing (CRM routing name + method
+  index in UDS inline frame, pure payload in buddy SHM).
 - **Backward compatible**: also handles v4 handshake and v1 wire frames.
-
-Phase 2: single CRM per server.  Phase 3 will add multi-CRM routing via
-:class:`MultiCRMServer`.
+- **Multi-CRM**: hosts multiple CRM instances under distinct routing
+  names (not tied to ICRM namespace from ``__tag__``).
 """
 from __future__ import annotations
 
@@ -59,7 +58,7 @@ from .protocol import (
     CAP_METHOD_IDX,
     STATUS_SUCCESS,
     STATUS_ERROR,
-    NamespaceInfo,
+    RouteInfo,
     MethodEntry,
     encode_v5_server_handshake,
     decode_v5_handshake,
@@ -113,14 +112,14 @@ class _Connection:
 
 
 # ---------------------------------------------------------------------------
-# Per-namespace CRM slot
+# Per-CRM routing slot
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CRMSlot:
-    """Per-namespace CRM registration in the server."""
+    """Per-CRM registration in the server, keyed by routing name."""
 
-    namespace: str
+    name: str
     icrm: object
     method_table: MethodTable
     scheduler: Scheduler
@@ -134,13 +133,14 @@ class CRMSlot:
 class ServerV2:
     """IPC v3 server with wire v2 control-plane routing.
 
-    Supports hosting **multiple CRM resources** under distinct namespaces.
-    Each namespace has its own ICRM instance, method table, and scheduler.
+    Supports hosting **multiple CRM resources** under distinct routing
+    names.  Each name has its own ICRM instance, method table, and
+    scheduler.
 
     Handles both v1 (wire CRM_CALL in buddy SHM / inline) and v2
     (control-plane method index + pure payload) frames.  V2 frames carry
-    namespace info in the control plane; v1 frames are routed to the
-    default namespace.
+    the routing name in the control plane; v1 frames are routed to the
+    default CRM.
 
     Parameters
     ----------
@@ -170,23 +170,28 @@ class ServerV2:
         ipc_config: IPCConfig | None = None,
         concurrency: ConcurrencyConfig | None = None,
         max_workers: int = 4,
+        *,
+        name: str | None = None,
     ):
         self._config = ipc_config or IPCConfig()
         self._address = bind_address
         region_id = bind_address.replace('ipc-v3://', '').replace('ipc://', '')
         self._socket_path = str(Path(_IPC_SOCK_DIR) / f'{region_id}.sock')
 
-        # Multi-CRM slots: namespace → CRMSlot.
+        # Multi-CRM slots: name → CRMSlot.
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
-        self._default_namespace: str | None = None
+        self._default_name: str | None = None
         self._default_concurrency = concurrency or ConcurrencyConfig(
             max_workers=max_workers,
         )
 
         # Register initial CRM if provided.
         if icrm_class is not None and crm_instance is not None:
-            self.register_crm(icrm_class, crm_instance, self._default_concurrency)
+            self.register_crm(
+                icrm_class, crm_instance, self._default_concurrency,
+                name=name,
+            )
         elif icrm_class is not None or crm_instance is not None:
             raise ValueError(
                 'Both icrm_class and crm_instance must be provided, or neither',
@@ -212,48 +217,56 @@ class ServerV2:
         icrm_class: type,
         crm_instance: object,
         concurrency: ConcurrencyConfig | None = None,
+        *,
+        name: str | None = None,
     ) -> str:
-        """Register a CRM under its ICRM namespace.
+        """Register a CRM under an explicit *name* (routing key).
 
-        Returns the namespace string.  Raises ``ValueError`` if the
-        namespace is already registered.
+        Parameters
+        ----------
+        name:
+            Unique routing key.  If ``None``, falls back to the ICRM
+            namespace extracted from ``__tag__``.
+
+        Returns the routing name.  Raises ``ValueError`` if the name is
+        already registered.
         """
+        routing_name = name if name is not None else self._extract_namespace(icrm_class)
         icrm = self._create_icrm(icrm_class, crm_instance)
         methods = self._discover_methods(icrm_class)
         method_table = MethodTable.from_methods(methods)
-        namespace = self._extract_namespace(icrm_class)
         cc_config = concurrency or self._default_concurrency
         scheduler = Scheduler(cc_config)
 
         slot = CRMSlot(
-            namespace=namespace,
+            name=routing_name,
             icrm=icrm,
             method_table=method_table,
             scheduler=scheduler,
             methods=methods,
         )
         with self._slots_lock:
-            if namespace in self._slots:
+            if routing_name in self._slots:
                 scheduler.shutdown()
-                raise ValueError(f'Namespace already registered: {namespace!r}')
-            self._slots[namespace] = slot
-            if self._default_namespace is None:
-                self._default_namespace = namespace
-        return namespace
+                raise ValueError(f'Name already registered: {routing_name!r}')
+            self._slots[routing_name] = slot
+            if self._default_name is None:
+                self._default_name = routing_name
+        return routing_name
 
-    def unregister_crm(self, namespace: str) -> None:
-        """Unregister a CRM by namespace."""
+    def unregister_crm(self, name: str) -> None:
+        """Unregister a CRM by its routing name."""
         with self._slots_lock:
-            slot = self._slots.pop(namespace, None)
+            slot = self._slots.pop(name, None)
             if slot is None:
-                raise KeyError(f'Namespace not registered: {namespace!r}')
-            if self._default_namespace == namespace:
-                self._default_namespace = next(iter(self._slots), None)
+                raise KeyError(f'Name not registered: {name!r}')
+            if self._default_name == name:
+                self._default_name = next(iter(self._slots), None)
         slot.scheduler.shutdown()
 
     @property
-    def namespaces(self) -> list[str]:
-        """Return list of registered namespace strings."""
+    def names(self) -> list[str]:
+        """Return list of registered routing names."""
         with self._slots_lock:
             return list(self._slots.keys())
 
@@ -283,13 +296,13 @@ class ServerV2:
         tag = getattr(icrm_class, '__tag__', '')
         return tag.split('/')[0] if tag else ''
 
-    def _resolve_slot(self, namespace: str) -> CRMSlot | None:
-        """Look up a CRM slot by namespace (empty → default)."""
+    def _resolve_slot(self, name: str) -> CRMSlot | None:
+        """Look up a CRM slot by routing name (empty → default)."""
         with self._slots_lock:
-            if namespace:
-                return self._slots.get(namespace)
-            if self._default_namespace is not None:
-                return self._slots.get(self._default_namespace)
+            if name:
+                return self._slots.get(name)
+            if self._default_name is not None:
+                return self._slots.get(self._default_name)
             return None
 
     # ------------------------------------------------------------------
@@ -471,12 +484,12 @@ class ServerV2:
         self._open_segments(conn, hs.segments)
         conn.v2_mode = True
 
-        # Build namespace / method table ACK for *all* registered CRMs.
-        ns_infos: list[NamespaceInfo] = []
+        # Build route / method table ACK for *all* registered CRMs.
+        route_infos: list[RouteInfo] = []
         with self._slots_lock:
             for slot in self._slots.values():
-                ns_infos.append(NamespaceInfo(
-                    namespace=slot.namespace,
+                route_infos.append(RouteInfo(
+                    name=slot.name,
                     methods=[
                         MethodEntry(name=n, index=slot.method_table.index_of(n))
                         for n in slot.method_table.names()
@@ -492,7 +505,7 @@ class ServerV2:
         ack_payload = encode_v5_server_handshake(
             segments=[],
             capability_flags=cap_flags,
-            namespaces=ns_infos,
+            routes=route_infos,
         )
         writer.write(encode_frame(0, FLAG_HANDSHAKE, ack_payload))
         await writer.drain()
@@ -630,20 +643,20 @@ class ServerV2:
         writer: asyncio.StreamWriter,
     ) -> None:
         if is_buddy:
-            namespace, method_idx, args_bytes = self._resolve_v2_buddy(conn, payload)
+            route_name, method_idx, args_bytes = self._resolve_v2_buddy(conn, payload)
             if args_bytes is None:
                 return
         else:
             if not payload:
                 return
-            namespace, method_idx, _consumed = decode_call_control(payload, 0)
+            route_name, method_idx, _consumed = decode_call_control(payload, 0)
             args_bytes = bytes(payload[_consumed:]) if _consumed < len(payload) else b''
 
-        slot = self._resolve_slot(namespace)
+        slot = self._resolve_slot(route_name)
         if slot is None:
-            logger.warning('Unknown namespace %r', namespace)
+            logger.warning('Unknown route name %r', route_name)
             err_frame = encode_v2_error_reply_frame(
-                request_id, f'Unknown namespace: {namespace}'.encode('utf-8'),
+                request_id, f'Unknown route name: {route_name}'.encode('utf-8'),
             )
             writer.write(err_frame)
             await writer.drain()
@@ -652,7 +665,7 @@ class ServerV2:
         try:
             method_name = slot.method_table.name_of(method_idx)
         except KeyError:
-            logger.warning('Unknown method index %d in namespace %r', method_idx, namespace)
+            logger.warning('Unknown method index %d for route %r', method_idx, route_name)
             return
 
         result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
@@ -661,7 +674,7 @@ class ServerV2:
     def _resolve_v2_buddy(
         self, conn: _Connection, payload: bytes,
     ) -> tuple[str, int, bytes | None]:
-        """Extract namespace + method_idx + args from a v2 buddy frame."""
+        """Extract route_name + method_idx + args from a v2 buddy frame."""
         seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
             decode_buddy_payload(payload)
         )
@@ -669,7 +682,7 @@ class ServerV2:
             return '', -1, None
 
         ctrl_offset = BUDDY_PAYLOAD_STRUCT.size
-        namespace, method_idx, _consumed = decode_call_control(payload, ctrl_offset)
+        route_name, method_idx, _consumed = decode_call_control(payload, ctrl_offset)
 
         seg_mv = conn.seg_views[seg_idx]
         args_bytes = bytes(seg_mv[data_offset : data_offset + data_size])
@@ -679,7 +692,7 @@ class ServerV2:
         except Exception:
             logger.warning('Conn %d: failed to free request block', conn.conn_id, exc_info=True)
 
-        return namespace, method_idx, args_bytes
+        return route_name, method_idx, args_bytes
 
     # ------------------------------------------------------------------
     # CRM dispatch

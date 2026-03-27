@@ -67,7 +67,7 @@ from .protocol import (
     STATUS_SUCCESS,
     STATUS_ERROR,
     HandshakeV5,
-    NamespaceInfo,
+    RouteInfo,
     encode_v5_client_handshake,
     decode_v5_handshake,
 )
@@ -174,8 +174,8 @@ class SharedClient:
         # Wire v2 mode (negotiated during handshake v5).
         self._v2_mode = False
         self._method_table: MethodTable | None = None
-        self._namespace_tables: dict[str, MethodTable] = {}
-        self._default_namespace = ''
+        self._name_tables: dict[str, MethodTable] = {}
+        self._default_name = ''
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -285,16 +285,16 @@ class SharedClient:
                 hs = decode_v5_handshake(payload)
                 if hs.capability_flags & CAP_CALL_V2:
                     self._v2_mode = True
-                    # Build per-namespace method tables.
-                    for ns in hs.namespaces:
+                    # Build per-route method tables.
+                    for route in hs.routes:
                         table = MethodTable()
-                        for m in ns.methods:
+                        for m in route.methods:
                             table.add(m.name, m.index)
-                        self._namespace_tables[ns.namespace] = table
-                    # Default namespace + unified table for backward compat.
-                    if hs.namespaces:
-                        self._default_namespace = hs.namespaces[0].namespace
-                        self._method_table = self._namespace_tables[self._default_namespace]
+                        self._name_tables[route.name] = table
+                    # Default route + unified table for backward compat.
+                    if hs.routes:
+                        self._default_name = hs.routes[0].name
+                        self._method_table = self._name_tables[self._default_name]
                     return True
             return False
         except Exception:
@@ -362,7 +362,7 @@ class SharedClient:
     # RPC call (thread-safe, concurrent)
     # ------------------------------------------------------------------
 
-    def call(self, method_name: str, data: bytes | None = None, *, namespace: str | None = None) -> bytes:
+    def call(self, method_name: str, data: bytes | None = None, *, name: str | None = None) -> bytes:
         """Send a CRM_CALL and return the response payload.
 
         Thread-safe: multiple threads may call concurrently.  Each call
@@ -377,8 +377,9 @@ class SharedClient:
             The method to invoke on the CRM.
         data:
             Serialized arguments payload.
-        namespace:
-            Target namespace (v2 only).  If ``None``, uses the default.
+        name:
+            Target CRM routing name (v2 only).  If ``None``, uses the
+            default.
 
         Returns ``bytes`` (always copied from SHM for safety).
         """
@@ -410,7 +411,7 @@ class SharedClient:
         try:
             with self._send_lock:
                 if self._v2_mode:
-                    self._send_request_v2(rid, method_name, args, wire_size, namespace=namespace)
+                    self._send_request_v2(rid, method_name, args, wire_size, name=name)
                 else:
                     self._send_request_v1(rid, method_name, args, wire_size)
         except Exception as exc:
@@ -506,7 +507,7 @@ class SharedClient:
                     )
                 raise
 
-    def _send_request_v2(self, rid: int, method_name: str, args: bytes, payload_size: int, *, namespace: str | None = None) -> None:
+    def _send_request_v2(self, rid: int, method_name: str, args: bytes, payload_size: int, *, name: str | None = None) -> None:
         """Encode and send a v2 call frame. Called under _send_lock.
 
         In v2 mode, SHM contains pure payload (no wire header).
@@ -516,15 +517,15 @@ class SharedClient:
         if sock is None:
             raise error.CompoClientError('Not connected')
 
-        ns = namespace if namespace is not None else self._default_namespace
-        # Look up method table for the target namespace.
-        table = self._namespace_tables.get(ns, self._method_table)
+        route_name = name if name is not None else self._default_name
+        # Look up method table for the target route.
+        table = self._name_tables.get(route_name, self._method_table)
         method_idx = table.index_of(method_name) if table else 0
 
         if payload_size <= self._config.shm_threshold or self._buddy_pool is None:
             # Inline: control + data in UDS frame.
             inline_data = b''.join(args) if isinstance(args, (list, tuple)) else args
-            frame = encode_v2_inline_call_frame(rid, ns, method_idx, inline_data)
+            frame = encode_v2_inline_call_frame(rid, route_name, method_idx, inline_data)
             sock.sendall(frame)
         else:
             # Buddy: pure payload in SHM, control in UDS frame.
@@ -536,7 +537,7 @@ class SharedClient:
                     )
                     # Fall back to inline.
                     inline_data = b''.join(args) if isinstance(args, (list, tuple)) else args
-                    frame = encode_v2_inline_call_frame(rid, ns, method_idx, inline_data)
+                    frame = encode_v2_inline_call_frame(rid, route_name, method_idx, inline_data)
                     sock.sendall(frame)
                     return
 
@@ -556,7 +557,7 @@ class SharedClient:
                 frame = encode_v2_buddy_call_frame(
                     rid, alloc.seg_idx, alloc.offset,
                     payload_size, alloc.is_dedicated,
-                    ns, method_idx,
+                    route_name, method_idx,
                 )
                 sock.sendall(frame)
             except Exception:

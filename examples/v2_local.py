@@ -75,14 +75,14 @@ class Counter:
 
 def main():
     # 1. Register CRMs — implicitly starts a shared IPC server
-    cc.register(IGreeter, Greeter(lang='zh'))
-    cc.register(ICounter, Counter(initial=100))
+    cc.register(IGreeter, Greeter(lang='zh'), name='greeter')
+    cc.register(ICounter, Counter(initial=100), name='counter')
     print(f'Server address: {cc.server_address()}')
-    print(f'Registered namespaces: demo.greeter, demo.counter\n')
+    print(f'Registered routes: greeter, counter\n')
 
     # 2. Connect with thread preference (same process → zero serde)
-    greeter = cc.connect(IGreeter)
-    counter = cc.connect(ICounter)
+    greeter = cc.connect(IGreeter, name='greeter')
+    counter = cc.connect(ICounter, name='counter')
 
     print(f'Greeter proxy mode: {greeter.client._mode}')   # → "thread"
     print(f'Counter proxy mode: {counter.client._mode}\n')  # → "thread"
@@ -101,8 +101,8 @@ def main():
     # 4. Cleanup
     cc.close(greeter)
     cc.close(counter)
-    cc.unregister(IGreeter)
-    cc.unregister(ICounter)
+    cc.unregister('greeter')
+    cc.unregister('counter')
     cc.shutdown()
     print('Done — all resources cleaned up.')
 
