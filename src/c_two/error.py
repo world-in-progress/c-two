@@ -18,6 +18,18 @@ class ERROR_Code(IntEnum):
 class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
 
+
+class MemoryPressureError(CCBaseError):
+    """Raised when a buddy pool allocation fails and the payload is too large
+    for inline fallback (exceeds ``max_frame_size``).
+
+    Callers may retry after freeing resources or reconfiguring the pool.
+    """
+
+    def __init__(self, message: str | None = None):
+        self.message = message or 'Buddy pool exhausted and payload exceeds inline limit'
+        super().__init__(self.message)
+
 class CCError(CCBaseError):
     """
     General error class for C-Two.
