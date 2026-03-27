@@ -95,13 +95,13 @@ Run benchmarks with `uv run python benchmarks/<script>.py`.
 
 ---
 
-## Rust Tests (`rust/c2_buddy/`)
+## Rust Tests (`src/c_two/buddy/_buddy_core/`)
 
 The Rust buddy allocator has its own test suite:
 
 ```bash
 # Run Rust tests (must use --no-default-features on macOS to avoid PyO3 linker errors)
-cd rust/c2_buddy && cargo test --no-default-features
+cd src/c_two/buddy/_buddy_core && cargo test --no-default-features
 ```
 
 Currently **36 Rust tests** covering:

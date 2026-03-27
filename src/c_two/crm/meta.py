@@ -4,6 +4,7 @@ from typing import TypeVar, Type, Callable
 from ..rpc.transferable import auto_transfer
 from ..rpc.util.wire import preregister_methods
 
+_F = TypeVar('_F', bound=Callable)
 ICRM = TypeVar('ICRM')
 _METHOD_ACCESS_ATTR = '__cc_method_access__'
 
@@ -12,17 +13,17 @@ class MethodAccess(enum.Enum):
     READ = 'read'
     WRITE = 'write'
 
-def _set_method_access(func: Callable, access: MethodAccess) -> Callable:
+def _set_method_access(func: _F, access: MethodAccess) -> _F:
     if not callable(func):
         raise TypeError('Method access decorators can only be applied to callables.')
 
     setattr(func, _METHOD_ACCESS_ATTR, access)
     return func
 
-def read(func: Callable) -> Callable:
+def read(func: _F) -> _F:
     return _set_method_access(func, MethodAccess.READ)
 
-def write(func: Callable) -> Callable:
+def write(func: _F) -> _F:
     return _set_method_access(func, MethodAccess.WRITE)
 
 def get_method_access(func: Callable) -> MethodAccess:

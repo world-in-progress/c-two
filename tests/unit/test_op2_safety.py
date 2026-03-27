@@ -394,15 +394,15 @@ class TestBuddyLifecycle:
 
     def test_alloc_count_increments_and_decrements(self):
         """alloc_count goes up on alloc and down on free."""
-        import c2_buddy
-        config = c2_buddy.PoolConfig(
+        from c_two.buddy import BuddyPoolHandle, PoolConfig, PoolStats, cleanup_stale_shm
+        config = PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=2,
             max_dedicated_segments=2,
             dedicated_gc_delay_secs=0.0,
         )
-        pool = c2_buddy.BuddyPoolHandle(config)
+        pool = BuddyPoolHandle(config)
         stats0 = pool.stats()
         assert stats0.alloc_count == 0
 
@@ -426,15 +426,15 @@ class TestBuddyLifecycle:
 
     def test_alloc_count_zero_after_destroy(self):
         """After destroy, pool is cleaned up."""
-        import c2_buddy
-        config = c2_buddy.PoolConfig(
+        from c_two.buddy import BuddyPoolHandle, PoolConfig, PoolStats, cleanup_stale_shm
+        config = PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=1,
             max_dedicated_segments=1,
             dedicated_gc_delay_secs=0.0,
         )
-        pool = c2_buddy.BuddyPoolHandle(config)
+        pool = BuddyPoolHandle(config)
         a = pool.alloc(4096)
         pool.free_at(a.seg_idx, a.offset, a.actual_size, a.is_dedicated)
         pool.destroy()
@@ -449,14 +449,14 @@ class TestStaleCleanup:
 
     def test_cleanup_stale_shm_returns_zero_on_clean_system(self):
         """With no stale segments, cleanup returns 0."""
-        import c2_buddy
-        removed = c2_buddy.cleanup_stale_shm()
+        from c_two.buddy import BuddyPoolHandle, PoolConfig, PoolStats, cleanup_stale_shm
+        removed = cleanup_stale_shm()
         assert removed == 0
 
     def test_cleanup_stale_shm_with_custom_prefix(self):
         """Custom prefix works without error."""
-        import c2_buddy
-        removed = c2_buddy.cleanup_stale_shm('cc3bdeadbeef')
+        from c_two.buddy import BuddyPoolHandle, PoolConfig, PoolStats, cleanup_stale_shm
+        removed = cleanup_stale_shm('cc3bdeadbeef')
         assert removed == 0
 
 

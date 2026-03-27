@@ -735,8 +735,8 @@ class IPCv3Server(BaseServer):
                 return
 
         try:
-            import c2_buddy
-            conn.buddy_pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+            from c_two.buddy import BuddyPoolHandle, PoolConfig
+            conn.buddy_pool = BuddyPoolHandle(PoolConfig(
                 segment_size=self._config.pool_segment_size,
                 min_block_size=4096,
                 max_segments=len(segments),

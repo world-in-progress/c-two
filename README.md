@@ -9,6 +9,11 @@
 C-Two is a **Remote Procedure Call (RPC) framework** that enables resource-oriented classes to be remotely invoked across different processes or machines. It is specifically designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method calling between **Components** and **Core Resource Models (CRMs)** with automatic serialization and protocol-agnostic communication.
 
 ## What's New in v0.2.7
+- **SOTA API (`rpc_v2`)**: New `cc.register()` / `cc.connect()` / `cc.set_address()` API for multi-CRM hosting in a single process.
+- **Multi-CRM Server**: `ServerV2` hosts multiple CRM instances behind one IPC endpoint, routed by user-chosen names.
+- **SharedClient**: Concurrent multiplexed IPC v3 client — N ICRM consumers share 1 connection + 1 buddy pool (256 MB vs N × 256 MB).
+- **Wire v2**: Control-plane / data-plane separation — method routing in UDS inline frames, pure payload in SHM.
+- **Thread preference**: Same-process `cc.connect()` returns zero-serialization proxy.
 - Fixed a bug in the `@icrm` decorator that made type hinting into ICRMMeta forcefully.
 
 ## WIP
@@ -30,6 +35,7 @@ This framework tries to transform isolated computational models into reusable, n
 - **Resource-Oriented Design**: Focus on stateful computational resources rather than stateless function calls
 - **Interface Segregation**: Clean separation between interface definitions (ICRM) and implementations (CRM)
 - **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (Thread, Memory, IPC, TCP, HTTP)
+- **Multi-CRM Hosting**: A single server process can host multiple CRM instances, each identified by a routing name, reducing process overhead
 
 ## Architecture
 
@@ -45,6 +51,9 @@ Server-side CRMs that maintain persistent state and implement domain-specific re
 
 ### Transport Layer
 Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Thread, Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management, and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
+
+### RPC v2 Transport (`rpc_v2/`)
+Next-generation transport optimized for IPC v3. Features multi-CRM routing per server, wire v2 control-plane/data-plane separation, concurrent multiplexed `SharedClient`, and reference-counted `ClientPool`. Uses a Rust-based buddy allocator (`c_two.buddy`) for zero-syscall shared memory allocation, compiled automatically via maturin on `uv sync`.
 
 ## Technical Requirements
 
@@ -82,9 +91,14 @@ git clone https://github.com/world-in-progress/c-two.git
 # Navigate to the project directory
 cd c-two
 
-# Install development dependencies
+# Install dependencies (automatically compiles the Rust buddy allocator via maturin)
 uv sync
+
+# Run tests
+uv run pytest -q
 ```
+
+> **Note**: Development installation requires a Rust toolchain (`cargo`). The Rust buddy allocator at `src/c_two/buddy/_buddy_core/` is compiled automatically by maturin during `uv sync`.
 
 ## Implementation Guide
 
@@ -235,7 +249,57 @@ def deserialize_to_rows(serialized_data: bytes) -> dict:
     return table.to_pylist()
 ```
 
-### 4. Server Deployment
+### 4. SOTA API — Simplified Registration & Connection (Recommended)
+
+The `rpc_v2` module provides a streamlined API for multi-CRM hosting. Multiple CRMs share a single IPC server process, and same-process connections use zero-serialization thread preference.
+
+#### Server Process
+```python
+import c_two as cc
+from crm import Grid, Network
+from icrm import IGrid, INetwork
+
+# Optional: set explicit IPC address (default: auto-generated)
+cc.set_address('ipc-v3://my_server')
+
+# Register multiple CRMs — server starts automatically on first register
+grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
+cc.register(IGrid, grid, name='grid')
+
+network = Network(...)
+cc.register(INetwork, network, name='network')
+
+print(f'Server running at {cc.server_address()}')
+# Keep process alive...
+
+# Cleanup
+cc.shutdown()
+```
+
+#### Client Process (Remote IPC)
+```python
+import c_two as cc
+from icrm import IGrid
+
+# Connect to remote server
+grid = cc.connect(IGrid, name='grid', address='ipc-v3://my_server')
+infos = grid.get_grid_infos(1, [0, 1, 2])
+
+# Done
+cc.close(grid)
+cc.shutdown()
+```
+
+#### Same-Process (Thread Preference)
+```python
+# When connect() targets a locally registered CRM,
+# the proxy uses direct method calls with zero serialization overhead.
+grid = cc.connect(IGrid, name='grid')  # no address → thread-local proxy
+grid.get_grid_infos(1, [0])            # direct call, no IPC
+cc.close(grid)
+```
+
+### 5. Legacy Server Deployment
 
 Deploy the CRM as a networked service with automatic protocol detection.
 Services are accessible only through the defined ICRM interfaces.
@@ -278,7 +342,7 @@ finally:
     print('CRM server stopped.')
 ```
 
-### 5. Client Implementation
+### 6. Legacy Client Implementation
 
 The framework provides seamless, protocol-transparent connectivity to CRM services.
 
@@ -335,7 +399,7 @@ with cc.compo.connect_crm('thread://grid_processor'):
     result = process_grids(1)
 ```
 
-### 6. External System Integration
+### 7. External System Integration
 
 Integrate with external systems using the Model Context Protocol (MCP):
 
