@@ -49,7 +49,19 @@ from .server import ServerV2
 from ..rpc.ipc.ipc_protocol import IPCConfig
 
 ICRM = TypeVar('ICRM')
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+
+def _physical_memory() -> int | None:
+    """Return physical RAM in bytes, or *None* if unavailable."""
+    try:
+        pages = os.sysconf('SC_PHYS_PAGES')
+        page_size = os.sysconf('SC_PAGE_SIZE')
+        if pages > 0 and page_size > 0:
+            return pages * page_size
+    except (ValueError, OSError, AttributeError):
+        pass
+    return None
 
 
 @dataclass
@@ -217,7 +229,7 @@ class _ProcessRegistry:
             if not self._server._started.is_set():
                 self._server.start()
 
-        logger.debug('Registered CRM %s at %s', name, self._server_address)
+        log.debug('Registered CRM %s at %s', name, self._server_address)
         return name
 
     def connect(
@@ -324,7 +336,7 @@ class _ProcessRegistry:
             try:
                 server.shutdown()
             except Exception:
-                logger.warning('Error shutting down ServerV2', exc_info=True)
+                log.warning('Error shutting down ServerV2', exc_info=True)
 
         self._pool.shutdown_all()
 
@@ -352,10 +364,39 @@ class _ProcessRegistry:
 
     @staticmethod
     def _make_ipc_config(**overrides: int) -> IPCConfig:
-        """Create IPCConfig with auto-derived ``max_pool_memory``."""
+        """Create IPCConfig with auto-derived ``max_pool_memory``.
+
+        Raises :class:`ValueError` if ``pool_segment_size`` exceeds
+        physical RAM (allocation would fail immediately).  Emits a
+        warning if the theoretical pool ceiling (``segment_size ×
+        max_segments``) exceeds 75 % of physical RAM.
+        """
         seg = overrides.get('pool_segment_size', IPCConfig.pool_segment_size)
         segs = overrides.get('max_pool_segments', IPCConfig.max_pool_segments)
-        overrides.setdefault('max_pool_memory', seg * segs)
+        pool_max = seg * segs
+        overrides.setdefault('max_pool_memory', pool_max)
+
+        phys = _physical_memory()
+        if phys is not None:
+            if seg > phys:
+                raise ValueError(
+                    f'pool_segment_size ({seg / (1 << 30):.1f} GB) exceeds '
+                    f'physical RAM ({phys / (1 << 30):.1f} GB) — '
+                    f'SHM allocation will fail'
+                )
+            if pool_max > int(phys * 0.75):
+                log.warning(
+                    'Theoretical pool ceiling %.1f GB '
+                    '(segment_size=%.1f GB × max_segments=%d) exceeds '
+                    '75%% of physical RAM (%.1f GB).  '
+                    'Segments are allocated lazily so this may be fine, '
+                    'but monitor memory usage under load.',
+                    pool_max / (1 << 30),
+                    seg / (1 << 30),
+                    segs,
+                    phys / (1 << 30),
+                )
+
         return IPCConfig(**overrides)
 
     @staticmethod
