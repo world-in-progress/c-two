@@ -119,12 +119,12 @@ impl IpcClient {
     /// Create a new IPC client targeting the given address.
     ///
     /// The address should be like `ipc-v3://name` — the socket path is
-    /// derived as `/tmp/c_two_{name}.sock`.
+    /// derived as `/tmp/c_two_ipc/{name}.sock` (matching Python ServerV2).
     pub fn new(address: &str) -> Self {
         let name = address
             .strip_prefix("ipc-v3://")
             .unwrap_or(address);
-        let socket_path = PathBuf::from(format!("/tmp/c_two_{name}.sock"));
+        let socket_path = PathBuf::from(format!("/tmp/c_two_ipc/{name}.sock"));
 
         Self {
             socket_path,

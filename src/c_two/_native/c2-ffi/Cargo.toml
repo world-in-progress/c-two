@@ -1,0 +1,26 @@
+[package]
+name = "c2-ffi"
+edition.workspace = true
+version.workspace = true
+description = "PyO3 bindings for C-Two native extensions (buddy allocator + HTTP relay)"
+
+[lib]
+name = "c2_ffi"
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+
+[dependencies]
+c2-buddy = { path = "../c2-buddy" }
+c2-relay = { path = "../c2-relay" }
+c2-ipc = { path = "../c2-ipc" }
+pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

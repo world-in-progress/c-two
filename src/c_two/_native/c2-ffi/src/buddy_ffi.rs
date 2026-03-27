@@ -6,7 +6,7 @@
 //! - PoolConfig: configuration dataclass
 //! - PoolStats: statistics dataclass
 
-use crate::pool::{BuddyPool, PoolAllocation, PoolConfig};
+use c2_buddy::pool::{BuddyPool, PoolAllocation, PoolConfig};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -466,7 +466,7 @@ impl PyBuddyPoolHandle {
 #[pyfunction]
 #[pyo3(signature = (prefix="cc3b"))]
 fn cleanup_stale_shm(prefix: &str) -> usize {
-    use crate::pool::BuddyPool;
+    use c2_buddy::pool::BuddyPool;
     BuddyPool::cleanup_stale_segments(prefix)
 }
 
