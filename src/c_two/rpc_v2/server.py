@@ -124,6 +124,17 @@ class CRMSlot:
     method_table: MethodTable
     scheduler: Scheduler
     methods: list[str]
+    # Pre-built dispatch table: method_name → (callable, MethodAccess).
+    _dispatch_table: dict[str, tuple[Any, MethodAccess]] = field(
+        default_factory=dict, repr=False,
+    )
+
+    def build_dispatch_table(self) -> None:
+        """Populate the dispatch table from the ICRM instance."""
+        for name in self.methods:
+            method = getattr(self.icrm, name, None)
+            if method is not None:
+                self._dispatch_table[name] = (method, get_method_access(method))
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +260,7 @@ class ServerV2:
             scheduler=scheduler,
             methods=methods,
         )
+        slot.build_dispatch_table()
         with self._slots_lock:
             if routing_name in self._slots:
                 scheduler.shutdown()
@@ -301,13 +313,18 @@ class ServerV2:
         return tag.split('/')[0] if tag else ''
 
     def _resolve_slot(self, name: str) -> CRMSlot | None:
-        """Look up a CRM slot by routing name (empty → default)."""
-        with self._slots_lock:
-            if name:
-                return self._slots.get(name)
-            if self._default_name is not None:
-                return self._slots.get(self._default_name)
-            return None
+        """Look up a CRM slot by routing name (empty → default).
+
+        Uses direct dict read (safe on CPython; asyncio hot path is
+        single-threaded).  The _slots_lock is only needed for mutations.
+        """
+        slots = self._slots
+        if name:
+            return slots.get(name)
+        dn = self._default_name
+        if dn is not None:
+            return slots.get(dn)
+        return None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -788,22 +805,21 @@ class ServerV2:
 
         Returns ``(result_bytes, error_bytes)``.  Exactly one is non-empty.
         """
-        method = getattr(slot.icrm, method_name, None)
-        if method is None:
+        entry = slot._dispatch_table.get(method_name)
+        if entry is None:
             err = error.CRMServerError(f'Method not found: {method_name}')
             try:
                 return b'', err.serialize()
             except Exception:
                 return b'', str(err).encode('utf-8')
 
-        access = get_method_access(method)
+        method, access = entry
         try:
             slot.scheduler.begin()
         except RuntimeError as exc:
             return self._wrap_error(exc)
-        loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(
+            result = await self._loop.run_in_executor(
                 slot.scheduler.executor,
                 slot.scheduler.execute,
                 method, args_bytes, access,
