@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -107,7 +107,7 @@ type PendingMap = HashMap<u32, oneshot::Sender<Result<Vec<u8>, IpcError>>>;
 pub struct IpcClient {
     socket_path: PathBuf,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
-    pending: Arc<RwLock<PendingMap>>,
+    pending: Arc<StdMutex<PendingMap>>,
     rid_counter: AtomicU32,
     route_tables: HashMap<String, MethodTable>,
     server_segments: Vec<(String, u32)>,
@@ -129,7 +129,7 @@ impl IpcClient {
         Self {
             socket_path,
             writer: Arc::new(Mutex::new(None)),
-            pending: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: AtomicU32::new(1),
             route_tables: HashMap::new(),
             server_segments: Vec::new(),
@@ -254,8 +254,7 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.write().await;
-            pending.insert(rid, tx);
+            self.pending.lock().unwrap().insert(rid, tx);
         }
 
         // Build and send the frame.
@@ -299,7 +298,7 @@ impl IpcClient {
             handle.abort();
         }
         // Wake pending callers.
-        let mut pending = self.pending.write().await;
+        let mut pending = self.pending.lock().unwrap();
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(IpcError::Closed));
         }
@@ -310,7 +309,7 @@ impl IpcClient {
 
 async fn recv_loop(
     mut reader: tokio::io::ReadHalf<UnixStream>,
-    pending: Arc<RwLock<PendingMap>>,
+    pending: Arc<StdMutex<PendingMap>>,
     seg_cache: Arc<RwLock<SegmentCache>>,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
@@ -343,8 +342,7 @@ async fn recv_loop(
 
         // Dispatch to pending caller.
         let tx = {
-            let mut pending_guard = pending.write().await;
-            pending_guard.remove(&rid)
+            pending.lock().unwrap().remove(&rid)
         };
         if let Some(tx) = tx {
             let _ = tx.send(result);
@@ -352,7 +350,7 @@ async fn recv_loop(
     }
 
     // Connection lost — wake all pending callers.
-    let mut pending_guard = pending.write().await;
+    let mut pending_guard = pending.lock().unwrap();
     for (_, tx) in pending_guard.drain() {
         let _ = tx.send(Err(IpcError::Closed));
     }
