@@ -1,6 +1,9 @@
-# c2_buddy
+# c2_buddy — Rust Core
 
 Cross-process buddy allocator over POSIX shared memory for C-Two IPC v3.
+
+> **This is the Rust implementation.** Python access is via `from c_two.buddy import BuddyPoolHandle, PoolConfig`.
+> The Rust code is compiled automatically by `uv sync` (maturin build backend).
 
 ## Overview
 
@@ -117,14 +120,14 @@ SHM naming convention: `cc3b{pid_hex}_{counter}` (embeds creator PID for stale c
 
 ## Python API
 
-The crate exposes a PyO3 module (`c2_buddy`) with `gil_used = false`:
+The crate exposes a PyO3 module (installed as `c_two.buddy._buddy_core`) with `gil_used = false`:
 
 ```python
-import c2_buddy
+from c_two.buddy import BuddyPoolHandle, PoolConfig, PoolAlloc, PoolStats, cleanup_stale_shm
 
 # Create pool with custom config
-config = c2_buddy.PoolConfig(segment_size=256 * 1024 * 1024, min_block_size=4096)
-pool = c2_buddy.BuddyPoolHandle(config)
+config = PoolConfig(segment_size=256 * 1024 * 1024, min_block_size=4096)
+pool = BuddyPoolHandle(config)
 
 # Allocate
 alloc = pool.alloc(1024 * 1024)  # 1 MB
@@ -154,7 +157,7 @@ stats = pool.stats()
 print(stats.total_segments, stats.free_bytes, stats.fragmentation_ratio)
 
 # Cleanup stale segments from dead processes
-cleaned = c2_buddy.cleanup_stale_shm('cc3b')
+cleaned = cleanup_stale_shm('cc3b')
 
 # Destroy all segments
 pool.destroy()
@@ -171,14 +174,21 @@ pool.destroy()
 
 ## Building
 
+The Rust code is compiled automatically when running `uv sync` from the project root (maturin build backend).
+
 ```bash
-# Build with Python bindings (default)
+# Auto-build via uv (from project root)
+uv sync
+
+# Manual build for development iteration
+cd src/c_two/buddy/_buddy_core
 cargo build --release
 
-# Build Rust library only (no Python)
-cargo build --release --no-default-features
+# Run Rust-only tests (no PyO3 / no Python)
+cargo test --no-default-features
 
-# The cdylib is loaded by C-Two's Python package at runtime
+# Build with Python bindings manually (via maturin)
+maturin develop --release
 ```
 
 ## Thread Safety

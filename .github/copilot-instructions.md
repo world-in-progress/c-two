@@ -8,10 +8,10 @@ The core abstraction is **not services, but resources**: CRMs (Core Resource Mod
 
 ## Build, Test & Run
 
-Package manager: **uv** (not pip directly)
+Package manager: **uv** (not pip directly). Build backend: **maturin** (auto-compiles Rust native extensions).
 
 ```bash
-# Install dependencies
+# Install dependencies + compile Rust buddy allocator
 uv sync
 
 # Run the full test suite
@@ -31,6 +31,12 @@ uv run python examples/client.py
 uv run python examples/v2_local.py         # single-process, thread preference
 uv run python examples/v2_server.py        # server process (IPC)
 uv run python examples/v2_client.py        # client process (IPC)
+
+# Rebuild Rust extension after Rust code changes
+uv sync
+
+# Run Rust-only tests (no PyO3)
+cd src/c_two/buddy/_buddy_core && cargo test --no-default-features
 
 # CLI tool (installed as `c3`)
 c3 --version
@@ -114,6 +120,22 @@ Bridges C-Two components to the Model Context Protocol. `register_mcp_tools_from
 
 ### Seed / CLI (`src/c_two/seed/`, `src/c_two/cli.py`)
 The `c3` CLI currently has one command: `build` — for generating Dockerfiles and building Docker images for CRM deployment.
+
+### Buddy Allocator (`src/c_two/buddy/`)
+A Rust-based cross-process buddy allocator for POSIX shared memory, compiled as a native Python extension via PyO3/maturin. Provides zero-syscall allocation within pre-mapped SHM segments for the IPC v3 transport.
+
+Structure:
+- `__init__.py` — Public Python API: `BuddyPoolHandle`, `PoolConfig`, `PoolAlloc`, `PoolStats`, `cleanup_stale_shm`
+- `_buddy_core/` — Rust source (compiled to `_buddy_core.cpython-*.so` by maturin during `uv sync`)
+  - `allocator.rs` — Core buddy algorithm with power-of-2 splitting/merging
+  - `pool.rs` — Multi-segment pool with lazy expansion and dedicated fallback
+  - `segment.rs` — POSIX SHM lifecycle (create, open, unlink)
+  - `bitmap.rs` — Level-wise atomic bitmaps for allocation tracking
+  - `spinlock.rs` — Cross-process spinlock with crash recovery
+  - `ffi.rs` — PyO3 bindings (`BuddyPoolHandle`, `PoolConfig`, etc.)
+
+Import: `from c_two.buddy import BuddyPoolHandle, PoolConfig`
+Build: Automatic via `uv sync` (maturin build backend). Requires Rust toolchain.
 
 ## Key Conventions
 
@@ -203,7 +225,7 @@ Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Err
 - CRM routing names: user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)` — distinct from ICRM namespace
 
 ### Performance-Sensitive Code
-Wire codec and transport code (`rpc/util/`, `rpc/ipc/`) prioritize zero-copy (`memoryview`), single-allocation patterns (`bytearray` + `struct.pack_into`), and pre-computation. Avoid introducing intermediate `bytes` copies on the hot path. The `thread://` transport skips serialization entirely via `call_direct`. The `rpc_v2/` module continues these zero-copy patterns — `SharedClient` uses buddy SHM with cached segment memoryviews and deferred free on the recv thread. Wire v2 eliminates method-name-in-SHM overhead by moving routing to the control plane.
+Wire codec and transport code (`rpc/util/`, `rpc/ipc/`) prioritize zero-copy (`memoryview`), single-allocation patterns (`bytearray` + `struct.pack_into`), and pre-computation. Avoid introducing intermediate `bytes` copies on the hot path. The `thread://` transport skips serialization entirely via `call_direct`. The `rpc_v2/` module continues these zero-copy patterns — `SharedClient` uses buddy SHM with cached segment memoryviews and deferred free on the recv thread. Wire v2 eliminates method-name-in-SHM overhead by moving routing to the control plane. The buddy allocator (`c_two.buddy`) is a Rust native extension — its `alloc()`/`free_at()` are thread-safe (`RwLock<BuddyPool>`).
 
 ## Python Version
 

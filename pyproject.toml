@@ -26,6 +26,16 @@ dev = [
     "pytest-timeout>=2.0.0",
 ]
 
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "src/c_two/buddy/_buddy_core/Cargo.toml"
+module-name = "c_two.buddy._buddy_core"
+python-source = "src"
+features = ["pyo3/extension-module"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

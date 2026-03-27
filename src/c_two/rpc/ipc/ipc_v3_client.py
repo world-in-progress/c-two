@@ -84,7 +84,7 @@ class IPCv3Client(BaseClient):
         self._next_rid: int = 0
 
         # Buddy pool (owned by client, shared with server).
-        self._buddy_pool = None  # c2_buddy.BuddyPoolHandle
+        self._buddy_pool = None  # BuddyPoolHandle
         self._pool_handshake_done = False
         self._seg_views: list[memoryview] = []  # Cached segment data region views
         self._seg_base_addrs: list[int] = []    # Cached segment data base addresses
@@ -148,13 +148,13 @@ class IPCv3Client(BaseClient):
     def _do_buddy_handshake(self) -> None:
         """Create buddy pool and exchange segment info with server."""
         try:
-            import c2_buddy
+            from c_two.buddy import BuddyPoolHandle, PoolConfig
         except ImportError:
-            logger.warning('c2_buddy not available, falling back to inline-only')
+            logger.warning('c_two.buddy not available, falling back to inline-only')
             self._pool_handshake_done = True
             return
 
-        self._buddy_pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+        self._buddy_pool = BuddyPoolHandle(PoolConfig(
             segment_size=self._config.pool_segment_size,
             min_block_size=4096,
             max_segments=1,

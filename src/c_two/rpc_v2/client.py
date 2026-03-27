@@ -216,12 +216,12 @@ class SharedClient:
         timeout penalty against legacy servers.
         """
         try:
-            import c2_buddy
+            from c_two.buddy import BuddyPoolHandle, PoolConfig
         except ImportError:
-            logger.warning('c2_buddy not available, falling back to inline-only')
+            logger.warning('c_two.buddy not available, falling back to inline-only')
             return
 
-        self._buddy_pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+        self._buddy_pool = BuddyPoolHandle(PoolConfig(
             segment_size=self._config.pool_segment_size,
             min_block_size=4096,
             max_segments=1,

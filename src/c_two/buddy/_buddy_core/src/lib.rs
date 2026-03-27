@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 
 /// Python module entry point.
 #[cfg(feature = "python")]
-#[pymodule(gil_used = false)]
+#[pymodule(name = "_buddy_core", gil_used = false)]
 fn c2_buddy(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ffi::register_module(m)?;
     Ok(())

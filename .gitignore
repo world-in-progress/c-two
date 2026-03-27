@@ -191,3 +191,5 @@ temp/
 
 Dockerfile
 log/
+# Rust build artifacts (maturin)
+src/c_two/buddy/_buddy_core/target/

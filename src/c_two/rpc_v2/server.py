@@ -94,7 +94,7 @@ class _Connection:
     conn_id: int
     writer: asyncio.StreamWriter
     config: IPCConfig
-    buddy_pool: object = None          # c2_buddy.BuddyPoolHandle
+    buddy_pool: object = None          # BuddyPoolHandle
     seg_views: list[memoryview] = field(default_factory=list)
     remote_segment_names: list[str] = field(default_factory=list)
     remote_segment_sizes: list[int] = field(default_factory=list)
@@ -538,9 +538,9 @@ class ServerV2:
                 logger.warning('Conn %d: invalid segment name: %r', conn.conn_id, name)
                 return
         try:
-            import c2_buddy
+            from c_two.buddy import BuddyPoolHandle, PoolConfig
 
-            conn.buddy_pool = c2_buddy.BuddyPoolHandle(c2_buddy.PoolConfig(
+            conn.buddy_pool = BuddyPoolHandle(PoolConfig(
                 segment_size=self._config.pool_segment_size,
                 min_block_size=4096,
                 max_segments=len(segments),

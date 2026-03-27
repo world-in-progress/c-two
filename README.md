@@ -53,7 +53,7 @@ Server-side CRMs that maintain persistent state and implement domain-specific re
 Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Thread, Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management, and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
 
 ### RPC v2 Transport (`rpc_v2/`)
-Next-generation transport optimized for IPC v3. Features multi-CRM routing per server, wire v2 control-plane/data-plane separation, concurrent multiplexed `SharedClient`, and reference-counted `ClientPool`. Uses a Rust-based buddy allocator (`c2_buddy`) for zero-syscall shared memory allocation.
+Next-generation transport optimized for IPC v3. Features multi-CRM routing per server, wire v2 control-plane/data-plane separation, concurrent multiplexed `SharedClient`, and reference-counted `ClientPool`. Uses a Rust-based buddy allocator (`c_two.buddy`) for zero-syscall shared memory allocation, compiled automatically via maturin on `uv sync`.
 
 ## Technical Requirements
 
@@ -91,9 +91,14 @@ git clone https://github.com/world-in-progress/c-two.git
 # Navigate to the project directory
 cd c-two
 
-# Install development dependencies
+# Install dependencies (automatically compiles the Rust buddy allocator via maturin)
 uv sync
+
+# Run tests
+uv run pytest -q
 ```
+
+> **Note**: Development installation requires a Rust toolchain (`cargo`). The Rust buddy allocator at `src/c_two/buddy/_buddy_core/` is compiled automatically by maturin during `uv sync`.
 
 ## Implementation Guide
 
