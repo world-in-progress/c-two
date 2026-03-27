@@ -333,6 +333,7 @@ async fn recv_loop(
     seg_cache: Arc<RwLock<SegmentCache>>,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
+    let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
     loop {
         // Read frame header.
         if reader.read_exact(&mut header_buf).await.is_err() {
@@ -348,9 +349,14 @@ async fn recv_loop(
         };
 
         let payload_len = hdr.payload_len();
-        let mut payload = vec![0u8; payload_len];
+        // Reuse recv_buf: resize without shrinking allocation.
+        recv_buf.clear();
+        if payload_len > recv_buf.capacity() {
+            recv_buf.reserve(payload_len - recv_buf.capacity());
+        }
+        recv_buf.resize(payload_len, 0);
         if payload_len > 0 {
-            if reader.read_exact(&mut payload).await.is_err() {
+            if reader.read_exact(&mut recv_buf).await.is_err() {
                 break;
             }
         }
@@ -358,7 +364,7 @@ async fn recv_loop(
         let rid = hdr.request_id as u32;
 
         // Decode response.
-        let result = decode_response(&hdr, &payload, &seg_cache).await;
+        let result = decode_response(&hdr, &recv_buf, &seg_cache).await;
 
         // Dispatch to pending caller.
         let tx = {
