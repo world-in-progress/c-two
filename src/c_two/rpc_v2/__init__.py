@@ -17,6 +17,7 @@ from .pool import ClientPool
 from .proxy import ICRMProxy
 from .registry import (
     set_address,
+    set_ipc_config,
     register,
     connect,
     close,
@@ -32,6 +33,6 @@ __all__ = [
     'ServerV2', 'CRMSlot',
     'ICRMProxy',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
-    'set_address', 'register', 'connect', 'close', 'unregister',
+    'set_address', 'set_ipc_config', 'register', 'connect', 'close', 'unregister',
     'server_address', 'shutdown',
 ]

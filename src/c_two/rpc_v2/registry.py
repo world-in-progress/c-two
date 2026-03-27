@@ -46,6 +46,8 @@ from .proxy import ICRMProxy
 from .scheduler import ConcurrencyConfig
 from .server import ServerV2
 
+from ..rpc.ipc.ipc_protocol import IPCConfig
+
 ICRM = TypeVar('ICRM')
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,7 @@ class _ProcessRegistry:
         self._server: ServerV2 | None = None
         self._server_address: str | None = None
         self._explicit_address: str | None = None
+        self._explicit_ipc_config: IPCConfig | None = None
         self._pool = ClientPool()
 
     # ------------------------------------------------------------------
@@ -120,6 +123,41 @@ class _ProcessRegistry:
                     'Call set_address() before register().',
                 )
             self._explicit_address = address
+
+    def set_ipc_config(
+        self,
+        *,
+        segment_size: int | None = None,
+        max_segments: int | None = None,
+    ) -> None:
+        """Set IPC transport parameters programmatically.
+
+        Priority: ``set_ipc_config()`` > ``C2_IPC_SEGMENT_SIZE`` /
+        ``C2_IPC_MAX_SEGMENTS`` env vars > defaults.
+
+        Must be called **before** any :func:`register` call.
+
+        Parameters
+        ----------
+        segment_size:
+            Buddy pool segment size in bytes.  Determines the maximum
+            single-call payload size.  Default: 256 MB.
+        max_segments:
+            Maximum number of buddy pool segments (1–255).  Default: 4.
+        """
+        with self._lock:
+            if self._server is not None:
+                raise RuntimeError(
+                    'Cannot set IPC config after CRMs have been registered. '
+                    'Call set_ipc_config() before register().',
+                )
+            overrides: dict[str, int] = {}
+            if segment_size is not None:
+                overrides['pool_segment_size'] = segment_size
+            if max_segments is not None:
+                overrides['max_pool_segments'] = max_segments
+            if overrides:
+                self._explicit_ipc_config = self._make_ipc_config(**overrides)
 
     def register(
         self,
@@ -161,8 +199,11 @@ class _ProcessRegistry:
                     or settings.ipc_address
                     or self._auto_address()
                 )
-                self._server = ServerV2(bind_address=addr)
+                ipc_cfg = self._build_ipc_config()
+                self._server = ServerV2(bind_address=addr, ipc_config=ipc_cfg)
                 self._server_address = addr
+                # Share the same config with the client pool.
+                self._pool._default_config = ipc_cfg
 
             self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
             self._registrations[name] = _Registration(
@@ -276,6 +317,7 @@ class _ProcessRegistry:
             self._server = None
             self._server_address = None
             self._explicit_address = None
+            self._explicit_ipc_config = None
             self._registrations.clear()
 
         if server is not None:
@@ -289,6 +331,32 @@ class _ProcessRegistry:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _build_ipc_config(self) -> IPCConfig:
+        """Build an :class:`IPCConfig` from the three-level priority chain.
+
+        Priority: ``set_ipc_config()`` > env vars > defaults.
+        """
+        if self._explicit_ipc_config is not None:
+            return self._explicit_ipc_config
+
+        overrides: dict[str, int] = {}
+        if settings.ipc_segment_size is not None:
+            overrides['pool_segment_size'] = settings.ipc_segment_size
+        if settings.ipc_max_segments is not None:
+            overrides['max_pool_segments'] = settings.ipc_max_segments
+
+        if overrides:
+            return self._make_ipc_config(**overrides)
+        return IPCConfig()
+
+    @staticmethod
+    def _make_ipc_config(**overrides: int) -> IPCConfig:
+        """Create IPCConfig with auto-derived ``max_pool_memory``."""
+        seg = overrides.get('pool_segment_size', IPCConfig.pool_segment_size)
+        segs = overrides.get('max_pool_segments', IPCConfig.max_pool_segments)
+        overrides.setdefault('max_pool_memory', seg * segs)
+        return IPCConfig(**overrides)
 
     @staticmethod
     def _auto_address() -> str:
@@ -307,6 +375,24 @@ def set_address(address: str) -> None:
     See :meth:`_ProcessRegistry.set_address`.
     """
     _ProcessRegistry.get().set_address(address)
+
+
+def set_ipc_config(
+    *,
+    segment_size: int | None = None,
+    max_segments: int | None = None,
+) -> None:
+    """Set IPC transport parameters before registering any CRM.
+
+    Priority: ``set_ipc_config()`` > ``C2_IPC_SEGMENT_SIZE`` /
+    ``C2_IPC_MAX_SEGMENTS`` env vars > defaults (256 MB / 4 segments).
+
+    See :meth:`_ProcessRegistry.set_ipc_config`.
+    """
+    _ProcessRegistry.get().set_ipc_config(
+        segment_size=segment_size,
+        max_segments=max_segments,
+    )
 
 
 def register(

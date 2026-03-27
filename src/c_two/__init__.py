@@ -10,6 +10,7 @@ from .crm.meta import icrm, read, write
 from .rpc.transferable import transferable
 from .rpc_v2.registry import (
     set_address,
+    set_ipc_config,
     register,
     connect,
     close,

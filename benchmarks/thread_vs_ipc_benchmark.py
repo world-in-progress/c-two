@@ -2,7 +2,7 @@
 
 Compares cc.connect() in two modes:
   - Thread-local (same process, zero serialization)
-  - IPC (ServerV2 + SharedClient with 2GB buddy pool)
+  - IPC (full serialize + SHM + UDS, 2GB buddy pool via cc.set_ipc_config)
 
 Uses @transferable Payload wrapper to avoid the raw bytes fast-path.
 100 rounds per size, P50 latency.
@@ -22,8 +22,6 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 
 import c_two as cc
-from c_two.rpc.ipc.ipc_protocol import IPCConfig
-from c_two.rpc_v2 import ServerV2, SharedClient, ICRMProxy
 
 
 # ---------------------------------------------------------------------------
@@ -78,24 +76,7 @@ WARMUP = 5
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 
-def _ipc_config() -> IPCConfig:
-    return IPCConfig(
-        pool_enabled=True,
-        pool_segment_size=2 * 1024 * 1024 * 1024,  # 2 GB
-        max_pool_segments=8,
-        max_pool_memory=4 * 1024 * 1024 * 1024,
-    )
-
-
-def _wait_v2_server(addr: str, timeout: float = 5.0) -> None:
-    region_id = addr.replace('ipc-v3://', '')
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
-            return
-        time.sleep(0.05)
-    raise RuntimeError(f'ServerV2 at {sock_path} not ready')
+_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 
 # ---------------------------------------------------------------------------
@@ -143,22 +124,26 @@ def bench_ipc(payload_size: int) -> float:
     global _ipc_counter
     _ipc_counter += 1
     address = f'ipc-v3://bench_tipc_{_ipc_counter}'
-    ipc_config = _ipc_config()
 
-    server = ServerV2(bind_address=address, ipc_config=ipc_config)
-    server.register_crm(IEcho, Echo(), name='echo')
-    server.start()
-    _wait_v2_server(address)
+    # 2 GB buddy segments to handle up to 1 GB payloads.
+    cc.set_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_address(address)
+    cc.register(IEcho, Echo(), name='echo_ipc')
+
+    # Wait for server socket.
+    region_id = address.replace('ipc-v3://', '')
+    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if os.path.exists(sock_path):
+            break
+        time.sleep(0.05)
 
     payload = Payload(data=b'\xAB' * payload_size)
     latencies: list[float] = []
 
     try:
-        client = SharedClient(address, try_v2=True, ipc_config=ipc_config)
-        client.connect()
-        proxy = ICRMProxy.ipc(client, 'echo')
-        icrm = IEcho()
-        icrm.client = proxy
+        icrm = cc.connect(IEcho, name='echo_ipc', address=address)
 
         for _ in range(WARMUP):
             icrm.echo(payload)
@@ -176,9 +161,10 @@ def bench_ipc(payload_size: int) -> float:
         assert isinstance(result, Payload)
         assert len(result.data) == payload_size
 
-        client.terminate()
+        cc.close(icrm)
     finally:
-        server.shutdown()
+        cc.unregister('echo_ipc')
+        cc.shutdown()
 
     return statistics.median(latencies) * 1000
 
