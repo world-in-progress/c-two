@@ -17,6 +17,7 @@ import ctypes
 import inspect
 import logging
 import os
+import queue
 import re
 import struct
 import threading
@@ -136,6 +137,59 @@ class CRMSlot:
             method = getattr(self.icrm, name, None)
             if method is not None:
                 self._dispatch_table[name] = (method, get_method_access(method))
+
+
+_SENTINEL = None  # Poison pill for dispatcher shutdown
+
+
+class _FastDispatcher:
+    """Lightweight CRM method dispatcher using SimpleQueue.
+
+    Replaces ThreadPoolExecutor to avoid _WorkItem wrapping, heavy Queue
+    locks, and per-submission Future creation overhead.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, num_workers: int = 4) -> None:
+        self._loop = loop
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._workers: list[threading.Thread] = []
+        for i in range(num_workers):
+            t = threading.Thread(
+                target=self._worker, daemon=True, name=f'c2v2_fast_{i}',
+            )
+            t.start()
+            self._workers.append(t)
+
+    def submit(
+        self,
+        sched_execute,
+        method,
+        args_bytes,
+        access,
+        future: asyncio.Future,
+    ) -> None:
+        self._q.put((sched_execute, method, args_bytes, access, future))
+
+    def shutdown(self) -> None:
+        for _ in self._workers:
+            self._q.put(_SENTINEL)
+        for t in self._workers:
+            t.join(timeout=2.0)
+
+    def _worker(self) -> None:
+        loop = self._loop
+        q = self._q
+        call_soon = loop.call_soon_threadsafe
+        while True:
+            item = q.get()
+            if item is _SENTINEL:
+                break
+            sched_execute, method, args_bytes, access, future = item
+            try:
+                result = sched_execute(method, args_bytes, access)
+                call_soon(future.set_result, result)
+            except BaseException as exc:
+                call_soon(future.set_exception, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +406,7 @@ class ServerV2:
 
     async def _async_main(self) -> None:
         self._shutdown_event = asyncio.Event()
+        self._dispatcher = _FastDispatcher(asyncio.get_running_loop())
 
         os.makedirs(os.path.dirname(self._socket_path), exist_ok=True)
         if os.path.exists(self._socket_path):
@@ -371,6 +426,7 @@ class ServerV2:
             task.cancel()
         if self._client_tasks:
             await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        self._dispatcher.shutdown()
         self._server.close()
         await self._server.wait_closed()
         with self._slots_lock:
@@ -787,9 +843,9 @@ class ServerV2:
             return
 
         try:
-            result = await self._loop.run_in_executor(
-                sched.executor, sched.execute, method, args_bytes, access,
-            )
+            future = self._loop.create_future()
+            self._dispatcher.submit(sched.execute, method, args_bytes, access, future)
+            result = await future
         except Exception as exc:
             err_bytes = self._wrap_error(exc)[1]
             writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
@@ -870,16 +926,15 @@ class ServerV2:
                 return b'', str(err).encode('utf-8')
 
         method, access = entry
+        sched = slot.scheduler
         try:
-            slot.scheduler.begin()
+            sched.begin()
         except RuntimeError as exc:
             return self._wrap_error(exc)
         try:
-            result = await self._loop.run_in_executor(
-                slot.scheduler.executor,
-                slot.scheduler.execute,
-                method, args_bytes, access,
-            )
+            future = self._loop.create_future()
+            self._dispatcher.submit(sched.execute, method, args_bytes, access, future)
+            result = await future
         except Exception as exc:
             return self._wrap_error(exc)
 
