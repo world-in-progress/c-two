@@ -9,6 +9,7 @@ from .compo import runtime
 from .crm.meta import icrm, read, write
 from .rpc.transferable import transferable
 from .rpc_v2.registry import (
+    set_address,
     register,
     connect,
     close,

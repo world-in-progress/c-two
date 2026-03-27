@@ -187,6 +187,10 @@ class SharedClient:
             return
         self._sock = self._do_connect()
         self._do_buddy_handshake()
+        # Switch to a short recv timeout so terminate() can stop the recv
+        # thread promptly.  On macOS, socket.shutdown(SHUT_RDWR) from
+        # another thread doesn't reliably unblock a blocked recv().
+        self._sock.settimeout(0.1)
         self._running = True
         self._recv_thread = threading.Thread(
             target=self._recv_loop,
@@ -328,6 +332,14 @@ class SharedClient:
         # Close socket to unblock recv thread.
         if self._sock is not None:
             try:
+                # Set a very short timeout so the recv thread's blocking recv()
+                # returns quickly with a timeout error, allowing it to see
+                # _running=False and exit.  On macOS, shutdown(SHUT_RDWR) on a
+                # UDS doesn't reliably unblock a concurrent recv().
+                self._sock.settimeout(0.05)
+            except Exception:
+                pass
+            try:
                 self._sock.shutdown(_socket.SHUT_RDWR)
             except Exception:
                 pass
@@ -339,7 +351,7 @@ class SharedClient:
 
         # Wait for recv thread to exit.
         if self._recv_thread is not None and self._recv_thread.is_alive():
-            self._recv_thread.join(timeout=5.0)
+            self._recv_thread.join(timeout=1.0)
             self._recv_thread = None
 
         # Wake up all pending callers with error.
@@ -615,6 +627,9 @@ class SharedClient:
             while self._running and sock is not None:
                 try:
                     header = _recv_exact(sock, 16)
+                except _socket.timeout:
+                    # Short timeout expired — re-check _running flag.
+                    continue
                 except (ConnectionResetError, BrokenPipeError, OSError):
                     break
 

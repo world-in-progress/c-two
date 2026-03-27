@@ -27,6 +27,11 @@ uv run pytest tests/unit/test_transferable.py::TestTransferableDecorator::test_h
 uv run python examples/server.py
 uv run python examples/client.py
 
+# Run v2 examples (SOTA API)
+uv run python examples/v2_local.py         # single-process, thread preference
+uv run python examples/v2_server.py        # server process (IPC)
+uv run python examples/v2_client.py        # client process (IPC)
+
 # CLI tool (installed as `c3`)
 c3 --version
 c3 build <project_path> --base-image python:3.12-slim
@@ -60,6 +65,38 @@ Protocol is auto-detected from the address scheme:
 | `http://host:port` | HttpServer/Client | Web-compatible |
 
 The `Server` class in `rpc/server.py` and `Client` class in `rpc/client.py` are the unified entry points — they dispatch to protocol-specific implementations based on address prefix.
+
+### RPC v2 Module (`src/c_two/rpc_v2/`) — SOTA API
+
+The `rpc_v2` module is the next-generation transport layer designed for multi-CRM hosting over IPC v3. It supersedes `rpc/` for new development while the legacy module remains supported.
+
+Key differences from `rpc/`:
+- **Multi-CRM per process**: A single server hosts multiple CRM instances, each identified by a user-chosen `name` string.
+- **Control-plane / data-plane separation**: Method routing (route name + method index) flows through UDS inline frames; SHM carries pure payload bytes with no headers.
+- **Concurrent multiplexed client**: `SharedClient` allows N ICRM consumers to share one UDS connection and one buddy pool (256 MB), compared to N × 256 MB in `rpc/`.
+- **Thread preference**: Same-process `cc.connect()` returns a zero-serialization proxy that calls CRM methods directly — no serde overhead.
+- **Reference-counted client pool**: `ClientPool` manages `SharedClient` lifecycle with grace-period destruction so transient disconnects don't tear down the pool.
+
+Key files:
+
+| File | Purpose |
+|------|---------|
+| `registry.py` | SOTA API surface: `cc.register()`, `cc.connect()`, `cc.set_address()`, `cc.close()`, `cc.unregister()`, `cc.shutdown()` |
+| `server.py` | `ServerV2` — asyncio-based multi-CRM server with per-request routing |
+| `client.py` | `SharedClient` — concurrent IPC v3 client with background recv thread |
+| `pool.py` | `ClientPool` — reference-counted `SharedClient` management |
+| `proxy.py` | `ICRMProxy` — unified proxy supporting both thread-local and IPC modes |
+| `wire.py` | Wire v2 codec — control-plane method indexing, pure SHM payload |
+| `protocol.py` | Handshake v5, `RouteInfo`, capability negotiation |
+| `scheduler.py` | Read/write-aware CRM method execution scheduler |
+| `config.py` | `C2Settings` pydantic model — `C2_IPC_ADDRESS` env var |
+
+Wire v2 format:
+- **Call control (UDS inline)**: `[1B name_len][route_name UTF-8][2B method_idx LE]`
+- **Reply control (UDS inline)**: `[1B status][optional: 4B error_len + error_bytes]`
+- **Data (SHM)**: Pure serialized payload at offset 0 — no wire headers in the data plane.
+
+Address priority: `cc.set_address()` > `C2_IPC_ADDRESS` env var > auto-generated UUID path.
 
 ### Wire Protocol (`src/c_two/rpc/util/wire.py`)
 The compact binary wire codec used by all non-thread transports. Little-endian format:
@@ -119,6 +156,35 @@ def process(crm: IGrid, level: int) -> list[str]:
 result = process(1, crm_address='thread://server')
 ```
 
+### SOTA API Pattern (rpc_v2)
+
+The `rpc_v2` registry exposes a flat top-level API on the `cc` namespace:
+
+```python
+import c_two as cc
+
+# Server side
+cc.set_address('ipc-v3://my_server')                   # optional: explicit address
+cc.register(IGrid, grid_instance, name='grid')          # register CRM
+cc.register(INetwork, net_instance, name='network')     # multiple CRMs in one process
+
+# Client side (same process → thread preference, zero serde)
+grid = cc.connect(IGrid, name='grid')
+grid.some_method(arg)
+cc.close(grid)
+
+# Client side (remote process → IPC)
+grid = cc.connect(IGrid, name='grid', address='ipc-v3://my_server')
+grid.some_method(arg)
+cc.close(grid)
+
+# Cleanup
+cc.unregister('grid')
+cc.shutdown()
+```
+
+The `name` parameter in `cc.register()` is a user-chosen routing key — it is **not** the ICRM namespace. Multiple CRMs using different ICRM classes (or even the same ICRM class with different instances) can coexist under distinct names.
+
 ### ICRM Direction Convention
 - `'->'` (default): Component-to-CRM direction (client side)
 - `'<-'`: CRM-to-Component direction (server side, set internally when server creates the inverted ICRM)
@@ -134,9 +200,10 @@ Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Err
 - CRM classes: plain names matching the resource (e.g., `Grid`)
 - Transferable classes: descriptive data names (e.g., `GridAttribute`, `GridSchema`)
 - Address constants: `SCREAMING_SNAKE_CASE` (e.g., `MEMORY_ADDRESS`, `TCP_ADDRESS`)
+- CRM routing names: user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)` — distinct from ICRM namespace
 
 ### Performance-Sensitive Code
-Wire codec and transport code (`rpc/util/`, `rpc/ipc/`) prioritize zero-copy (`memoryview`), single-allocation patterns (`bytearray` + `struct.pack_into`), and pre-computation. Avoid introducing intermediate `bytes` copies on the hot path. The `thread://` transport skips serialization entirely via `call_direct`.
+Wire codec and transport code (`rpc/util/`, `rpc/ipc/`) prioritize zero-copy (`memoryview`), single-allocation patterns (`bytearray` + `struct.pack_into`), and pre-computation. Avoid introducing intermediate `bytes` copies on the hot path. The `thread://` transport skips serialization entirely via `call_direct`. The `rpc_v2/` module continues these zero-copy patterns — `SharedClient` uses buddy SHM with cached segment memoryviews and deferred free on the recv thread. Wire v2 eliminates method-name-in-SHM overhead by moving routing to the control plane.
 
 ## Python Version
 

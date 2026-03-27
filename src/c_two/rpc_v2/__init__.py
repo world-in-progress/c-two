@@ -16,6 +16,7 @@ from .client import SharedClient
 from .pool import ClientPool
 from .proxy import ICRMProxy
 from .registry import (
+    set_address,
     register,
     connect,
     close,
@@ -31,6 +32,6 @@ __all__ = [
     'ServerV2', 'CRMSlot',
     'ICRMProxy',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
-    'register', 'connect', 'close', 'unregister',
+    'set_address', 'register', 'connect', 'close', 'unregister',
     'server_address', 'shutdown',
 ]

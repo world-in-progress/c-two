@@ -11,12 +11,6 @@ Then in another terminal:
 """
 import os, sys, signal, threading
 
-# C2_IPC_ADDRESS must be set BEFORE importing c_two, because the pydantic
-# settings singleton is instantiated at import time and won't pick up env
-# vars that are set afterwards.
-BIND_ADDRESS = 'ipc-v3://v2_grid'
-os.environ['C2_IPC_ADDRESS'] = BIND_ADDRESS
-
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
@@ -24,8 +18,13 @@ import c_two as cc
 from icrm import IGrid
 from crm import Grid
 
+BIND_ADDRESS = 'ipc-v3://v2_grid'
+
 
 def main():
+    # Set address before registering any CRM.
+    cc.set_address(BIND_ADDRESS)
+
     # Init the Grid CRM (same as old server.py)
     epsg = 2326
     first_size = [64.0, 64.0]

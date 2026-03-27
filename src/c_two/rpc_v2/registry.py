@@ -93,11 +93,33 @@ class _ProcessRegistry:
         self._registrations: dict[str, _Registration] = {}
         self._server: ServerV2 | None = None
         self._server_address: str | None = None
+        self._explicit_address: str | None = None
         self._pool = ClientPool()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_address(self, address: str) -> None:
+        """Set the IPC server address programmatically.
+
+        Priority: ``set_address()`` > ``C2_IPC_ADDRESS`` env var > auto.
+
+        Must be called **before** any :func:`register` call.  Raises
+        :class:`RuntimeError` if CRMs are already registered.
+
+        Parameters
+        ----------
+        address:
+            IPC address (e.g. ``'ipc-v3://my_server'``).
+        """
+        with self._lock:
+            if self._server is not None:
+                raise RuntimeError(
+                    'Cannot set address after CRMs have been registered. '
+                    'Call set_address() before register().',
+                )
+            self._explicit_address = address
 
     def register(
         self,
@@ -134,7 +156,11 @@ class _ProcessRegistry:
 
             # Lazy-init server on first registration.
             if self._server is None:
-                addr = settings.ipc_address or self._auto_address()
+                addr = (
+                    self._explicit_address
+                    or settings.ipc_address
+                    or self._auto_address()
+                )
                 self._server = ServerV2(bind_address=addr)
                 self._server_address = addr
 
@@ -249,6 +275,7 @@ class _ProcessRegistry:
             server = self._server
             self._server = None
             self._server_address = None
+            self._explicit_address = None
             self._registrations.clear()
 
         if server is not None:
@@ -271,6 +298,16 @@ class _ProcessRegistry:
 # ------------------------------------------------------------------
 # Module-level API (delegates to singleton)
 # ------------------------------------------------------------------
+
+def set_address(address: str) -> None:
+    """Set the IPC server address before registering any CRM.
+
+    Priority: ``set_address()`` > ``C2_IPC_ADDRESS`` env var > auto.
+
+    See :meth:`_ProcessRegistry.set_address`.
+    """
+    _ProcessRegistry.get().set_address(address)
+
 
 def register(
     icrm_class: type,
