@@ -257,21 +257,39 @@ impl IpcClient {
             self.pending.lock().unwrap().insert(rid, tx);
         }
 
-        // Build and send the frame using vectored I/O (avoids payload Vec).
+        // Build and send the frame.
+        // For small payloads (≤1KB), build the entire frame on the stack
+        // to issue a single write_all. For large payloads, use 3 writes.
         let ctrl = c2_wire::control::encode_call_control(route_name, method_idx);
         let payload_len = ctrl.len() + data.len();
         let total_len = (12 + payload_len) as u32;
-        let mut hdr_buf = [0u8; frame::HEADER_SIZE];
-        hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
-        hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
-        hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
+        let frame_size = frame::HEADER_SIZE + payload_len;
 
         {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
-            writer.write_all(&hdr_buf).await?;
-            writer.write_all(&ctrl).await?;
-            writer.write_all(data).await?;
+
+            if frame_size <= 1024 {
+                // Stack-allocate the entire frame (avoids heap + single syscall).
+                let mut buf = [0u8; 1024];
+                buf[0..4].copy_from_slice(&total_len.to_le_bytes());
+                buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
+                buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
+                let mut off = frame::HEADER_SIZE;
+                buf[off..off + ctrl.len()].copy_from_slice(&ctrl);
+                off += ctrl.len();
+                buf[off..off + data.len()].copy_from_slice(data);
+                writer.write_all(&buf[..frame_size]).await?;
+            } else {
+                // Large payload: 3 writes, no heap allocation.
+                let mut hdr_buf = [0u8; frame::HEADER_SIZE];
+                hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
+                hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
+                hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
+                writer.write_all(&hdr_buf).await?;
+                writer.write_all(&ctrl).await?;
+                writer.write_all(data).await?;
+            }
         }
 
         // Await response.
