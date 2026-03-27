@@ -102,6 +102,37 @@ class _Connection:
     remote_segment_sizes: list[int] = field(default_factory=list)
     handshake_done: bool = False
     v2_mode: bool = False
+    # In-flight submit_inline request counter.  Incremented on the event
+    # loop thread before submitting; decremented by worker threads via
+    # call_soon_threadsafe.  The _idle event is set when the count drops
+    # to zero, allowing _handle_client's finally block to wait for all
+    # pending replies before closing the writer.
+    _inflight: int = field(default=0, repr=False)
+    _idle: asyncio.Event | None = field(default=None, repr=False)
+
+    def init_flight_tracking(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._idle = asyncio.Event()
+        self._idle.set()  # starts idle
+        self._loop = loop
+
+    def flight_inc(self) -> None:
+        """Mark a submit_inline request as in-flight (call from event loop)."""
+        self._inflight += 1
+        if self._idle is not None and self._idle.is_set():
+            self._idle.clear()
+
+    def flight_dec(self) -> None:
+        """Mark a submit_inline request as completed (call from event loop via call_soon_threadsafe)."""
+        self._inflight -= 1
+        if self._inflight <= 0:
+            self._inflight = 0
+            if self._idle is not None:
+                self._idle.set()
+
+    async def wait_idle(self) -> None:
+        """Wait until all in-flight submit_inline requests complete."""
+        if self._idle is not None and not self._idle.is_set():
+            await self._idle.wait()
 
     def cleanup(self) -> None:
         self.seg_views = []
@@ -168,7 +199,7 @@ class _FastDispatcher:
         access,
         future: asyncio.Future,
     ) -> None:
-        self._q.put((sched_execute, method, args_bytes, access, future, None, None))
+        self._q.put((sched_execute, method, args_bytes, access, future, None, None, None, None))
 
     def submit_inline(
         self,
@@ -178,9 +209,21 @@ class _FastDispatcher:
         access,
         request_id: int,
         writer,
+        barrier=None,
+        flight_dec=None,
     ) -> None:
-        """Fire-and-forget: worker builds inline reply frame and writes directly."""
-        self._q.put((sched_execute, method, args_bytes, access, None, request_id, writer))
+        """Fire-and-forget: worker builds inline reply frame and writes directly.
+
+        If *barrier* is an ``asyncio.Event``, the worker will call
+        ``barrier.set()`` (via ``call_soon_threadsafe``) after execution
+        completes, allowing the read loop to resume.  Used for ``@cc.write``
+        methods to guarantee per-connection causal ordering.
+
+        If *flight_dec* is provided, the worker will call it (via
+        ``call_soon_threadsafe``) in the finally block to decrement the
+        connection's in-flight counter.
+        """
+        self._q.put((sched_execute, method, args_bytes, access, None, request_id, writer, barrier, flight_dec))
 
     def shutdown(self) -> None:
         for _ in self._workers:
@@ -196,7 +239,7 @@ class _FastDispatcher:
             item = q.get()
             if item is _SENTINEL:
                 break
-            sched_execute, method, args_bytes, access, future, request_id, writer = item
+            sched_execute, method, args_bytes, access, future, request_id, writer, barrier, flight_dec = item
             try:
                 result = sched_execute(method, args_bytes, access)
                 if future is not None:
@@ -209,6 +252,11 @@ class _FastDispatcher:
                     call_soon(future.set_exception, exc)
                 else:
                     self._write_error_reply(call_soon, writer, request_id, exc)
+            finally:
+                if barrier is not None:
+                    call_soon(barrier.set)
+                if flight_dec is not None:
+                    call_soon(flight_dec)
 
     @staticmethod
     def _write_inline_reply(call_soon, writer, request_id, result):
@@ -301,6 +349,7 @@ class ServerV2:
         # Multi-CRM slots: name → CRMSlot.
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
+        self._slots_generation: int = 0
         self._default_name: str | None = None
         self._default_concurrency = concurrency or ConcurrencyConfig(
             max_workers=max_workers,
@@ -375,6 +424,7 @@ class ServerV2:
                 scheduler.shutdown()
                 raise ValueError(f'Name already registered: {routing_name!r}')
             self._slots[routing_name] = slot
+            self._slots_generation += 1
             if self._default_name is None:
                 self._default_name = routing_name
         return routing_name
@@ -385,6 +435,7 @@ class ServerV2:
             slot = self._slots.pop(name, None)
             if slot is None:
                 raise KeyError(f'Name not registered: {name!r}')
+            self._slots_generation += 1
             if self._default_name == name:
                 self._default_name = next(iter(self._slots), None)
         slot.scheduler.shutdown()
@@ -470,6 +521,12 @@ class ServerV2:
             self._handle_client,
             path=self._socket_path,
         )
+        # Restrict socket access to the owning user (defense-in-depth
+        # for multi-user HPC nodes where /tmp is shared).
+        try:
+            os.chmod(self._socket_path, 0o600)
+        except OSError:
+            pass
         self._started.set()
         logger.debug('ServerV2 listening on %s', self._socket_path)
 
@@ -518,6 +575,7 @@ class ServerV2:
         self._conn_counter += 1
         conn_id = self._conn_counter
         conn = _Connection(conn_id=conn_id, writer=writer, config=self._config)
+        conn.init_flight_tracking(asyncio.get_running_loop())
         task = asyncio.current_task()
         self._client_tasks.append(task)
 
@@ -531,6 +589,7 @@ class ServerV2:
             default_name = self._default_name
             dispatcher = self._dispatcher
             dispatch_cache: dict[tuple[bytes, int], tuple] = {}
+            cache_gen = self._slots_generation
             while True:
                 header = await reader.readexactly(16)
                 total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -570,19 +629,40 @@ class ServerV2:
                             route_key = b''
                             method_idx = _U16.unpack_from(payload, 1)[0]
                             args_start = 3
-                    except (struct.error, UnicodeDecodeError):
+                    except (struct.error, UnicodeDecodeError) as exc:
+                        writer.write(encode_v2_error_reply_frame(
+                            request_id,
+                            f'Malformed v2 call control: {exc}'.encode('utf-8'),
+                        ))
                         continue
                     args_bytes = payload[args_start:] if args_start < len(payload) else b''
+
+                    # Invalidate dispatch cache when CRM registrations change.
+                    cur_gen = self._slots_generation
+                    if cur_gen != cache_gen:
+                        dispatch_cache.clear()
+                        cache_gen = cur_gen
+                        slots = self._slots
+                        default_name = self._default_name
 
                     # Combined cache: (route_bytes, method_idx) → dispatch tuple
                     cache_key = (bytes(route_key), method_idx)
                     cached = dispatch_cache.get(cache_key)
                     if cached is not None:
                         exec_fast, method, access = cached
-                        dispatcher.submit_inline(
-                            exec_fast, method, args_bytes, access,
-                            request_id, writer,
-                        )
+                        conn.flight_inc()
+                        if access is MethodAccess.WRITE:
+                            barrier = asyncio.Event()
+                            dispatcher.submit_inline(
+                                exec_fast, method, args_bytes, access,
+                                request_id, writer, barrier, conn.flight_dec,
+                            )
+                            await barrier.wait()
+                        else:
+                            dispatcher.submit_inline(
+                                exec_fast, method, args_bytes, access,
+                                request_id, writer, None, conn.flight_dec,
+                            )
                         continue
 
                     route_name = route_key.decode('utf-8') if route_key else ''
@@ -595,10 +675,21 @@ class ServerV2:
                             if entry is not None:
                                 method, access = entry
                                 dispatch_cache[cache_key] = (slot.scheduler.execute_fast, method, access)
-                                dispatcher.submit_inline(
-                                    slot.scheduler.execute_fast, method,
-                                    args_bytes, access, request_id, writer,
-                                )
+                                conn.flight_inc()
+                                if access is MethodAccess.WRITE:
+                                    barrier = asyncio.Event()
+                                    dispatcher.submit_inline(
+                                        slot.scheduler.execute_fast, method,
+                                        args_bytes, access, request_id, writer,
+                                        barrier, conn.flight_dec,
+                                    )
+                                    await barrier.wait()
+                                else:
+                                    dispatcher.submit_inline(
+                                        slot.scheduler.execute_fast, method,
+                                        args_bytes, access, request_id, writer,
+                                        None, conn.flight_dec,
+                                    )
                                 continue
 
                 # Fallback: full handler via Task for buddy, v1, or error paths.
@@ -627,6 +718,10 @@ class ServerV2:
             # Drain in-flight tasks before tearing down the connection.
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            # Wait for submit_inline requests still executing in worker
+            # threads.  Without this, writer.close() could discard replies
+            # for requests that have already completed on the CRM side.
+            await conn.wait_idle()
             conn.cleanup()
             writer.close()
             try:
