@@ -7,6 +7,7 @@ from ..rpc.util.wire import preregister_methods
 _F = TypeVar('_F', bound=Callable)
 ICRM = TypeVar('ICRM')
 _METHOD_ACCESS_ATTR = '__cc_method_access__'
+_SHUTDOWN_ATTR = '__cc_on_shutdown__'
 
 @enum.unique
 class MethodAccess(enum.Enum):
@@ -31,6 +32,40 @@ def get_method_access(func: Callable) -> MethodAccess:
     if isinstance(access, MethodAccess):
         return access
     return MethodAccess(access)
+
+
+def on_shutdown(func: _F) -> _F:
+    """Mark an ICRM method as the shutdown callback.
+
+    The decorated method is called (with no arguments) when the CRM is
+    unregistered or the process exits.  At most one method per ICRM may
+    carry this decorator.  It is **not** added to the RPC dispatch table.
+    """
+    if not callable(func):
+        raise TypeError('@cc.on_shutdown can only be applied to callables.')
+    setattr(func, _SHUTDOWN_ATTR, True)
+    return func
+
+
+def get_shutdown_method(cls: type) -> str | None:
+    """Discover the ``@cc.on_shutdown``-decorated method name in *cls*.
+
+    Returns ``None`` if no shutdown method exists.
+    Raises ``ValueError`` if more than one method is decorated.
+    """
+    found: str | None = None
+    for name in dir(cls):
+        if name.startswith('_'):
+            continue
+        obj = getattr(cls, name, None)
+        if callable(obj) and getattr(obj, _SHUTDOWN_ATTR, False):
+            if found is not None:
+                raise ValueError(
+                    f'ICRM {cls.__name__} has multiple @on_shutdown methods: '
+                    f'{found!r} and {name!r}',
+                )
+            found = name
+    return found
 
 class ICRMMeta(type):
     """
@@ -74,6 +109,8 @@ def icrm(*, namespace: str = 'cc', version: str = '0.1.0'):
         decorated_methods = {}
         for name, value in cls.__dict__.items():
             if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__', '__tag__'):
+                if getattr(value, _SHUTDOWN_ATTR, False):
+                    continue  # @cc.on_shutdown methods are not RPC-callable
                 decorated_methods[name] = auto_transfer(value)
         
         # Define a new class with ICRMMeta metaclass that inherits from the original class

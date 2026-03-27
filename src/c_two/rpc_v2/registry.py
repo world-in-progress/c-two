@@ -46,9 +46,10 @@ from .config import settings
 from .http_client import HttpClientPool
 from .pool import ClientPool
 from .proxy import ICRMProxy
-from .scheduler import ConcurrencyConfig
+from .scheduler import ConcurrencyConfig, Scheduler
 from .server import ServerV2
 
+from ..crm.meta import MethodAccess
 from ..rpc.ipc.ipc_protocol import IPCConfig
 
 ICRM = TypeVar('ICRM')
@@ -77,6 +78,8 @@ class _Registration:
     icrm_class: type
     crm_instance: object
     concurrency: ConcurrencyConfig | None
+    scheduler: Scheduler | None = None
+    access_map: dict[str, MethodAccess] | None = None
 
 
 class _ProcessRegistry:
@@ -228,11 +231,14 @@ class _ProcessRegistry:
                 self._pool.set_default_config(ipc_cfg)
 
             self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
+            scheduler, access_map = self._server.get_slot_info(name)
             self._registrations[name] = _Registration(
                 name=name,
                 icrm_class=icrm_class,
                 crm_instance=crm_instance,
                 concurrency=concurrency,
+                scheduler=scheduler,
+                access_map=access_map,
             )
 
             # Start server if not yet running.
@@ -282,7 +288,11 @@ class _ProcessRegistry:
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
-            proxy = ICRMProxy.thread_local(local.crm_instance)
+            proxy = ICRMProxy.thread_local(
+                local.crm_instance,
+                scheduler=local.scheduler,
+                access_map=local.access_map,
+            )
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
             client = self._http_pool.acquire(address)

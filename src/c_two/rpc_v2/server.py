@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import error
-from ..crm.meta import MethodAccess, get_method_access
+from ..crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ..rpc.event.msg_type import MsgType
 from ..rpc.util.wire import (
     decode,
@@ -157,14 +157,20 @@ class CRMSlot:
     method_table: MethodTable
     scheduler: Scheduler
     methods: list[str]
+    shutdown_method: str | None = None
     # Pre-built dispatch table: method_name → (callable, MethodAccess).
     _dispatch_table: dict[str, tuple[Any, MethodAccess]] = field(
         default_factory=dict, repr=False,
     )
 
     def build_dispatch_table(self) -> None:
-        """Populate the dispatch table from the ICRM instance."""
+        """Populate the dispatch table from the ICRM instance.
+
+        Skips the ``@cc.on_shutdown`` method (not RPC-callable).
+        """
         for name in self.methods:
+            if name == self.shutdown_method:
+                continue
             method = getattr(self.icrm, name, None)
             if method is not None:
                 self._dispatch_table[name] = (method, get_method_access(method))
@@ -407,9 +413,14 @@ class ServerV2:
         routing_name = name if name is not None else self._extract_namespace(icrm_class)
         icrm = self._create_icrm(icrm_class, crm_instance)
         methods = self._discover_methods(icrm_class)
-        method_table = MethodTable.from_methods(methods)
         cc_config = concurrency or self._default_concurrency
         scheduler = Scheduler(cc_config)
+        sd_method = get_shutdown_method(icrm_class)
+
+        # Exclude shutdown method from RPC-visible method list.
+        if sd_method is not None:
+            methods = [m for m in methods if m != sd_method]
+        method_table = MethodTable.from_methods(methods)
 
         slot = CRMSlot(
             name=routing_name,
@@ -417,6 +428,7 @@ class ServerV2:
             method_table=method_table,
             scheduler=scheduler,
             methods=methods,
+            shutdown_method=sd_method,
         )
         slot.build_dispatch_table()
         with self._slots_lock:
@@ -430,7 +442,11 @@ class ServerV2:
         return routing_name
 
     def unregister_crm(self, name: str) -> None:
-        """Unregister a CRM by its routing name."""
+        """Unregister a CRM by its routing name.
+
+        Invokes the ``@cc.on_shutdown`` method (if declared) on the
+        underlying CRM instance before shutting down the scheduler.
+        """
         with self._slots_lock:
             slot = self._slots.pop(name, None)
             if slot is None:
@@ -438,7 +454,25 @@ class ServerV2:
             self._slots_generation += 1
             if self._default_name == name:
                 self._default_name = next(iter(self._slots), None)
+        self._invoke_shutdown(slot)
         slot.scheduler.shutdown()
+
+    def get_slot_info(
+        self, name: str,
+    ) -> tuple[Scheduler, dict[str, MethodAccess]]:
+        """Return the Scheduler and method access map for a registered CRM.
+
+        Used by the registry to inject concurrency control into
+        thread-local proxies.
+        """
+        with self._slots_lock:
+            slot = self._slots.get(name)
+        if slot is None:
+            raise KeyError(f'Name not registered: {name!r}')
+        access_map = {
+            mname: access for mname, (_, access) in slot._dispatch_table.items()
+        }
+        return slot.scheduler, access_map
 
     @property
     def names(self) -> list[str]:
@@ -548,8 +582,16 @@ class ServerV2:
     def shutdown(self) -> None:
         """Signal the server to shut down and wait for the loop thread.
 
-        Safe to call multiple times — subsequent calls are no-ops.
+        Invokes ``@cc.on_shutdown`` methods on all registered CRMs
+        before tearing down the event loop.  Safe to call multiple
+        times — subsequent calls are no-ops.
         """
+        # Invoke shutdown callbacks before stopping the loop.
+        with self._slots_lock:
+            slots_snapshot = list(self._slots.values())
+        for slot in slots_snapshot:
+            self._invoke_shutdown(slot)
+
         if self._loop is not None and self._shutdown_event is not None:
             try:
                 self._loop.call_soon_threadsafe(self._shutdown_event.set)
@@ -562,6 +604,28 @@ class ServerV2:
             os.unlink(self._socket_path)
         except OSError:
             pass
+
+    # ------------------------------------------------------------------
+    # Shutdown callback helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _invoke_shutdown(slot: CRMSlot) -> None:
+        """Best-effort invocation of a CRM's ``@cc.on_shutdown`` method."""
+        sd = slot.shutdown_method
+        if sd is None:
+            return
+        crm = getattr(slot.icrm, 'crm', None)
+        if crm is None:
+            return
+        try:
+            getattr(crm, sd)()
+        except Exception:
+            logger.warning(
+                'Error in @on_shutdown method %s.%s for CRM %r',
+                type(crm).__name__, sd, slot.name,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Client handler
