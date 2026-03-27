@@ -393,6 +393,10 @@ class ServerV2:
         task = asyncio.current_task()
         self._client_tasks.append(task)
 
+        # Pipelined dispatch: read next frame while previous dispatches
+        # are still executing in the thread pool.
+        pending: set[asyncio.Task] = set()
+
         try:
             max_frame = self._config.max_frame_size
             while True:
@@ -411,7 +415,7 @@ class ServerV2:
                     else b''
                 )
 
-                # Dispatch.
+                # Handshake & control: must complete before reading more.
                 if flags & FLAG_HANDSHAKE:
                     await self._handle_handshake(conn, payload, writer)
                     continue
@@ -422,13 +426,19 @@ class ServerV2:
                 is_buddy = bool(flags & FLAG_BUDDY)
 
                 if is_v2_call:
-                    await self._handle_v2_call(
-                        conn, request_id, payload, is_buddy, writer,
+                    t = asyncio.create_task(
+                        self._handle_v2_call(
+                            conn, request_id, payload, is_buddy, writer,
+                        ),
                     )
                 else:
-                    await self._handle_v1_call(
-                        conn, request_id, payload, is_buddy, writer,
+                    t = asyncio.create_task(
+                        self._handle_v1_call(
+                            conn, request_id, payload, is_buddy, writer,
+                        ),
                     )
+                pending.add(t)
+                t.add_done_callback(pending.discard)
 
         except asyncio.IncompleteReadError:
             pass
@@ -437,6 +447,9 @@ class ServerV2:
         except Exception:
             logger.debug('Conn %d: handler error', conn.conn_id, exc_info=True)
         finally:
+            # Drain in-flight tasks before tearing down the connection.
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             conn.cleanup()
             writer.close()
             try:
