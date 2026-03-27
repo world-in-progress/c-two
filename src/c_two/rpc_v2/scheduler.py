@@ -131,6 +131,10 @@ class Scheduler:
         self._pending_count = 0
         self._drain_event = threading.Event()
         self._drain_event.set()
+        # Pre-compute hot-path flags.
+        self._has_capacity_limit = config is not None and config.max_pending is not None
+        self._is_exclusive = self._config.mode is ConcurrencyMode.EXCLUSIVE
+        self._is_parallel = self._config.mode is ConcurrencyMode.PARALLEL
 
         effective_workers = self._config.max_workers
         if effective_workers is None and self._config.mode is ConcurrencyMode.EXCLUSIVE:
@@ -168,12 +172,21 @@ class Scheduler:
         incremented before submission and decremented here on completion.
         """
         try:
-            with self._execution_guard(access_mode):
+            if self._is_parallel:
+                return method(args_bytes)
+            if self._is_exclusive:
+                with self._exclusive_lock:
+                    return method(args_bytes)
+            # READ_PARALLEL
+            if access_mode is MethodAccess.READ:
+                with self._rw_lock.read_lock():
+                    return method(args_bytes)
+            with self._rw_lock.write_lock():
                 return method(args_bytes)
         finally:
             with self._state_lock:
                 self._pending_count -= 1
-                if self._pending_count == 0:
+                if self._shutdown_flag and self._pending_count == 0:
                     self._drain_event.set()
 
     def begin(self) -> None:
@@ -182,16 +195,18 @@ class Scheduler:
         Must be called on the **caller** side (e.g. asyncio event loop thread)
         before ``loop.run_in_executor(sched.executor, sched.execute, ...)``.
         """
-        with self._state_lock:
-            if self._shutdown_flag:
-                raise RuntimeError('Scheduler is shut down')
-            if (self._config.max_pending is not None
-                    and self._pending_count >= self._config.max_pending):
-                raise RuntimeError(
-                    f'Scheduler at capacity ({self._config.max_pending} pending)',
-                )
-            self._pending_count += 1
-            self._drain_event.clear()
+        if self._shutdown_flag:
+            raise RuntimeError('Scheduler is shut down')
+        if self._has_capacity_limit:
+            with self._state_lock:
+                if (self._pending_count >= self._config.max_pending):
+                    raise RuntimeError(
+                        f'Scheduler at capacity ({self._config.max_pending} pending)',
+                    )
+                self._pending_count += 1
+        else:
+            with self._state_lock:
+                self._pending_count += 1
 
     # ------------------------------------------------------------------
     # Lifecycle
