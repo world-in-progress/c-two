@@ -5,10 +5,11 @@
 //! commands to the async runtime via channels.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot};
 
+use c2_ipc::IpcClient;
 use crate::router;
 use crate::state::{RelayState, UpstreamPool};
 
@@ -173,17 +174,32 @@ impl RelayServer {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 Command::RegisterUpstream { name, address, reply } => {
-                    let mut pool = state.pool.write().await;
-                    let result = pool.add(name, address).await;
+                    // Check duplicate without holding lock
+                    {
+                        let pool = state.pool.read().unwrap();
+                        if pool.contains(&name) {
+                            let _ = reply.send(Err(format!("Route name already registered: '{name}'")));
+                            continue;
+                        }
+                    }
+                    // Connect without holding lock
+                    let mut client = IpcClient::new(&address);
+                    let result = match client.connect().await {
+                        Ok(()) => {
+                            let mut pool = state.pool.write().unwrap();
+                            pool.insert(name, address, Arc::new(client))
+                        }
+                        Err(e) => Err(format!("Failed to connect: {e}")),
+                    };
                     let _ = reply.send(result);
                 }
                 Command::UnregisterUpstream { name, reply } => {
-                    let mut pool = state.pool.write().await;
+                    let mut pool = state.pool.write().unwrap();
                     let result = pool.remove(&name);
                     let _ = reply.send(result);
                 }
                 Command::ListRoutes { reply } => {
-                    let pool = state.pool.read().await;
+                    let pool = state.pool.read().unwrap();
                     let routes: Vec<(String, String)> = pool
                         .list_routes()
                         .into_iter()

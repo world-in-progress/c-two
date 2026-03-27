@@ -1,5 +1,7 @@
 //! Axum router for the multi-upstream relay server.
 
+use std::sync::Arc;
+
 use axum::{
     body::Bytes,
     extract::{Path, State},
@@ -9,6 +11,7 @@ use axum::{
     Json, Router,
 };
 
+use c2_ipc::IpcClient;
 use crate::state::RelayState;
 
 /// Build the relay axum router with control-plane and data-plane endpoints.
@@ -44,8 +47,31 @@ async fn handle_register(
         None => return (StatusCode::BAD_REQUEST, "Missing \"address\"").into_response(),
     };
 
-    let mut pool = state.pool.write().await;
-    match pool.add(name.clone(), address).await {
+    // Check for duplicate under read lock (brief)
+    {
+        let pool = state.pool.read().unwrap();
+        if pool.contains(&name) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("Route name already registered: '{name}'")})),
+            )
+                .into_response();
+        }
+    }
+
+    // Connect IPC client without holding any lock
+    let mut client = IpcClient::new(&address);
+    if let Err(e) = client.connect().await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Insert under write lock (brief)
+    let mut pool = state.pool.write().unwrap();
+    match pool.insert(name.clone(), address, Arc::new(client)) {
         Ok(()) => (
             StatusCode::CREATED,
             Json(serde_json::json!({"registered": name})),
@@ -77,7 +103,7 @@ async fn handle_unregister(
         None => return (StatusCode::BAD_REQUEST, "Missing \"name\"").into_response(),
     };
 
-    let mut pool = state.pool.write().await;
+    let mut pool = state.pool.write().unwrap();
     match pool.remove(&name) {
         Ok(()) => (
             StatusCode::OK,
@@ -94,8 +120,7 @@ async fn handle_unregister(
 
 /// `GET /_routes` — list all registered routes.
 async fn handle_routes(State(state): State<RelayState>) -> impl IntoResponse {
-    let pool = state.pool.read().await;
-    let routes: Vec<serde_json::Value> = pool
+    let routes: Vec<serde_json::Value> = state.pool.read().unwrap()
         .list_routes()
         .into_iter()
         .map(|r| serde_json::json!({"name": r.name, "address": r.address}))
@@ -107,8 +132,7 @@ async fn handle_routes(State(state): State<RelayState>) -> impl IntoResponse {
 
 /// `GET /health` — liveness check.
 async fn health(State(state): State<RelayState>) -> impl IntoResponse {
-    let pool = state.pool.read().await;
-    let route_names = pool.route_names();
+    let route_names = state.pool.read().unwrap().route_names();
     Json(serde_json::json!({
         "status": "ok",
         "routes": route_names,
@@ -121,8 +145,13 @@ async fn call_handler(
     Path((route_name, method_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let pool = state.pool.read().await;
-    let client = match pool.get(&route_name) {
+    // Acquire read lock briefly to clone the Arc<IpcClient>, then drop lock.
+    let client = {
+        let pool = state.pool.read().unwrap();
+        pool.get(&route_name)
+    };
+
+    let client = match client {
         Some(c) => c,
         None => {
             return (

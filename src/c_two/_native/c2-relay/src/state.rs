@@ -4,15 +4,14 @@
 //! name. Supports dynamic registration and removal of upstreams.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use c2_ipc::IpcClient;
 
 /// A single upstream connection entry.
 struct UpstreamEntry {
     address: String,
-    client: IpcClient,
+    client: Arc<IpcClient>,
 }
 
 /// Thread-safe pool of upstream IPC connections.
@@ -27,37 +26,34 @@ impl UpstreamPool {
         }
     }
 
-    /// Register a new upstream. Connects an IpcClient immediately.
-    ///
-    /// Returns `Err` if the name is already registered or connection fails.
-    pub async fn add(&mut self, name: String, address: String) -> Result<(), String> {
+    /// Insert a pre-connected upstream.
+    pub fn insert(&mut self, name: String, address: String, client: Arc<IpcClient>) -> Result<(), String> {
         if self.entries.contains_key(&name) {
             return Err(format!("Route name already registered: '{name}'"));
         }
-
-        let mut client = IpcClient::new(&address);
-        client.connect().await.map_err(|e| {
-            format!("Failed to connect upstream '{name}' at {address}: {e}")
-        })?;
-
         self.entries.insert(name, UpstreamEntry { address, client });
         Ok(())
+    }
+
+    /// Check if a route name is already registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
     }
 
     /// Unregister an upstream by name.
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
         match self.entries.remove(name) {
-            Some(entry) => {
-                drop(entry.client);
-                Ok(())
-            }
+            Some(_entry) => Ok(()),
             None => Err(format!("Route name not registered: '{name}'")),
         }
     }
 
-    /// Get a reference to an upstream's IpcClient.
-    pub fn get(&self, name: &str) -> Option<&IpcClient> {
-        self.entries.get(name).map(|e| &e.client)
+    /// Get a cloned Arc to an upstream's IpcClient.
+    ///
+    /// The caller gets an owned Arc — no need to hold the pool lock
+    /// while making IPC calls.
+    pub fn get(&self, name: &str) -> Option<Arc<IpcClient>> {
+        self.entries.get(name).map(|e| e.client.clone())
     }
 
     /// List all registered routes with their addresses.
@@ -123,24 +119,20 @@ mod tests {
         assert!(result.unwrap_err().contains("not registered"));
     }
 
-    #[tokio::test]
-    async fn upstream_pool_add_duplicate_returns_err() {
-        // We can't actually connect in unit tests (no real server),
-        // so we test the duplicate-check path by adding twice.
-        // The first add will fail with connection error (expected).
+    #[test]
+    fn upstream_pool_insert_duplicate_returns_err() {
         let mut pool = UpstreamPool::new();
-        let result = pool.add("test".into(), "ipc-v3://nonexistent".into()).await;
-        // First add fails because there's no server — that's OK.
+        let client = Arc::new(IpcClient::new("ipc-v3://nonexistent"));
+        pool.insert("test".into(), "ipc-v3://nonexistent".into(), client.clone()).unwrap();
+        let result = pool.insert("test".into(), "ipc-v3://nonexistent".into(), client);
         assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already registered"));
     }
 
     #[test]
     fn relay_state_new_has_empty_pool() {
         let state = RelayState::new();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let pool = state.pool.read().await;
-            assert!(pool.list_routes().is_empty());
-        });
+        let pool = state.pool.read().unwrap();
+        assert!(pool.list_routes().is_empty());
     }
 }
