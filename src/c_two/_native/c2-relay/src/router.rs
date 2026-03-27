@@ -20,6 +20,7 @@ pub fn build_router(state: RelayState) -> Router {
         .route("/_routes", get(handle_routes))
         // Data-plane endpoints
         .route("/health", get(health))
+        .route("/_echo", post(echo_handler))
         .route("/{route_name}/{method_name}", post(call_handler))
         .with_state(state)
 }
@@ -154,4 +155,16 @@ async fn call_handler(
         )
             .into_response(),
     }
+}
+
+/// `POST /_echo` — echo endpoint for benchmarking the relay itself.
+///
+/// Returns the request body immediately with no IPC round-trip.
+async fn echo_handler(body: Bytes) -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "application/octet-stream")],
+        body,
+    )
+        .into_response()
 }
