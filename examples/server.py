@@ -1,40 +1,54 @@
-import os
-import sys
-import logging
+"""SOTA API — server process.
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+Registers CRMs and keeps the process alive so remote clients can connect
+via IPC.  Press Ctrl-C to shut down.
+
+Run:
+    uv run python examples/v2_server.py
+
+Then in another terminal:
+    uv run python examples/v2_client.py
+"""
+import os, sys, signal, threading
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
-from crm import Grid
 from icrm import IGrid
-from example_addresses import EXAMPLE_ADDRESS
+from crm import Grid
 
-if __name__ == '__main__':
-    # Grid parameters
+BIND_ADDRESS = 'ipc-v3://v2_grid'
+
+
+def main():
+    # Set address before registering any CRM.
+    cc.set_address(BIND_ADDRESS)
+
+    # Init the Grid CRM (same as old server.py)
     epsg = 2326
     first_size = [64.0, 64.0]
     bounds = [808357.5, 824117.5, 838949.5, 843957.5]
     subdivide_rules = [
-        #    64x64,  32x32,  16x16,    8x8,    4x4,    2x2,    1x1
         [478, 310], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [1, 1]
     ]
-    
-    # Init CRM
     grid = Grid(epsg, bounds, first_size, subdivide_rules)
-    
-    # Create server config
-    config = cc.rpc.ServerConfig(
-        name='Grid Processor',
-        crm=grid,
-        icrm=IGrid,
-        on_shutdown=grid.terminate,
-        bind_address=EXAMPLE_ADDRESS
-    )
-    
-    # Create CRM server
-    server = cc.rpc.Server(config)
 
-    # Run CRM server
-    server.start()
+    # Register — one line replaces ServerConfig + Server + start()
+    cc.register(IGrid, grid, name='grid')
+    print(f'Grid CRM registered at {cc.server_address()}')
+    print('Waiting for clients… (Ctrl-C to stop)\n')
+
+    # Block until interrupted
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    stop.wait()
+
+    # Cleanup
+    cc.unregister('grid')
+    cc.shutdown()
+    print('\nServer shut down.')
+
+
+if __name__ == '__main__':
+    main()

@@ -363,3 +363,280 @@ RDMA (Remote Direct Memory Access) 是工业界唯一实现**跨节点零拷贝*
 2. **优化拷贝效率**（大页、SIMD memcpy、DMA）
 3. **同节点用 SHM 完全避免拷贝**
 4. **分离控制面和数据面**（小控制帧 + 大数据走 SHM）
+
+### 五、C-Two Rust Routing Server 的现实拷贝分析
+
+基于以上调研，让我们精确分析 C-Two 架构下的实际拷贝次数：
+
+#### 5.1 当前 Python 实现的拷贝次数
+
+```
+Request:  NIC → kernel → uvicorn buffer → Python bytes → wire encode → Client SHM → CRM read
+          拷贝:  ①          ②              ③              ④             ⑤(memoryview)
+          
+Response: CRM SHM → Client bytes → wire encode → Python bytes → uvicorn → kernel → NIC
+          拷贝:     ⑥             ⑦             ⑧             ⑨          ⑩
+```
+
+**Python 方案**: 请求路径 ~4 次拷贝，响应路径 ~4 次拷贝，总计 **~8 次拷贝**。
+
+#### 5.2 Rust Routing Server（标准方案）的拷贝次数
+
+```
+Request:  NIC → kernel → hyper Bytes → memcpy到SHM → CRM memoryview读取
+          拷贝:  ①          ②            零拷贝
+          
+Response: CRM写入SHM → memcpy到hyper Bytes → kernel → NIC
+          拷贝:           ③                    ④
+```
+
+**Rust 标准方案**: 请求路径 2 次拷贝，响应路径 2 次拷贝，总计 **4 次拷贝**。
+相比 Python 减少 50%。
+
+#### 5.3 Rust 优化方案的拷贝次数
+
+进一步优化的核心思路：**让 hyper 的 Bytes 直接引用 SHM 内存**。
+
+**请求路径优化——Streaming Write to SHM**：
+
+```rust
+async fn relay_request(body: axum::body::Body, pool: &BuddyPool) {
+    // 1. 预分配 SHM block（基于 Content-Length 或初始估计）
+    let alloc = pool.alloc(content_length)?;
+    let shm_slice = pool.as_mut_slice(&alloc);
+    
+    // 2. 流式写入：每个 chunk 直接 memcpy 到 SHM 的对应偏移
+    let mut offset = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        shm_slice[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        offset += bytes.len();
+    }
+    // 总拷贝：kernel→hyper(①) + hyper→SHM(②) = 2次
+    // 但第②次是streaming的增量拷贝，不需要先完整接收再整体拷贝
+}
+```
+
+**响应路径优化——SHM Bytes 封装**：
+
+```rust
+// 方案 A: 从 SHM 构造 Bytes（需要一次拷贝）
+fn shm_to_response(pool: &BuddyPool, alloc: &Alloc, size: usize) -> Response {
+    let data = pool.read_bytes(alloc, size); // 1次 SHM → heap 拷贝
+    Response::new(Body::from(data))          // Bytes 到 hyper 零拷贝
+    // kernel 写入 socket: ③
+}
+
+// 方案 B: 自定义 Body 流式从 SHM 读取（仍需拷贝，但分块）
+struct ShmBody { pool: Arc<BuddyPool>, alloc: Alloc, offset: usize, size: usize }
+
+impl http_body::Body for ShmBody {
+    fn poll_frame(&mut self, ..) -> Frame<Bytes> {
+        let chunk_size = min(65536, self.size - self.offset);
+        let chunk = self.pool.read_bytes_at(self.alloc, self.offset, chunk_size);
+        self.offset += chunk_size;
+        Frame::data(Bytes::from(chunk)) // 分块拷贝，内存友好
+    }
+}
+```
+
+**Rust 优化方案总计**: 请求 2 次，响应 2 次，共 **4 次拷贝**——但每次拷贝都是高效的：
+- 拷贝操作是 **streaming** 的（不需要先完整接收再整体拷贝）
+- 可以利用 Rust 的 SIMD `memcpy` 优化
+- SHM 是 mmap 内存，对 CPU cache 友好
+
+#### 5.4 理论最优方案（io_uring ZC Rx + vmsplice）
+
+```
+Request:  NIC → DMA直入用户内存 → 用户内存=SHM → CRM读取
+          拷贝:  零(DMA)            零               零
+          
+Response: CRM写入SHM → vmsplice→pipe→splice→socket → NIC
+          拷贝:           零(页表操作)                零(DMA)
+```
+
+**理论最优**: 请求 0 次用户态拷贝，响应 0 次用户态拷贝。
+但需要 Linux 6.15+ 内核、支持 header/data split 的 NIC、以及完全自定义的 I/O 层。
+
+### 六、性能影响量化估计
+
+虽然有 4 次拷贝，但让我们量化这些拷贝的实际性能影响：
+
+#### 内存拷贝带宽参考值（现代 x86_64）
+
+| Payload Size | memcpy 耗时（单核） | 内存带宽利用 | 相对于网络延迟 |
+|-------------|---------------------|-------------|---------------|
+| 64 B | < 50 ns | N/A | 可忽略 |
+| 4 KB | ~200 ns | ~20 GB/s | 可忽略 |
+| 1 MB | ~50 μs | ~20 GB/s | < 1% of RTT |
+| 10 MB | ~500 μs | ~20 GB/s | ~5% of RTT |
+| 100 MB | ~5 ms | ~20 GB/s | ~50% of RTT |
+| 1 GB | ~50 ms | ~20 GB/s | > RTT |
+
+（注：RTT 按典型数据中心 ~10ms 估算）
+
+#### C-Two 典型场景分析
+
+| 场景 | Payload 大小 | 拷贝开销(4次) | 网络传输时间(1Gbps) | 拷贝占比 |
+|------|-------------|--------------|-------------------|---------|
+| API 调用 | 64B-4KB | < 1μs | ~40μs | < 3% |
+| 中型数据 | 100KB-1MB | ~100μs | ~8ms | ~1% |
+| GIS Tile | 10MB-50MB | ~5ms | ~400ms | ~1% |
+| 大型网格 | 100MB-1GB | ~50-200ms | ~4s | ~5% |
+
+**关键结论**：对于通过 HTTP 传输的数据（意味着要跨网络），**memcpy 开销在绝大多数场景下不是瓶颈**。网络传输时间是主导因素。
+
+**例外情况**：同节点 HTTP relay（Routing Server 和 CRM Server 在同一机器）。此时网络延迟近零，memcpy 成为主要开销。但即使如此：
+- 10MB: 4次 memcpy ≈ 2ms，仍然可接受
+- 100MB+: 考虑使用 Content-Length 分流，大 payload 直接走 IPC-v2（绕过 HTTP）
+
+---
+
+## Decision
+
+### Recommendation
+
+**采用"标准 Rust 方案 + 流式 SHM 写入"，总计 4 次拷贝，不追求内核级零拷贝。**
+
+具体实现策略分为三层：
+
+#### 第一层：Baseline（立即实现）
+
+```
+HTTP Request → hyper Bytes → streaming memcpy → Buddy SHM → UDS控制帧 → CRM
+HTTP Response ← hyper Bytes ← memcpy ← Buddy SHM ← UDS控制帧 ← CRM
+```
+
+- 使用 **axum + hyper + tokio** 标准栈
+- 请求 body 流式写入预分配的 SHM block
+- 响应从 SHM 读取后构造 `Bytes` 返回
+- **4 次拷贝**，但每次都是 Rust 优化的 SIMD memcpy
+- 预期吞吐量：50K-200K req/s（小 payload），数 GB/s（大 payload）
+
+#### 第二层：小 Payload 内联优化（紧随实现）
+
+```
+对于 payload < 4KB (shm_threshold):
+HTTP Request → hyper Bytes → 直接内联在UDS帧中 → CRM
+HTTP Response ← hyper Bytes ← 直接内联在UDS帧中 ← CRM
+```
+
+- 复用 IPC v3 的 inline 路径，**跳过 SHM 分配和写入**
+- 小 payload（API 调用、元数据查询）仅 **2 次拷贝**
+- 绝大多数 API 调用都走这条快速路径
+
+#### 第三层：大 Payload 流式优化（渐进实现）
+
+```
+对于 payload > 1MB:
+请求: hyper chunk → 直接追加写入SHM block（避免内存中完整缓冲）
+响应: SHM block → 分块构造 Body stream（避免一次性复制到堆）
+```
+
+- 自定义 `http_body::Body` 实现，分块从 SHM 读取响应
+- 请求 body streaming 直接写入 SHM，不在用户态缓冲完整 payload
+- 内存占用从 O(payload_size) 降为 O(chunk_size)
+
+### Rationale
+
+1. **实用主义优于理论完美**：4 次拷贝在 HTTP 场景下的实际性能影响 < 5%。追求 0 拷贝的工程代价（自定义 I/O 层、内核版本要求、硬件要求）与收益不成比例。
+
+2. **与 SOTA 设计一致**：sota.md 附录明确指出 "纯字节透传" 和 "axum (基于 hyper + tokio, 零拷贝 body 处理)"。这里的"零拷贝"指的是 hyper 内部的 body chunk 传递（Bytes 引用计数），不是内核级零拷贝。
+
+3. **工业界验证**：Ray、gRPC、iceoryx 等主流系统均接受"网络 I/O 需要拷贝"的现实，转而优化**拷贝次数**和**拷贝效率**。C-Two 采用同样策略。
+
+4. **渐进式优化路径清晰**：
+   - 短期：标准方案（4 次拷贝）→ 大幅超越 Python 方案（~8 次拷贝）
+   - 中期：vmsplice 响应路径 PoC → 可能减少到 3 次
+   - 长期：io_uring ZC Rx → 可能减少到 1 次
+
+5. **buddy allocator 的天然优势**：C-Two 的 buddy SHM 已为零拷贝 IPC 提供了基础。Routing Server 作为 SHM 的另一个 writer/reader，本质上与 SharedClient 在同一个零拷贝框架内。真正消耗大的 CRM 计算结果（GB 级 mesh 数据）在 CRM→SHM 写入时已完成，Routing Server 只是搬运。
+
+### Implementation Notes
+
+#### 关键实现要点
+
+1. **Content-Length 预分配**：如果 HTTP 请求带 `Content-Length`，一次性 `alloc(content_length)` SHM block，避免多次分配和碎片。
+
+2. **Chunked Transfer 的 SHM 写入策略**：
+   - 初始分配一个合理大小的 block（如 64KB）
+   - 如果不够，释放旧 block，重新分配 2x 大小
+   - 或者使用 dedicated segment 回退
+
+3. **SHM memoryview 生命周期管理**：
+   - 响应的 SHM block 必须在 HTTP 响应完全发送后才能释放
+   - 实现 deferred free：在 `Body::poll_frame()` 返回 EOF 时触发 `free_at()`
+   - 参考 Python 端 `_deferred_response_free` 的设计
+
+4. **连接池**：Routing Server 维护到各 CRM Server 的持久 IPC 连接池（bb8 或自建），避免每次 relay 创建/销毁连接。
+
+5. **Wire v2 透传**：Routing Server 不需要解析 wire 内容（method name、error code），只需要：
+   - 从 HTTP body 读取原始 bytes → 写入 SHM
+   - 发送 UDS 控制帧（route name + method index 由 HTTP URL path 或 header 提供）
+   - 等待 UDS 响应控制帧
+   - 从 SHM 读取响应 bytes → 写入 HTTP response body
+
+#### 架构示意
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │         Rust Routing Server              │
+                    │                                         │
+  HTTP Client ──────│──▶ axum handler                         │
+       ▲            │       │                                 │
+       │            │       │ Bytes (hyper零拷贝引用)          │
+       │            │       ▼                                 │
+       │            │   streaming memcpy                      │
+       │            │       │                                 │
+       │            │       ▼                                 │
+       │            │   ┌─────────────┐   UDS控制帧(11B)      │
+       │            │   │ Buddy SHM   │──────────────────────▶│──▶ CRM Server
+       │            │   │ Pool (mmap) │◀──────────────────────│◀── (Python)
+       │            │   └─────────────┘   UDS响应帧(11B)      │
+       │            │       │                                 │
+       │            │       │ memcpy (分块读取)                │
+       │            │       ▼                                 │
+       │            │   Bytes → Response                      │
+  HTTP Client ◀─────│──◀ axum response                        │
+                    └─────────────────────────────────────────┘
+```
+
+### Follow-up Actions
+
+- [ ] 实现 Rust Routing Server 的 baseline 版本（axum + c2-ipc crate）
+- [ ] 基准测试：Python router vs Rust router 在 64B-1GB payload 范围的延迟和吞吐量对比
+- [ ] PoC: 验证 vmsplice+splice 在响应路径上的可行性和性能收益
+- [ ] 评估 io_uring ZC Rx 的长期集成路线图
+- [ ] 实现 SHM Body streaming（自定义 `http_body::Body`）优化大 payload 的内存占用
+
+---
+
+### External Resources
+
+- [io_uring zero copy Rx — Linux Kernel Documentation](https://docs.kernel.org/next/networking/iou-zcrx.html)
+- [Efficient zero-copy networking using io_uring — Kernel Recipes 2024](https://kernel-recipes.org/en/2024/schedule/efficient-zero-copy-networking-using-io_uring/)
+- [tokio-uring fixed buffers API](https://docs.rs/tokio-uring/latest/tokio_uring/buf/fixed/index.html)
+- [hyper::body — Rust Docs](https://docs.rs/hyper/latest/hyper/body/)
+- [Implementing True Zero-Copy Communication with iceoryx2](https://ekxide.io/blog/how-to-implement-zero-copy-communication/)
+- [Introducing Shmipc — CloudWeGo](https://www.cloudwego.io/blog/2023/04/04/introducing-shmipc-a-high-performance-inter-process-communication-library/)
+- [Ray Plasma Object Store](https://ray-core.readthedocs.io/en/snapshot/plasma.html)
+- [RDMA Explained — DigitalOcean](https://www.digitalocean.com/community/conceptual-articles/rdma-high-performance-networking)
+- [Zero-Copy I/O Techniques — Codemia](https://codemia.io/blog/path/Zero-Copy-IO-From-sendfile-to-iouring--Evolution-and-Impact-on-Latency-in-Distributed-Logs)
+- [Achieving Zero-Copy Data Parsing in Rust Web Services](https://leapcell.io/blog/achieving-zero-copy-data-parsing-in-rust-web-services-for-enhanced-performance)
+- [Linux Zero-Copy: vmsplice Between Processes](https://linuxvox.com/blog/linux-zero-copy-transfer-memory-pages-between-two-processes-with-vmsplice/)
+- [Achieving Zero-copy Serialization for Datacenter RPC (IEEE)](https://ieeexplore.ieee.org/document/10253859)
+
+---
+
+## Status History
+
+| Date | Status | Notes |
+|------|--------|-------|
+| 2026-03-27 | 🔴 Not Started | Spike created and scoped |
+| 2026-03-27 | 🟡 In Progress | Research commenced: web search + codebase analysis |
+| 2026-03-27 | 🟢 Complete | 结论：采用标准 Rust 方案（4 次拷贝），流式 SHM 写入，不追求内核级零拷贝。工业界验证此为最佳实践。 |
+
+---
+
+_Last updated: 2026-03-27 by soku_

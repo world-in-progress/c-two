@@ -17,8 +17,8 @@ import pytest
 # Import private assembler classes from rpc_v2 internals
 # ---------------------------------------------------------------------------
 
-from c_two.rpc_v2.server import _ChunkAssembler
-from c_two.rpc_v2.client import _ReplyChunkAssembler
+from c_two.transport.server.core import _ChunkAssembler
+from c_two.transport.client.core import _ReplyChunkAssembler
 
 
 # ---------------------------------------------------------------------------

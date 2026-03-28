@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
-from c_two.rpc_v2.relay import RelayV2
+from c_two.transport.relay import RelayV2
 from icrm import IGrid
 from crm import Grid
 

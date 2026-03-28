@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import c_two as cc
 from c_two._native import NativeRelay
-from c_two.rpc_v2.registry import _ProcessRegistry
+from c_two.transport.registry import _ProcessRegistry
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
 

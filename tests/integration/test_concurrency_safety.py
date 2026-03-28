@@ -17,10 +17,10 @@ import struct
 import pytest
 
 import c_two as cc
-from c_two.rpc_v2.client import SharedClient
-from c_two.rpc_v2.server import ServerV2
-from c_two.rpc_v2.pool import ClientPool
-from c_two.rpc.ipc.ipc_protocol import IPCConfig
+from c_two.transport.client.core import SharedClient
+from c_two.transport.server.core import ServerV2
+from c_two.transport.client.pool import ClientPool
+from c_two.transport.ipc.frame import IPCConfig
 
 
 # ---------------------------------------------------------------------------
@@ -445,8 +445,8 @@ class TestServerMalformedFrames:
             raw.connect(sock_path)
             raw.settimeout(2.0)
 
-            from c_two.rpc.ipc.ipc_protocol import encode_frame
-            from c_two.rpc_v2.protocol import FLAG_CALL_V2
+            from c_two.transport.ipc.frame import encode_frame
+            from c_two.transport.protocol import FLAG_CALL_V2
 
             # FLAG_CALL_V2 frame with only 1 byte payload (name_len=5 but no data).
             malformed_payload = bytes([5])  # name_len=5, but no name or method_idx
@@ -489,8 +489,8 @@ class TestServerMalformedFrames:
             raw.connect(sock_path)
             raw.settimeout(2.0)
 
-            from c_two.rpc.ipc.ipc_protocol import encode_frame
-            from c_two.rpc_v2.protocol import FLAG_CALL_V2
+            from c_two.transport.ipc.frame import encode_frame
+            from c_two.transport.protocol import FLAG_CALL_V2
 
             frame = encode_frame(1, FLAG_CALL_V2, b'')
             raw.sendall(frame)
@@ -530,8 +530,8 @@ class TestServerMalformedFrames:
             raw.connect(sock_path)
             raw.settimeout(2.0)
 
-            from c_two.rpc.ipc.ipc_protocol import encode_frame
-            from c_two.rpc_v2.protocol import FLAG_CALL_V2
+            from c_two.transport.ipc.frame import encode_frame
+            from c_two.transport.protocol import FLAG_CALL_V2
 
             # Send a v2 call with garbage control bytes (too short to parse)
             frame = encode_frame(1, FLAG_CALL_V2, b'\xff\x01')

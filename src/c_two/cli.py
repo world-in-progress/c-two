@@ -170,7 +170,7 @@ def relay(
     # Build IPC config if overrides provided.
     ipc_config = None
     if segment_size is not None or max_segments is not None:
-        from .rpc.ipc.ipc_protocol import IPCConfig
+        from .transport.ipc.frame import IPCConfig
         kwargs: dict = {}
         if segment_size is not None:
             kwargs['pool_segment_size'] = parse_size(segment_size)
@@ -230,7 +230,7 @@ def _start_python_relay(
     ipc_config,
     upstreams: list[tuple[str, str]],
 ):
-    from .rpc_v2.relay import RelayV2
+    from .transport.relay import RelayV2
 
     relay = RelayV2(bind=bind, max_workers=workers, ipc_config=ipc_config)
     relay.start(blocking=False)

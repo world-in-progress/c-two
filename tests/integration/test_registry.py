@@ -15,8 +15,8 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.rpc_v2.registry import _ProcessRegistry
-from c_two.rpc_v2.proxy import ICRMProxy
+from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.client.proxy import ICRMProxy
 
 # Re-use the existing test fixtures.
 from tests.fixtures.ihello import IHello

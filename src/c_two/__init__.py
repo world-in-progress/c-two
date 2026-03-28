@@ -1,7 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from . import rpc
 from . import mcp
 from . import compo
 from . import error

@@ -18,10 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytest
 
 from c_two.error import MemoryPressureError
-from c_two.rpc.ipc.ipc_protocol import IPCConfig
-from c_two.rpc_v2.client import SharedClient
-from c_two.rpc_v2.proxy import ICRMProxy
-from c_two.rpc_v2.server import ServerV2
+from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport.client.core import SharedClient
+from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.server.core import ServerV2
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello
@@ -577,87 +577,6 @@ class TestEdgeCases:
             client.terminate()
             server.shutdown()
 
-
-# ---------------------------------------------------------------------------
-# Experiment 6: Legacy rpc.Server + rpc.Client backpressure
-# ---------------------------------------------------------------------------
-
-
-class TestLegacyClientBackpressure:
-    """Backpressure through legacy rpc.Server + compo.runtime.connect_crm."""
-
-    def test_legacy_inline_fallback(self):
-        """Legacy IPC v3 client inline fallback under tiny pool."""
-        import c_two as cc
-
-        addr = f'ipc-v3://{_unique_region()}'
-        tiny_cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        config = cc.rpc.ServerConfig(
-            name='LegacyBP',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-            ipc_config=tiny_cfg,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
-        _wait_for_server(addr)
-
-        try:
-            with cc.compo.runtime.connect_crm(addr, IHello, ipc_config=tiny_cfg) as crm:
-                # Small calls succeed (inline path or within pool).
-                for i in range(10):
-                    assert crm.greeting(f'Legacy{i}') == f'Hello, Legacy{i}!'
-                assert crm.add(100, 200) == 300
-        finally:
-            try:
-                cc.rpc.Client.shutdown(addr, timeout=2.0)
-            except Exception:
-                pass
-            server.stop()
-
-    @pytest.mark.skip(reason='v1 Client backpressure via connect_crm removed; SOTA API has different pressure handling')
-    def test_legacy_pressure_error(self):
-        """Legacy client raises MemoryPressureError for oversized payload."""
-        import c_two as cc
-        from c_two.transport.server.core import ServerV2
-        from c_two.transport.client.core import SharedClient
-
-        addr = f'ipc-v3://{_unique_region()}'
-        tiny_cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-            max_frame_size=8192,
-        )
-        server = ServerV2(
-            bind_address=addr,
-            icrm_class=IHello,
-            crm_instance=Hello(),
-            ipc_config=tiny_cfg,
-            name='default',
-        )
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            with cc.compo.runtime.connect_crm(addr, IHello) as crm:
-                # Small call succeeds.
-                assert crm.add(1, 2) == 3
-
-                # Large payload: 200KB > 8KB max_frame_size, > 64KB pool.
-                with pytest.raises(MemoryPressureError):
-                    crm.greeting('Z' * 200_000)
-
-                # Recovery: client still usable.
-                assert crm.add(10, 20) == 30
-        finally:
-            server.shutdown()
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ import struct
 
 import pytest
 
-from c_two.rpc_v2.protocol import (
+from c_two.transport.protocol import (
     HANDSHAKE_V5,
     CAP_CALL_V2,
     CAP_METHOD_IDX,
@@ -24,7 +24,7 @@ from c_two.rpc_v2.protocol import (
     _MAX_HANDSHAKE_ROUTES,
     _MAX_HANDSHAKE_METHODS,
 )
-from c_two.rpc_v2.wire import (
+from c_two.transport.wire import (
     encode_call_control,
     decode_call_control,
     encode_reply_control,
@@ -259,7 +259,7 @@ class TestPendingCallSafety:
 
     def test_double_set_result(self):
         """Setting result twice is harmless (first wins on event)."""
-        from c_two.rpc_v2.client import PendingCall
+        from c_two.transport.client.core import PendingCall
         p = PendingCall(rid=0)
         p.set_result(b'first')
         p.set_result(b'second')
@@ -270,7 +270,7 @@ class TestPendingCallSafety:
 
     def test_set_error_then_result(self):
         """Error takes precedence even if result is also set."""
-        from c_two.rpc_v2.client import PendingCall
+        from c_two.transport.client.core import PendingCall
         p = PendingCall(rid=0)
         p.set_error(ValueError('test'))
         p.set_result(b'data')
@@ -279,7 +279,7 @@ class TestPendingCallSafety:
 
     def test_timeout_raises(self):
         """wait() with short timeout raises TimeoutError."""
-        from c_two.rpc_v2.client import PendingCall
+        from c_two.transport.client.core import PendingCall
         p = PendingCall(rid=0)
         with pytest.raises(TimeoutError):
             p.wait(timeout=0.01)
@@ -287,7 +287,7 @@ class TestPendingCallSafety:
     def test_concurrent_wait_and_set(self):
         """One thread waits, another sets result concurrently."""
         import threading
-        from c_two.rpc_v2.client import PendingCall
+        from c_two.transport.client.core import PendingCall
         p = PendingCall(rid=42)
         results = []
 
@@ -320,19 +320,19 @@ class TestMethodTableSafety:
     """Edge cases for MethodTable lookups."""
 
     def test_index_of_missing_raises(self):
-        from c_two.rpc_v2.wire import MethodTable
+        from c_two.transport.wire import MethodTable
         t = MethodTable.from_methods(['a', 'b'])
         with pytest.raises(KeyError):
             t.index_of('nonexistent')
 
     def test_name_of_missing_raises(self):
-        from c_two.rpc_v2.wire import MethodTable
+        from c_two.transport.wire import MethodTable
         t = MethodTable.from_methods(['a', 'b'])
         with pytest.raises(KeyError):
             t.name_of(999)
 
     def test_empty_table(self):
-        from c_two.rpc_v2.wire import MethodTable
+        from c_two.transport.wire import MethodTable
         t = MethodTable()
         assert len(t) == 0
         assert t.names() == []
@@ -344,14 +344,14 @@ class TestSchedulerSafety:
     """Validate scheduler edge cases."""
 
     def test_begin_after_shutdown_raises(self):
-        from c_two.rpc_v2.scheduler import ConcurrencyConfig, Scheduler
+        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
         sched = Scheduler(ConcurrencyConfig())
         sched.shutdown()
         with pytest.raises(RuntimeError, match='shut down'):
             sched.begin()
 
     def test_begin_at_capacity_raises(self):
-        from c_two.rpc_v2.scheduler import ConcurrencyConfig, Scheduler
+        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
         sched = Scheduler(ConcurrencyConfig(max_pending=1))
         sched.begin()  # fills to capacity
         with pytest.raises(RuntimeError, match='capacity'):
@@ -363,7 +363,7 @@ class TestSchedulerSafety:
         sched.shutdown()
 
     def test_execute_decrements_pending(self):
-        from c_two.rpc_v2.scheduler import ConcurrencyConfig, Scheduler
+        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
         sched = Scheduler(ConcurrencyConfig(max_pending=2))
         sched.begin()
         assert sched._pending_count == 1

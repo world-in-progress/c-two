@@ -15,10 +15,10 @@ import pytest
 import httpx
 
 import c_two as cc
-from c_two.rpc_v2.http_client import HttpClient
-from c_two.rpc_v2.proxy import ICRMProxy
-from c_two.rpc_v2.registry import _ProcessRegistry
-from c_two.rpc_v2.relay import RelayV2
+from c_two.transport.client.http import HttpClient
+from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.relay.core import RelayV2
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello

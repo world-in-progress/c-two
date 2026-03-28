@@ -61,7 +61,6 @@ def error_server():
         bind_address=address,
         icrm_class=IHello,
         crm_instance=ErrorHello(),
-        name='default',
     )
     server.start()
     deadline = time.monotonic() + 5.0

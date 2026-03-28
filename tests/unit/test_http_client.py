@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from c_two import error
-from c_two.rpc_v2.http_client import HttpClient, HttpClientPool
+from c_two.transport.client.http import HttpClient, HttpClientPool
 
 
 # ---------------------------------------------------------------------------

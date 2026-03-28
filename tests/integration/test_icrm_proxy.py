@@ -11,8 +11,8 @@ import uuid
 
 import pytest
 
-from c_two.rpc_v2 import ServerV2, ICRMProxy
-from c_two.rpc_v2.client import SharedClient
+from c_two.transport import ServerV2, ICRMProxy
+from c_two.transport.client.core import SharedClient
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello

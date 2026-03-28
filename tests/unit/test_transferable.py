@@ -2,7 +2,7 @@ import pickle
 import inspect
 import pytest
 import c_two as cc
-from c_two.rpc.transferable import (
+from c_two.crm.transferable import (
     Transferable, TransferableMeta,
     register_transferable, get_transferable,
     create_default_transferable, auto_transfer,
@@ -509,29 +509,29 @@ class TestWireScatterWrite:
     """Tests for tuple/list scatter-write in wire.py."""
 
     def test_payload_total_size_none(self):
-        from c_two.rpc.util.wire import payload_total_size
+        from c_two.transport.wire_v1 import payload_total_size
         assert payload_total_size(None) == 0
 
     def test_payload_total_size_bytes(self):
-        from c_two.rpc.util.wire import payload_total_size
+        from c_two.transport.wire_v1 import payload_total_size
         assert payload_total_size(b'hello') == 5
 
     def test_payload_total_size_memoryview(self):
-        from c_two.rpc.util.wire import payload_total_size
+        from c_two.transport.wire_v1 import payload_total_size
         assert payload_total_size(memoryview(b'hello')) == 5
 
     def test_payload_total_size_tuple(self):
-        from c_two.rpc.util.wire import payload_total_size
+        from c_two.transport.wire_v1 import payload_total_size
         assert payload_total_size((b'hel', b'lo')) == 5
 
     def test_payload_total_size_list(self):
-        from c_two.rpc.util.wire import payload_total_size
+        from c_two.transport.wire_v1 import payload_total_size
         assert payload_total_size([b'a', b'bc', b'def']) == 6
 
     def test_write_call_into_scatter_write(self):
         """write_call_into accepts tuple payload and produces identical
         output to a single contiguous bytes payload."""
-        from c_two.rpc.util.wire import write_call_into
+        from c_two.transport.wire_v1 import write_call_into
 
         header = b'\x01\x02\x03\x04'
         blob = b'\x05\x06\x07\x08\x09\x0a'
@@ -550,7 +550,7 @@ class TestWireScatterWrite:
     def test_write_reply_into_scatter_write(self):
         """write_reply_into accepts tuple result_data and produces identical
         output to a single contiguous bytes payload."""
-        from c_two.rpc.util.wire import write_reply_into
+        from c_two.transport.wire_v1 import write_reply_into
 
         part_a = b'\x01\x02\x03'
         part_b = b'\x04\x05\x06\x07'
@@ -568,7 +568,7 @@ class TestWireScatterWrite:
 
     def test_write_call_into_with_offset(self):
         """write_call_into works correctly with non-zero offset."""
-        from c_two.rpc.util.wire import write_call_into
+        from c_two.transport.wire_v1 import write_call_into
 
         buf = bytearray(256)
         offset = 16
@@ -580,7 +580,7 @@ class TestWireScatterWrite:
 
     def test_write_reply_into_empty_result(self):
         """write_reply_into handles None result_data."""
-        from c_two.rpc.util.wire import write_reply_into
+        from c_two.transport.wire_v1 import write_reply_into
 
         buf = bytearray(256)
         n = write_reply_into(buf, 0, result_data=None)

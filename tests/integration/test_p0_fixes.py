@@ -7,7 +7,7 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.rpc_v2.scheduler import ConcurrencyConfig, ConcurrencyMode
+from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +209,7 @@ class TestOnShutdownLifecycle:
         crm = Counter()
         cc.register(ICounter, crm, name='ctr_rpc')
 
-        from c_two.rpc_v2.registry import _ProcessRegistry
+        from c_two.transport.registry import _ProcessRegistry
         reg = _ProcessRegistry._instance
         slot = reg._server._slots.get('ctr_rpc')
         assert slot is not None

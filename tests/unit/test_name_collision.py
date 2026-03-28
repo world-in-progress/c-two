@@ -12,8 +12,8 @@ import uuid
 
 import pytest
 
-from c_two.rpc_v2 import ServerV2, ConcurrencyConfig, ConcurrencyMode
-from c_two.rpc_v2.registry import _ProcessRegistry
+from c_two.transport import ServerV2, ConcurrencyConfig, ConcurrencyMode
+from c_two.transport.registry import _ProcessRegistry
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello

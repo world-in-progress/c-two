@@ -16,10 +16,10 @@ import sys
 import time
 
 import c_two as cc
-from c_two.rpc.ipc.ipc_protocol import IPCConfig
-from c_two.rpc_v2.client import SharedClient
-from c_two.rpc_v2.proxy import ICRMProxy
-from c_two.rpc_v2.server import ServerV2
+from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport.client import SharedClient
+from c_two.transport.proxy import ICRMProxy
+from c_two.transport.server import ServerV2
 
 
 # ---------------------------------------------------------------------------

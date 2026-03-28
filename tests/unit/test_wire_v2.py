@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from c_two.rpc_v2.protocol import (
+from c_two.transport.protocol import (
     FLAG_CALL_V2,
     FLAG_REPLY_V2,
     FLAG_CHUNKED,
@@ -21,7 +21,7 @@ from c_two.rpc_v2.protocol import (
     encode_v5_server_handshake,
     decode_v5_handshake,
 )
-from c_two.rpc_v2.wire import (
+from c_two.transport.wire import (
     CHUNK_HEADER_SIZE,
     MethodTable,
     encode_call_control,
@@ -40,8 +40,8 @@ from c_two.rpc_v2.wire import (
     encode_v2_buddy_chunked_reply_frame,
     encode_v2_inline_chunked_reply_frame,
 )
-from c_two.rpc.ipc.ipc_protocol import FRAME_STRUCT, FLAG_RESPONSE
-from c_two.rpc.ipc.ipc_v3_protocol import FLAG_BUDDY, BUDDY_PAYLOAD_STRUCT
+from c_two.transport.ipc.frame import FRAME_STRUCT, FLAG_RESPONSE
+from c_two.transport.ipc.buddy import FLAG_BUDDY, BUDDY_PAYLOAD_STRUCT
 
 
 # ---------------------------------------------------------------------------

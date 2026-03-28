@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 import c_two as cc
-from c_two.rpc_v2.registry import _ProcessRegistry
+from c_two.transport.registry import _ProcessRegistry
 
 
 # -- Helpers ---------------------------------------------------------------

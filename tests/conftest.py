@@ -66,7 +66,6 @@ def hello_server(protocol_address, hello_crm):
         bind_address=protocol_address,
         icrm_class=IHello,
         crm_instance=hello_crm,
-        name='default',
     )
     server.start()
     _wait_for_server(protocol_address)

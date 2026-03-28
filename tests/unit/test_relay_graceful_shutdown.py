@@ -11,7 +11,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 import c_two as cc
-from c_two.rpc_v2.registry import _ProcessRegistry
+from c_two.transport.registry import _ProcessRegistry
 
 
 # -- Helpers ---------------------------------------------------------------
@@ -80,7 +80,7 @@ class TestUpstreamPoolShutdownLogging:
 
     def test_shutdown_logs_upstream_names(self, caplog):
         """UpstreamPool.shutdown() logs names of disconnected upstreams."""
-        from c_two.rpc_v2.relay import UpstreamPool, _UpstreamEntry
+        from c_two.transport.relay.core import UpstreamPool, _UpstreamEntry
 
         pool = UpstreamPool()
         # Inject a mock entry directly (skip real IPC connection).

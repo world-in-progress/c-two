@@ -6,8 +6,8 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.rpc.ipc import IPCConfig
-from c_two.rpc.ipc.ipc_v3_protocol import (
+from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport.ipc.buddy import (
     encode_buddy_handshake,
     decode_buddy_handshake,
     encode_buddy_payload,
@@ -22,6 +22,8 @@ from c_two.rpc.ipc.ipc_v3_protocol import (
     BUDDY_REUSE_FLAG,
     HANDSHAKE_VERSION,
 )
+from c_two.transport.server.core import ServerV2
+from c_two.transport.client.core import SharedClient
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
 
@@ -31,7 +33,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if cc.rpc.Client.ping(address, timeout=0.5):
+            if SharedClient.ping(address, timeout=0.5):
                 return
         except Exception:
             pass
@@ -44,7 +46,7 @@ def _wait_for_shutdown(address: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if not cc.rpc.Client.ping(address, timeout=0.3):
+            if not SharedClient.ping(address, timeout=0.3):
                 return
         except Exception:
             return
@@ -84,7 +86,7 @@ class TestBuddyProtocol:
     def test_buddy_reuse_payload_roundtrip(self):
         """Test the extended reuse payload format with separate free coordinates."""
         import struct
-        from c_two.rpc.ipc.ipc_v3_protocol import (
+        from c_two.transport.ipc.buddy import (
             BUDDY_PAYLOAD_STRUCT, BUDDY_REUSE_EXTRA,
         )
         # Build a reuse payload manually.
@@ -134,31 +136,20 @@ def _unique_region():
 def ipc_v3_server():
     """Start an IPC v3 server, yield address, shut down."""
     addr = f'ipc-v3://{_unique_region()}'
-    config = cc.rpc.ServerConfig(
-        name='TestBuddy',
-        crm=Hello(),
-        icrm=IHello,
-        bind_address=addr,
-    )
-    server = cc.rpc.Server(config)
-    from c_two.rpc.server import _start
-    _start(server._state)
+    server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+    server.start()
     _wait_for_server(addr)
     yield addr
     try:
-        cc.rpc.Client.shutdown(addr, timeout=1.0)
+        server.shutdown()
     except Exception:
         pass
     _wait_for_shutdown(addr)
-    try:
-        server.stop()
-    except Exception:
-        pass
 
 
 class TestIPCv3Lifecycle:
     def test_ping(self, ipc_v3_server):
-        assert cc.rpc.Client.ping(ipc_v3_server, timeout=1.0)
+        assert SharedClient.ping(ipc_v3_server, timeout=1.0)
 
     def test_simple_call(self, ipc_v3_server):
         with cc.compo.runtime.connect_crm(ipc_v3_server, IHello) as crm:
@@ -179,23 +170,12 @@ class TestIPCv3Lifecycle:
 
     def test_shutdown(self):
         addr = f'ipc-v3://{_unique_region()}'
-        config = cc.rpc.ServerConfig(
-            name='TestBuddyShutdown',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
+        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+        server.start()
         _wait_for_server(addr)
-        assert cc.rpc.Client.shutdown(addr, timeout=1.0)
+        server.shutdown()
         _wait_for_shutdown(addr)
-        assert not cc.rpc.Client.ping(addr, timeout=0.5)
-        try:
-            server.stop()
-        except Exception:
-            pass
+        assert not SharedClient.ping(addr, timeout=0.5)
 
 
 # ------------------------------------------------------------------
@@ -235,16 +215,8 @@ class TestIPCv3BuddyPath:
             shm_threshold=1024,
             pool_segment_size=64 * 1024,
         )
-        config = cc.rpc.ServerConfig(
-            name='TestBuddyLarge',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-            ipc_config=ipc_config,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
+        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), ipc_config=ipc_config, name='default')
+        server.start()
         _wait_for_server(addr)
         try:
             with cc.compo.runtime.connect_crm(addr, IHello) as crm:
@@ -258,14 +230,10 @@ class TestIPCv3BuddyPath:
                     'Buddy pool not initialized for large payload'
         finally:
             try:
-                cc.rpc.Client.shutdown(addr, timeout=1.0)
+                server.shutdown()
             except Exception:
                 pass
             _wait_for_shutdown(addr)
-            try:
-                server.stop()
-            except Exception:
-                pass
 
 
 # ------------------------------------------------------------------
@@ -316,16 +284,8 @@ class TestOPTC1SafeBytesCopy:
             shm_threshold=512,
             pool_segment_size=64 * 1024,
         )
-        config = cc.rpc.ServerConfig(
-            name='TestOPTC1',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-            ipc_config=ipc_config,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
+        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), ipc_config=ipc_config, name='default')
+        server.start()
         _wait_for_server(addr)
         try:
             with cc.compo.runtime.connect_crm(addr, IHello) as crm:
@@ -339,14 +299,10 @@ class TestOPTC1SafeBytesCopy:
                 assert v3_client._buddy_pool is not None
         finally:
             try:
-                cc.rpc.Client.shutdown(addr, timeout=1.0)
+                server.shutdown()
             except Exception:
                 pass
             _wait_for_shutdown(addr)
-            try:
-                server.stop()
-            except Exception:
-                pass
 
 
 class TestBuddyProtocolEdgeCases:
@@ -394,15 +350,8 @@ class TestIPCv3StressRecovery:
     def test_rapid_connect_disconnect(self):
         """Rapid connect/disconnect cycles should not leak resources."""
         addr = f'ipc-v3://{_unique_region()}'
-        config = cc.rpc.ServerConfig(
-            name='TestRapidReconnect',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
+        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+        server.start()
         _wait_for_server(addr)
         try:
             for i in range(10):
@@ -410,27 +359,16 @@ class TestIPCv3StressRecovery:
                     assert crm.add(i, 1) == i + 1
         finally:
             try:
-                cc.rpc.Client.shutdown(addr, timeout=1.0)
+                server.shutdown()
             except Exception:
                 pass
             _wait_for_shutdown(addr)
-            try:
-                server.stop()
-            except Exception:
-                pass
 
     def test_concurrent_clients_heavy(self):
         """8 threads × 20 iterations stress test."""
         addr = f'ipc-v3://{_unique_region()}'
-        config = cc.rpc.ServerConfig(
-            name='TestHeavyConcurrency',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
+        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+        server.start()
         _wait_for_server(addr)
         errors = []
 
@@ -453,11 +391,7 @@ class TestIPCv3StressRecovery:
             assert errors == [], f'Heavy concurrency errors: {errors}'
         finally:
             try:
-                cc.rpc.Client.shutdown(addr, timeout=1.0)
+                server.shutdown()
             except Exception:
                 pass
             _wait_for_shutdown(addr)
-            try:
-                server.stop()
-            except Exception:
-                pass

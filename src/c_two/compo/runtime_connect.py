@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 @overload
-def connect_crm(address: str, icrm_class: type[ICRM], *, crm_name: str = 'default') -> ContextManager[ICRM]:
+def connect_crm(address: str, icrm_class: type[ICRM], *, crm_name: str = '') -> ContextManager[ICRM]:
     ...
 
 
@@ -25,7 +25,7 @@ def connect_crm(
     address: str,
     icrm_class: type[ICRM] = None,
     *,
-    crm_name: str = 'default',
+    crm_name: str = '',
     **kwargs,
 ) -> Generator[ICRM, None, None]:
     """Context manager to connect to a CRM server.
@@ -33,7 +33,7 @@ def connect_crm(
     Args:
         address: The server address string (e.g., 'ipc-v3://region')
         icrm_class: The ICRM class to connect as
-        crm_name: The CRM routing name (default: 'default')
+        crm_name: The CRM routing name (empty string uses server default)
         **kwargs: Reserved for future use
     """
     if icrm_class is None:
@@ -86,7 +86,7 @@ def connect(func=None, icrm_class=None) -> callable:
         def wrapper(
             *args,
             crm_address: str = '',
-            crm_name: str = 'default',
+            crm_name: str = '',
             crm_connection=None,
         ):
             # Priority: runtime context > provided connection > new from address

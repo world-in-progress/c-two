@@ -19,7 +19,7 @@ import os, sys, signal, threading
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
 
-from c_two.rpc_v2.relay import RelayV2
+from c_two.transport.relay import RelayV2
 
 HTTP_BIND = '127.0.0.1:8080'
 

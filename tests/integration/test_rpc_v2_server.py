@@ -13,8 +13,8 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.rpc.ipc.ipc_protocol import IPCConfig
-from c_two.rpc_v2 import SharedClient, ClientPool, ServerV2
+from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport import SharedClient, ClientPool, ServerV2
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -284,48 +284,3 @@ class TestServerV2Concurrent:
         finally:
             client.terminate()
 
-
-# ---------------------------------------------------------------------------
-# V2 fallback: SharedClient(try_v2=True) → old IPCv3Server
-# ---------------------------------------------------------------------------
-
-class TestV2FallbackToV4:
-    """SharedClient(try_v2=True) falls back to v4 when server doesn't support v5."""
-
-    @pytest.fixture
-    def legacy_ipc_addr(self):
-        """Start a standard IPCv3Server (v4 only)."""
-        from c_two.rpc.server import _start
-        addr = f'ipc-v3://{_unique_region("legacy")}'
-        config = cc.rpc.ServerConfig(
-            name='LegacyServer',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-        )
-        server = cc.rpc.Server(config)
-        _start(server._state)
-        _wait_for_server(addr)
-        yield addr
-        try:
-            cc.rpc.Client.shutdown(addr, timeout=1.0)
-        except Exception:
-            pass
-        time.sleep(0.3)
-        try:
-            server.stop()
-        except Exception:
-            pass
-
-    def test_v2_client_falls_back_to_v1(self, legacy_ipc_addr):
-        """try_v2=True client should fall back to v4/v1 with legacy server."""
-        client = SharedClient(legacy_ipc_addr, try_v2=True)
-        client.connect()
-        try:
-            # Should have fallen back to v1 mode.
-            assert not client._v2_mode
-            # But still works.
-            result = pickle.loads(client.call('add', pickle.dumps((3, 4))))
-            assert result == 7
-        finally:
-            client.terminate()

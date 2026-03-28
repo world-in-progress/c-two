@@ -53,7 +53,7 @@ class TestRuntimeConnectDecorator:
             assert result == 'Hello, Context!'
 
     def test_call_with_crm_connection(self, hello_server):
-        proxy = transport_connect(IHello, name='default', address=hello_server)
+        proxy = transport_connect(IHello, name='', address=hello_server)
         try:
             result = my_greeting('Conn', crm_connection=proxy)
             assert result == 'Hello, Conn!'

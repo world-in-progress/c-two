@@ -8,10 +8,9 @@ import time
 
 import pytest
 
-import c_two as cc
-from c_two.rpc.server import _start
-from c_two.rpc_v2.pool import ClientPool
-from c_two.rpc_v2.client import SharedClient
+from c_two.transport.client.pool import ClientPool
+from c_two.transport.client.core import SharedClient
+from c_two.transport.server.core import ServerV2
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -36,23 +35,12 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if cc.rpc.Client.ping(address, timeout=0.5):
+            if SharedClient.ping(address, timeout=0.5):
                 return
         except Exception:
             pass
         time.sleep(0.05)
     raise TimeoutError(f'Server at {address} not ready after {timeout}s')
-
-
-def _wait_for_shutdown(address: str, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if not cc.rpc.Client.ping(address, timeout=0.3):
-                return
-        except Exception:
-            return
-        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -62,27 +50,13 @@ def _wait_for_shutdown(address: str, timeout: float = 5.0) -> None:
 @pytest.fixture
 def ipc_v3_addr():
     addr = f'ipc-v3://{_unique_region()}'
-    config = cc.rpc.ServerConfig(
-        name='PoolTest',
-        crm=Hello(),
-        icrm=IHello,
-        bind_address=addr,
-    )
-    server = cc.rpc.Server(config)
-    _start(server._state)
+    server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello())
+    server.start()
     _wait_for_server(addr)
 
     yield addr
 
-    try:
-        cc.rpc.Client.shutdown(addr, timeout=1.0)
-    except Exception:
-        pass
-    _wait_for_shutdown(addr)
-    try:
-        server.stop()
-    except Exception:
-        pass
+    server.shutdown()
 
 
 @pytest.fixture
