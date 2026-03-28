@@ -63,9 +63,23 @@ from .protocol import (
 _U16 = struct.Struct('<H')
 _U32 = struct.Struct('<I')
 
+# Public alias for modules that need fast inline method_idx unpacking.
+U16_LE = _U16
+
 # ---------------------------------------------------------------------------
 # V2 Call Control
 # ---------------------------------------------------------------------------
+
+
+# Pre-computed default-route (name='') call control payloads for method indices
+# 0–255.  Eliminates bytearray allocation + pack + bytes() on the hot path.
+_DEFAULT_ROUTE_CACHE: list[bytes] = []
+for _i in range(256):
+    _b = bytearray(3)
+    _b[0] = 0
+    _U16.pack_into(_b, 1, _i)
+    _DEFAULT_ROUTE_CACHE.append(bytes(_b))
+del _i, _b
 
 
 def encode_call_control(name: str, method_idx: int) -> bytes:
@@ -79,10 +93,12 @@ def encode_call_control(name: str, method_idx: int) -> bytes:
         buf[0] = len(name_b)
         buf[1:1 + len(name_b)] = name_b
         _U16.pack_into(buf, 1 + len(name_b), method_idx)
-    else:
-        buf = bytearray(3)
-        buf[0] = 0
-        _U16.pack_into(buf, 1, method_idx)
+        return bytes(buf)
+    if method_idx < 256:
+        return _DEFAULT_ROUTE_CACHE[method_idx]
+    buf = bytearray(3)
+    buf[0] = 0
+    _U16.pack_into(buf, 1, method_idx)
     return bytes(buf)
 
 

@@ -95,6 +95,8 @@ _U32_LE = struct.Struct('<I')
 
 # Payloads exceeding this fraction of pool_segment_size trigger chunked transfer.
 _CHUNK_THRESHOLD_RATIO = 0.9
+_MAX_TOTAL_CHUNKS = 512           # 512 × 128 MB = 64 GB theoretical max
+_MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB hard cap on reassembly buffer
 
 
 def _resolve_socket_path(region_id: str) -> str:
@@ -150,12 +152,21 @@ class _ReplyChunkAssembler:
                  '_buf', '_received_flags')
 
     def __init__(self, total_chunks: int, chunk_size: int) -> None:
+        if total_chunks <= 0 or total_chunks > _MAX_TOTAL_CHUNKS:
+            raise ValueError(
+                f'total_chunks={total_chunks} out of range [1, {_MAX_TOTAL_CHUNKS}]'
+            )
+        alloc_size = total_chunks * chunk_size
+        if alloc_size > _MAX_REASSEMBLY_BYTES:
+            raise ValueError(
+                f'Reassembly buffer {alloc_size} bytes exceeds '
+                f'limit {_MAX_REASSEMBLY_BYTES}'
+            )
         import mmap as _mmap
         self.total_chunks = total_chunks
         self.chunk_size = chunk_size
         self.received = 0
         self._actual_total = 0
-        alloc_size = total_chunks * chunk_size
         self._buf = _mmap.mmap(-1, alloc_size)
         self._received_flags = bytearray(total_chunks)
 
@@ -172,7 +183,15 @@ class _ReplyChunkAssembler:
         return self.received == self.total_chunks
 
     def assemble(self) -> bytes:
-        """Return reassembled payload and release the mmap."""
+        """Return reassembled payload and release the mmap.
+
+        .. note::
+
+           ``buf.read()`` creates a ``bytes`` copy while the mmap is still
+           alive, so peak RSS briefly doubles (mmap + bytes).  This is
+           inherent to any copy-out scheme and acceptable given that the
+           mmap is released immediately after via ``close()`` → ``munmap``.
+        """
         buf = self._buf
         self._buf = None
         buf.seek(0)

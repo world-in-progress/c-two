@@ -79,7 +79,7 @@ from .wire import (
     encode_v2_error_reply_frame,
     encode_v2_buddy_chunked_reply_frame,
     encode_v2_inline_chunked_reply_frame,
-    _U16,
+    U16_LE,
 )
 from .scheduler import Scheduler, ConcurrencyConfig
 
@@ -97,6 +97,31 @@ _SHUTDOWN_CLIENT = int(MsgType.SHUTDOWN_CLIENT)
 _CHUNK_THRESHOLD_RATIO = 0.9
 _CHUNK_ASSEMBLER_TIMEOUT = 60.0   # seconds
 _CHUNK_GC_INTERVAL = 100          # frames between GC sweeps
+_MAX_TOTAL_CHUNKS = 512           # 512 × 128 MB = 64 GB theoretical max
+_MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB hard cap on reassembly buffer
+
+
+def _parse_v2_call_inline(
+    payload: bytes | memoryview,
+) -> tuple[bytes, int, int]:
+    """Parse v2 call control from an inline (non-buddy) payload.
+
+    Returns ``(route_key_bytes, method_idx, args_start_offset)``.
+
+    Raises ``struct.error`` or ``IndexError`` on malformed data.
+    This is the **single source of truth** for inline v2 call control
+    parsing — used by both the fast dispatch path and ``_handle_v2_call``.
+    """
+    name_len = payload[0]
+    if name_len:
+        route_key = payload[1:1 + name_len]
+        method_idx = U16_LE.unpack_from(payload, 1 + name_len)[0]
+        args_start = 3 + name_len
+    else:
+        route_key = b''
+        method_idx = U16_LE.unpack_from(payload, 1)[0]
+        args_start = 3
+    return route_key, method_idx, args_start
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +239,16 @@ class _ChunkAssembler:
     _received_flags: bytearray = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.total_chunks <= 0 or self.total_chunks > _MAX_TOTAL_CHUNKS:
+            raise ValueError(
+                f'total_chunks={self.total_chunks} out of range [1, {_MAX_TOTAL_CHUNKS}]'
+            )
         alloc_size = self.total_chunks * self.chunk_size
+        if alloc_size > _MAX_REASSEMBLY_BYTES:
+            raise ValueError(
+                f'Reassembly buffer {alloc_size} bytes exceeds '
+                f'limit {_MAX_REASSEMBLY_BYTES}'
+            )
         self._buf = mmap.mmap(-1, alloc_size)
         self._received_flags = bytearray(self.total_chunks)
 
@@ -231,7 +265,15 @@ class _ChunkAssembler:
         return self.received == self.total_chunks
 
     def assemble(self) -> bytes:
-        """Return reassembled payload and release the mmap."""
+        """Return reassembled payload and release the mmap.
+
+        .. note::
+
+           ``buf.read()`` creates a ``bytes`` copy while the mmap is still
+           alive, so peak RSS briefly doubles (mmap + bytes).  This is
+           inherent to any copy-out scheme and acceptable given that the
+           mmap is released immediately after via ``close()`` → ``munmap``.
+        """
         buf = self._buf
         self._buf = None
         buf.seek(0)
@@ -579,16 +621,18 @@ class ServerV2:
     def _resolve_slot(self, name: str) -> CRMSlot | None:
         """Look up a CRM slot by routing name (empty → default).
 
-        Uses direct dict read (safe on CPython; asyncio hot path is
-        single-threaded).  The _slots_lock is only needed for mutations.
+        Acquires ``_slots_lock`` for the dict read to be safe under
+        free-threaded Python (3.13t / 3.14t) where dict operations are
+        not inherently atomic.
         """
-        slots = self._slots
-        if name:
-            return slots.get(name)
-        dn = self._default_name
-        if dn is not None:
-            return slots.get(dn)
-        return None
+        with self._slots_lock:
+            slots = self._slots
+            if name:
+                return slots.get(name)
+            dn = self._default_name
+            if dn is not None:
+                return slots.get(dn)
+            return None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -776,17 +820,9 @@ class ServerV2:
                 # Fast inline path for v2 non-buddy calls:
                 # parse + dispatch table lookup + submit all without Task.
                 if is_v2_call and not is_buddy:
-                    name_len = payload[0]
                     try:
-                        if name_len:
-                            route_key = payload[1:1 + name_len]
-                            method_idx = _U16.unpack_from(payload, 1 + name_len)[0]
-                            args_start = 3 + name_len
-                        else:
-                            route_key = b''
-                            method_idx = _U16.unpack_from(payload, 1)[0]
-                            args_start = 3
-                    except (struct.error, UnicodeDecodeError) as exc:
+                        route_key, method_idx, args_start = _parse_v2_call_inline(payload)
+                    except (struct.error, IndexError) as exc:
                         writer.write(encode_v2_error_reply_frame(
                             request_id,
                             f'Malformed v2 call control: {exc}'.encode('utf-8'),
@@ -799,8 +835,9 @@ class ServerV2:
                     if cur_gen != cache_gen:
                         dispatch_cache.clear()
                         cache_gen = cur_gen
-                        slots = self._slots
-                        default_name = self._default_name
+                        with self._slots_lock:
+                            slots = self._slots.copy()
+                            default_name = self._default_name
 
                     # Combined cache: (route_bytes, method_idx) → dispatch tuple
                     cache_key = (bytes(route_key), method_idx)
@@ -1112,10 +1149,8 @@ class ServerV2:
         args_bytes = asm.assemble()
 
         # Resolve slot.
-        slots = self._slots
         route_name = asm.route_name
-        slot = (slots.get(route_name) if route_name
-                else slots.get(self._default_name or ''))
+        slot = self._resolve_slot(route_name)
         if slot is None:
             logger.warning('Conn %d: unknown route %r in chunked call',
                            conn.conn_id, route_name)
@@ -1281,19 +1316,9 @@ class ServerV2:
         else:
             if not payload:
                 return
-            # Inline decode_call_control for speed (avoids function call +
-            # tuple allocation on the hot path).
-            name_len = payload[0]
             try:
-                if name_len:
-                    route_name = payload[1:1 + name_len].decode('utf-8')
-                    method_idx = _U16.unpack_from(payload, 1 + name_len)[0]
-                    args_start = 3 + name_len
-                else:
-                    route_name = ''
-                    method_idx = _U16.unpack_from(payload, 1)[0]
-                    args_start = 3
-            except (struct.error, UnicodeDecodeError) as exc:
+                route_key, method_idx, args_start = _parse_v2_call_inline(payload)
+            except (struct.error, IndexError, UnicodeDecodeError) as exc:
                 logger.warning('Conn %d: malformed v2 call control: %s',
                                conn.conn_id, exc)
                 writer.write(encode_v2_error_reply_frame(
@@ -1301,12 +1326,11 @@ class ServerV2:
                 ))
                 await writer.drain()
                 return
+            route_name = route_key.decode('utf-8') if route_key else ''
             args_bytes = payload[args_start:] if args_start < len(payload) else b''
 
         # Inline slot + method resolve.
-        slots = self._slots
-        slot = (slots.get(route_name) if route_name
-                else slots.get(self._default_name or ''))
+        slot = self._resolve_slot(route_name)
         if slot is None:
             logger.warning('Unknown route name %r', route_name)
             writer.write(encode_v2_error_reply_frame(
@@ -1599,6 +1623,7 @@ class ServerV2:
             end = min(start + chunk_size, total_size)
             chunk_data = result_bytes[start:end]
             chunk_len = end - start
+            is_last = (i == n_chunks - 1)
 
             # Try buddy allocation for each chunk.
             sent = False
@@ -1617,14 +1642,31 @@ class ServerV2:
                         chunk_len, alloc.is_dedicated, i, n_chunks,
                     )
                     writer.write(frame)
-                    await writer.drain()
                     sent = True
                 except Exception:
                     pass  # Fall through to inline.
 
             if not sent:
+                if chunk_len > self._config.max_frame_size:
+                    logger.error(
+                        'Conn %d: chunk %d/%d size %d exceeds max_frame_size %d '
+                        'and buddy alloc failed — aborting chunked reply',
+                        conn.conn_id, i, n_chunks, chunk_len,
+                        self._config.max_frame_size,
+                    )
+                    writer.write(encode_v2_error_reply_frame(
+                        request_id,
+                        b'Chunked reply failed: chunk exceeds inline limit',
+                    ))
+                    await writer.drain()
+                    return
                 frame = encode_v2_inline_chunked_reply_frame(
                     request_id, i, n_chunks, chunk_data,
                 )
                 writer.write(frame)
+
+            # Batch drain: flush every 4 chunks or on the final chunk to
+            # avoid per-chunk event-loop yields while still bounding the
+            # kernel socket buffer usage.
+            if is_last or (i + 1) % 4 == 0:
                 await writer.drain()
