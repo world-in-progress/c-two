@@ -133,6 +133,13 @@ class UpstreamPool:
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
+        if entries:
+            names = ', '.join(e.name for e in entries)
+            logger.info(
+                'Relay shutting down — disconnecting %d upstream(s): %s. '
+                'CRM processes should handle relay absence gracefully.',
+                len(entries), names,
+            )
         for entry in entries:
             try:
                 entry.client.terminate()

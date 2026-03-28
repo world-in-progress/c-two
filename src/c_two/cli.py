@@ -111,10 +111,10 @@ _RELAY_BANNER = """\
     help='Thread pool size for concurrent relay calls.',
 )
 @click.option(
-    '--native',
-    is_flag=True,
-    default=False,
-    help='Use Rust NativeRelay engine (higher throughput).',
+    '--native/--python',
+    default=True,
+    show_default=True,
+    help='Relay engine: Rust NativeRelay (default) or Python RelayV2.',
 )
 @click.option(
     '--upstream', '-u',

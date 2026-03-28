@@ -346,8 +346,14 @@ class _ProcessRegistry:
             if self._server is not None:
                 self._server.unregister_crm(name)
 
-        # Notify relay (outside lock).
-        self._relay_unregister(name)
+        # Notify relay (outside lock) — best-effort; relay may already be down.
+        try:
+            self._relay_unregister(name)
+        except Exception:
+            log.warning(
+                'Relay unreachable during unregister of %s — relay may have '
+                'shut down already; skipping relay notification.', name,
+            )
 
     def get_server_address(self) -> str | None:
         """IPC address of the auto-created server, or ``None``."""
@@ -381,7 +387,10 @@ class _ProcessRegistry:
             try:
                 self._relay_unregister(name)
             except Exception:
-                log.debug('Relay unregister failed for %s during shutdown', name)
+                log.info(
+                    'Relay unreachable during shutdown unregister of %s — '
+                    'relay may have shut down already.', name,
+                )
 
         if server is not None:
             try:
