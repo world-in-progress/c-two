@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import math
 import os
 import socket as _socket
 import struct
@@ -61,9 +62,12 @@ from ..rpc.ipc.ipc_v3_protocol import (
 from .protocol import (
     FLAG_CALL_V2,
     FLAG_REPLY_V2,
+    FLAG_CHUNKED,
+    FLAG_CHUNK_LAST,
     HANDSHAKE_V5,
     CAP_CALL_V2,
     CAP_METHOD_IDX,
+    CAP_CHUNKED,
     STATUS_SUCCESS,
     STATUS_ERROR,
     HandshakeV5,
@@ -72,9 +76,13 @@ from .protocol import (
     decode_v5_handshake,
 )
 from .wire import (
+    CHUNK_HEADER_SIZE,
     MethodTable,
     encode_v2_buddy_call_frame,
     encode_v2_inline_call_frame,
+    encode_v2_buddy_chunked_call_frame,
+    encode_v2_inline_chunked_call_frame,
+    decode_chunk_header,
     decode_reply_control,
 )
 
@@ -84,6 +92,9 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 _CRM_REPLY_TYPE = int(MsgType.CRM_REPLY)
 _U32_LE = struct.Struct('<I')
+
+# Payloads exceeding this fraction of pool_segment_size trigger chunked transfer.
+_CHUNK_THRESHOLD_RATIO = 0.9
 
 
 def _resolve_socket_path(region_id: str) -> str:
@@ -123,6 +134,57 @@ class PendingCall:
     def set_error(self, exc: Exception) -> None:
         self.error_exc = exc
         self._event.set()
+
+
+# ---------------------------------------------------------------------------
+# ReplyChunkAssembler — client-side chunked reply reassembly
+# ---------------------------------------------------------------------------
+
+class _ReplyChunkAssembler:
+    """Reassembles chunked reply frames into a single result bytes.
+
+    Uses ``mmap.mmap(-1, size)`` for deterministic OS-level release.
+    """
+
+    __slots__ = ('total_chunks', 'chunk_size', 'received', '_actual_total',
+                 '_buf', '_received_flags')
+
+    def __init__(self, total_chunks: int, chunk_size: int) -> None:
+        import mmap as _mmap
+        self.total_chunks = total_chunks
+        self.chunk_size = chunk_size
+        self.received = 0
+        self._actual_total = 0
+        alloc_size = total_chunks * chunk_size
+        self._buf = _mmap.mmap(-1, alloc_size)
+        self._received_flags = bytearray(total_chunks)
+
+    def add(self, idx: int, data: bytes | memoryview) -> bool:
+        """Write chunk data at the correct offset.  Returns True when complete."""
+        if self._received_flags[idx]:
+            return False
+        offset = idx * self.chunk_size
+        dlen = len(data)
+        self._buf[offset:offset + dlen] = data
+        self._received_flags[idx] = 1
+        self._actual_total += dlen
+        self.received += 1
+        return self.received == self.total_chunks
+
+    def assemble(self) -> bytes:
+        """Return reassembled payload and release the mmap."""
+        buf = self._buf
+        self._buf = None
+        buf.seek(0)
+        result = buf.read(self._actual_total)
+        buf.close()
+        return result
+
+    def discard(self) -> None:
+        """Release the mmap without assembling."""
+        if self._buf is not None:
+            self._buf.close()
+            self._buf = None
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +238,7 @@ class SharedClient:
         self._method_table: MethodTable | None = None
         self._name_tables: dict[str, MethodTable] = {}
         self._default_name = ''
+        self._chunked_capable = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -271,7 +334,7 @@ class SharedClient:
         """Attempt handshake v5.  Returns True if server responded with v5 ACK."""
         try:
             handshake_payload = encode_v5_client_handshake(
-                segments, CAP_CALL_V2 | CAP_METHOD_IDX,
+                segments, CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
             )
             handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
             self._sock.sendall(handshake_frame)
@@ -289,6 +352,7 @@ class SharedClient:
                 hs = decode_v5_handshake(payload)
                 if hs.capability_flags & CAP_CALL_V2:
                     self._v2_mode = True
+                    self._chunked_capable = bool(hs.capability_flags & CAP_CHUNKED)
                     # Build per-route method tables.
                     for route in hs.routes:
                         table = MethodTable()
@@ -420,6 +484,18 @@ class SharedClient:
         with self._pending_lock:
             self._pending[rid] = pending
 
+        # Chunked transfer for large payloads (v2 only).
+        chunk_threshold = int(self._config.pool_segment_size * _CHUNK_THRESHOLD_RATIO)
+        if self._v2_mode and wire_size > chunk_threshold:
+            if not self._chunked_capable:
+                with self._pending_lock:
+                    self._pending.pop(rid, None)
+                raise error.MemoryPressureError(
+                    f'Payload {wire_size} bytes exceeds segment size '
+                    f'and server does not support chunked transfer',
+                )
+            return self._call_chunked(rid, pending, method_name, args, wire_size, name=name)
+
         try:
             with self._send_lock:
                 if self._v2_mode:
@@ -524,6 +600,71 @@ class SharedClient:
             )
 
     # ------------------------------------------------------------------
+    # Chunked send (large payloads, v2 only)
+    # ------------------------------------------------------------------
+
+    def _call_chunked(
+        self,
+        rid: int,
+        pending: PendingCall,
+        method_name: str,
+        data: bytes,
+        total_size: int,
+        *,
+        name: str | None = None,
+    ) -> bytes:
+        """Send a large payload as multiple chunked frames.
+
+        Each chunk independently allocates from the buddy pool and is sent
+        under ``_send_lock`` per-frame (not per-sequence), allowing other
+        RIDs to interleave.
+        """
+        chunk_size = self._config.pool_segment_size // 2
+        n_chunks = math.ceil(total_size / chunk_size)
+
+        route_name = name if name is not None else self._default_name
+        table = self._name_tables.get(route_name, self._method_table)
+        method_idx = table.index_of(method_name) if table else 0
+
+        try:
+            for i in range(n_chunks):
+                start = i * chunk_size
+                end = min(start + chunk_size, total_size)
+                chunk_data = data[start:end]
+                chunk_len = end - start
+
+                alloc, shm_buf = self._try_buddy_alloc(chunk_len, f'chunk-{i}')
+
+                if alloc is not None:
+                    try:
+                        shm_buf[:chunk_len] = chunk_data
+                        frame = encode_v2_buddy_chunked_call_frame(
+                            rid, alloc.seg_idx, alloc.offset, chunk_len,
+                            alloc.is_dedicated, i, n_chunks,
+                            name=route_name, method_idx=method_idx,
+                        )
+                        with self._send_lock:
+                            self._sock.sendall(frame)
+                    except Exception:
+                        self._free_buddy(alloc, chunk_len)
+                        raise
+                else:
+                    # Inline fallback for this chunk.
+                    frame = encode_v2_inline_chunked_call_frame(
+                        rid, i, n_chunks, chunk_data,
+                        name=route_name, method_idx=method_idx,
+                    )
+                    with self._send_lock:
+                        self._sock.sendall(frame)
+        except Exception:
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise
+
+        timeout = self._config.call_timeout if hasattr(self._config, 'call_timeout') else 30.0
+        return pending.wait(timeout=timeout)
+
+    # ------------------------------------------------------------------
     # Send helpers (called under _send_lock)
     # ------------------------------------------------------------------
 
@@ -626,6 +767,7 @@ class SharedClient:
     def _recv_loop(self) -> None:
         """Background thread: read response frames, dispatch to pending callers."""
         sock = self._sock
+        reply_assemblers: dict[int, _ReplyChunkAssembler] = {}
         try:
             while self._running and sock is not None:
                 try:
@@ -645,6 +787,28 @@ class SharedClient:
                     payload = _recv_exact(sock, payload_len) if payload_len > 0 else b''
                 except (ConnectionResetError, BrokenPipeError, OSError):
                     break
+
+                # Chunked reply: accumulate in assembler.
+                if flags & FLAG_CHUNKED:
+                    try:
+                        result, complete = self._handle_chunked_reply(
+                            flags, payload, request_id, reply_assemblers,
+                        )
+                    except Exception as exc:
+                        with self._pending_lock:
+                            pending = self._pending.pop(request_id, None)
+                        if pending is not None:
+                            pending.set_error(exc)
+                        continue
+
+                    if not complete:
+                        continue
+
+                    with self._pending_lock:
+                        pending = self._pending.pop(request_id, None)
+                    if pending is not None:
+                        pending.set_result(result)
+                    continue
 
                 # Decode response and dispatch.
                 try:
@@ -674,6 +838,10 @@ class SharedClient:
         except Exception:
             logger.error('recv_loop: unexpected error', exc_info=True)
         finally:
+            # Clean up stale reply assemblers.
+            for asm in reply_assemblers.values():
+                asm.discard()
+            reply_assemblers.clear()
             # Wake up any remaining pending callers.
             with self._pending_lock:
                 for p in self._pending.values():
@@ -826,6 +994,81 @@ class SharedClient:
             return b'', None
         # Always copy to bytes for Phase 1 safety.
         return bytes(mv[5:]), None
+
+    # ------------------------------------------------------------------
+    # Chunked reply reassembly
+    # ------------------------------------------------------------------
+
+    def _handle_chunked_reply(
+        self,
+        flags: int,
+        payload: bytes,
+        request_id: int,
+        assemblers: dict[int, '_ReplyChunkAssembler'],
+    ) -> tuple[bytes, bool]:
+        """Process one chunked reply frame.
+
+        Returns ``(result_bytes, complete)``.  When ``complete`` is False,
+        ``result_bytes`` is meaningless.
+        """
+        is_buddy = bool(flags & FLAG_BUDDY)
+
+        if is_buddy:
+            from ..rpc.ipc.ipc_v3_protocol import BUDDY_PAYLOAD_STRUCT as _BP
+            seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
+            if self._buddy_pool is None or seg_idx >= len(self._seg_views):
+                raise error.CompoClientError(f'Chunked reply: invalid seg_idx {seg_idx}')
+            seg_mv = self._seg_views[seg_idx]
+            chunk_data = bytes(seg_mv[data_offset:data_offset + data_size])
+            with self._alloc_lock:
+                try:
+                    self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+                except Exception:
+                    pass
+            ctrl_off = _BP.size
+        else:
+            ctrl_off = 0
+
+        chunk_idx, total_chunks, ch_consumed = decode_chunk_header(payload, ctrl_off)
+        ctrl_off += ch_consumed
+
+        if chunk_idx == 0:
+            # First chunk: parse reply control (status byte).
+            from .wire import decode_reply_control as _drc
+            status, err_data, rc_consumed = _drc(payload, ctrl_off)
+            ctrl_off += rc_consumed
+            if status == STATUS_ERROR:
+                if err_data:
+                    err = error.CCError.deserialize(err_data)
+                    if err:
+                        raise err
+                raise error.CompoClientError('Chunked reply error (empty)')
+
+            if not is_buddy:
+                chunk_data = bytes(payload[ctrl_off:])
+
+            chunk_size = self._config.pool_segment_size // 2
+            asm = _ReplyChunkAssembler(
+                total_chunks=total_chunks,
+                chunk_size=chunk_size,
+            )
+            assemblers[request_id] = asm
+        else:
+            asm = assemblers.get(request_id)
+            if asm is None:
+                logger.warning('Orphan chunked reply chunk (rid=%d, idx=%d)',
+                               request_id, chunk_idx)
+                return b'', False
+            if not is_buddy:
+                chunk_data = bytes(payload[ctrl_off:])
+
+        complete = asm.add(chunk_idx, chunk_data)
+
+        if not complete:
+            return b'', False
+
+        del assemblers[request_id]
+        return asm.assemble(), True
 
     # ------------------------------------------------------------------
     # Static utility methods

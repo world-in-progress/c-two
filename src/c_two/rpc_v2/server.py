@@ -16,11 +16,13 @@ import asyncio
 import ctypes
 import inspect
 import logging
+import mmap
 import os
 import queue
 import re
 import struct
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,9 +56,12 @@ from ..rpc.ipc.ipc_v3_protocol import (
 from .protocol import (
     FLAG_CALL_V2,
     FLAG_REPLY_V2,
+    FLAG_CHUNKED,
+    FLAG_CHUNK_LAST,
     HANDSHAKE_V5,
     CAP_CALL_V2,
     CAP_METHOD_IDX,
+    CAP_CHUNKED,
     STATUS_SUCCESS,
     STATUS_ERROR,
     RouteInfo,
@@ -67,9 +72,13 @@ from .protocol import (
 from .wire import (
     MethodTable,
     decode_call_control,
+    decode_chunk_header,
+    CHUNK_HEADER_SIZE,
     encode_v2_buddy_reply_frame,
     encode_v2_inline_reply_frame,
     encode_v2_error_reply_frame,
+    encode_v2_buddy_chunked_reply_frame,
+    encode_v2_inline_chunked_reply_frame,
     _U16,
 )
 from .scheduler import Scheduler, ConcurrencyConfig
@@ -83,6 +92,11 @@ FLAG_HANDSHAKE = 1 << 2
 # Signal byte values (MsgType enum ints).
 _PING = int(MsgType.PING)
 _SHUTDOWN_CLIENT = int(MsgType.SHUTDOWN_CLIENT)
+
+# Chunked transfer constants.
+_CHUNK_THRESHOLD_RATIO = 0.9
+_CHUNK_ASSEMBLER_TIMEOUT = 60.0   # seconds
+_CHUNK_GC_INTERVAL = 100          # frames between GC sweeps
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +116,7 @@ class _Connection:
     remote_segment_sizes: list[int] = field(default_factory=list)
     handshake_done: bool = False
     v2_mode: bool = False
+    chunked_capable: bool = False
     # In-flight submit_inline request counter.  Incremented on the event
     # loop thread before submitting; decremented by worker threads via
     # call_soon_threadsafe.  The _idle event is set when the count drops
@@ -174,6 +189,61 @@ class CRMSlot:
             method = getattr(self.icrm, name, None)
             if method is not None:
                 self._dispatch_table[name] = (method, get_method_access(method))
+
+
+# ---------------------------------------------------------------------------
+# Chunk assembler (mmap-based reassembly buffer for chunked transfer)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ChunkAssembler:
+    """Reassembles a chunked request into contiguous bytes.
+
+    Uses ``mmap.mmap(-1, size)`` (anonymous mmap) for the reassembly buffer
+    to get deterministic OS-level memory release via ``close()``.
+    """
+
+    total_chunks: int
+    chunk_size: int
+    route_name: str
+    method_idx: int
+    received: int = 0
+    _actual_total: int = 0
+    created_at: float = field(default_factory=time.monotonic)
+    _buf: mmap.mmap | None = field(default=None, init=False, repr=False)
+    _received_flags: bytearray = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        alloc_size = self.total_chunks * self.chunk_size
+        self._buf = mmap.mmap(-1, alloc_size)
+        self._received_flags = bytearray(self.total_chunks)
+
+    def add(self, idx: int, data: bytes | memoryview) -> bool:
+        """Write chunk data at the correct offset.  Returns True when complete."""
+        if self._received_flags[idx]:
+            return False
+        offset = idx * self.chunk_size
+        dlen = len(data)
+        self._buf[offset:offset + dlen] = data
+        self._received_flags[idx] = 1
+        self._actual_total += dlen
+        self.received += 1
+        return self.received == self.total_chunks
+
+    def assemble(self) -> bytes:
+        """Return reassembled payload and release the mmap."""
+        buf = self._buf
+        self._buf = None
+        buf.seek(0)
+        result = buf.read(self._actual_total)
+        buf.close()
+        return result
+
+    def discard(self) -> None:
+        """Release the mmap without assembling."""
+        if self._buf is not None:
+            self._buf.close()
+            self._buf = None
 
 
 _SENTINEL = None  # Poison pill for dispatcher shutdown
@@ -650,6 +720,7 @@ class ServerV2:
         # Pipelined dispatch: read next frame while previous dispatches
         # are still executing in the thread pool.
         pending: set[asyncio.Task] = set()
+        chunk_assemblers: dict[int, _ChunkAssembler] = {}
 
         try:
             max_frame = self._config.max_frame_size
@@ -658,6 +729,7 @@ class ServerV2:
             dispatcher = self._dispatcher
             dispatch_cache: dict[tuple[bytes, int], tuple] = {}
             cache_gen = self._slots_generation
+            frame_count = 0
             while True:
                 header = await reader.readexactly(16)
                 total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -679,6 +751,23 @@ class ServerV2:
                     await self._handle_handshake(conn, payload, writer)
                     continue
                 if flags & FLAG_CTRL:
+                    continue
+
+                # Periodic GC for stale chunk assemblers.
+                frame_count += 1
+                if frame_count % _CHUNK_GC_INTERVAL == 0 and chunk_assemblers:
+                    self._gc_chunk_assemblers(chunk_assemblers, conn.conn_id)
+
+                # Chunked frame: accumulate in assembler, dispatch on completion.
+                if flags & FLAG_CHUNKED:
+                    t = asyncio.create_task(
+                        self._process_chunked_frame(
+                            conn, request_id, flags, payload, writer,
+                            chunk_assemblers,
+                        ),
+                    )
+                    pending.add(t)
+                    t.add_done_callback(pending.discard)
                     continue
 
                 is_v2_call = bool(flags & FLAG_CALL_V2)
@@ -786,6 +875,10 @@ class ServerV2:
             # Drain in-flight tasks before tearing down the connection.
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            # Clean up stale chunk assemblers.
+            for asm in chunk_assemblers.values():
+                asm.discard()
+            chunk_assemblers.clear()
             # Wait for submit_inline requests still executing in worker
             # threads.  Without this, writer.close() could discard replies
             # for requests that have already completed on the CRM side.
@@ -865,6 +958,9 @@ class ServerV2:
             cap_flags |= CAP_CALL_V2
         if hs.capability_flags & CAP_METHOD_IDX:
             cap_flags |= CAP_METHOD_IDX
+        if hs.capability_flags & CAP_CHUNKED:
+            cap_flags |= CAP_CHUNKED
+            conn.chunked_capable = True
 
         ack_payload = encode_v5_server_handshake(
             segments=[],
@@ -918,8 +1014,151 @@ class ServerV2:
             conn.cleanup()
 
     # ------------------------------------------------------------------
-    # V1 call handling (legacy wire CRM_CALL format)
+    # Chunked frame handling
     # ------------------------------------------------------------------
+
+    async def _process_chunked_frame(
+        self,
+        conn: _Connection,
+        request_id: int,
+        flags: int,
+        payload: bytes,
+        writer: asyncio.StreamWriter,
+        assemblers: dict[int, _ChunkAssembler],
+    ) -> None:
+        """Process a single chunked frame, dispatching when all chunks arrive."""
+        is_buddy = bool(flags & FLAG_BUDDY)
+
+        if is_buddy:
+            try:
+                seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
+                    decode_buddy_payload(payload)
+                )
+            except (struct.error, Exception) as exc:
+                logger.warning('Conn %d: malformed chunked buddy payload: %s',
+                               conn.conn_id, exc)
+                return
+            if conn.buddy_pool is None or seg_idx >= len(conn.seg_views):
+                return
+            seg_mv = conn.seg_views[seg_idx]
+            if data_offset + data_size > len(seg_mv):
+                logger.warning('Conn %d: chunked buddy OOB', conn.conn_id)
+                return
+            chunk_data = bytes(seg_mv[data_offset:data_offset + data_size])
+            try:
+                conn.buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+            except Exception:
+                logger.warning('Conn %d: failed to free chunked buddy block',
+                               conn.conn_id, exc_info=True)
+            ctrl_off = BUDDY_PAYLOAD_STRUCT.size
+        else:
+            ctrl_off = 0
+
+        # Parse chunk header.
+        try:
+            chunk_idx, total_chunks, ch_consumed = decode_chunk_header(payload, ctrl_off)
+        except (ValueError, struct.error) as exc:
+            logger.warning('Conn %d: malformed chunk header: %s', conn.conn_id, exc)
+            return
+        ctrl_off += ch_consumed
+
+        if chunk_idx == 0:
+            # First chunk: parse call control.
+            try:
+                route_name, method_idx, cc_consumed = decode_call_control(payload, ctrl_off)
+            except (ValueError, struct.error) as exc:
+                logger.warning('Conn %d: malformed chunked call control: %s',
+                               conn.conn_id, exc)
+                return
+            ctrl_off += cc_consumed
+
+            if not is_buddy:
+                chunk_data = bytes(payload[ctrl_off:])
+
+            chunk_size = self._config.pool_segment_size // 2
+            try:
+                asm = _ChunkAssembler(
+                    total_chunks=total_chunks,
+                    chunk_size=chunk_size,
+                    route_name=route_name,
+                    method_idx=method_idx,
+                )
+            except Exception as exc:
+                logger.error('Conn %d: failed to create chunk assembler: %s',
+                             conn.conn_id, exc)
+                writer.write(encode_v2_error_reply_frame(
+                    request_id,
+                    f'Failed to allocate reassembly buffer: {exc}'.encode('utf-8'),
+                ))
+                await writer.drain()
+                return
+            assemblers[request_id] = asm
+        else:
+            asm = assemblers.get(request_id)
+            if asm is None:
+                logger.warning('Conn %d: orphan chunk (rid=%d, idx=%d)',
+                               conn.conn_id, request_id, chunk_idx)
+                return
+            if not is_buddy:
+                chunk_data = bytes(payload[ctrl_off:])
+
+        complete = asm.add(chunk_idx, chunk_data)
+
+        if not complete:
+            return
+
+        # All chunks received — assemble and dispatch.
+        del assemblers[request_id]
+        args_bytes = asm.assemble()
+
+        # Resolve slot.
+        slots = self._slots
+        route_name = asm.route_name
+        slot = (slots.get(route_name) if route_name
+                else slots.get(self._default_name or ''))
+        if slot is None:
+            logger.warning('Conn %d: unknown route %r in chunked call',
+                           conn.conn_id, route_name)
+            writer.write(encode_v2_error_reply_frame(
+                request_id,
+                f'Unknown route name: {route_name}'.encode('utf-8'),
+            ))
+            await writer.drain()
+            return
+
+        method_name = slot.method_table._idx_to_name.get(asm.method_idx)
+        if method_name is None:
+            logger.warning('Conn %d: unknown method idx %d for route %r',
+                           conn.conn_id, asm.method_idx, route_name)
+            writer.write(encode_v2_error_reply_frame(
+                request_id,
+                f'Unknown method index {asm.method_idx}'.encode('utf-8'),
+            ))
+            await writer.drain()
+            return
+
+        result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
+        await self._send_v2_reply(conn, request_id, result_bytes, err_bytes, writer)
+
+    @staticmethod
+    def _gc_chunk_assemblers(
+        assemblers: dict[int, _ChunkAssembler],
+        conn_id: int,
+    ) -> None:
+        """Discard chunk assemblers that have been incomplete for too long."""
+        now = time.monotonic()
+        expired = [
+            rid for rid, asm in assemblers.items()
+            if now - asm.created_at > _CHUNK_ASSEMBLER_TIMEOUT
+        ]
+        for rid in expired:
+            asm = assemblers.pop(rid)
+            logger.warning(
+                'Conn %d: GC stale chunk assembler rid=%d '
+                '(%d/%d chunks received)',
+                conn_id, rid, asm.received, asm.total_chunks,
+            )
+            asm.discard()
 
     async def _handle_v1_call(
         self,
@@ -1304,6 +1543,12 @@ class ServerV2:
 
         data_size = len(result_bytes)
 
+        # Chunked reply for large results.
+        chunk_threshold = int(self._config.pool_segment_size * _CHUNK_THRESHOLD_RATIO)
+        if data_size > chunk_threshold and conn.chunked_capable:
+            await self._send_chunked_v2_reply(conn, request_id, result_bytes, writer)
+            return
+
         if data_size > self._config.shm_threshold and conn.buddy_pool is not None:
             try:
                 alloc = conn.buddy_pool.alloc(data_size)
@@ -1335,3 +1580,51 @@ class ServerV2:
         writer.write(frame)
         if data_size > 65536:
             await writer.drain()
+
+    async def _send_chunked_v2_reply(
+        self,
+        conn: _Connection,
+        request_id: int,
+        result_bytes: bytes,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Send a large result as multiple chunked reply frames."""
+        import math
+        chunk_size = self._config.pool_segment_size // 2
+        total_size = len(result_bytes)
+        n_chunks = math.ceil(total_size / chunk_size)
+
+        for i in range(n_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, total_size)
+            chunk_data = result_bytes[start:end]
+            chunk_len = end - start
+
+            # Try buddy allocation for each chunk.
+            sent = False
+            if conn.buddy_pool is not None and chunk_len > self._config.shm_threshold:
+                try:
+                    alloc = conn.buddy_pool.alloc(chunk_len)
+                    if alloc.is_dedicated:
+                        conn.buddy_pool.free_at(
+                            alloc.seg_idx, alloc.offset, chunk_len, True,
+                        )
+                        raise MemoryError('dedicated')
+                    seg_mv = conn.seg_views[alloc.seg_idx]
+                    seg_mv[alloc.offset:alloc.offset + chunk_len] = chunk_data
+                    frame = encode_v2_buddy_chunked_reply_frame(
+                        request_id, alloc.seg_idx, alloc.offset,
+                        chunk_len, alloc.is_dedicated, i, n_chunks,
+                    )
+                    writer.write(frame)
+                    await writer.drain()
+                    sent = True
+                except Exception:
+                    pass  # Fall through to inline.
+
+            if not sent:
+                frame = encode_v2_inline_chunked_reply_frame(
+                    request_id, i, n_chunks, chunk_data,
+                )
+                writer.write(frame)
+                await writer.drain()

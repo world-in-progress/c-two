@@ -50,6 +50,8 @@ from ..rpc.ipc.ipc_v3_protocol import (
 from .protocol import (
     FLAG_CALL_V2,
     FLAG_REPLY_V2,
+    FLAG_CHUNKED,
+    FLAG_CHUNK_LAST,
     STATUS_SUCCESS,
     STATUS_ERROR,
 )
@@ -268,6 +270,171 @@ def encode_v2_error_reply_frame(
     _U32.pack_into(buf, 17, err_len)
     buf[21:21 + err_len] = error_data
     return buf
+
+
+# ---------------------------------------------------------------------------
+# Chunk Header Codec
+# ---------------------------------------------------------------------------
+
+_CHUNK_HDR = struct.Struct('<HH')  # 4 bytes: chunk_idx(u16) + total_chunks(u16)
+CHUNK_HEADER_SIZE = _CHUNK_HDR.size
+
+
+def encode_chunk_header(chunk_idx: int, total_chunks: int) -> bytes:
+    """Encode chunk header: ``[2B chunk_idx LE][2B total_chunks LE]``."""
+    return _CHUNK_HDR.pack(chunk_idx, total_chunks)
+
+
+def decode_chunk_header(
+    data: bytes | memoryview, offset: int = 0,
+) -> tuple[int, int, int]:
+    """Decode chunk header.
+
+    Returns ``(chunk_idx, total_chunks, bytes_consumed)``.
+    """
+    if offset + CHUNK_HEADER_SIZE > len(data):
+        raise ValueError(
+            f'chunk header: need {CHUNK_HEADER_SIZE} bytes at offset {offset}, '
+            f'have {len(data) - offset}'
+        )
+    chunk_idx, total_chunks = _CHUNK_HDR.unpack_from(data, offset)
+    return chunk_idx, total_chunks, CHUNK_HEADER_SIZE
+
+
+# ---------------------------------------------------------------------------
+# V2 Chunked Frame Builders — Call
+# ---------------------------------------------------------------------------
+
+
+def encode_v2_buddy_chunked_call_frame(
+    request_id: int,
+    seg_idx: int,
+    offset: int,
+    data_size: int,
+    is_dedicated: bool,
+    chunk_idx: int,
+    total_chunks: int,
+    name: str = '',
+    method_idx: int = 0,
+) -> bytes:
+    """Build a v2 buddy chunked call frame.
+
+    Frame layout::
+
+        [16B header (flags=FLAG_BUDDY|FLAG_CALL_V2|FLAG_CHUNKED[|FLAG_CHUNK_LAST])]
+        [11B buddy_payload]
+        [4B chunk_header]
+        [v2_call_control]    ← only when chunk_idx==0
+
+    ``name`` and ``method_idx`` are ignored when ``chunk_idx > 0``.
+    """
+    buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
+    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    flags = FLAG_BUDDY | FLAG_CALL_V2 | FLAG_CHUNKED
+    if chunk_idx == total_chunks - 1:
+        flags |= FLAG_CHUNK_LAST
+    if chunk_idx == 0:
+        ctrl = encode_call_control(name, method_idx)
+        payload = buddy + chunk_hdr + ctrl
+    else:
+        payload = buddy + chunk_hdr
+    return encode_frame(request_id, flags, payload)
+
+
+def encode_v2_inline_chunked_call_frame(
+    request_id: int,
+    chunk_idx: int,
+    total_chunks: int,
+    data: bytes | memoryview,
+    name: str = '',
+    method_idx: int = 0,
+) -> bytes:
+    """Build a v2 inline chunked call frame (no buddy).
+
+    Frame layout::
+
+        [16B header (flags=FLAG_CALL_V2|FLAG_CHUNKED[|FLAG_CHUNK_LAST])]
+        [4B chunk_header]
+        [v2_call_control]    ← only when chunk_idx==0
+        [inline_data]
+
+    ``name`` and ``method_idx`` are ignored when ``chunk_idx > 0``.
+    """
+    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    flags = FLAG_CALL_V2 | FLAG_CHUNKED
+    if chunk_idx == total_chunks - 1:
+        flags |= FLAG_CHUNK_LAST
+    if chunk_idx == 0:
+        ctrl = encode_call_control(name, method_idx)
+        payload = chunk_hdr + ctrl + bytes(data)
+    else:
+        payload = chunk_hdr + bytes(data)
+    return encode_frame(request_id, flags, payload)
+
+
+# ---------------------------------------------------------------------------
+# V2 Chunked Frame Builders — Reply
+# ---------------------------------------------------------------------------
+
+
+_V2_BUDDY_CHUNKED_REPLY_BASE_FLAGS = FLAG_RESPONSE | FLAG_BUDDY | FLAG_REPLY_V2 | FLAG_CHUNKED
+_V2_INLINE_CHUNKED_REPLY_BASE_FLAGS = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_CHUNKED
+
+
+def encode_v2_buddy_chunked_reply_frame(
+    request_id: int,
+    seg_idx: int,
+    offset: int,
+    data_size: int,
+    is_dedicated: bool,
+    chunk_idx: int,
+    total_chunks: int,
+) -> bytes:
+    """Build a v2 buddy chunked reply frame.
+
+    Frame layout::
+
+        [16B header (flags=RESPONSE|BUDDY|REPLY_V2|CHUNKED[|CHUNK_LAST])]
+        [11B buddy_payload]
+        [4B chunk_header]
+        [1B status]          ← only when chunk_idx==0 (always STATUS_SUCCESS)
+    """
+    buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
+    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    flags = _V2_BUDDY_CHUNKED_REPLY_BASE_FLAGS
+    if chunk_idx == total_chunks - 1:
+        flags |= FLAG_CHUNK_LAST
+    if chunk_idx == 0:
+        payload = buddy + chunk_hdr + bytes([STATUS_SUCCESS])
+    else:
+        payload = buddy + chunk_hdr
+    return encode_frame(request_id, flags, payload)
+
+
+def encode_v2_inline_chunked_reply_frame(
+    request_id: int,
+    chunk_idx: int,
+    total_chunks: int,
+    data: bytes | memoryview,
+) -> bytes:
+    """Build a v2 inline chunked reply frame.
+
+    Frame layout::
+
+        [16B header (flags=RESPONSE|REPLY_V2|CHUNKED[|CHUNK_LAST])]
+        [4B chunk_header]
+        [1B status]          ← only when chunk_idx==0 (always STATUS_SUCCESS)
+        [inline_data]
+    """
+    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    flags = _V2_INLINE_CHUNKED_REPLY_BASE_FLAGS
+    if chunk_idx == total_chunks - 1:
+        flags |= FLAG_CHUNK_LAST
+    if chunk_idx == 0:
+        payload = chunk_hdr + bytes([STATUS_SUCCESS]) + bytes(data)
+    else:
+        payload = chunk_hdr + bytes(data)
+    return encode_frame(request_id, flags, payload)
 
 
 # ---------------------------------------------------------------------------

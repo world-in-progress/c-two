@@ -16,6 +16,8 @@ Frame flag bit allocation (32-bit LE flags field in the 16-byte frame header):
     Bit 6: FLAG_BUDDY          — buddy-allocated SHM block
     Bit 7: FLAG_CALL_V2        — v2 call frame (control-plane routing)
     Bit 8: FLAG_REPLY_V2       — v2 reply frame (control-plane status)
+    Bit 9: FLAG_CHUNKED        — frame is part of a chunked sequence
+    Bit 10: FLAG_CHUNK_LAST    — last frame in the chunked sequence
 """
 from __future__ import annotations
 
@@ -29,6 +31,10 @@ from dataclasses import dataclass, field
 FLAG_CALL_V2  = 1 << 7   # 0x80  — v2 call frame with control-plane routing
 FLAG_REPLY_V2 = 1 << 8   # 0x100 — v2 reply frame with control-plane status
 
+# Chunked transfer flags
+FLAG_CHUNKED    = 1 << 9   # 0x200 — frame is part of a chunked sequence
+FLAG_CHUNK_LAST = 1 << 10  # 0x400 — last frame in the chunked sequence
+
 # ---------------------------------------------------------------------------
 # Handshake v5
 # ---------------------------------------------------------------------------
@@ -38,6 +44,7 @@ HANDSHAKE_V5 = 5
 # Capability flags (2 bytes, exchanged in handshake v5)
 CAP_CALL_V2    = 1 << 0  # Supports v2 call/reply frames
 CAP_METHOD_IDX = 1 << 1  # Supports method indexing (2-byte index vs UTF-8 name)
+CAP_CHUNKED    = 1 << 2  # Supports chunked transfer for large payloads
 
 # ---------------------------------------------------------------------------
 # Reply status codes (1 byte, in v2 reply control payload)
