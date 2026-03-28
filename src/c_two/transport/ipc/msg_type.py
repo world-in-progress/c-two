@@ -1,9 +1,4 @@
 from __future__ import annotations
-
-# Re-export from canonical location.
-from c_two.transport.ipc.msg_type import *  # noqa: F401,F403
-from c_two.transport.ipc.msg_type import MsgType  # noqa: F401
-
 from enum import IntEnum, unique
 
 

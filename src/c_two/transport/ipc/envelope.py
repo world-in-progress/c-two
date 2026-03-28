@@ -1,9 +1,4 @@
 from __future__ import annotations
-
-# Re-export from canonical location.
-from c_two.transport.ipc.envelope import *  # noqa: F401,F403
-from c_two.transport.ipc.envelope import Envelope, CompletionType  # noqa: F401
-
 from dataclasses import dataclass
 from enum import Enum, unique
 from .msg_type import MsgType

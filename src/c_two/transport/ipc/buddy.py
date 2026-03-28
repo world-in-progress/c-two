@@ -1,6 +1,3 @@
-# Re-export from canonical location.
-from c_two.transport.ipc.buddy import *  # noqa: F401,F403
-
 """IPC v3 protocol — buddy allocator-backed SHM transport.
 
 Extends the IPC v2 protocol with:
@@ -17,7 +14,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .ipc_protocol import (
+from .frame import (
     FRAME_STRUCT,
     FRAME_HEADER_SIZE,
     FLAG_RESPONSE,

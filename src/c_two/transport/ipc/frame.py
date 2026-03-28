@@ -1,6 +1,3 @@
-# Re-export from canonical location.
-from c_two.transport.ipc.frame import *  # noqa: F401,F403
-
 """IPC v2 shared protocol — constants, config, frame codec, and SHM utilities.
 
 Extracted from ``ipc_server.py`` so both server and client can import
@@ -17,7 +14,6 @@ from enum import IntEnum
 from multiprocessing import shared_memory
 
 from ... import error
-from ..util.adaptive_buffer import AdaptiveBuffer
 
 # ---------------------------------------------------------------------------
 # Frame flag bits (uint32, little-endian)
@@ -272,7 +268,7 @@ def encode_inline_call_frame(
     call_header_cache: dict[str, bytes],
 ) -> bytes:
     """Single-allocation frame for inline CRM_CALL (eliminates encode_call + encode_frame double copy)."""
-    from ..event.msg_type import MsgType
+    from .msg_type import MsgType
 
     cached_header = call_header_cache.get(method_name)
     method_bytes: bytes | None = None
@@ -312,7 +308,7 @@ def encode_inline_reply_frame(
     result_bytes: bytes | memoryview,
 ) -> bytes:
     """Single-allocation frame for inline CRM_REPLY (eliminates encode_reply + encode_frame double copy)."""
-    from ..event.msg_type import MsgType
+    from .msg_type import MsgType
 
     err_len = len(err_bytes) if err_bytes else 0
     result_len = len(result_bytes) if result_bytes else 0
@@ -345,80 +341,3 @@ def decode_frame(body: bytes) -> tuple[int, int, bytes]:
     return request_id, flags, payload
 
 
-# ---------------------------------------------------------------------------
-# SHM read utilities
-# ---------------------------------------------------------------------------
-
-def fast_read_shm(
-    name: str,
-    size: int,
-    adaptive_buf: AdaptiveBuffer | None = None,
-) -> tuple[memoryview, AdaptiveBuffer]:
-    """Read SHM using native memcpy into an :class:`AdaptiveBuffer`.
-
-    For large payloads, uses ctypes.memmove instead of
-    Python's ``bytes(shm.buf)`` to avoid per-call mmap overhead.
-
-    The adaptive buffer grows when needed and shrinks when consecutive reads
-    are significantly smaller than capacity (see :mod:`~c_two.rpc.util.adaptive_buffer`).
-
-    Returns ``(data_view, adaptive_buf)`` — pass *adaptive_buf* back on the
-    next call for reuse.
-    """
-    if adaptive_buf is None:
-        adaptive_buf = AdaptiveBuffer()
-
-    shm = shared_memory.SharedMemory(name=name, create=False, track=False)
-    try:
-        # Validate SHM actual size covers the declared size BEFORE allocating
-        if shm.size < size:
-            raise error.EventDeserializeError(
-                f'SHM segment {name!r} actual size {shm.size} < declared size {size}'
-            )
-
-        buf = adaptive_buf.acquire(size)
-
-        if size >= FAST_READ_THRESHOLD:
-            ctypes.memmove(
-                ctypes.addressof(ctypes.c_char.from_buffer(buf)),
-                ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)),
-                size,
-            )
-        else:
-            buf[:size] = shm.buf[:size]
-    finally:
-        shm.close()
-        shm.unlink()
-    return memoryview(buf)[:size], adaptive_buf
-
-
-def read_from_pool_shm(
-    shm_buf: memoryview,
-    size: int,
-    adaptive_buf: AdaptiveBuffer | None = None,
-) -> tuple[memoryview, AdaptiveBuffer]:
-    """Read from a pre-opened pool SHM buffer into an :class:`AdaptiveBuffer`.
-
-    Unlike :func:`fast_read_shm`, does **not** open or unlink the SHM — the
-    handle is assumed to be pre-opened and cached from the pool handshake.
-    """
-    if adaptive_buf is None:
-        adaptive_buf = AdaptiveBuffer()
-
-    if size > len(shm_buf):
-        raise error.EventDeserializeError(
-            f'Pool read size {size} exceeds SHM buffer length {len(shm_buf)}'
-        )
-
-    buf = adaptive_buf.acquire(size)
-
-    if size >= FAST_READ_THRESHOLD:
-        ctypes.memmove(
-            ctypes.addressof(ctypes.c_char.from_buffer(buf)),
-            ctypes.addressof(ctypes.c_char.from_buffer(shm_buf)),
-            size,
-        )
-    else:
-        buf[:size] = shm_buf[:size]
-
-    return memoryview(buf)[:size], adaptive_buf

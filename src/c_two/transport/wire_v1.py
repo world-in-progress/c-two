@@ -22,13 +22,10 @@ reference headers and the majority of target platforms.
 """
 from __future__ import annotations
 
-# Re-export from canonical location.
-from c_two.transport.wire_v1 import *  # noqa: F401,F403
-
 import struct
 from collections.abc import Iterable
-from ..event.msg_type import MsgType
-from ..event.envelope import Envelope
+from .ipc.msg_type import MsgType
+from .ipc.envelope import Envelope
 
 # Fixed header sizes
 CALL_HEADER_FIXED = 3    # 1B type + 2B method_len
