@@ -287,10 +287,10 @@ if flags & FLAG_CHUNKED:
 - ✅ **Backpressure 自然延伸:** 每个 chunk 独立走 `_try_buddy_alloc()`，pool 满时逐 chunk inline fallback
 
 #### 缺点
-- ❌ **服务端重组成本:** 需要 per-RID 的 `_ChunkBuffer`，最终 `b''.join()` 产生完整 payload 的内存拷贝
+- ⚠️ **接收端重组占用内存:** 需要 per-RID 的 `_ChunkAssembler`，使用匿名 mmap 做 reassembly buffer。`mmap.close()` 确定性释放，但重组期间内存占用 = payload 大小。注意：当前实现在接收端已有 `bytes()` 堆拷贝（server.py line 1006, client.py line 736），所以这并非新引入的内存模型变化
 - ❌ **无法真正流式处理:** CRM 方法签名是 `def method(self, args) -> result`，必须等全部 chunk 到齐才能调用
-- ❌ **chunk 乱序:** 帧级交错意味着 chunk 可能乱序到达（但单连接 UDS 保证 FIFO 顺序 — 不是问题）
-- ❌ **send_lock 粒度:** 每帧独立获取 `_send_lock` → N 次 lock/unlock 开销
+- ⚠️ **chunk 乱序:** 帧级交错意味着 chunk 可能乱序到达（但单连接 UDS 保证 FIFO 顺序 — 不是问题）
+- ⚠️ **send_lock 粒度:** 每帧独立获取 `_send_lock` → N 次 lock/unlock 开销
 
 ---
 
@@ -367,8 +367,9 @@ Disk Spill Payload:
 | 维度 | A: 多帧分块 | B: 分散引用 | C: 磁盘溢写 |
 |------|-----------|-----------|-----------|
 | **最大 payload** | 无限（逐 chunk 传输） | segment_size × 255 (~64 GB) | 无限（磁盘容量） |
-| **客户端峰值内存** | chunk_size (~128MB) | 整个 payload | 接近零（mmap lazy） |
-| **服务端峰值内存** | 整个 payload（重组） | 整个 payload（重组） | 接近零（mmap lazy） |
+| **客户端发送峰值** | chunk_size (~128MB) | 整个 payload | 接近零（mmap lazy） |
+| **接收端重组峰值** | payload 大小（mmap，确定性释放） | payload 大小（同上） | 接近零（mmap lazy） |
+| **内存释放方式** | SHM: `free_at()` ✅ / 重组: `mmap.close()` ✅ | SHM: `free_at()` ✅ | `munmap()` ✅ |
 | **并发友好** | ✅ 帧级交错 | ❌ 长时间持锁 | ✅ 不占 SHM pool |
 | **实现复杂度** | 中 — 分块/重组逻辑 | 低 — 单帧扩展 | 高 — 文件生命周期 |
 | **传输性能** | 好 — SHM 级别 | 好 — SHM 级别 | 差 — 磁盘 I/O |
@@ -393,6 +394,59 @@ Disk Spill Payload:
 5. 为未来 P3 Streaming RPC (§4.2) 奠定帧格式基础
 
 方案 B 的核心问题是**同时占用多个 segment** — 在默认配置下（4 segments × 256 MB），一个 1 GB 请求会完全耗尽 pool，阻塞所有其他请求。方案 C 可作为极端场景的 L3 兜底（当 SHM + inline 都失败时回退到磁盘），但不应作为主路径。
+
+### 内存模型分析
+
+#### 现状：当前实现并非端到端零拷贝
+
+审计发现，当前的 SHM 路径在两端**已经存在堆拷贝**：
+
+```
+Server 端 (server.py line 1006):
+  args_bytes = bytes(env.payload)   ← SHM memoryview → Python bytes 堆拷贝
+
+Client 端 (client.py line 736):
+  result = bytes(seg_mv[data_offset : data_offset + data_size])  ← 同上
+```
+
+"零拷贝"的准确含义是 **SHM 传输阶段零拷贝**（client 写 SHM → server 直接读同一块 SHM，无需 UDS 传输 payload），但两端在与 Python 对象交互时各有一次 `bytes()` 堆拷贝。这意味着 chunked streaming 引入的 reassembly buffer 是**量变而非质变** — 从"一次 ≤256MB 堆拷贝"变为"一次 reassembly 大小的堆拷贝"。
+
+#### 分块传输的内存流转
+
+```
+Client send (1GB payload, 8 × 128MB chunks):
+  serialize() → 1GB bytes (Python heap)          ← 和现在一样
+  for each chunk (128MB):
+    buddy_alloc(128MB) → SHM memoryview
+    shm_buf[:] = payload[i:i+128MB]               ← memcpy into SHM
+    sendall(chunk_header)                          ← UDS 仅传 ~40B 控制帧
+    # server 读完后 free_at()                      ← SHM 块确定性释放，逐块复用
+
+Server recv (reassembly):
+  mmap_buf = mmap.mmap(-1, total_size)             ← 匿名 mmap，OS 级确定性生命周期
+  for each chunk:
+    mmap_buf[offset:offset+chunk_size] = shm_data  ← memcpy from SHM
+    free_at(chunk_shm_block)                        ← SHM 确定性释放
+  deserialize(mmap_buf)                             ← CRM 方法执行
+  mmap_buf.close()                                  ← munmap() 确定性释放，立即归还 OS
+```
+
+#### 为什么用 `mmap.mmap(-1, size)` 而非 `bytearray`
+
+| 维度 | `bytearray` | `mmap.mmap(-1, size)` |
+|------|------------|----------------------|
+| **分配方式** | Python 内存分配器 (pymalloc / libc malloc) | OS 直接 `mmap(MAP_ANONYMOUS)` |
+| **释放方式** | CPython 引用计数（`del` 时若无其他引用则立即释放），但受循环引用、碎片化影响 | `mmap_buf.close()` → 立即 `munmap()` 系统调用，**确定性归还 OS** |
+| **大块行为** | > 256KB 时 CPython 通常调 `mmap` 然后管理，但释放路径仍经过 Python 分配器 | 直接走 OS 页映射，不经过 Python 分配器 |
+| **可调试性** | 在 Python heap 统计中不易区分 | 在 `/proc/pid/maps` 中可见独立匿名映射，易于监控 |
+| **memoryview 兼容** | ✅ | ✅ `mmap` 对象支持 buffer protocol |
+| **显式生命周期** | ❌ 依赖引用计数/GC | ✅ `close()` 即销毁，适合大 buffer 管理 |
+
+选择 `mmap.mmap(-1, size)` 的核心理由：
+1. **确定性释放** — `close()` 对应 `munmap()`，内存立即归还 OS，不依赖 Python GC cycle
+2. **显式生命周期声明** — 代码意图清晰，后续维护者不会意外持有引用导致内存泄漏
+3. **OS 级内存管理** — 大 buffer 不经过 Python 内存分配器，避免堆碎片化
+4. **Buffer protocol 兼容** — `mmap` 对象支持 memoryview，可无缝对接 `@transferable` 的 `deserialize()`
 
 ### Rationale
 
@@ -564,30 +618,66 @@ def _call_chunked(self, method_name, data, total_size, *, name=None):
 
 #### Phase 3: 服务端接收重组 (server.py)
 
-**3.1 ChunkAssembler 数据结构**
+**3.1 ChunkAssembler 数据结构（基于匿名 mmap）**
 
 ```python
+import mmap
+
 @dataclass
 class _ChunkAssembler:
-    """Accumulates chunked frames for a single request."""
+    """Accumulates chunked frames for a single request.
+    
+    Uses anonymous mmap for the reassembly buffer to ensure deterministic
+    deallocation via close() → munmap(), rather than relying on Python GC.
+    """
     total_chunks: int
+    chunk_size: int
+    total_size: int
     route_name: str
     method_idx: int
-    chunks: list[bytes | None]
     received: int = 0
     created_at: float = field(default_factory=time.monotonic)
+    _buf: mmap.mmap | None = field(default=None, init=False)
+    _chunk_received: list[bool] = field(default_factory=list, init=False)
     
-    def add(self, idx: int, data: bytes) -> bool:
-        """Add a chunk. Returns True when all chunks received."""
-        if self.chunks[idx] is not None:
+    def __post_init__(self):
+        # Allocate anonymous mmap: -1 fd = MAP_ANONYMOUS, no file backing.
+        # OS manages pages lazily — only touched pages consume physical RAM.
+        self._buf = mmap.mmap(-1, self.total_size)
+        self._chunk_received = [False] * self.total_chunks
+    
+    def add(self, idx: int, data: bytes | memoryview) -> bool:
+        """Add a chunk at position idx. Returns True when all chunks received."""
+        if self._chunk_received[idx]:
             return False  # duplicate — ignore
-        self.chunks[idx] = data
+        offset = idx * self.chunk_size
+        data_len = len(data)
+        self._buf[offset : offset + data_len] = data
+        self._chunk_received[idx] = True
         self.received += 1
         return self.received == self.total_chunks
     
-    def assemble(self) -> bytes:
-        return b''.join(self.chunks)
+    def assemble(self) -> mmap.mmap:
+        """Return the mmap buffer directly. Caller owns the buffer and
+        MUST call .close() after deserialization to release memory."""
+        buf = self._buf
+        self._buf = None  # Transfer ownership to caller
+        buf.seek(0)
+        return buf
+    
+    def discard(self):
+        """Release the reassembly buffer (e.g., on timeout or error)."""
+        if self._buf is not None:
+            self._buf.close()  # munmap() — deterministic OS-level release
+            self._buf = None
 ```
+
+**关键设计：**
+- `mmap.mmap(-1, total_size)` 创建匿名 mmap：`fd=-1` 对应 `MAP_ANONYMOUS`，无文件后端
+- OS 采用 lazy page allocation — 仅被写入的页面消耗物理 RAM（如 1GB buffer 但只写入 512MB，只占 512MB）
+- `assemble()` 直接返回 `mmap` 对象（支持 buffer protocol），`@transferable.deserialize()` 可直接读取
+- `discard()` 在超时/错误时调用，`close()` → `munmap()` 确定性释放
+- `mmap` 对象支持 `memoryview`、切片写入、`seek()`+`read()` — 满足 deserialize 需求
 
 **3.2 服务端处理流程修改**
 
@@ -630,16 +720,19 @@ async def _process_chunked_frame(self, rid, flags, payload, conn, assemblers):
         logger.warning('Chunk frame for unknown RID %d (chunk %d)', rid, chunk_idx)
         return
     
-    # 4. Accumulate
+    # 4. Accumulate (write directly into mmap buffer at correct offset)
     complete = asm.add(chunk_idx, chunk_data)
     
     if complete:
-        full_payload = asm.assemble()
+        mmap_buf = asm.assemble()  # Returns mmap object, ownership transferred
         del assemblers[rid]
-        # 5. Dispatch to CRM
+        # 5. Dispatch to CRM — deserialize reads from mmap buffer protocol
         slot = self._resolve_slot(asm.route_name)
         method_name = slot.method_table.name_of(asm.method_idx)
-        await self._execute_and_reply(conn, rid, slot, method_name, full_payload, ...)
+        try:
+            await self._execute_and_reply(conn, rid, slot, method_name, mmap_buf, ...)
+        finally:
+            mmap_buf.close()  # munmap() — deterministic release
 ```
 
 **3.3 Chunk Assembler GC (超时清理)**
@@ -653,9 +746,10 @@ async def _gc_chunk_assemblers(self, assemblers: dict):
     expired = [rid for rid, asm in assemblers.items()
                if now - asm.created_at > _CHUNK_TIMEOUT]
     for rid in expired:
+        asm = assemblers.pop(rid)
         logger.warning('Chunk sequence RID=%d timed out (%d/%d received)',
-                       rid, assemblers[rid].received, assemblers[rid].total_chunks)
-        del assemblers[rid]
+                       rid, asm.received, asm.total_chunks)
+        asm.discard()  # munmap() — deterministic release of partial reassembly buffer
 ```
 
 #### Phase 4: 响应分块 (双向)
@@ -674,7 +768,69 @@ async def _send_chunked_v2_reply(self, conn, rid, result_bytes, writer):
         ...
 ```
 
-客户端 `_recv_loop` 中对称地实现 chunk 重组。
+客户端 `_recv_loop` 中对称地实现 chunk 重组，同样使用匿名 mmap 做 reassembly buffer：
+
+```python
+# client.py: _recv_loop 中的响应分块重组
+
+class _ReplyChunkAssembler:
+    """Client-side reply chunk reassembly using anonymous mmap."""
+    
+    def __init__(self, total_chunks: int, chunk_size: int, total_size: int):
+        self._buf = mmap.mmap(-1, total_size)
+        self._chunk_size = chunk_size
+        self._chunk_received = [False] * total_chunks
+        self.total_chunks = total_chunks
+        self.received = 0
+    
+    def add(self, idx: int, data: bytes | memoryview) -> bool:
+        offset = idx * self._chunk_size
+        self._buf[offset : offset + len(data)] = data
+        if not self._chunk_received[idx]:
+            self._chunk_received[idx] = True
+            self.received += 1
+        return self.received == self.total_chunks
+    
+    def assemble(self) -> bytes:
+        """Return reassembled bytes. Closes mmap immediately after copy."""
+        self._buf.seek(0)
+        result = self._buf.read()  # One contiguous read
+        self._buf.close()           # munmap() — deterministic release
+        self._buf = None
+        return result
+    
+    def discard(self):
+        if self._buf is not None:
+            self._buf.close()
+            self._buf = None
+
+# In _recv_loop:
+_reply_assemblers: dict[int, _ReplyChunkAssembler] = {}
+
+if flags & FLAG_CHUNKED:
+    chunk_idx, total_chunks = decode_chunk_header(payload, offset)
+    
+    if rid not in _reply_assemblers:
+        total_size = total_chunks * chunk_size  # chunk_size from handshake
+        _reply_assemblers[rid] = _ReplyChunkAssembler(
+            total_chunks, chunk_size, total_size)
+    
+    asm = _reply_assemblers[rid]
+    chunk_data = shm_data if is_buddy else inline_data
+    complete = asm.add(chunk_idx, chunk_data)
+    
+    if is_buddy:
+        self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+    
+    if complete:
+        result = asm.assemble()  # bytes — mmap already closed inside
+        del _reply_assemblers[rid]
+        pending = self._pending.get(rid)
+        if pending:
+            pending.set_result(result, None)
+```
+
+**注意：** 客户端 `assemble()` 返回 `bytes` 而非 `mmap`，因为结果要传回用户代码（`@transferable.deserialize()` 通常期望 `bytes`）。`mmap_buf.read()` → `close()` 的组合确保 mmap buffer 在拷贝出 bytes 后立即释放，峰值内存 = 2× payload（mmap + bytes），持续时间仅为 `read()` + `close()` 之间。
 
 #### Phase 5: Relay 兼容 (relay.py + Rust relay)
 
@@ -751,6 +907,25 @@ roadmap §2.1 "SHM Pool 动态扩容" 应更新为：
 - [ ] 确认 Rust relay 是否需要在 P1 同步支持分块，还是先只做 Python relay
 - [ ] 更新 `doc/plan/c-two-rpc-v2-roadmap.md` 中的 §2.1 和 §4.2
 - [ ] 创建实现任务拆分
+- [ ] 评估是否需要在 Rust buddy allocator 的 `expand()` 和 `DedicatedSegment::create()` 中加入可用内存预检查
+
+### 附录：SHM 跨平台 OOM 行为分析
+
+POSIX SHM 在所有目标平台上**都不是磁盘溢出兜底机制**，会导致 OOM：
+
+| 平台 | SHM 后端 | OOM 风险 |
+|------|----------|----------|
+| **Linux** | `/dev/shm` (tmpfs) — 纯 RAM+swap 支撑，默认上限 50% 物理 RAM | ⚠️ 超出后 `shm_open` 失败或触发 OOM killer |
+| **macOS** | VM 子系统支撑，可被换出到 swap (compressed memory) | ⚠️ 过度分配导致 memory pressure，可能被系统杀进程 |
+| **Windows** | `CreateFileMapping(INVALID_HANDLE)` → pagefile 支撑 | ⚠️ 不是真实文件，消耗 commit charge |
+
+**当前 L0 检查缺陷（`registry.py:599-618`）：**
+- 检查 `seg > phys_ram` — 仅检查物理总量，不检查当前可用内存
+- 如果系统已占用 80% 内存，剩余 20%，L0 不会拦截新 segment 创建
+- Rust 层 `ShmSegment::create()` / `DedicatedSegment::create()` 无任何内存预检查
+- 存在 TOCTOU 竞态（check 和 allocate 之间其他进程可能抢占内存）
+
+**缓解策略：** 优雅降级（已有 inline fallback）+ chunked streaming（本方案 A）比内存预检查更健壮 — 通过控制单次 alloc 的粒度（chunk_size）来降低 OOM 触发概率，而非依赖不可靠的预检查。匿名 mmap 做 reassembly buffer 同样受 OS 内存限制，但 `mmap(-1, size)` 的 lazy page allocation 意味着只有被写入的页面消耗物理 RAM。
 
 ## Status History
 
@@ -758,6 +933,7 @@ roadmap §2.1 "SHM Pool 动态扩容" 应更新为：
 |------|--------|-------|
 | 2026-03-28 | 🔴 Not Started | Spike created and scoped |
 | 2026-03-28 | 🟡 In Progress | 完成全栈审计 + 三方案对比 + 推荐方案 A 及详细实现路径 |
+| 2026-03-28 | 🟡 In Progress | 修正 dedicated segment 描述；更新内存模型分析；引入 `mmap.mmap(-1, size)` 做 reassembly buffer 替代 `bytearray`；新增 SHM OOM 跨平台分析 |
 
 ---
 
