@@ -8,7 +8,7 @@ from . import error
 from .compo import runtime
 from .crm.meta import icrm, read, write, on_shutdown
 from .rpc.transferable import transferable
-from .rpc_v2.registry import (
+from .transport.registry import (
     set_address,
     set_ipc_config,
     register,
