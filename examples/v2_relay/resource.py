@@ -49,14 +49,8 @@ def main():
         print('[Grid Server] No C2_RELAY_ADDRESS set — relay disabled')
 
     print('[Grid Server] Waiting for clients… (Ctrl-C to stop)\n')
-
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    stop.wait()
-
-    cc.unregister('grid')
-    cc.shutdown()
-    print('\n[Grid Server] Shut down.')
+    
+    cc.serve()
 
 
 if __name__ == '__main__':
