@@ -131,19 +131,28 @@ class Scheduler:
         self._pending_count = 0
         self._drain_event = threading.Event()
         self._drain_event.set()
+        # Pre-compute hot-path flags.
+        self._has_capacity_limit = config is not None and config.max_pending is not None
+        self._is_exclusive = self._config.mode is ConcurrencyMode.EXCLUSIVE
+        self._is_parallel = self._config.mode is ConcurrencyMode.PARALLEL
 
         effective_workers = self._config.max_workers
         if effective_workers is None and self._config.mode is ConcurrencyMode.EXCLUSIVE:
             effective_workers = 1
 
-        self._executor = ThreadPoolExecutor(
-            max_workers=effective_workers,
-            thread_name_prefix='c2v2_worker',
-        )
+        # Executor kept for backward compatibility (v1 dispatch path)
+        # but _FastDispatcher is the primary dispatch mechanism.
+        self._executor: ThreadPoolExecutor | None = None
+        self._executor_workers = effective_workers
 
     @property
     def executor(self) -> ThreadPoolExecutor:
-        """The underlying executor — pass to ``loop.run_in_executor()``."""
+        """The underlying executor — lazy creation for backward compatibility."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._executor_workers,
+                thread_name_prefix='c2v2_worker',
+            )
         return self._executor
 
     @property
@@ -161,37 +170,61 @@ class Scheduler:
         args_bytes: bytes | memoryview,
         access_mode: MethodAccess = MethodAccess.WRITE,
     ) -> Any:
-        """Execute *method(args_bytes)* with the appropriate concurrency guard.
-
-        Designed to be called from ``loop.run_in_executor(sched.executor,
-        sched.execute, method, args, access)``.  The pending counter is
-        incremented before submission and decremented here on completion.
-        """
+        """Execute *method(args_bytes)* with the appropriate concurrency guard."""
         try:
-            with self._execution_guard(access_mode):
+            if self._is_parallel:
+                return method(args_bytes)
+            if self._is_exclusive:
+                with self._exclusive_lock:
+                    return method(args_bytes)
+            # READ_PARALLEL
+            if access_mode is MethodAccess.READ:
+                with self._rw_lock.read_lock():
+                    return method(args_bytes)
+            with self._rw_lock.write_lock():
                 return method(args_bytes)
         finally:
             with self._state_lock:
                 self._pending_count -= 1
-                if self._pending_count == 0:
+                if self._shutdown_flag and self._pending_count == 0:
                     self._drain_event.set()
 
-    def begin(self) -> None:
-        """Increment pending counter before dispatching to the executor.
+    def execute_fast(
+        self,
+        method: Callable[..., Any],
+        args_bytes: bytes | memoryview,
+        access_mode: MethodAccess = MethodAccess.WRITE,
+    ) -> Any:
+        """Like execute() but without pending-count tracking.
 
-        Must be called on the **caller** side (e.g. asyncio event loop thread)
-        before ``loop.run_in_executor(sched.executor, sched.execute, ...)``.
+        Used by _FastDispatcher where task lifecycle is managed by asyncio.
+        Caller must ensure shutdown() waits for tasks via other means.
         """
-        with self._state_lock:
-            if self._shutdown_flag:
-                raise RuntimeError('Scheduler is shut down')
-            if (self._config.max_pending is not None
-                    and self._pending_count >= self._config.max_pending):
-                raise RuntimeError(
-                    f'Scheduler at capacity ({self._config.max_pending} pending)',
-                )
-            self._pending_count += 1
-            self._drain_event.clear()
+        if self._is_parallel:
+            return method(args_bytes)
+        if self._is_exclusive:
+            with self._exclusive_lock:
+                return method(args_bytes)
+        if access_mode is MethodAccess.READ:
+            with self._rw_lock.read_lock():
+                return method(args_bytes)
+        with self._rw_lock.write_lock():
+            return method(args_bytes)
+
+    def begin(self) -> None:
+        """Increment pending counter before dispatching to the executor."""
+        if self._shutdown_flag:
+            raise RuntimeError('Scheduler is shut down')
+        if self._has_capacity_limit:
+            with self._state_lock:
+                if (self._pending_count >= self._config.max_pending):
+                    raise RuntimeError(
+                        f'Scheduler at capacity ({self._config.max_pending} pending)',
+                    )
+                self._pending_count += 1
+        else:
+            with self._state_lock:
+                self._pending_count += 1
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -204,14 +237,15 @@ class Scheduler:
                 return
             self._shutdown_flag = True
         self._drain_event.wait()
-        self._executor.shutdown(wait=True)
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     @contextmanager
-    def _execution_guard(self, access_mode: MethodAccess):
+    def execution_guard(self, access_mode: MethodAccess):
         if self._config.mode is ConcurrencyMode.EXCLUSIVE:
             with self._exclusive_lock:
                 yield

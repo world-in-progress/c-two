@@ -217,63 +217,57 @@ def encode_v2_inline_call_frame(
 # ---------------------------------------------------------------------------
 
 
+_V2_BUDDY_REPLY_FLAGS = FLAG_RESPONSE | FLAG_BUDDY | FLAG_REPLY_V2
+_V2_INLINE_REPLY_FLAGS = FLAG_RESPONSE | FLAG_REPLY_V2
+_BUDDY_REPLY_PAYLOAD_LEN = BUDDY_PAYLOAD_STRUCT.size + 1  # 11B buddy + 1B status
+
+
 def encode_v2_buddy_reply_frame(
     request_id: int,
     seg_idx: int,
     offset: int,
     data_size: int,
     is_dedicated: bool,
-) -> bytes:
-    """Build a v2 buddy success reply frame.
-
-    Frame layout::
-
-        [16B header (flags=FLAG_RESPONSE|FLAG_BUDDY|FLAG_REPLY_V2)]
-        [11B buddy_payload]
-        [1B status=SUCCESS]
-    """
-    buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
-    ctrl = encode_reply_control(STATUS_SUCCESS)
-    payload = buddy + ctrl
-    flags = FLAG_RESPONSE | FLAG_BUDDY | FLAG_REPLY_V2
-    return encode_frame(request_id, flags, payload)
+) -> bytearray:
+    """Build a v2 buddy success reply frame (single allocation, no copy)."""
+    total_len = 12 + _BUDDY_REPLY_PAYLOAD_LEN
+    buf = bytearray(4 + total_len)
+    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _V2_BUDDY_REPLY_FLAGS)
+    BUDDY_PAYLOAD_STRUCT.pack_into(
+        buf, 16, seg_idx, offset, data_size, 1 if is_dedicated else 0,
+    )
+    buf[16 + BUDDY_PAYLOAD_STRUCT.size] = STATUS_SUCCESS
+    return buf
 
 
 def encode_v2_inline_reply_frame(
     request_id: int,
     result_data: bytes | memoryview | None = None,
-) -> bytes:
-    """Build a v2 inline success reply frame (small result).
-
-    Frame layout::
-
-        [16B header (flags=FLAG_RESPONSE|FLAG_REPLY_V2)]
-        [1B status=SUCCESS]
-        [inline_result_data]
-    """
-    ctrl = encode_reply_control(STATUS_SUCCESS)
-    if result_data:
-        payload = ctrl + bytes(result_data)
-    else:
-        payload = ctrl
-    flags = FLAG_RESPONSE | FLAG_REPLY_V2
-    return encode_frame(request_id, flags, payload)
+) -> bytearray:
+    """Build a v2 inline success reply frame (single allocation, no copy)."""
+    data_len = len(result_data) if result_data else 0
+    total_len = 12 + 1 + data_len
+    buf = bytearray(4 + total_len)
+    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _V2_INLINE_REPLY_FLAGS)
+    buf[16] = STATUS_SUCCESS
+    if data_len > 0:
+        buf[17:17 + data_len] = result_data
+    return buf
 
 
 def encode_v2_error_reply_frame(
     request_id: int,
     error_data: bytes,
-) -> bytes:
-    """Build a v2 error reply frame (always inline, no buddy SHM).
-
-    Frame layout::
-
-        [16B header (flags=FLAG_RESPONSE|FLAG_REPLY_V2)]
-        [1B status=ERROR][4B error_len LE][error_bytes]
-    """
-    ctrl = encode_reply_control(STATUS_ERROR, error_data)
-    flags = FLAG_RESPONSE | FLAG_REPLY_V2
-    return encode_frame(request_id, flags, ctrl)
+) -> bytearray:
+    """Build a v2 error reply frame (single allocation, no copy)."""
+    err_len = len(error_data)
+    total_len = 12 + 1 + 4 + err_len
+    buf = bytearray(4 + total_len)
+    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _V2_INLINE_REPLY_FLAGS)
+    buf[16] = STATUS_ERROR
+    _U32.pack_into(buf, 17, err_len)
+    buf[21:21 + err_len] = error_data
+    return buf
 
 
 # ---------------------------------------------------------------------------

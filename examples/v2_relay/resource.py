@@ -1,15 +1,16 @@
-"""Grid CRM server — standalone IPC process.
+"""Grid CRM server — standalone IPC process with relay auto-registration.
 
-Registers the Grid CRM over IPC v3.  A separate relay process
-(``relay_server.py``) can then bridge HTTP traffic to this server.
+Registers the Grid CRM over IPC v3.  When ``C2_RELAY_ADDRESS`` is set,
+``cc.register()`` automatically notifies the relay server, making the
+Grid CRM accessible via HTTP.
 
 Usage (3-terminal workflow):
 
-    # Terminal 1 — start the Grid CRM
-    uv run python examples/v2_relay/resource.py
-
-    # Terminal 2 — start the HTTP relay (connects to Grid's IPC)
+    # Terminal 1 — start the relay
     uv run python examples/v2_relay/relay_server.py
+
+    # Terminal 2 — start the Grid CRM (auto-registers with relay)
+    C2_RELAY_ADDRESS=http://127.0.0.1:8080 uv run python examples/v2_relay/resource.py
 
     # Terminal 3 — send HTTP requests
     uv run python examples/v2_relay/http_client.py
@@ -40,7 +41,14 @@ def main():
 
     cc.register(IGrid, grid, name='grid')
     print(f'[Grid Server] CRM registered at {cc.server_address()}')
-    print('[Grid Server] Waiting for relay / clients… (Ctrl-C to stop)\n')
+
+    relay = os.environ.get('C2_RELAY_ADDRESS')
+    if relay:
+        print(f'[Grid Server] Auto-registered with relay at {relay}')
+    else:
+        print('[Grid Server] No C2_RELAY_ADDRESS set — relay disabled')
+
+    print('[Grid Server] Waiting for clients… (Ctrl-C to stop)\n')
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())

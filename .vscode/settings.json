@@ -1,5 +1,5 @@
 {
   "rust-analyzer.linkedProjects": [
-    "src/c_two/buddy/_buddy_core/Cargo.toml",
+    "src/c_two/_native/Cargo.toml",
   ]
 }

@@ -21,7 +21,7 @@ Typical usage::
 """
 from __future__ import annotations
 
-from ._buddy_core import (
+from c_two._native import (
     BuddyPoolHandle,
     PoolAlloc,
     PoolConfig,

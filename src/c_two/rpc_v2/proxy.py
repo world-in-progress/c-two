@@ -35,7 +35,12 @@ Usage::
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
+
+from ..crm.meta import MethodAccess
+
+if TYPE_CHECKING:
+    from .scheduler import Scheduler
 
 
 class ICRMProxy:
@@ -54,6 +59,7 @@ class ICRMProxy:
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
         '_closed', '_on_terminate',
+        '_scheduler', '_access_map',
     )
 
     # ------------------------------------------------------------------
@@ -65,12 +71,24 @@ class ICRMProxy:
         cls,
         crm_instance: object,
         *,
+        scheduler: Scheduler | None = None,
+        access_map: dict[str, MethodAccess] | None = None,
         on_terminate: Callable[[], None] | None = None,
     ) -> ICRMProxy:
         """Create a thread-local proxy (same process, no serialization).
 
         ``supports_direct_call`` is ``True`` — the ``auto_transfer``
         wrapper will call :meth:`call_direct` instead of :meth:`call`.
+
+        Parameters
+        ----------
+        scheduler:
+            Optional :class:`Scheduler` for read/write concurrency control.
+            When provided, ``call_direct`` wraps method execution in
+            the scheduler's execution guard.
+        access_map:
+            Mapping from method name → :class:`MethodAccess`.  Required
+            when *scheduler* is provided.
         """
         proxy = object.__new__(cls)
         proxy._mode = 'thread'
@@ -79,6 +97,8 @@ class ICRMProxy:
         proxy._name = ''
         proxy._closed = False
         proxy._on_terminate = on_terminate
+        proxy._scheduler = scheduler
+        proxy._access_map = access_map
         return proxy
 
     @classmethod
@@ -101,6 +121,8 @@ class ICRMProxy:
         proxy._name = name
         proxy._closed = False
         proxy._on_terminate = on_terminate
+        proxy._scheduler = None
+        proxy._access_map = None
         return proxy
 
     @classmethod
@@ -123,6 +145,8 @@ class ICRMProxy:
         proxy._name = name
         proxy._closed = False
         proxy._on_terminate = on_terminate
+        proxy._scheduler = None
+        proxy._access_map = None
         return proxy
 
     # ------------------------------------------------------------------
@@ -151,6 +175,9 @@ class ICRMProxy:
     def call_direct(self, method_name: str, args: tuple) -> Any:
         """Call CRM method directly with Python objects (thread-local mode).
 
+        When a :class:`Scheduler` is attached, the call is wrapped in
+        the scheduler's execution guard to enforce read/write isolation.
+
         Raises :class:`NotImplementedError` in IPC mode.
         """
         if self._closed:
@@ -164,7 +191,11 @@ class ICRMProxy:
             raise AttributeError(
                 f'{type(self._crm).__name__} has no method {method_name!r}',
             )
-        return method(*args)
+        if self._scheduler is None:
+            return method(*args)
+        access = self._access_map.get(method_name, MethodAccess.WRITE) if self._access_map else MethodAccess.WRITE
+        with self._scheduler.execution_guard(access):
+            return method(*args)
 
     def relay(self, event_bytes: bytes) -> bytes:
         """Relay raw wire bytes to the server (IPC mode only)."""

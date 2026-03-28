@@ -5,7 +5,9 @@
       "Bash(grep:*)",
       "Bash(wc:*)",
       "Bash(uv run:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(python -m pytest tests/ -x -q --timeout=30 -k \"server or rpc_v2 or ipc\")",
+      "Bash(find /Users/soku/Desktop/codespace/WorldInProgress/c-two -name *.rs -type f)"
     ]
   }
 }

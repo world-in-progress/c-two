@@ -17,6 +17,7 @@ import ctypes
 import inspect
 import logging
 import os
+import queue
 import re
 import struct
 import threading
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import error
-from ..crm.meta import MethodAccess, get_method_access
+from ..crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ..rpc.event.msg_type import MsgType
 from ..rpc.util.wire import (
     decode,
@@ -69,6 +70,7 @@ from .wire import (
     encode_v2_buddy_reply_frame,
     encode_v2_inline_reply_frame,
     encode_v2_error_reply_frame,
+    _U16,
 )
 from .scheduler import Scheduler, ConcurrencyConfig
 
@@ -100,6 +102,37 @@ class _Connection:
     remote_segment_sizes: list[int] = field(default_factory=list)
     handshake_done: bool = False
     v2_mode: bool = False
+    # In-flight submit_inline request counter.  Incremented on the event
+    # loop thread before submitting; decremented by worker threads via
+    # call_soon_threadsafe.  The _idle event is set when the count drops
+    # to zero, allowing _handle_client's finally block to wait for all
+    # pending replies before closing the writer.
+    _inflight: int = field(default=0, repr=False)
+    _idle: asyncio.Event | None = field(default=None, repr=False)
+
+    def init_flight_tracking(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._idle = asyncio.Event()
+        self._idle.set()  # starts idle
+        self._loop = loop
+
+    def flight_inc(self) -> None:
+        """Mark a submit_inline request as in-flight (call from event loop)."""
+        self._inflight += 1
+        if self._idle is not None and self._idle.is_set():
+            self._idle.clear()
+
+    def flight_dec(self) -> None:
+        """Mark a submit_inline request as completed (call from event loop via call_soon_threadsafe)."""
+        self._inflight -= 1
+        if self._inflight <= 0:
+            self._inflight = 0
+            if self._idle is not None:
+                self._idle.set()
+
+    async def wait_idle(self) -> None:
+        """Wait until all in-flight submit_inline requests complete."""
+        if self._idle is not None and not self._idle.is_set():
+            await self._idle.wait()
 
     def cleanup(self) -> None:
         self.seg_views = []
@@ -124,6 +157,147 @@ class CRMSlot:
     method_table: MethodTable
     scheduler: Scheduler
     methods: list[str]
+    shutdown_method: str | None = None
+    # Pre-built dispatch table: method_name → (callable, MethodAccess).
+    _dispatch_table: dict[str, tuple[Any, MethodAccess]] = field(
+        default_factory=dict, repr=False,
+    )
+
+    def build_dispatch_table(self) -> None:
+        """Populate the dispatch table from the ICRM instance.
+
+        Skips the ``@cc.on_shutdown`` method (not RPC-callable).
+        """
+        for name in self.methods:
+            if name == self.shutdown_method:
+                continue
+            method = getattr(self.icrm, name, None)
+            if method is not None:
+                self._dispatch_table[name] = (method, get_method_access(method))
+
+
+_SENTINEL = None  # Poison pill for dispatcher shutdown
+
+
+class _FastDispatcher:
+    """Lightweight CRM method dispatcher using SimpleQueue.
+
+    Replaces ThreadPoolExecutor to avoid _WorkItem wrapping, heavy Queue
+    locks, and per-submission Future creation overhead.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, num_workers: int = 2) -> None:
+        self._loop = loop
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._workers: list[threading.Thread] = []
+        for i in range(num_workers):
+            t = threading.Thread(
+                target=self._worker, daemon=True, name=f'c2v2_fast_{i}',
+            )
+            t.start()
+            self._workers.append(t)
+
+    def submit(
+        self,
+        sched_execute,
+        method,
+        args_bytes,
+        access,
+        future: asyncio.Future,
+    ) -> None:
+        self._q.put((sched_execute, method, args_bytes, access, future, None, None, None, None))
+
+    def submit_inline(
+        self,
+        sched_execute,
+        method,
+        args_bytes,
+        access,
+        request_id: int,
+        writer,
+        barrier=None,
+        flight_dec=None,
+    ) -> None:
+        """Fire-and-forget: worker builds inline reply frame and writes directly.
+
+        If *barrier* is an ``asyncio.Event``, the worker will call
+        ``barrier.set()`` (via ``call_soon_threadsafe``) after execution
+        completes, allowing the read loop to resume.  Used for ``@cc.write``
+        methods to guarantee per-connection causal ordering.
+
+        If *flight_dec* is provided, the worker will call it (via
+        ``call_soon_threadsafe``) in the finally block to decrement the
+        connection's in-flight counter.
+        """
+        self._q.put((sched_execute, method, args_bytes, access, None, request_id, writer, barrier, flight_dec))
+
+    def shutdown(self) -> None:
+        for _ in self._workers:
+            self._q.put(_SENTINEL)
+        for t in self._workers:
+            t.join(timeout=2.0)
+
+    def _worker(self) -> None:
+        loop = self._loop
+        q = self._q
+        call_soon = loop.call_soon_threadsafe
+        while True:
+            item = q.get()
+            if item is _SENTINEL:
+                break
+            sched_execute, method, args_bytes, access, future, request_id, writer, barrier, flight_dec = item
+            try:
+                result = sched_execute(method, args_bytes, access)
+                if future is not None:
+                    call_soon(future.set_result, result)
+                else:
+                    # Fire-and-forget: build reply and write directly
+                    self._write_inline_reply(call_soon, writer, request_id, result)
+            except BaseException as exc:
+                if future is not None:
+                    call_soon(future.set_exception, exc)
+                else:
+                    self._write_error_reply(call_soon, writer, request_id, exc)
+            finally:
+                if barrier is not None:
+                    call_soon(barrier.set)
+                if flight_dec is not None:
+                    call_soon(flight_dec)
+
+    @staticmethod
+    def _write_inline_reply(call_soon, writer, request_id, result):
+        """Build inline reply frame from ICRM result and write."""
+        if isinstance(result, tuple):
+            err_part = result[0] if result[0] else b''
+            res_part = result[1] if len(result) > 1 and result[1] else b''
+            if isinstance(err_part, memoryview):
+                err_part = bytes(err_part)
+            if isinstance(res_part, memoryview):
+                res_part = bytes(res_part)
+        elif result is None:
+            res_part, err_part = b'', b''
+        elif isinstance(result, memoryview):
+            res_part, err_part = bytes(result), b''
+        else:
+            res_part, err_part = result, b''
+
+        if err_part:
+            frame = encode_v2_error_reply_frame(request_id, err_part)
+        else:
+            frame = encode_v2_inline_reply_frame(request_id, res_part)
+        call_soon(writer.write, frame)
+
+    @staticmethod
+    def _write_error_reply(call_soon, writer, request_id, exc):
+        """Build error reply frame from exception and write."""
+        try:
+            if hasattr(exc, 'serialize'):
+                err_bytes = exc.serialize()
+            else:
+                err_bytes = str(exc).encode('utf-8')
+        except Exception:
+            err_bytes = b'Internal server error'
+        call_soon(writer.write, encode_v2_error_reply_frame(request_id, err_bytes))
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +355,7 @@ class ServerV2:
         # Multi-CRM slots: name → CRMSlot.
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
+        self._slots_generation: int = 0
         self._default_name: str | None = None
         self._default_concurrency = concurrency or ConcurrencyConfig(
             max_workers=max_workers,
@@ -238,9 +413,14 @@ class ServerV2:
         routing_name = name if name is not None else self._extract_namespace(icrm_class)
         icrm = self._create_icrm(icrm_class, crm_instance)
         methods = self._discover_methods(icrm_class)
-        method_table = MethodTable.from_methods(methods)
         cc_config = concurrency or self._default_concurrency
         scheduler = Scheduler(cc_config)
+        sd_method = get_shutdown_method(icrm_class)
+
+        # Exclude shutdown method from RPC-visible method list.
+        if sd_method is not None:
+            methods = [m for m in methods if m != sd_method]
+        method_table = MethodTable.from_methods(methods)
 
         slot = CRMSlot(
             name=routing_name,
@@ -248,25 +428,51 @@ class ServerV2:
             method_table=method_table,
             scheduler=scheduler,
             methods=methods,
+            shutdown_method=sd_method,
         )
+        slot.build_dispatch_table()
         with self._slots_lock:
             if routing_name in self._slots:
                 scheduler.shutdown()
                 raise ValueError(f'Name already registered: {routing_name!r}')
             self._slots[routing_name] = slot
+            self._slots_generation += 1
             if self._default_name is None:
                 self._default_name = routing_name
         return routing_name
 
     def unregister_crm(self, name: str) -> None:
-        """Unregister a CRM by its routing name."""
+        """Unregister a CRM by its routing name.
+
+        Invokes the ``@cc.on_shutdown`` method (if declared) on the
+        underlying CRM instance before shutting down the scheduler.
+        """
         with self._slots_lock:
             slot = self._slots.pop(name, None)
             if slot is None:
                 raise KeyError(f'Name not registered: {name!r}')
+            self._slots_generation += 1
             if self._default_name == name:
                 self._default_name = next(iter(self._slots), None)
+        self._invoke_shutdown(slot)
         slot.scheduler.shutdown()
+
+    def get_slot_info(
+        self, name: str,
+    ) -> tuple[Scheduler, dict[str, MethodAccess]]:
+        """Return the Scheduler and method access map for a registered CRM.
+
+        Used by the registry to inject concurrency control into
+        thread-local proxies.
+        """
+        with self._slots_lock:
+            slot = self._slots.get(name)
+        if slot is None:
+            raise KeyError(f'Name not registered: {name!r}')
+        access_map = {
+            mname: access for mname, (_, access) in slot._dispatch_table.items()
+        }
+        return slot.scheduler, access_map
 
     @property
     def names(self) -> list[str]:
@@ -301,13 +507,18 @@ class ServerV2:
         return tag.split('/')[0] if tag else ''
 
     def _resolve_slot(self, name: str) -> CRMSlot | None:
-        """Look up a CRM slot by routing name (empty → default)."""
-        with self._slots_lock:
-            if name:
-                return self._slots.get(name)
-            if self._default_name is not None:
-                return self._slots.get(self._default_name)
-            return None
+        """Look up a CRM slot by routing name (empty → default).
+
+        Uses direct dict read (safe on CPython; asyncio hot path is
+        single-threaded).  The _slots_lock is only needed for mutations.
+        """
+        slots = self._slots
+        if name:
+            return slots.get(name)
+        dn = self._default_name
+        if dn is not None:
+            return slots.get(dn)
+        return None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -334,6 +545,7 @@ class ServerV2:
 
     async def _async_main(self) -> None:
         self._shutdown_event = asyncio.Event()
+        self._dispatcher = _FastDispatcher(asyncio.get_running_loop())
 
         os.makedirs(os.path.dirname(self._socket_path), exist_ok=True)
         if os.path.exists(self._socket_path):
@@ -343,6 +555,12 @@ class ServerV2:
             self._handle_client,
             path=self._socket_path,
         )
+        # Restrict socket access to the owning user (defense-in-depth
+        # for multi-user HPC nodes where /tmp is shared).
+        try:
+            os.chmod(self._socket_path, 0o600)
+        except OSError:
+            pass
         self._started.set()
         logger.debug('ServerV2 listening on %s', self._socket_path)
 
@@ -353,6 +571,7 @@ class ServerV2:
             task.cancel()
         if self._client_tasks:
             await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        self._dispatcher.shutdown()
         self._server.close()
         await self._server.wait_closed()
         with self._slots_lock:
@@ -363,8 +582,16 @@ class ServerV2:
     def shutdown(self) -> None:
         """Signal the server to shut down and wait for the loop thread.
 
-        Safe to call multiple times — subsequent calls are no-ops.
+        Invokes ``@cc.on_shutdown`` methods on all registered CRMs
+        before tearing down the event loop.  Safe to call multiple
+        times — subsequent calls are no-ops.
         """
+        # Invoke shutdown callbacks before stopping the loop.
+        with self._slots_lock:
+            slots_snapshot = list(self._slots.values())
+        for slot in slots_snapshot:
+            self._invoke_shutdown(slot)
+
         if self._loop is not None and self._shutdown_event is not None:
             try:
                 self._loop.call_soon_threadsafe(self._shutdown_event.set)
@@ -379,6 +606,32 @@ class ServerV2:
             pass
 
     # ------------------------------------------------------------------
+    # Shutdown callback helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _invoke_shutdown(slot: CRMSlot) -> None:
+        """Best-effort invocation of a CRM's ``@cc.on_shutdown`` method."""
+        sd = slot.shutdown_method
+        if sd is None:
+            return
+        # slot.icrm is the ICRM *wrapper* (created by _create_icrm), not
+        # the CRM instance itself.  The actual CRM is stored as
+        # slot.icrm.crm — the @on_shutdown method is defined on the CRM
+        # class, so we resolve it from the underlying instance.
+        crm = getattr(slot.icrm, 'crm', None)
+        if crm is None:
+            return
+        try:
+            getattr(crm, sd)()
+        except Exception:
+            logger.warning(
+                'Error in @on_shutdown method %s.%s for CRM %r',
+                type(crm).__name__, sd, slot.name,
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
     # Client handler
     # ------------------------------------------------------------------
 
@@ -390,11 +643,21 @@ class ServerV2:
         self._conn_counter += 1
         conn_id = self._conn_counter
         conn = _Connection(conn_id=conn_id, writer=writer, config=self._config)
+        conn.init_flight_tracking(asyncio.get_running_loop())
         task = asyncio.current_task()
         self._client_tasks.append(task)
 
+        # Pipelined dispatch: read next frame while previous dispatches
+        # are still executing in the thread pool.
+        pending: set[asyncio.Task] = set()
+
         try:
             max_frame = self._config.max_frame_size
+            slots = self._slots
+            default_name = self._default_name
+            dispatcher = self._dispatcher
+            dispatch_cache: dict[tuple[bytes, int], tuple] = {}
+            cache_gen = self._slots_generation
             while True:
                 header = await reader.readexactly(16)
                 total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -411,7 +674,7 @@ class ServerV2:
                     else b''
                 )
 
-                # Dispatch.
+                # Handshake & control: must complete before reading more.
                 if flags & FLAG_HANDSHAKE:
                     await self._handle_handshake(conn, payload, writer)
                     continue
@@ -421,14 +684,97 @@ class ServerV2:
                 is_v2_call = bool(flags & FLAG_CALL_V2)
                 is_buddy = bool(flags & FLAG_BUDDY)
 
+                # Fast inline path for v2 non-buddy calls:
+                # parse + dispatch table lookup + submit all without Task.
+                if is_v2_call and not is_buddy:
+                    name_len = payload[0]
+                    try:
+                        if name_len:
+                            route_key = payload[1:1 + name_len]
+                            method_idx = _U16.unpack_from(payload, 1 + name_len)[0]
+                            args_start = 3 + name_len
+                        else:
+                            route_key = b''
+                            method_idx = _U16.unpack_from(payload, 1)[0]
+                            args_start = 3
+                    except (struct.error, UnicodeDecodeError) as exc:
+                        writer.write(encode_v2_error_reply_frame(
+                            request_id,
+                            f'Malformed v2 call control: {exc}'.encode('utf-8'),
+                        ))
+                        continue
+                    args_bytes = payload[args_start:] if args_start < len(payload) else b''
+
+                    # Invalidate dispatch cache when CRM registrations change.
+                    cur_gen = self._slots_generation
+                    if cur_gen != cache_gen:
+                        dispatch_cache.clear()
+                        cache_gen = cur_gen
+                        slots = self._slots
+                        default_name = self._default_name
+
+                    # Combined cache: (route_bytes, method_idx) → dispatch tuple
+                    cache_key = (bytes(route_key), method_idx)
+                    cached = dispatch_cache.get(cache_key)
+                    if cached is not None:
+                        exec_fast, method, access = cached
+                        conn.flight_inc()
+                        if access is MethodAccess.WRITE:
+                            barrier = asyncio.Event()
+                            dispatcher.submit_inline(
+                                exec_fast, method, args_bytes, access,
+                                request_id, writer, barrier, conn.flight_dec,
+                            )
+                            await barrier.wait()
+                        else:
+                            dispatcher.submit_inline(
+                                exec_fast, method, args_bytes, access,
+                                request_id, writer, None, conn.flight_dec,
+                            )
+                        continue
+
+                    route_name = route_key.decode('utf-8') if route_key else ''
+                    slot = (slots.get(route_name) if route_name
+                            else slots.get(default_name or ''))
+                    if slot is not None:
+                        method_name = slot.method_table._idx_to_name.get(method_idx)
+                        if method_name is not None:
+                            entry = slot._dispatch_table.get(method_name)
+                            if entry is not None:
+                                method, access = entry
+                                dispatch_cache[cache_key] = (slot.scheduler.execute_fast, method, access)
+                                conn.flight_inc()
+                                if access is MethodAccess.WRITE:
+                                    barrier = asyncio.Event()
+                                    dispatcher.submit_inline(
+                                        slot.scheduler.execute_fast, method,
+                                        args_bytes, access, request_id, writer,
+                                        barrier, conn.flight_dec,
+                                    )
+                                    await barrier.wait()
+                                else:
+                                    dispatcher.submit_inline(
+                                        slot.scheduler.execute_fast, method,
+                                        args_bytes, access, request_id, writer,
+                                        None, conn.flight_dec,
+                                    )
+                                continue
+
+                # Fallback: full handler via Task for buddy, v1, or error paths.
                 if is_v2_call:
-                    await self._handle_v2_call(
-                        conn, request_id, payload, is_buddy, writer,
+                    t = asyncio.create_task(
+                        self._handle_v2_call(
+                            conn, request_id, payload, is_buddy, writer,
+                        ),
                     )
                 else:
-                    await self._handle_v1_call(
-                        conn, request_id, payload, is_buddy, writer,
+                    t = asyncio.create_task(
+                        self._handle_v1_call(
+                            conn, request_id, payload, is_buddy, writer,
+                        ),
                     )
+                pending.add(t)
+                t.add_done_callback(pending.discard)
 
         except asyncio.IncompleteReadError:
             pass
@@ -437,6 +783,13 @@ class ServerV2:
         except Exception:
             logger.debug('Conn %d: handler error', conn.conn_id, exc_info=True)
         finally:
+            # Drain in-flight tasks before tearing down the connection.
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            # Wait for submit_inline requests still executing in worker
+            # threads.  Without this, writer.close() could discard replies
+            # for requests that have already completed on the CRM side.
+            await conn.wait_idle()
             conn.cleanup()
             writer.close()
             try:
@@ -689,43 +1042,100 @@ class ServerV2:
         else:
             if not payload:
                 return
+            # Inline decode_call_control for speed (avoids function call +
+            # tuple allocation on the hot path).
+            name_len = payload[0]
             try:
-                route_name, method_idx, _consumed = decode_call_control(payload, 0)
-            except (ValueError, struct.error) as exc:
+                if name_len:
+                    route_name = payload[1:1 + name_len].decode('utf-8')
+                    method_idx = _U16.unpack_from(payload, 1 + name_len)[0]
+                    args_start = 3 + name_len
+                else:
+                    route_name = ''
+                    method_idx = _U16.unpack_from(payload, 1)[0]
+                    args_start = 3
+            except (struct.error, UnicodeDecodeError) as exc:
                 logger.warning('Conn %d: malformed v2 call control: %s',
                                conn.conn_id, exc)
-                err_frame = encode_v2_error_reply_frame(
+                writer.write(encode_v2_error_reply_frame(
                     request_id, f'Malformed call control: {exc}'.encode('utf-8'),
-                )
-                writer.write(err_frame)
+                ))
                 await writer.drain()
                 return
-            args_bytes = bytes(payload[_consumed:]) if _consumed < len(payload) else b''
+            args_bytes = payload[args_start:] if args_start < len(payload) else b''
 
-        slot = self._resolve_slot(route_name)
+        # Inline slot + method resolve.
+        slots = self._slots
+        slot = (slots.get(route_name) if route_name
+                else slots.get(self._default_name or ''))
         if slot is None:
             logger.warning('Unknown route name %r', route_name)
-            err_frame = encode_v2_error_reply_frame(
+            writer.write(encode_v2_error_reply_frame(
                 request_id, f'Unknown route name: {route_name}'.encode('utf-8'),
-            )
-            writer.write(err_frame)
+            ))
             await writer.drain()
+            return
+
+        method_name = slot.method_table._idx_to_name.get(method_idx)
+        if method_name is None:
+            logger.warning('Unknown method index %d for route %r', method_idx, route_name)
+            writer.write(encode_v2_error_reply_frame(
+                request_id,
+                f'Unknown method index {method_idx} for route {route_name!r}'.encode('utf-8'),
+            ))
+            await writer.drain()
+            return
+
+        # Inline dispatch — avoids _dispatch() + _unpack_icrm_result() calls.
+        entry = slot._dispatch_table.get(method_name)
+        if entry is None:
+            err = error.CRMServerError(f'Method not found: {method_name}')
+            try:
+                err_bytes = err.serialize()
+            except Exception:
+                err_bytes = str(err).encode('utf-8')
+            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
+            await writer.drain()
+            return
+
+        method, access = entry
+
+        # For non-buddy calls with no SHM pool, fire-and-forget:
+        # the worker thread builds the reply frame and writes directly,
+        # avoiding Future creation + asyncio task resume overhead.
+        if not is_buddy and (conn.buddy_pool is None or not conn.buddy_pool):
+            self._dispatcher.submit_inline(
+                slot.scheduler.execute_fast, method, args_bytes, access,
+                request_id, writer,
+            )
             return
 
         try:
-            method_name = slot.method_table.name_of(method_idx)
-        except KeyError:
-            logger.warning('Unknown method index %d for route %r', method_idx, route_name)
-            err_frame = encode_v2_error_reply_frame(
-                request_id,
-                f'Unknown method index {method_idx} for route {route_name!r}'.encode('utf-8'),
-            )
-            writer.write(err_frame)
+            future = self._loop.create_future()
+            self._dispatcher.submit(slot.scheduler.execute_fast, method, args_bytes, access, future)
+            result = await future
+        except Exception as exc:
+            err_bytes = self._wrap_error(exc)[1]
+            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
             await writer.drain()
             return
 
-        result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
-        await self._send_v2_reply(conn, request_id, result_bytes, err_bytes, writer)
+        # Inline unpack + send.
+        if isinstance(result, tuple):
+            err_part = result[0] if result[0] else b''
+            res_part = result[1] if len(result) > 1 and result[1] else b''
+            if isinstance(err_part, memoryview):
+                err_part = bytes(err_part)
+            if isinstance(res_part, memoryview):
+                res_part = bytes(res_part)
+        elif result is None:
+            res_part, err_part = b'', b''
+        elif isinstance(result, memoryview):
+            res_part, err_part = bytes(result), b''
+        else:
+            res_part, err_part = result, b''
+
+        await self._send_v2_reply(conn, request_id, res_part, err_part, writer)
 
     def _resolve_v2_buddy(
         self, conn: _Connection, payload: bytes,
@@ -775,26 +1185,19 @@ class ServerV2:
 
         Returns ``(result_bytes, error_bytes)``.  Exactly one is non-empty.
         """
-        method = getattr(slot.icrm, method_name, None)
-        if method is None:
+        entry = slot._dispatch_table.get(method_name)
+        if entry is None:
             err = error.CRMServerError(f'Method not found: {method_name}')
             try:
                 return b'', err.serialize()
             except Exception:
                 return b'', str(err).encode('utf-8')
 
-        access = get_method_access(method)
+        method, access = entry
         try:
-            slot.scheduler.begin()
-        except RuntimeError as exc:
-            return self._wrap_error(exc)
-        loop = asyncio.get_running_loop()
-        try:
-            result = await loop.run_in_executor(
-                slot.scheduler.executor,
-                slot.scheduler.execute,
-                method, args_bytes, access,
-            )
+            future = self._loop.create_future()
+            self._dispatcher.submit(slot.scheduler.execute_fast, method, args_bytes, access, future)
+            result = await future
         except Exception as exc:
             return self._wrap_error(exc)
 

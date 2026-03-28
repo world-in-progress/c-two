@@ -1,15 +1,16 @@
-"""HTTP relay — standalone process.
+"""HTTP relay — standalone gateway process.
 
-Bridges HTTP requests to a Grid CRM server running on IPC v3.
-This process does NOT host any CRM — it only relays HTTP traffic.
+Bridges HTTP requests to CRM resource processes running on IPC v3.
+The relay starts empty; CRM processes auto-register via
+``C2_RELAY_ADDRESS`` when they call ``cc.register()``.
 
 Usage (3-terminal workflow):
 
-    # Terminal 1 — start the Grid CRM
-    uv run python examples/v2_relay/resource.py
-
-    # Terminal 2 — start this relay
+    # Terminal 1 — start the relay (empty, waits for registrations)
     uv run python examples/v2_relay/relay_server.py
+
+    # Terminal 2 — start the Grid CRM (auto-registers with relay)
+    C2_RELAY_ADDRESS=http://127.0.0.1:8080 uv run python examples/v2_relay/resource.py
 
     # Terminal 3 — send HTTP requests
     uv run python examples/v2_relay/http_client.py
@@ -20,23 +21,22 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from c_two.rpc_v2.relay import RelayV2
 
-# Must match the address used by v2_grid_server.py
-IPC_UPSTREAM = 'ipc-v3://v2_grid_standalone'
 HTTP_BIND = '127.0.0.1:8080'
 
 
 def main():
-    relay = RelayV2(bind=HTTP_BIND, upstream=IPC_UPSTREAM)
+    relay = RelayV2(bind=HTTP_BIND)
     relay.start(blocking=False)
 
-    print(f'[Relay] Upstream IPC : {IPC_UPSTREAM}')
     print(f'[Relay] HTTP listen  : {relay.url}')
-    print(f'[Relay] Endpoints:')
-    print(f'  POST /grid/hello              — say hello')
-    print(f'  POST /grid/get_grid_infos     — query grid attributes')
-    print(f'  POST /grid/subdivide_grids    — subdivide grids')
-    print(f'  GET  /health                  — relay health check')
-    print('[Relay] Ready. (Ctrl-C to stop)\n')
+    print(f'[Relay] Control endpoints:')
+    print(f'  POST /_register    — register a CRM upstream')
+    print(f'  POST /_unregister  — remove a CRM upstream')
+    print(f'  GET  /_routes      — list registered routes')
+    print(f'  GET  /health       — relay health check')
+    print(f'[Relay] Data endpoints (after registration):')
+    print(f'  POST /{{name}}/{{method}} — call a CRM method')
+    print('[Relay] Waiting for CRM registrations… (Ctrl-C to stop)\n')
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
