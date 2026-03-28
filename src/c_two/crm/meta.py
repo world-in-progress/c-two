@@ -1,8 +1,8 @@
 import enum
 from inspect import isfunction
 from typing import TypeVar, Type, Callable
-from ..rpc.transferable import auto_transfer
-from ..rpc.util.wire import preregister_methods
+from .transferable import auto_transfer
+from ..transport.wire_v1 import preregister_methods
 
 _F = TypeVar('_F', bound=Callable)
 ICRM = TypeVar('ICRM')

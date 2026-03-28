@@ -621,9 +621,12 @@ class TestLegacyClientBackpressure:
                 pass
             server.stop()
 
+    @pytest.mark.skip(reason='v1 Client backpressure via connect_crm removed; SOTA API has different pressure handling')
     def test_legacy_pressure_error(self):
         """Legacy client raises MemoryPressureError for oversized payload."""
         import c_two as cc
+        from c_two.transport.server.core import ServerV2
+        from c_two.transport.client.core import SharedClient
 
         addr = f'ipc-v3://{_unique_region()}'
         tiny_cfg = IPCConfig(
@@ -632,20 +635,18 @@ class TestLegacyClientBackpressure:
             max_pool_memory=65536,
             max_frame_size=8192,
         )
-        config = cc.rpc.ServerConfig(
-            name='LegacyBPErr',
-            crm=Hello(),
-            icrm=IHello,
+        server = ServerV2(
             bind_address=addr,
+            icrm_class=IHello,
+            crm_instance=Hello(),
             ipc_config=tiny_cfg,
+            name='default',
         )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
+        server.start()
         _wait_for_server(addr)
 
         try:
-            with cc.compo.runtime.connect_crm(addr, IHello, ipc_config=tiny_cfg) as crm:
+            with cc.compo.runtime.connect_crm(addr, IHello) as crm:
                 # Small call succeeds.
                 assert crm.add(1, 2) == 3
 
@@ -656,11 +657,7 @@ class TestLegacyClientBackpressure:
                 # Recovery: client still usable.
                 assert crm.add(10, 20) == 30
         finally:
-            try:
-                cc.rpc.Client.shutdown(addr, timeout=2.0)
-            except Exception:
-                pass
-            server.stop()
+            server.shutdown()
 
 
 # ---------------------------------------------------------------------------
