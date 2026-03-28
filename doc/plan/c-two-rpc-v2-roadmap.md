@@ -28,6 +28,7 @@
 | Per-connection write barrier（同连接因果序保证） | `server.py:_handle_client` + barrier 机制 | ✓ (2026-03-28) |
 | dispatch_cache 代际失效 | `server.py:_slots_generation` | ✓ (2026-03-28) |
 | 连接级 in-flight 计数器（writer.close 安全性） | `server.py:_Connection.flight_inc/dec/wait_idle` | ✓ (2026-03-28) |
+| 分块流式传输（Chunked Streaming Transfer） | `wire.py` + `client.py` + `server.py` | ✓ (2026-03-28) |
 
 ### 部分实现 ⚠
 
@@ -125,19 +126,15 @@ class IGrid:
 
 ## 2. P1 — 性能与可靠性增强
 
-### 2.1 SHM Pool 动态扩容（Segment Chain）
+### 2.1 SHM Pool 动态扩容（Segment Chain）— 已部分替代
 
-**问题**: Pool 满时退化到 per-request SHM（5 个系统调用/request），这在大 payload 场景下造成显著性能下降。sota.md 附录 A.2 建议动态扩容替代磁盘溢出。
+**原始问题**: Pool 满时退化到 per-request SHM（5 个系统调用/request），这在大 payload 场景下造成显著性能下降。sota.md 附录 A.2 建议动态扩容替代磁盘溢出。
 
-**方案**: Segment chain 模式：
-1. 第一个 segment 满时，`c2-buddy` 自动创建第二个 segment
-2. 元数据记录在 pool header 中（当前 segment 数、每个 segment 的 base_addr + size）
-3. 分配时优先在已有 segment 中查找空闲块，所有 segment 满时再创建新 segment
-4. `max_segments` 配置上限（默认 16），超出后退化到 per-request SHM
+**当前状态**: 分块流式传输（Chunked Streaming Transfer）已实现，将超过 `pool_segment_size * 0.9` 的大 payload 拆分为 `segment_size // 2` 大小的独立帧，每帧独立 buddy alloc → SHM write → send → free。理论上限 65535 chunks × 128 MB = 8 TB。此方案消除了单次 RPC 256 MB 限制这一最大痛点。
+
+**剩余价值**: Segment Chain 仍可减少 per-request SHM 退化频率（多段 pool 提高容量），但优先级降低。如有需求可在 P2 阶段实施。
 
 **改动范围**: `c2-buddy` (Rust) + `c2-ffi` (PyO3 绑定) + `client.py` / `server.py`（握手时协商 segment 列表）
-
-**优先级理由**: per-request SHM 回退的性能惩罚在 GIS 场景（大网格/raster 传输）中是已知痛点。
 
 ### 2.2 心跳检测 + 进程存活检测
 
@@ -166,6 +163,16 @@ class IGrid:
 ---
 
 ## 3. P2 — 功能完善
+
+### 3.0 磁盘溢写兜底（Plan C）
+
+**背景**: 分块流式传输解决了大 payload 突破 256 MB 限制的问题，但当系统物理内存不足以容纳 reassembly buffer（接收端使用 `mmap.mmap(-1, total_size)` 匿名映射）时，仍需要磁盘级兜底策略。
+
+**方案**: 当 mmap 分配失败或检测到系统可用内存低于阈值时，`_ChunkAssembler` / `_ReplyChunkAssembler` 切换到文件支持的 mmap（`mmap.mmap(fd, size)`），将 reassembly buffer 溢写到临时文件。具体设计参见 spike 文档 `doc/spikes/performance-shm-streaming-large-payload-spike.md` 中的 Plan C。
+
+**触发条件**: 可通过 `IPCConfig.disk_spill_threshold` 配置（默认 None = 不启用），当 `total_payload > threshold` 或 `mmap(-1, ...)` 抛出 `OSError` 时自动降级。
+
+**改动范围**: `server.py:_ChunkAssembler` + `client.py:_ReplyChunkAssembler`（增加文件 mmap 分支） + `IPCConfig`（新增配置项）
 
 ### 3.1 版本兼容性检查
 
@@ -268,16 +275,24 @@ SOTA 设计未覆盖的场景：
 ## 5. 实施时间线建议
 
 ```
-P0 — 设计缺陷修复（合入 dev-feature 前必须完成）
-├─ 1.1 线程优惠并发控制      预计 0.5d
-└─ 1.2 shutdown_callback     预计 0.5d
+P0 — 设计缺陷修复 ✅
+├─ 1.1 线程优惠并发控制      ✅ 已完成
+└─ 1.2 shutdown_callback     ✅ 已完成
+
+P0.5 — 大 payload 支持 ✅
+└─ 分块流式传输 (Plan A)     ✅ 已完成 (2026-03-28)
+   ├─ 协议层: FLAG_CHUNKED / FLAG_CHUNK_LAST / CAP_CHUNKED
+   ├─ 客户端: _call_chunked + _ReplyChunkAssembler
+   ├─ 服务端: _ChunkAssembler + _send_chunked_v2_reply
+   └─ 基准: 256 MB chunked echo ≈ 1.9 GB/s
 
 P1 — 性能与可靠性增强（v0.3.0 里程碑）
-├─ 2.1 SHM Pool 动态扩容     预计 3-5d (Rust + Python + 测试)
+├─ 2.1 SHM Pool 动态扩容     优先级降低（分块传输已消除最大痛点）
 ├─ 2.2 心跳 + PID 存活检测    预计 1-2d
 └─ 2.3 Rust Relay 发布集成    预计 2-3d (CI/CD)
 
 P2 — 功能完善（v0.4.0 里程碑）
+├─ 3.0 磁盘溢写兜底 (Plan C)  预计 1-2d
 ├─ 3.1 版本兼容性检查         预计 1d
 ├─ 3.2 异步接口               预计 2-3d
 └─ 3.3 自适应分代 GC          预计 1-2d
@@ -301,6 +316,7 @@ P3 — 长期演进（v1.0 方向）
 | dispatch_cache + `_slots_generation` | §3.1 版本兼容性检查可复用 generation 失效机制 |
 | Rust relay 35K+ QPS | §2.3 集成后即可作为生产级 HTTP 路由层 |
 | flight_inc/dec/wait_idle | §2.2 心跳检测可复用 flight counter 判断连接活跃度 |
+| Chunked Streaming Transfer | 消除 256 MB 单次 RPC 限制，§2.1 SHM Pool 扩容优先级降低 |
 
 ### 优化报告中建议但未覆盖的后续方向
 

@@ -332,3 +332,123 @@ class TestReplyChunkAssembler:
             asm.add(i, c)
 
         assert asm.assemble() == full
+
+
+# ===========================================================================
+# Edge case & lifecycle tests for both assemblers
+# ===========================================================================
+
+class TestAssemblerEdgeCases:
+    """Edge cases shared between server and client assemblers."""
+
+    def test_server_zero_length_chunk(self):
+        """Zero-length chunk data does not crash assembler."""
+        asm = _ChunkAssembler(
+            total_chunks=2,
+            chunk_size=1024,
+            route_name='test',
+            method_idx=0,
+        )
+        assert not asm.add(0, b'')  # zero-length first chunk
+        assert asm.add(1, b'')     # zero-length second chunk
+        result = asm.assemble()
+        assert result == b''
+
+    def test_client_zero_length_chunk(self):
+        """Zero-length chunk data in reply assembler."""
+        asm = _ReplyChunkAssembler(total_chunks=1, chunk_size=1024)
+        assert asm.add(0, b'')
+        assert asm.assemble() == b''
+
+    def test_server_very_small_chunk_size(self):
+        """chunk_size=1 with many chunks."""
+        n_chunks = 10
+        data = b'0123456789'
+        asm = _ChunkAssembler(
+            total_chunks=n_chunks,
+            chunk_size=1,
+            route_name='test',
+            method_idx=0,
+        )
+        for i in range(n_chunks):
+            asm.add(i, data[i:i + 1])
+        assert asm.assemble() == data
+
+    def test_client_very_small_chunk_size(self):
+        """Reply assembler with chunk_size=1."""
+        data = b'ABCDE'
+        asm = _ReplyChunkAssembler(total_chunks=5, chunk_size=1)
+        for i in range(5):
+            asm.add(i, data[i:i + 1])
+        assert asm.assemble() == data
+
+    def test_server_discard_after_partial(self):
+        """Discard after receiving some (but not all) chunks."""
+        asm = _ChunkAssembler(
+            total_chunks=3,
+            chunk_size=1024,
+            route_name='test',
+            method_idx=0,
+        )
+        asm.add(0, b'\x00' * 512)
+        asm.add(1, b'\x01' * 512)
+        # Discard before receiving chunk 2 (simulates GC timeout).
+        asm.discard()
+        assert asm._buf is None
+
+    def test_client_discard_after_partial(self):
+        """Discard reply assembler after partial receipt."""
+        asm = _ReplyChunkAssembler(total_chunks=4, chunk_size=512)
+        asm.add(0, b'\x00' * 200)
+        asm.discard()
+        assert asm._buf is None
+
+    def test_server_reverse_order(self):
+        """Chunks arriving in exact reverse order."""
+        chunk_size = 256
+        n_chunks = 5
+        last_size = 100
+        full, chunks = _make_payload(n_chunks, chunk_size, last_size)
+
+        asm = _ChunkAssembler(
+            total_chunks=n_chunks,
+            chunk_size=chunk_size,
+            route_name='rev',
+            method_idx=0,
+        )
+        for i in reversed(range(n_chunks)):
+            asm.add(i, chunks[i])
+        assert asm.assemble() == full
+
+    def test_server_last_chunk_much_smaller(self):
+        """Last chunk is 1 byte — total assembled payload is exact."""
+        chunk_size = 4096
+        asm = _ChunkAssembler(
+            total_chunks=3,
+            chunk_size=chunk_size,
+            route_name='test',
+            method_idx=0,
+        )
+        asm.add(0, b'\xAA' * chunk_size)
+        asm.add(1, b'\xBB' * chunk_size)
+        asm.add(2, b'\xCC')  # 1 byte
+        result = asm.assemble()
+        assert len(result) == chunk_size * 2 + 1
+        assert result[-1:] == b'\xCC'
+
+    def test_client_concurrent_assemblers_independent(self):
+        """Two independent reply assemblers don't interfere."""
+        asm1 = _ReplyChunkAssembler(total_chunks=2, chunk_size=512)
+        asm2 = _ReplyChunkAssembler(total_chunks=2, chunk_size=512)
+
+        asm1.add(0, b'\x01' * 512)
+        asm2.add(0, b'\x02' * 512)
+        asm1.add(1, b'\x03' * 100)
+        asm2.add(1, b'\x04' * 200)
+
+        r1 = asm1.assemble()
+        r2 = asm2.assemble()
+        assert len(r1) == 612
+        assert len(r2) == 712
+        assert r1[:512] == b'\x01' * 512
+        assert r2[:512] == b'\x02' * 512

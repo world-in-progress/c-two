@@ -661,3 +661,161 @@ class TestLegacyClientBackpressure:
             except Exception:
                 pass
             server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Chunked transfer backpressure tests
+# ---------------------------------------------------------------------------
+
+
+class TestChunkedBackpressure:
+    """Backpressure behavior when chunked transfer is active."""
+
+    def test_chunked_inline_fallback_per_chunk(self):
+        """With a tiny pool, individual chunks fall back to inline transport.
+
+        Each chunk (segment_size // 2 = 32KB) is below max_frame_size (16 MB),
+        so inline fallback succeeds even when buddy alloc fails.
+        """
+        cfg = IPCConfig(
+            pool_segment_size=65536,   # 64 KB → chunk_size=32KB, threshold≈58KB
+            max_pool_segments=1,       # Very tight: only 64 KB total
+            max_pool_memory=65536,
+        )
+        addr = f'ipc-v3://{_unique_region()}'
+        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
+        _wait_for_server(addr)
+
+        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client.connect()
+        try:
+            proxy = ICRMProxy.ipc(client, 'hello')
+            icrm = IHello()
+            icrm.client = proxy
+
+            # 70KB > threshold → chunked (3 chunks of 32KB each).
+            # Pool is tiny → some chunks may inline-fallback, but all succeed.
+            big = 'P' * 70_000
+            result = icrm.greeting(big)
+            assert result == f'Hello, {big}!'
+
+            # Small call still works after chunked transfer.
+            assert icrm.add(1, 2) == 3
+        finally:
+            client.terminate()
+            server.shutdown()
+
+    def test_chunked_not_capable_raises_on_large(self):
+        """When server does not advertise CAP_CHUNKED, large payload raises."""
+        cfg = IPCConfig(
+            pool_segment_size=65536,
+            max_pool_segments=4,
+            max_pool_memory=65536 * 4,
+        )
+        addr = f'ipc-v3://{_unique_region()}'
+        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
+        _wait_for_server(addr)
+
+        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client.connect()
+        try:
+            # Forcibly disable chunked capability to simulate old server.
+            client._chunked_capable = False
+
+            proxy = ICRMProxy.ipc(client, 'hello')
+            icrm = IHello()
+            icrm.client = proxy
+
+            # Payload exceeds threshold but chunked is "not supported".
+            with pytest.raises(MemoryPressureError):
+                icrm.greeting('X' * 70_000)
+
+            # Small calls unaffected.
+            assert icrm.add(5, 10) == 15
+        finally:
+            client.terminate()
+            server.shutdown()
+
+    def test_chunked_recovery_after_multiple_large(self):
+        """Multiple sequential chunked calls don't leak assemblers or pool."""
+        cfg = IPCConfig(
+            pool_segment_size=65536,
+            max_pool_segments=4,
+            max_pool_memory=65536 * 4,
+        )
+        addr = f'ipc-v3://{_unique_region()}'
+        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
+        _wait_for_server(addr)
+
+        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client.connect()
+        try:
+            proxy = ICRMProxy.ipc(client, 'hello')
+            icrm = IHello()
+            icrm.client = proxy
+
+            # 10 sequential chunked calls — should not exhaust resources.
+            for i in range(10):
+                payload = chr(ord('A') + i % 26) * 80_000
+                result = icrm.greeting(payload)
+                assert result == f'Hello, {payload}!'
+
+            # Verify system healthy after stress.
+            assert icrm.add(42, 58) == 100
+        finally:
+            client.terminate()
+            server.shutdown()
+
+    def test_concurrent_chunked_under_pressure(self):
+        """Multiple threads sending chunked payloads with tight pool."""
+        cfg = IPCConfig(
+            pool_segment_size=65536,
+            max_pool_segments=8,
+            max_pool_memory=65536 * 8,
+        )
+        addr = f'ipc-v3://{_unique_region()}'
+        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
+        _wait_for_server(addr)
+
+        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client.connect()
+        try:
+            errors: list[Exception] = []
+            results: list[tuple[int, str]] = []
+            lock = threading.Lock()
+
+            def worker(tid: int) -> None:
+                try:
+                    proxy = ICRMProxy.ipc(client, 'hello')
+                    icrm = IHello()
+                    icrm.client = proxy
+                    payload = chr(ord('A') + tid) * 70_000
+                    result = icrm.greeting(payload)
+                    with lock:
+                        results.append((tid, result))
+                except Exception as e:
+                    with lock:
+                        errors.append(e)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=60)
+
+            assert len(errors) == 0, f'Errors: {errors}'
+            assert len(results) == 4
+            for tid, result in results:
+                expected = f'Hello, {chr(ord("A") + tid) * 70_000}!'
+                assert result == expected
+        finally:
+            client.terminate()
+            server.shutdown()

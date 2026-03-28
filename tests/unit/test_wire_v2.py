@@ -528,3 +528,68 @@ class TestCapChunked:
         hs = decode_v5_handshake(encoded)
         assert hs.capability_flags & CAP_CHUNKED
         assert hs.capability_flags == caps
+
+    def test_cap_without_chunked(self):
+        """Capability without CAP_CHUNKED — older client."""
+        caps = CAP_CALL_V2 | CAP_METHOD_IDX
+        encoded = encode_v5_client_handshake([('seg', 256)], caps)
+        hs = decode_v5_handshake(encoded)
+        assert not (hs.capability_flags & CAP_CHUNKED)
+        assert hs.capability_flags == caps
+
+
+class TestChunkHeaderEdgeCases:
+    """Edge cases for chunk header encoding."""
+
+    def test_zero_chunk_idx(self):
+        """chunk_idx=0 (first chunk) roundtrips correctly."""
+        raw = encode_chunk_header(0, 10)
+        idx, total = decode_chunk_header(raw)[:2]
+        assert idx == 0
+        assert total == 10
+
+    def test_total_chunks_one(self):
+        """Single-chunk transfer (degenerate)."""
+        raw = encode_chunk_header(0, 1)
+        idx, total = decode_chunk_header(raw)[:2]
+        assert idx == 0
+        assert total == 1
+
+    def test_total_chunks_zero_reserved(self):
+        """total_chunks=0 is reserved for future streaming — still encodes."""
+        raw = encode_chunk_header(0, 0)
+        idx, total = decode_chunk_header(raw)[:2]
+        assert idx == 0
+        assert total == 0
+
+    def test_chunk_header_size_constant(self):
+        """CHUNK_HEADER_SIZE must be 4 (2B idx + 2B total)."""
+        assert CHUNK_HEADER_SIZE == 4
+        raw = encode_chunk_header(1, 2)
+        assert len(raw) == CHUNK_HEADER_SIZE
+
+
+class TestChunkedFrameEdgeCases:
+    """Edge cases for chunked frame builders."""
+
+    def test_inline_chunked_call_empty_payload(self):
+        """Inline chunked call with empty chunk data."""
+        frame = encode_v2_inline_chunked_call_frame(
+            request_id=1, chunk_idx=0, total_chunks=1,
+            data=b'', name='r', method_idx=0,
+        )
+        assert len(frame) > 0  # header + chunk_header + call_control
+
+    def test_inline_chunked_reply_empty_payload(self):
+        """Inline chunked reply with empty chunk data."""
+        frame = encode_v2_inline_chunked_reply_frame(
+            request_id=1, chunk_idx=0, total_chunks=1, data=b'',
+        )
+        assert len(frame) > 0
+
+    def test_large_chunk_idx_near_max(self):
+        """chunk_idx near u16 max — 65534 (second-to-last of 65535 chunks)."""
+        raw = encode_chunk_header(65534, 65535)
+        idx, total = decode_chunk_header(raw)[:2]
+        assert idx == 65534
+        assert total == 65535
