@@ -35,6 +35,8 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import signal
+import sys
 import threading
 import uuid
 from dataclasses import dataclass
@@ -402,6 +404,99 @@ class _ProcessRegistry:
         self._http_pool.shutdown_all()
 
     # ------------------------------------------------------------------
+    # Serve (daemon mode)
+    # ------------------------------------------------------------------
+
+    _serve_stop: threading.Event | None = None
+
+    def serve(self, blocking: bool = True) -> None:
+        """Keep the process alive as a CRM resource server.
+
+        Transitions the process from a computation script into a
+        long-running resource service.  Installs signal handlers for
+        ``SIGINT`` / ``SIGTERM`` and, when *blocking* is ``True``,
+        blocks until a termination signal arrives, then calls
+        :meth:`shutdown` for graceful cleanup.
+
+        If no CRM has been registered yet, a warning is logged but
+        the process still blocks (useful during development).
+
+        Parameters
+        ----------
+        blocking:
+            If ``True`` (default), block the calling thread until a
+            termination signal is received.  If ``False``, install
+            signal handlers and print the banner but return immediately
+            — the caller is responsible for keeping the process alive.
+        """
+        if self._serve_stop is not None:
+            return  # idempotent
+
+        self._serve_stop = threading.Event()
+
+        with self._lock:
+            names = list(self._registrations.keys())
+            addr = self._server_address
+
+        if not names:
+            log.warning(
+                'cc.serve() called with no CRM registered. '
+                'The process will block but has nothing to serve.',
+            )
+
+        # Print banner.
+        self._print_serve_banner(names, addr)
+
+        # Signal handlers — only installable from the main thread.
+        def _handle_signal(signum, frame):  # noqa: ARG001
+            self._serve_stop.set()
+
+        try:
+            signal.signal(signal.SIGINT, _handle_signal)
+            if sys.platform != 'win32':
+                signal.signal(signal.SIGTERM, _handle_signal)
+        except ValueError:
+            # Not the main thread — signals cannot be registered.
+            # Caller must arrange to call _serve_stop.set() externally.
+            log.debug('cc.serve(): signal handlers skipped (not main thread)')
+
+        if not blocking:
+            return
+
+        try:
+            self._serve_stop.wait()
+        except KeyboardInterrupt:
+            # On some platforms, SIGINT also raises KeyboardInterrupt
+            # even when a custom handler is installed.
+            pass
+
+        # Graceful shutdown.
+        print('\n Shutting down…')
+        self.shutdown()
+        self._serve_stop = None
+        print(' Resource server stopped.')
+
+    @staticmethod
+    def _print_serve_banner(
+        names: list[str],
+        addr: str | None,
+    ) -> None:
+        """Print a human-readable startup banner to stdout."""
+        lines = [' ── C-Two Resource Server ────────────────']
+        if addr:
+            lines.append(f'  IPC: {addr}')
+        if names:
+            lines.append('  CRM routes:')
+            for n in names:
+                lines.append(f'    • {n}')
+        else:
+            lines.append('  (no CRM routes registered)')
+        lines.append(' ─────────────────────────────────────────')
+        count = len(names)
+        lines.append(f'  Serving {count} CRM resource(s). Ctrl+C to stop.')
+        print('\n'.join(lines))
+
+    # ------------------------------------------------------------------
     # Relay service discovery
     # ------------------------------------------------------------------
 
@@ -620,6 +715,18 @@ def shutdown() -> None:
     See :meth:`_ProcessRegistry.shutdown`.
     """
     _ProcessRegistry.get().shutdown()
+
+
+def serve(blocking: bool = True) -> None:
+    """Keep the process alive as a CRM resource server.
+
+    Transitions the calling process from a computation script into a
+    long-running resource service.  Blocks until ``SIGINT`` or
+    ``SIGTERM``, then calls :func:`shutdown` for graceful cleanup.
+
+    See :meth:`_ProcessRegistry.serve`.
+    """
+    _ProcessRegistry.get().serve(blocking=blocking)
 
 
 # Auto-cleanup on process exit.

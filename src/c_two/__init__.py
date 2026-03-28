@@ -17,6 +17,7 @@ from .rpc_v2.registry import (
     unregister,
     server_address,
     shutdown,
+    serve,
 )
 
 __version__ = '0.2.7'
