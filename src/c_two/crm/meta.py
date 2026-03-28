@@ -51,20 +51,25 @@ def get_shutdown_method(cls: type) -> str | None:
     """Discover the ``@cc.on_shutdown``-decorated method name in *cls*.
 
     Returns ``None`` if no shutdown method exists.
-    Raises ``ValueError`` if more than one method is decorated.
+    Raises ``ValueError`` if more than one method is decorated, or if the
+    decorated method is private (name starts with ``_``).
     """
     found: str | None = None
     for name in dir(cls):
-        if name.startswith('_'):
-            continue
         obj = getattr(cls, name, None)
-        if callable(obj) and getattr(obj, _SHUTDOWN_ATTR, False):
-            if found is not None:
-                raise ValueError(
-                    f'ICRM {cls.__name__} has multiple @on_shutdown methods: '
-                    f'{found!r} and {name!r}',
-                )
-            found = name
+        if not callable(obj) or not getattr(obj, _SHUTDOWN_ATTR, False):
+            continue
+        if name.startswith('_'):
+            raise ValueError(
+                f'@on_shutdown cannot be applied to private method '
+                f'{cls.__name__}.{name!r} — use a public method name',
+            )
+        if found is not None:
+            raise ValueError(
+                f'ICRM {cls.__name__} has multiple @on_shutdown methods: '
+                f'{found!r} and {name!r}',
+            )
+        found = name
     return found
 
 class ICRMMeta(type):

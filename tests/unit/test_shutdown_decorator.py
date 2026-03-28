@@ -73,14 +73,14 @@ class TestGetShutdownMethod:
         with pytest.raises(ValueError, match='multiple @on_shutdown'):
             get_shutdown_method(IBad)
 
-    def test_private_methods_skipped(self):
-        """Methods starting with _ are not scanned."""
+    def test_private_methods_rejected(self):
+        """@on_shutdown on private methods raises ValueError."""
         class IPrivate:
             @on_shutdown
             def _internal_cleanup(self): ...
 
-        # Private methods are skipped by get_shutdown_method
-        assert get_shutdown_method(IPrivate) is None
+        with pytest.raises(ValueError, match='private method'):
+            get_shutdown_method(IPrivate)
 
 
 # ---------------------------------------------------------------------------

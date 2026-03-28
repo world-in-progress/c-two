@@ -245,7 +245,7 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def _execution_guard(self, access_mode: MethodAccess):
+    def execution_guard(self, access_mode: MethodAccess):
         if self._config.mode is ConcurrencyMode.EXCLUSIVE:
             with self._exclusive_lock:
                 yield

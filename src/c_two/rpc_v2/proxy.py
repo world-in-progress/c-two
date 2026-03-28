@@ -37,9 +37,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, TYPE_CHECKING
 
+from ..crm.meta import MethodAccess
+
 if TYPE_CHECKING:
     from .scheduler import Scheduler
-    from ..crm.meta import MethodAccess
 
 
 class ICRMProxy:
@@ -192,9 +193,8 @@ class ICRMProxy:
             )
         if self._scheduler is None:
             return method(*args)
-        from ..crm.meta import MethodAccess
         access = self._access_map.get(method_name, MethodAccess.WRITE) if self._access_map else MethodAccess.WRITE
-        with self._scheduler._execution_guard(access):
+        with self._scheduler.execution_guard(access):
             return method(*args)
 
     def relay(self, event_bytes: bytes) -> bytes:

@@ -615,6 +615,10 @@ class ServerV2:
         sd = slot.shutdown_method
         if sd is None:
             return
+        # slot.icrm is the ICRM *wrapper* (created by _create_icrm), not
+        # the CRM instance itself.  The actual CRM is stored as
+        # slot.icrm.crm — the @on_shutdown method is defined on the CRM
+        # class, so we resolve it from the underlying instance.
         crm = getattr(slot.icrm, 'crm', None)
         if crm is None:
             return
