@@ -73,24 +73,29 @@ class IPCConfig:
         heartbeat_interval: Seconds between PING probes (default 15; ≤0 disables).
         heartbeat_timeout: Seconds with no activity before declaring dead (default 30).
     """
+    # Transport limits
     shm_threshold: int = DEFAULT_SHM_THRESHOLD
     max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
     max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE
     max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
-    pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
+    
+    # Pool SHM settings
     pool_enabled: bool = True
     pool_decay_seconds: float = 60.0
-    max_pool_segments: int = DEFAULT_MAX_POOL_SEGMENTS
     max_pool_memory: int = DEFAULT_MAX_POOL_MEMORY
-    heartbeat_interval: float = 15.0
-    heartbeat_timeout: float = 30.0
+    max_pool_segments: int = DEFAULT_MAX_POOL_SEGMENTS
+    pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
 
     # Chunked transfer settings
+    max_total_chunks: int = 512
+    chunk_gc_interval: int = 100
     chunk_threshold_ratio: float = 0.9
     chunk_assembler_timeout: float = 60.0
-    chunk_gc_interval: int = 100
-    max_total_chunks: int = 512
     max_reassembly_bytes: int = 8 * (1 << 30)  # 8 GB
+    
+    # Heartbeat settings
+    heartbeat_interval: float = 15.0
+    heartbeat_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         if self.pool_segment_size > 0xFFFFFFFF:
@@ -344,5 +349,3 @@ def decode_frame(body: bytes) -> tuple[int, int, bytes]:
     request_id, flags = U64_STRUCT.unpack_from(body, 0)[0], U32_STRUCT.unpack_from(body, 8)[0]
     payload = body[12:]
     return request_id, flags, payload
-
-

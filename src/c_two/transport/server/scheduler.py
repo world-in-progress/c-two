@@ -40,14 +40,14 @@ from ...crm.meta import MethodAccess, get_method_access  # noqa: F401
 
 @enum.unique
 class ConcurrencyMode(enum.Enum):
+    PARALLEL = 'parallel'
     EXCLUSIVE = 'exclusive'
     READ_PARALLEL = 'read_parallel'
-    PARALLEL = 'parallel'
 
 
 @dataclass(frozen=True)
 class ConcurrencyConfig:
-    mode: ConcurrencyMode | str = ConcurrencyMode.EXCLUSIVE
+    mode: ConcurrencyMode | str = ConcurrencyMode.READ_PARALLEL
     max_workers: int | None = None
     max_pending: int | None = None
 

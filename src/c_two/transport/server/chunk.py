@@ -14,8 +14,6 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# Chunked transfer constants.
-CHUNK_GC_INTERVAL = 100          # frames between GC sweeps (used by core.py when no config)
 
 # Default limits used when no IPCConfig is available (backward-compat).
 _DEFAULT_MAX_TOTAL_CHUNKS = 512
