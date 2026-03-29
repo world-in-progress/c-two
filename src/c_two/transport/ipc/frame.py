@@ -1,4 +1,4 @@
-"""IPC v2 shared protocol — constants, config, frame codec, and SHM utilities.
+"""IPC shared protocol — constants, config, frame codec, and SHM utilities.
 
 Extracted from ``ipc_server.py`` so both server and client can import
 without a circular or tight-coupling dependency.  All symbols are public
@@ -63,7 +63,7 @@ SHM_MAX_AGE = 120.0       # seconds — max time before SHM segment is considere
 
 @dataclass
 class IPCConfig:
-    """IPC v2 transport configuration.
+    """IPC transport configuration.
 
     Transport limits (affect correctness and compatibility):
         max_frame_size: Maximum inline frame size in bytes (default 16 MB).

@@ -2,7 +2,7 @@
 name = "c2-buddy"
 edition.workspace = true
 version.workspace = true
-description = "Cross-process buddy allocator over POSIX shared memory for C-Two IPC v3"
+description = "Cross-process buddy allocator over POSIX shared memory for C-Two IPC"
 
 [lib]
 name = "c2_buddy"

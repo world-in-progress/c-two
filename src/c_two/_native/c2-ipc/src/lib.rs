@@ -1,7 +1,7 @@
-//! Async IPC v3 client for C-Two relay.
+//! Async IPC client for C-Two relay.
 //!
 //! Connects to a Python `ServerV2` via Unix Domain Socket, performs
-//! handshake v5, and forwards HTTP-originated requests using buddy SHM.
+//! handshake, and forwards HTTP-originated requests using buddy SHM.
 //!
 //! # Architecture
 //!

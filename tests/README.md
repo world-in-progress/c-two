@@ -40,7 +40,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `test_wire_v2.py` | Wire v2 codec — call/reply control encoding, default-route cache |
 | `test_scheduler.py` | Read/write concurrency scheduler for CRM method dispatch |
 | `test_concurrency.py` | Read/write lock semantics for ICRM method scheduling |
-| `test_shared_client.py` | `SharedClient` — multiplexed IPC v3 client lifecycle |
+| `test_shared_client.py` | `SharedClient` — multiplexed IPC client lifecycle |
 | `test_client_pool.py` | `ClientPool` — ref-counted SharedClient management, grace period |
 | `test_icrm_proxy.py` | `ICRMProxy` — thread-local and IPC modes, method routing |
 | `test_proxy_concurrency.py` | ICRMProxy concurrency under read/write access control |
@@ -56,7 +56,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | File | Description |
 |------|-------------|
 | `test_buddy_pool.py` | Rust buddy allocator — alloc/free, pool stats, dedicated fallback, FFI, segment lifecycle, stale cleanup |
-| `test_ipc_v3.py` | IPC v3 transport — buddy handshake, wire frames, inline/buddy paths, boundary checks, shutdown safety |
+| `test_ipc.py` | IPC transport — buddy handshake, wire frames, inline/buddy paths, boundary checks, shutdown safety |
 | `test_ipc_security.py` | IPC handshake security — SHM name validation, segment count DoS limits, malformed frame handling |
 
 ### Relay
@@ -73,7 +73,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | File | Description |
 |------|-------------|
 | `test_rpc_v2_server.py` | ServerV2 end-to-end — multi-CRM hosting, handshake, method dispatch |
-| `test_rpc_v2_basic.py` | SharedClient backward compatibility with legacy ipc-v3 server |
+| `test_rpc_v2_basic.py` | SharedClient backward compatibility with legacy IPC server |
 | `test_registry.py` | `cc.register()` / `cc.connect()` / `cc.close()` SOTA API lifecycle |
 | `test_multi_crm_server.py` | Multi-CRM routing — name-based dispatch, concurrent access |
 | `test_icrm_proxy.py` | ICRMProxy integration — thread-local + IPC modes end-to-end |
@@ -105,8 +105,8 @@ Parametrized `protocol_address` fixture provides unique addresses for each proto
 | `tcp` | `tcp://` | ZeroMQ TCP socket |
 | `http` | `http://` | HTTP/REST via Starlette/uvicorn |
 | `ipc-v2` | `ipc-v2://` | UDS control + Python SharedMemory pool (legacy) |
-| `ipc-v3` | `ipc-v3://` | UDS control + Rust buddy allocator SHM (explicit) |
-| `ipc` | `ipc://` | **Default IPC** — routes to v3 (recommended) |
+| `ipc` | `ipc://` | UDS control + Rust buddy allocator SHM (explicit) |
+| `ipc` | `ipc://` | **Default IPC** — UDS control + Rust buddy allocator SHM |
 
 ---
 
@@ -117,7 +117,7 @@ Run benchmarks with `uv run python benchmarks/<script>.py`.
 | File | Description |
 |------|-------------|
 | `memory_benchmark.py` | Memory transport latency/throughput across payload sizes |
-| `ipc_v3_detailed_bench.py` | IPC v3 detailed latency breakdown (P50/P95/P99, throughput, ops) |
+| `ipc_detailed_bench.py` | IPC detailed latency breakdown (P50/P95/P99, throughput, ops) |
 | `ipc_v2_vs_v3_benchmark.py` | Side-by-side comparison: IPC v2 vs v3 across 64B–1GB |
 | `concurrency_benchmark.py` | Concurrent client load — throughput scaling, contention |
 | `wire_preencoding_benchmark.py` | Wire protocol encoding micro-benchmark |

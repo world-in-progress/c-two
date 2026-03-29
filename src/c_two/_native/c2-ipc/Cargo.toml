@@ -2,7 +2,7 @@
 name = "c2-ipc"
 edition.workspace = true
 version.workspace = true
-description = "Async IPC v3 client for C-Two relay"
+description = "Async IPC client for C-Two relay"
 
 [dependencies]
 c2-wire = { path = "../c2-wire" }

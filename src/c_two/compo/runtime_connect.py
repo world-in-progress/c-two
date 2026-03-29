@@ -31,7 +31,7 @@ def connect_crm(
     """Context manager to connect to a CRM server.
 
     Args:
-        address: The server address string (e.g., 'ipc-v3://region')
+        address: The server address string (e.g., 'ipc://region')
         icrm_class: The ICRM class to connect as
         crm_name: The CRM routing name (empty string uses server default)
         **kwargs: Reserved for future use

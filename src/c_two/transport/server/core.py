@@ -1,7 +1,7 @@
-"""Asyncio-based IPC v3 server with multi-CRM hosting.
+"""Asyncio-based IPC server with multi-CRM hosting.
 
 - **No EventQueue**: direct CRM dispatch via ``ThreadPoolExecutor``.
-- **Handshake v5**: capability negotiation + method index exchange.
+- **Handshake**: capability negotiation + method index exchange.
 - **Control-plane routing**: CRM routing name + method index in UDS
   inline frame, pure payload in buddy SHM.
 - **Multi-CRM**: hosts multiple CRM instances under distinct routing
@@ -65,7 +65,7 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 # ---------------------------------------------------------------------------
 
 class Server:
-    """IPC v3 server with control-plane routing.
+    """IPC server with control-plane routing.
 
     Supports hosting **multiple CRM resources** under distinct routing
     names.  Each name has its own ICRM instance, method table, and
@@ -77,7 +77,7 @@ class Server:
     Parameters
     ----------
     bind_address:
-        ``ipc-v3://<region_id>`` — the Unix socket will be created at
+        ``ipc://<region_id>`` — the Unix socket will be created at
         ``/tmp/c_two_ipc/<region_id>.sock``.
     icrm_class:
         Optional ``@cc.icrm``-decorated interface class to register at
@@ -107,7 +107,7 @@ class Server:
     ):
         self._config = ipc_config or IPCConfig()
         self._address = bind_address
-        region_id = bind_address.replace('ipc-v3://', '').replace('ipc://', '')
+        region_id = bind_address.replace('ipc://', '')
         self._socket_path = str(Path(_IPC_SOCK_DIR) / f'{region_id}.sock')
 
         # Multi-CRM slots: name → CRMSlot.

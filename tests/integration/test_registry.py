@@ -94,7 +94,7 @@ class TestRegisterConnect:
         cc.register(IHello, Hello(), name='hello')
         addr = cc.server_address()
         assert addr is not None
-        assert addr.startswith('ipc-v3://')
+        assert addr.startswith('ipc://')
 
     def test_shutdown_cleans_everything(self):
         cc.register(IHello, Hello(), name='hello')

@@ -32,7 +32,7 @@ pub fn build_router(state: RelayState) -> Router {
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "address": "ipc-v3://..."}`
+/// Body: `{"name": "grid", "address": "ipc://..."}`
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
     State(state): State<RelayState>,

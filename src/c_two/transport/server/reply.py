@@ -1,4 +1,4 @@
-"""Reply encoding and sending for the IPC v3 server.
+"""Reply encoding and sending for the IPC server.
 
 Centralises ICRM result unpacking, error wrapping, and reply frame
 construction — eliminating the triple-duplication that existed when

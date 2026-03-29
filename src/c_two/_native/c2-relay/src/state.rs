@@ -1,6 +1,6 @@
 //! Multi-upstream relay state.
 //!
-//! Manages a pool of IPC v3 connections, each keyed by a user-chosen route
+//! Manages a pool of IPC connections, each keyed by a user-chosen route
 //! name. Supports dynamic registration and removal of upstreams.
 
 use std::collections::HashMap;
@@ -122,9 +122,9 @@ mod tests {
     #[test]
     fn upstream_pool_insert_duplicate_returns_err() {
         let mut pool = UpstreamPool::new();
-        let client = Arc::new(IpcClient::new("ipc-v3://nonexistent"));
-        pool.insert("test".into(), "ipc-v3://nonexistent".into(), client.clone()).unwrap();
-        let result = pool.insert("test".into(), "ipc-v3://nonexistent".into(), client);
+        let client = Arc::new(IpcClient::new("ipc://nonexistent"));
+        pool.insert("test".into(), "ipc://nonexistent".into(), client.clone()).unwrap();
+        let result = pool.insert("test".into(), "ipc://nonexistent".into(), client);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already registered"));
     }

@@ -1,6 +1,6 @@
 """Integration tests for Server + SharedClient.
 
-Tests SharedClient → Server via handshake v5 protocol.
+Tests SharedClient → Server via handshake protocol.
 """
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 @pytest.fixture
 def server_addr():
     """Start a Server hosting the Hello CRM + IHello ICRM."""
-    addr = f'ipc-v3://{_unique_region()}'
+    addr = f'ipc://{_unique_region()}'
     server = Server(
         bind_address=addr,
         icrm_class=IHello,
@@ -69,7 +69,7 @@ def server_addr():
 @pytest.fixture
 def server_small_shm():
     """Server with small SHM threshold (forces inline path more often)."""
-    addr = f'ipc-v3://{_unique_region("small")}'
+    addr = f'ipc://{_unique_region("small")}'
     config = IPCConfig(shm_threshold=16)
     server = Server(
         bind_address=addr,
@@ -123,7 +123,7 @@ class TestServerBackwardCompat:
         assert SharedClient.ping(server_addr)
 
     def test_shutdown_v1(self):
-        addr = f'ipc-v3://{_unique_region("shut")}'
+        addr = f'ipc://{_unique_region("shut")}'
         server = Server(
             bind_address=addr,
             icrm_class=IHello,
@@ -137,7 +137,7 @@ class TestServerBackwardCompat:
 
 
 # ---------------------------------------------------------------------------
-# V2 mode: SharedClient → Server (handshake v5)
+# SharedClient → Server (handshake)
 # ---------------------------------------------------------------------------
 
 class TestServerWire:
@@ -189,7 +189,7 @@ class TestServerWire:
             client.terminate()
 
     def test_method_table_populated(self, server_addr):
-        """Verify that v5 handshake populates method table on client."""
+        """Verify that handshake populates method table on client."""
         client = SharedClient(server_addr)
         client.connect()
         try:

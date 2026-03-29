@@ -465,7 +465,7 @@ def encode_inline_chunked_reply_frame(
 class MethodTable:
     """Maps method names to 2-byte indices (and back).
 
-    Built during handshake v5 and used per-request to replace method name
+    Built during handshake and used per-request to replace method name
     strings with compact indices.
     """
 

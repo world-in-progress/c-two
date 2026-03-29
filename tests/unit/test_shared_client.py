@@ -1,4 +1,4 @@
-"""Unit tests for SharedClient — concurrent multiplexed IPC v3 client."""
+"""Unit tests for SharedClient — concurrent multiplexed IPC client."""
 from __future__ import annotations
 
 import os
@@ -47,9 +47,9 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def ipc_v3_addr():
-    """Start an IPC v3 server, yield address, shut down."""
-    addr = f'ipc-v3://{_unique_region()}'
+def ipc_addr():
+    """Start an IPC server, yield address, shut down."""
+    addr = f'ipc://{_unique_region()}'
     server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello())
     server.start()
     _wait_for_server(addr)
@@ -66,8 +66,8 @@ def ipc_v3_addr():
 class TestSharedClientBasic:
     """Basic SharedClient lifecycle and call tests."""
 
-    def test_connect_and_terminate(self, ipc_v3_addr):
-        client = SharedClient(ipc_v3_addr)
+    def test_connect_and_terminate(self, ipc_addr):
+        client = SharedClient(ipc_addr)
         client.connect()
         assert client._sock is not None
         assert client._recv_thread is not None
@@ -75,9 +75,9 @@ class TestSharedClientBasic:
         client.terminate()
         assert client._closed
 
-    def test_basic_call(self, ipc_v3_addr):
-        """Simple RPC call through SharedClient → IPCv3Server."""
-        client = SharedClient(ipc_v3_addr)
+    def test_basic_call(self, ipc_addr):
+        """Simple RPC call through SharedClient → Server."""
+        client = SharedClient(ipc_addr)
         client.connect()
         try:
             result_bytes = client.call('greeting', pickle.dumps(('World',)))
@@ -86,8 +86,8 @@ class TestSharedClientBasic:
         finally:
             client.terminate()
 
-    def test_multiple_sequential_calls(self, ipc_v3_addr):
-        client = SharedClient(ipc_v3_addr)
+    def test_multiple_sequential_calls(self, ipc_addr):
+        client = SharedClient(ipc_addr)
         client.connect()
         try:
             r1 = pickle.loads(client.call('greeting', pickle.dumps(('Alice',))))
@@ -99,8 +99,8 @@ class TestSharedClientBasic:
         finally:
             client.terminate()
 
-    def test_none_return(self, ipc_v3_addr):
-        client = SharedClient(ipc_v3_addr)
+    def test_none_return(self, ipc_addr):
+        client = SharedClient(ipc_addr)
         client.connect()
         try:
             result_bytes = client.call('echo_none', pickle.dumps(('none',)))
@@ -109,8 +109,8 @@ class TestSharedClientBasic:
         finally:
             client.terminate()
 
-    def test_list_return(self, ipc_v3_addr):
-        client = SharedClient(ipc_v3_addr)
+    def test_list_return(self, ipc_addr):
+        client = SharedClient(ipc_addr)
         client.connect()
         try:
             result = pickle.loads(client.call('get_items', pickle.dumps(([1, 2, 3],))))
@@ -122,9 +122,9 @@ class TestSharedClientBasic:
 class TestSharedClientConcurrent:
     """Concurrency tests — the core value proposition of SharedClient."""
 
-    def test_concurrent_calls(self, ipc_v3_addr):
+    def test_concurrent_calls(self, ipc_addr):
         """Multiple threads calling via the same SharedClient simultaneously."""
-        client = SharedClient(ipc_v3_addr)
+        client = SharedClient(ipc_addr)
         client.connect()
         errors: list[str] = []
         n_threads = 4
@@ -150,9 +150,9 @@ class TestSharedClientConcurrent:
         finally:
             client.terminate()
 
-    def test_concurrent_different_methods(self, ipc_v3_addr):
+    def test_concurrent_different_methods(self, ipc_addr):
         """Different methods called concurrently on the same SharedClient."""
-        client = SharedClient(ipc_v3_addr)
+        client = SharedClient(ipc_addr)
         client.connect()
         results: dict[str, object] = {}
         errors: list[str] = []
@@ -195,25 +195,25 @@ class TestSharedClientConcurrent:
 class TestSharedClientPingShutdown:
     """Ping and shutdown static methods."""
 
-    def test_ping(self, ipc_v3_addr):
-        assert SharedClient.ping(ipc_v3_addr) is True
+    def test_ping(self, ipc_addr):
+        assert SharedClient.ping(ipc_addr) is True
 
     def test_ping_nonexistent(self):
-        assert SharedClient.ping('ipc-v3://nonexistent_test_shared') is False
+        assert SharedClient.ping('ipc://nonexistent_test_shared') is False
 
-    def test_shutdown(self, ipc_v3_addr):
-        result = SharedClient.shutdown(ipc_v3_addr)
+    def test_shutdown(self, ipc_addr):
+        result = SharedClient.shutdown(ipc_addr)
         assert result is True
         time.sleep(0.5)
-        assert SharedClient.ping(ipc_v3_addr) is False
+        assert SharedClient.ping(ipc_addr) is False
 
 
 class TestSharedClientBuddy:
     """Test that buddy SHM path works for larger payloads."""
 
-    def test_large_payload_buddy_path(self, ipc_v3_addr):
+    def test_large_payload_buddy_path(self, ipc_addr):
         """Payload exceeding shm_threshold should use buddy SHM."""
-        client = SharedClient(ipc_v3_addr)
+        client = SharedClient(ipc_addr)
         client.connect()
         try:
             assert client._buddy_pool is not None
@@ -225,9 +225,9 @@ class TestSharedClientBuddy:
         finally:
             client.terminate()
 
-    def test_inline_small_payload(self, ipc_v3_addr):
+    def test_inline_small_payload(self, ipc_addr):
         """Small payloads should go through inline (non-buddy) path."""
-        client = SharedClient(ipc_v3_addr)
+        client = SharedClient(ipc_addr)
         client.connect()
         try:
             result_bytes = client.call('add', pickle.dumps((1, 2)))
@@ -240,16 +240,16 @@ class TestSharedClientBuddy:
 class TestSharedClientErrorHandling:
     """Error propagation tests."""
 
-    def test_call_after_terminate(self, ipc_v3_addr):
-        client = SharedClient(ipc_v3_addr)
+    def test_call_after_terminate(self, ipc_addr):
+        client = SharedClient(ipc_addr)
         client.connect()
         client.terminate()
         with pytest.raises(Exception):
             client.call('greeting', pickle.dumps(('test',)))
 
-    def test_double_terminate(self, ipc_v3_addr):
+    def test_double_terminate(self, ipc_addr):
         """Double terminate should not raise."""
-        client = SharedClient(ipc_v3_addr)
+        client = SharedClient(ipc_addr)
         client.connect()
         client.terminate()
         client.terminate()  # Should be idempotent

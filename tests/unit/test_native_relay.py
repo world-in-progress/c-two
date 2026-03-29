@@ -55,7 +55,7 @@ class TestNativeRelayUpstreamErrors:
     def test_register_upstream_not_running(self):
         relay = NativeRelay('127.0.0.1:0')
         with pytest.raises(RuntimeError, match='not running'):
-            relay.register_upstream('test', 'ipc-v3://nonexistent')
+            relay.register_upstream('test', 'ipc://nonexistent')
 
     def test_unregister_upstream_not_running(self):
         relay = NativeRelay('127.0.0.1:0')
@@ -77,7 +77,7 @@ class TestNativeRelayUpstreamErrors:
         relay.start()
         try:
             with pytest.raises(RuntimeError, match='Failed to connect'):
-                relay.register_upstream('bad', 'ipc-v3://nonexistent_server_xyz')
+                relay.register_upstream('bad', 'ipc://nonexistent_server_xyz')
         finally:
             relay.stop()
 
@@ -94,7 +94,7 @@ class TestNativeRelayWithServer:
         from tests.fixtures.ihello import IHello
 
         _ProcessRegistry.reset()
-        ipc_addr = f'ipc-v3://nrelay_test_{os.getpid()}'
+        ipc_addr = f'ipc://nrelay_test_{os.getpid()}'
 
         try:
             cc.set_address(ipc_addr)
@@ -119,7 +119,7 @@ class TestNativeRelayWithServer:
             _ProcessRegistry.reset()
 
     def test_http_data_plane_call(self):
-        """Full chain: httpx → NativeRelay → IPC v3 → CRM."""
+        """Full chain: httpx → NativeRelay → IPC → CRM."""
         import os
         import httpx
         import c_two as cc
@@ -130,7 +130,7 @@ class TestNativeRelayWithServer:
         from tests.fixtures.ihello import IHello
 
         _ProcessRegistry.reset()
-        ipc_addr = f'ipc-v3://nrelay_data_{os.getpid()}'
+        ipc_addr = f'ipc://nrelay_data_{os.getpid()}'
 
         try:
             cc.set_address(ipc_addr)

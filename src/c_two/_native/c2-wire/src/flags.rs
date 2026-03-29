@@ -3,16 +3,16 @@
 //! Matches Python `ipc_protocol.py` and `protocol.py` flag constants.
 //! All flags occupy the 4-byte LE `flags` field of the frame header.
 
-/// Payload references a per-request SharedMemory segment (IPC v2 legacy).
+/// Payload references a per-request SharedMemory segment (legacy).
 pub const FLAG_SHM: u32 = 1 << 0;
 
 /// Server→client direction marker.
 pub const FLAG_RESPONSE: u32 = 1 << 1;
 
-/// Handshake message (pool SHM exchange or v5 capability negotiation).
+/// Handshake message (pool SHM exchange or capability negotiation).
 pub const FLAG_HANDSHAKE: u32 = 1 << 2;
 
-/// Payload references pre-allocated pool SharedMemory (IPC v2 legacy).
+/// Payload references pre-allocated pool SharedMemory (legacy).
 pub const FLAG_POOL: u32 = 1 << 3;
 
 /// Control message (segment announce, consumed signal).

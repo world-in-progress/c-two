@@ -2,7 +2,7 @@
 name = "c2-relay"
 edition.workspace = true
 version.workspace = true
-description = "HTTP relay server for C-Two (axum → IPC v3)"
+description = "HTTP relay server for C-Two (axum → IPC)"
 
 [dependencies]
 c2-wire = { path = "../c2-wire" }

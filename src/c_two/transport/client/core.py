@@ -1,6 +1,6 @@
-"""Concurrent multiplexed IPC v3 client.
+"""Concurrent multiplexed IPC client.
 
-Unlike the serial :class:`IPCv3Client` (which holds ``_conn_lock`` for the
+Unlike the serial :class:`IPCClient` (which holds ``_conn_lock`` for the
 entire call duration), :class:`SharedClient` uses a background receive thread
 and per-request :class:`PendingCall` objects to support concurrent calls from
 multiple ICRM consumers over a single UDS connection and buddy pool.
@@ -10,11 +10,11 @@ Memory model:
 - One buddy pool (256 MB default) shared across all callers
 - N ICRM consumers share 1 SharedClient → N × 256 MB → 256 MB
 
-Ownership model (same as IPCv3Client):
+Ownership model (same as IPCClient):
 - Request blocks: client allocs, server frees after reading
 - Response blocks: server allocs, client frees after reading
 
-Control-plane routing negotiated via handshake v5.  SHM contains pure
+Control-plane routing negotiated via handshake.  SHM contains pure
 payload (no wire header); method routing via 2-byte index in the inline
 control frame.
 """
@@ -56,16 +56,16 @@ from ..protocol import (
     FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
-    HANDSHAKE_V5,
+    HANDSHAKE_VERSION,
     CAP_CALL,
     CAP_METHOD_IDX,
     CAP_CHUNKED,
     STATUS_SUCCESS,
     STATUS_ERROR,
-    HandshakeV5,
+    Handshake,
     RouteInfo,
-    encode_v5_client_handshake,
-    decode_v5_handshake,
+    encode_client_handshake,
+    decode_handshake,
 )
 from ..wire import (
     CHUNK_HEADER_SIZE,
@@ -200,7 +200,7 @@ class _ReplyChunkAssembler:
 # ---------------------------------------------------------------------------
 
 class SharedClient:
-    """Concurrent multiplexed IPC v3 client.
+    """Concurrent multiplexed IPC client.
 
     Thread-safe: multiple ICRM consumers may call :meth:`call` concurrently
     from different threads.  A single UDS connection and buddy pool is shared.
@@ -213,7 +213,7 @@ class SharedClient:
     ):
         self._config = ipc_config or IPCConfig()
         self._address = server_address
-        self.region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
+        self.region_id = server_address.replace('ipc://', '')
         self._socket_path = _resolve_socket_path(self.region_id)
 
         # UDS connection — single socket shared across all callers.
@@ -238,7 +238,7 @@ class SharedClient:
         self._closed = False
         self._close_lock = threading.Lock()
 
-        # Wire v2 mode (negotiated during handshake v5).
+        # Negotiated during handshake.
         self._method_table: MethodTable | None = None
         self._name_tables: dict[str, MethodTable] = {}
         self._default_name = ''
@@ -273,7 +273,7 @@ class SharedClient:
         return sock
 
     def _do_buddy_handshake(self) -> None:
-        """Create buddy pool and perform handshake v5 with server."""
+        """Create buddy pool and perform handshake with server."""
         try:
             from c_two.buddy import BuddyPoolHandle, PoolConfig
         except ImportError:
@@ -299,8 +299,8 @@ class SharedClient:
 
         segments = [(seg_name, seg_size)]
 
-        # Handshake v5 (only supported protocol).
-        handshake_payload = encode_v5_client_handshake(
+        # Handshake (only supported protocol).
+        handshake_payload = encode_client_handshake(
             segments, CAP_CALL | CAP_METHOD_IDX | CAP_CHUNKED,
         )
         handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
@@ -314,10 +314,10 @@ class SharedClient:
         if not (flags & (1 << 2)):
             raise error.CompoClientError('Server did not respond with handshake ACK')
 
-        if len(payload) < 1 or payload[0] != HANDSHAKE_V5:
-            raise error.CompoClientError('Server does not support handshake v5')
+        if len(payload) < 1 or payload[0] != HANDSHAKE_VERSION:
+            raise error.CompoClientError('Server does not support handshake')
 
-        hs = decode_v5_handshake(payload)
+        hs = decode_handshake(payload)
         if not (hs.capability_flags & CAP_CALL):
             raise error.CompoClientError('Server does not support routed calls')
 
@@ -344,7 +344,7 @@ class SharedClient:
             self._seg_views.append(mv)
             self._seg_base_addrs.append(base_addr)
 
-        logger.debug('Buddy handshake complete (v5), pool segment: %s', seg_name)
+        logger.debug('Buddy handshake complete, pool segment: %s', seg_name)
 
     def terminate(self) -> None:
         """Shut down the client: stop recv thread, close socket, destroy pool."""
@@ -460,7 +460,7 @@ class SharedClient:
                 self._pending.pop(rid, None)
             if isinstance(exc, error.CCBaseError):
                 raise
-            raise error.CompoClientError(f'IPC v3 call failed: {exc}') from exc
+            raise error.CompoClientError(f'IPC call failed: {exc}') from exc
 
         # Wait for response (no locks held).
         try:
@@ -496,7 +496,7 @@ class SharedClient:
                 self._pending.pop(rid, None)
             if isinstance(exc, error.CCBaseError):
                 raise
-            raise error.CompoClientError(f'IPC v3 relay failed: {exc}') from exc
+            raise error.CompoClientError(f'IPC relay failed: {exc}') from exc
 
         return pending.wait(timeout=30.0)
 
@@ -919,7 +919,7 @@ class SharedClient:
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         """Ping a server to check if it is alive."""
-        region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
+        region_id = server_address.replace('ipc://', '')
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return False
@@ -942,7 +942,7 @@ class SharedClient:
     @staticmethod
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
         """Send shutdown signal to a server."""
-        region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
+        region_id = server_address.replace('ipc://', '')
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return True

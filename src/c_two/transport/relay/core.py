@@ -1,6 +1,6 @@
 """Multi-upstream HTTP relay server for C-Two.
 
-Bridges HTTP requests to multiple IPC v3 ``Server`` processes via
+Bridges HTTP requests to multiple IPC ``Server`` processes via
 dynamically registered :class:`SharedClient` connections.
 
 CRM resource processes register themselves at runtime via::

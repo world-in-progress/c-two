@@ -1,7 +1,7 @@
 //! PyO3 bindings for the C-Two HTTP relay server.
 //!
 //! Exposes `NativeRelay` — an embedded axum HTTP server that bridges
-//! HTTP requests to IPC v3 upstreams. The server runs on a background
+//! HTTP requests to IPC upstreams. The server runs on a background
 //! OS thread with its own tokio runtime.
 //!
 //! **GIL handling**: All methods that block (start, stop, register, etc.)
@@ -22,8 +22,8 @@ use c2_relay::server::RelayServer;
 /// from c_two._native import NativeRelay
 /// relay = NativeRelay("0.0.0.0:8080")
 /// relay.start()
-/// relay.register_upstream("grid", "ipc-v3://my_server")
-/// relay.list_routes()  # [{"name": "grid", "address": "ipc-v3://my_server"}]
+/// relay.register_upstream("grid", "ipc://my_server")
+/// relay.list_routes()  # [{"name": "grid", "address": "ipc://my_server"}]
 /// relay.stop()
 /// ```
 #[pyclass(name = "NativeRelay")]

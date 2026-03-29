@@ -16,7 +16,7 @@ from examples.grid.igrid import (
     GridAttribute,
 )
 
-SERVER_ADDRESS = 'ipc-v3://grid'
+SERVER_ADDRESS = 'ipc://grid'
 
 
 def main():

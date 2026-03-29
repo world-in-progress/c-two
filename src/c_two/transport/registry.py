@@ -137,7 +137,7 @@ class _ProcessRegistry:
         Parameters
         ----------
         address:
-            IPC address (e.g. ``'ipc-v3://my_server'``).
+            IPC address (e.g. ``'ipc://my_server'``).
         """
         with self._lock:
             if self._server is not None:
@@ -276,7 +276,7 @@ class _ProcessRegistry:
         name:
             Routing name of the target CRM.
         address:
-            Explicit IPC server address (e.g. ``'ipc-v3://remote'``).
+            Explicit IPC server address (e.g. ``'ipc://remote'``).
             If ``None``, looks up the local registry.
 
         Returns
@@ -621,7 +621,7 @@ class _ProcessRegistry:
 
     @staticmethod
     def _auto_address() -> str:
-        return f'ipc-v3://cc_auto_{os.getpid()}_{uuid.uuid4().hex[:8]}'
+        return f'ipc://cc_auto_{os.getpid()}_{uuid.uuid4().hex[:8]}'
 
 
 # ------------------------------------------------------------------

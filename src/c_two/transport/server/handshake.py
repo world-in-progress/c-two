@@ -1,4 +1,4 @@
-"""Handshake v5 protocol for the IPC v3 server.
+"""Handshake protocol for the IPC server.
 
 Handles capability negotiation, method-table exchange, and
 client SHM segment opening.  All functions are standalone —
@@ -14,14 +14,14 @@ import re
 
 from ..ipc.frame import IPCConfig, encode_frame
 from ..protocol import (
-    HANDSHAKE_V5,
+    HANDSHAKE_VERSION,
     CAP_CALL,
     CAP_METHOD_IDX,
     CAP_CHUNKED,
     RouteInfo,
     MethodEntry,
-    encode_v5_server_handshake,
-    decode_v5_handshake,
+    encode_server_handshake,
+    decode_handshake,
 )
 from .connection import Connection, CRMSlot
 
@@ -43,26 +43,26 @@ async def handle_handshake(
     if len(payload) < 1:
         return
     version = payload[0]
-    if version == HANDSHAKE_V5:
-        await handle_v5_handshake(conn, payload, writer, slots_snapshot, config)
+    if version == HANDSHAKE_VERSION:
+        await _handle_handshake_impl(conn, payload, writer, slots_snapshot, config)
     else:
-        # Reject legacy v4 clients — only v5 supported.
+        # Reject legacy clients — only current version supported.
         writer.close()
         await writer.wait_closed()
 
 
-async def handle_v5_handshake(
+async def _handle_handshake_impl(
     conn: Connection,
     payload: bytes,
     writer: asyncio.StreamWriter,
     slots_snapshot: list[CRMSlot],
     config: IPCConfig,
 ) -> None:
-    """Process a v5 handshake: open segments, negotiate caps, send ACK."""
+    """Process handshake: open segments, negotiate caps, send ACK."""
     try:
-        hs = decode_v5_handshake(payload)
+        hs = decode_handshake(payload)
     except Exception as e:
-        logger.warning('Conn %d: bad v5 handshake: %s', conn.conn_id, e)
+        logger.warning('Conn %d: bad handshake: %s', conn.conn_id, e)
         return
     open_segments(conn, hs.segments, config)
 
@@ -86,7 +86,7 @@ async def handle_v5_handshake(
         cap_flags |= CAP_CHUNKED
         conn.chunked_capable = True
 
-    ack_payload = encode_v5_server_handshake(
+    ack_payload = encode_server_handshake(
         segments=[],
         capability_flags=cap_flags,
         routes=route_infos,

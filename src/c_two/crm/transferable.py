@@ -235,7 +235,7 @@ def create_default_transferable(func, is_input: bool):
 
         # Fast path: bytes return type — skip pickle entirely.
         # The serializer passes memoryview through to enable zero-copy
-        # SHM→SHM writes in transports that support it (ipc-v3 buddy).
+        # SHM→SHM writes in transports that support it (ipc buddy).
         if return_type is bytes:
             def _bytes_output_serialize(val):
                 if isinstance(val, (bytes, memoryview)):

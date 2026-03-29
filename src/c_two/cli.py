@@ -46,7 +46,7 @@ def parse_upstream(value: str) -> tuple[str, str]:
     if '=' not in value:
         raise click.BadParameter(
             f'Invalid upstream format: {value!r}. '
-            f'Expected name=address, e.g. grid=ipc-v3://my_server',
+            f'Expected name=address, e.g. grid=ipc://my_server',
         )
     name, address = value.split('=', 1)
     name = name.strip()
@@ -156,7 +156,7 @@ def relay(
 ):
     """Start the C-Two HTTP relay server.
 
-    Bridges HTTP requests to CRM resource processes over IPC v3.
+    Bridges HTTP requests to CRM resource processes over IPC.
     CRM processes auto-register via C2_RELAY_ADDRESS, or use --upstream
     to pre-register at startup.
     """

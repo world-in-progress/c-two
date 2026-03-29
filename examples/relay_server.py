@@ -19,7 +19,7 @@ from c_two.transport.relay import Relay
 from icrm import IGrid
 from crm import Grid
 
-IPC_ADDRESS = 'ipc-v3://grid_relay'
+IPC_ADDRESS = 'ipc://grid_relay'
 HTTP_BIND = '127.0.0.1:8080'
 
 

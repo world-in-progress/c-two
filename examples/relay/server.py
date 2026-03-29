@@ -1,6 +1,6 @@
 """HTTP relay — standalone gateway process.
 
-Bridges HTTP requests to CRM resource processes running on IPC v3.
+Bridges HTTP requests to CRM resource processes running on IPC.
 The relay starts empty; CRM processes auto-register via
 ``C2_RELAY_ADDRESS`` when they call ``cc.register()``.
 

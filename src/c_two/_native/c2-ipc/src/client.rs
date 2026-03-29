@@ -1,6 +1,6 @@
-//! Async IPC v3 client — connects to Python ServerV2 via UDS.
+//! Async IPC client — connects to Python ServerV2 via UDS.
 //!
-//! Performs handshake v5, then multiplexes concurrent requests over
+//! Performs handshake, then multiplexes concurrent requests over
 //! a single UDS connection using request IDs.
 
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use c2_wire::control::{decode_reply_control, ReplyControl};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
-    decode_handshake, encode_client_handshake, HandshakeV5, MethodEntry,
+    decode_handshake, encode_client_handshake, Handshake, MethodEntry,
     CAP_CALL_V2, CAP_METHOD_IDX,
 };
 
@@ -100,10 +100,10 @@ type PendingMap = HashMap<u32, oneshot::Sender<Result<Vec<u8>, IpcError>>>;
 
 // ── IpcClient ────────────────────────────────────────────────────────────
 
-/// Async IPC v3 client for the C-Two relay.
+/// Async IPC client for the C-Two relay.
 ///
 /// Connects to a Python `ServerV2` via Unix Domain Socket, performs
-/// handshake v5, and multiplexes concurrent CRM calls.
+/// handshake, and multiplexes concurrent CRM calls.
 pub struct IpcClient {
     socket_path: PathBuf,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
@@ -118,11 +118,11 @@ pub struct IpcClient {
 impl IpcClient {
     /// Create a new IPC client targeting the given address.
     ///
-    /// The address should be like `ipc-v3://name` — the socket path is
-    /// derived as `/tmp/c_two_ipc/{name}.sock` (matching Python ServerV2).
+    /// The address should be like `ipc://name` — the socket path is
+    /// derived as `/tmp/c_two_ipc/{name}.sock` (matching Python Server).
     pub fn new(address: &str) -> Self {
         let name = address
-            .strip_prefix("ipc-v3://")
+            .strip_prefix("ipc://")
             .unwrap_or(address);
         let socket_path = PathBuf::from(format!("/tmp/c_two_ipc/{name}.sock"));
 
@@ -138,12 +138,12 @@ impl IpcClient {
         }
     }
 
-    /// Connect and perform handshake v5.
+    /// Connect and perform handshake.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
         let stream = UnixStream::connect(&self.socket_path).await?;
         let (reader, mut writer) = tokio::io::split(stream);
 
-        // Perform handshake v5.
+        // Perform handshake.
         let hs = self.do_handshake(&mut writer, reader).await?;
 
         // Store method tables from the handshake response.
@@ -184,7 +184,7 @@ impl IpcClient {
         &self,
         writer: &mut tokio::io::WriteHalf<UnixStream>,
         mut reader: tokio::io::ReadHalf<UnixStream>,
-    ) -> Result<HandshakeV5, IpcError> {
+    ) -> Result<Handshake, IpcError> {
         // We don't create SHM segments from the relay side — the relay
         // reads from server segments only.  Send empty segments list.
         let payload = encode_client_handshake(&[], CAP_CALL_V2 | CAP_METHOD_IDX);
@@ -210,7 +210,7 @@ impl IpcClient {
         }
 
         let hs = decode_handshake(&payload_buf)
-            .map_err(|e| IpcError::Handshake(format!("v5 decode: {e}")))?;
+            .map_err(|e| IpcError::Handshake(format!("decode: {e}")))?;
 
         if hs.capability_flags & CAP_CALL_V2 == 0 {
             return Err(IpcError::Handshake(

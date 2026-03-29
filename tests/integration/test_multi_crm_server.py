@@ -29,7 +29,7 @@ def _unique_region() -> str:
 
 
 def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
-    region_id = addr.replace('ipc-v3://', '')
+    region_id = addr.replace('ipc://', '')
     sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -46,7 +46,7 @@ def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
 @pytest.fixture
 def multi_crm_addr():
     """Start a Server hosting Hello + Counter CRMs."""
-    addr = f'ipc-v3://{_unique_region()}'
+    addr = f'ipc://{_unique_region()}'
     server = Server(bind_address=addr)
     server.register_crm(IHello, Hello(), name='hello')
     server.register_crm(ICounter, Counter(initial=100), name='counter')
@@ -59,7 +59,7 @@ def multi_crm_addr():
 @pytest.fixture
 def single_then_add_addr():
     """Start with one CRM, add second after start."""
-    addr = f'ipc-v3://{_unique_region()}'
+    addr = f'ipc://{_unique_region()}'
     server = Server(
         bind_address=addr,
         icrm_class=IHello,
@@ -79,14 +79,14 @@ def single_then_add_addr():
 class TestRegistrationAPI:
 
     def test_register_returns_name(self):
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         result = server.register_crm(IHello, Hello(), name='hello')
         assert result == 'hello'
         server.shutdown()
 
     def test_duplicate_name_raises(self):
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         with pytest.raises(ValueError, match='already registered'):
@@ -94,7 +94,7 @@ class TestRegistrationAPI:
         server.shutdown()
 
     def test_names_property(self):
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(), name='counter')
@@ -102,7 +102,7 @@ class TestRegistrationAPI:
         server.shutdown()
 
     def test_unregister(self):
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(), name='counter')
@@ -111,7 +111,7 @@ class TestRegistrationAPI:
         server.shutdown()
 
     def test_unregister_unknown_raises(self):
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         with pytest.raises(KeyError):
             server.unregister_crm('nonexistent')
@@ -119,7 +119,7 @@ class TestRegistrationAPI:
 
     def test_no_crm_constructor(self):
         """Server can be created without any initial CRM."""
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         assert server.names == []
         server.shutdown()
@@ -271,7 +271,7 @@ class TestDynamicRegistration:
 
     def test_unregister_default_shifts(self):
         """Unregistering the default route shifts to the next one."""
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(), name='counter')

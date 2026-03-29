@@ -2,7 +2,7 @@
 
 Wraps the Rust ``c2_buddy`` native extension, providing zero-syscall
 dynamic allocation within pre-mapped POSIX shared memory segments for
-the C-Two IPC v3 transport.
+the C-Two IPC transport.
 
 Typical usage::
 

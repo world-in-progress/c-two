@@ -27,15 +27,15 @@ def _next_id():
 
 
 @pytest.fixture
-def unique_ipc_v3_address():
-    return f'ipc-v3://test_hello_{_next_id()}'
+def unique_ipc_address():
+    return f'ipc://test_hello_{_next_id()}'
 
 
-@pytest.fixture(params=['ipc-v3'])
-def protocol_address(request, unique_ipc_v3_address):
+@pytest.fixture(params=['ipc'])
+def protocol_address(request, unique_ipc_address):
     """Parametrized fixture providing a unique address for each supported protocol."""
     addresses = {
-        'ipc-v3': unique_ipc_v3_address,
+        'ipc': unique_ipc_address,
     }
     return addresses[request.param]
 

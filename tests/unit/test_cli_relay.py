@@ -50,29 +50,29 @@ class TestParseSize:
 
 class TestParseUpstream:
     def test_valid(self):
-        name, addr = parse_upstream('grid=ipc-v3://my_server')
+        name, addr = parse_upstream('grid=ipc://my_server')
         assert name == 'grid'
-        assert addr == 'ipc-v3://my_server'
+        assert addr == 'ipc://my_server'
 
     def test_address_with_equals(self):
-        name, addr = parse_upstream('grid=ipc-v3://host=foo')
+        name, addr = parse_upstream('grid=ipc://host=foo')
         assert name == 'grid'
-        assert addr == 'ipc-v3://host=foo'
+        assert addr == 'ipc://host=foo'
 
     def test_whitespace_stripped(self):
-        name, addr = parse_upstream('  grid = ipc-v3://my_server  ')
+        name, addr = parse_upstream('  grid = ipc://my_server  ')
         assert name == 'grid'
-        assert addr == 'ipc-v3://my_server'
+        assert addr == 'ipc://my_server'
 
     def test_no_equals(self):
         from click import BadParameter
         with pytest.raises(BadParameter, match='Invalid upstream format'):
-            parse_upstream('grid-ipc-v3://my_server')
+            parse_upstream('grid-ipc://my_server')
 
     def test_empty_name(self):
         from click import BadParameter
         with pytest.raises(BadParameter, match='name cannot be empty'):
-            parse_upstream('=ipc-v3://foo')
+            parse_upstream('=ipc://foo')
 
     def test_empty_address(self):
         from click import BadParameter

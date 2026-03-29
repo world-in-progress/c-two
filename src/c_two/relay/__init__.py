@@ -8,7 +8,7 @@ Typical usage::
 
     relay = NativeRelay("0.0.0.0:8080")
     relay.start()
-    relay.register_upstream("grid", "ipc-v3://my_server")
+    relay.register_upstream("grid", "ipc://my_server")
     relay.stop()
 """
 from __future__ import annotations

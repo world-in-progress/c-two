@@ -18,7 +18,7 @@ import c_two as cc
 from icrm import IGrid
 from crm import Grid
 
-BIND_ADDRESS = 'ipc-v3://grid'
+BIND_ADDRESS = 'ipc://grid'
 
 
 def main():

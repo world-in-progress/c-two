@@ -1,6 +1,6 @@
 """Grid CRM server — standalone IPC process with relay auto-registration.
 
-Registers the Grid CRM over IPC v3.  When ``C2_RELAY_ADDRESS`` is set,
+Registers the Grid CRM over IPC.  When ``C2_RELAY_ADDRESS`` is set,
 ``cc.register()`` automatically notifies the relay server, making the
 Grid CRM accessible via HTTP.
 
@@ -24,7 +24,7 @@ import c_two as cc
 from grid.grid import Grid
 from grid.igrid import IGrid
 
-BIND_ADDRESS = 'ipc-v3://v2_grid_standalone'
+BIND_ADDRESS = 'ipc://v2_grid_standalone'
 
 
 def main():

@@ -56,7 +56,7 @@ class ErrorHello(Hello):
 @pytest.fixture
 def error_server():
     """Start a server backed by ErrorHello, yield its address, then shut down."""
-    address = f'ipc-v3://error_test_{_next_id()}'
+    address = f'ipc://error_test_{_next_id()}'
     server = Server(
         bind_address=address,
         icrm_class=IHello,
@@ -133,13 +133,13 @@ class TestCompoClientError:
     """Errors triggered by client connectivity problems."""
 
     def test_connect_to_nonexistent_server(self):
-        address = f'ipc-v3://nonexistent_{_next_id()}'
+        address = f'ipc://nonexistent_{_next_id()}'
         with pytest.raises(Exception):
             with cc.compo.runtime.connect_crm(address, IHello) as crm:
                 crm.greeting('test')
 
     def test_ping_nonexistent_returns_false(self):
-        address = f'ipc-v3://nonexistent_{_next_id()}'
+        address = f'ipc://nonexistent_{_next_id()}'
         assert SharedClient.ping(address, timeout=0.5) is False
 
 
