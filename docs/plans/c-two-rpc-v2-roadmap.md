@@ -106,18 +106,14 @@ Server 端主动心跳探测 + 客户端 PONG 自动响应 + SHM 孤儿回收，
 
 **详细实施方案**: `docs/superpowers/plans/2025-07-25-heartbeat-detection.md`
 
-### 2.3 Rust Relay 发布集成
+### 2.3 CI/CD 发布集成 — 已完成 ✓
 
-**问题**: Rust relay (`c2-relay`) 性能远超 Python relay（估计 50K-200K vs 1K-5K QPS），但未集成到 Python 包分发中。
-
-**方案**: 参考 `ruff` 的模式：
-1. `c2-relay` 编译为独立二进制
-2. GitHub Action CI 矩阵构建（Linux x86_64/aarch64, macOS x86_64/aarch64）
-3. 二进制打包进 platform-specific wheel
-4. Python 端 `cc.relay.start()` 通过 `subprocess` 启动，传入 IPC 地址和端口
-5. `pip install c-two` 自动获取预编译 relay
-
-**改动范围**: CI/CD 配置 + `c2-relay` 的独立 binary 构建 + Python thin wrapper
+**完成内容** (2025-07-26):
+- `.github/workflows/ci.yml` — PR 测试 (Python 3.12 + 3.14t, ubuntu-latest)
+- `.github/workflows/release.yml` — 版本门控发布 (4 平台 × 6 解释器 wheel + sdist)
+- `.github/scripts/check_version.py` — pyproject.toml vs PyPI 版本比对 (6 单元测试)
+- PyPI Trusted Publishing (OIDC) — 零 secret 认证
+- 平台: Linux x86_64/aarch64 + macOS x86_64(交叉编译)/aarch64
 
 ---
 
@@ -127,7 +123,7 @@ Server 端主动心跳探测 + 客户端 PONG 自动响应 + SHM 孤儿回收，
 
 **背景**: 分块流式传输解决了大 payload 突破 256 MB 限制的问题，但当系统物理内存不足以容纳 reassembly buffer（接收端使用 `mmap.mmap(-1, total_size)` 匿名映射）时，仍需要磁盘级兜底策略。
 
-**方案**: 当 mmap 分配失败或检测到系统可用内存低于阈值时，`_ChunkAssembler` / `_ReplyChunkAssembler` 切换到文件支持的 mmap（`mmap.mmap(fd, size)`），将 reassembly buffer 溢写到临时文件。具体设计参见 spike 文档 `doc/spikes/performance-shm-streaming-large-payload-spike.md` 中的 Plan C。
+**方案**: 当 mmap 分配失败或检测到系统可用内存低于阈值时，`_ChunkAssembler` / `_ReplyChunkAssembler` 切换到文件支持的 mmap（`mmap.mmap(fd, size)`），将 reassembly buffer 溢写到临时文件。具体设计参见 spike 文档 `docs/spikes/performance-shm-streaming-large-payload-spike.md` 中的 Plan C。
 
 **触发条件**: 可通过 `IPCConfig.disk_spill_threshold` 配置（默认 None = 不启用），当 `total_payload > threshold` 或 `mmap(-1, ...)` 抛出 `OSError` 时自动降级。
 
@@ -251,7 +247,7 @@ P0.5 — 大 payload 支持 ✅
 P1 — 性能与可靠性增强
 ├─ 2.1 SHM Pool 动态扩容        优先级降低（Rust 侧已就绪，Python 层待实现）
 ├─ 2.2 心跳 + PID 存活检测      ✅ 已完成 (2026-03-29)
-└─ 2.3 Rust Relay 发布集成      ← 下一目标（CI/CD 工程）
+└─ 2.3 CI/CD 发布集成           ✅ 已完成 (2025-07-26)
 
 P2 — 功能完善（v0.4.0 里程碑）
 ├─ 3.0 磁盘溢写兜底 (Plan C)
