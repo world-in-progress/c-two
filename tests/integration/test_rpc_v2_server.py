@@ -1,7 +1,6 @@
 """Integration tests for rpc_v2 Phase 2 — ServerV2 + SharedClient.
 
-Tests both backward-compatible (v1 mode: SharedClient → IPCv3Server) and
-v2 mode (SharedClient(try_v2=True) → ServerV2) paths.
+Tests SharedClient → ServerV2 via handshake v5 with wire v2 protocol.
 """
 from __future__ import annotations
 
@@ -138,37 +137,35 @@ class TestServerV2BackwardCompat:
 
 
 # ---------------------------------------------------------------------------
-# V2 mode: SharedClient(try_v2=True) → ServerV2 (handshake v5)
+# V2 mode: SharedClient → ServerV2 (handshake v5)
 # ---------------------------------------------------------------------------
 
 class TestServerV2WireV2:
     """SharedClient in v2 mode against ServerV2 — control-plane routing."""
 
     def test_greeting_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr, try_v2=True)
+        client = SharedClient(server_v2_addr)
         client.connect()
         try:
-            assert client._v2_mode, 'Expected v2 mode after v5 handshake'
+            
             result = pickle.loads(client.call('greeting', pickle.dumps(('V2',))))
             assert result == 'Hello, V2!'
         finally:
             client.terminate()
 
     def test_add_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr, try_v2=True)
+        client = SharedClient(server_v2_addr)
         client.connect()
         try:
-            assert client._v2_mode
             result = pickle.loads(client.call('add', pickle.dumps((100, 200))))
             assert result == 300
         finally:
             client.terminate()
 
     def test_list_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr, try_v2=True)
+        client = SharedClient(server_v2_addr)
         client.connect()
         try:
-            assert client._v2_mode
             result = pickle.loads(
                 client.call('get_items', pickle.dumps(([5, 10],)))
             )
@@ -178,10 +175,9 @@ class TestServerV2WireV2:
 
     def test_custom_type_v2(self, server_v2_addr):
         """Test transferable type round-trip in v2 mode."""
-        client = SharedClient(server_v2_addr, try_v2=True)
+        client = SharedClient(server_v2_addr)
         client.connect()
         try:
-            assert client._v2_mode
             raw = client.call('get_data', pickle.dumps((42,)))
             # HelloData.serialize produces pickle.dumps(dict), so wire result
             # is a pickled dict.  Deserialize with the transferable's deserializer.
@@ -194,10 +190,9 @@ class TestServerV2WireV2:
 
     def test_v2_method_table_populated(self, server_v2_addr):
         """Verify that v5 handshake populates method table on client."""
-        client = SharedClient(server_v2_addr, try_v2=True)
+        client = SharedClient(server_v2_addr)
         client.connect()
         try:
-            assert client._v2_mode
             assert client._method_table is not None
             assert client._method_table.has_name('greeting')
             assert client._method_table.has_name('add')
@@ -259,7 +254,7 @@ class TestServerV2Concurrent:
             client.terminate()
 
     def test_concurrent_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr, try_v2=True)
+        client = SharedClient(server_v2_addr)
         client.connect()
         errors: list[str] = []
 
@@ -275,7 +270,6 @@ class TestServerV2Concurrent:
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
         try:
-            assert client._v2_mode
             for t in threads:
                 t.start()
             for t in threads:

@@ -102,7 +102,7 @@ class UpstreamPool:
             if name in self._entries:
                 raise ValueError(f'Route name already registered: {name!r}')
 
-            client = SharedClient(address, self._ipc_config, try_v2=True)
+            client = SharedClient(address, self._ipc_config)
             try:
                 client.connect()
             except Exception as exc:

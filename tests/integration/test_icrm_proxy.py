@@ -104,7 +104,7 @@ class TestICRMProxyIPC:
         server.shutdown()
 
     def test_hello_via_ipc_proxy(self, server_addr):
-        client = SharedClient(server_addr, try_v2=True)
+        client = SharedClient(server_addr)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -116,7 +116,7 @@ class TestICRMProxyIPC:
             client.terminate()
 
     def test_counter_via_ipc_proxy(self, server_addr):
-        client = SharedClient(server_addr, try_v2=True)
+        client = SharedClient(server_addr)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'counter')
@@ -129,7 +129,7 @@ class TestICRMProxyIPC:
 
     def test_two_proxies_same_client(self, server_addr):
         """Two different ICRM proxies share the same SharedClient."""
-        client = SharedClient(server_addr, try_v2=True)
+        client = SharedClient(server_addr)
         client.connect()
         try:
             hello_proxy = ICRMProxy.ipc(client, 'hello')

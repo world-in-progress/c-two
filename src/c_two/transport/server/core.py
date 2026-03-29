@@ -6,7 +6,6 @@ Compared to :class:`IPCv3Server`:
 - **Handshake v5**: capability negotiation + method index exchange.
 - **Wire v2 frames**: control-plane routing (CRM routing name + method
   index in UDS inline frame, pure payload in buddy SHM).
-- **Backward compatible**: also handles v4 handshake and v1 wire frames.
 - **Multi-CRM**: hosts multiple CRM instances under distinct routing
   names (not tied to ICRM namespace from ``__tag__``).
 """
@@ -30,28 +29,24 @@ from typing import Any
 from ... import error
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ..ipc.msg_type import MsgType
-from ..wire_v1 import (
-    decode,
-    write_reply_into,
-    reply_wire_size,
+from ..ipc.msg_type import (
+    MsgType,
     PONG_BYTES,
     SHUTDOWN_ACK_BYTES,
+    _SIGNAL_TYPES,
 )
+from ..protocol import FLAG_SIGNAL
 from ..ipc.frame import (
     IPCConfig,
     FRAME_STRUCT,
     FLAG_RESPONSE,
     FLAG_CTRL,
     encode_frame,
-    encode_inline_reply_frame,
 )
 from ..ipc.buddy import (
     FLAG_BUDDY,
     BUDDY_PAYLOAD_STRUCT,
     decode_buddy_payload,
-    encode_buddy_handshake,
-    decode_buddy_handshake,
-    encode_buddy_reply_frame,
 )
 from ..protocol import (
     FLAG_CALL_V2,
@@ -88,10 +83,6 @@ logger = logging.getLogger(__name__)
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 _SHM_NAME_RE = re.compile(r'^/?[A-Za-z0-9_.\-]{1,255}$')
 FLAG_HANDSHAKE = 1 << 2
-
-# Signal byte values (MsgType enum ints).
-_PING = int(MsgType.PING)
-_SHUTDOWN_CLIENT = int(MsgType.SHUTDOWN_CLIENT)
 
 # Chunked transfer constants.
 _CHUNK_THRESHOLD_RATIO = 0.9
@@ -423,10 +414,8 @@ class ServerV2:
     names.  Each name has its own ICRM instance, method table, and
     scheduler.
 
-    Handles both v1 (wire CRM_CALL in buddy SHM / inline) and v2
-    (control-plane method index + pure payload) frames.  V2 frames carry
-    the routing name in the control plane; v1 frames are routed to the
-    default CRM.
+    Handles wire v2 frames with control-plane method index + pure payload.
+    V2 frames carry the routing name in the control plane.
 
     Parameters
     ----------
@@ -797,6 +786,18 @@ class ServerV2:
                 if flags & FLAG_CTRL:
                     continue
 
+                # Signal handling (frame-level, requires FLAG_SIGNAL)
+                if flags & FLAG_SIGNAL and len(payload) == 1 and payload[0] in _SIGNAL_TYPES:
+                    sig_type = payload[0]
+                    if sig_type == MsgType.PING:
+                        writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, PONG_BYTES))
+                    elif sig_type == MsgType.SHUTDOWN_CLIENT:
+                        if self._shutdown_event:
+                            self._shutdown_event.set()
+                        writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, SHUTDOWN_ACK_BYTES))
+                        return  # close connection after shutdown ack
+                    continue
+
                 # Periodic GC for stale chunk assemblers.
                 frame_count += 1
                 if frame_count % _CHUNK_GC_INTERVAL == 0 and chunk_assemblers:
@@ -886,7 +887,7 @@ class ServerV2:
                                     )
                                 continue
 
-                # Fallback: full handler via Task for buddy, v1, or error paths.
+                # Fallback: full handler via Task for buddy or error paths.
                 if is_v2_call:
                     t = asyncio.create_task(
                         self._handle_v2_call(
@@ -894,11 +895,7 @@ class ServerV2:
                         ),
                     )
                 else:
-                    t = asyncio.create_task(
-                        self._handle_v1_call(
-                            conn, request_id, payload, is_buddy, writer,
-                        ),
-                    )
+                    continue  # Non-v2, non-signal frame — ignore
                 pending.add(t)
                 t.add_done_callback(pending.discard)
 
@@ -945,24 +942,10 @@ class ServerV2:
         if version == HANDSHAKE_V5:
             await self._handle_v5_handshake(conn, payload, writer)
         else:
-            await self._handle_v4_handshake(conn, payload, writer)
-
-    async def _handle_v4_handshake(
-        self,
-        conn: _Connection,
-        payload: bytes,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        try:
-            segments = decode_buddy_handshake(payload)
-        except Exception as e:
-            logger.warning('Conn %d: bad v4 handshake: %s', conn.conn_id, e)
+            # Reject legacy v4 clients — only v5 supported
+            writer.close()
+            await writer.wait_closed()
             return
-        self._open_segments(conn, segments)
-
-        ack = encode_frame(0, FLAG_HANDSHAKE, encode_buddy_handshake([]))
-        writer.write(ack)
-        await writer.drain()
 
     async def _handle_v5_handshake(
         self,
@@ -1195,108 +1178,6 @@ class ServerV2:
             )
             asm.discard()
 
-    async def _handle_v1_call(
-        self,
-        conn: _Connection,
-        request_id: int,
-        payload: bytes,
-        is_buddy: bool,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        if is_buddy:
-            method_name, args_bytes = self._resolve_v1_buddy(conn, payload)
-            if method_name is None:
-                return
-        else:
-            sig = self._check_signal(payload)
-            if sig is not None:
-                writer.write(encode_frame(request_id, FLAG_RESPONSE, sig))
-                await writer.drain()
-                if sig is SHUTDOWN_ACK_BYTES and self._shutdown_event:
-                    self._shutdown_event.set()
-                return
-
-            try:
-                env = decode(payload)
-            except (ValueError, struct.error) as exc:
-                logger.warning('Conn %d: malformed v1 wire payload: %s',
-                               conn.conn_id, exc)
-                return
-            if env.msg_type == MsgType.PING:
-                writer.write(encode_frame(request_id, FLAG_RESPONSE, PONG_BYTES))
-                await writer.drain()
-                return
-            if env.msg_type == MsgType.SHUTDOWN_CLIENT:
-                writer.write(encode_frame(request_id, FLAG_RESPONSE, SHUTDOWN_ACK_BYTES))
-                await writer.drain()
-                if self._shutdown_event:
-                    self._shutdown_event.set()
-                return
-            if env.msg_type != MsgType.CRM_CALL:
-                return
-
-            method_name = env.method_name
-            args_bytes = bytes(env.payload) if env.payload is not None else b''
-
-        slot = self._resolve_slot('')
-        if slot is None:
-            return
-        result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
-        await self._send_v1_reply(conn, request_id, result_bytes, err_bytes, writer)
-
-    def _resolve_v1_buddy(
-        self, conn: _Connection, payload: bytes,
-    ) -> tuple[str | None, bytes]:
-        """Extract method_name + args from a v1 buddy frame, free request block."""
-        try:
-            seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
-                decode_buddy_payload(payload)
-            )
-        except (struct.error, Exception) as exc:
-            logger.warning('Conn %d: malformed v1 buddy payload: %s',
-                           conn.conn_id, exc)
-            return None, b''
-        if conn.buddy_pool is None or seg_idx >= len(conn.seg_views):
-            return None, b''
-
-        seg_mv = conn.seg_views[seg_idx]
-        if data_offset + data_size > len(seg_mv):
-            logger.warning('Conn %d: v1 buddy OOB: offset=%d + size=%d > seg_len=%d',
-                           conn.conn_id, data_offset, data_size, len(seg_mv))
-            return None, b''
-        wire_mv = seg_mv[data_offset : data_offset + data_size]
-
-        try:
-            env = decode(wire_mv)
-        except (ValueError, struct.error) as exc:
-            logger.warning('Conn %d: malformed v1 wire data: %s',
-                           conn.conn_id, exc)
-            try:
-                conn.buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
-            except Exception:
-                pass
-            return None, b''
-        method_name = env.method_name
-        args_bytes = bytes(env.payload) if env.payload is not None else b''
-
-        try:
-            conn.buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
-        except Exception:
-            logger.warning('Conn %d: failed to free request block', conn.conn_id, exc_info=True)
-
-        return method_name, args_bytes
-
-    @staticmethod
-    def _check_signal(payload: bytes) -> bytes | None:
-        """Fast-path check for 1-byte signal messages."""
-        if len(payload) >= 1:
-            b = payload[0]
-            if b == _PING:
-                return PONG_BYTES
-            if b == _SHUTDOWN_CLIENT:
-                return SHUTDOWN_ACK_BYTES
-        return None
-
     # ------------------------------------------------------------------
     # V2 call handling (control-plane routing)
     # ------------------------------------------------------------------
@@ -1494,58 +1375,6 @@ class ServerV2:
             return b'', error.CRMExecuteFunction(str(exc)).serialize()
         except Exception:
             return b'', str(exc).encode('utf-8')
-
-    # ------------------------------------------------------------------
-    # Reply — v1 (wire CRM_REPLY in SHM or inline)
-    # ------------------------------------------------------------------
-
-    async def _send_v1_reply(
-        self,
-        conn: _Connection,
-        request_id: int,
-        result_bytes: bytes,
-        err_bytes: bytes,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        total_wire = reply_wire_size(len(err_bytes), len(result_bytes))
-
-        if total_wire > self._config.shm_threshold and conn.buddy_pool is not None:
-            try:
-                alloc = conn.buddy_pool.alloc(total_wire)
-                if alloc.is_dedicated:
-                    conn.buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, total_wire, True,
-                    )
-                    raise MemoryError('dedicated segment, fall back to inline')
-
-                seg_mv = conn.seg_views[alloc.seg_idx]
-                if alloc.offset + total_wire > len(seg_mv):
-                    conn.buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, total_wire, alloc.is_dedicated,
-                    )
-                    raise MemoryError('reply offset OOB, fall back to inline')
-                write_reply_into(
-                    seg_mv, alloc.offset,
-                    err_bytes or None,
-                    result_bytes or None,
-                )
-                frame = encode_buddy_reply_frame(
-                    request_id, alloc.seg_idx, alloc.offset,
-                    total_wire, alloc.is_dedicated,
-                )
-                writer.write(frame)
-                if total_wire > 65536:
-                    await writer.drain()
-                return
-            except Exception:
-                pass  # Fall through to inline.
-
-        frame = encode_inline_reply_frame(
-            request_id, FLAG_RESPONSE, err_bytes, result_bytes,
-        )
-        writer.write(frame)
-        if len(frame) > 65536:
-            await writer.drain()
 
     # ------------------------------------------------------------------
     # Reply — v2 (control-plane status + pure payload)

@@ -80,7 +80,6 @@ class ClientPool:
         self,
         server_address: str,
         ipc_config: IPCConfig | None = None,
-        try_v2: bool = False,
     ) -> SharedClient:
         """Get a :class:`SharedClient` for *server_address*, creating if needed.
 
@@ -100,7 +99,7 @@ class ClientPool:
 
             # Create new client.
             config = ipc_config or self._default_config
-            client = SharedClient(server_address, config, try_v2=try_v2)
+            client = SharedClient(server_address, config)
             client.connect()
             self._clients[server_address] = client
             self._refcounts[server_address] = 1

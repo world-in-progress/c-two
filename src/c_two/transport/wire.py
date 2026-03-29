@@ -66,6 +66,19 @@ _U32 = struct.Struct('<I')
 # Public alias for modules that need fast inline method_idx unpacking.
 U16_LE = _U16
 
+
+def payload_total_size(payload) -> int:
+    """Return total byte length of *payload*.
+
+    *payload* may be ``bytes``, ``memoryview``, a ``tuple``/``list`` of
+    such segments (scatter-write), or ``None``.
+    """
+    if payload is None:
+        return 0
+    if isinstance(payload, (list, tuple)):
+        return sum(len(s) for s in payload)
+    return len(payload)
+
 # ---------------------------------------------------------------------------
 # V2 Call Control
 # ---------------------------------------------------------------------------

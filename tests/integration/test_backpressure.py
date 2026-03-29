@@ -77,7 +77,7 @@ class TestClientInlineFallback:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -98,7 +98,7 @@ class TestClientInlineFallback:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -138,7 +138,7 @@ class TestServerInlineFallback:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -170,7 +170,7 @@ class TestConcurrentBackpressure:
         lock = threading.Lock()
 
         def worker(thread_id: int) -> None:
-            client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+            client = SharedClient(addr, ipc_config=cfg)
             client.connect()
             try:
                 proxy = ICRMProxy.ipc(client, 'hello')
@@ -213,7 +213,7 @@ class TestConcurrentBackpressure:
         lock = threading.Lock()
 
         def worker(thread_id: int) -> None:
-            client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+            client = SharedClient(addr, ipc_config=cfg)
             client.connect()
             try:
                 proxy = ICRMProxy.ipc(client, 'hello')
@@ -264,7 +264,7 @@ class TestRecoveryAfterPressure:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -306,7 +306,7 @@ class TestLargePayloadPressureError:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -336,7 +336,7 @@ class TestLargePayloadPressureError:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -442,7 +442,7 @@ class TestHighConcurrencyStress:
         lock = threading.Lock()
 
         def worker(tid: int) -> None:
-            client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+            client = SharedClient(addr, ipc_config=cfg)
             client.connect()
             try:
                 proxy = ICRMProxy.ipc(client, 'hello')
@@ -480,7 +480,7 @@ class TestHighConcurrencyStress:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
 
         results = []
@@ -527,7 +527,7 @@ class TestEdgeCases:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -556,7 +556,7 @@ class TestEdgeCases:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -604,7 +604,7 @@ class TestChunkedBackpressure:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -636,7 +636,7 @@ class TestChunkedBackpressure:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             # Forcibly disable chunked capability to simulate old server.
@@ -669,7 +669,7 @@ class TestChunkedBackpressure:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -701,7 +701,7 @@ class TestChunkedBackpressure:
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             errors: list[Exception] = []

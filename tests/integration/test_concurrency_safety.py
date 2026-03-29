@@ -88,7 +88,7 @@ class TestRequestIdWrapping:
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg, try_v2=True)
+            client = SharedClient(addr, cfg)
             client.connect()
 
             # Simulate near-wrap: set counter close to 32-bit max.
@@ -135,7 +135,7 @@ class TestConcurrentCallSafety:
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg, try_v2=True)
+            client = SharedClient(addr, cfg)
             client.connect()
 
             errors = []
@@ -182,7 +182,7 @@ class TestConcurrentCallSafety:
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg, try_v2=True)
+            client = SharedClient(addr, cfg)
             client.connect()
 
             errors = []
@@ -286,7 +286,7 @@ class TestClientPoolSafety:
 
             def worker(tid: int):
                 try:
-                    client = pool.acquire(addr, try_v2=True)
+                    client = pool.acquire(addr)
                     r = client.call('echo', f'tid={tid}'.encode())
                     assert r == f'tid={tid}'.encode()
                     pool.release(addr)
@@ -457,7 +457,7 @@ class TestServerMalformedFrames:
             raw.close()
 
             # Verify server is still alive by making a normal call.
-            client = SharedClient(addr, cfg, try_v2=True)
+            client = SharedClient(addr, cfg)
             client.connect()
             r = client.call('echo', b'still alive')
             assert r == b'still alive'
@@ -498,7 +498,7 @@ class TestServerMalformedFrames:
             raw.close()
 
             # Server should still be alive.
-            client = SharedClient(addr, cfg, try_v2=True)
+            client = SharedClient(addr, cfg)
             client.connect()
             r = client.call('echo', b'ok')
             assert r == b'ok'
@@ -540,7 +540,7 @@ class TestServerMalformedFrames:
             raw.close()
 
             # Server should still be alive.
-            client = SharedClient(addr, cfg, try_v2=True)
+            client = SharedClient(addr, cfg)
             client.connect()
             r = client.call('echo', b'ok')
             assert r == b'ok'

@@ -133,10 +133,9 @@ class TestMultiCRMRouting:
 
     def test_v2_hello_greeting(self, multi_crm_addr):
         addr, _server = multi_crm_addr
-        client = SharedClient(addr, try_v2=True)
+        client = SharedClient(addr)
         client.connect()
         try:
-            assert client._v2_mode
             result = pickle.loads(client.call(
                 'greeting', pickle.dumps(('World',)), name='hello',
             ))
@@ -146,10 +145,9 @@ class TestMultiCRMRouting:
 
     def test_v2_counter_get(self, multi_crm_addr):
         addr, _server = multi_crm_addr
-        client = SharedClient(addr, try_v2=True)
+        client = SharedClient(addr)
         client.connect()
         try:
-            assert client._v2_mode
             result = pickle.loads(client.call(
                 'get', pickle.dumps(()), name='counter',
             ))
@@ -160,7 +158,7 @@ class TestMultiCRMRouting:
     def test_v2_both_names_same_client(self, multi_crm_addr):
         """A single client can call methods on both CRMs."""
         addr, _server = multi_crm_addr
-        client = SharedClient(addr, try_v2=True)
+        client = SharedClient(addr)
         client.connect()
         try:
             r1 = pickle.loads(client.call(
@@ -177,7 +175,7 @@ class TestMultiCRMRouting:
     def test_v2_counter_increment(self, multi_crm_addr):
         """Stateful CRM — increment counter and read back."""
         addr, _server = multi_crm_addr
-        client = SharedClient(addr, try_v2=True)
+        client = SharedClient(addr)
         client.connect()
         try:
             r1 = pickle.loads(client.call(
@@ -193,10 +191,9 @@ class TestMultiCRMRouting:
 
     def test_v2_handshake_returns_all_routes(self, multi_crm_addr):
         addr, _server = multi_crm_addr
-        client = SharedClient(addr, try_v2=True)
+        client = SharedClient(addr)
         client.connect()
         try:
-            assert client._v2_mode
             # The method tables should contain methods from both routes.
             name_tables = client._name_tables
             assert 'hello' in name_tables
@@ -215,7 +212,7 @@ class TestMultiCRMRouting:
     def test_v2_unknown_name_returns_error(self, multi_crm_addr):
         """Calling a non-existent route name returns an error."""
         addr, _server = multi_crm_addr
-        client = SharedClient(addr, try_v2=True)
+        client = SharedClient(addr)
         client.connect()
         try:
             # The name doesn't exist in the server's routing tables,
@@ -235,10 +232,9 @@ class TestMultiCRMV1Compat:
     def test_v1_uses_default_name(self, multi_crm_addr):
         """V1 calls (no name in wire) route to the first registered CRM."""
         addr, _server = multi_crm_addr
-        client = SharedClient(addr, try_v2=False)
+        client = SharedClient(addr)
         client.connect()
         try:
-            assert not client._v2_mode
             result = pickle.loads(client.call(
                 'greeting', pickle.dumps(('V1Client',)),
             ))
@@ -263,10 +259,9 @@ class TestDynamicRegistration:
         assert set(server.names) == {'hello', 'counter'}
 
         # Connect with v2 and call the new CRM.
-        client = SharedClient(addr, try_v2=True)
+        client = SharedClient(addr)
         client.connect()
         try:
-            assert client._v2_mode
             result = pickle.loads(client.call(
                 'get', pickle.dumps(()), name='counter',
             ))

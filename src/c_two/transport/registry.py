@@ -305,7 +305,7 @@ class _ProcessRegistry:
             )
         elif address is not None:
             # Remote IPC via pooled SharedClient.
-            client = self._pool.acquire(address, try_v2=True)
+            client = self._pool.acquire(address)
             proxy = ICRMProxy.ipc(
                 client,
                 name,

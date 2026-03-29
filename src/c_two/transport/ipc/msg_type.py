@@ -16,3 +16,20 @@ class MsgType(IntEnum):
     SHUTDOWN_CLIENT  = 0x05
     SHUTDOWN_SERVER  = 0x06
     SHUTDOWN_ACK     = 0x07
+
+
+# Pre-encoded 1-byte signal payloads (used as inline frame body)
+PING_BYTES = bytes([MsgType.PING])
+PONG_BYTES = bytes([MsgType.PONG])
+SHUTDOWN_CLIENT_BYTES = bytes([MsgType.SHUTDOWN_CLIENT])
+SHUTDOWN_SERVER_BYTES = bytes([MsgType.SHUTDOWN_SERVER])
+SHUTDOWN_ACK_BYTES = bytes([MsgType.SHUTDOWN_ACK])
+SIGNAL_SIZE = 1
+
+_SIGNAL_TYPES = frozenset({
+    MsgType.PING,
+    MsgType.PONG,
+    MsgType.SHUTDOWN_CLIENT,
+    MsgType.SHUTDOWN_SERVER,
+    MsgType.SHUTDOWN_ACK,
+})

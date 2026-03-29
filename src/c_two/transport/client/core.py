@@ -14,13 +14,9 @@ Ownership model (same as IPCv3Client):
 - Request blocks: client allocs, server frees after reading
 - Response blocks: server allocs, client frees after reading
 
-Supports two wire modes:
-- **v1 mode** (default): wire v1 format (CRM_CALL / CRM_REPLY), compatible
-  with standard IPCv3Server.
-- **v2 mode**: wire v2 format with control-plane routing.  Negotiated via
-  handshake v5 when connecting to a Server v2.  SHM contains pure payload
-  (no wire header); method routing via 2-byte index in the inline control
-  frame.
+Wire v2 format with control-plane routing.  Negotiated via handshake v5
+when connecting to a Server v2.  SHM contains pure payload (no wire
+header); method routing via 2-byte index in the inline control frame.
 """
 from __future__ import annotations
 
@@ -36,27 +32,23 @@ from pathlib import Path
 
 from ... import error
 from ..ipc.msg_type import MsgType
-from ..wire_v1 import (
-    write_call_into,
-    call_wire_size,
-    payload_total_size,
-    decode,
-    get_call_header_cache,
+from ..wire import payload_total_size
+from ..ipc.msg_type import (
+    MsgType,
     PING_BYTES,
     SHUTDOWN_CLIENT_BYTES,
     SHUTDOWN_ACK_BYTES,
 )
+from ..protocol import FLAG_SIGNAL
 from ..ipc.frame import (
     IPCConfig,
     FRAME_STRUCT,
     FLAG_RESPONSE,
     encode_frame,
-    encode_inline_call_frame,
 )
 from ..ipc.buddy import (
     FLAG_BUDDY,
     decode_buddy_payload,
-    encode_buddy_handshake,
     encode_buddy_call_frame,
 )
 from ..protocol import (
@@ -89,9 +81,6 @@ from ..wire import (
 logger = logging.getLogger(__name__)
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-
-_CRM_REPLY_TYPE = int(MsgType.CRM_REPLY)
-_U32_LE = struct.Struct('<I')
 
 # Payloads exceeding this fraction of pool_segment_size trigger chunked transfer.
 _CHUNK_THRESHOLD_RATIO = 0.9
@@ -221,12 +210,9 @@ class SharedClient:
         self,
         server_address: str,
         ipc_config: IPCConfig | None = None,
-        *,
-        try_v2: bool = False,
     ):
         self._config = ipc_config or IPCConfig()
         self._address = server_address
-        self._try_v2 = try_v2
         self.region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
         self._socket_path = _resolve_socket_path(self.region_id)
 
@@ -253,7 +239,6 @@ class SharedClient:
         self._close_lock = threading.Lock()
 
         # Wire v2 mode (negotiated during handshake v5).
-        self._v2_mode = False
         self._method_table: MethodTable | None = None
         self._name_tables: dict[str, MethodTable] = {}
         self._default_name = ''
@@ -288,15 +273,7 @@ class SharedClient:
         return sock
 
     def _do_buddy_handshake(self) -> None:
-        """Create buddy pool and exchange segment info with server.
-
-        When ``try_v2=True``, tries handshake v5 first.  If server responds
-        with v5 ACK, enables v2 mode with method indexing.  If v5 fails (e.g.
-        old IPCv3Server), reconnects and falls back to v4.
-
-        When ``try_v2=False`` (default), always uses v4 — no 10-second
-        timeout penalty against legacy servers.
-        """
+        """Create buddy pool and perform handshake v5 with server."""
         try:
             from c_two.buddy import BuddyPoolHandle, PoolConfig
         except ImportError:
@@ -322,18 +299,39 @@ class SharedClient:
 
         segments = [(seg_name, seg_size)]
 
-        if self._try_v2:
-            v5_ok = self._try_v5_handshake(segments)
-            if not v5_ok:
-                # v5 failed — connection is likely dead. Reconnect for v4.
-                try:
-                    self._sock.close()
-                except Exception:
-                    pass
-                self._sock = self._do_connect()
-                self._do_v4_handshake(segments)
-        else:
-            self._do_v4_handshake(segments)
+        # Handshake v5 (only supported protocol).
+        handshake_payload = encode_v5_client_handshake(
+            segments, CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+        )
+        handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
+        self._sock.sendall(handshake_frame)
+
+        header = _recv_exact(self._sock, 16)
+        total_len, _rid, flags = FRAME_STRUCT.unpack(header)
+        payload_len = total_len - 12
+        payload = _recv_exact(self._sock, payload_len) if payload_len > 0 else b''
+
+        if not (flags & (1 << 2)):
+            raise error.CompoClientError('Server did not respond with handshake ACK')
+
+        if len(payload) < 1 or payload[0] != HANDSHAKE_V5:
+            raise error.CompoClientError('Server does not support handshake v5')
+
+        hs = decode_v5_handshake(payload)
+        if not (hs.capability_flags & CAP_CALL_V2):
+            raise error.CompoClientError('Server does not support v2 calls')
+
+        self._chunked_capable = bool(hs.capability_flags & CAP_CHUNKED)
+        # Build per-route method tables.
+        for route in hs.routes:
+            table = MethodTable()
+            for m in route.methods:
+                table.add(m.name, m.index)
+            self._name_tables[route.name] = table
+        # Default route + unified table for backward compat.
+        if hs.routes:
+            self._default_name = hs.routes[0].name
+            self._method_table = self._name_tables[self._default_name]
 
         # Cache persistent memoryviews for each buddy segment.
         self._seg_views = []
@@ -346,62 +344,7 @@ class SharedClient:
             self._seg_views.append(mv)
             self._seg_base_addrs.append(base_addr)
 
-        logger.debug('Buddy handshake complete (v2_mode=%s), pool segment: %s',
-                      self._v2_mode, seg_name)
-
-    def _try_v5_handshake(self, segments: list[tuple[str, int]]) -> bool:
-        """Attempt handshake v5.  Returns True if server responded with v5 ACK."""
-        try:
-            handshake_payload = encode_v5_client_handshake(
-                segments, CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
-            )
-            handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
-            self._sock.sendall(handshake_frame)
-
-            header = _recv_exact(self._sock, 16)
-            total_len, _rid, flags = FRAME_STRUCT.unpack(header)
-            payload_len = total_len - 12
-            payload = _recv_exact(self._sock, payload_len) if payload_len > 0 else b''
-
-            if not (flags & (1 << 2)):
-                return False
-
-            # Try to parse as v5 response.
-            if len(payload) >= 1 and payload[0] == HANDSHAKE_V5:
-                hs = decode_v5_handshake(payload)
-                if hs.capability_flags & CAP_CALL_V2:
-                    self._v2_mode = True
-                    self._chunked_capable = bool(hs.capability_flags & CAP_CHUNKED)
-                    # Build per-route method tables.
-                    for route in hs.routes:
-                        table = MethodTable()
-                        for m in route.methods:
-                            table.add(m.name, m.index)
-                        self._name_tables[route.name] = table
-                    # Default route + unified table for backward compat.
-                    if hs.routes:
-                        self._default_name = hs.routes[0].name
-                        self._method_table = self._name_tables[self._default_name]
-                    return True
-            return False
-        except Exception:
-            logger.debug('v5 handshake failed, falling back to v4', exc_info=True)
-            return False
-
-    def _do_v4_handshake(self, segments: list[tuple[str, int]]) -> None:
-        """Standard v4 buddy handshake (compatible with IPCv3Server)."""
-        handshake_payload = encode_buddy_handshake(segments)
-        handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
-        self._sock.sendall(handshake_frame)
-
-        header = _recv_exact(self._sock, 16)
-        total_len, _rid, flags = FRAME_STRUCT.unpack(header)
-        payload_len = total_len - 12
-        if payload_len > 0:
-            _recv_exact(self._sock, payload_len)
-
-        if not (flags & (1 << 2)):
-            logger.warning('Expected handshake ACK, got flags=%d', flags)
+        logger.debug('Buddy handshake complete (v5), pool segment: %s', seg_name)
 
     def terminate(self) -> None:
         """Shut down the client: stop recv thread, close socket, destroy pool."""
@@ -485,13 +428,7 @@ class SharedClient:
 
         args = data if data is not None else b''
         payload_size = payload_total_size(args)
-
-        # In v2 mode, SHM contains only payload (no wire header).
-        if self._v2_mode:
-            wire_size = payload_size
-        else:
-            method_bytes = method_name.encode('utf-8')
-            wire_size = call_wire_size(len(method_bytes), payload_size)
+        wire_size = payload_size
 
         # Allocate request ID (32-bit wrapping to match frame header).
         with self._rid_lock:
@@ -503,9 +440,9 @@ class SharedClient:
         with self._pending_lock:
             self._pending[rid] = pending
 
-        # Chunked transfer for large payloads (v2 only).
+        # Chunked transfer for large payloads.
         chunk_threshold = int(self._config.pool_segment_size * _CHUNK_THRESHOLD_RATIO)
-        if self._v2_mode and wire_size > chunk_threshold:
+        if wire_size > chunk_threshold:
             if not self._chunked_capable:
                 with self._pending_lock:
                     self._pending.pop(rid, None)
@@ -517,10 +454,7 @@ class SharedClient:
 
         try:
             with self._send_lock:
-                if self._v2_mode:
-                    self._send_request_v2(rid, method_name, args, wire_size, name=name)
-                else:
-                    self._send_request_v1(rid, method_name, args, wire_size)
+                self._send_request_v2(rid, method_name, args, wire_size, name=name)
         except Exception as exc:
             with self._pending_lock:
                 self._pending.pop(rid, None)
@@ -687,33 +621,6 @@ class SharedClient:
     # Send helpers (called under _send_lock)
     # ------------------------------------------------------------------
 
-    def _send_request_v1(self, rid: int, method_name: str, args: bytes, wire_size: int) -> None:
-        """Encode and send a v1 CRM_CALL frame. Called under _send_lock."""
-        sock = self._sock
-        if sock is None:
-            raise error.CompoClientError('Not connected')
-
-        alloc, shm_buf = self._try_buddy_alloc(wire_size, 'v1')
-
-        if alloc is None:
-            inline_args = b''.join(args) if isinstance(args, (list, tuple)) else args
-            frame = encode_inline_call_frame(
-                rid, method_name, inline_args, get_call_header_cache(),
-            )
-            sock.sendall(frame)
-            return
-
-        try:
-            write_call_into(shm_buf, 0, method_name, args)
-            frame = encode_buddy_call_frame(
-                rid, alloc.seg_idx, alloc.offset,
-                wire_size, alloc.is_dedicated,
-            )
-            sock.sendall(frame)
-        except Exception:
-            self._free_buddy(alloc, wire_size)
-            raise
-
     def _send_request_v2(self, rid: int, method_name: str, args: bytes, payload_size: int, *, name: str | None = None) -> None:
         """Encode and send a v2 call frame. Called under _send_lock.
 
@@ -868,18 +775,9 @@ class SharedClient:
                 self._pending.clear()
 
     def _decode_response(self, flags: int, payload: bytes) -> tuple[bytes | None, Exception | None]:
-        """Decode a response frame into (result_bytes, error_or_none).
-
-        Handles both v1 (wire CRM_REPLY in SHM) and v2 (control-plane status
-        + pure data in SHM) response frames.
-        """
-        is_v2_reply = bool(flags & FLAG_REPLY_V2)
+        """Decode a v2 response frame into (result_bytes, error_or_none)."""
         is_buddy = bool(flags & FLAG_BUDDY)
-
-        if is_v2_reply:
-            return self._decode_v2_response(flags, payload, is_buddy)
-        else:
-            return self._decode_v1_response(flags, payload, is_buddy)
+        return self._decode_v2_response(flags, payload, is_buddy)
 
     def _decode_v2_response(
         self, flags: int, payload: bytes, is_buddy: bool,
@@ -943,76 +841,6 @@ class SharedClient:
             # Success: inline data follows control.
             result = bytes(payload[consumed:]) if consumed < len(payload) else b''
             return result, None
-
-    def _decode_v1_response(
-        self, flags: int, payload: bytes, is_buddy: bool,
-    ) -> tuple[bytes | None, Exception | None]:
-        """Decode a v1 reply frame (legacy wire format)."""
-        if is_buddy:
-            seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
-
-            if self._buddy_pool is None:
-                return None, error.CompoClientError('Buddy response but no pool')
-            if seg_idx >= len(self._seg_views):
-                return None, error.CompoClientError(f'Invalid seg_idx {seg_idx}')
-
-            seg_mv = self._seg_views[seg_idx]
-            if data_offset + data_size > len(seg_mv):
-                return None, error.CompoClientError('Response out of bounds')
-
-            data_mv = seg_mv[data_offset : data_offset + data_size]
-            result, err = self._parse_crm_reply(data_mv)
-
-            with self._alloc_lock:
-                try:
-                    self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
-                except Exception:
-                    logger.warning('Failed to free buddy block', exc_info=True)
-
-            return result, err
-        else:
-            # Inline v1 response.
-            if len(payload) >= 1 and payload[0] == MsgType.PONG:
-                return b'', None
-
-            env = decode(payload)
-            if env.msg_type == MsgType.PONG:
-                return b'', None
-            if env.msg_type == MsgType.SHUTDOWN_ACK:
-                return b'', None
-            if env.msg_type != MsgType.CRM_REPLY:
-                return None, error.CompoClientError(f'Unexpected msg type: {env.msg_type}')
-            if env.error:
-                err = error.CCError.deserialize(env.error)
-                if err:
-                    return None, err
-            return (bytes(env.payload) if env.payload is not None else b''), None
-
-    def _parse_crm_reply(self, mv: memoryview) -> tuple[bytes | None, Exception | None]:
-        """Parse CRM_REPLY from a memoryview (SHM buddy data).
-
-        Always copies result to bytes for caller safety (Phase 1).
-        """
-        total_size = len(mv)
-        if total_size < 5 or mv[0] != _CRM_REPLY_TYPE:
-            return None, error.CompoClientError(f'Bad reply type: 0x{mv[0]:02x}' if total_size > 0 else 'Empty reply')
-
-        err_len = _U32_LE.unpack_from(mv, 1)[0]
-        if err_len > 0:
-            err_end = 5 + err_len
-            if err_end > total_size:
-                return None, error.CompoClientError('Corrupted CRM_REPLY: err_len exceeds size')
-            err_bytes = bytes(mv[5:err_end])
-            err = error.CCError.deserialize(err_bytes)
-            if err:
-                return None, err
-            return b'', None
-
-        data_size = total_size - 5
-        if data_size == 0:
-            return b'', None
-        # Always copy to bytes for Phase 1 safety.
-        return bytes(mv[5:]), None
 
     # ------------------------------------------------------------------
     # Chunked reply reassembly
@@ -1104,14 +932,13 @@ class SharedClient:
         try:
             sock.settimeout(timeout)
             sock.connect(socket_path)
-            frame = encode_frame(0, 0, PING_BYTES)
+            frame = encode_frame(0, FLAG_SIGNAL, PING_BYTES)
             sock.sendall(frame)
             header = _recv_exact(sock, 16)
             total_len, _rid, _flags = FRAME_STRUCT.unpack(header)
             payload_len = total_len - 12
             payload = _recv_exact(sock, payload_len) if payload_len > 0 else b''
-            env = decode(payload)
-            return env.msg_type == MsgType.PONG
+            return len(payload) == 1 and payload[0] == MsgType.PONG
         except Exception:
             return False
         finally:
@@ -1128,7 +955,7 @@ class SharedClient:
         try:
             sock.settimeout(timeout)
             sock.connect(socket_path)
-            frame = encode_frame(0, 0, SHUTDOWN_CLIENT_BYTES)
+            frame = encode_frame(0, FLAG_SIGNAL, SHUTDOWN_CLIENT_BYTES)
             sock.sendall(frame)
             header = _recv_exact(sock, 16)
             total_len, _rid, _flags = FRAME_STRUCT.unpack(header)

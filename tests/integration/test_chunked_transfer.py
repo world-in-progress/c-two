@@ -116,7 +116,7 @@ def _setup(
     server.start()
     _wait_for_server(addr)
 
-    client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+    client = SharedClient(addr, ipc_config=cfg)
     client.connect()
 
     proxy = ICRMProxy.ipc(client, 'chunk')

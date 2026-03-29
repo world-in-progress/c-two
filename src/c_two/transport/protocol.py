@@ -18,6 +18,7 @@ Frame flag bit allocation (32-bit LE flags field in the 16-byte frame header):
     Bit 8: FLAG_REPLY_V2       — v2 reply frame (control-plane status)
     Bit 9: FLAG_CHUNKED        — frame is part of a chunked sequence
     Bit 10: FLAG_CHUNK_LAST    — last frame in the chunked sequence
+    Bit 11: FLAG_SIGNAL        — frame carries a 1-byte signal (PING, SHUTDOWN, etc.)
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ FLAG_REPLY_V2 = 1 << 8   # 0x100 — v2 reply frame with control-plane status
 # Chunked transfer flags
 FLAG_CHUNKED    = 1 << 9   # 0x200 — frame is part of a chunked sequence
 FLAG_CHUNK_LAST = 1 << 10  # 0x400 — last frame in the chunked sequence
+FLAG_SIGNAL     = 1 << 11  # 0x800 — frame carries a 1-byte signal (PING, SHUTDOWN, etc.)
 
 # ---------------------------------------------------------------------------
 # Handshake v5
