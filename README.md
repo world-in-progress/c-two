@@ -3,7 +3,7 @@
 [![PyPI version](https://badge.fury.io/py/c-two.svg)](https://badge.fury.io/py/c-two)
 
 <p align="center">
-<img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/logo.png">
+<img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/docs/images/logo.png">
 </p> 
 
 C-Two is a **Remote Procedure Call (RPC) framework** that enables resource-oriented classes to be remotely invoked across different processes or machines. It is specifically designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method calling between **Components** and **Core Resource Models (CRMs)** with automatic serialization and protocol-agnostic communication.
@@ -41,7 +41,7 @@ This framework tries to transform isolated computational models into reusable, n
 
 The framework implements a three-tier architecture:
 
-<img src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/architecture.png" alt="Architecture" width="1500" />
+<img src="https://raw.githubusercontent.com/world-in-progress/c-two/main/docs/images/architecture.png" alt="Architecture" width="1500" />
 
 ### Component Layer
 Client-side computational units that consume remote resources through Interface of Core Resource Models (ICRM), providing network transparency for distributed operations.
