@@ -1,6 +1,6 @@
 # C-Two 后续计划
 
-> Date: 2026-03-28 | Updated: 2026-03-29
+> Date: 2026-03-28 | Updated: 2026-03-29 (heartbeat §2.2 completed)
 > 基于: `doc/log/sota.md`（SOTA 设计文档）+ 当前代码库实现状态
 > 目的: 系统梳理 SOTA 设计目标与已有实现之间的差距，规划后续工作优先级
 
@@ -31,6 +31,7 @@
 | 分块流式传输（Chunked Streaming Transfer） | `wire.py` + `client/core.py` + `server/core.py` | ✓ (2026-03-28) |
 | 线程优惠的并发控制 | `ICRMProxy.thread_local()` 接收 `Scheduler` + `access_map` | ✓ (2026-03-29) |
 | @cc.shutdown 声明式生命周期回调 | `crm/meta.py` + `server/core.py` + `registry.py` | ✓ (2026-03-29) |
+| 心跳检测 + 连接空闲清理 + SHM 孤儿回收 | `server/heartbeat.py` + `server/core.py` + `client/core.py` | ✓ (2026-03-29) |
 
 ### 仓库重构 (2026-03-29) ✓
 
@@ -53,7 +54,6 @@
 
 | 设计点 | sota.md 章节 | 说明 |
 |---|---|---|
-| 心跳 + 进程存活检测 | 附录 A.3 | `IPCConfig` 有 `heartbeat_interval/timeout` 字段但为死代码，Server 仅被动回复 PING，无主动探测 |
 | 版本兼容性检查 | §1.2 | `cc.connect()` 不接受版本参数，ICRM 的 `version` 字段未用于选择 |
 | 异步接口 | §4.3 | 无 `cc.connect_async()` 或 `async with cc.connect()` |
 | 自适应分代 GC | 附录 A.3 | per-request SHM 与 pool SHM 使用相同超时 |
@@ -90,67 +90,21 @@
 
 **剩余价值**: 减少 per-request SHM 退化频率。如有需求可在 P2 阶段实施。
 
-### 2.2 心跳检测 + 进程存活检测 ← **下一实施目标**
+### 2.2 心跳检测 + 进程存活检测 — ✅ 已完成 (2026-03-29)
 
-**问题**: 客户端被 SIGKILL 时 UDS socket 未关闭，Pool SHM 成为孤儿。Server 无法检测死亡连接。
+Server 端主动心跳探测 + 客户端 PONG 自动响应 + SHM 孤儿回收，三阶段全部实现。
 
-**当前状态 (~5%)**:
-- ✅ `IPCConfig.heartbeat_interval` (15s) 和 `heartbeat_timeout` (30s) 字段已定义（**但为死代码**）
-- ✅ PING/PONG 消息类型定义完备（`msg_type.py`），Server 被动回复 PING
-- ✅ Rust buddy 有 PID 提取 + `is_process_alive()` 逻辑（仅 Linux）
-- ❌ Server 不主动发送 PING（无心跳探测）
-- ❌ 无连接空闲超时检测
-- ❌ 无 SHM 段自动清理（需手动调用 `cleanup_stale_shm()`）
+**实现内容**:
+- `Connection` 增加 `last_activity` / `touch()` / `idle_seconds()` 跟踪连接活跃度
+- 新增 `server/heartbeat.py:run_heartbeat()` 协程 — per-connection asyncio task，周期发送 PING
+- `SharedClient._recv_loop` 增加 `FLAG_SIGNAL` 检测，自动回复 PONG（通过 `_send_lock` 保护线程安全）
+- `_handle_client` 集成心跳任务：每帧 `conn.touch()`，finally 中 cancel + 超时日志
+- `Server.shutdown()` 调用 `cleanup_stale_shm('cc')` 回收死进程遗留的 SHM segment
+- `heartbeat_interval <= 0` 禁用心跳（已有 `IPCConfig` 验证）
 
-**实施方案**:
+**测试覆盖**: 10 单元 + 4 集成（活跃连接存活、空闲 PONG 存活、死客户端检测、禁用模式）
 
-#### Phase 1: Server 端心跳探测
-
-在 `server/core.py:_handle_client` 的 asyncio 事件循环中加入定时心跳：
-
-```
-连接建立 → 启动 heartbeat timer
-  ↓
-每 heartbeat_interval 秒检查:
-  if 距上次收到帧 > heartbeat_interval:
-    发送 PING
-    设置 pong_deadline = now + heartbeat_timeout
-  ↓
-收到任意帧 → 重置 last_activity
-收到 PONG → 重置 pong_deadline
-  ↓
-if now > pong_deadline:
-  判定连接死亡 → close + cleanup
-```
-
-**实现路径**:
-1. `Connection` dataclass 增加 `last_activity: float` 字段
-2. `_handle_client` 每次收帧时更新 `conn.last_activity = time.monotonic()`
-3. 新增 `_heartbeat_task(conn, writer)` asyncio.Task，周期 = `config.heartbeat_interval`
-4. 心跳任务检测 idle → 发 PING → 等 PONG → 超时则 cancel reader task
-5. `heartbeat_interval <= 0` 时跳过（已有 IPCConfig 验证）
-
-**改动范围**: `server/core.py`（~40 行）+ `server/connection.py`（+2 字段）
-
-#### Phase 2: 连接空闲清理
-
-当 Server 检测到心跳超时或 read EOF：
-1. Cancel 该连接所有 in-flight 调用（`conn.wait_idle(timeout=5)`）
-2. 释放该连接持有的 buddy pool segments
-3. 关闭 UDS socket
-4. 记录 warning 日志
-
-**已有基础**: `conn.wait_idle()` + `flight_inc/dec` 已实现，仅需在心跳超时时触发。
-
-#### Phase 3: SHM 段 PID 回收（可选）
-
-1. SHM segment 名已包含 PID 信息（`cc{pid:08x}{random}_bXXXX` 格式）
-2. Rust 侧 `cleanup_stale_segments()` 已实现 PID 提取 + 存活检测（Linux）
-3. Python 侧需要：
-   - 在 Server shutdown 时调用 `cleanup_stale_shm()`
-   - macOS 需要 fallback 方案（`/dev/shm` 不存在，需要 `sysctl kern.ipc.shm` 或 named segment 枚举）
-
-**改动范围**: `server/core.py`（shutdown 时调用）+ 可选：`buddy/__init__.py`（macOS 支持）
+**详细实施方案**: `docs/superpowers/plans/2025-07-25-heartbeat-detection.md`
 
 ### 2.3 Rust Relay 发布集成
 
@@ -296,8 +250,8 @@ P0.5 — 大 payload 支持 ✅
 
 P1 — 性能与可靠性增强
 ├─ 2.1 SHM Pool 动态扩容        优先级降低（Rust 侧已就绪，Python 层待实现）
-├─ 2.2 心跳 + PID 存活检测      ← 下一目标（Phase 1-2 即可投产）
-└─ 2.3 Rust Relay 发布集成      CI/CD 工程
+├─ 2.2 心跳 + PID 存活检测      ✅ 已完成 (2026-03-29)
+└─ 2.3 Rust Relay 发布集成      ← 下一目标（CI/CD 工程）
 
 P2 — 功能完善（v0.4.0 里程碑）
 ├─ 3.0 磁盘溢写兜底 (Plan C)
@@ -323,7 +277,7 @@ P3 — 长期演进（v1.0 方向）
 | Per-connection write barrier | §3.2 异步接口需要兼容 barrier 机制 |
 | dispatch_cache + `_slots_generation` | §3.1 版本兼容性检查可复用 generation 失效机制 |
 | Rust relay 35K+ QPS | §2.3 集成后即可作为生产级 HTTP 路由层 |
-| flight_inc/dec/wait_idle | §2.2 心跳检测可复用 flight counter 判断连接活跃度 |
+| flight_inc/dec/wait_idle | §2.2 ✅ 心跳检测已复用 flight counter 判断连接活跃度 |
 | Chunked Streaming Transfer | ✅ 消除 256 MB 单次 RPC 限制，§2.1 SHM Pool 扩容优先级降低 |
 
 ### 优化报告中建议但未覆盖的后续方向
