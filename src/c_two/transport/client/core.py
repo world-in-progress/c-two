@@ -34,6 +34,7 @@ from ... import error
 from ..ipc.msg_type import (
     MsgType,
     PING_BYTES,
+    PONG_BYTES,
     SHUTDOWN_CLIENT_BYTES,
     SHUTDOWN_ACK_BYTES,
 )
@@ -713,6 +714,17 @@ class SharedClient:
                     payload = _recv_exact(sock, payload_len) if payload_len > 0 else b''
                 except (ConnectionResetError, BrokenPipeError, OSError):
                     break
+
+                # Auto-respond to server-initiated PING with PONG.
+                if flags & FLAG_SIGNAL:
+                    if len(payload) == 1 and payload[0] == MsgType.PING:
+                        pong = encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, PONG_BYTES)
+                        with self._send_lock:
+                            try:
+                                sock.sendall(pong)
+                            except (ConnectionResetError, BrokenPipeError, OSError):
+                                break
+                    continue
 
                 # Chunked reply: accumulate in assembler.
                 if flags & FLAG_CHUNKED:

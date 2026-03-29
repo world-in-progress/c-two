@@ -53,6 +53,8 @@ from .connection import Connection, CRMSlot, parse_call_inline
 from .chunk import ChunkAssembler, gc_chunk_assemblers
 from .reply import unpack_icrm_result, wrap_error, send_reply
 from .dispatcher import FastDispatcher
+from ...buddy import cleanup_stale_shm
+from .heartbeat import run_heartbeat
 from .handshake import handle_handshake, FLAG_HANDSHAKE
 
 logger = logging.getLogger(__name__)
@@ -365,6 +367,14 @@ class Server:
         except OSError:
             pass
 
+        # Best-effort cleanup of SHM segments owned by dead processes.
+        try:
+            cleaned = cleanup_stale_shm('cc')
+            if cleaned > 0:
+                logger.info('Cleaned %d stale SHM segments', cleaned)
+        except Exception:
+            logger.debug('SHM cleanup failed', exc_info=True)
+
     # ------------------------------------------------------------------
     # Shutdown callback helper
     # ------------------------------------------------------------------
@@ -420,6 +430,12 @@ class Server:
             dispatch_cache: dict[tuple[bytes, int], tuple] = {}
             cache_gen = self._slots_generation
             frame_count = 0
+
+            # Start heartbeat probe for this connection.
+            heartbeat_task: asyncio.Task | None = None
+            if self._config.heartbeat_interval > 0:
+                heartbeat_task = asyncio.create_task(run_heartbeat(conn))
+
             while True:
                 header = await reader.readexactly(16)
                 total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -435,6 +451,8 @@ class Server:
                     if payload_len > 0
                     else b''
                 )
+
+                conn.touch()
 
                 # Handshake & control: must complete before reading more.
                 if flags & FLAG_HANDSHAKE:
@@ -566,6 +584,17 @@ class Server:
         except Exception:
             logger.debug('Conn %d: handler error', conn.conn_id, exc_info=True)
         finally:
+            # Cancel heartbeat probe.
+            heartbeat_expired = False
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                if heartbeat_task.done() and not heartbeat_task.cancelled():
+                    heartbeat_expired = True
+
             # Drain in-flight tasks before tearing down the connection.
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -585,6 +614,11 @@ class Server:
                 pass
             if task in self._client_tasks:
                 self._client_tasks.remove(task)
+
+            if heartbeat_expired:
+                logger.warning('Conn %d: disconnected (heartbeat timeout)', conn.conn_id)
+            else:
+                logger.debug('Conn %d: disconnected', conn.conn_id)
 
     # ------------------------------------------------------------------
     # Chunked frame handling
