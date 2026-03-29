@@ -1,3 +1,6 @@
+from importlib.metadata import version
+__version__ = version('c-two')
+
 from . import mcp
 from . import compo
 from . import error
@@ -15,8 +18,6 @@ from .transport.registry import (
     shutdown,
     serve,
 )
-
-__version__ = '0.2.7'
 
 LOGO_ASCII ="""
                                                   

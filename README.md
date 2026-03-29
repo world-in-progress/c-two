@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
-  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/pyversions/c-two" alt="Python" /></a>
   <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
   <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
 </p>
@@ -21,7 +20,7 @@
 
 ---
 
-## Why C-Two?
+## Basic Idea
 
 - **Resources, not services** — C-Two doesn't expose RPC endpoints. It makes Python classes remotely accessible while preserving their stateful, object-oriented nature.
 
@@ -29,7 +28,7 @@
 
 - **Built for scientific Python** — Native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
 
-- **Rust-powered transport** — The IPC layer uses a Rust buddy allocator for shared memory and a Rust HTTP relay for high-throughput networking. Python-friendly API, native performance where it counts.
+- **Rust-powered transport** — The IPC layer uses a Rust buddy allocator for shared memory and a Rust HTTP relay for high-throughput networking.
 
 ---
 

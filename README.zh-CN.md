@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
-  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/pyversions/c-two" alt="Python" /></a>
   <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
   <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
 </p>
@@ -21,7 +20,7 @@
 
 ---
 
-## 为什么选择 C-Two？
+## 基本理念
 
 - **面向资源，而非服务** — C-Two 不是暴露 RPC 端点，而是让 Python 类在保持有状态、面向对象特性的同时可被远程访问。
 
@@ -29,7 +28,7 @@
 
 - **为科学计算而生** — 原生支持 Apache Arrow、NumPy 数组和大体量载荷（超过 256 MB 自动分块流式传输）。专为计算密集型场景设计，而非微服务。
 
-- **Rust 驱动的传输层** — IPC 层使用 Rust 伙伴分配器管理共享内存，HTTP 中继基于 Rust 实现高吞吐网络转发。Python 友好的 API，关键路径上的原生性能。
+- **Rust 驱动的传输层** — IPC 层使用 Rust buddy 分配器管理共享内存，HTTP 中继基于 Rust 实现高吞吐网络转发。
 
 ---
 
@@ -113,7 +112,7 @@ ICRM（Interface of Core Resource Model）声明了哪些 CRM 方法可被远程
 ```python
 @cc.icrm(namespace='demo.greeter', version='0.1.0')
 class IGreeter:
-    @cc.read                              # 允许并发读取
+    @cc.read    # 允许并发读取
     def greet(self, name: str) -> str: ...
 
     @cc.read
