@@ -4,8 +4,8 @@ Extracted and simplified from :mod:`c_two.rpc.server._Scheduler`.
 
 Three concurrency modes:
 
-- **EXCLUSIVE** (default): all CRM calls serialized via a single lock.
-- **READ_PARALLEL**: ``@cc.read`` methods run concurrently; ``@cc.write``
+- **EXCLUSIVE**: all CRM calls serialized via a single lock.
+- **READ_PARALLEL** (default): ``@cc.read`` methods run concurrently; ``@cc.write``
   methods acquire exclusive access (writer-priority RW lock).
 - **PARALLEL**: no locking — the CRM is assumed fully thread-safe.
 

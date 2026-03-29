@@ -31,15 +31,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ... import error
-from ..ipc.msg_type import MsgType
-from ..wire import payload_total_size
 from ..ipc.msg_type import (
     MsgType,
     PING_BYTES,
     SHUTDOWN_CLIENT_BYTES,
     SHUTDOWN_ACK_BYTES,
 )
-from ..protocol import FLAG_SIGNAL
 from ..ipc.frame import (
     IPCConfig,
     FRAME_STRUCT,
@@ -49,13 +46,13 @@ from ..ipc.frame import (
 from ..ipc.buddy import (
     FLAG_BUDDY,
     decode_buddy_payload,
-    encode_buddy_call_frame,
 )
 from ..protocol import (
     FLAG_CALL,
     FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
+    FLAG_SIGNAL,
     HANDSHAKE_VERSION,
     CAP_CALL,
     CAP_METHOD_IDX,
@@ -70,6 +67,7 @@ from ..protocol import (
 from ..wire import (
     CHUNK_HEADER_SIZE,
     MethodTable,
+    payload_total_size,
     encode_buddy_call_frame,
     encode_inline_call_frame,
     encode_buddy_chunked_call_frame,
