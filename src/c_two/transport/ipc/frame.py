@@ -35,7 +35,6 @@ U32_STRUCT = struct.Struct('<I')       # 4B unsigned 32-bit (error length, segme
 # ---------------------------------------------------------------------------
 # Performance tuning
 # ---------------------------------------------------------------------------
-FAST_READ_THRESHOLD = 1_048_576        # 1 MB — use ctypes.memmove above this size (benchmarked)
 FRAME_HEADER_SIZE = FRAME_STRUCT.size  # 16 bytes
 POOL_PAYLOAD_HEADER_SIZE = 9           # 1B segment_index + 8B data_size
 
@@ -49,13 +48,6 @@ DEFAULT_MAX_PENDING_REQUESTS = 1024                  # per-server total
 DEFAULT_POOL_SEGMENT_SIZE = 268_435_456              # 256 MB — pool SHM segment
 DEFAULT_MAX_POOL_SEGMENTS = 4                        # max segments per pool
 DEFAULT_MAX_POOL_MEMORY = DEFAULT_POOL_SEGMENT_SIZE * DEFAULT_MAX_POOL_SEGMENTS  # 1 GB per pool
-
-# ---------------------------------------------------------------------------
-# SHM garbage collection tuning
-# ---------------------------------------------------------------------------
-SHM_GC_INTERVAL = 30.0   # seconds — scan interval for leaked SHM segments
-SHM_MAX_AGE = 120.0       # seconds — max time before SHM segment is considered leaked
-
 
 # ---------------------------------------------------------------------------
 # IPCConfig dataclass
@@ -93,6 +85,13 @@ class IPCConfig:
     heartbeat_interval: float = 15.0
     heartbeat_timeout: float = 30.0
 
+    # Chunked transfer settings
+    chunk_threshold_ratio: float = 0.9
+    chunk_assembler_timeout: float = 60.0
+    chunk_gc_interval: int = 100
+    max_total_chunks: int = 512
+    max_reassembly_bytes: int = 8 * (1 << 30)  # 8 GB
+
     def __post_init__(self) -> None:
         if self.pool_segment_size > 0xFFFFFFFF:
             raise ValueError(
@@ -126,6 +125,12 @@ class IPCConfig:
                 f'heartbeat_timeout ({self.heartbeat_timeout}) must be > '
                 f'heartbeat_interval ({self.heartbeat_interval})'
             )
+        if not (0.0 < self.chunk_threshold_ratio <= 1.0):
+            raise ValueError(f'chunk_threshold_ratio must be in (0, 1], got {self.chunk_threshold_ratio}')
+        if self.max_total_chunks < 1:
+            raise ValueError(f'max_total_chunks must be >= 1, got {self.max_total_chunks}')
+        if self.max_reassembly_bytes < 1:
+            raise ValueError(f'max_reassembly_bytes must be >= 1, got {self.max_reassembly_bytes}')
 
 
 # ---------------------------------------------------------------------------

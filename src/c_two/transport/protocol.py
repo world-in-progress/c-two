@@ -194,7 +194,13 @@ def encode_server_handshake(
 # Handshake — Decode (both directions)
 # ---------------------------------------------------------------------------
 
-def decode_handshake(payload: bytes | memoryview) -> Handshake:
+def decode_handshake(
+    payload: bytes | memoryview,
+    *,
+    max_segments: int = _MAX_HANDSHAKE_SEGMENTS,
+    max_routes: int = _MAX_HANDSHAKE_ROUTES,
+    max_methods: int = _MAX_HANDSHAKE_METHODS,
+) -> Handshake:
     """Decode handshake from either direction.
 
     Client payloads have no route section (detected by exhausting bytes
@@ -214,8 +220,8 @@ def decode_handshake(payload: bytes | memoryview) -> Handshake:
     if off + 2 > buf_len:
         raise ValueError('Handshake truncated: missing segment count')
     seg_count = _U16.unpack_from(buf, off)[0]; off += 2
-    if seg_count > _MAX_HANDSHAKE_SEGMENTS:
-        raise ValueError(f'Handshake segment count {seg_count} exceeds limit {_MAX_HANDSHAKE_SEGMENTS}')
+    if seg_count > max_segments:
+        raise ValueError(f'Handshake segment count {seg_count} exceeds limit {max_segments}')
 
     segments: list[tuple[str, int]] = []
     for _ in range(seg_count):
@@ -236,8 +242,8 @@ def decode_handshake(payload: bytes | memoryview) -> Handshake:
     routes: list[RouteInfo] = []
     if off + 2 <= buf_len:
         route_count = _U16.unpack_from(buf, off)[0]; off += 2
-        if route_count > _MAX_HANDSHAKE_ROUTES:
-            raise ValueError(f'Handshake route count {route_count} exceeds limit {_MAX_HANDSHAKE_ROUTES}')
+        if route_count > max_routes:
+            raise ValueError(f'Handshake route count {route_count} exceeds limit {max_routes}')
         for _ in range(route_count):
             if off + 1 > buf_len:
                 raise ValueError('Handshake truncated in route entry')
@@ -248,8 +254,8 @@ def decode_handshake(payload: bytes | memoryview) -> Handshake:
             if off + 2 > buf_len:
                 raise ValueError('Handshake truncated: missing method count')
             m_count = _U16.unpack_from(buf, off)[0]; off += 2
-            if m_count > _MAX_HANDSHAKE_METHODS:
-                raise ValueError(f'Handshake method count {m_count} exceeds limit {_MAX_HANDSHAKE_METHODS}')
+            if m_count > max_methods:
+                raise ValueError(f'Handshake method count {m_count} exceeds limit {max_methods}')
             methods: list[MethodEntry] = []
             for mi in range(m_count):
                 if off + 1 > buf_len:

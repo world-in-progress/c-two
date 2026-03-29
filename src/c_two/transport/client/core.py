@@ -82,11 +82,6 @@ logger = logging.getLogger(__name__)
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
-# Payloads exceeding this fraction of pool_segment_size trigger chunked transfer.
-_CHUNK_THRESHOLD_RATIO = 0.9
-_MAX_TOTAL_CHUNKS = 512           # 512 × 128 MB = 64 GB theoretical max
-_MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB hard cap on reassembly buffer
-
 
 def _resolve_socket_path(region_id: str) -> str:
     return str(Path(_IPC_SOCK_DIR) / f'{region_id}.sock')
@@ -140,16 +135,23 @@ class _ReplyChunkAssembler:
     __slots__ = ('total_chunks', 'chunk_size', 'received', '_actual_total',
                  '_buf', '_received_flags')
 
-    def __init__(self, total_chunks: int, chunk_size: int) -> None:
-        if total_chunks <= 0 or total_chunks > _MAX_TOTAL_CHUNKS:
+    def __init__(
+        self,
+        total_chunks: int,
+        chunk_size: int,
+        *,
+        max_total_chunks: int = 512,
+        max_reassembly_bytes: int = 8 * (1 << 30),
+    ) -> None:
+        if total_chunks <= 0 or total_chunks > max_total_chunks:
             raise ValueError(
-                f'total_chunks={total_chunks} out of range [1, {_MAX_TOTAL_CHUNKS}]'
+                f'total_chunks={total_chunks} out of range [1, {max_total_chunks}]'
             )
         alloc_size = total_chunks * chunk_size
-        if alloc_size > _MAX_REASSEMBLY_BYTES:
+        if alloc_size > max_reassembly_bytes:
             raise ValueError(
                 f'Reassembly buffer {alloc_size} bytes exceeds '
-                f'limit {_MAX_REASSEMBLY_BYTES}'
+                f'limit {max_reassembly_bytes}'
             )
         import mmap as _mmap
         self.total_chunks = total_chunks
@@ -441,7 +443,7 @@ class SharedClient:
             self._pending[rid] = pending
 
         # Chunked transfer for large payloads.
-        chunk_threshold = int(self._config.pool_segment_size * _CHUNK_THRESHOLD_RATIO)
+        chunk_threshold = int(self._config.pool_segment_size * self._config.chunk_threshold_ratio)
         if wire_size > chunk_threshold:
             if not self._chunked_capable:
                 with self._pending_lock:
@@ -893,6 +895,8 @@ class SharedClient:
             asm = _ReplyChunkAssembler(
                 total_chunks=total_chunks,
                 chunk_size=chunk_size,
+                max_total_chunks=self._config.max_total_chunks,
+                max_reassembly_bytes=self._config.max_reassembly_bytes,
             )
             assemblers[request_id] = asm
         else:

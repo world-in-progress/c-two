@@ -15,11 +15,11 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 # Chunked transfer constants.
-CHUNK_THRESHOLD_RATIO = 0.9
-CHUNK_ASSEMBLER_TIMEOUT = 60.0   # seconds
-CHUNK_GC_INTERVAL = 100          # frames between GC sweeps
-MAX_TOTAL_CHUNKS = 512           # 512 × 128 MB = 64 GB theoretical max
-MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB hard cap on reassembly buffer
+CHUNK_GC_INTERVAL = 100          # frames between GC sweeps (used by core.py when no config)
+
+# Default limits used when no IPCConfig is available (backward-compat).
+_DEFAULT_MAX_TOTAL_CHUNKS = 512
+_DEFAULT_MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB
 
 
 @dataclass
@@ -34,6 +34,8 @@ class ChunkAssembler:
     chunk_size: int
     route_name: str
     method_idx: int
+    max_total_chunks: int = _DEFAULT_MAX_TOTAL_CHUNKS
+    max_reassembly_bytes: int = _DEFAULT_MAX_REASSEMBLY_BYTES
     received: int = 0
     _actual_total: int = 0
     created_at: float = field(default_factory=time.monotonic)
@@ -41,15 +43,15 @@ class ChunkAssembler:
     _received_flags: bytearray = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.total_chunks <= 0 or self.total_chunks > MAX_TOTAL_CHUNKS:
+        if self.total_chunks <= 0 or self.total_chunks > self.max_total_chunks:
             raise ValueError(
-                f'total_chunks={self.total_chunks} out of range [1, {MAX_TOTAL_CHUNKS}]'
+                f'total_chunks={self.total_chunks} out of range [1, {self.max_total_chunks}]'
             )
         alloc_size = self.total_chunks * self.chunk_size
-        if alloc_size > MAX_REASSEMBLY_BYTES:
+        if alloc_size > self.max_reassembly_bytes:
             raise ValueError(
                 f'Reassembly buffer {alloc_size} bytes exceeds '
-                f'limit {MAX_REASSEMBLY_BYTES}'
+                f'limit {self.max_reassembly_bytes}'
             )
         self._buf = mmap.mmap(-1, alloc_size)
         self._received_flags = bytearray(self.total_chunks)
@@ -93,12 +95,14 @@ class ChunkAssembler:
 def gc_chunk_assemblers(
     assemblers: dict[int, ChunkAssembler],
     conn_id: int,
+    *,
+    timeout: float = 60.0,
 ) -> None:
     """Discard chunk assemblers that have been incomplete for too long."""
     now = time.monotonic()
     expired = [
         rid for rid, asm in assemblers.items()
-        if now - asm.created_at > CHUNK_ASSEMBLER_TIMEOUT
+        if now - asm.created_at > timeout
     ]
     for rid in expired:
         asm = assemblers.pop(rid)

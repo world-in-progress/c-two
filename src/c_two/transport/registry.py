@@ -57,8 +57,6 @@ from .ipc.frame import IPCConfig
 ICRM = TypeVar('ICRM')
 log = logging.getLogger(__name__)
 
-_RELAY_TIMEOUT = 5.0
-
 
 def _physical_memory() -> int | None:
     """Return physical RAM in bytes, or *None* if unavailable."""
@@ -501,7 +499,7 @@ class _ProcessRegistry:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _relay_register(name: str, ipc_address: str) -> None:
+    def _relay_register(name: str, ipc_address: str, *, timeout: float = 5.0) -> None:
         """Notify the relay server about a newly registered CRM.
 
         Does nothing if ``C2_RELAY_ADDRESS`` is not set.  Raises on
@@ -514,7 +512,7 @@ class _ProcessRegistry:
         url = f'{relay_addr.rstrip("/")}/_register'
         try:
             transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport, timeout=_RELAY_TIMEOUT) as client:
+            with httpx.Client(transport=transport, timeout=timeout) as client:
                 resp = client.post(url, json={'name': name, 'address': ipc_address})
         except Exception as exc:
             raise ConnectionError(
@@ -531,7 +529,7 @@ class _ProcessRegistry:
         log.info('Registered CRM %s with relay at %s', name, relay_addr)
 
     @staticmethod
-    def _relay_unregister(name: str) -> None:
+    def _relay_unregister(name: str, *, timeout: float = 5.0) -> None:
         """Notify the relay server about a CRM removal.
 
         Does nothing if ``C2_RELAY_ADDRESS`` is not set.  Raises on
@@ -544,7 +542,7 @@ class _ProcessRegistry:
         url = f'{relay_addr.rstrip("/")}/_unregister'
         try:
             transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport, timeout=_RELAY_TIMEOUT) as client:
+            with httpx.Client(transport=transport, timeout=timeout) as client:
                 resp = client.post(url, json={'name': name})
         except Exception as exc:
             raise ConnectionError(

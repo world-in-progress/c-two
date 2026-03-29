@@ -50,7 +50,7 @@ from ..wire import (
 from .scheduler import Scheduler, ConcurrencyConfig
 
 from .connection import Connection, CRMSlot, parse_call_inline
-from .chunk import ChunkAssembler, gc_chunk_assemblers, CHUNK_GC_INTERVAL
+from .chunk import ChunkAssembler, gc_chunk_assemblers
 from .reply import unpack_icrm_result, wrap_error, send_reply
 from .dispatcher import FastDispatcher
 from .handshake import handle_handshake, FLAG_HANDSHAKE
@@ -459,8 +459,9 @@ class Server:
 
                 # Periodic GC for stale chunk assemblers.
                 frame_count += 1
-                if frame_count % CHUNK_GC_INTERVAL == 0 and chunk_assemblers:
-                    gc_chunk_assemblers(chunk_assemblers, conn.conn_id)
+                if frame_count % self._config.chunk_gc_interval == 0 and chunk_assemblers:
+                    gc_chunk_assemblers(chunk_assemblers, conn.conn_id,
+                                       timeout=self._config.chunk_assembler_timeout)
 
                 # Chunked frame: accumulate in assembler, dispatch on completion.
                 if flags & FLAG_CHUNKED:
@@ -654,6 +655,8 @@ class Server:
                     chunk_size=chunk_size,
                     route_name=route_name,
                     method_idx=method_idx,
+                    max_total_chunks=self._config.max_total_chunks,
+                    max_reassembly_bytes=self._config.max_reassembly_bytes,
                 )
             except Exception as exc:
                 logger.error('Conn %d: failed to create chunk assembler: %s',
