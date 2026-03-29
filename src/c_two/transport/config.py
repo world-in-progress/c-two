@@ -11,7 +11,7 @@ Recognised environment variables:
   (default 268 435 456 = 256 MB).  Determines the maximum single-call
   payload that can be transferred via SHM.
 - ``C2_IPC_MAX_SEGMENTS`` — maximum number of buddy pool segments
-  (default 4, range 1–255).
+  (default 4, range 1-255).
 - ``C2_RELAY_ADDRESS`` — HTTP address of the relay server for service
   discovery.  When set, :func:`cc.register` automatically registers
   the CRM with the relay via ``POST /_register``.
@@ -38,7 +38,9 @@ class C2Settings(BaseSettings):
     """C-Two runtime settings sourced from environment variables."""
 
     model_config = SettingsConfigDict(
+        env_file='.env',
         env_prefix='C2_',
+        env_file_encoding='utf-8',
     )
 
     ipc_address: str | None = None

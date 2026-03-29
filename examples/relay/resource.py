@@ -21,8 +21,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../examples/')))
 
 import c_two as cc
-from icrm import IGrid
-from crm import Grid
+from grid.grid import Grid
+from grid.igrid import IGrid
 
 BIND_ADDRESS = 'ipc-v3://v2_grid_standalone'
 

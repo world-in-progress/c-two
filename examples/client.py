@@ -11,7 +11,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
-from icrm import IGrid, GridAttribute
+from examples.grid.igrid import (
+    IGrid,
+    GridAttribute,
+)
 
 SERVER_ADDRESS = 'ipc-v3://grid'
 

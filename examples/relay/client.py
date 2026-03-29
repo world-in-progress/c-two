@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../examples/')))
 
 import c_two as cc
-from icrm import IGrid, GridAttribute
+from grid.igrid import IGrid, GridAttribute
 
 RELAY_URL = 'http://127.0.0.1:8080'
 
