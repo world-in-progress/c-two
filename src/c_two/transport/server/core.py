@@ -10,30 +10,23 @@
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import inspect
 import logging
-import mmap
 import os
-import queue
-import re
 import struct
 import threading
-import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ... import error
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
-from ..ipc.msg_type import MsgType
 from ..ipc.msg_type import (
     MsgType,
     PONG_BYTES,
     SHUTDOWN_ACK_BYTES,
     _SIGNAL_TYPES,
 )
-from ..protocol import FLAG_SIGNAL
+from ..protocol import FLAG_SIGNAL, FLAG_CALL, FLAG_CHUNKED
 from ..ipc.frame import (
     IPCConfig,
     FRAME_STRUCT,
@@ -46,358 +39,25 @@ from ..ipc.buddy import (
     BUDDY_PAYLOAD_STRUCT,
     decode_buddy_payload,
 )
-from ..protocol import (
-    FLAG_CALL,
-    FLAG_REPLY,
-    FLAG_CHUNKED,
-    FLAG_CHUNK_LAST,
-    HANDSHAKE_V5,
-    CAP_CALL,
-    CAP_METHOD_IDX,
-    CAP_CHUNKED,
-    STATUS_SUCCESS,
-    STATUS_ERROR,
-    RouteInfo,
-    MethodEntry,
-    encode_v5_server_handshake,
-    decode_v5_handshake,
-)
 from ..wire import (
     MethodTable,
     decode_call_control,
     decode_chunk_header,
     CHUNK_HEADER_SIZE,
-    encode_buddy_reply_frame,
-    encode_inline_reply_frame,
     encode_error_reply_frame,
-    encode_buddy_chunked_reply_frame,
-    encode_inline_chunked_reply_frame,
     U16_LE,
 )
 from .scheduler import Scheduler, ConcurrencyConfig
 
+from .connection import Connection, CRMSlot, parse_call_inline
+from .chunk import ChunkAssembler, gc_chunk_assemblers, CHUNK_GC_INTERVAL
+from .reply import unpack_icrm_result, wrap_error, send_reply
+from .dispatcher import FastDispatcher
+from .handshake import handle_handshake, FLAG_HANDSHAKE
+
 logger = logging.getLogger(__name__)
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-_SHM_NAME_RE = re.compile(r'^/?[A-Za-z0-9_.\-]{1,255}$')
-FLAG_HANDSHAKE = 1 << 2
-
-# Chunked transfer constants.
-_CHUNK_THRESHOLD_RATIO = 0.9
-_CHUNK_ASSEMBLER_TIMEOUT = 60.0   # seconds
-_CHUNK_GC_INTERVAL = 100          # frames between GC sweeps
-_MAX_TOTAL_CHUNKS = 512           # 512 × 128 MB = 64 GB theoretical max
-_MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB hard cap on reassembly buffer
-
-
-def _parse_call_inline(
-    payload: bytes | memoryview,
-) -> tuple[bytes, int, int]:
-    """Parse call control from an inline (non-buddy) payload.
-
-    Returns ``(route_key_bytes, method_idx, args_start_offset)``.
-
-    Raises ``struct.error`` or ``IndexError`` on malformed data.
-    This is the **single source of truth** for inline call control
-    parsing — used by both the fast dispatch path and ``_handle_call``.
-    """
-    name_len = payload[0]
-    if name_len:
-        route_key = payload[1:1 + name_len]
-        method_idx = U16_LE.unpack_from(payload, 1 + name_len)[0]
-        args_start = 3 + name_len
-    else:
-        route_key = b''
-        method_idx = U16_LE.unpack_from(payload, 1)[0]
-        args_start = 3
-    return route_key, method_idx, args_start
-
-
-# ---------------------------------------------------------------------------
-# Per-connection state
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _Connection:
-    """Per-client connection state."""
-
-    conn_id: int
-    writer: asyncio.StreamWriter
-    config: IPCConfig
-    buddy_pool: object = None          # BuddyPoolHandle
-    seg_views: list[memoryview] = field(default_factory=list)
-    remote_segment_names: list[str] = field(default_factory=list)
-    remote_segment_sizes: list[int] = field(default_factory=list)
-    handshake_done: bool = False
-    chunked_capable: bool = False
-    # In-flight submit_inline request counter.  Incremented on the event
-    # loop thread before submitting; decremented by worker threads via
-    # call_soon_threadsafe.  The _idle event is set when the count drops
-    # to zero, allowing _handle_client's finally block to wait for all
-    # pending replies before closing the writer.
-    _inflight: int = field(default=0, repr=False)
-    _idle: asyncio.Event | None = field(default=None, repr=False)
-
-    def init_flight_tracking(self, loop: asyncio.AbstractEventLoop) -> None:
-        self._idle = asyncio.Event()
-        self._idle.set()  # starts idle
-        self._loop = loop
-
-    def flight_inc(self) -> None:
-        """Mark a submit_inline request as in-flight (call from event loop)."""
-        self._inflight += 1
-        if self._idle is not None and self._idle.is_set():
-            self._idle.clear()
-
-    def flight_dec(self) -> None:
-        """Mark a submit_inline request as completed (call from event loop via call_soon_threadsafe)."""
-        self._inflight -= 1
-        if self._inflight <= 0:
-            self._inflight = 0
-            if self._idle is not None:
-                self._idle.set()
-
-    async def wait_idle(self) -> None:
-        """Wait until all in-flight submit_inline requests complete."""
-        if self._idle is not None and not self._idle.is_set():
-            await self._idle.wait()
-
-    def cleanup(self) -> None:
-        self.seg_views = []
-        if self.buddy_pool is not None:
-            try:
-                self.buddy_pool.destroy()
-            except Exception:
-                pass
-            self.buddy_pool = None
-
-
-# ---------------------------------------------------------------------------
-# Per-CRM routing slot
-# ---------------------------------------------------------------------------
-
-@dataclass
-class CRMSlot:
-    """Per-CRM registration in the server, keyed by routing name."""
-
-    name: str
-    icrm: object
-    method_table: MethodTable
-    scheduler: Scheduler
-    methods: list[str]
-    shutdown_method: str | None = None
-    # Pre-built dispatch table: method_name → (callable, MethodAccess).
-    _dispatch_table: dict[str, tuple[Any, MethodAccess]] = field(
-        default_factory=dict, repr=False,
-    )
-
-    def build_dispatch_table(self) -> None:
-        """Populate the dispatch table from the ICRM instance.
-
-        Skips the ``@cc.on_shutdown`` method (not RPC-callable).
-        """
-        for name in self.methods:
-            if name == self.shutdown_method:
-                continue
-            method = getattr(self.icrm, name, None)
-            if method is not None:
-                self._dispatch_table[name] = (method, get_method_access(method))
-
-
-# ---------------------------------------------------------------------------
-# Chunk assembler (mmap-based reassembly buffer for chunked transfer)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _ChunkAssembler:
-    """Reassembles a chunked request into contiguous bytes.
-
-    Uses ``mmap.mmap(-1, size)`` (anonymous mmap) for the reassembly buffer
-    to get deterministic OS-level memory release via ``close()``.
-    """
-
-    total_chunks: int
-    chunk_size: int
-    route_name: str
-    method_idx: int
-    received: int = 0
-    _actual_total: int = 0
-    created_at: float = field(default_factory=time.monotonic)
-    _buf: mmap.mmap | None = field(default=None, init=False, repr=False)
-    _received_flags: bytearray = field(default=None, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        if self.total_chunks <= 0 or self.total_chunks > _MAX_TOTAL_CHUNKS:
-            raise ValueError(
-                f'total_chunks={self.total_chunks} out of range [1, {_MAX_TOTAL_CHUNKS}]'
-            )
-        alloc_size = self.total_chunks * self.chunk_size
-        if alloc_size > _MAX_REASSEMBLY_BYTES:
-            raise ValueError(
-                f'Reassembly buffer {alloc_size} bytes exceeds '
-                f'limit {_MAX_REASSEMBLY_BYTES}'
-            )
-        self._buf = mmap.mmap(-1, alloc_size)
-        self._received_flags = bytearray(self.total_chunks)
-
-    def add(self, idx: int, data: bytes | memoryview) -> bool:
-        """Write chunk data at the correct offset.  Returns True when complete."""
-        if self._received_flags[idx]:
-            return False
-        offset = idx * self.chunk_size
-        dlen = len(data)
-        self._buf[offset:offset + dlen] = data
-        self._received_flags[idx] = 1
-        self._actual_total += dlen
-        self.received += 1
-        return self.received == self.total_chunks
-
-    def assemble(self) -> bytes:
-        """Return reassembled payload and release the mmap.
-
-        .. note::
-
-           ``buf.read()`` creates a ``bytes`` copy while the mmap is still
-           alive, so peak RSS briefly doubles (mmap + bytes).  This is
-           inherent to any copy-out scheme and acceptable given that the
-           mmap is released immediately after via ``close()`` → ``munmap``.
-        """
-        buf = self._buf
-        self._buf = None
-        buf.seek(0)
-        result = buf.read(self._actual_total)
-        buf.close()
-        return result
-
-    def discard(self) -> None:
-        """Release the mmap without assembling."""
-        if self._buf is not None:
-            self._buf.close()
-            self._buf = None
-
-
-_SENTINEL = None  # Poison pill for dispatcher shutdown
-
-
-class _FastDispatcher:
-    """Lightweight CRM method dispatcher using SimpleQueue.
-
-    Replaces ThreadPoolExecutor to avoid _WorkItem wrapping, heavy Queue
-    locks, and per-submission Future creation overhead.
-    """
-
-    def __init__(self, loop: asyncio.AbstractEventLoop, num_workers: int = 2) -> None:
-        self._loop = loop
-        self._q: queue.SimpleQueue = queue.SimpleQueue()
-        self._workers: list[threading.Thread] = []
-        for i in range(num_workers):
-            t = threading.Thread(
-                target=self._worker, daemon=True, name=f'c2_fast_{i}',
-            )
-            t.start()
-            self._workers.append(t)
-
-    def submit(
-        self,
-        sched_execute,
-        method,
-        args_bytes,
-        access,
-        future: asyncio.Future,
-    ) -> None:
-        self._q.put((sched_execute, method, args_bytes, access, future, None, None, None, None))
-
-    def submit_inline(
-        self,
-        sched_execute,
-        method,
-        args_bytes,
-        access,
-        request_id: int,
-        writer,
-        barrier=None,
-        flight_dec=None,
-    ) -> None:
-        """Fire-and-forget: worker builds inline reply frame and writes directly.
-
-        If *barrier* is an ``asyncio.Event``, the worker will call
-        ``barrier.set()`` (via ``call_soon_threadsafe``) after execution
-        completes, allowing the read loop to resume.  Used for ``@cc.write``
-        methods to guarantee per-connection causal ordering.
-
-        If *flight_dec* is provided, the worker will call it (via
-        ``call_soon_threadsafe``) in the finally block to decrement the
-        connection's in-flight counter.
-        """
-        self._q.put((sched_execute, method, args_bytes, access, None, request_id, writer, barrier, flight_dec))
-
-    def shutdown(self) -> None:
-        for _ in self._workers:
-            self._q.put(_SENTINEL)
-        for t in self._workers:
-            t.join(timeout=2.0)
-
-    def _worker(self) -> None:
-        loop = self._loop
-        q = self._q
-        call_soon = loop.call_soon_threadsafe
-        while True:
-            item = q.get()
-            if item is _SENTINEL:
-                break
-            sched_execute, method, args_bytes, access, future, request_id, writer, barrier, flight_dec = item
-            try:
-                result = sched_execute(method, args_bytes, access)
-                if future is not None:
-                    call_soon(future.set_result, result)
-                else:
-                    # Fire-and-forget: build reply and write directly
-                    self._write_inline_reply(call_soon, writer, request_id, result)
-            except BaseException as exc:
-                if future is not None:
-                    call_soon(future.set_exception, exc)
-                else:
-                    self._write_error_reply(call_soon, writer, request_id, exc)
-            finally:
-                if barrier is not None:
-                    call_soon(barrier.set)
-                if flight_dec is not None:
-                    call_soon(flight_dec)
-
-    @staticmethod
-    def _write_inline_reply(call_soon, writer, request_id, result):
-        """Build inline reply frame from ICRM result and write."""
-        if isinstance(result, tuple):
-            err_part = result[0] if result[0] else b''
-            res_part = result[1] if len(result) > 1 and result[1] else b''
-            if isinstance(err_part, memoryview):
-                err_part = bytes(err_part)
-            if isinstance(res_part, memoryview):
-                res_part = bytes(res_part)
-        elif result is None:
-            res_part, err_part = b'', b''
-        elif isinstance(result, memoryview):
-            res_part, err_part = bytes(result), b''
-        else:
-            res_part, err_part = result, b''
-
-        if err_part:
-            frame = encode_error_reply_frame(request_id, err_part)
-        else:
-            frame = encode_inline_reply_frame(request_id, res_part)
-        call_soon(writer.write, frame)
-
-    @staticmethod
-    def _write_error_reply(call_soon, writer, request_id, exc):
-        """Build error reply frame from exception and write."""
-        try:
-            if hasattr(exc, 'serialize'):
-                err_bytes = exc.serialize()
-            else:
-                err_bytes = str(exc).encode('utf-8')
-        except Exception:
-            err_bytes = b'Internal server error'
-        call_soon(writer.write, encode_error_reply_frame(request_id, err_bytes))
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +305,7 @@ class Server:
 
     async def _async_main(self) -> None:
         self._shutdown_event = asyncio.Event()
-        self._dispatcher = _FastDispatcher(asyncio.get_running_loop())
+        self._dispatcher = FastDispatcher(asyncio.get_running_loop())
 
         os.makedirs(os.path.dirname(self._socket_path), exist_ok=True)
         if os.path.exists(self._socket_path):
@@ -742,7 +402,7 @@ class Server:
     ) -> None:
         self._conn_counter += 1
         conn_id = self._conn_counter
-        conn = _Connection(conn_id=conn_id, writer=writer, config=self._config)
+        conn = Connection(conn_id=conn_id, writer=writer, config=self._config)
         conn.init_flight_tracking(asyncio.get_running_loop())
         task = asyncio.current_task()
         self._client_tasks.append(task)
@@ -750,7 +410,7 @@ class Server:
         # Pipelined dispatch: read next frame while previous dispatches
         # are still executing in the thread pool.
         pending: set[asyncio.Task] = set()
-        chunk_assemblers: dict[int, _ChunkAssembler] = {}
+        chunk_assemblers: dict[int, ChunkAssembler] = {}
 
         try:
             max_frame = self._config.max_frame_size
@@ -778,7 +438,9 @@ class Server:
 
                 # Handshake & control: must complete before reading more.
                 if flags & FLAG_HANDSHAKE:
-                    await self._handle_handshake(conn, payload, writer)
+                    with self._slots_lock:
+                        slots_snap = list(self._slots.values())
+                    await handle_handshake(conn, payload, writer, slots_snap, self._config)
                     continue
                 if flags & FLAG_CTRL:
                     continue
@@ -797,8 +459,8 @@ class Server:
 
                 # Periodic GC for stale chunk assemblers.
                 frame_count += 1
-                if frame_count % _CHUNK_GC_INTERVAL == 0 and chunk_assemblers:
-                    self._gc_chunk_assemblers(chunk_assemblers, conn.conn_id)
+                if frame_count % CHUNK_GC_INTERVAL == 0 and chunk_assemblers:
+                    gc_chunk_assemblers(chunk_assemblers, conn.conn_id)
 
                 # Chunked frame: accumulate in assembler, dispatch on completion.
                 if flags & FLAG_CHUNKED:
@@ -819,7 +481,7 @@ class Server:
                 # parse + dispatch table lookup + submit all without Task.
                 if is_routed and not is_buddy:
                     try:
-                        route_key, method_idx, args_start = _parse_call_inline(payload)
+                        route_key, method_idx, args_start = parse_call_inline(payload)
                     except (struct.error, IndexError) as exc:
                         writer.write(encode_error_reply_frame(
                             request_id,
@@ -924,123 +586,17 @@ class Server:
                 self._client_tasks.remove(task)
 
     # ------------------------------------------------------------------
-    # Handshake
-    # ------------------------------------------------------------------
-
-    async def _handle_handshake(
-        self,
-        conn: _Connection,
-        payload: bytes,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        if len(payload) < 1:
-            return
-        version = payload[0]
-        if version == HANDSHAKE_V5:
-            await self._handle_v5_handshake(conn, payload, writer)
-        else:
-            # Reject legacy v4 clients — only v5 supported
-            writer.close()
-            await writer.wait_closed()
-            return
-
-    async def _handle_v5_handshake(
-        self,
-        conn: _Connection,
-        payload: bytes,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        try:
-            hs = decode_v5_handshake(payload)
-        except Exception as e:
-            logger.warning('Conn %d: bad v5 handshake: %s', conn.conn_id, e)
-            return
-        self._open_segments(conn, hs.segments)
-
-        # Build route / method table ACK for *all* registered CRMs.
-        route_infos: list[RouteInfo] = []
-        with self._slots_lock:
-            for slot in self._slots.values():
-                route_infos.append(RouteInfo(
-                    name=slot.name,
-                    methods=[
-                        MethodEntry(name=n, index=slot.method_table.index_of(n))
-                        for n in slot.method_table.names()
-                    ],
-                ))
-
-        cap_flags = 0
-        if hs.capability_flags & CAP_CALL:
-            cap_flags |= CAP_CALL
-        if hs.capability_flags & CAP_METHOD_IDX:
-            cap_flags |= CAP_METHOD_IDX
-        if hs.capability_flags & CAP_CHUNKED:
-            cap_flags |= CAP_CHUNKED
-            conn.chunked_capable = True
-
-        ack_payload = encode_v5_server_handshake(
-            segments=[],
-            capability_flags=cap_flags,
-            routes=route_infos,
-        )
-        writer.write(encode_frame(0, FLAG_HANDSHAKE, ack_payload))
-        await writer.drain()
-
-    _MAX_CLIENT_SEGMENTS = 16
-
-    def _open_segments(
-        self,
-        conn: _Connection,
-        segments: list[tuple[str, int]],
-    ) -> None:
-        """Open the client's buddy SHM segments and cache memoryviews."""
-        if len(segments) > self._MAX_CLIENT_SEGMENTS:
-            logger.warning('Conn %d: too many segments (%d > %d), rejecting handshake',
-                           conn.conn_id, len(segments), self._MAX_CLIENT_SEGMENTS)
-            return
-        for name, _ in segments:
-            if not _SHM_NAME_RE.match(name):
-                logger.warning('Conn %d: invalid segment name: %r', conn.conn_id, name)
-                return
-        try:
-            from c_two.buddy import BuddyPoolHandle, PoolConfig
-
-            conn.buddy_pool = BuddyPoolHandle(PoolConfig(
-                segment_size=self._config.pool_segment_size,
-                min_block_size=4096,
-                max_segments=len(segments),
-                max_dedicated_segments=4,
-            ))
-            for name, size in segments:
-                conn.buddy_pool.open_segment(name, size)
-                conn.remote_segment_names.append(name)
-                conn.remote_segment_sizes.append(size)
-
-            conn.seg_views = []
-            for seg_idx in range(conn.buddy_pool.segment_count()):
-                base_addr, data_size = conn.buddy_pool.seg_data_info(seg_idx)
-                mv = memoryview(
-                    (ctypes.c_char * data_size).from_address(base_addr)
-                ).cast('B')
-                conn.seg_views.append(mv)
-
-            conn.handshake_done = True
-        except Exception as e:
-            logger.error('Conn %d: segment open failed: %s', conn.conn_id, e)
-            conn.cleanup()
-
-    # ------------------------------------------------------------------
     # Chunked frame handling
     # ------------------------------------------------------------------
 
     async def _process_chunked_frame(
         self,
-        conn: _Connection,
+        conn: Connection,
         request_id: int,
         flags: int,
         payload: bytes,
         writer: asyncio.StreamWriter,
-        assemblers: dict[int, _ChunkAssembler],
+        assemblers: dict[int, ChunkAssembler],
     ) -> None:
         """Process a single chunked frame, dispatching when all chunks arrive."""
         is_buddy = bool(flags & FLAG_BUDDY)
@@ -1093,7 +649,7 @@ class Server:
 
             chunk_size = self._config.pool_segment_size // 2
             try:
-                asm = _ChunkAssembler(
+                asm = ChunkAssembler(
                     total_chunks=total_chunks,
                     chunk_size=chunk_size,
                     route_name=route_name,
@@ -1152,27 +708,7 @@ class Server:
             return
 
         result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
-        await self._send_reply(conn, request_id, result_bytes, err_bytes, writer)
-
-    @staticmethod
-    def _gc_chunk_assemblers(
-        assemblers: dict[int, _ChunkAssembler],
-        conn_id: int,
-    ) -> None:
-        """Discard chunk assemblers that have been incomplete for too long."""
-        now = time.monotonic()
-        expired = [
-            rid for rid, asm in assemblers.items()
-            if now - asm.created_at > _CHUNK_ASSEMBLER_TIMEOUT
-        ]
-        for rid in expired:
-            asm = assemblers.pop(rid)
-            logger.warning(
-                'Conn %d: GC stale chunk assembler rid=%d '
-                '(%d/%d chunks received)',
-                conn_id, rid, asm.received, asm.total_chunks,
-            )
-            asm.discard()
+        await send_reply(conn, request_id, result_bytes, err_bytes, writer, self._config)
 
     # ------------------------------------------------------------------
     # Call handling (control-plane routing)
@@ -1180,7 +716,7 @@ class Server:
 
     async def _handle_call(
         self,
-        conn: _Connection,
+        conn: Connection,
         request_id: int,
         payload: bytes,
         is_buddy: bool,
@@ -1194,7 +730,7 @@ class Server:
             if not payload:
                 return
             try:
-                route_key, method_idx, args_start = _parse_call_inline(payload)
+                route_key, method_idx, args_start = parse_call_inline(payload)
             except (struct.error, IndexError, UnicodeDecodeError) as exc:
                 logger.warning('Conn %d: malformed call control: %s',
                                conn.conn_id, exc)
@@ -1255,30 +791,18 @@ class Server:
             self._dispatcher.submit(slot.scheduler.execute_fast, method, args_bytes, access, future)
             result = await future
         except Exception as exc:
-            err_bytes = self._wrap_error(exc)[1]
+            err_bytes = wrap_error(exc)[1]
             writer.write(encode_error_reply_frame(request_id, err_bytes))
             await writer.drain()
             return
 
-        # Inline unpack + send.
-        if isinstance(result, tuple):
-            err_part = result[0] if result[0] else b''
-            res_part = result[1] if len(result) > 1 and result[1] else b''
-            if isinstance(err_part, memoryview):
-                err_part = bytes(err_part)
-            if isinstance(res_part, memoryview):
-                res_part = bytes(res_part)
-        elif result is None:
-            res_part, err_part = b'', b''
-        elif isinstance(result, memoryview):
-            res_part, err_part = bytes(result), b''
-        else:
-            res_part, err_part = result, b''
+        # Unpack ICRM result and send reply.
+        res_part, err_part = unpack_icrm_result(result)
 
-        await self._send_reply(conn, request_id, res_part, err_part, writer)
+        await send_reply(conn, request_id, res_part, err_part, writer, self._config)
 
     def _resolve_buddy(
-        self, conn: _Connection, payload: bytes,
+        self, conn: Connection, payload: bytes,
     ) -> tuple[str, int, bytes | None]:
         """Extract route_name + method_idx + args from a buddy frame."""
         try:
@@ -1339,159 +863,7 @@ class Server:
             self._dispatcher.submit(slot.scheduler.execute_fast, method, args_bytes, access, future)
             result = await future
         except Exception as exc:
-            return self._wrap_error(exc)
+            return wrap_error(exc)
 
-        return self._unpack_icrm_result(result)
+        return unpack_icrm_result(result)
 
-    @staticmethod
-    def _unpack_icrm_result(result: Any) -> tuple[bytes, bytes]:
-        """Unpack ICRM '<-' result into ``(result_bytes, error_bytes)``."""
-        if isinstance(result, tuple):
-            err_part = result[0] if result[0] else b''
-            res_part = result[1] if len(result) > 1 and result[1] else b''
-            if isinstance(err_part, memoryview):
-                err_part = bytes(err_part)
-            if isinstance(res_part, memoryview):
-                res_part = bytes(res_part)
-            return res_part, err_part
-        if result is None:
-            return b'', b''
-        if isinstance(result, memoryview):
-            return bytes(result), b''
-        return result, b''
-
-    @staticmethod
-    def _wrap_error(exc: Exception) -> tuple[bytes, bytes]:
-        if isinstance(exc, error.CCBaseError):
-            try:
-                return b'', exc.serialize()
-            except Exception:
-                pass
-        try:
-            return b'', error.CRMExecuteFunction(str(exc)).serialize()
-        except Exception:
-            return b'', str(exc).encode('utf-8')
-
-    # ------------------------------------------------------------------
-    # Reply — control-plane ( status + pure payload)
-    # ------------------------------------------------------------------
-
-    async def _send_reply(
-        self,
-        conn: _Connection,
-        request_id: int,
-        result_bytes: bytes,
-        err_bytes: bytes,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        if err_bytes:
-            frame = encode_error_reply_frame(request_id, err_bytes)
-            writer.write(frame)
-            await writer.drain()
-            return
-
-        data_size = len(result_bytes)
-
-        # Chunked reply for large results.
-        chunk_threshold = int(self._config.pool_segment_size * _CHUNK_THRESHOLD_RATIO)
-        if data_size > chunk_threshold and conn.chunked_capable:
-            await self._send_chunked_reply(conn, request_id, result_bytes, writer)
-            return
-
-        if data_size > self._config.shm_threshold and conn.buddy_pool is not None:
-            try:
-                alloc = conn.buddy_pool.alloc(data_size)
-                if alloc.is_dedicated:
-                    conn.buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, data_size, True,
-                    )
-                    raise MemoryError('dedicated segment, fall back to inline')
-
-                seg_mv = conn.seg_views[alloc.seg_idx]
-                if alloc.offset + data_size > len(seg_mv):
-                    conn.buddy_pool.free_at(
-                        alloc.seg_idx, alloc.offset, data_size, alloc.is_dedicated,
-                    )
-                    raise MemoryError('reply offset OOB, fall back to inline')
-                seg_mv[alloc.offset : alloc.offset + data_size] = result_bytes
-                frame = encode_buddy_reply_frame(
-                    request_id, alloc.seg_idx, alloc.offset,
-                    data_size, alloc.is_dedicated,
-                )
-                writer.write(frame)
-                if data_size > 65536:
-                    await writer.drain()
-                return
-            except Exception:
-                pass  # Fall through to inline.
-
-        frame = encode_inline_reply_frame(request_id, result_bytes)
-        writer.write(frame)
-        if data_size > 65536:
-            await writer.drain()
-
-    async def _send_chunked_reply(
-        self,
-        conn: _Connection,
-        request_id: int,
-        result_bytes: bytes,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        """Send a large result as multiple chunked reply frames."""
-        import math
-        chunk_size = self._config.pool_segment_size // 2
-        total_size = len(result_bytes)
-        n_chunks = math.ceil(total_size / chunk_size)
-
-        for i in range(n_chunks):
-            start = i * chunk_size
-            end = min(start + chunk_size, total_size)
-            chunk_data = result_bytes[start:end]
-            chunk_len = end - start
-            is_last = (i == n_chunks - 1)
-
-            # Try buddy allocation for each chunk.
-            sent = False
-            if conn.buddy_pool is not None and chunk_len > self._config.shm_threshold:
-                try:
-                    alloc = conn.buddy_pool.alloc(chunk_len)
-                    if alloc.is_dedicated:
-                        conn.buddy_pool.free_at(
-                            alloc.seg_idx, alloc.offset, chunk_len, True,
-                        )
-                        raise MemoryError('dedicated')
-                    seg_mv = conn.seg_views[alloc.seg_idx]
-                    seg_mv[alloc.offset:alloc.offset + chunk_len] = chunk_data
-                    frame = encode_buddy_chunked_reply_frame(
-                        request_id, alloc.seg_idx, alloc.offset,
-                        chunk_len, alloc.is_dedicated, i, n_chunks,
-                    )
-                    writer.write(frame)
-                    sent = True
-                except Exception:
-                    pass  # Fall through to inline.
-
-            if not sent:
-                if chunk_len > self._config.max_frame_size:
-                    logger.error(
-                        'Conn %d: chunk %d/%d size %d exceeds max_frame_size %d '
-                        'and buddy alloc failed — aborting chunked reply',
-                        conn.conn_id, i, n_chunks, chunk_len,
-                        self._config.max_frame_size,
-                    )
-                    writer.write(encode_error_reply_frame(
-                        request_id,
-                        b'Chunked reply failed: chunk exceeds inline limit',
-                    ))
-                    await writer.drain()
-                    return
-                frame = encode_inline_chunked_reply_frame(
-                    request_id, i, n_chunks, chunk_data,
-                )
-                writer.write(frame)
-
-            # Batch drain: flush every 4 chunks or on the final chunk to
-            # avoid per-chunk event-loop yields while still bounding the
-            # kernel socket buffer usage.
-            if is_last or (i + 1) % 4 == 0:
-                await writer.drain()

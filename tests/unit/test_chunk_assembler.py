@@ -17,7 +17,7 @@ import pytest
 # Import private assembler classes from transport internals
 # ---------------------------------------------------------------------------
 
-from c_two.transport.server.core import _ChunkAssembler
+from c_two.transport.server.chunk import ChunkAssembler as _ChunkAssembler
 from c_two.transport.client.core import _ReplyChunkAssembler
 
 
