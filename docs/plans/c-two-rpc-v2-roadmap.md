@@ -1,7 +1,7 @@
-# C-Two RPC v2 后续计划
+# C-Two 后续计划
 
-> Date: 2026-03-28
-> 基于: `doc/log/sota.md`（SOTA 设计文档）+ 当前代码库实现状态（v0.2.7+, branch `autoresearch/python-qps-mar27`）
+> Date: 2026-03-28 | Updated: 2026-03-29
+> 基于: `doc/log/sota.md`（SOTA 设计文档）+ 当前代码库实现状态
 > 目的: 系统梳理 SOTA 设计目标与已有实现之间的差距，规划后续工作优先级
 
 ---
@@ -12,140 +12,145 @@
 
 | SOTA 设计点 | 实现位置 | 状态 |
 |---|---|---|
-| 进程级注册器 `cc.register()` / `cc.connect()` / `cc.unregister()` | `rpc_v2/registry.py` | ✓ 完整实现 |
-| 隐式 IPC-v2 服务启动（register 时后台线程启动 ServerV2） | `registry.py:register()` → `ServerV2.start()` | ✓ |
+| 进程级注册器 `cc.register()` / `cc.connect()` / `cc.unregister()` | `transport/registry.py` | ✓ 完整实现 |
+| 隐式 IPC 服务启动（register 时后台线程启动 Server） | `registry.py:register()` → `Server.start()` | ✓ |
 | 线程优惠（同进程直接返回 CRM 实例，零序列化） | `registry.py:connect()` → `ICRMProxy.thread_local()` | ✓ |
-| 多 CRM 单 Server（单端口多路复用） | `server.py:ServerV2` 多 `CRMSlot` | ✓ — 满足 sota.md §4.1 |
-| Wire v2 控制面/数据面分离 | `wire.py` + `protocol.py` | ✓ |
-| Handshake v5 能力协商 + 方法索引 | `protocol.py:HandshakeV5` | ✓ |
+| 多 CRM 单 Server（单端口多路复用） | `server/core.py:Server` 多 `CRMSlot` | ✓ — 满足 sota.md §4.1 |
+| Wire 控制面/数据面分离 | `wire.py` + `protocol.py` | ✓ |
+| Handshake 能力协商 + 方法索引 | `protocol.py:Handshake` | ✓ |
 | Buddy Pool SHM 零系统调用分配 | `c2-buddy` (Rust crate) | ✓ |
-| SharedClient（N 消费者 → 1 UDS + 1 Pool） | `client.py:SharedClient` | ✓ |
+| SharedClient（N 消费者 → 1 UDS + 1 Pool） | `client/core.py:SharedClient` | ✓ |
 | 统一代理对象（thread / ipc / http 三模式） | `proxy.py:ICRMProxy` | ✓ — 满足 sota.md §4.2 |
-| HTTP relay（Python + Rust） | `relay.py:RelayV2` + `c2-relay` (Rust crate) | ✓ |
-| HTTP client + 跨节点访问 | `http_client.py:HttpClient` | ✓ |
+| HTTP relay（Python + Rust） | `relay/core.py:Relay` + `c2-relay` (Rust crate) | ✓ |
+| HTTP client + 跨节点访问 | `client/http.py:HttpClient` | ✓ |
 | Rust SDK 基础（c2-wire, c2-ipc, c2-buddy, c2-relay, c2-ffi） | `src/c_two/_native/` workspace | ✓ |
-| @cc.read / @cc.write 并发控制 | `scheduler.py:Scheduler` + `_WriterPriorityReadWriteLock` | ✓ |
-| Per-connection write barrier（同连接因果序保证） | `server.py:_handle_client` + barrier 机制 | ✓ (2026-03-28) |
-| dispatch_cache 代际失效 | `server.py:_slots_generation` | ✓ (2026-03-28) |
-| 连接级 in-flight 计数器（writer.close 安全性） | `server.py:_Connection.flight_inc/dec/wait_idle` | ✓ (2026-03-28) |
-| 分块流式传输（Chunked Streaming Transfer） | `wire.py` + `client.py` + `server.py` | ✓ (2026-03-28) |
+| @cc.read / @cc.write 并发控制 | `server/scheduler.py:Scheduler` + `_WriterPriorityReadWriteLock` | ✓ |
+| Per-connection write barrier（同连接因果序保证） | `server/core.py:_handle_client` + barrier 机制 | ✓ (2026-03-28) |
+| dispatch_cache 代际失效 | `server/core.py:_slots_generation` | ✓ (2026-03-28) |
+| 连接级 in-flight 计数器（writer.close 安全性） | `server/connection.py:Connection.flight_inc/dec/wait_idle` | ✓ (2026-03-28) |
+| 分块流式传输（Chunked Streaming Transfer） | `wire.py` + `client/core.py` + `server/core.py` | ✓ (2026-03-28) |
+| 线程优惠的并发控制 | `ICRMProxy.thread_local()` 接收 `Scheduler` + `access_map` | ✓ (2026-03-29) |
+| @cc.shutdown 声明式生命周期回调 | `crm/meta.py` + `server/core.py` + `registry.py` | ✓ (2026-03-29) |
+
+### 仓库重构 (2026-03-29) ✓
+
+| 重构项 | 说明 |
+|---|---|
+| 传输层统一 | `rpc/` + `rpc_v2/` → `transport/`，消除双模块冗余 |
+| Wire 协议统一 | 去除 Wire v1，仅保留控制面/数据面分离的编码格式 |
+| 版本标签归一 | `HandshakeV5` → `Handshake`, `ipc-v3://` → `ipc://`, 全面去版本化 |
+| Server 解耦 | 1497 行 core.py → 7 模块（core, connection, chunk, reply, dispatcher, handshake, scheduler） |
+| 配置暴露 | 11 项硬编码常量移入 `IPCConfig`，3 项僵尸常量删除 |
 
 ### 部分实现 ⚠
 
 | 设计点 | 差距 |
 |---|---|
-| 线程优惠的并发控制 | `ICRMProxy.thread_local()` 返回的是**裸 CRM 实例**，不经过 `Scheduler` 的 RW 锁。若多个线程通过 `cc.connect()` 获取同一 CRM 并行调用，read/write 隔离**不生效** |
+| SHM Pool 动态扩容 | Rust buddy 支持多 segment (max_segments=8)，`CTRL_BUDDY_ANNOUNCE` 协议已定义。但 Python 层 **Client 硬编码 1 segment**，Server 不发送扩容通告 |
 | Rust relay 集成 | Rust relay (`c2-relay`) 代码完整，但未嵌入 Python 发布流程（无 wheel 分发、无 `cc.router.start()` 封装） |
 
 ### 未实现 ✗
 
 | 设计点 | sota.md 章节 | 说明 |
 |---|---|---|
-| `shutdown_callback` 语义 | §4.4 | `cc.register()` 无 callback 参数，shutdown 时的清理行为未定义 |
+| 心跳 + 进程存活检测 | 附录 A.3 | `IPCConfig` 有 `heartbeat_interval/timeout` 字段但为死代码，Server 仅被动回复 PING，无主动探测 |
 | 版本兼容性检查 | §1.2 | `cc.connect()` 不接受版本参数，ICRM 的 `version` 字段未用于选择 |
 | 异步接口 | §4.3 | 无 `cc.connect_async()` 或 `async with cc.connect()` |
-| SHM Pool 动态扩容 | 附录 A.2 | Pool 满时退化到 per-request SHM（5 个系统调用），无 segment chain |
-| 心跳 + 进程存活检测 | 附录 A.3 | GC 仍依赖 120s 超时扫描，无 heartbeat / `os.kill(pid, 0)` |
 | 自适应分代 GC | 附录 A.3 | per-request SHM 与 pool SHM 使用相同超时 |
 | 跨语言 CRM Client（Rust/C++） | 附录 Rust §代码组织 | `c2-wire` + `c2-ipc` 已存在，但无 Rust 端的 ICRM 代码生成 |
 
 ---
 
-## 1. P0 — 必须修复的设计缺陷
+## 1. P0 — 必须修复的设计缺陷 ✅ 全部完成
 
-### 1.1 线程优惠的并发控制缺失
+### 1.1 线程优惠的并发控制缺失 — ✅ 已完成 (2026-03-29)
 
-**问题**: `cc.connect()` 对同进程 CRM 返回 `ICRMProxy.thread_local(crm_instance)`。调用方直接操作 CRM 实例，不经过 `Scheduler`。如果多个线程并行调用同一 CRM 的 `@cc.write` 和 `@cc.read` 方法，读写隔离不生效。
+`ICRMProxy.thread_local()` 构造时接收 `Scheduler` + `access_map`，`call_direct()` 内部经过 `scheduler._execution_guard(access)` 保护。线程优惠保留零序列化优势，增加 RW 锁开销（EXCLUSIVE 模式 ~100ns/call）。
 
-**严重性**: 这是 SOTA 设计中明确要求但未实现的核心保证——"仍需遵守读写并发规则"。
+### 1.2 @cc.shutdown 装饰器 — ✅ 已完成 (2026-03-29)
 
-**方案**:
-
-`ICRMProxy.thread_local()` 模式下，调用链应为：
-
-```
-proxy.method(args) → Scheduler.execute_fast(method, args, access) → method(args)
-```
-
-而非当前的：
-
-```
-proxy.method(args) → crm.method(args)   # 绕过 Scheduler
-```
-
-实现路径：
-1. `ICRMProxy.thread_local()` 构造时接收 `Scheduler` 引用
-2. `call_direct()` 内部包装为 `scheduler.execute_fast(method, args, access)`
-3. 线程优惠保留零序列化优势，但增加了锁开销（EXCLUSIVE 模式下约 ~100ns/call）
-
-**改动范围**: `proxy.py` + `registry.py`（传递 Scheduler）
-
----
-
-### 1.2 @cc.shutdown 装饰器 — 声明式 CRM 生命周期回调
-
-**问题**: sota.md §4.4 要求 shutdown callback 支持，但当前 API 无此能力。当 CRM 被 unregister 或进程退出时，CRM 无法执行清理逻辑（如关闭文件句柄、flush 缓冲区）。
-
-**方案**: 采用装饰器模式（与 `@cc.read` / `@cc.write` 一致），而非 `cc.register()` 的 callback 参数：
-
-```python
-@cc.icrm
-class IGrid:
-    @cc.read
-    def get_grid(self, level, ids): ...
-
-    @cc.write
-    def update_grid(self, data): ...
-
-    @cc.shutdown
-    def cleanup(self):
-        """CRM 被 unregister 或进程退出时自动调用。"""
-        self.flush_cache()
-        self.close_handles()
-```
-
-**设计优势**:
-- 声明式：shutdown 行为定义在 ICRM 接口上，代码自文档化
-- 模式统一：`@cc.read` / `@cc.write` / `@cc.shutdown` 构成完整的 CRM 生命周期声明
-- 自动发现：`register_crm()` 扫描 ICRM class 即可，调用方无需显式传参
-- `@cc.shutdown` 标记的方法**不**进入 dispatch_table（不可被 RPC 调用），仅在生命周期事件中本地执行
-
-**触发场景**:
-- `cc.unregister(name)` → 在 CRM 实例上调用 `@cc.shutdown` 方法
-- `cc.shutdown()` (atexit) → 对所有注册 CRM 调用
-- 远程 SHUTDOWN_CLIENT 信号到达 → 调用
-
-**约束**: 每个 ICRM 最多一个 `@cc.shutdown` 方法（多个则注册时报错）
-
-**改动范围**:
-- `crm/meta.py` — 新增 `shutdown()` 装饰器，设 `_cc_shutdown = True` 属性
-- `server.py:CRMSlot` — `build_dispatch_table()` 时扫描并记录 shutdown 方法
-- `registry.py` — `unregister()` / `shutdown()` 时调用
+声明式 CRM 生命周期回调。`@cc.shutdown` 标记的方法在 `cc.unregister()` / `cc.shutdown()` / atexit 时自动调用。不进入 dispatch_table（不可被 RPC 调用）。
 
 ---
 
 ## 2. P1 — 性能与可靠性增强
 
-### 2.1 SHM Pool 动态扩容（Segment Chain）— 已部分替代
+### 2.1 SHM Pool 动态扩容（Segment Chain）— 优先级降低
 
-**原始问题**: Pool 满时退化到 per-request SHM（5 个系统调用/request），这在大 payload 场景下造成显著性能下降。sota.md 附录 A.2 建议动态扩容替代磁盘溢出。
+**原始问题**: Pool 满时退化到 per-request SHM（5 个系统调用/request），这在大 payload 场景下造成显著性能下降。
 
-**当前状态**: 分块流式传输（Chunked Streaming Transfer）已实现，将超过 `pool_segment_size * 0.9` 的大 payload 拆分为 `segment_size // 2` 大小的独立帧，每帧独立 buddy alloc → SHM write → send → free。理论上限 65535 chunks × 128 MB = 8 TB。此方案消除了单次 RPC 256 MB 限制这一最大痛点。
+**当前状态**: 分块流式传输（Chunked Streaming Transfer）已消除最大痛点（256 MB 单次 RPC 限制）。
 
-**剩余价值**: Segment Chain 仍可减少 per-request SHM 退化频率（多段 pool 提高容量），但优先级降低。如有需求可在 P2 阶段实施。
+**实现进度 (~20%)**:
+- ✅ Rust buddy allocator 支持多 segment（`max_segments=8`），含 3 层 fallback（现有 → 扩容 → 专用）
+- ✅ `CTRL_BUDDY_ANNOUNCE` 协议编解码已定义（`ipc/buddy.py`）
+- ❌ Python Client 硬编码 `max_segments=1`（`client/core.py:286`），不支持接收新 segment
+- ❌ Server 不发送扩容通告，镜像 Client 的 segment 数量
+- ❌ Client `_recv_loop` 不处理 `CTRL_BUDDY_ANNOUNCE`
 
-**改动范围**: `c2-buddy` (Rust) + `c2-ffi` (PyO3 绑定) + `client.py` / `server.py`（握手时协商 segment 列表）
+**剩余价值**: 减少 per-request SHM 退化频率。如有需求可在 P2 阶段实施。
 
-### 2.2 心跳检测 + 进程存活检测
+### 2.2 心跳检测 + 进程存活检测 ← **下一实施目标**
 
-**问题**: 客户端被 SIGKILL 时 UDS socket 未关闭，Pool SHM 成为孤儿。当前依赖 120s 超时扫描，延迟过长。
+**问题**: 客户端被 SIGKILL 时 UDS socket 未关闭，Pool SHM 成为孤儿。Server 无法检测死亡连接。
 
-**方案**:
-1. **Server 端心跳**: 在 `_handle_client` 中设置 idle timeout（默认 30s）。超时无帧到达则发送 PING，PING 无响应则视为断连。
-2. **Owner PID 检测**: SHM segment 名中嵌入创建者 PID。GC 扫描时 `os.kill(pid, 0)` 检测进程存活。
-3. **Server 端 idle 超时**: 连接无请求超过 idle timeout → 主动 close + cleanup。
+**当前状态 (~5%)**:
+- ✅ `IPCConfig.heartbeat_interval` (15s) 和 `heartbeat_timeout` (30s) 字段已定义（**但为死代码**）
+- ✅ PING/PONG 消息类型定义完备（`msg_type.py`），Server 被动回复 PING
+- ✅ Rust buddy 有 PID 提取 + `is_process_alive()` 逻辑（仅 Linux）
+- ❌ Server 不主动发送 PING（无心跳探测）
+- ❌ 无连接空闲超时检测
+- ❌ 无 SHM 段自动清理（需手动调用 `cleanup_stale_shm()`）
 
-**改动范围**: `server.py`（心跳逻辑）+ `c2-buddy`（PID 嵌入）+ GC 模块（PID 检测）
+**实施方案**:
+
+#### Phase 1: Server 端心跳探测
+
+在 `server/core.py:_handle_client` 的 asyncio 事件循环中加入定时心跳：
+
+```
+连接建立 → 启动 heartbeat timer
+  ↓
+每 heartbeat_interval 秒检查:
+  if 距上次收到帧 > heartbeat_interval:
+    发送 PING
+    设置 pong_deadline = now + heartbeat_timeout
+  ↓
+收到任意帧 → 重置 last_activity
+收到 PONG → 重置 pong_deadline
+  ↓
+if now > pong_deadline:
+  判定连接死亡 → close + cleanup
+```
+
+**实现路径**:
+1. `Connection` dataclass 增加 `last_activity: float` 字段
+2. `_handle_client` 每次收帧时更新 `conn.last_activity = time.monotonic()`
+3. 新增 `_heartbeat_task(conn, writer)` asyncio.Task，周期 = `config.heartbeat_interval`
+4. 心跳任务检测 idle → 发 PING → 等 PONG → 超时则 cancel reader task
+5. `heartbeat_interval <= 0` 时跳过（已有 IPCConfig 验证）
+
+**改动范围**: `server/core.py`（~40 行）+ `server/connection.py`（+2 字段）
+
+#### Phase 2: 连接空闲清理
+
+当 Server 检测到心跳超时或 read EOF：
+1. Cancel 该连接所有 in-flight 调用（`conn.wait_idle(timeout=5)`）
+2. 释放该连接持有的 buddy pool segments
+3. 关闭 UDS socket
+4. 记录 warning 日志
+
+**已有基础**: `conn.wait_idle()` + `flight_inc/dec` 已实现，仅需在心跳超时时触发。
+
+#### Phase 3: SHM 段 PID 回收（可选）
+
+1. SHM segment 名已包含 PID 信息（`cc{pid:08x}{random}_bXXXX` 格式）
+2. Rust 侧 `cleanup_stale_segments()` 已实现 PID 提取 + 存活检测（Linux）
+3. Python 侧需要：
+   - 在 Server shutdown 时调用 `cleanup_stale_shm()`
+   - macOS 需要 fallback 方案（`/dev/shm` 不存在，需要 `sysctl kern.ipc.shm` 或 named segment 枚举）
+
+**改动范围**: `server/core.py`（shutdown 时调用）+ 可选：`buddy/__init__.py`（macOS 支持）
 
 ### 2.3 Rust Relay 发布集成
 
@@ -272,35 +277,38 @@ SOTA 设计未覆盖的场景：
 
 ---
 
-## 5. 实施时间线建议
+## 5. 实施时间线
 
 ```
 P0 — 设计缺陷修复 ✅
-├─ 1.1 线程优惠并发控制      ✅ 已完成
-└─ 1.2 shutdown_callback     ✅ 已完成
+├─ 1.1 线程优惠并发控制         ✅ 已完成 (2026-03-29)
+└─ 1.2 @cc.shutdown 回调        ✅ 已完成 (2026-03-29)
 
 P0.5 — 大 payload 支持 ✅
-└─ 分块流式传输 (Plan A)     ✅ 已完成 (2026-03-28)
-   ├─ 协议层: FLAG_CHUNKED / FLAG_CHUNK_LAST / CAP_CHUNKED
-   ├─ 客户端: _call_chunked + _ReplyChunkAssembler
-   ├─ 服务端: _ChunkAssembler + _send_chunked_v2_reply
-   └─ 基准: 256 MB chunked echo ≈ 1.9 GB/s
+└─ 分块流式传输 (Plan A)        ✅ 已完成 (2026-03-28)
 
-P1 — 性能与可靠性增强（v0.3.0 里程碑）
-├─ 2.1 SHM Pool 动态扩容     优先级降低（分块传输已消除最大痛点）
-├─ 2.2 心跳 + PID 存活检测    预计 1-2d
-└─ 2.3 Rust Relay 发布集成    预计 2-3d (CI/CD)
+仓库重构 ✅ (2026-03-29)
+├─ rpc/ + rpc_v2/ → transport/  ✅ 消除双模块
+├─ Wire v1 移除                 ✅ 仅保留统一编码
+├─ 版本标签归一                 ✅ Handshake/ipc:// 去版本化
+├─ Server core 解耦             ✅ 7 模块
+└─ 配置暴露                     ✅ IPCConfig 11 项新字段
+
+P1 — 性能与可靠性增强
+├─ 2.1 SHM Pool 动态扩容        优先级降低（Rust 侧已就绪，Python 层待实现）
+├─ 2.2 心跳 + PID 存活检测      ← 下一目标（Phase 1-2 即可投产）
+└─ 2.3 Rust Relay 发布集成      CI/CD 工程
 
 P2 — 功能完善（v0.4.0 里程碑）
-├─ 3.0 磁盘溢写兜底 (Plan C)  预计 1-2d
-├─ 3.1 版本兼容性检查         预计 1d
-├─ 3.2 异步接口               预计 2-3d
-└─ 3.3 自适应分代 GC          预计 1-2d
+├─ 3.0 磁盘溢写兜底 (Plan C)
+├─ 3.1 版本兼容性检查
+├─ 3.2 异步接口
+└─ 3.3 自适应分代 GC
 
 P3 — 长期演进（v1.0 方向）
-├─ 4.1 跨语言 CRM Client      评估阶段
-├─ 4.2 Streaming RPC          设计阶段
-└─ 4.3 服务发现               需求驱动
+├─ 4.1 跨语言 CRM Client
+├─ 4.2 Streaming RPC
+└─ 4.3 服务发现
 ```
 
 ---
@@ -311,12 +319,12 @@ P3 — 长期演进（v1.0 方向）
 
 | 优化成果 | 对后续计划的影响 |
 |---|---|
-| `_FastDispatcher` + `SimpleQueue` 替代 `ThreadPoolExecutor` | §1.1 线程优惠并发控制可复用 `execute_fast` 路径 |
+| `_FastDispatcher` + `SimpleQueue` 替代 `ThreadPoolExecutor` | §1.1 ✅ 线程优惠并发控制已复用 `execute_fast` 路径 |
 | Per-connection write barrier | §3.2 异步接口需要兼容 barrier 机制 |
 | dispatch_cache + `_slots_generation` | §3.1 版本兼容性检查可复用 generation 失效机制 |
 | Rust relay 35K+ QPS | §2.3 集成后即可作为生产级 HTTP 路由层 |
 | flight_inc/dec/wait_idle | §2.2 心跳检测可复用 flight counter 判断连接活跃度 |
-| Chunked Streaming Transfer | 消除 256 MB 单次 RPC 限制，§2.1 SHM Pool 扩容优先级降低 |
+| Chunked Streaming Transfer | ✅ 消除 256 MB 单次 RPC 限制，§2.1 SHM Pool 扩容优先级降低 |
 
 ### 优化报告中建议但未覆盖的后续方向
 
