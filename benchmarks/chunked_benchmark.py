@@ -19,7 +19,7 @@ import c_two as cc
 from c_two.transport.ipc.frame import IPCConfig
 from c_two.transport.client import SharedClient
 from c_two.transport.proxy import ICRMProxy
-from c_two.transport.server import ServerV2
+from c_two.transport.server import Server
 
 
 # ---------------------------------------------------------------------------
@@ -103,12 +103,12 @@ def main() -> None:
     cfg = IPCConfig()
 
     addr = f'ipc-v3://bench_chunk_{os.getpid()}'
-    server = ServerV2(bind_address=addr, ipc_config=cfg)
+    server = Server(bind_address=addr, ipc_config=cfg)
     server.register_crm(IBenchChunk, BenchChunk(), name='bench')
     server.start()
     _wait_for_server(addr)
 
-    client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+    client = SharedClient(addr, ipc_config=cfg)
     client.connect()
 
     proxy = ICRMProxy.ipc(client, 'bench')

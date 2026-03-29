@@ -1,27 +1,18 @@
-"""Wire v2 — control-plane / data-plane separated frame codec.
+"""Wire codec — control-plane / data-plane frame separation.
 
-In wire v1 (``rpc.util.wire``), the SHM buddy block contains the full wire
-message: ``[type][method_len][method_name][payload]``.  Control metadata
-(method name, error info) is mixed with data in the SHM block.
-
-In wire v2, control and data are cleanly separated:
+Control and data planes are cleanly separated:
 
 - **Control payload** travels in the UDS inline frame (small, always inline).
 - **Data payload** sits at offset 0 in the SHM buddy block — pure serialized
   bytes, no headers.
 
-This separation eliminates:
-- Extra copies when concatenating method name + payload into a single buffer.
-- 5-byte ``CRM_REPLY`` header overhead in every SHM block.
-- Error bytes polluting SHM (errors are always inline in wire v2).
-
-V2 Call Control (appended to buddy pointer, or prepended to inline data)::
+Call Control (appended to buddy pointer, or prepended to inline data)::
 
     [1B name_len][route_name UTF-8][2B method_idx LE]
 
     Total: 3 + name_len bytes.  name_len=0 → use connection default route.
 
-V2 Reply Control::
+Reply Control::
 
     [1B status]
     if status == STATUS_SUCCESS (0x00):
@@ -29,9 +20,9 @@ V2 Reply Control::
     if status == STATUS_ERROR (0x01):
         [4B error_len LE][error_bytes]
 
-V2 frame identification (per frame header flags):
-- ``FLAG_CALL_V2`` (bit 7): request frame carries v2 call control.
-- ``FLAG_REPLY_V2`` (bit 8): response frame carries v2 reply control.
+Frame identification (per frame header flags):
+- ``FLAG_CALL`` (bit 7): request frame carries call control.
+- ``FLAG_REPLY`` (bit 8): response frame carries reply control.
 """
 from __future__ import annotations
 
@@ -48,8 +39,8 @@ from .ipc.buddy import (
     encode_buddy_payload,
 )
 from .protocol import (
-    FLAG_CALL_V2,
-    FLAG_REPLY_V2,
+    FLAG_CALL,
+    FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
     STATUS_SUCCESS,
@@ -80,7 +71,7 @@ def payload_total_size(payload) -> int:
     return len(payload)
 
 # ---------------------------------------------------------------------------
-# V2 Call Control
+# Call Control
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +87,7 @@ del _i, _b
 
 
 def encode_call_control(name: str, method_idx: int) -> bytes:
-    """Encode v2 call control payload.
+    """Encode call control payload.
 
     Format: ``[1B name_len][route_name UTF-8][2B method_idx LE]``
     """
@@ -118,7 +109,7 @@ def encode_call_control(name: str, method_idx: int) -> bytes:
 def decode_call_control(
     data: bytes | memoryview, offset: int = 0,
 ) -> tuple[str, int, int]:
-    """Decode v2 call control payload.
+    """Decode call control payload.
 
     Returns ``(route_name, method_idx, bytes_consumed)``.
 
@@ -146,12 +137,12 @@ def decode_call_control(
 
 
 # ---------------------------------------------------------------------------
-# V2 Reply Control
+# Reply Control
 # ---------------------------------------------------------------------------
 
 
 def encode_reply_control(status: int, error_data: bytes | None = None) -> bytes:
-    """Encode v2 reply control payload.
+    """Encode reply control payload.
 
     Format::
 
@@ -170,7 +161,7 @@ def encode_reply_control(status: int, error_data: bytes | None = None) -> bytes:
 def decode_reply_control(
     data: bytes | memoryview, offset: int = 0,
 ) -> tuple[int, bytes | None, int]:
-    """Decode v2 reply control payload.
+    """Decode reply control payload.
 
     Returns ``(status, error_data_or_none, bytes_consumed)``.
 
@@ -196,11 +187,11 @@ def decode_reply_control(
 
 
 # ---------------------------------------------------------------------------
-# V2 Frame Builders — Call
+# Frame Builders — Call
 # ---------------------------------------------------------------------------
 
 
-def encode_v2_buddy_call_frame(
+def encode_buddy_call_frame(
     request_id: int,
     seg_idx: int,
     offset: int,
@@ -209,61 +200,61 @@ def encode_v2_buddy_call_frame(
     name: str,
     method_idx: int,
 ) -> bytes:
-    """Build a complete v2 buddy call frame.
+    """Build a complete buddy call frame.
 
     Frame layout::
 
-        [16B header (flags=FLAG_BUDDY|FLAG_CALL_V2)]
+        [16B header (flags=FLAG_BUDDY|FLAG_CALL)]
         [11B buddy_payload]
-        [v2_call_control]
+        [call_control]
     """
     buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
     ctrl = encode_call_control(name, method_idx)
     payload = buddy + ctrl
-    flags = FLAG_BUDDY | FLAG_CALL_V2
+    flags = FLAG_BUDDY | FLAG_CALL
     return encode_frame(request_id, flags, payload)
 
 
-def encode_v2_inline_call_frame(
+def encode_inline_call_frame(
     request_id: int,
     name: str,
     method_idx: int,
     data: bytes | memoryview,
 ) -> bytes:
-    """Build a complete v2 inline call frame (small payloads, no buddy).
+    """Build a complete inline call frame (small payloads, no buddy).
 
     Frame layout::
 
-        [16B header (flags=FLAG_CALL_V2)]
-        [v2_call_control]
+        [16B header (flags=FLAG_CALL)]
+        [call_control]
         [inline_data]
     """
     ctrl = encode_call_control(name, method_idx)
     payload = ctrl + bytes(data) if data else ctrl
-    return encode_frame(request_id, FLAG_CALL_V2, payload)
+    return encode_frame(request_id, FLAG_CALL, payload)
 
 
 # ---------------------------------------------------------------------------
-# V2 Frame Builders — Reply
+# Frame Builders — Reply
 # ---------------------------------------------------------------------------
 
 
-_V2_BUDDY_REPLY_FLAGS = FLAG_RESPONSE | FLAG_BUDDY | FLAG_REPLY_V2
-_V2_INLINE_REPLY_FLAGS = FLAG_RESPONSE | FLAG_REPLY_V2
+_BUDDY_REPLY_FLAGS = FLAG_RESPONSE | FLAG_BUDDY | FLAG_REPLY
+_INLINE_REPLY_FLAGS = FLAG_RESPONSE | FLAG_REPLY
 _BUDDY_REPLY_PAYLOAD_LEN = BUDDY_PAYLOAD_STRUCT.size + 1  # 11B buddy + 1B status
 
 
-def encode_v2_buddy_reply_frame(
+def encode_buddy_reply_frame(
     request_id: int,
     seg_idx: int,
     offset: int,
     data_size: int,
     is_dedicated: bool,
 ) -> bytearray:
-    """Build a v2 buddy success reply frame (single allocation, no copy)."""
+    """Build a buddy success reply frame (single allocation, no copy)."""
     total_len = 12 + _BUDDY_REPLY_PAYLOAD_LEN
     buf = bytearray(4 + total_len)
-    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _V2_BUDDY_REPLY_FLAGS)
+    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _BUDDY_REPLY_FLAGS)
     BUDDY_PAYLOAD_STRUCT.pack_into(
         buf, 16, seg_idx, offset, data_size, 1 if is_dedicated else 0,
     )
@@ -271,30 +262,30 @@ def encode_v2_buddy_reply_frame(
     return buf
 
 
-def encode_v2_inline_reply_frame(
+def encode_inline_reply_frame(
     request_id: int,
     result_data: bytes | memoryview | None = None,
 ) -> bytearray:
-    """Build a v2 inline success reply frame (single allocation, no copy)."""
+    """Build an inline success reply frame (single allocation, no copy)."""
     data_len = len(result_data) if result_data else 0
     total_len = 12 + 1 + data_len
     buf = bytearray(4 + total_len)
-    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _V2_INLINE_REPLY_FLAGS)
+    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _INLINE_REPLY_FLAGS)
     buf[16] = STATUS_SUCCESS
     if data_len > 0:
         buf[17:17 + data_len] = result_data
     return buf
 
 
-def encode_v2_error_reply_frame(
+def encode_error_reply_frame(
     request_id: int,
     error_data: bytes,
 ) -> bytearray:
-    """Build a v2 error reply frame (single allocation, no copy)."""
+    """Build an error reply frame (single allocation, no copy)."""
     err_len = len(error_data)
     total_len = 12 + 1 + 4 + err_len
     buf = bytearray(4 + total_len)
-    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _V2_INLINE_REPLY_FLAGS)
+    FRAME_STRUCT.pack_into(buf, 0, total_len, request_id, _INLINE_REPLY_FLAGS)
     buf[16] = STATUS_ERROR
     _U32.pack_into(buf, 17, err_len)
     buf[21:21 + err_len] = error_data
@@ -331,11 +322,11 @@ def decode_chunk_header(
 
 
 # ---------------------------------------------------------------------------
-# V2 Chunked Frame Builders — Call
+# Chunked Frame Builders — Call
 # ---------------------------------------------------------------------------
 
 
-def encode_v2_buddy_chunked_call_frame(
+def encode_buddy_chunked_call_frame(
     request_id: int,
     seg_idx: int,
     offset: int,
@@ -346,20 +337,20 @@ def encode_v2_buddy_chunked_call_frame(
     name: str = '',
     method_idx: int = 0,
 ) -> bytes:
-    """Build a v2 buddy chunked call frame.
+    """Build a buddy chunked call frame.
 
     Frame layout::
 
-        [16B header (flags=FLAG_BUDDY|FLAG_CALL_V2|FLAG_CHUNKED[|FLAG_CHUNK_LAST])]
+        [16B header (flags=FLAG_BUDDY|FLAG_CALL|FLAG_CHUNKED[|FLAG_CHUNK_LAST])]
         [11B buddy_payload]
         [4B chunk_header]
-        [v2_call_control]    ← only when chunk_idx==0
+        [call_control]    ← only when chunk_idx==0
 
     ``name`` and ``method_idx`` are ignored when ``chunk_idx > 0``.
     """
     buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
     chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
-    flags = FLAG_BUDDY | FLAG_CALL_V2 | FLAG_CHUNKED
+    flags = FLAG_BUDDY | FLAG_CALL | FLAG_CHUNKED
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST
     if chunk_idx == 0:
@@ -370,7 +361,7 @@ def encode_v2_buddy_chunked_call_frame(
     return encode_frame(request_id, flags, payload)
 
 
-def encode_v2_inline_chunked_call_frame(
+def encode_inline_chunked_call_frame(
     request_id: int,
     chunk_idx: int,
     total_chunks: int,
@@ -378,19 +369,19 @@ def encode_v2_inline_chunked_call_frame(
     name: str = '',
     method_idx: int = 0,
 ) -> bytes:
-    """Build a v2 inline chunked call frame (no buddy).
+    """Build a inline chunked call frame (no buddy).
 
     Frame layout::
 
-        [16B header (flags=FLAG_CALL_V2|FLAG_CHUNKED[|FLAG_CHUNK_LAST])]
+        [16B header (flags=FLAG_CALL|FLAG_CHUNKED[|FLAG_CHUNK_LAST])]
         [4B chunk_header]
-        [v2_call_control]    ← only when chunk_idx==0
+        [call_control]    ← only when chunk_idx==0
         [inline_data]
 
     ``name`` and ``method_idx`` are ignored when ``chunk_idx > 0``.
     """
     chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
-    flags = FLAG_CALL_V2 | FLAG_CHUNKED
+    flags = FLAG_CALL | FLAG_CHUNKED
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST
     if chunk_idx == 0:
@@ -402,15 +393,15 @@ def encode_v2_inline_chunked_call_frame(
 
 
 # ---------------------------------------------------------------------------
-# V2 Chunked Frame Builders — Reply
+# Chunked Frame Builders — Reply
 # ---------------------------------------------------------------------------
 
 
-_V2_BUDDY_CHUNKED_REPLY_BASE_FLAGS = FLAG_RESPONSE | FLAG_BUDDY | FLAG_REPLY_V2 | FLAG_CHUNKED
-_V2_INLINE_CHUNKED_REPLY_BASE_FLAGS = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_CHUNKED
+_BUDDY_CHUNKED_REPLY_BASE_FLAGS = FLAG_RESPONSE | FLAG_BUDDY | FLAG_REPLY | FLAG_CHUNKED
+_INLINE_CHUNKED_REPLY_BASE_FLAGS = FLAG_RESPONSE | FLAG_REPLY | FLAG_CHUNKED
 
 
-def encode_v2_buddy_chunked_reply_frame(
+def encode_buddy_chunked_reply_frame(
     request_id: int,
     seg_idx: int,
     offset: int,
@@ -419,18 +410,18 @@ def encode_v2_buddy_chunked_reply_frame(
     chunk_idx: int,
     total_chunks: int,
 ) -> bytes:
-    """Build a v2 buddy chunked reply frame.
+    """Build a buddy chunked reply frame.
 
     Frame layout::
 
-        [16B header (flags=RESPONSE|BUDDY|REPLY_V2|CHUNKED[|CHUNK_LAST])]
+        [16B header (flags=RESPONSE|BUDDY|REPLY|CHUNKED[|CHUNK_LAST])]
         [11B buddy_payload]
         [4B chunk_header]
         [1B status]          ← only when chunk_idx==0 (always STATUS_SUCCESS)
     """
     buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
     chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
-    flags = _V2_BUDDY_CHUNKED_REPLY_BASE_FLAGS
+    flags = _BUDDY_CHUNKED_REPLY_BASE_FLAGS
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST
     if chunk_idx == 0:
@@ -440,23 +431,23 @@ def encode_v2_buddy_chunked_reply_frame(
     return encode_frame(request_id, flags, payload)
 
 
-def encode_v2_inline_chunked_reply_frame(
+def encode_inline_chunked_reply_frame(
     request_id: int,
     chunk_idx: int,
     total_chunks: int,
     data: bytes | memoryview,
 ) -> bytes:
-    """Build a v2 inline chunked reply frame.
+    """Build a inline chunked reply frame.
 
     Frame layout::
 
-        [16B header (flags=RESPONSE|REPLY_V2|CHUNKED[|CHUNK_LAST])]
+        [16B header (flags=RESPONSE|REPLY|CHUNKED[|CHUNK_LAST])]
         [4B chunk_header]
         [1B status]          ← only when chunk_idx==0 (always STATUS_SUCCESS)
         [inline_data]
     """
     chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
-    flags = _V2_INLINE_CHUNKED_REPLY_BASE_FLAGS
+    flags = _INLINE_CHUNKED_REPLY_BASE_FLAGS
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST
     if chunk_idx == 0:

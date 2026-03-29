@@ -1,11 +1,11 @@
-"""Transport layer — promoted from rpc_v2/.
+"""Transport layer for C-Two.
 
 Provides the complete transport stack for C-Two:
-- ServerV2: asyncio-based multi-CRM IPC server
+- Server: asyncio-based multi-CRM IPC server
 - SharedClient: concurrent multiplexed IPC client
 - ClientPool: reference-counted client lifecycle
 - ICRMProxy: unified proxy (thread-local / IPC / HTTP)
-- RelayV2: HTTP → IPC bridge (Starlette + uvicorn)
+- Relay: HTTP → IPC bridge (Starlette + uvicorn)
 - Registry: cc.register/connect/close/shutdown SOTA API
 """
 from __future__ import annotations
@@ -13,9 +13,9 @@ from __future__ import annotations
 __all__ = [
     'SharedClient', 'ClientPool', 'ICRMProxy',
     'HttpClient', 'HttpClientPool',
-    'ServerV2', 'CRMSlot',
+    'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
-    'RelayV2', 'UpstreamPool',
+    'Relay', 'UpstreamPool',
     'set_address', 'set_ipc_config', 'register', 'connect', 'close',
     'unregister', 'server_address', 'shutdown', 'serve',
 ]
@@ -26,12 +26,12 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'ICRMProxy':         ('.client.proxy',        'ICRMProxy'),
     'HttpClient':        ('.client.http',         'HttpClient'),
     'HttpClientPool':    ('.client.http',         'HttpClientPool'),
-    'ServerV2':          ('.server.core',         'ServerV2'),
+    'Server':          ('.server.core',         'Server'),
     'CRMSlot':           ('.server.core',         'CRMSlot'),
     'Scheduler':         ('.server.scheduler',    'Scheduler'),
     'ConcurrencyConfig': ('.server.scheduler',    'ConcurrencyConfig'),
     'ConcurrencyMode':   ('.server.scheduler',    'ConcurrencyMode'),
-    'RelayV2':           ('.relay.core',          'RelayV2'),
+    'Relay':           ('.relay.core',          'Relay'),
     'UpstreamPool':      ('.relay.core',          'UpstreamPool'),
     'set_address':       ('.registry',            'set_address'),
     'set_ipc_config':    ('.registry',            'set_ipc_config'),

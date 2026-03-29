@@ -9,7 +9,7 @@ Three concurrency modes:
   methods acquire exclusive access (writer-priority RW lock).
 - **PARALLEL**: no locking — the CRM is assumed fully thread-safe.
 
-Usage with asyncio (ServerV2)::
+Usage with asyncio (Server)::
 
     sched = Scheduler(ConcurrencyConfig(mode='read_parallel'))
     loop = asyncio.get_running_loop()
@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
-# Re-export access decorators so consumers only import from rpc_v2.
+# Re-export access decorators so consumers only import from transport.
 from ...crm.meta import MethodAccess, get_method_access  # noqa: F401
 
 
@@ -151,7 +151,7 @@ class Scheduler:
         if self._executor is None:
             self._executor = ThreadPoolExecutor(
                 max_workers=self._executor_workers,
-                thread_name_prefix='c2v2_worker',
+                thread_name_prefix='c2_worker',
             )
         return self._executor
 

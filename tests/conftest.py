@@ -4,7 +4,7 @@ import threading
 import time
 import c_two as cc
 
-from c_two.transport.server.core import ServerV2
+from c_two.transport.server.core import Server
 from c_two.transport.client.core import SharedClient
 
 from tests.fixtures.hello import Hello
@@ -62,7 +62,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 @pytest.fixture
 def hello_server(protocol_address, hello_crm):
     """Start a Hello CRM server on the given protocol, yield the address, then shut down."""
-    server = ServerV2(
+    server = Server(
         bind_address=protocol_address,
         icrm_class=IHello,
         crm_instance=hello_crm,

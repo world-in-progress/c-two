@@ -1,6 +1,6 @@
 """Integration tests for the HTTP relay chain.
 
-Tests the full pipeline:  HttpClient → RelayV2 → SharedClient → ServerV2 → CRM
+Tests the full pipeline:  HttpClient → Relay → SharedClient → Server → CRM
 
 Also tests ``cc.connect(address='http://...')`` end-to-end.
 """
@@ -18,7 +18,7 @@ import c_two as cc
 from c_two.transport.client.http import HttpClient
 from c_two.transport.client.proxy import ICRMProxy
 from c_two.transport.registry import _ProcessRegistry
-from c_two.transport.relay.core import RelayV2
+from c_two.transport.relay.core import Relay
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -63,7 +63,7 @@ def _clean_registry():
 
 @pytest.fixture
 def relay_stack():
-    """Start ServerV2 + RelayV2 and return (relay_url, ipc_address).
+    """Start Server + Relay and return (relay_url, ipc_address).
 
     Registers a Hello CRM as 'hello' and optionally a Counter CRM as
     'counter'.  The relay starts empty; upstreams are added
@@ -78,7 +78,7 @@ def relay_stack():
     cc.register(ICounter, Counter(), name='counter')
 
     # Start relay (empty — no upstream param).
-    relay = RelayV2(bind=f'0.0.0.0:{http_port}')
+    relay = Relay(bind=f'0.0.0.0:{http_port}')
     relay.start(blocking=False)
     _wait_for_relay(relay.url)
 
@@ -96,7 +96,7 @@ def relay_stack():
 # ---------------------------------------------------------------------------
 
 class TestHttpRelayFullChain:
-    """End-to-end: HttpClient → RelayV2 → ServerV2 → Hello CRM."""
+    """End-to-end: HttpClient → Relay → Server → Hello CRM."""
 
     def test_hello_via_http(self, relay_stack):
         """Simple string call through HTTP relay."""
@@ -274,7 +274,7 @@ class TestRelayControlPlane:
         cc.set_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
-        relay = RelayV2(bind=f'0.0.0.0:{http_port}')
+        relay = Relay(bind=f'0.0.0.0:{http_port}')
         relay.start(blocking=False)
         _wait_for_relay(relay.url)
 
@@ -314,7 +314,7 @@ class TestRelayControlPlane:
         cc.set_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
-        relay = RelayV2(bind=f'0.0.0.0:{http_port}')
+        relay = Relay(bind=f'0.0.0.0:{http_port}')
         relay.start(blocking=False)
         _wait_for_relay(relay.url)
 
@@ -344,7 +344,7 @@ class TestRelayControlPlane:
         cc.set_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
-        relay = RelayV2(bind=f'0.0.0.0:{http_port}')
+        relay = Relay(bind=f'0.0.0.0:{http_port}')
         relay.start(blocking=False)
         _wait_for_relay(relay.url)
 
@@ -380,7 +380,7 @@ class TestRelayControlPlane:
         """POST /_unregister for unknown name returns 404."""
         http_port = 19000 + _next_id()
 
-        relay = RelayV2(bind=f'0.0.0.0:{http_port}')
+        relay = Relay(bind=f'0.0.0.0:{http_port}')
         relay.start(blocking=False)
         _wait_for_relay(relay.url)
 
@@ -404,7 +404,7 @@ class TestRelayControlPlane:
         cc.register(IHello, Hello(), name='hello')
         cc.register(ICounter, Counter(), name='counter')
 
-        relay = RelayV2(bind=f'0.0.0.0:{http_port}')
+        relay = Relay(bind=f'0.0.0.0:{http_port}')
         relay.start(blocking=False)
         _wait_for_relay(relay.url)
 
@@ -425,7 +425,7 @@ class TestRelayControlPlane:
         """POST /{route}/{method} for unregistered route returns 404."""
         http_port = 19000 + _next_id()
 
-        relay = RelayV2(bind=f'0.0.0.0:{http_port}')
+        relay = Relay(bind=f'0.0.0.0:{http_port}')
         relay.start(blocking=False)
         _wait_for_relay(relay.url)
 

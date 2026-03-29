@@ -1,4 +1,4 @@
-"""Security and bounds-checking tests for rpc_v2 wire codec and protocol.
+"""Security and bounds-checking tests for wire codec and protocol.
 
 Validates that malformed / malicious inputs are rejected with clear errors
 rather than causing buffer overflows, silent data corruption, or DoS.
@@ -11,7 +11,7 @@ import pytest
 
 from c_two.transport.protocol import (
     HANDSHAKE_V5,
-    CAP_CALL_V2,
+    CAP_CALL,
     CAP_METHOD_IDX,
     STATUS_SUCCESS,
     STATUS_ERROR,
@@ -79,7 +79,7 @@ class TestHandshakeV5BoundsChecking:
     def test_max_segment_count_ok(self):
         """Exactly _MAX_HANDSHAKE_SEGMENTS is allowed."""
         segs = [(f's{i}', 100) for i in range(_MAX_HANDSHAKE_SEGMENTS)]
-        encoded = encode_v5_client_handshake(segs, CAP_CALL_V2)
+        encoded = encode_v5_client_handshake(segs, CAP_CALL)
         hs = decode_v5_handshake(encoded)
         assert len(hs.segments) == _MAX_HANDSHAKE_SEGMENTS
 
@@ -99,7 +99,7 @@ class TestHandshakeV5BoundsChecking:
         """Route section present but truncated."""
         segs = [('s1', 100)]
         routes = [RouteInfo('r1', [MethodEntry('m1', 0)])]
-        full = encode_v5_server_handshake(segs, CAP_CALL_V2, routes)
+        full = encode_v5_server_handshake(segs, CAP_CALL, routes)
         # Truncate inside route section
         truncated = full[:len(full) - 3]
         with pytest.raises(ValueError, match='truncated'):
@@ -108,7 +108,7 @@ class TestHandshakeV5BoundsChecking:
     def test_excessive_route_count(self):
         """Craft payload with route_count exceeding limit."""
         segs = [('s1', 100)]
-        encoded = encode_v5_client_handshake(segs, CAP_CALL_V2)
+        encoded = encode_v5_client_handshake(segs, CAP_CALL)
         # Append a fake route section with excessive count
         buf = bytearray(encoded)
         buf += struct.pack('<H', _MAX_HANDSHAKE_ROUTES + 1)
@@ -118,7 +118,7 @@ class TestHandshakeV5BoundsChecking:
     def test_excessive_method_count(self):
         """Craft payload with method_count exceeding limit."""
         segs = [('s1', 100)]
-        encoded = encode_v5_client_handshake(segs, CAP_CALL_V2)
+        encoded = encode_v5_client_handshake(segs, CAP_CALL)
         # Append route section: 1 route, with excessive method count
         buf = bytearray(encoded)
         buf += struct.pack('<H', 1)     # route_count=1
@@ -135,7 +135,7 @@ class TestHandshakeV5BoundsChecking:
             RouteInfo('ns1', [MethodEntry('add', 0), MethodEntry('mul', 1)]),
             RouteInfo('ns2', [MethodEntry('get', 0)]),
         ]
-        encoded = encode_v5_server_handshake(segs, CAP_CALL_V2 | CAP_METHOD_IDX, routes)
+        encoded = encode_v5_server_handshake(segs, CAP_CALL | CAP_METHOD_IDX, routes)
         hs = decode_v5_handshake(encoded)
         assert len(hs.segments) == 2
         assert len(hs.routes) == 2

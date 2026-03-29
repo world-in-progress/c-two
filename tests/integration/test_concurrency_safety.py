@@ -1,4 +1,4 @@
-"""Concurrency safety and security integration tests for rpc_v2.
+"""Concurrency safety and security integration tests.
 
 Tests:
 - Thread-safe concurrent calls through SharedClient
@@ -18,7 +18,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport.client.core import SharedClient
-from c_two.transport.server.core import ServerV2
+from c_two.transport.server.core import Server
 from c_two.transport.client.pool import ClientPool
 from c_two.transport.ipc.frame import IPCConfig
 
@@ -82,7 +82,7 @@ class TestRequestIdWrapping:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -129,7 +129,7 @@ class TestConcurrentCallSafety:
             max_pool_segments=2,
             max_pool_memory=2 << 20,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -176,7 +176,7 @@ class TestConcurrentCallSafety:
             max_pool_segments=2,
             max_pool_memory=2 << 20,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -226,7 +226,7 @@ class TestDoubleTerminate:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -250,7 +250,7 @@ class TestDoubleTerminate:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -275,7 +275,7 @@ class TestClientPoolSafety:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -333,7 +333,7 @@ class TestCallAfterTerminate:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -378,7 +378,7 @@ class TestTerminateDuringInFlight:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(ISlow, SlowImpl())
         server.start()
         _wait_for_server(addr)
@@ -419,8 +419,8 @@ class TestTerminateDuringInFlight:
 class TestServerMalformedFrames:
     """Verify server gracefully handles malformed frames without crashing."""
 
-    def test_server_survives_malformed_v2_payload(self):
-        """Send truncated v2 call control; server should disconnect client
+    def test_server_survives_malformed_payload(self):
+        """Send truncated call control; server should disconnect client
         but keep serving others."""
         import socket as _sock
 
@@ -430,7 +430,7 @@ class TestServerMalformedFrames:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -440,17 +440,17 @@ class TestServerMalformedFrames:
             region = addr.replace('ipc-v3://', '')
             sock_path = os.path.join(sock_dir, region + '.sock')
 
-            # Send a malformed v2 call frame (truncated call control).
+            # Send a malformed call frame (truncated call control).
             raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
             raw.connect(sock_path)
             raw.settimeout(2.0)
 
             from c_two.transport.ipc.frame import encode_frame
-            from c_two.transport.protocol import FLAG_CALL_V2
+            from c_two.transport.protocol import FLAG_CALL
 
-            # FLAG_CALL_V2 frame with only 1 byte payload (name_len=5 but no data).
+            # FLAG_CALL frame with only 1 byte payload (name_len=5 but no data).
             malformed_payload = bytes([5])  # name_len=5, but no name or method_idx
-            frame = encode_frame(1, FLAG_CALL_V2, malformed_payload)
+            frame = encode_frame(1, FLAG_CALL, malformed_payload)
             raw.sendall(frame)
             # Server should handle error (close conn or return error), not crash.
             time.sleep(0.2)
@@ -466,7 +466,7 @@ class TestServerMalformedFrames:
             server.shutdown()
 
     def test_server_survives_zero_length_payload(self):
-        """Empty v2 call payload should not crash server."""
+        """Empty call payload should not crash server."""
         import socket as _sock
 
         addr = _next_addr()
@@ -475,7 +475,7 @@ class TestServerMalformedFrames:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -490,9 +490,9 @@ class TestServerMalformedFrames:
             raw.settimeout(2.0)
 
             from c_two.transport.ipc.frame import encode_frame
-            from c_two.transport.protocol import FLAG_CALL_V2
+            from c_two.transport.protocol import FLAG_CALL
 
-            frame = encode_frame(1, FLAG_CALL_V2, b'')
+            frame = encode_frame(1, FLAG_CALL, b'')
             raw.sendall(frame)
             time.sleep(0.2)
             raw.close()
@@ -506,8 +506,8 @@ class TestServerMalformedFrames:
         finally:
             server.shutdown()
 
-    def test_server_survives_corrupted_v2_control(self):
-        """V2 call with garbage control bytes should not crash server."""
+    def test_server_survives_corrupted_control(self):
+        """Routed call with garbage control bytes should not crash server."""
         import socket as _sock
 
         addr = _next_addr()
@@ -516,7 +516,7 @@ class TestServerMalformedFrames:
             max_pool_segments=1,
             max_pool_memory=65536,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl())
         server.start()
         _wait_for_server(addr)
@@ -531,10 +531,10 @@ class TestServerMalformedFrames:
             raw.settimeout(2.0)
 
             from c_two.transport.ipc.frame import encode_frame
-            from c_two.transport.protocol import FLAG_CALL_V2
+            from c_two.transport.protocol import FLAG_CALL
 
-            # Send a v2 call with garbage control bytes (too short to parse)
-            frame = encode_frame(1, FLAG_CALL_V2, b'\xff\x01')
+            # Send a call with garbage control bytes (too short to parse)
+            frame = encode_frame(1, FLAG_CALL, b'\xff\x01')
             raw.sendall(frame)
             time.sleep(0.2)
             raw.close()

@@ -1,1 +1,1 @@
-from .core import RelayV2, UpstreamPool
+from .core import Relay, UpstreamPool

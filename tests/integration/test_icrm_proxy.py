@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 
-from c_two.transport import ServerV2, ICRMProxy
+from c_two.transport import Server, ICRMProxy
 from c_two.transport.client.core import SharedClient
 
 from tests.fixtures.ihello import IHello
@@ -90,12 +90,12 @@ class TestICRMProxyThreadLocal:
 # ---------------------------------------------------------------------------
 
 class TestICRMProxyIPC:
-    """ICRMProxy.ipc() with real ServerV2 + SharedClient."""
+    """ICRMProxy.ipc() with real Server + SharedClient."""
 
     @pytest.fixture
     def server_addr(self):
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(initial=50), name='counter')
         server.start()

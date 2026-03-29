@@ -23,7 +23,7 @@ from c_two.error import MemoryPressureError
 from c_two.transport.ipc.frame import IPCConfig
 from c_two.transport.client.core import SharedClient
 from c_two.transport.client.proxy import ICRMProxy
-from c_two.transport.server.core import ServerV2
+from c_two.transport.server.core import Server
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +101,8 @@ def _chunk_config() -> IPCConfig:
 def _setup(
     addr: str | None = None,
     cfg: IPCConfig | None = None,
-) -> tuple[str, ServerV2, SharedClient, IChunkTest]:
-    """Spin up a ServerV2 + SharedClient pair with IChunkTest CRM.
+) -> tuple[str, Server, SharedClient, IChunkTest]:
+    """Spin up a Server + SharedClient pair with IChunkTest CRM.
 
     Returns ``(addr, server, client, icrm)``.
     """
@@ -111,7 +111,7 @@ def _setup(
     if cfg is None:
         cfg = _chunk_config()
 
-    server = ServerV2(bind_address=addr, ipc_config=cfg)
+    server = Server(bind_address=addr, ipc_config=cfg)
     server.register_crm(IChunkTest, ChunkTest(), name='chunk')
     server.start()
     _wait_for_server(addr)
@@ -126,7 +126,7 @@ def _setup(
     return addr, server, client, icrm
 
 
-def _teardown(server: ServerV2, client: SharedClient) -> None:
+def _teardown(server: Server, client: SharedClient) -> None:
     try:
         client.terminate()
     except Exception:

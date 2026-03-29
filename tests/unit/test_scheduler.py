@@ -1,4 +1,4 @@
-"""Unit tests for rpc_v2 Scheduler (read/write concurrency control)."""
+"""Unit tests for Scheduler (read/write concurrency control)."""
 from __future__ import annotations
 
 import threading

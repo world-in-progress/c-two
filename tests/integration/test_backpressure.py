@@ -21,7 +21,7 @@ from c_two.error import MemoryPressureError
 from c_two.transport.ipc.frame import IPCConfig
 from c_two.transport.client.core import SharedClient
 from c_two.transport.client.proxy import ICRMProxy
-from c_two.transport.server.core import ServerV2
+from c_two.transport.server.core import Server
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello
@@ -72,7 +72,7 @@ class TestClientInlineFallback:
         """Payload fits inline but not in a tiny pool → inline fallback succeeds."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -93,7 +93,7 @@ class TestClientInlineFallback:
         """Payload fits within the buddy pool → normal SHM path."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -133,7 +133,7 @@ class TestServerInlineFallback:
         """Server's response alloc fails → falls back to inline → client gets result."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -160,7 +160,7 @@ class TestConcurrentBackpressure:
         """8 threads sending small payloads with tiny pool → all succeed."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -202,7 +202,7 @@ class TestConcurrentBackpressure:
         """Concurrent threads — verify results are correct or MemoryPressureError."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -259,7 +259,7 @@ class TestRecoveryAfterPressure:
         """After inline fallback, subsequent normal calls succeed."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -301,7 +301,7 @@ class TestLargePayloadPressureError:
             max_pool_memory=65536,
             max_frame_size=8192,  # 8KB inline limit
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -331,7 +331,7 @@ class TestLargePayloadPressureError:
         """Payload > pool but ≤ max_frame_size → inline fallback succeeds."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -432,7 +432,7 @@ class TestHighConcurrencyStress:
         """16 threads, each doing 20 add() calls, tiny pool — all results correct."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -475,7 +475,7 @@ class TestHighConcurrencyStress:
         """Single SharedClient, 8 threads, concurrent calls — data integrity."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -522,7 +522,7 @@ class TestEdgeCases:
         """Empty payload call succeeds even under pressure."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -551,7 +551,7 @@ class TestEdgeCases:
             max_pool_memory=65536,
             max_frame_size=8192,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -599,7 +599,7 @@ class TestChunkedBackpressure:
             max_pool_memory=65536,
         )
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -631,7 +631,7 @@ class TestChunkedBackpressure:
             max_pool_memory=65536 * 4,
         )
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -664,7 +664,7 @@ class TestChunkedBackpressure:
             max_pool_memory=65536 * 4,
         )
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -696,7 +696,7 @@ class TestChunkedBackpressure:
             max_pool_memory=65536 * 8,
         )
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)

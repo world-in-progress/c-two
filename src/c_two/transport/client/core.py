@@ -14,9 +14,9 @@ Ownership model (same as IPCv3Client):
 - Request blocks: client allocs, server frees after reading
 - Response blocks: server allocs, client frees after reading
 
-Wire v2 format with control-plane routing.  Negotiated via handshake v5
-when connecting to a Server v2.  SHM contains pure payload (no wire
-header); method routing via 2-byte index in the inline control frame.
+Control-plane routing negotiated via handshake v5.  SHM contains pure
+payload (no wire header); method routing via 2-byte index in the inline
+control frame.
 """
 from __future__ import annotations
 
@@ -52,12 +52,12 @@ from ..ipc.buddy import (
     encode_buddy_call_frame,
 )
 from ..protocol import (
-    FLAG_CALL_V2,
-    FLAG_REPLY_V2,
+    FLAG_CALL,
+    FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
     HANDSHAKE_V5,
-    CAP_CALL_V2,
+    CAP_CALL,
     CAP_METHOD_IDX,
     CAP_CHUNKED,
     STATUS_SUCCESS,
@@ -70,10 +70,10 @@ from ..protocol import (
 from ..wire import (
     CHUNK_HEADER_SIZE,
     MethodTable,
-    encode_v2_buddy_call_frame,
-    encode_v2_inline_call_frame,
-    encode_v2_buddy_chunked_call_frame,
-    encode_v2_inline_chunked_call_frame,
+    encode_buddy_call_frame,
+    encode_inline_call_frame,
+    encode_buddy_chunked_call_frame,
+    encode_inline_chunked_call_frame,
     decode_chunk_header,
     decode_reply_control,
 )
@@ -301,7 +301,7 @@ class SharedClient:
 
         # Handshake v5 (only supported protocol).
         handshake_payload = encode_v5_client_handshake(
-            segments, CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+            segments, CAP_CALL | CAP_METHOD_IDX | CAP_CHUNKED,
         )
         handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
         self._sock.sendall(handshake_frame)
@@ -318,8 +318,8 @@ class SharedClient:
             raise error.CompoClientError('Server does not support handshake v5')
 
         hs = decode_v5_handshake(payload)
-        if not (hs.capability_flags & CAP_CALL_V2):
-            raise error.CompoClientError('Server does not support v2 calls')
+        if not (hs.capability_flags & CAP_CALL):
+            raise error.CompoClientError('Server does not support routed calls')
 
         self._chunked_capable = bool(hs.capability_flags & CAP_CHUNKED)
         # Build per-route method tables.
@@ -406,7 +406,7 @@ class SharedClient:
         Thread-safe: multiple threads may call concurrently.  Each call
         blocks only its own thread until the matching response arrives.
 
-        In v2 mode, uses control-plane routing (method index + pure SHM
+        Uses control-plane routing (method index + pure SHM
         payload).  In v1 mode, uses standard wire format.
 
         Parameters
@@ -416,7 +416,7 @@ class SharedClient:
         data:
             Serialized arguments payload.
         name:
-            Target CRM routing name (v2 only).  If ``None``, uses the
+            Target CRM routing name for multi-CRM.  If ``None``, uses the
             default.
 
         Returns ``bytes`` (always copied from SHM for safety).
@@ -454,7 +454,7 @@ class SharedClient:
 
         try:
             with self._send_lock:
-                self._send_request_v2(rid, method_name, args, wire_size, name=name)
+                self._send_request(rid, method_name, args, wire_size, name=name)
         except Exception as exc:
             with self._pending_lock:
                 self._pending.pop(rid, None)
@@ -553,7 +553,7 @@ class SharedClient:
             )
 
     # ------------------------------------------------------------------
-    # Chunked send (large payloads, v2 only)
+    # Chunked send (large payloads)
     # ------------------------------------------------------------------
 
     def _call_chunked(
@@ -591,7 +591,7 @@ class SharedClient:
                 if alloc is not None:
                     try:
                         shm_buf[:chunk_len] = chunk_data
-                        frame = encode_v2_buddy_chunked_call_frame(
+                        frame = encode_buddy_chunked_call_frame(
                             rid, alloc.seg_idx, alloc.offset, chunk_len,
                             alloc.is_dedicated, i, n_chunks,
                             name=route_name, method_idx=method_idx,
@@ -603,7 +603,7 @@ class SharedClient:
                         raise
                 else:
                     # Inline fallback for this chunk.
-                    frame = encode_v2_inline_chunked_call_frame(
+                    frame = encode_inline_chunked_call_frame(
                         rid, i, n_chunks, chunk_data,
                         name=route_name, method_idx=method_idx,
                     )
@@ -621,10 +621,10 @@ class SharedClient:
     # Send helpers (called under _send_lock)
     # ------------------------------------------------------------------
 
-    def _send_request_v2(self, rid: int, method_name: str, args: bytes, payload_size: int, *, name: str | None = None) -> None:
-        """Encode and send a v2 call frame. Called under _send_lock.
+    def _send_request(self, rid: int, method_name: str, args: bytes, payload_size: int, *, name: str | None = None) -> None:
+        """Encode and send a call frame. Called under _send_lock.
 
-        In v2 mode, SHM contains pure payload (no wire header).
+        SHM contains pure payload (no wire header).
         Method routing uses 2-byte index in the UDS inline control frame.
         """
         sock = self._sock
@@ -635,11 +635,11 @@ class SharedClient:
         table = self._name_tables.get(route_name, self._method_table)
         method_idx = table.index_of(method_name) if table else 0
 
-        alloc, shm_buf = self._try_buddy_alloc(payload_size, 'v2')
+        alloc, shm_buf = self._try_buddy_alloc(payload_size, 'call')
 
         if alloc is None:
             inline_data = b''.join(args) if isinstance(args, (list, tuple)) else args
-            frame = encode_v2_inline_call_frame(rid, route_name, method_idx, inline_data)
+            frame = encode_inline_call_frame(rid, route_name, method_idx, inline_data)
             sock.sendall(frame)
             return
 
@@ -652,7 +652,7 @@ class SharedClient:
                     off += part_len
             else:
                 shm_buf[:payload_size] = args
-            frame = encode_v2_buddy_call_frame(
+            frame = encode_buddy_call_frame(
                 rid, alloc.seg_idx, alloc.offset,
                 payload_size, alloc.is_dedicated,
                 route_name, method_idx,
@@ -738,7 +738,7 @@ class SharedClient:
 
                 # Decode response and dispatch.
                 try:
-                    result, err = self._decode_response(flags, payload)
+                    result, err = self._decode_response(flags, payload, bool(flags & FLAG_BUDDY))
                 except Exception as exc:
                     # Dispatch error to pending caller.
                     with self._pending_lock:
@@ -774,15 +774,10 @@ class SharedClient:
                     p.set_error(error.CompoClientError('Connection closed'))
                 self._pending.clear()
 
-    def _decode_response(self, flags: int, payload: bytes) -> tuple[bytes | None, Exception | None]:
-        """Decode a v2 response frame into (result_bytes, error_or_none)."""
-        is_buddy = bool(flags & FLAG_BUDDY)
-        return self._decode_v2_response(flags, payload, is_buddy)
-
-    def _decode_v2_response(
+    def _decode_response(
         self, flags: int, payload: bytes, is_buddy: bool,
     ) -> tuple[bytes | None, Exception | None]:
-        """Decode a v2 reply frame (FLAG_REPLY_V2 set)."""
+        """Decode a reply frame (FLAG_REPLY set)."""
         if is_buddy:
             # Buddy: [11B buddy_ptr][1B status][optional error]
             seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
@@ -792,7 +787,7 @@ class SharedClient:
             if seg_idx >= len(self._seg_views):
                 return None, error.CompoClientError(f'Invalid seg_idx {seg_idx}')
 
-            # Parse v2 reply control (after buddy pointer).
+            # Parse reply control (after buddy pointer).
             from ..ipc.buddy import BUDDY_PAYLOAD_STRUCT
             ctrl_offset = BUDDY_PAYLOAD_STRUCT.size
             # Check for reuse flag (19 bytes total buddy payload).
@@ -828,7 +823,7 @@ class SharedClient:
 
             return result, None
         else:
-            # Inline v2 reply: [1B status][optional error | inline data]
+            # Inline reply: [1B status][optional error | inline data]
             if len(payload) < 1:
                 return b'', None
             status, err_data, consumed = decode_reply_control(payload, 0)

@@ -1,11 +1,9 @@
-"""Server v2 — asyncio-based IPC v3 server with wire v2 support.
-
-Compared to :class:`IPCv3Server`:
+"""Asyncio-based IPC v3 server with multi-CRM hosting.
 
 - **No EventQueue**: direct CRM dispatch via ``ThreadPoolExecutor``.
 - **Handshake v5**: capability negotiation + method index exchange.
-- **Wire v2 frames**: control-plane routing (CRM routing name + method
-  index in UDS inline frame, pure payload in buddy SHM).
+- **Control-plane routing**: CRM routing name + method index in UDS
+  inline frame, pure payload in buddy SHM.
 - **Multi-CRM**: hosts multiple CRM instances under distinct routing
   names (not tied to ICRM namespace from ``__tag__``).
 """
@@ -49,12 +47,12 @@ from ..ipc.buddy import (
     decode_buddy_payload,
 )
 from ..protocol import (
-    FLAG_CALL_V2,
-    FLAG_REPLY_V2,
+    FLAG_CALL,
+    FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
     HANDSHAKE_V5,
-    CAP_CALL_V2,
+    CAP_CALL,
     CAP_METHOD_IDX,
     CAP_CHUNKED,
     STATUS_SUCCESS,
@@ -69,11 +67,11 @@ from ..wire import (
     decode_call_control,
     decode_chunk_header,
     CHUNK_HEADER_SIZE,
-    encode_v2_buddy_reply_frame,
-    encode_v2_inline_reply_frame,
-    encode_v2_error_reply_frame,
-    encode_v2_buddy_chunked_reply_frame,
-    encode_v2_inline_chunked_reply_frame,
+    encode_buddy_reply_frame,
+    encode_inline_reply_frame,
+    encode_error_reply_frame,
+    encode_buddy_chunked_reply_frame,
+    encode_inline_chunked_reply_frame,
     U16_LE,
 )
 from .scheduler import Scheduler, ConcurrencyConfig
@@ -92,16 +90,16 @@ _MAX_TOTAL_CHUNKS = 512           # 512 × 128 MB = 64 GB theoretical max
 _MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB hard cap on reassembly buffer
 
 
-def _parse_v2_call_inline(
+def _parse_call_inline(
     payload: bytes | memoryview,
 ) -> tuple[bytes, int, int]:
-    """Parse v2 call control from an inline (non-buddy) payload.
+    """Parse call control from an inline (non-buddy) payload.
 
     Returns ``(route_key_bytes, method_idx, args_start_offset)``.
 
     Raises ``struct.error`` or ``IndexError`` on malformed data.
-    This is the **single source of truth** for inline v2 call control
-    parsing — used by both the fast dispatch path and ``_handle_v2_call``.
+    This is the **single source of truth** for inline call control
+    parsing — used by both the fast dispatch path and ``_handle_call``.
     """
     name_len = payload[0]
     if name_len:
@@ -131,7 +129,6 @@ class _Connection:
     remote_segment_names: list[str] = field(default_factory=list)
     remote_segment_sizes: list[int] = field(default_factory=list)
     handshake_done: bool = False
-    v2_mode: bool = False
     chunked_capable: bool = False
     # In-flight submit_inline request counter.  Incremented on the event
     # loop thread before submitting; decremented by worker threads via
@@ -295,7 +292,7 @@ class _FastDispatcher:
         self._workers: list[threading.Thread] = []
         for i in range(num_workers):
             t = threading.Thread(
-                target=self._worker, daemon=True, name=f'c2v2_fast_{i}',
+                target=self._worker, daemon=True, name=f'c2_fast_{i}',
             )
             t.start()
             self._workers.append(t)
@@ -385,9 +382,9 @@ class _FastDispatcher:
             res_part, err_part = result, b''
 
         if err_part:
-            frame = encode_v2_error_reply_frame(request_id, err_part)
+            frame = encode_error_reply_frame(request_id, err_part)
         else:
-            frame = encode_v2_inline_reply_frame(request_id, res_part)
+            frame = encode_inline_reply_frame(request_id, res_part)
         call_soon(writer.write, frame)
 
     @staticmethod
@@ -400,22 +397,22 @@ class _FastDispatcher:
                 err_bytes = str(exc).encode('utf-8')
         except Exception:
             err_bytes = b'Internal server error'
-        call_soon(writer.write, encode_v2_error_reply_frame(request_id, err_bytes))
+        call_soon(writer.write, encode_error_reply_frame(request_id, err_bytes))
 
 
 # ---------------------------------------------------------------------------
-# ServerV2
+# Server
 # ---------------------------------------------------------------------------
 
-class ServerV2:
-    """IPC v3 server with wire v2 control-plane routing.
+class Server:
+    """IPC v3 server with control-plane routing.
 
     Supports hosting **multiple CRM resources** under distinct routing
     names.  Each name has its own ICRM instance, method table, and
     scheduler.
 
-    Handles wire v2 frames with control-plane method index + pure payload.
-    V2 frames carry the routing name in the control plane.
+    Handles frames with control-plane method index + pure payload.
+    Frames carry the routing name in the control plane.
 
     Parameters
     ----------
@@ -631,12 +628,12 @@ class ServerV2:
         """Start the server in a background thread.  Blocks until ready."""
         self._loop_thread = threading.Thread(
             target=self._run_loop,
-            name=f'c2-srv-v2-{self._address}',
+            name=f'c2-srv-{self._address}',
             daemon=True,
         )
         self._loop_thread.start()
         if not self._started.wait(timeout):
-            raise RuntimeError('ServerV2 failed to start within timeout')
+            raise RuntimeError('Server failed to start within timeout')
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -665,7 +662,7 @@ class ServerV2:
         except OSError:
             pass
         self._started.set()
-        logger.debug('ServerV2 listening on %s', self._socket_path)
+        logger.debug('Server listening on %s', self._socket_path)
 
         await self._shutdown_event.wait()
 
@@ -815,18 +812,18 @@ class ServerV2:
                     t.add_done_callback(pending.discard)
                     continue
 
-                is_v2_call = bool(flags & FLAG_CALL_V2)
+                is_routed = bool(flags & FLAG_CALL)
                 is_buddy = bool(flags & FLAG_BUDDY)
 
-                # Fast inline path for v2 non-buddy calls:
+                # Fast inline path for non-buddy calls:
                 # parse + dispatch table lookup + submit all without Task.
-                if is_v2_call and not is_buddy:
+                if is_routed and not is_buddy:
                     try:
-                        route_key, method_idx, args_start = _parse_v2_call_inline(payload)
+                        route_key, method_idx, args_start = _parse_call_inline(payload)
                     except (struct.error, IndexError) as exc:
-                        writer.write(encode_v2_error_reply_frame(
+                        writer.write(encode_error_reply_frame(
                             request_id,
-                            f'Malformed v2 call control: {exc}'.encode('utf-8'),
+                            f'Malformed call control: {exc}'.encode('utf-8'),
                         ))
                         continue
                     args_bytes = payload[args_start:] if args_start < len(payload) else b''
@@ -888,14 +885,14 @@ class ServerV2:
                                 continue
 
                 # Fallback: full handler via Task for buddy or error paths.
-                if is_v2_call:
+                if is_routed:
                     t = asyncio.create_task(
-                        self._handle_v2_call(
+                        self._handle_call(
                             conn, request_id, payload, is_buddy, writer,
                         ),
                     )
                 else:
-                    continue  # Non-v2, non-signal frame — ignore
+                    continue  # Non-routed, non-signal frame — ignore
                 pending.add(t)
                 t.add_done_callback(pending.discard)
 
@@ -959,7 +956,6 @@ class ServerV2:
             logger.warning('Conn %d: bad v5 handshake: %s', conn.conn_id, e)
             return
         self._open_segments(conn, hs.segments)
-        conn.v2_mode = True
 
         # Build route / method table ACK for *all* registered CRMs.
         route_infos: list[RouteInfo] = []
@@ -974,8 +970,8 @@ class ServerV2:
                 ))
 
         cap_flags = 0
-        if hs.capability_flags & CAP_CALL_V2:
-            cap_flags |= CAP_CALL_V2
+        if hs.capability_flags & CAP_CALL:
+            cap_flags |= CAP_CALL
         if hs.capability_flags & CAP_METHOD_IDX:
             cap_flags |= CAP_METHOD_IDX
         if hs.capability_flags & CAP_CHUNKED:
@@ -1106,7 +1102,7 @@ class ServerV2:
             except Exception as exc:
                 logger.error('Conn %d: failed to create chunk assembler: %s',
                              conn.conn_id, exc)
-                writer.write(encode_v2_error_reply_frame(
+                writer.write(encode_error_reply_frame(
                     request_id,
                     f'Failed to allocate reassembly buffer: {exc}'.encode('utf-8'),
                 ))
@@ -1137,7 +1133,7 @@ class ServerV2:
         if slot is None:
             logger.warning('Conn %d: unknown route %r in chunked call',
                            conn.conn_id, route_name)
-            writer.write(encode_v2_error_reply_frame(
+            writer.write(encode_error_reply_frame(
                 request_id,
                 f'Unknown route name: {route_name}'.encode('utf-8'),
             ))
@@ -1148,7 +1144,7 @@ class ServerV2:
         if method_name is None:
             logger.warning('Conn %d: unknown method idx %d for route %r',
                            conn.conn_id, asm.method_idx, route_name)
-            writer.write(encode_v2_error_reply_frame(
+            writer.write(encode_error_reply_frame(
                 request_id,
                 f'Unknown method index {asm.method_idx}'.encode('utf-8'),
             ))
@@ -1156,7 +1152,7 @@ class ServerV2:
             return
 
         result_bytes, err_bytes = await self._dispatch(slot, method_name, args_bytes)
-        await self._send_v2_reply(conn, request_id, result_bytes, err_bytes, writer)
+        await self._send_reply(conn, request_id, result_bytes, err_bytes, writer)
 
     @staticmethod
     def _gc_chunk_assemblers(
@@ -1179,10 +1175,10 @@ class ServerV2:
             asm.discard()
 
     # ------------------------------------------------------------------
-    # V2 call handling (control-plane routing)
+    # Call handling (control-plane routing)
     # ------------------------------------------------------------------
 
-    async def _handle_v2_call(
+    async def _handle_call(
         self,
         conn: _Connection,
         request_id: int,
@@ -1191,18 +1187,18 @@ class ServerV2:
         writer: asyncio.StreamWriter,
     ) -> None:
         if is_buddy:
-            route_name, method_idx, args_bytes = self._resolve_v2_buddy(conn, payload)
+            route_name, method_idx, args_bytes = self._resolve_buddy(conn, payload)
             if args_bytes is None:
                 return
         else:
             if not payload:
                 return
             try:
-                route_key, method_idx, args_start = _parse_v2_call_inline(payload)
+                route_key, method_idx, args_start = _parse_call_inline(payload)
             except (struct.error, IndexError, UnicodeDecodeError) as exc:
-                logger.warning('Conn %d: malformed v2 call control: %s',
+                logger.warning('Conn %d: malformed call control: %s',
                                conn.conn_id, exc)
-                writer.write(encode_v2_error_reply_frame(
+                writer.write(encode_error_reply_frame(
                     request_id, f'Malformed call control: {exc}'.encode('utf-8'),
                 ))
                 await writer.drain()
@@ -1214,7 +1210,7 @@ class ServerV2:
         slot = self._resolve_slot(route_name)
         if slot is None:
             logger.warning('Unknown route name %r', route_name)
-            writer.write(encode_v2_error_reply_frame(
+            writer.write(encode_error_reply_frame(
                 request_id, f'Unknown route name: {route_name}'.encode('utf-8'),
             ))
             await writer.drain()
@@ -1223,7 +1219,7 @@ class ServerV2:
         method_name = slot.method_table._idx_to_name.get(method_idx)
         if method_name is None:
             logger.warning('Unknown method index %d for route %r', method_idx, route_name)
-            writer.write(encode_v2_error_reply_frame(
+            writer.write(encode_error_reply_frame(
                 request_id,
                 f'Unknown method index {method_idx} for route {route_name!r}'.encode('utf-8'),
             ))
@@ -1238,7 +1234,7 @@ class ServerV2:
                 err_bytes = err.serialize()
             except Exception:
                 err_bytes = str(err).encode('utf-8')
-            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
+            writer.write(encode_error_reply_frame(request_id, err_bytes))
             await writer.drain()
             return
 
@@ -1260,7 +1256,7 @@ class ServerV2:
             result = await future
         except Exception as exc:
             err_bytes = self._wrap_error(exc)[1]
-            writer.write(encode_v2_error_reply_frame(request_id, err_bytes))
+            writer.write(encode_error_reply_frame(request_id, err_bytes))
             await writer.drain()
             return
 
@@ -1279,18 +1275,18 @@ class ServerV2:
         else:
             res_part, err_part = result, b''
 
-        await self._send_v2_reply(conn, request_id, res_part, err_part, writer)
+        await self._send_reply(conn, request_id, res_part, err_part, writer)
 
-    def _resolve_v2_buddy(
+    def _resolve_buddy(
         self, conn: _Connection, payload: bytes,
     ) -> tuple[str, int, bytes | None]:
-        """Extract route_name + method_idx + args from a v2 buddy frame."""
+        """Extract route_name + method_idx + args from a buddy frame."""
         try:
             seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = (
                 decode_buddy_payload(payload)
             )
         except (struct.error, Exception) as exc:
-            logger.warning('Conn %d: malformed v2 buddy payload: %s',
+            logger.warning('Conn %d: malformed buddy payload: %s',
                            conn.conn_id, exc)
             return '', -1, None
         if conn.buddy_pool is None or seg_idx >= len(conn.seg_views):
@@ -1300,13 +1296,13 @@ class ServerV2:
         try:
             route_name, method_idx, _consumed = decode_call_control(payload, ctrl_offset)
         except (ValueError, struct.error) as exc:
-            logger.warning('Conn %d: malformed v2 buddy call control: %s',
+            logger.warning('Conn %d: malformed buddy call control: %s',
                            conn.conn_id, exc)
             return '', -1, None
 
         seg_mv = conn.seg_views[seg_idx]
         if data_offset + data_size > len(seg_mv):
-            logger.warning('Conn %d: v2 buddy OOB: offset=%d + size=%d > seg_len=%d',
+            logger.warning('Conn %d: buddy OOB: offset=%d + size=%d > seg_len=%d',
                            conn.conn_id, data_offset, data_size, len(seg_mv))
             return '', -1, None
         args_bytes = bytes(seg_mv[data_offset : data_offset + data_size])
@@ -1377,10 +1373,10 @@ class ServerV2:
             return b'', str(exc).encode('utf-8')
 
     # ------------------------------------------------------------------
-    # Reply — v2 (control-plane status + pure payload)
+    # Reply — control-plane ( status + pure payload)
     # ------------------------------------------------------------------
 
-    async def _send_v2_reply(
+    async def _send_reply(
         self,
         conn: _Connection,
         request_id: int,
@@ -1389,7 +1385,7 @@ class ServerV2:
         writer: asyncio.StreamWriter,
     ) -> None:
         if err_bytes:
-            frame = encode_v2_error_reply_frame(request_id, err_bytes)
+            frame = encode_error_reply_frame(request_id, err_bytes)
             writer.write(frame)
             await writer.drain()
             return
@@ -1399,7 +1395,7 @@ class ServerV2:
         # Chunked reply for large results.
         chunk_threshold = int(self._config.pool_segment_size * _CHUNK_THRESHOLD_RATIO)
         if data_size > chunk_threshold and conn.chunked_capable:
-            await self._send_chunked_v2_reply(conn, request_id, result_bytes, writer)
+            await self._send_chunked_reply(conn, request_id, result_bytes, writer)
             return
 
         if data_size > self._config.shm_threshold and conn.buddy_pool is not None:
@@ -1418,7 +1414,7 @@ class ServerV2:
                     )
                     raise MemoryError('reply offset OOB, fall back to inline')
                 seg_mv[alloc.offset : alloc.offset + data_size] = result_bytes
-                frame = encode_v2_buddy_reply_frame(
+                frame = encode_buddy_reply_frame(
                     request_id, alloc.seg_idx, alloc.offset,
                     data_size, alloc.is_dedicated,
                 )
@@ -1429,12 +1425,12 @@ class ServerV2:
             except Exception:
                 pass  # Fall through to inline.
 
-        frame = encode_v2_inline_reply_frame(request_id, result_bytes)
+        frame = encode_inline_reply_frame(request_id, result_bytes)
         writer.write(frame)
         if data_size > 65536:
             await writer.drain()
 
-    async def _send_chunked_v2_reply(
+    async def _send_chunked_reply(
         self,
         conn: _Connection,
         request_id: int,
@@ -1466,7 +1462,7 @@ class ServerV2:
                         raise MemoryError('dedicated')
                     seg_mv = conn.seg_views[alloc.seg_idx]
                     seg_mv[alloc.offset:alloc.offset + chunk_len] = chunk_data
-                    frame = encode_v2_buddy_chunked_reply_frame(
+                    frame = encode_buddy_chunked_reply_frame(
                         request_id, alloc.seg_idx, alloc.offset,
                         chunk_len, alloc.is_dedicated, i, n_chunks,
                     )
@@ -1483,13 +1479,13 @@ class ServerV2:
                         conn.conn_id, i, n_chunks, chunk_len,
                         self._config.max_frame_size,
                     )
-                    writer.write(encode_v2_error_reply_frame(
+                    writer.write(encode_error_reply_frame(
                         request_id,
                         b'Chunked reply failed: chunk exceeds inline limit',
                     ))
                     await writer.drain()
                     return
-                frame = encode_v2_inline_chunked_reply_frame(
+                frame = encode_inline_chunked_reply_frame(
                     request_id, i, n_chunks, chunk_data,
                 )
                 writer.write(frame)

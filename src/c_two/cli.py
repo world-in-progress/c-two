@@ -76,12 +76,12 @@ cli.command(build)
 # ---------------------------------------------------------------------------
 
 _RELAY_BANNER = """\
- ╔══════════════════════════════════════╗
- ║  C-Two Relay Server                 ║
- ║  {url:<37s}║
- ║  Engine: {engine:<28s}║
- ║  Workers: {workers:<27s}║
- ╚══════════════════════════════════════╝
+ ╔═════════════════════════════════════════════════════════╗
+   C-Two Relay Server                   
+   {url:<37s}                          
+   Engine: {engine:<28s}               
+   Workers: {workers:<27s}             
+ ╚═════════════════════════════════════════════════════════╝
 
  Control endpoints:
    POST /_register      Register upstream CRM
@@ -114,7 +114,7 @@ _RELAY_BANNER = """\
     '--native/--python',
     default=True,
     show_default=True,
-    help='Relay engine: Rust NativeRelay (default) or Python RelayV2.',
+    help='Relay engine: Rust NativeRelay (default) or Python Relay.',
 )
 @click.option(
     '--upstream', '-u',
@@ -186,7 +186,7 @@ def relay(
         relay_instance = _start_python_relay(
             bind, workers, ipc_config, parsed_upstreams,
         )
-        engine = 'Python (RelayV2)'
+        engine = 'Python (Relay)'
 
     # Print banner.
     url = _relay_url(bind)
@@ -230,9 +230,9 @@ def _start_python_relay(
     ipc_config,
     upstreams: list[tuple[str, str]],
 ):
-    from .transport.relay import RelayV2
+    from .transport.relay import Relay
 
-    relay = RelayV2(bind=bind, max_workers=workers, ipc_config=ipc_config)
+    relay = Relay(bind=bind, max_workers=workers, ipc_config=ipc_config)
     relay.start(blocking=False)
 
     for name, address in upstreams:

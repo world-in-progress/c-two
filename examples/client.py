@@ -1,10 +1,10 @@
 """SOTA API — client process.
 
-Connects to the server started by ``v2_server.py`` via IPC and invokes
+Connects to the server started by ``server.py`` via IPC and invokes
 CRM methods through the ICRM proxy.
 
-Run (after starting v2_server.py in another terminal):
-    uv run python examples/v2_client.py
+Run (after starting server.py in another terminal):
+    uv run python examples/client.py
 """
 import os, sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../e
 import c_two as cc
 from icrm import IGrid, GridAttribute
 
-SERVER_ADDRESS = 'ipc-v3://v2_grid'
+SERVER_ADDRESS = 'ipc-v3://grid'
 
 
 def main():

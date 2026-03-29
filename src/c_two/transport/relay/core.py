@@ -1,6 +1,6 @@
 """Multi-upstream HTTP relay server for C-Two.
 
-Bridges HTTP requests to multiple IPC v3 ``ServerV2`` processes via
+Bridges HTTP requests to multiple IPC v3 ``Server`` processes via
 dynamically registered :class:`SharedClient` connections.
 
 CRM resource processes register themselves at runtime via::
@@ -16,9 +16,9 @@ Data-plane requests follow the REST convention::
 
 Usage (standalone relay)::
 
-    from c_two.transport.relay.core import RelayV2
+    from c_two.transport.relay.core import Relay
 
-    relay = RelayV2(bind='0.0.0.0:8080')
+    relay = Relay(bind='0.0.0.0:8080')
     relay.start(blocking=False)
     # CRM processes POST /_register to add routes dynamically
     relay.stop()
@@ -167,9 +167,9 @@ class UpstreamPool:
                 logger.warning('Error terminating upstream %s', entry.name, exc_info=True)
 
 
-# -- RelayV2 --------------------------------------------------------------
+# -- Relay --------------------------------------------------------------
 
-class RelayV2:
+class Relay:
     """Multi-upstream HTTP relay server.
 
     Starts as an empty relay with no upstream connections. CRM resource
@@ -215,7 +215,7 @@ class RelayV2:
         """Start the relay HTTP server."""
         self._relay_thread_pool = ThreadPoolExecutor(
             max_workers=self._max_workers,
-            thread_name_prefix='c2_relay_v2',
+            thread_name_prefix='c2_relay',
         )
         self._app = self._create_app()
 
@@ -227,7 +227,7 @@ class RelayV2:
             self._server_started.is_set,
             _WAIT_TIMEOUT,
         )
-        logger.info('RelayV2 started on %s:%d', self._host, self._port)
+        logger.info('Relay started on %s:%d', self._host, self._port)
 
         if blocking:
             try:
@@ -256,7 +256,7 @@ class RelayV2:
             self._relay_thread_pool = None
 
         self._pool.shutdown()
-        logger.info('RelayV2 stopped.')
+        logger.info('Relay stopped.')
 
     @property
     def url(self) -> str:
@@ -468,7 +468,7 @@ class RelayV2:
             self._event_loop.run_until_complete(self._server.serve())
         except Exception as exc:
             if not self._shutdown_event.is_set():
-                logger.error('RelayV2 HTTP server error: %s', exc)
+                logger.error('Relay HTTP server error: %s', exc)
             self._server_started.set()
         finally:
             if not self._event_loop.is_closed():

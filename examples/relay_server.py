@@ -4,10 +4,10 @@ Registers CRMs via IPC and starts an HTTP relay so remote clients can
 access them over HTTP.  Press Ctrl-C to shut down.
 
 Run:
-    uv run python examples/v2_relay_server.py
+    uv run python examples/relay_server.py
 
 Then in another terminal:
-    uv run python examples/v2_relay_client.py
+    uv run python examples/relay_client.py
 """
 import os, sys, signal, threading
 
@@ -15,11 +15,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
-from c_two.transport.relay import RelayV2
+from c_two.transport.relay import Relay
 from icrm import IGrid
 from crm import Grid
 
-IPC_ADDRESS = 'ipc-v3://v2_grid_relay'
+IPC_ADDRESS = 'ipc-v3://grid_relay'
 HTTP_BIND = '127.0.0.1:8080'
 
 
@@ -37,7 +37,7 @@ def main():
     cc.register(IGrid, grid, name='grid')
 
     # ── Start HTTP relay ──────────────────────────────────────────
-    relay = RelayV2(bind=HTTP_BIND, upstream=IPC_ADDRESS)
+    relay = Relay(bind=HTTP_BIND, upstream=IPC_ADDRESS)
     relay.start(blocking=False)
 
     print(f'IPC  : {cc.server_address()}')

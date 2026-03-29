@@ -10,7 +10,7 @@ import threading
 import pytest
 
 import c_two as cc
-from c_two.transport.server.core import ServerV2
+from c_two.transport.server.core import Server
 from c_two.transport.client.core import SharedClient
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
@@ -57,7 +57,7 @@ class ErrorHello(Hello):
 def error_server():
     """Start a server backed by ErrorHello, yield its address, then shut down."""
     address = f'ipc-v3://error_test_{_next_id()}'
-    server = ServerV2(
+    server = Server(
         bind_address=address,
         icrm_class=IHello,
         crm_instance=ErrorHello(),

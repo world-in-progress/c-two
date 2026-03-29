@@ -19,13 +19,13 @@ import os, sys, signal, threading
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
 
-from c_two.transport.relay import RelayV2
+from c_two.transport.relay import Relay
 
 HTTP_BIND = '127.0.0.1:8080'
 
 
 def main():
-    relay = RelayV2(bind=HTTP_BIND)
+    relay = Relay(bind=HTTP_BIND)
     relay.start(blocking=False)
 
     print(f'[Relay] HTTP listen  : {relay.url}')

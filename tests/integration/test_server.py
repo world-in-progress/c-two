@@ -1,6 +1,6 @@
-"""Integration tests for rpc_v2 Phase 2 — ServerV2 + SharedClient.
+"""Integration tests for Server + SharedClient.
 
-Tests SharedClient → ServerV2 via handshake v5 with wire v2 protocol.
+Tests SharedClient → Server via handshake v5 protocol.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport.ipc.frame import IPCConfig
-from c_two.transport import SharedClient, ClientPool, ServerV2
+from c_two.transport import SharedClient, ClientPool, Server
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -52,10 +52,10 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def server_v2_addr():
-    """Start a ServerV2 hosting the Hello CRM + IHello ICRM."""
+def server_addr():
+    """Start a Server hosting the Hello CRM + IHello ICRM."""
     addr = f'ipc-v3://{_unique_region()}'
-    server = ServerV2(
+    server = Server(
         bind_address=addr,
         icrm_class=IHello,
         crm_instance=Hello(),
@@ -67,11 +67,11 @@ def server_v2_addr():
 
 
 @pytest.fixture
-def server_v2_small_shm():
-    """ServerV2 with small SHM threshold (forces inline path more often)."""
+def server_small_shm():
+    """Server with small SHM threshold (forces inline path more often)."""
     addr = f'ipc-v3://{_unique_region("small")}'
     config = IPCConfig(shm_threshold=16)
-    server = ServerV2(
+    server = Server(
         bind_address=addr,
         icrm_class=IHello,
         crm_instance=Hello(),
@@ -84,14 +84,14 @@ def server_v2_small_shm():
 
 
 # ---------------------------------------------------------------------------
-# V1 mode: SharedClient (v4 handshake) → ServerV2
+# V1 mode: SharedClient (v4 handshake) → Server
 # ---------------------------------------------------------------------------
 
-class TestServerV2BackwardCompat:
-    """ServerV2 must handle v1 wire frames from a v4-handshake client."""
+class TestServerBackwardCompat:
+    """Server must handle v1 wire frames from a v4-handshake client."""
 
-    def test_greeting_v1(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_greeting_legacy(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         try:
             result = pickle.loads(client.call('greeting', pickle.dumps(('World',))))
@@ -99,8 +99,8 @@ class TestServerV2BackwardCompat:
         finally:
             client.terminate()
 
-    def test_add_v1(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_add_legacy(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         try:
             result = pickle.loads(client.call('add', pickle.dumps((7, 8))))
@@ -108,8 +108,8 @@ class TestServerV2BackwardCompat:
         finally:
             client.terminate()
 
-    def test_list_v1(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_list_legacy(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         try:
             result = pickle.loads(
@@ -119,12 +119,12 @@ class TestServerV2BackwardCompat:
         finally:
             client.terminate()
 
-    def test_ping_v1(self, server_v2_addr):
-        assert SharedClient.ping(server_v2_addr)
+    def test_ping(self, server_addr):
+        assert SharedClient.ping(server_addr)
 
     def test_shutdown_v1(self):
         addr = f'ipc-v3://{_unique_region("shut")}'
-        server = ServerV2(
+        server = Server(
             bind_address=addr,
             icrm_class=IHello,
             crm_instance=Hello(),
@@ -137,14 +137,14 @@ class TestServerV2BackwardCompat:
 
 
 # ---------------------------------------------------------------------------
-# V2 mode: SharedClient → ServerV2 (handshake v5)
+# V2 mode: SharedClient → Server (handshake v5)
 # ---------------------------------------------------------------------------
 
-class TestServerV2WireV2:
-    """SharedClient in v2 mode against ServerV2 — control-plane routing."""
+class TestServerWire:
+    """SharedClient against Server — control-plane routing."""
 
-    def test_greeting_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_greeting_routed(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         try:
             
@@ -153,8 +153,8 @@ class TestServerV2WireV2:
         finally:
             client.terminate()
 
-    def test_add_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_add_routed(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         try:
             result = pickle.loads(client.call('add', pickle.dumps((100, 200))))
@@ -162,8 +162,8 @@ class TestServerV2WireV2:
         finally:
             client.terminate()
 
-    def test_list_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_list_routed(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         try:
             result = pickle.loads(
@@ -173,9 +173,9 @@ class TestServerV2WireV2:
         finally:
             client.terminate()
 
-    def test_custom_type_v2(self, server_v2_addr):
-        """Test transferable type round-trip in v2 mode."""
-        client = SharedClient(server_v2_addr)
+    def test_custom_type_routed(self, server_addr):
+        """Test transferable type round-trip via control-plane routing."""
+        client = SharedClient(server_addr)
         client.connect()
         try:
             raw = client.call('get_data', pickle.dumps((42,)))
@@ -188,9 +188,9 @@ class TestServerV2WireV2:
         finally:
             client.terminate()
 
-    def test_v2_method_table_populated(self, server_v2_addr):
+    def test_method_table_populated(self, server_addr):
         """Verify that v5 handshake populates method table on client."""
-        client = SharedClient(server_v2_addr)
+        client = SharedClient(server_addr)
         client.connect()
         try:
             assert client._method_table is not None
@@ -202,15 +202,15 @@ class TestServerV2WireV2:
 
 
 # ---------------------------------------------------------------------------
-# V2 mode: inline path (small SHM threshold)
+# Inline path (small SHM threshold)
 # ---------------------------------------------------------------------------
 
-class TestServerV2InlinePath:
+class TestServerInlinePath:
     """Force the inline path by using a very small SHM threshold."""
 
-    def test_greeting_inline_v1(self, server_v2_small_shm):
+    def test_greeting_inline(self, server_small_shm):
         client = SharedClient(
-            server_v2_small_shm,
+            server_small_shm,
             ipc_config=IPCConfig(shm_threshold=16),
         )
         client.connect()
@@ -225,11 +225,11 @@ class TestServerV2InlinePath:
 # Concurrent calls
 # ---------------------------------------------------------------------------
 
-class TestServerV2Concurrent:
-    """Multiple concurrent calls to ServerV2."""
+class TestServerConcurrent:
+    """Multiple concurrent calls to Server."""
 
-    def test_concurrent_v1(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_concurrent_legacy(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         errors: list[str] = []
 
@@ -253,8 +253,8 @@ class TestServerV2Concurrent:
         finally:
             client.terminate()
 
-    def test_concurrent_v2(self, server_v2_addr):
-        client = SharedClient(server_v2_addr)
+    def test_concurrent_routed(self, server_addr):
+        client = SharedClient(server_addr)
         client.connect()
         errors: list[str] = []
 

@@ -3,7 +3,7 @@
 Provides a singleton :class:`_ProcessRegistry` that manages:
 
 1. **CRM registration** — registers CRM objects to a process-level
-   :class:`ServerV2`, making them accessible via IPC.
+   :class:`Server`, making them accessible via IPC.
 2. **Thread preference** — ``connect()`` returns a zero-serialization
    :class:`ICRMProxy.thread_local` when the target CRM lives in the
    same process.
@@ -49,7 +49,7 @@ from .client.http import HttpClientPool
 from .client.pool import ClientPool
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
-from .server.core import ServerV2
+from .server.core import Server
 
 from ..crm.meta import MethodAccess
 from .ipc.frame import IPCConfig
@@ -115,7 +115,7 @@ class _ProcessRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._registrations: dict[str, _Registration] = {}
-        self._server: ServerV2 | None = None
+        self._server: Server | None = None
         self._server_address: str | None = None
         self._explicit_address: str | None = None
         self._explicit_ipc_config: IPCConfig | None = None
@@ -192,7 +192,7 @@ class _ProcessRegistry:
     ) -> str:
         """Register a CRM, making it available via :func:`connect`.
 
-        On the first call, a :class:`ServerV2` is created and started
+        On the first call, a :class:`Server` is created and started
         automatically (lazy init).
 
         If ``C2_RELAY_ADDRESS`` is set, the CRM is also registered with
@@ -227,7 +227,7 @@ class _ProcessRegistry:
                     or self._auto_address()
                 )
                 ipc_cfg = self._build_ipc_config()
-                self._server = ServerV2(bind_address=addr, ipc_config=ipc_cfg)
+                self._server = Server(bind_address=addr, ipc_config=ipc_cfg)
                 self._server_address = addr
                 # Share the same config with the client pool.
                 self._pool.set_default_config(ipc_cfg)
@@ -398,7 +398,7 @@ class _ProcessRegistry:
             try:
                 server.shutdown()
             except Exception:
-                log.warning('Error shutting down ServerV2', exc_info=True)
+                log.warning('Error shutting down Server', exc_info=True)
 
         self._pool.shutdown_all()
         self._http_pool.shutdown_all()

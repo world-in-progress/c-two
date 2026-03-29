@@ -1,15 +1,15 @@
-"""Unit tests for rpc_v2 wire v2 codec and protocol v3.1."""
+"""Unit tests for wire codec and protocol v3.1."""
 from __future__ import annotations
 
 import pytest
 
 from c_two.transport.protocol import (
-    FLAG_CALL_V2,
-    FLAG_REPLY_V2,
+    FLAG_CALL,
+    FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
     HANDSHAKE_V5,
-    CAP_CALL_V2,
+    CAP_CALL,
     CAP_METHOD_IDX,
     CAP_CHUNKED,
     STATUS_SUCCESS,
@@ -30,22 +30,22 @@ from c_two.transport.wire import (
     decode_reply_control,
     encode_chunk_header,
     decode_chunk_header,
-    encode_v2_buddy_call_frame,
-    encode_v2_inline_call_frame,
-    encode_v2_buddy_reply_frame,
-    encode_v2_inline_reply_frame,
-    encode_v2_error_reply_frame,
-    encode_v2_buddy_chunked_call_frame,
-    encode_v2_inline_chunked_call_frame,
-    encode_v2_buddy_chunked_reply_frame,
-    encode_v2_inline_chunked_reply_frame,
+    encode_buddy_call_frame,
+    encode_inline_call_frame,
+    encode_buddy_reply_frame,
+    encode_inline_reply_frame,
+    encode_error_reply_frame,
+    encode_buddy_chunked_call_frame,
+    encode_inline_chunked_call_frame,
+    encode_buddy_chunked_reply_frame,
+    encode_inline_chunked_reply_frame,
 )
 from c_two.transport.ipc.frame import FRAME_STRUCT, FLAG_RESPONSE
 from c_two.transport.ipc.buddy import FLAG_BUDDY, BUDDY_PAYLOAD_STRUCT
 
 
 # ---------------------------------------------------------------------------
-# Wire v2 call control round-trip
+# Call control round-trip
 # ---------------------------------------------------------------------------
 
 class TestCallControl:
@@ -83,7 +83,7 @@ class TestCallControl:
 
 
 # ---------------------------------------------------------------------------
-# Wire v2 reply control round-trip
+# Reply control round-trip
 # ---------------------------------------------------------------------------
 
 class TestReplyControl:
@@ -110,16 +110,16 @@ class TestReplyControl:
 
 
 # ---------------------------------------------------------------------------
-# V2 frame builders
+# Frame builders
 # ---------------------------------------------------------------------------
 
-class TestV2FrameBuilders:
+class TestFrameBuilders:
 
     def test_inline_call_frame(self):
-        frame = encode_v2_inline_call_frame(42, 'test.ns', 3, b'hello')
+        frame = encode_inline_call_frame(42, 'test.ns', 3, b'hello')
         total_len, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 42
-        assert flags & FLAG_CALL_V2
+        assert flags & FLAG_CALL
         assert not (flags & FLAG_BUDDY)
         payload = frame[16:]
         ns, idx, consumed = decode_call_control(payload)
@@ -128,14 +128,14 @@ class TestV2FrameBuilders:
         assert payload[consumed:] == b'hello'
 
     def test_buddy_call_frame(self):
-        frame = encode_v2_buddy_call_frame(
+        frame = encode_buddy_call_frame(
             request_id=7, seg_idx=0, offset=1024, data_size=8192,
             is_dedicated=False, name='ns', method_idx=1,
         )
         total_len, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 7
         assert flags & FLAG_BUDDY
-        assert flags & FLAG_CALL_V2
+        assert flags & FLAG_CALL
         payload = frame[16:]
         # First 11 bytes = buddy payload
         assert len(payload) >= BUDDY_PAYLOAD_STRUCT.size
@@ -150,11 +150,11 @@ class TestV2FrameBuilders:
         assert idx == 1
 
     def test_inline_reply_frame(self):
-        frame = encode_v2_inline_reply_frame(99, b'result')
+        frame = encode_inline_reply_frame(99, b'result')
         total_len, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 99
         assert flags & FLAG_RESPONSE
-        assert flags & FLAG_REPLY_V2
+        assert flags & FLAG_REPLY
         assert not (flags & FLAG_BUDDY)
         payload = frame[16:]
         status, err, consumed = decode_reply_control(payload)
@@ -162,7 +162,7 @@ class TestV2FrameBuilders:
         assert payload[consumed:] == b'result'
 
     def test_buddy_reply_frame(self):
-        frame = encode_v2_buddy_reply_frame(
+        frame = encode_buddy_reply_frame(
             request_id=5, seg_idx=0, offset=0, data_size=4096,
             is_dedicated=False,
         )
@@ -170,7 +170,7 @@ class TestV2FrameBuilders:
         assert rid == 5
         assert flags & FLAG_RESPONSE
         assert flags & FLAG_BUDDY
-        assert flags & FLAG_REPLY_V2
+        assert flags & FLAG_REPLY
         payload = frame[16:]
         assert len(payload) >= BUDDY_PAYLOAD_STRUCT.size + 1
         status = payload[BUDDY_PAYLOAD_STRUCT.size]
@@ -178,11 +178,11 @@ class TestV2FrameBuilders:
 
     def test_error_reply_frame(self):
         err = b'test error'
-        frame = encode_v2_error_reply_frame(88, err)
+        frame = encode_error_reply_frame(88, err)
         total_len, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 88
         assert flags & FLAG_RESPONSE
-        assert flags & FLAG_REPLY_V2
+        assert flags & FLAG_REPLY
         assert not (flags & FLAG_BUDDY)
         payload = frame[16:]
         status, dec_err, consumed = decode_reply_control(payload)
@@ -223,7 +223,7 @@ class TestHandshakeV5:
 
     def test_client_handshake_roundtrip(self):
         segments = [('seg_abc', 268435456)]
-        cap = CAP_CALL_V2 | CAP_METHOD_IDX
+        cap = CAP_CALL | CAP_METHOD_IDX
         encoded = encode_v5_client_handshake(segments, cap)
         assert encoded[0] == HANDSHAKE_V5
         hs = decode_v5_handshake(encoded)
@@ -233,7 +233,7 @@ class TestHandshakeV5:
 
     def test_server_handshake_roundtrip(self):
         segments = [('srv_seg', 134217728)]
-        cap = CAP_CALL_V2 | CAP_METHOD_IDX
+        cap = CAP_CALL | CAP_METHOD_IDX
         route = RouteInfo(
             name='hello',
             methods=[
@@ -258,7 +258,7 @@ class TestHandshakeV5:
         segs = [('s1', 100), ('s2', 200)]
         r1 = RouteInfo('route_a', [MethodEntry('m1', 0)])
         r2 = RouteInfo('route_b', [MethodEntry('m2', 0), MethodEntry('m3', 1)])
-        encoded = encode_v5_server_handshake(segs, CAP_CALL_V2, [r1, r2])
+        encoded = encode_v5_server_handshake(segs, CAP_CALL, [r1, r2])
         hs = decode_v5_handshake(encoded)
         assert len(hs.segments) == 2
         assert len(hs.routes) == 2
@@ -267,7 +267,7 @@ class TestHandshakeV5:
         assert len(hs.routes[1].methods) == 2
 
     def test_empty_segments(self):
-        encoded = encode_v5_client_handshake([], CAP_CALL_V2)
+        encoded = encode_v5_client_handshake([], CAP_CALL)
         hs = decode_v5_handshake(encoded)
         assert hs.segments == []
 
@@ -328,7 +328,7 @@ class TestChunkedCallFrames:
 
     def test_buddy_chunked_first_chunk(self):
         """First chunk carries call control (route + method_idx)."""
-        frame = encode_v2_buddy_chunked_call_frame(
+        frame = encode_buddy_chunked_call_frame(
             request_id=42, seg_idx=0, offset=1024, data_size=4096,
             is_dedicated=False, chunk_idx=0, total_chunks=4,
             name='myroute', method_idx=3,
@@ -336,7 +336,7 @@ class TestChunkedCallFrames:
         _, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 42
         assert flags & FLAG_BUDDY
-        assert flags & FLAG_CALL_V2
+        assert flags & FLAG_CALL
         assert flags & FLAG_CHUNKED
         assert not (flags & FLAG_CHUNK_LAST)
         payload = frame[16:]
@@ -354,7 +354,7 @@ class TestChunkedCallFrames:
 
     def test_buddy_chunked_middle_chunk(self):
         """Middle chunk has no call control."""
-        frame = encode_v2_buddy_chunked_call_frame(
+        frame = encode_buddy_chunked_call_frame(
             request_id=42, seg_idx=1, offset=0, data_size=8192,
             is_dedicated=False, chunk_idx=2, total_chunks=4,
         )
@@ -368,7 +368,7 @@ class TestChunkedCallFrames:
 
     def test_buddy_chunked_last_chunk(self):
         """Last chunk sets FLAG_CHUNK_LAST."""
-        frame = encode_v2_buddy_chunked_call_frame(
+        frame = encode_buddy_chunked_call_frame(
             request_id=42, seg_idx=0, offset=0, data_size=2048,
             is_dedicated=False, chunk_idx=3, total_chunks=4,
         )
@@ -378,7 +378,7 @@ class TestChunkedCallFrames:
 
     def test_single_chunk_degeneracy(self):
         """Single chunk (total=1): both CHUNKED and CHUNK_LAST set."""
-        frame = encode_v2_buddy_chunked_call_frame(
+        frame = encode_buddy_chunked_call_frame(
             request_id=1, seg_idx=0, offset=0, data_size=100,
             is_dedicated=False, chunk_idx=0, total_chunks=1,
             name='ns', method_idx=0,
@@ -395,13 +395,13 @@ class TestChunkedCallFrames:
     def test_inline_chunked_first_chunk(self):
         """Inline chunked: first chunk has call control + data."""
         data = b'hello world'
-        frame = encode_v2_inline_chunked_call_frame(
+        frame = encode_inline_chunked_call_frame(
             request_id=99, chunk_idx=0, total_chunks=3,
             data=data, name='route', method_idx=5,
         )
         _, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 99
-        assert flags & FLAG_CALL_V2
+        assert flags & FLAG_CALL
         assert flags & FLAG_CHUNKED
         assert not (flags & FLAG_BUDDY)
         assert not (flags & FLAG_CHUNK_LAST)
@@ -418,7 +418,7 @@ class TestChunkedCallFrames:
     def test_inline_chunked_subsequent_chunk(self):
         """Inline chunked: subsequent chunk has no call control."""
         data = b'\xff' * 100
-        frame = encode_v2_inline_chunked_call_frame(
+        frame = encode_inline_chunked_call_frame(
             request_id=99, chunk_idx=1, total_chunks=3, data=data,
         )
         _, _, flags = FRAME_STRUCT.unpack(frame[:16])
@@ -431,7 +431,7 @@ class TestChunkedCallFrames:
         assert payload[cc:] == data
 
     def test_inline_chunked_last_chunk(self):
-        frame = encode_v2_inline_chunked_call_frame(
+        frame = encode_inline_chunked_call_frame(
             request_id=99, chunk_idx=2, total_chunks=3, data=b'end',
         )
         _, _, flags = FRAME_STRUCT.unpack(frame[:16])
@@ -447,7 +447,7 @@ class TestChunkedReplyFrames:
 
     def test_buddy_chunked_reply_first(self):
         """First reply chunk has status byte."""
-        frame = encode_v2_buddy_chunked_reply_frame(
+        frame = encode_buddy_chunked_reply_frame(
             request_id=10, seg_idx=0, offset=0, data_size=4096,
             is_dedicated=False, chunk_idx=0, total_chunks=2,
         )
@@ -455,7 +455,7 @@ class TestChunkedReplyFrames:
         assert rid == 10
         assert flags & FLAG_RESPONSE
         assert flags & FLAG_BUDDY
-        assert flags & FLAG_REPLY_V2
+        assert flags & FLAG_REPLY
         assert flags & FLAG_CHUNKED
         assert not (flags & FLAG_CHUNK_LAST)
         payload = frame[16:]
@@ -467,7 +467,7 @@ class TestChunkedReplyFrames:
 
     def test_buddy_chunked_reply_subsequent(self):
         """Subsequent reply chunk has no status byte."""
-        frame = encode_v2_buddy_chunked_reply_frame(
+        frame = encode_buddy_chunked_reply_frame(
             request_id=10, seg_idx=0, offset=4096, data_size=2048,
             is_dedicated=False, chunk_idx=1, total_chunks=2,
         )
@@ -480,13 +480,13 @@ class TestChunkedReplyFrames:
 
     def test_inline_chunked_reply_first(self):
         data = b'result part 1'
-        frame = encode_v2_inline_chunked_reply_frame(
+        frame = encode_inline_chunked_reply_frame(
             request_id=20, chunk_idx=0, total_chunks=3, data=data,
         )
         _, rid, flags = FRAME_STRUCT.unpack(frame[:16])
         assert rid == 20
         assert flags & FLAG_RESPONSE
-        assert flags & FLAG_REPLY_V2
+        assert flags & FLAG_REPLY
         assert flags & FLAG_CHUNKED
         assert not (flags & FLAG_BUDDY)
         payload = frame[16:]
@@ -499,7 +499,7 @@ class TestChunkedReplyFrames:
 
     def test_inline_chunked_reply_subsequent(self):
         data = b'result part 2'
-        frame = encode_v2_inline_chunked_reply_frame(
+        frame = encode_inline_chunked_reply_frame(
             request_id=20, chunk_idx=1, total_chunks=3, data=data,
         )
         payload = frame[16:]
@@ -509,7 +509,7 @@ class TestChunkedReplyFrames:
         assert payload[cc:] == data
 
     def test_inline_chunked_reply_last(self):
-        frame = encode_v2_inline_chunked_reply_frame(
+        frame = encode_inline_chunked_reply_frame(
             request_id=20, chunk_idx=2, total_chunks=3, data=b'fin',
         )
         _, _, flags = FRAME_STRUCT.unpack(frame[:16])
@@ -523,7 +523,7 @@ class TestChunkedReplyFrames:
 class TestCapChunked:
 
     def test_cap_chunked_roundtrip(self):
-        caps = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED
+        caps = CAP_CALL | CAP_METHOD_IDX | CAP_CHUNKED
         encoded = encode_v5_client_handshake([('seg', 256)], caps)
         hs = decode_v5_handshake(encoded)
         assert hs.capability_flags & CAP_CHUNKED
@@ -531,7 +531,7 @@ class TestCapChunked:
 
     def test_cap_without_chunked(self):
         """Capability without CAP_CHUNKED — older client."""
-        caps = CAP_CALL_V2 | CAP_METHOD_IDX
+        caps = CAP_CALL | CAP_METHOD_IDX
         encoded = encode_v5_client_handshake([('seg', 256)], caps)
         hs = decode_v5_handshake(encoded)
         assert not (hs.capability_flags & CAP_CHUNKED)
@@ -574,7 +574,7 @@ class TestChunkedFrameEdgeCases:
 
     def test_inline_chunked_call_empty_payload(self):
         """Inline chunked call with empty chunk data."""
-        frame = encode_v2_inline_chunked_call_frame(
+        frame = encode_inline_chunked_call_frame(
             request_id=1, chunk_idx=0, total_chunks=1,
             data=b'', name='r', method_idx=0,
         )
@@ -582,7 +582,7 @@ class TestChunkedFrameEdgeCases:
 
     def test_inline_chunked_reply_empty_payload(self):
         """Inline chunked reply with empty chunk data."""
-        frame = encode_v2_inline_chunked_reply_frame(
+        frame = encode_inline_chunked_reply_frame(
             request_id=1, chunk_idx=0, total_chunks=1, data=b'',
         )
         assert len(frame) > 0

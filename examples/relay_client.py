@@ -1,10 +1,10 @@
 """SOTA API — HTTP relay client.
 
-Connects to the relay server started by ``v2_relay_server.py`` via HTTP
+Connects to the relay server started by ``relay_server.py`` via HTTP
 and invokes CRM methods through the ICRM proxy — identical API to IPC.
 
-Run (after starting v2_relay_server.py in another terminal):
-    uv run python examples/v2_relay_client.py
+Run (after starting relay_server.py in another terminal):
+    uv run python examples/relay_client.py
 """
 import os, sys
 

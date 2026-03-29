@@ -4,10 +4,10 @@ Registers CRMs and keeps the process alive so remote clients can connect
 via IPC.  Press Ctrl-C to shut down.
 
 Run:
-    uv run python examples/v2_server.py
+    uv run python examples/server.py
 
 Then in another terminal:
-    uv run python examples/v2_client.py
+    uv run python examples/client.py
 """
 import os, sys, signal, threading
 
@@ -18,7 +18,7 @@ import c_two as cc
 from icrm import IGrid
 from crm import Grid
 
-BIND_ADDRESS = 'ipc-v3://v2_grid'
+BIND_ADDRESS = 'ipc-v3://grid'
 
 
 def main():

@@ -1,7 +1,7 @@
-"""Integration tests for multi-CRM ServerV2.
+"""Integration tests for multi-CRM Server.
 
-Tests that a single ServerV2 can host multiple CRM resources under
-distinct routing names, routed via v2 control-plane name field.
+Tests that a single Server can host multiple CRM resources under
+distinct routing names, routed via control-plane name field.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import uuid
 
 import pytest
 
-from c_two.transport import ServerV2, ConcurrencyConfig, ConcurrencyMode
+from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
 from c_two.transport.client.core import SharedClient
 from c_two.transport.wire import MethodTable
 
@@ -45,9 +45,9 @@ def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
 
 @pytest.fixture
 def multi_crm_addr():
-    """Start a ServerV2 hosting Hello + Counter CRMs."""
+    """Start a Server hosting Hello + Counter CRMs."""
     addr = f'ipc-v3://{_unique_region()}'
-    server = ServerV2(bind_address=addr)
+    server = Server(bind_address=addr)
     server.register_crm(IHello, Hello(), name='hello')
     server.register_crm(ICounter, Counter(initial=100), name='counter')
     server.start()
@@ -60,7 +60,7 @@ def multi_crm_addr():
 def single_then_add_addr():
     """Start with one CRM, add second after start."""
     addr = f'ipc-v3://{_unique_region()}'
-    server = ServerV2(
+    server = Server(
         bind_address=addr,
         icrm_class=IHello,
         crm_instance=Hello(),
@@ -80,14 +80,14 @@ class TestRegistrationAPI:
 
     def test_register_returns_name(self):
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         result = server.register_crm(IHello, Hello(), name='hello')
         assert result == 'hello'
         server.shutdown()
 
     def test_duplicate_name_raises(self):
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         with pytest.raises(ValueError, match='already registered'):
             server.register_crm(IHello, Hello(), name='hello')
@@ -95,7 +95,7 @@ class TestRegistrationAPI:
 
     def test_names_property(self):
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(), name='counter')
         assert set(server.names) == {'hello', 'counter'}
@@ -103,7 +103,7 @@ class TestRegistrationAPI:
 
     def test_unregister(self):
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(), name='counter')
         server.unregister_crm('counter')
@@ -112,26 +112,26 @@ class TestRegistrationAPI:
 
     def test_unregister_unknown_raises(self):
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         with pytest.raises(KeyError):
             server.unregister_crm('nonexistent')
         server.shutdown()
 
     def test_no_crm_constructor(self):
-        """ServerV2 can be created without any initial CRM."""
+        """Server can be created without any initial CRM."""
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         assert server.names == []
         server.shutdown()
 
 
 # ---------------------------------------------------------------------------
-# Tests — multi-CRM v2 routing
+# Tests — multi-CRM routing
 # ---------------------------------------------------------------------------
 
 class TestMultiCRMRouting:
 
-    def test_v2_hello_greeting(self, multi_crm_addr):
+    def test_hello_greeting(self, multi_crm_addr):
         addr, _server = multi_crm_addr
         client = SharedClient(addr)
         client.connect()
@@ -143,7 +143,7 @@ class TestMultiCRMRouting:
         finally:
             client.terminate()
 
-    def test_v2_counter_get(self, multi_crm_addr):
+    def test_counter_get(self, multi_crm_addr):
         addr, _server = multi_crm_addr
         client = SharedClient(addr)
         client.connect()
@@ -155,7 +155,7 @@ class TestMultiCRMRouting:
         finally:
             client.terminate()
 
-    def test_v2_both_names_same_client(self, multi_crm_addr):
+    def test_both_names_same_client(self, multi_crm_addr):
         """A single client can call methods on both CRMs."""
         addr, _server = multi_crm_addr
         client = SharedClient(addr)
@@ -172,7 +172,7 @@ class TestMultiCRMRouting:
         finally:
             client.terminate()
 
-    def test_v2_counter_increment(self, multi_crm_addr):
+    def test_counter_increment(self, multi_crm_addr):
         """Stateful CRM — increment counter and read back."""
         addr, _server = multi_crm_addr
         client = SharedClient(addr)
@@ -189,7 +189,7 @@ class TestMultiCRMRouting:
         finally:
             client.terminate()
 
-    def test_v2_handshake_returns_all_routes(self, multi_crm_addr):
+    def test_handshake_returns_all_routes(self, multi_crm_addr):
         addr, _server = multi_crm_addr
         client = SharedClient(addr)
         client.connect()
@@ -209,7 +209,7 @@ class TestMultiCRMRouting:
         finally:
             client.terminate()
 
-    def test_v2_unknown_name_returns_error(self, multi_crm_addr):
+    def test_unknown_name_returns_error(self, multi_crm_addr):
         """Calling a non-existent route name returns an error."""
         addr, _server = multi_crm_addr
         client = SharedClient(addr)
@@ -258,7 +258,7 @@ class TestDynamicRegistration:
         server.register_crm(ICounter, Counter(initial=42), name='counter')
         assert set(server.names) == {'hello', 'counter'}
 
-        # Connect with v2 and call the new CRM.
+        # Connect and call the new CRM.
         client = SharedClient(addr)
         client.connect()
         try:
@@ -272,7 +272,7 @@ class TestDynamicRegistration:
     def test_unregister_default_shifts(self):
         """Unregistering the default route shifts to the next one."""
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr)
+        server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(), name='counter')
 

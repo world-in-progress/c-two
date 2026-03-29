@@ -10,7 +10,7 @@ import pytest
 
 from c_two.transport.client.pool import ClientPool
 from c_two.transport.client.core import SharedClient
-from c_two.transport.server.core import ServerV2
+from c_two.transport.server.core import Server
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -50,7 +50,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 @pytest.fixture
 def ipc_v3_addr():
     addr = f'ipc-v3://{_unique_region()}'
-    server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello())
+    server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello())
     server.start()
     _wait_for_server(addr)
 

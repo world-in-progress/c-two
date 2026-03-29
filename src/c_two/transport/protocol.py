@@ -1,7 +1,7 @@
-"""Protocol v3.1 extensions for rpc_v2.
+"""Protocol v3.1 — frame flag extensions and handshake v5.
 
 Extends the IPC v3 buddy protocol with:
-- ``FLAG_CALL_V2`` / ``FLAG_REPLY_V2`` frame flags for control-plane routing
+- ``FLAG_CALL`` / ``FLAG_REPLY`` frame flags for control-plane routing
 - Handshake v5 with capability negotiation and method index exchange
 - Reply status codes (success / error, no per-byte overhead in SHM)
 
@@ -14,8 +14,8 @@ Frame flag bit allocation (32-bit LE flags field in the 16-byte frame header):
     Bit 4: FLAG_CTRL           — control message
     Bit 5: FLAG_DISK_SPILL     — reserved
     Bit 6: FLAG_BUDDY          — buddy-allocated SHM block
-    Bit 7: FLAG_CALL_V2        — v2 call frame (control-plane routing)
-    Bit 8: FLAG_REPLY_V2       — v2 reply frame (control-plane status)
+    Bit 7: FLAG_CALL           — call frame (control-plane routing)
+    Bit 8: FLAG_REPLY          — reply frame (control-plane status)
     Bit 9: FLAG_CHUNKED        — frame is part of a chunked sequence
     Bit 10: FLAG_CHUNK_LAST    — last frame in the chunked sequence
     Bit 11: FLAG_SIGNAL        — frame carries a 1-byte signal (PING, SHUTDOWN, etc.)
@@ -29,8 +29,8 @@ from dataclasses import dataclass, field
 # Flag constants
 # ---------------------------------------------------------------------------
 
-FLAG_CALL_V2  = 1 << 7   # 0x80  — v2 call frame with control-plane routing
-FLAG_REPLY_V2 = 1 << 8   # 0x100 — v2 reply frame with control-plane status
+FLAG_CALL  = 1 << 7   # 0x80  — call frame with control-plane routing
+FLAG_REPLY = 1 << 8   # 0x100 — reply frame with control-plane status
 
 # Chunked transfer flags
 FLAG_CHUNKED    = 1 << 9   # 0x200 — frame is part of a chunked sequence
@@ -44,12 +44,12 @@ FLAG_SIGNAL     = 1 << 11  # 0x800 — frame carries a 1-byte signal (PING, SHUT
 HANDSHAKE_V5 = 5
 
 # Capability flags (2 bytes, exchanged in handshake v5)
-CAP_CALL_V2    = 1 << 0  # Supports v2 call/reply frames
+CAP_CALL    = 1 << 0  # Supports call/reply frames
 CAP_METHOD_IDX = 1 << 1  # Supports method indexing (2-byte index vs UTF-8 name)
 CAP_CHUNKED    = 1 << 2  # Supports chunked transfer for large payloads
 
 # ---------------------------------------------------------------------------
-# Reply status codes (1 byte, in v2 reply control payload)
+# Reply status codes (1 byte, in reply control payload)
 # ---------------------------------------------------------------------------
 
 STATUS_SUCCESS = 0x00     # Result data follows (inline or in buddy SHM)
@@ -119,7 +119,7 @@ class HandshakeV5:
 
 def encode_v5_client_handshake(
     segments: list[tuple[str, int]],
-    capability_flags: int = CAP_CALL_V2 | CAP_METHOD_IDX,
+    capability_flags: int = CAP_CALL | CAP_METHOD_IDX,
 ) -> bytes:
     """Encode client→server handshake v5.
 

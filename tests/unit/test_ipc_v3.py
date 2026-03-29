@@ -22,7 +22,7 @@ from c_two.transport.ipc.buddy import (
     BUDDY_REUSE_FLAG,
     HANDSHAKE_VERSION,
 )
-from c_two.transport.server.core import ServerV2
+from c_two.transport.server.core import Server
 from c_two.transport.client.core import SharedClient
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -136,7 +136,7 @@ def _unique_region():
 def ipc_v3_server():
     """Start an IPC v3 server, yield address, shut down."""
     addr = f'ipc-v3://{_unique_region()}'
-    server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+    server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
     server.start()
     _wait_for_server(addr)
     yield addr
@@ -170,7 +170,7 @@ class TestIPCv3Lifecycle:
 
     def test_shutdown(self):
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+        server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
         server.start()
         _wait_for_server(addr)
         server.shutdown()
@@ -215,7 +215,7 @@ class TestIPCv3BuddyPath:
             shm_threshold=1024,
             pool_segment_size=64 * 1024,
         )
-        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), ipc_config=ipc_config, name='default')
+        server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), ipc_config=ipc_config, name='default')
         server.start()
         _wait_for_server(addr)
         try:
@@ -284,7 +284,7 @@ class TestOPTC1SafeBytesCopy:
             shm_threshold=512,
             pool_segment_size=64 * 1024,
         )
-        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), ipc_config=ipc_config, name='default')
+        server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), ipc_config=ipc_config, name='default')
         server.start()
         _wait_for_server(addr)
         try:
@@ -350,7 +350,7 @@ class TestIPCv3StressRecovery:
     def test_rapid_connect_disconnect(self):
         """Rapid connect/disconnect cycles should not leak resources."""
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+        server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
         server.start()
         _wait_for_server(addr)
         try:
@@ -367,7 +367,7 @@ class TestIPCv3StressRecovery:
     def test_concurrent_clients_heavy(self):
         """8 threads × 20 iterations stress test."""
         addr = f'ipc-v3://{_unique_region()}'
-        server = ServerV2(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
+        server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
         server.start()
         _wait_for_server(addr)
         errors = []
