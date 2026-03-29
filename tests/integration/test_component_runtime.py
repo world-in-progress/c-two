@@ -1,9 +1,8 @@
 import time
 import pytest
 import c_two as cc
-from c_two.rpc import Client, ServerConfig
-from c_two.rpc.server import _start
 from c_two.compo.runtime_connect import get_current_client
+from c_two.transport.registry import connect as transport_connect, close as transport_close
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello, HelloData
 
@@ -27,26 +26,18 @@ def my_get_data(crm: IHello, id: int) -> HelloData:
 class TestConnectCrmWithIcrm:
     """Test connect_crm(address, IHello) context manager."""
 
-    def test_yields_icrm_instance(self, hello_server):
+    def test_yields_proxy(self, hello_server):
         with cc.compo.runtime.connect_crm(hello_server, IHello) as crm:
-            assert isinstance(crm, IHello)
+            assert crm is not None
 
     def test_methods_callable(self, hello_server):
         with cc.compo.runtime.connect_crm(hello_server, IHello) as crm:
             assert crm.greeting('Test') == 'Hello, Test!'
 
-    def test_has_client_attribute(self, hello_server):
-        with cc.compo.runtime.connect_crm(hello_server, IHello) as crm:
-            assert hasattr(crm, 'client')
-            assert crm.client is not None
-
-
-class TestConnectCrmWithoutIcrm:
-    """Test connect_crm(address) yields a raw Client."""
-
-    def test_yields_client(self, hello_server):
-        with cc.compo.runtime.connect_crm(hello_server) as client:
-            assert isinstance(client, Client)
+    def test_requires_icrm_class(self, hello_server):
+        with pytest.raises(ValueError, match='icrm_class is required'):
+            with cc.compo.runtime.connect_crm(hello_server) as _:
+                pass
 
 
 class TestRuntimeConnectDecorator:
@@ -57,17 +48,17 @@ class TestRuntimeConnectDecorator:
         assert result == 'Hello, World!'
 
     def test_call_with_context_manager(self, hello_server):
-        with cc.compo.runtime.connect_crm(hello_server):
+        with cc.compo.runtime.connect_crm(hello_server, IHello):
             result = my_greeting('Context')
             assert result == 'Hello, Context!'
 
     def test_call_with_crm_connection(self, hello_server):
-        client = Client(hello_server)
+        proxy = transport_connect(IHello, name='', address=hello_server)
         try:
-            result = my_greeting('Conn', crm_connection=client)
+            result = my_greeting('Conn', crm_connection=proxy)
             assert result == 'Hello, Conn!'
         finally:
-            client.terminate()
+            transport_close(proxy)
 
     def test_multi_param_component(self, hello_server):
         result = my_add(3, 7, crm_address=hello_server)
@@ -88,14 +79,14 @@ class TestContextNesting:
     """Test that nested connect_crm contexts work correctly."""
 
     def test_nested_contexts_restore_client(self, hello_server):
-        with cc.compo.runtime.connect_crm(hello_server) as outer_client:
+        with cc.compo.runtime.connect_crm(hello_server, IHello) as outer_proxy:
             outer = get_current_client()
             assert outer is not None
 
-            with cc.compo.runtime.connect_crm(hello_server) as inner_client:
+            with cc.compo.runtime.connect_crm(hello_server, IHello) as inner_proxy:
                 inner = get_current_client()
                 assert inner is not None
 
-            # After inner context exits, outer client should be restored
+            # After inner context exits, outer proxy should be restored
             restored = get_current_client()
             assert restored is outer

@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-# Full test suite (616 tests, ~3 min)
+# Full test suite (855 tests, ~80s on Apple Silicon)
 uv run pytest -q
 
 # Single test file
@@ -16,39 +16,75 @@ uv run pytest tests/unit/test_transferable.py::TestTransferableDecorator::test_h
 uv run pytest -v --timeout=30
 ```
 
-All tests use a **30-second per-test timeout**. Tests are parametrized across 7 transport protocols: `thread`, `memory`, `tcp`, `http`, `ipc` (v3, default), `ipc-v2`, `ipc-v3`.
+All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-threaded).
 
 ---
 
 ## Unit Tests (`tests/unit/`)
 
+### CRM Core
+
 | File | Description |
 |------|-------------|
 | `test_icrm_decorator.py` | `@cc.icrm()` decorator, namespace/version validation, method registration |
-| `test_server_config.py` | `ServerConfig` validation — ICRM-CRM method matching, missing method detection |
 | `test_crm_template.py` | CRM template generation from ICRM interface classes |
-| `test_encoding.py` | Wire protocol encoding/decoding — `Event`, `EventTag`, message serialization |
-| `test_event.py` | `Event` / `EventQueue` lifecycle — round-trip serialization, queue mechanics |
+| `test_encoding.py` | Wire protocol encoding/decoding, message serialization |
 | `test_error.py` | `CCError` hierarchy — serialization/deserialization across wire |
 | `test_transferable.py` | `@transferable` decorator — serialize/deserialize, auto-dataclass, scatter-write tuples, memoryview-aware deserialize, bytes fast-path |
+| `test_shutdown_decorator.py` | `@cc.on_shutdown` CRM lifecycle cleanup |
+
+### rpc_v2 Transport
+
+| File | Description |
+|------|-------------|
+| `test_wire_v2.py` | Wire v2 codec — call/reply control encoding, default-route cache |
+| `test_scheduler.py` | Read/write concurrency scheduler for CRM method dispatch |
 | `test_concurrency.py` | Read/write lock semantics for ICRM method scheduling |
-| `test_adaptive_buffer.py` | `AdaptiveBuffer` — grow/shrink, idle decay (used by IPC v2 client) |
-| `test_buddy_pool.py` | Rust buddy allocator (`c2_buddy`) — alloc/free, pool stats, dedicated fallback, FFI bindings, segment lifecycle, stale cleanup |
-| `test_ipc_v3.py` | IPC v3 transport — buddy handshake, wire frames, inline/buddy paths, reuse path, boundary checks, shutdown safety |
+| `test_shared_client.py` | `SharedClient` — multiplexed IPC v3 client lifecycle |
+| `test_client_pool.py` | `ClientPool` — ref-counted SharedClient management, grace period |
+| `test_icrm_proxy.py` | `ICRMProxy` — thread-local and IPC modes, method routing |
+| `test_proxy_concurrency.py` | ICRMProxy concurrency under read/write access control |
+| `test_chunk_assembler.py` | Chunk assembler — OOM validation, reassembly, boundary checks |
+| `test_serve.py` | `cc.serve()` API — server start/stop lifecycle |
+| `test_security_v2.py` | v2 handshake security, frame validation |
+| `test_name_collision.py` | Multi-CRM name collision detection |
+| `test_adaptive_buffer.py` | `AdaptiveBuffer` — grow/shrink, idle decay |
+| `test_op2_safety.py` | Safety regressions — deferred free, TOCTOU, err_len bounds, scatter-write, double-free guard |
+
+### IPC & Buddy Allocator
+
+| File | Description |
+|------|-------------|
+| `test_buddy_pool.py` | Rust buddy allocator — alloc/free, pool stats, dedicated fallback, FFI, segment lifecycle, stale cleanup |
+| `test_ipc_v3.py` | IPC v3 transport — buddy handshake, wire frames, inline/buddy paths, boundary checks, shutdown safety |
 | `test_ipc_security.py` | IPC handshake security — SHM name validation, segment count DoS limits, malformed frame handling |
-| `test_op2_safety.py` | Safety regression tests from op2 audit — deferred free, TOCTOU, err_len bounds, scatter-write, double-free guard |
+
+### Relay
+
+| File | Description |
+|------|-------------|
+| `test_cli_relay.py` | CLI relay commands — start/stop, config |
+| `test_http_client.py` | HTTP client transport — request/response, error handling |
+| `test_native_relay.py` | `NativeRelay` (Rust/axum) — start/stop, upstream registration |
+| `test_relay_graceful_shutdown.py` | Relay graceful shutdown — drain, timeout |
 
 ## Integration Tests (`tests/integration/`)
 
 | File | Description |
 |------|-------------|
-| `test_server_client.py` | End-to-end server↔client across all protocols — call, relay, ping, shutdown |
-| `test_grid_operations.py` | Grid CRM domain logic — subdivide, merge, attribute queries |
-| `test_component_runtime.py` | Component `@cc.runtime.connect` — injection, type matching, address passing |
-| `test_concurrency_scheduler.py` | Read/write concurrency scheduling under concurrent client load |
+| `test_rpc_v2_server.py` | ServerV2 end-to-end — multi-CRM hosting, handshake, method dispatch |
+| `test_rpc_v2_basic.py` | SharedClient backward compatibility with legacy ipc-v3 server |
+| `test_registry.py` | `cc.register()` / `cc.connect()` / `cc.close()` SOTA API lifecycle |
+| `test_multi_crm_server.py` | Multi-CRM routing — name-based dispatch, concurrent access |
+| `test_icrm_proxy.py` | ICRMProxy integration — thread-local + IPC modes end-to-end |
+| `test_chunked_transfer.py` | Large payload chunked transfer across transports |
+| `test_backpressure.py` | Buddy pool OOM backpressure — L0/L1/L2 protection |
+| `test_concurrency_safety.py` | Concurrent client safety under load |
 | `test_error_propagation.py` | CRM-side exceptions propagate to client as typed `CCError` |
-| `test_ipc_v2.py` | IPC v2 specific tests — legacy protocol validation (retained for backwards compat) |
-| `test_router.py` | HTTP Router — worker registration, relay, health endpoint |
+| `test_p0_fixes.py` | P0 regression tests — scheduler, proxy, lifecycle fixes |
+| `test_serve.py` | `cc.serve()` integration — multi-protocol serving |
+| `test_component_runtime.py` | Component `@cc.runtime.connect` — injection, type matching, address passing |
+| `test_http_relay.py` | HTTP relay end-to-end — POST routing, error forwarding |
 
 ## Shared Fixtures (`tests/fixtures/`)
 
@@ -56,6 +92,7 @@ All tests use a **30-second per-test timeout**. Tests are parametrized across 7 
 |------|-------------|
 | `ihello.py` | `IHello` ICRM interface + `HelloData` / `HelloItems` transferable types |
 | `hello.py` | `Hello` CRM implementation (stateful greeting service) |
+| `counter.py` | `ICounter` / `Counter` — minimal read/write CRM for concurrency tests |
 
 ## Protocol Address Fixtures (`tests/conftest.py`)
 

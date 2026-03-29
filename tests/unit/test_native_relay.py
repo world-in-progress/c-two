@@ -83,13 +83,13 @@ class TestNativeRelayUpstreamErrors:
 
 
 class TestNativeRelayWithServer:
-    """Integration test: NativeRelay + real ServerV2 via cc.register."""
+    """Integration test: NativeRelay + real Server via cc.register."""
 
     def test_register_and_list_routes(self):
-        """Register an upstream to a real ServerV2, verify routes appear."""
+        """Register an upstream to a real Server, verify routes appear."""
         import os
         import c_two as cc
-        from c_two.rpc_v2.registry import _ProcessRegistry
+        from c_two.transport.registry import _ProcessRegistry
         from tests.fixtures.hello import Hello
         from tests.fixtures.ihello import IHello
 
@@ -123,9 +123,9 @@ class TestNativeRelayWithServer:
         import os
         import httpx
         import c_two as cc
-        from c_two.rpc_v2.registry import _ProcessRegistry
-        from c_two.rpc_v2.http_client import HttpClient
-        from c_two.rpc_v2.proxy import ICRMProxy
+        from c_two.transport.registry import _ProcessRegistry
+        from c_two.transport.client.http import HttpClient
+        from c_two.transport.client.proxy import ICRMProxy
         from tests.fixtures.hello import Hello
         from tests.fixtures.ihello import IHello
 

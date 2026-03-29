@@ -1,4 +1,4 @@
-"""Unit tests for rpc_v2 Scheduler (read/write concurrency control)."""
+"""Unit tests for Scheduler (read/write concurrency control)."""
 from __future__ import annotations
 
 import threading
@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from c_two.rpc_v2.scheduler import (
+from c_two.transport.server.scheduler import (
     Scheduler,
     ConcurrencyConfig,
     ConcurrencyMode,

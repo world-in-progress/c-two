@@ -3,9 +3,10 @@ import logging
 import threading
 from functools import wraps
 from contextlib import contextmanager
-from typing import ContextManager, Generator, Type, TypeVar, cast, overload
+from typing import ContextManager, Generator, TypeVar, overload
 
-from ..rpc import Client
+from ..transport.registry import connect as _transport_connect
+from ..transport.registry import close as _transport_close
 
 _local = threading.local()
 
@@ -13,143 +14,112 @@ ICRM = TypeVar('ICRM')
 
 logger = logging.getLogger(__name__)
 
-@overload
-def connect_crm(address: str) -> ContextManager[Client]:
-    ...
 
 @overload
-def connect_crm(address: str, icrm_class: Type[ICRM]) -> ContextManager[ICRM]:
+def connect_crm(address: str, icrm_class: type[ICRM], *, crm_name: str = '') -> ContextManager[ICRM]:
     ...
+
 
 @contextmanager
-def connect_crm(address: str, icrm_class: Type[ICRM] = None, **kwargs) -> Generator[Client | ICRM, None, None]:
-    """
-    Context manager to connect to a CRM server.
-    
+def connect_crm(
+    address: str,
+    icrm_class: type[ICRM] = None,
+    *,
+    crm_name: str = '',
+    **kwargs,
+) -> Generator[ICRM, None, None]:
+    """Context manager to connect to a CRM server.
+
     Args:
-        address: The server address string
-        icrm_class: The ICRM class to instantiate
-        **kwargs: Additional keyword arguments passed to Client (e.g., ipc_config)
-        
-    Yields:
-        The connected client instance, or an ICRM instance if icrm_class is provided
+        address: The server address string (e.g., 'ipc-v3://region')
+        icrm_class: The ICRM class to connect as
+        crm_name: The CRM routing name (empty string uses server default)
+        **kwargs: Reserved for future use
     """
-    if isinstance(address, str):
-        # Remote CRM server connection logic
-        client = Client(address, **kwargs)
-        old_client = getattr(_local, 'current_client', None)
-        _local.current_client = client
-        try:
-            if icrm_class is not None:
-                icrm = icrm_class()
-                icrm.client = client
-                yield icrm
-            else:
-                yield client
-        finally:
-            if old_client is not None:
-                _local.current_client = old_client
-            else:
-                if hasattr(_local, 'current_client'):
-                    delattr(_local, 'current_client')
-            client.terminate()
+    if icrm_class is None:
+        raise ValueError('icrm_class is required for connect_crm')
+
+    proxy = _transport_connect(icrm_class, name=crm_name, address=address)
+    old_proxy = getattr(_local, 'current_proxy', None)
+    _local.current_proxy = proxy
+    try:
+        yield proxy
+    finally:
+        if old_proxy is not None:
+            _local.current_proxy = old_proxy
+        elif hasattr(_local, 'current_proxy'):
+            delattr(_local, 'current_proxy')
+        _transport_close(proxy)
+
 
 def get_current_client():
-    """
-    Get the current client from the thread-local storage.
-    """
-    client = getattr(_local, 'current_client', None)
-    return client
+    """Get the current proxy from the thread-local storage."""
+    return getattr(_local, 'current_proxy', None)
 
-def connect(func = None, icrm_class = None) -> callable:
-    """
-    Insert a CRM client into ICRM instance and transfer the instance to a Component function. 
-    
-    Component function
-    --
-    Component function can be reused by different agnostic resources sharing the same `ICRM Specification`.  
-    Common Component function is expected to have inputs:  
-    - `ICRM connected to CRM`
-    - `Component args`  
-    The `ICRM connected to CRM` is an ICRM instance having a specific CRM client.
-    This `ICRM` will direct the Component to a CRM Server and make it calculate with specified resource behind the CRM.
-    
-    Component-related runtime
-    --
-    The Component-related runtime does not know which `CRM client` the Component's ICRM needs until a specified request coming.  
-    Therefore, when the runtime tries to invoke a Component function, it will call from the following arguments:  
-    - `Component args`
-    - `[CRM address (provided by request)]`
-    - `[CRM client (provided for test)]`
-    
-    instead of expected inputs of Component function.
-    
-    connect
-    --    
-    This decorator handles three scenarios in priority order:
-    - Use current_client from runtime context if available (with statement)
-    - Use provided crm_connection if available
-    - Create new client from crm_address if provided
-    
+
+def connect(func=None, icrm_class=None) -> callable:
+    """Decorator: inject a connected ICRM proxy as the first argument.
+
     Supports both @connect and @connect() usage patterns.
-    
-    If icrm_class is None, it will be inferred from the first parameter type annotation of the decorated function.
-    
-    Args:
-        func (callable, optional): The function to decorate
-        icrm_class (type, optional): The ICRM class to use
+    If icrm_class is None, it is inferred from the first parameter's
+    type annotation.
+
+    The decorated function accepts additional kwargs:
+    - crm_address: str — server address
+    - crm_name: str — CRM routing name (default: 'default')
+    - crm_connection: pre-existing proxy (for testing)
     """
     def create_wrapper(func):
-        
-        # Get the icrm_class from the first parameter's type annotation if not provided
         nonlocal icrm_class
         if icrm_class is None:
             signature = inspect.signature(func)
             params = list(signature.parameters.values())
             if params and params[0].annotation != inspect.Parameter.empty:
-                inferred_icrm_class = params[0].annotation
+                icrm_class = params[0].annotation
             else:
-                raise ValueError(f"Could not infer ICRM class from {func.__name__}'s first parameter. "
-                               "Either provide icrm_class explicitly or add type annotations.")
-            icrm_class = inferred_icrm_class
-    
+                raise ValueError(
+                    f"Could not infer ICRM class from {func.__name__}'s first parameter. "
+                    "Either provide icrm_class explicitly or add type annotations."
+                )
+
         @wraps(func)
-        def wrapper(*args: any, crm_address: str = '', crm_connection: Client | None = None):
-            # Check for client in runtime context first (highest priority)
-            current_client = get_current_client()
-            if current_client is not None:
-                # Use client from runtime context (from with statement)
-                client = current_client
-                close_client = False
+        def wrapper(
+            *args,
+            crm_address: str = '',
+            crm_name: str = '',
+            crm_connection=None,
+        ):
+            # Priority: runtime context > provided connection > new from address
+            current = get_current_client()
+            if current is not None:
+                proxy = current
+                close_proxy = False
             elif crm_connection is not None:
-                # Use provided connection
-                client = crm_connection
-                close_client = False
-            elif crm_address != '':
-                # Create new client from address
-                client = Client(crm_address)
-                close_client = True
+                proxy = crm_connection
+                close_proxy = False
+            elif crm_address:
+                proxy = _transport_connect(
+                    icrm_class, name=crm_name, address=crm_address,
+                )
+                close_proxy = True
             else:
-                raise ValueError("No client available: Either use 'with connect_crm()', or provide 'crm_address' or 'crm_connection'")
-            
-            icrm = icrm_class()
-            icrm.client = client
-            
+                raise ValueError(
+                    "No client available: use 'with connect_crm()', "
+                    "or provide 'crm_address' or 'crm_connection'"
+                )
+
             try:
-                return func(icrm, *args)
+                return func(proxy, *args)
             finally:
-                if close_client:
-                    icrm.client.terminate()
+                if close_proxy:
+                    _transport_close(proxy)
+
         return wrapper
-    
-    # Handle both @connect and @connect() usage patterns
+
     if func is not None:
         return create_wrapper(func)
-    
-    # Handle @connect(icrm_class=ICRM) or @connect(ICRM) case
+
     if icrm_class is not None and not isinstance(icrm_class, type) and callable(icrm_class):
-        # In case someone does @connect(some_func)
         return create_wrapper(icrm_class)
-    
-    # Handle @connect() case - returns a decorator
+
     return create_wrapper

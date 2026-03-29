@@ -184,6 +184,7 @@ impl BuddyPool {
     }
 
     /// Extract PID from a segment name like "cc3b{pid:08x}_b0000".
+    #[cfg(target_os = "linux")]
     fn extract_pid_from_name(name: &str) -> Option<u32> {
         // The prefix is "cc3b" (4 chars), followed by 8 hex chars of PID.
         if name.len() >= 12 && name.starts_with("cc3b") {

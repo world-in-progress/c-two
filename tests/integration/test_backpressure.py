@@ -18,10 +18,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytest
 
 from c_two.error import MemoryPressureError
-from c_two.rpc.ipc.ipc_protocol import IPCConfig
-from c_two.rpc_v2.client import SharedClient
-from c_two.rpc_v2.proxy import ICRMProxy
-from c_two.rpc_v2.server import ServerV2
+from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport.client.core import SharedClient
+from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.server.core import Server
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello
@@ -72,12 +72,12 @@ class TestClientInlineFallback:
         """Payload fits inline but not in a tiny pool → inline fallback succeeds."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -93,12 +93,12 @@ class TestClientInlineFallback:
         """Payload fits within the buddy pool → normal SHM path."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -133,12 +133,12 @@ class TestServerInlineFallback:
         """Server's response alloc fails → falls back to inline → client gets result."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -160,7 +160,7 @@ class TestConcurrentBackpressure:
         """8 threads sending small payloads with tiny pool → all succeed."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -170,7 +170,7 @@ class TestConcurrentBackpressure:
         lock = threading.Lock()
 
         def worker(thread_id: int) -> None:
-            client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+            client = SharedClient(addr, ipc_config=cfg)
             client.connect()
             try:
                 proxy = ICRMProxy.ipc(client, 'hello')
@@ -202,7 +202,7 @@ class TestConcurrentBackpressure:
         """Concurrent threads — verify results are correct or MemoryPressureError."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -213,7 +213,7 @@ class TestConcurrentBackpressure:
         lock = threading.Lock()
 
         def worker(thread_id: int) -> None:
-            client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+            client = SharedClient(addr, ipc_config=cfg)
             client.connect()
             try:
                 proxy = ICRMProxy.ipc(client, 'hello')
@@ -259,12 +259,12 @@ class TestRecoveryAfterPressure:
         """After inline fallback, subsequent normal calls succeed."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -301,12 +301,12 @@ class TestLargePayloadPressureError:
             max_pool_memory=65536,
             max_frame_size=8192,  # 8KB inline limit
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -331,12 +331,12 @@ class TestLargePayloadPressureError:
         """Payload > pool but ≤ max_frame_size → inline fallback succeeds."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -432,7 +432,7 @@ class TestHighConcurrencyStress:
         """16 threads, each doing 20 add() calls, tiny pool — all results correct."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
@@ -442,7 +442,7 @@ class TestHighConcurrencyStress:
         lock = threading.Lock()
 
         def worker(tid: int) -> None:
-            client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+            client = SharedClient(addr, ipc_config=cfg)
             client.connect()
             try:
                 proxy = ICRMProxy.ipc(client, 'hello')
@@ -475,12 +475,12 @@ class TestHighConcurrencyStress:
         """Single SharedClient, 8 threads, concurrent calls — data integrity."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
 
         results = []
@@ -522,12 +522,12 @@ class TestEdgeCases:
         """Empty payload call succeeds even under pressure."""
         addr = f'ipc-v3://{_unique_region()}'
         cfg = _tiny_config(seg_size=65536, max_seg=1)
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -551,12 +551,12 @@ class TestEdgeCases:
             max_pool_memory=65536,
             max_frame_size=8192,
         )
-        server = ServerV2(bind_address=addr, ipc_config=cfg)
+        server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IHello, Hello(), name='hello')
         server.start()
         _wait_for_server(addr)
 
-        client = SharedClient(addr, try_v2=True, ipc_config=cfg)
+        client = SharedClient(addr, ipc_config=cfg)
         client.connect()
         try:
             proxy = ICRMProxy.ipc(client, 'hello')
@@ -578,86 +578,160 @@ class TestEdgeCases:
             server.shutdown()
 
 
+
 # ---------------------------------------------------------------------------
-# Experiment 6: Legacy rpc.Server + rpc.Client backpressure
+# Chunked transfer backpressure tests
 # ---------------------------------------------------------------------------
 
 
-class TestLegacyClientBackpressure:
-    """Backpressure through legacy rpc.Server + compo.runtime.connect_crm."""
+class TestChunkedBackpressure:
+    """Backpressure behavior when chunked transfer is active."""
 
-    def test_legacy_inline_fallback(self):
-        """Legacy IPC v3 client inline fallback under tiny pool."""
-        import c_two as cc
+    def test_chunked_inline_fallback_per_chunk(self):
+        """With a tiny pool, individual chunks fall back to inline transport.
 
-        addr = f'ipc-v3://{_unique_region()}'
-        tiny_cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
+        Each chunk (segment_size // 2 = 32KB) is below max_frame_size (16 MB),
+        so inline fallback succeeds even when buddy alloc fails.
+        """
+        cfg = IPCConfig(
+            pool_segment_size=65536,   # 64 KB → chunk_size=32KB, threshold≈58KB
+            max_pool_segments=1,       # Very tight: only 64 KB total
             max_pool_memory=65536,
         )
-        config = cc.rpc.ServerConfig(
-            name='LegacyBP',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-            ipc_config=tiny_cfg,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
-        _wait_for_server(addr)
-
-        try:
-            with cc.compo.runtime.connect_crm(addr, IHello, ipc_config=tiny_cfg) as crm:
-                # Small calls succeed (inline path or within pool).
-                for i in range(10):
-                    assert crm.greeting(f'Legacy{i}') == f'Hello, Legacy{i}!'
-                assert crm.add(100, 200) == 300
-        finally:
-            try:
-                cc.rpc.Client.shutdown(addr, timeout=2.0)
-            except Exception:
-                pass
-            server.stop()
-
-    def test_legacy_pressure_error(self):
-        """Legacy client raises MemoryPressureError for oversized payload."""
-        import c_two as cc
-
         addr = f'ipc-v3://{_unique_region()}'
-        tiny_cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-            max_frame_size=8192,
-        )
-        config = cc.rpc.ServerConfig(
-            name='LegacyBPErr',
-            crm=Hello(),
-            icrm=IHello,
-            bind_address=addr,
-            ipc_config=tiny_cfg,
-        )
-        server = cc.rpc.Server(config)
-        from c_two.rpc.server import _start
-        _start(server._state)
+        server = Server(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
         _wait_for_server(addr)
 
+        client = SharedClient(addr, ipc_config=cfg)
+        client.connect()
         try:
-            with cc.compo.runtime.connect_crm(addr, IHello, ipc_config=tiny_cfg) as crm:
-                # Small call succeeds.
-                assert crm.add(1, 2) == 3
+            proxy = ICRMProxy.ipc(client, 'hello')
+            icrm = IHello()
+            icrm.client = proxy
 
-                # Large payload: 200KB > 8KB max_frame_size, > 64KB pool.
-                with pytest.raises(MemoryPressureError):
-                    crm.greeting('Z' * 200_000)
+            # 70KB > threshold → chunked (3 chunks of 32KB each).
+            # Pool is tiny → some chunks may inline-fallback, but all succeed.
+            big = 'P' * 70_000
+            result = icrm.greeting(big)
+            assert result == f'Hello, {big}!'
 
-                # Recovery: client still usable.
-                assert crm.add(10, 20) == 30
+            # Small call still works after chunked transfer.
+            assert icrm.add(1, 2) == 3
         finally:
-            try:
-                cc.rpc.Client.shutdown(addr, timeout=2.0)
-            except Exception:
-                pass
-            server.stop()
+            client.terminate()
+            server.shutdown()
+
+    def test_chunked_not_capable_raises_on_large(self):
+        """When server does not advertise CAP_CHUNKED, large payload raises."""
+        cfg = IPCConfig(
+            pool_segment_size=65536,
+            max_pool_segments=4,
+            max_pool_memory=65536 * 4,
+        )
+        addr = f'ipc-v3://{_unique_region()}'
+        server = Server(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
+        _wait_for_server(addr)
+
+        client = SharedClient(addr, ipc_config=cfg)
+        client.connect()
+        try:
+            # Forcibly disable chunked capability to simulate old server.
+            client._chunked_capable = False
+
+            proxy = ICRMProxy.ipc(client, 'hello')
+            icrm = IHello()
+            icrm.client = proxy
+
+            # Payload exceeds threshold but chunked is "not supported".
+            with pytest.raises(MemoryPressureError):
+                icrm.greeting('X' * 70_000)
+
+            # Small calls unaffected.
+            assert icrm.add(5, 10) == 15
+        finally:
+            client.terminate()
+            server.shutdown()
+
+    def test_chunked_recovery_after_multiple_large(self):
+        """Multiple sequential chunked calls don't leak assemblers or pool."""
+        cfg = IPCConfig(
+            pool_segment_size=65536,
+            max_pool_segments=4,
+            max_pool_memory=65536 * 4,
+        )
+        addr = f'ipc-v3://{_unique_region()}'
+        server = Server(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
+        _wait_for_server(addr)
+
+        client = SharedClient(addr, ipc_config=cfg)
+        client.connect()
+        try:
+            proxy = ICRMProxy.ipc(client, 'hello')
+            icrm = IHello()
+            icrm.client = proxy
+
+            # 10 sequential chunked calls — should not exhaust resources.
+            for i in range(10):
+                payload = chr(ord('A') + i % 26) * 80_000
+                result = icrm.greeting(payload)
+                assert result == f'Hello, {payload}!'
+
+            # Verify system healthy after stress.
+            assert icrm.add(42, 58) == 100
+        finally:
+            client.terminate()
+            server.shutdown()
+
+    def test_concurrent_chunked_under_pressure(self):
+        """Multiple threads sending chunked payloads with tight pool."""
+        cfg = IPCConfig(
+            pool_segment_size=65536,
+            max_pool_segments=8,
+            max_pool_memory=65536 * 8,
+        )
+        addr = f'ipc-v3://{_unique_region()}'
+        server = Server(bind_address=addr, ipc_config=cfg)
+        server.register_crm(IHello, Hello(), name='hello')
+        server.start()
+        _wait_for_server(addr)
+
+        client = SharedClient(addr, ipc_config=cfg)
+        client.connect()
+        try:
+            errors: list[Exception] = []
+            results: list[tuple[int, str]] = []
+            lock = threading.Lock()
+
+            def worker(tid: int) -> None:
+                try:
+                    proxy = ICRMProxy.ipc(client, 'hello')
+                    icrm = IHello()
+                    icrm.client = proxy
+                    payload = chr(ord('A') + tid) * 70_000
+                    result = icrm.greeting(payload)
+                    with lock:
+                        results.append((tid, result))
+                except Exception as e:
+                    with lock:
+                        errors.append(e)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=60)
+
+            assert len(errors) == 0, f'Errors: {errors}'
+            assert len(results) == 4
+            for tid, result in results:
+                expected = f'Hello, {chr(ord("A") + tid) * 70_000}!'
+                assert result == expected
+        finally:
+            client.terminate()
+            server.shutdown()

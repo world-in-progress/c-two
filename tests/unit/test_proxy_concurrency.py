@@ -7,8 +7,8 @@ import time
 import pytest
 
 from c_two.crm.meta import MethodAccess
-from c_two.rpc_v2.proxy import ICRMProxy
-from c_two.rpc_v2.scheduler import Scheduler, ConcurrencyConfig, ConcurrencyMode
+from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.server.scheduler import Scheduler, ConcurrencyConfig, ConcurrencyMode
 
 
 # ---------------------------------------------------------------------------

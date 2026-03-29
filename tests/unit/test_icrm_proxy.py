@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from c_two.rpc_v2.proxy import ICRMProxy
+from c_two.transport.client.proxy import ICRMProxy
 
 
 # ---------------------------------------------------------------------------

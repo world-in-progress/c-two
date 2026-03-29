@@ -1,14 +1,10 @@
-from dotenv import load_dotenv
-load_dotenv()
-
-from . import rpc
 from . import mcp
 from . import compo
 from . import error
 from .compo import runtime
 from .crm.meta import icrm, read, write, on_shutdown
-from .rpc.transferable import transferable
-from .rpc_v2.registry import (
+from .crm.transferable import transferable
+from .transport.registry import (
     set_address,
     set_ipc_config,
     register,
@@ -17,6 +13,7 @@ from .rpc_v2.registry import (
     unregister,
     server_address,
     shutdown,
+    serve,
 )
 
 __version__ = '0.2.7'

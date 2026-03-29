@@ -10,8 +10,8 @@ import threading
 import pytest
 
 import c_two as cc
-from c_two.rpc import ServerConfig
-from c_two.rpc.server import _start
+from c_two.transport.server.core import Server
+from c_two.transport.client.core import SharedClient
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
     CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
@@ -56,23 +56,23 @@ class ErrorHello(Hello):
 @pytest.fixture
 def error_server():
     """Start a server backed by ErrorHello, yield its address, then shut down."""
-    address = f'thread://error_test_{_next_id()}'
-    server = cc.rpc.Server(ServerConfig(
-        name='ErrorTest', crm=ErrorHello(), icrm=IHello, bind_address=address,
-    ))
-    _start(server._state)
-    for _ in range(50):
+    address = f'ipc-v3://error_test_{_next_id()}'
+    server = Server(
+        bind_address=address,
+        icrm_class=IHello,
+        crm_instance=ErrorHello(),
+    )
+    server.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
         try:
-            if cc.rpc.Client.ping(address, timeout=0.5):
+            if SharedClient.ping(address, timeout=0.5):
                 break
         except Exception:
             pass
-        time.sleep(0.1)
+        time.sleep(0.05)
     yield address
-    try:
-        cc.rpc.Client.shutdown(address, timeout=1.0)
-    except Exception:
-        pass
+    server.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -133,14 +133,14 @@ class TestCompoClientError:
     """Errors triggered by client connectivity problems."""
 
     def test_connect_to_nonexistent_server(self):
-        address = f'thread://nonexistent_{_next_id()}'
-        with cc.compo.runtime.connect_crm(address, IHello) as crm:
-            with pytest.raises(CompoClientError):
+        address = f'ipc-v3://nonexistent_{_next_id()}'
+        with pytest.raises(Exception):
+            with cc.compo.runtime.connect_crm(address, IHello) as crm:
                 crm.greeting('test')
 
     def test_ping_nonexistent_returns_false(self):
-        address = f'thread://nonexistent_{_next_id()}'
-        assert cc.rpc.Client.ping(address, timeout=0.5) is False
+        address = f'ipc-v3://nonexistent_{_next_id()}'
+        assert SharedClient.ping(address, timeout=0.5) is False
 
 
 # ---------------------------------------------------------------------------

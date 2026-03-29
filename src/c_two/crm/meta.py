@@ -1,8 +1,7 @@
 import enum
 from inspect import isfunction
 from typing import TypeVar, Type, Callable
-from ..rpc.transferable import auto_transfer
-from ..rpc.util.wire import preregister_methods
+from .transferable import auto_transfer
 
 _F = TypeVar('_F', bound=Callable)
 ICRM = TypeVar('ICRM')
@@ -144,9 +143,6 @@ def icrm(*, namespace: str = 'cc', version: str = '0.1.0'):
         
         # Add static tag attributes
         setattr(new_cls, '__tag__', f'{namespace}/{class_name}/{version}')
-
-        # Pre-encode method names for fast wire encoding
-        preregister_methods(decorated_methods.keys())
 
         return new_cls
     return icrm_wrapper
