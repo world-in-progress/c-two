@@ -90,8 +90,9 @@ class UpstreamPool:
         self._ipc_config = ipc_config
         self._idle_timeout = idle_timeout
         self._sweeper_timer: threading.Timer | None = None
-        if idle_timeout > 0:
-            self._start_sweeper()
+        # Always start sweeper for dead-connection detection; when
+        # idle_timeout <= 0 only dead connections are evicted.
+        self._start_sweeper()
 
     def add(self, name: str, address: str) -> None:
         """Register a new upstream. Connects a SharedClient immediately.
@@ -211,28 +212,34 @@ class UpstreamPool:
     # -- Sweeper -----------------------------------------------------------
 
     def _start_sweeper(self) -> None:
-        interval = max(self._idle_timeout / 10, 5.0)
+        # When idle_timeout <= 0, still sweep for dead connections every 30s.
+        interval = max(self._idle_timeout / 10, 5.0) if self._idle_timeout > 0 else 30.0
         self._sweeper_timer = threading.Timer(interval, self._sweep_idle)
         self._sweeper_timer.daemon = True
         self._sweeper_timer.start()
 
     def _sweep_idle(self) -> None:
         now = _time.monotonic()
-        to_terminate: list[SharedClient] = []
+        to_terminate: list[tuple[SharedClient, str, str]] = []  # (client, name, reason)
         with self._lock:
             for entry in self._entries.values():
-                if entry.client is not None and (now - entry.last_activity) >= self._idle_timeout:
-                    to_terminate.append(entry.client)
+                if entry.client is None:
+                    continue
+                if entry.client._closed:
+                    to_terminate.append((entry.client, entry.name, 'dead'))
                     entry.client = None
-                    logger.info('Evicted idle upstream %s (idle %.0fs)', entry.name, now - entry.last_activity)
+                elif self._idle_timeout > 0 and (now - entry.last_activity) >= self._idle_timeout:
+                    to_terminate.append((entry.client, entry.name, 'idle'))
+                    entry.client = None
         # Terminate outside lock
-        for client in to_terminate:
+        for client, name, reason in to_terminate:
+            logger.info('Evicted %s upstream %s', reason, name)
             try:
                 client.terminate()
             except Exception:
                 pass
         # Reschedule if pool is still alive
-        if self._idle_timeout > 0 and self._sweeper_timer is not None:
+        if self._sweeper_timer is not None:
             self._start_sweeper()
 
 

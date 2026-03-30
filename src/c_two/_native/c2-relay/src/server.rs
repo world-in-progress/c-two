@@ -180,15 +180,20 @@ impl RelayServer {
     /// Periodically evict upstream connections that have been idle
     /// longer than `idle_timeout_secs`.
     async fn idle_sweeper(state: RelayState, idle_timeout_secs: u64) {
-        if idle_timeout_secs == 0 {
-            // Sweeper disabled — park forever.
-            std::future::pending::<()>().await;
-            return;
-        }
-
-        let check_interval = std::cmp::max(idle_timeout_secs / 10, 5);
+        // When idle_timeout is 0, still sweep for dead connections every 30s.
+        let check_interval = if idle_timeout_secs == 0 {
+            30
+        } else {
+            std::cmp::max(idle_timeout_secs / 10, 5)
+        };
         let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
-        let idle_timeout_ms = idle_timeout_secs * 1000;
+        // idle_timeout_ms = u64::MAX means time-based eviction never fires,
+        // but is_connected() checks still catch dead connections.
+        let idle_timeout_ms = if idle_timeout_secs == 0 {
+            u64::MAX
+        } else {
+            idle_timeout_secs * 1000
+        };
 
         loop {
             interval.tick().await;
@@ -205,6 +210,7 @@ impl RelayServer {
             let mut pool = state.pool.write().unwrap();
             for name in &idle_names {
                 if let Some(old_client) = pool.evict(name) {
+                    let dead = !old_client.is_connected();
                     tokio::spawn(async move {
                         let mut client = match Arc::try_unwrap(old_client) {
                             Ok(c) => c,
@@ -212,7 +218,11 @@ impl RelayServer {
                         };
                         client.close().await;
                     });
-                    eprintln!("[relay] Evicted idle upstream: {name}");
+                    if dead {
+                        eprintln!("[relay] Evicted dead upstream: {name}");
+                    } else {
+                        eprintln!("[relay] Evicted idle upstream: {name}");
+                    }
                 }
             }
         }

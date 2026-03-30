@@ -100,16 +100,21 @@ impl UpstreamPool {
         }
     }
 
-    /// Return the names of entries whose last activity is older than
-    /// `idle_timeout_ms` milliseconds ago. Only considers entries with
-    /// a live client (already-evicted entries are skipped).
+    /// Return the names of entries whose client should be evicted.
+    /// An entry is evictable when it has a live client reference AND
+    /// either (a) the connection is dead (`!is_connected()`), or
+    /// (b) last activity is older than `idle_timeout_ms` milliseconds.
     pub fn idle_entries(&self, idle_timeout_ms: u64) -> Vec<String> {
         let cutoff = now_millis().saturating_sub(idle_timeout_ms);
         self.entries
             .iter()
             .filter(|(_, e)| {
-                e.client.is_some()
-                    && e.last_activity.load(Ordering::Relaxed) < cutoff
+                if let Some(ref client) = e.client {
+                    !client.is_connected()
+                        || e.last_activity.load(Ordering::Relaxed) < cutoff
+                } else {
+                    false
+                }
             })
             .map(|(name, _)| name.clone())
             .collect()
