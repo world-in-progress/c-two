@@ -1,7 +1,7 @@
-"""Asyncio-based IPC v3 server with multi-CRM hosting.
+"""Asyncio-based IPC server with multi-CRM hosting.
 
 - **No EventQueue**: direct CRM dispatch via ``ThreadPoolExecutor``.
-- **Handshake v5**: capability negotiation + method index exchange.
+- **Handshake**: capability negotiation + method index exchange.
 - **Control-plane routing**: CRM routing name + method index in UDS
   inline frame, pure payload in buddy SHM.
 - **Multi-CRM**: hosts multiple CRM instances under distinct routing
@@ -24,6 +24,7 @@ from ..ipc.msg_type import (
     MsgType,
     PONG_BYTES,
     SHUTDOWN_ACK_BYTES,
+    DISCONNECT_ACK_BYTES,
     _SIGNAL_TYPES,
 )
 from ..protocol import FLAG_SIGNAL, FLAG_CALL, FLAG_CHUNKED
@@ -50,9 +51,11 @@ from ..wire import (
 from .scheduler import Scheduler, ConcurrencyConfig
 
 from .connection import Connection, CRMSlot, parse_call_inline
-from .chunk import ChunkAssembler, gc_chunk_assemblers, CHUNK_GC_INTERVAL
+from .chunk import ChunkAssembler, gc_chunk_assemblers
 from .reply import unpack_icrm_result, wrap_error, send_reply
 from .dispatcher import FastDispatcher
+from ...buddy import cleanup_stale_shm
+from .heartbeat import run_heartbeat
 from .handshake import handle_handshake, FLAG_HANDSHAKE
 
 logger = logging.getLogger(__name__)
@@ -65,7 +68,7 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 # ---------------------------------------------------------------------------
 
 class Server:
-    """IPC v3 server with control-plane routing.
+    """IPC server with control-plane routing.
 
     Supports hosting **multiple CRM resources** under distinct routing
     names.  Each name has its own ICRM instance, method table, and
@@ -77,7 +80,7 @@ class Server:
     Parameters
     ----------
     bind_address:
-        ``ipc-v3://<region_id>`` — the Unix socket will be created at
+        ``ipc://<region_id>`` — the Unix socket will be created at
         ``/tmp/c_two_ipc/<region_id>.sock``.
     icrm_class:
         Optional ``@cc.icrm``-decorated interface class to register at
@@ -107,7 +110,7 @@ class Server:
     ):
         self._config = ipc_config or IPCConfig()
         self._address = bind_address
-        region_id = bind_address.replace('ipc-v3://', '').replace('ipc://', '')
+        region_id = bind_address.replace('ipc://', '')
         self._socket_path = str(Path(_IPC_SOCK_DIR) / f'{region_id}.sock')
 
         # Multi-CRM slots: name → CRMSlot.
@@ -365,6 +368,14 @@ class Server:
         except OSError:
             pass
 
+        # Best-effort cleanup of SHM segments owned by dead processes.
+        try:
+            cleaned = cleanup_stale_shm('cc')
+            if cleaned > 0:
+                logger.info('Cleaned %d stale SHM segments', cleaned)
+        except Exception:
+            logger.debug('SHM cleanup failed', exc_info=True)
+
     # ------------------------------------------------------------------
     # Shutdown callback helper
     # ------------------------------------------------------------------
@@ -420,6 +431,12 @@ class Server:
             dispatch_cache: dict[tuple[bytes, int], tuple] = {}
             cache_gen = self._slots_generation
             frame_count = 0
+
+            # Start heartbeat probe for this connection.
+            heartbeat_task: asyncio.Task | None = None
+            if self._config.heartbeat_interval > 0:
+                heartbeat_task = asyncio.create_task(run_heartbeat(conn))
+
             while True:
                 header = await reader.readexactly(16)
                 total_len, request_id, flags = FRAME_STRUCT.unpack(header)
@@ -435,6 +452,8 @@ class Server:
                     if payload_len > 0
                     else b''
                 )
+
+                conn.touch()
 
                 # Handshake & control: must complete before reading more.
                 if flags & FLAG_HANDSHAKE:
@@ -455,12 +474,17 @@ class Server:
                             self._shutdown_event.set()
                         writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, SHUTDOWN_ACK_BYTES))
                         return  # close connection after shutdown ack
+                    elif sig_type == MsgType.DISCONNECT:
+                        writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, DISCONNECT_ACK_BYTES))
+                        logger.debug('Conn %d: graceful disconnect', conn.conn_id)
+                        return  # close this connection only
                     continue
 
                 # Periodic GC for stale chunk assemblers.
                 frame_count += 1
-                if frame_count % CHUNK_GC_INTERVAL == 0 and chunk_assemblers:
-                    gc_chunk_assemblers(chunk_assemblers, conn.conn_id)
+                if frame_count % self._config.chunk_gc_interval == 0 and chunk_assemblers:
+                    gc_chunk_assemblers(chunk_assemblers, conn.conn_id,
+                                       timeout=self._config.chunk_assembler_timeout)
 
                 # Chunked frame: accumulate in assembler, dispatch on completion.
                 if flags & FLAG_CHUNKED:
@@ -565,6 +589,17 @@ class Server:
         except Exception:
             logger.debug('Conn %d: handler error', conn.conn_id, exc_info=True)
         finally:
+            # Cancel heartbeat probe.
+            heartbeat_expired = False
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                if heartbeat_task.done() and not heartbeat_task.cancelled():
+                    heartbeat_expired = True
+
             # Drain in-flight tasks before tearing down the connection.
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -584,6 +619,11 @@ class Server:
                 pass
             if task in self._client_tasks:
                 self._client_tasks.remove(task)
+
+            if heartbeat_expired:
+                logger.warning('Conn %d: disconnected (heartbeat timeout)', conn.conn_id)
+            else:
+                logger.debug('Conn %d: disconnected', conn.conn_id)
 
     # ------------------------------------------------------------------
     # Chunked frame handling
@@ -654,6 +694,8 @@ class Server:
                     chunk_size=chunk_size,
                     route_name=route_name,
                     method_idx=method_idx,
+                    max_total_chunks=self._config.max_total_chunks,
+                    max_reassembly_bytes=self._config.max_reassembly_bytes,
                 )
             except Exception as exc:
                 logger.error('Conn %d: failed to create chunk assembler: %s',

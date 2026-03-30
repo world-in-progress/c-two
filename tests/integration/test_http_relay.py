@@ -69,7 +69,7 @@ def relay_stack():
     'counter'.  The relay starts empty; upstreams are added
     programmatically via ``upstream_pool.add()``.
     """
-    ipc_addr = f'ipc-v3://relay_test_{os.getpid()}_{_next_id()}'
+    ipc_addr = f'ipc://relay_test_{os.getpid()}_{_next_id()}'
     http_port = 19000 + _next_id()
 
     # Register CRMs via SOTA API.
@@ -268,7 +268,7 @@ class TestRelayControlPlane:
 
     def test_register_via_http_control(self):
         """POST /_register adds an upstream and allows calls."""
-        ipc_addr = f'ipc-v3://ctrl_test_{os.getpid()}_{_next_id()}'
+        ipc_addr = f'ipc://ctrl_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
         cc.set_address(ipc_addr)
@@ -308,7 +308,7 @@ class TestRelayControlPlane:
 
     def test_register_duplicate_409(self):
         """POST /_register with duplicate name returns 409."""
-        ipc_addr = f'ipc-v3://dup_test_{os.getpid()}_{_next_id()}'
+        ipc_addr = f'ipc://dup_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
         cc.set_address(ipc_addr)
@@ -338,7 +338,7 @@ class TestRelayControlPlane:
 
     def test_unregister_removes_route(self):
         """POST /_unregister removes the route; calls return 404."""
-        ipc_addr = f'ipc-v3://unreg_test_{os.getpid()}_{_next_id()}'
+        ipc_addr = f'ipc://unreg_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
         cc.set_address(ipc_addr)
@@ -397,7 +397,7 @@ class TestRelayControlPlane:
 
     def test_health_shows_registered_routes(self):
         """GET /health lists all registered route names."""
-        ipc_addr = f'ipc-v3://health_test_{os.getpid()}_{_next_id()}'
+        ipc_addr = f'ipc://health_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
         cc.set_address(ipc_addr)

@@ -1,6 +1,6 @@
 """Multi-upstream HTTP relay server for C-Two.
 
-Bridges HTTP requests to multiple IPC v3 ``Server`` processes via
+Bridges HTTP requests to multiple IPC ``Server`` processes via
 dynamically registered :class:`SharedClient` connections.
 
 CRM resource processes register themselves at runtime via::
@@ -72,21 +72,27 @@ def _wait(wait_fn, wait_complete_fn, timeout, spin_cb=None):
 
 class _UpstreamEntry:
     """A single upstream IPC connection."""
-    __slots__ = ('name', 'address', 'client')
+    __slots__ = ('name', 'address', 'client', 'last_activity')
 
-    def __init__(self, name: str, address: str, client: SharedClient):
+    def __init__(self, name: str, address: str, client: SharedClient | None):
         self.name = name
         self.address = address
         self.client = client
+        self.last_activity = _time.monotonic()
 
 
 class UpstreamPool:
     """Thread-safe pool of upstream IPC connections, keyed by route name."""
 
-    def __init__(self, ipc_config: IPCConfig | None = None):
+    def __init__(self, ipc_config: IPCConfig | None = None, idle_timeout: float = 300.0):
         self._entries: dict[str, _UpstreamEntry] = {}
         self._lock = threading.Lock()
         self._ipc_config = ipc_config
+        self._idle_timeout = idle_timeout
+        self._sweeper_timer: threading.Timer | None = None
+        # Always start sweeper for dead-connection detection; when
+        # idle_timeout <= 0 only dead connections are evicted.
+        self._start_sweeper()
 
     def add(self, name: str, address: str) -> None:
         """Register a new upstream. Connects a SharedClient immediately.
@@ -126,16 +132,55 @@ class UpstreamPool:
             if entry is None:
                 raise KeyError(f'Route name not registered: {name!r}')
 
-        try:
-            entry.client.terminate()
-        except Exception:
-            logger.warning('Error terminating upstream %s', name, exc_info=True)
+        if entry.client is not None:
+            try:
+                entry.client.terminate()
+            except Exception:
+                logger.warning('Error terminating upstream %s', name, exc_info=True)
         logger.info('Upstream unregistered: %s', name)
 
     def get(self, name: str) -> SharedClient | None:
-        """Look up a SharedClient by route name (lock-free read)."""
+        """Look up a SharedClient by route name.
+
+        If the client was evicted by the idle sweeper or the connection
+        is dead, attempts a lazy reconnect before returning ``None``.
+        """
         entry = self._entries.get(name)
-        return entry.client if entry else None
+        if entry is None:
+            return None
+        if entry.client is not None:
+            if not entry.client._closed:
+                return entry.client
+            # Client is dead — terminate and trigger reconnect
+            try:
+                entry.client.terminate()
+            except Exception:
+                pass
+            entry.client = None
+        # Client was evicted or dead — try lazy reconnect
+        return self._try_reconnect(entry)
+
+    def touch(self, name: str) -> None:
+        """Update last-activity timestamp for *name*."""
+        entry = self._entries.get(name)
+        if entry is not None:
+            entry.last_activity = _time.monotonic()
+
+    def _try_reconnect(self, entry: _UpstreamEntry) -> SharedClient | None:
+        with self._lock:
+            # Re-check under lock (another thread may have reconnected)
+            if entry.client is not None:
+                return entry.client
+            try:
+                client = SharedClient(entry.address, self._ipc_config)
+                client.connect()
+                entry.client = client
+                entry.last_activity = _time.monotonic()
+                logger.info('Reconnected upstream %s at %s', entry.name, entry.address)
+                return client
+            except Exception as exc:
+                logger.warning('Failed to reconnect upstream %s: %s', entry.name, exc)
+                return None
 
     def list_routes(self) -> list[dict[str, str]]:
         """Return a list of registered routes."""
@@ -149,7 +194,10 @@ class UpstreamPool:
         return name in self._entries
 
     def shutdown(self) -> None:
-        """Terminate all upstream connections."""
+        """Terminate all upstream connections and stop the sweeper."""
+        if self._sweeper_timer is not None:
+            self._sweeper_timer.cancel()
+            self._sweeper_timer = None
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
@@ -161,10 +209,45 @@ class UpstreamPool:
                 len(entries), names,
             )
         for entry in entries:
+            if entry.client is None:
+                continue
             try:
                 entry.client.terminate()
             except Exception:
                 logger.warning('Error terminating upstream %s', entry.name, exc_info=True)
+
+    # -- Sweeper -----------------------------------------------------------
+
+    def _start_sweeper(self) -> None:
+        # When idle_timeout <= 0, still sweep for dead connections every 30s.
+        interval = max(self._idle_timeout / 10, 5.0) if self._idle_timeout > 0 else 30.0
+        self._sweeper_timer = threading.Timer(interval, self._sweep_idle)
+        self._sweeper_timer.daemon = True
+        self._sweeper_timer.start()
+
+    def _sweep_idle(self) -> None:
+        now = _time.monotonic()
+        to_terminate: list[tuple[SharedClient, str, str]] = []  # (client, name, reason)
+        with self._lock:
+            for entry in self._entries.values():
+                if entry.client is None:
+                    continue
+                if entry.client._closed:
+                    to_terminate.append((entry.client, entry.name, 'dead'))
+                    entry.client = None
+                elif self._idle_timeout > 0 and (now - entry.last_activity) >= self._idle_timeout:
+                    to_terminate.append((entry.client, entry.name, 'idle'))
+                    entry.client = None
+        # Terminate outside lock
+        for client, name, reason in to_terminate:
+            logger.info('Evicted %s upstream %s', reason, name)
+            try:
+                client.terminate()
+            except Exception:
+                pass
+        # Reschedule if pool is still alive
+        if self._sweeper_timer is not None:
+            self._start_sweeper()
 
 
 # -- Relay --------------------------------------------------------------
@@ -183,6 +266,9 @@ class Relay:
         Thread pool size for relay calls.
     ipc_config:
         Optional IPC config for upstream SharedClients.
+    idle_timeout:
+        Seconds of inactivity before an upstream connection is evicted.
+        Set to ``0`` to disable idle sweeping.
     """
 
     def __init__(
@@ -191,12 +277,13 @@ class Relay:
         *,
         max_workers: int = 32,
         ipc_config: IPCConfig | None = None,
+        idle_timeout: float = 300.0,
     ):
         self._host, self._port = self._parse_bind(bind)
         self._ipc_config = ipc_config
         self._max_workers = max_workers
 
-        self._pool = UpstreamPool(ipc_config)
+        self._pool = UpstreamPool(ipc_config, idle_timeout=idle_timeout)
         self._app: Starlette | None = None
         self._server: uvicorn.Server | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -360,6 +447,14 @@ class Relay:
 
             client = relay._pool.get(route_name)
             if client is None:
+                if relay._pool.has(route_name):
+                    return Response(
+                        content=json.dumps({
+                            'error': f'Upstream {route_name!r} is registered but unreachable',
+                        }).encode(),
+                        status_code=502,
+                        media_type='application/json',
+                    )
                 return Response(
                     content=json.dumps({
                         'error': f'No upstream registered for route: {route_name!r}',
@@ -380,11 +475,13 @@ class Relay:
                     method_name,
                     body,
                 )
+                relay._pool.touch(route_name)
                 return Response(
                     content=bytes(result) if not isinstance(result, bytes) else result,
                     media_type='application/octet-stream',
                 )
             except error.CCError as exc:
+                relay._pool.touch(route_name)
                 return Response(
                     content=error.CCError.serialize(exc),
                     status_code=500,

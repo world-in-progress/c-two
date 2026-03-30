@@ -24,7 +24,7 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 
 def _unique_addr() -> str:
-    return f'ipc-v3://test_collision_{uuid.uuid4().hex[:12]}'
+    return f'ipc://test_collision_{uuid.uuid4().hex[:12]}'
 
 
 # ---------------------------------------------------------------------------

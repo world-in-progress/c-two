@@ -8,11 +8,11 @@ with a configurable grace period (default 60 s) to avoid thrashing.
 Usage::
 
     pool = ClientPool.instance()
-    client = pool.acquire('ipc-v3://my_region')
+    client = pool.acquire('ipc://my_region')
     try:
         result = client.call('some_method', data)
     finally:
-        pool.release('ipc-v3://my_region')
+        pool.release('ipc://my_region')
 """
 from __future__ import annotations
 

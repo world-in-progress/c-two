@@ -1,11 +1,11 @@
-"""IPC v3 protocol — buddy allocator-backed SHM transport.
+"""IPC protocol — buddy allocator-backed SHM transport.
 
-Extends the IPC v2 protocol with:
+Extends the base IPC protocol with:
 - Buddy pool allocation (zero-syscall dynamic SHM alloc/free)
 - Full-duplex communication (concurrent requests and responses on shared buddy pool)
 - Direct SHM memoryview access (zero-copy consumer reads)
 
-Frame format is compatible with v2 (same 16-byte header) but uses a new
+Frame format is compatible with the base protocol (same 16-byte header) but uses a new
 FLAG_BUDDY flag and extended pool payload format.
 """
 
@@ -29,7 +29,7 @@ from .frame import (
 )
 
 # ---------------------------------------------------------------------------
-# IPC v3 flag bits (extend v2 flags)
+# Buddy flag bits (extend base flags)
 # ---------------------------------------------------------------------------
 FLAG_BUDDY = 1 << 6   # Payload references a buddy-allocated SHM block
 

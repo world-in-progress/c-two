@@ -1,4 +1,4 @@
-"""Reply encoding and sending for the IPC v3 server.
+"""Reply encoding and sending for the IPC server.
 
 Centralises ICRM result unpacking, error wrapping, and reply frame
 construction — eliminating the triple-duplication that existed when
@@ -19,7 +19,6 @@ from ..wire import (
     encode_buddy_chunked_reply_frame,
     encode_inline_chunked_reply_frame,
 )
-from .chunk import CHUNK_THRESHOLD_RATIO
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +103,7 @@ async def send_reply(
     data_size = len(result_bytes)
 
     # Chunked reply for large results.
-    chunk_threshold = int(config.pool_segment_size * CHUNK_THRESHOLD_RATIO)
+    chunk_threshold = int(config.pool_segment_size * config.chunk_threshold_ratio)
     if data_size > chunk_threshold and conn.chunked_capable:
         await send_chunked_reply(conn, request_id, result_bytes, writer, config)
         return

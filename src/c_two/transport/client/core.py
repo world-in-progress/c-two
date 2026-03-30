@@ -1,6 +1,6 @@
-"""Concurrent multiplexed IPC v3 client.
+"""Concurrent multiplexed IPC client.
 
-Unlike the serial :class:`IPCv3Client` (which holds ``_conn_lock`` for the
+Unlike the serial :class:`IPCClient` (which holds ``_conn_lock`` for the
 entire call duration), :class:`SharedClient` uses a background receive thread
 and per-request :class:`PendingCall` objects to support concurrent calls from
 multiple ICRM consumers over a single UDS connection and buddy pool.
@@ -10,11 +10,11 @@ Memory model:
 - One buddy pool (256 MB default) shared across all callers
 - N ICRM consumers share 1 SharedClient → N × 256 MB → 256 MB
 
-Ownership model (same as IPCv3Client):
+Ownership model (same as IPCClient):
 - Request blocks: client allocs, server frees after reading
 - Response blocks: server allocs, client frees after reading
 
-Control-plane routing negotiated via handshake v5.  SHM contains pure
+Control-plane routing negotiated via handshake.  SHM contains pure
 payload (no wire header); method routing via 2-byte index in the inline
 control frame.
 """
@@ -31,15 +31,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ... import error
-from ..ipc.msg_type import MsgType
-from ..wire import payload_total_size
 from ..ipc.msg_type import (
     MsgType,
     PING_BYTES,
+    PONG_BYTES,
     SHUTDOWN_CLIENT_BYTES,
     SHUTDOWN_ACK_BYTES,
+    DISCONNECT_BYTES,
 )
-from ..protocol import FLAG_SIGNAL
 from ..ipc.frame import (
     IPCConfig,
     FRAME_STRUCT,
@@ -49,27 +48,28 @@ from ..ipc.frame import (
 from ..ipc.buddy import (
     FLAG_BUDDY,
     decode_buddy_payload,
-    encode_buddy_call_frame,
 )
 from ..protocol import (
     FLAG_CALL,
     FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
-    HANDSHAKE_V5,
+    FLAG_SIGNAL,
+    HANDSHAKE_VERSION,
     CAP_CALL,
     CAP_METHOD_IDX,
     CAP_CHUNKED,
     STATUS_SUCCESS,
     STATUS_ERROR,
-    HandshakeV5,
+    Handshake,
     RouteInfo,
-    encode_v5_client_handshake,
-    decode_v5_handshake,
+    encode_client_handshake,
+    decode_handshake,
 )
 from ..wire import (
     CHUNK_HEADER_SIZE,
     MethodTable,
+    payload_total_size,
     encode_buddy_call_frame,
     encode_inline_call_frame,
     encode_buddy_chunked_call_frame,
@@ -81,11 +81,6 @@ from ..wire import (
 logger = logging.getLogger(__name__)
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-
-# Payloads exceeding this fraction of pool_segment_size trigger chunked transfer.
-_CHUNK_THRESHOLD_RATIO = 0.9
-_MAX_TOTAL_CHUNKS = 512           # 512 × 128 MB = 64 GB theoretical max
-_MAX_REASSEMBLY_BYTES = 8 * (1 << 30)  # 8 GB hard cap on reassembly buffer
 
 
 def _resolve_socket_path(region_id: str) -> str:
@@ -140,16 +135,23 @@ class _ReplyChunkAssembler:
     __slots__ = ('total_chunks', 'chunk_size', 'received', '_actual_total',
                  '_buf', '_received_flags')
 
-    def __init__(self, total_chunks: int, chunk_size: int) -> None:
-        if total_chunks <= 0 or total_chunks > _MAX_TOTAL_CHUNKS:
+    def __init__(
+        self,
+        total_chunks: int,
+        chunk_size: int,
+        *,
+        max_total_chunks: int = 512,
+        max_reassembly_bytes: int = 8 * (1 << 30),
+    ) -> None:
+        if total_chunks <= 0 or total_chunks > max_total_chunks:
             raise ValueError(
-                f'total_chunks={total_chunks} out of range [1, {_MAX_TOTAL_CHUNKS}]'
+                f'total_chunks={total_chunks} out of range [1, {max_total_chunks}]'
             )
         alloc_size = total_chunks * chunk_size
-        if alloc_size > _MAX_REASSEMBLY_BYTES:
+        if alloc_size > max_reassembly_bytes:
             raise ValueError(
                 f'Reassembly buffer {alloc_size} bytes exceeds '
-                f'limit {_MAX_REASSEMBLY_BYTES}'
+                f'limit {max_reassembly_bytes}'
             )
         import mmap as _mmap
         self.total_chunks = total_chunks
@@ -200,7 +202,7 @@ class _ReplyChunkAssembler:
 # ---------------------------------------------------------------------------
 
 class SharedClient:
-    """Concurrent multiplexed IPC v3 client.
+    """Concurrent multiplexed IPC client.
 
     Thread-safe: multiple ICRM consumers may call :meth:`call` concurrently
     from different threads.  A single UDS connection and buddy pool is shared.
@@ -213,7 +215,7 @@ class SharedClient:
     ):
         self._config = ipc_config or IPCConfig()
         self._address = server_address
-        self.region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
+        self.region_id = server_address.replace('ipc://', '')
         self._socket_path = _resolve_socket_path(self.region_id)
 
         # UDS connection — single socket shared across all callers.
@@ -237,8 +239,9 @@ class SharedClient:
         self._running = False
         self._closed = False
         self._close_lock = threading.Lock()
+        self._shutdown_ack = threading.Event()
 
-        # Wire v2 mode (negotiated during handshake v5).
+        # Negotiated during handshake.
         self._method_table: MethodTable | None = None
         self._name_tables: dict[str, MethodTable] = {}
         self._default_name = ''
@@ -273,7 +276,7 @@ class SharedClient:
         return sock
 
     def _do_buddy_handshake(self) -> None:
-        """Create buddy pool and perform handshake v5 with server."""
+        """Create buddy pool and perform handshake with server."""
         try:
             from c_two.buddy import BuddyPoolHandle, PoolConfig
         except ImportError:
@@ -299,8 +302,8 @@ class SharedClient:
 
         segments = [(seg_name, seg_size)]
 
-        # Handshake v5 (only supported protocol).
-        handshake_payload = encode_v5_client_handshake(
+        # Handshake (only supported protocol).
+        handshake_payload = encode_client_handshake(
             segments, CAP_CALL | CAP_METHOD_IDX | CAP_CHUNKED,
         )
         handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
@@ -314,10 +317,10 @@ class SharedClient:
         if not (flags & (1 << 2)):
             raise error.CompoClientError('Server did not respond with handshake ACK')
 
-        if len(payload) < 1 or payload[0] != HANDSHAKE_V5:
-            raise error.CompoClientError('Server does not support handshake v5')
+        if len(payload) < 1 or payload[0] != HANDSHAKE_VERSION:
+            raise error.CompoClientError('Server does not support handshake')
 
-        hs = decode_v5_handshake(payload)
+        hs = decode_handshake(payload)
         if not (hs.capability_flags & CAP_CALL):
             raise error.CompoClientError('Server does not support routed calls')
 
@@ -344,7 +347,7 @@ class SharedClient:
             self._seg_views.append(mv)
             self._seg_base_addrs.append(base_addr)
 
-        logger.debug('Buddy handshake complete (v5), pool segment: %s', seg_name)
+        logger.debug('Buddy handshake complete, pool segment: %s', seg_name)
 
     def terminate(self) -> None:
         """Shut down the client: stop recv thread, close socket, destroy pool."""
@@ -352,6 +355,18 @@ class SharedClient:
             if self._closed:
                 return
             self._closed = True
+
+        # Best-effort graceful disconnect: notify server before closing.
+        # The recv thread is still running and will set _shutdown_ack
+        # when the server replies with DISCONNECT_ACK.
+        if self._sock is not None and self._recv_thread is not None and self._recv_thread.is_alive():
+            try:
+                frame = encode_frame(0, FLAG_SIGNAL, DISCONNECT_BYTES)
+                with self._send_lock:
+                    self._sock.sendall(frame)
+                self._shutdown_ack.wait(timeout=1.0)
+            except Exception:
+                pass  # best-effort: fall through to hard close
 
         self._running = False
 
@@ -441,7 +456,7 @@ class SharedClient:
             self._pending[rid] = pending
 
         # Chunked transfer for large payloads.
-        chunk_threshold = int(self._config.pool_segment_size * _CHUNK_THRESHOLD_RATIO)
+        chunk_threshold = int(self._config.pool_segment_size * self._config.chunk_threshold_ratio)
         if wire_size > chunk_threshold:
             if not self._chunked_capable:
                 with self._pending_lock:
@@ -460,7 +475,7 @@ class SharedClient:
                 self._pending.pop(rid, None)
             if isinstance(exc, error.CCBaseError):
                 raise
-            raise error.CompoClientError(f'IPC v3 call failed: {exc}') from exc
+            raise error.CompoClientError(f'IPC call failed: {exc}') from exc
 
         # Wait for response (no locks held).
         try:
@@ -496,7 +511,7 @@ class SharedClient:
                 self._pending.pop(rid, None)
             if isinstance(exc, error.CCBaseError):
                 raise
-            raise error.CompoClientError(f'IPC v3 relay failed: {exc}') from exc
+            raise error.CompoClientError(f'IPC relay failed: {exc}') from exc
 
         return pending.wait(timeout=30.0)
 
@@ -714,6 +729,20 @@ class SharedClient:
                 except (ConnectionResetError, BrokenPipeError, OSError):
                     break
 
+                # Auto-respond to server-initiated PING with PONG.
+                if flags & FLAG_SIGNAL:
+                    if len(payload) == 1 and payload[0] == MsgType.PING:
+                        pong = encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, PONG_BYTES)
+                        with self._send_lock:
+                            try:
+                                sock.sendall(pong)
+                            except (ConnectionResetError, BrokenPipeError, OSError):
+                                break
+                    elif len(payload) == 1 and payload[0] == MsgType.DISCONNECT_ACK:
+                        self._shutdown_ack.set()
+                        break
+                    continue
+
                 # Chunked reply: accumulate in assembler.
                 if flags & FLAG_CHUNKED:
                     try:
@@ -893,6 +922,8 @@ class SharedClient:
             asm = _ReplyChunkAssembler(
                 total_chunks=total_chunks,
                 chunk_size=chunk_size,
+                max_total_chunks=self._config.max_total_chunks,
+                max_reassembly_bytes=self._config.max_reassembly_bytes,
             )
             assemblers[request_id] = asm
         else:
@@ -919,7 +950,7 @@ class SharedClient:
     @staticmethod
     def ping(server_address: str, timeout: float = 0.5) -> bool:
         """Ping a server to check if it is alive."""
-        region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
+        region_id = server_address.replace('ipc://', '')
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return False
@@ -942,7 +973,7 @@ class SharedClient:
     @staticmethod
     def shutdown(server_address: str, timeout: float = 0.5) -> bool:
         """Send shutdown signal to a server."""
-        region_id = server_address.replace('ipc-v3://', '').replace('ipc://', '')
+        region_id = server_address.replace('ipc://', '')
         socket_path = _resolve_socket_path(region_id)
         if not os.path.exists(socket_path):
             return True

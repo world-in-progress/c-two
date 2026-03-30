@@ -1,4 +1,4 @@
-"""Unit tests for wire codec and protocol v3.1."""
+"""Unit tests for wire codec and protocol."""
 from __future__ import annotations
 
 import pytest
@@ -8,7 +8,7 @@ from c_two.transport.protocol import (
     FLAG_REPLY,
     FLAG_CHUNKED,
     FLAG_CHUNK_LAST,
-    HANDSHAKE_V5,
+    HANDSHAKE_VERSION,
     CAP_CALL,
     CAP_METHOD_IDX,
     CAP_CHUNKED,
@@ -16,10 +16,10 @@ from c_two.transport.protocol import (
     STATUS_ERROR,
     MethodEntry,
     RouteInfo,
-    HandshakeV5,
-    encode_v5_client_handshake,
-    encode_v5_server_handshake,
-    decode_v5_handshake,
+    Handshake,
+    encode_client_handshake,
+    encode_server_handshake,
+    decode_handshake,
 )
 from c_two.transport.wire import (
     CHUNK_HEADER_SIZE,
@@ -216,17 +216,17 @@ class TestMethodTable:
 
 
 # ---------------------------------------------------------------------------
-# Handshake v5 round-trip
+# Handshake round-trip
 # ---------------------------------------------------------------------------
 
-class TestHandshakeV5:
+class TestHandshake:
 
     def test_client_handshake_roundtrip(self):
         segments = [('seg_abc', 268435456)]
         cap = CAP_CALL | CAP_METHOD_IDX
-        encoded = encode_v5_client_handshake(segments, cap)
-        assert encoded[0] == HANDSHAKE_V5
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_client_handshake(segments, cap)
+        assert encoded[0] == HANDSHAKE_VERSION
+        hs = decode_handshake(encoded)
         assert hs.segments == segments
         assert hs.capability_flags == cap
         assert hs.routes == []  # Client doesn't send routes
@@ -241,9 +241,9 @@ class TestHandshakeV5:
                 MethodEntry(name='greeting', index=1),
             ],
         )
-        encoded = encode_v5_server_handshake(segments, cap, [route])
-        assert encoded[0] == HANDSHAKE_V5
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_server_handshake(segments, cap, [route])
+        assert encoded[0] == HANDSHAKE_VERSION
+        hs = decode_handshake(encoded)
         assert hs.segments == segments
         assert hs.capability_flags == cap
         assert len(hs.routes) == 1
@@ -258,8 +258,8 @@ class TestHandshakeV5:
         segs = [('s1', 100), ('s2', 200)]
         r1 = RouteInfo('route_a', [MethodEntry('m1', 0)])
         r2 = RouteInfo('route_b', [MethodEntry('m2', 0), MethodEntry('m3', 1)])
-        encoded = encode_v5_server_handshake(segs, CAP_CALL, [r1, r2])
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_server_handshake(segs, CAP_CALL, [r1, r2])
+        hs = decode_handshake(encoded)
         assert len(hs.segments) == 2
         assert len(hs.routes) == 2
         assert hs.routes[0].name == 'route_a'
@@ -267,18 +267,18 @@ class TestHandshakeV5:
         assert len(hs.routes[1].methods) == 2
 
     def test_empty_segments(self):
-        encoded = encode_v5_client_handshake([], CAP_CALL)
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_client_handshake([], CAP_CALL)
+        hs = decode_handshake(encoded)
         assert hs.segments == []
 
     def test_bad_version_raises(self):
-        bad = bytes([4, 0, 0])  # version=4, not 5
-        with pytest.raises(ValueError, match='Expected handshake v5'):
-            decode_v5_handshake(bad)
+        bad = bytes([4, 0, 0])  # version=4, not expected
+        with pytest.raises(ValueError, match='Expected handshake'):
+            decode_handshake(bad)
 
     def test_truncated_raises(self):
         with pytest.raises(ValueError):
-            decode_v5_handshake(b'\x05')
+            decode_handshake(b'\x05')
 
 
 # ---------------------------------------------------------------------------
@@ -524,16 +524,16 @@ class TestCapChunked:
 
     def test_cap_chunked_roundtrip(self):
         caps = CAP_CALL | CAP_METHOD_IDX | CAP_CHUNKED
-        encoded = encode_v5_client_handshake([('seg', 256)], caps)
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_client_handshake([('seg', 256)], caps)
+        hs = decode_handshake(encoded)
         assert hs.capability_flags & CAP_CHUNKED
         assert hs.capability_flags == caps
 
     def test_cap_without_chunked(self):
         """Capability without CAP_CHUNKED — older client."""
         caps = CAP_CALL | CAP_METHOD_IDX
-        encoded = encode_v5_client_handshake([('seg', 256)], caps)
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_client_handshake([('seg', 256)], caps)
+        hs = decode_handshake(encoded)
         assert not (hs.capability_flags & CAP_CHUNKED)
         assert hs.capability_flags == caps
 

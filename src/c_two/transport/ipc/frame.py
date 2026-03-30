@@ -1,4 +1,4 @@
-"""IPC v2 shared protocol — constants, config, frame codec, and SHM utilities.
+"""IPC shared protocol — constants, config, frame codec, and SHM utilities.
 
 Extracted from ``ipc_server.py`` so both server and client can import
 without a circular or tight-coupling dependency.  All symbols are public
@@ -35,7 +35,6 @@ U32_STRUCT = struct.Struct('<I')       # 4B unsigned 32-bit (error length, segme
 # ---------------------------------------------------------------------------
 # Performance tuning
 # ---------------------------------------------------------------------------
-FAST_READ_THRESHOLD = 1_048_576        # 1 MB — use ctypes.memmove above this size (benchmarked)
 FRAME_HEADER_SIZE = FRAME_STRUCT.size  # 16 bytes
 POOL_PAYLOAD_HEADER_SIZE = 9           # 1B segment_index + 8B data_size
 
@@ -51,19 +50,12 @@ DEFAULT_MAX_POOL_SEGMENTS = 4                        # max segments per pool
 DEFAULT_MAX_POOL_MEMORY = DEFAULT_POOL_SEGMENT_SIZE * DEFAULT_MAX_POOL_SEGMENTS  # 1 GB per pool
 
 # ---------------------------------------------------------------------------
-# SHM garbage collection tuning
-# ---------------------------------------------------------------------------
-SHM_GC_INTERVAL = 30.0   # seconds — scan interval for leaked SHM segments
-SHM_MAX_AGE = 120.0       # seconds — max time before SHM segment is considered leaked
-
-
-# ---------------------------------------------------------------------------
 # IPCConfig dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
 class IPCConfig:
-    """IPC v2 transport configuration.
+    """IPC transport configuration.
 
     Transport limits (affect correctness and compatibility):
         max_frame_size: Maximum inline frame size in bytes (default 16 MB).
@@ -81,15 +73,27 @@ class IPCConfig:
         heartbeat_interval: Seconds between PING probes (default 15; ≤0 disables).
         heartbeat_timeout: Seconds with no activity before declaring dead (default 30).
     """
+    # Transport limits
     shm_threshold: int = DEFAULT_SHM_THRESHOLD
     max_frame_size: int = DEFAULT_MAX_FRAME_SIZE
     max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE
     max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS
-    pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
+    
+    # Pool SHM settings
     pool_enabled: bool = True
     pool_decay_seconds: float = 60.0
-    max_pool_segments: int = DEFAULT_MAX_POOL_SEGMENTS
     max_pool_memory: int = DEFAULT_MAX_POOL_MEMORY
+    max_pool_segments: int = DEFAULT_MAX_POOL_SEGMENTS
+    pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
+
+    # Chunked transfer settings
+    max_total_chunks: int = 512
+    chunk_gc_interval: int = 100
+    chunk_threshold_ratio: float = 0.9
+    chunk_assembler_timeout: float = 60.0
+    max_reassembly_bytes: int = 8 * (1 << 30)  # 8 GB
+    
+    # Heartbeat settings
     heartbeat_interval: float = 15.0
     heartbeat_timeout: float = 30.0
 
@@ -126,6 +130,12 @@ class IPCConfig:
                 f'heartbeat_timeout ({self.heartbeat_timeout}) must be > '
                 f'heartbeat_interval ({self.heartbeat_interval})'
             )
+        if not (0.0 < self.chunk_threshold_ratio <= 1.0):
+            raise ValueError(f'chunk_threshold_ratio must be in (0, 1], got {self.chunk_threshold_ratio}')
+        if self.max_total_chunks < 1:
+            raise ValueError(f'max_total_chunks must be >= 1, got {self.max_total_chunks}')
+        if self.max_reassembly_bytes < 1:
+            raise ValueError(f'max_reassembly_bytes must be >= 1, got {self.max_reassembly_bytes}')
 
 
 # ---------------------------------------------------------------------------
@@ -339,5 +349,3 @@ def decode_frame(body: bytes) -> tuple[int, int, bytes]:
     request_id, flags = U64_STRUCT.unpack_from(body, 0)[0], U32_STRUCT.unpack_from(body, 8)[0]
     payload = body[12:]
     return request_id, flags, payload
-
-

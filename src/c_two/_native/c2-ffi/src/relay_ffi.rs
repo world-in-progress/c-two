@@ -1,7 +1,7 @@
 //! PyO3 bindings for the C-Two HTTP relay server.
 //!
 //! Exposes `NativeRelay` — an embedded axum HTTP server that bridges
-//! HTTP requests to IPC v3 upstreams. The server runs on a background
+//! HTTP requests to IPC upstreams. The server runs on a background
 //! OS thread with its own tokio runtime.
 //!
 //! **GIL handling**: All methods that block (start, stop, register, etc.)
@@ -22,24 +22,29 @@ use c2_relay::server::RelayServer;
 /// from c_two._native import NativeRelay
 /// relay = NativeRelay("0.0.0.0:8080")
 /// relay.start()
-/// relay.register_upstream("grid", "ipc-v3://my_server")
-/// relay.list_routes()  # [{"name": "grid", "address": "ipc-v3://my_server"}]
+/// relay.register_upstream("grid", "ipc://my_server")
+/// relay.list_routes()  # [{"name": "grid", "address": "ipc://my_server"}]
 /// relay.stop()
 /// ```
 #[pyclass(name = "NativeRelay")]
 pub struct PyNativeRelay {
     bind: String,
+    idle_timeout_secs: u64,
     server: Option<RelayServer>,
 }
 
 #[pymethods]
 impl PyNativeRelay {
     /// Create a new relay targeting the given bind address.
+    ///
+    /// `idle_timeout_secs` controls how long an upstream can be idle
+    /// before its connection is evicted. Set to `0` to disable (default).
     #[new]
-    #[pyo3(signature = (bind = "0.0.0.0:8080"))]
-    fn new(bind: &str) -> Self {
+    #[pyo3(signature = (bind = "0.0.0.0:8080", idle_timeout_secs = 0))]
+    fn new(bind: &str, idle_timeout_secs: u64) -> Self {
         Self {
             bind: bind.to_string(),
+            idle_timeout_secs,
             server: None,
         }
     }
@@ -52,8 +57,9 @@ impl PyNativeRelay {
             return Err(PyRuntimeError::new_err("Relay is already running"));
         }
         let bind = self.bind.clone();
+        let idle_timeout_secs = self.idle_timeout_secs;
         let server = py
-            .allow_threads(|| RelayServer::start(&bind))
+            .allow_threads(|| RelayServer::start(&bind, idle_timeout_secs))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to start relay: {e}")))?;
         self.server = Some(server);
         Ok(())

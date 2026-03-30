@@ -10,16 +10,16 @@ import struct
 import pytest
 
 from c_two.transport.protocol import (
-    HANDSHAKE_V5,
+    HANDSHAKE_VERSION,
     CAP_CALL,
     CAP_METHOD_IDX,
     STATUS_SUCCESS,
     STATUS_ERROR,
     MethodEntry,
     RouteInfo,
-    encode_v5_client_handshake,
-    encode_v5_server_handshake,
-    decode_v5_handshake,
+    encode_client_handshake,
+    encode_server_handshake,
+    decode_handshake,
     _MAX_HANDSHAKE_SEGMENTS,
     _MAX_HANDSHAKE_ROUTES,
     _MAX_HANDSHAKE_METHODS,
@@ -33,92 +33,92 @@ from c_two.transport.wire import (
 
 
 # ---------------------------------------------------------------------------
-# decode_v5_handshake bounds checking
+# decode_handshake bounds checking
 # ---------------------------------------------------------------------------
 
-class TestHandshakeV5BoundsChecking:
-    """Validate that decode_v5_handshake rejects malformed payloads."""
+class TestHandshakeBoundsChecking:
+    """Validate that decode_handshake rejects malformed payloads."""
 
     def test_too_short_payload(self):
         with pytest.raises(ValueError, match='too short'):
-            decode_v5_handshake(b'\x05')
+            decode_handshake(b'\x05')
 
     def test_empty_payload(self):
         with pytest.raises(ValueError, match='too short'):
-            decode_v5_handshake(b'')
+            decode_handshake(b'')
 
     def test_wrong_version(self):
-        with pytest.raises(ValueError, match='Expected handshake v5'):
-            decode_v5_handshake(bytes([4, 0, 0]))
+        with pytest.raises(ValueError, match='Expected handshake'):
+            decode_handshake(bytes([4, 0, 0]))
 
     def test_truncated_segment_entry(self):
         """seg_count=1 but no segment data follows."""
-        buf = bytes([HANDSHAKE_V5]) + struct.pack('<H', 1)  # version + seg_count=1
+        buf = bytes([HANDSHAKE_VERSION]) + struct.pack('<H', 1)  # version + seg_count=1
         with pytest.raises(ValueError, match='truncated'):
-            decode_v5_handshake(buf)
+            decode_handshake(buf)
 
     def test_truncated_segment_name(self):
         """Segment name_len claims 10 bytes but only 2 available."""
         buf = bytearray()
-        buf.append(HANDSHAKE_V5)
+        buf.append(HANDSHAKE_VERSION)
         buf += struct.pack('<H', 1)    # seg_count=1
         buf += struct.pack('<I', 256)  # segment size
         buf.append(10)                 # name_len = 10
         buf += b'ab'                   # only 2 bytes of name
         with pytest.raises(ValueError, match='truncated'):
-            decode_v5_handshake(bytes(buf))
+            decode_handshake(bytes(buf))
 
     def test_excessive_segment_count(self):
         """seg_count exceeds _MAX_HANDSHAKE_SEGMENTS."""
         buf = bytearray()
-        buf.append(HANDSHAKE_V5)
+        buf.append(HANDSHAKE_VERSION)
         buf += struct.pack('<H', _MAX_HANDSHAKE_SEGMENTS + 1)
         with pytest.raises(ValueError, match='exceeds limit'):
-            decode_v5_handshake(bytes(buf))
+            decode_handshake(bytes(buf))
 
     def test_max_segment_count_ok(self):
         """Exactly _MAX_HANDSHAKE_SEGMENTS is allowed."""
         segs = [(f's{i}', 100) for i in range(_MAX_HANDSHAKE_SEGMENTS)]
-        encoded = encode_v5_client_handshake(segs, CAP_CALL)
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_client_handshake(segs, CAP_CALL)
+        hs = decode_handshake(encoded)
         assert len(hs.segments) == _MAX_HANDSHAKE_SEGMENTS
 
     def test_missing_capability_flags(self):
         """Payload has segment data but no capability_flags."""
         buf = bytearray()
-        buf.append(HANDSHAKE_V5)
+        buf.append(HANDSHAKE_VERSION)
         buf += struct.pack('<H', 1)     # seg_count=1
         buf += struct.pack('<I', 256)   # segment size
         buf.append(2)                   # name_len=2
         buf += b'ab'                    # name
         # Missing 2-byte capability_flags
         with pytest.raises(ValueError, match='missing capability_flags'):
-            decode_v5_handshake(bytes(buf))
+            decode_handshake(bytes(buf))
 
     def test_truncated_route_entry(self):
         """Route section present but truncated."""
         segs = [('s1', 100)]
         routes = [RouteInfo('r1', [MethodEntry('m1', 0)])]
-        full = encode_v5_server_handshake(segs, CAP_CALL, routes)
+        full = encode_server_handshake(segs, CAP_CALL, routes)
         # Truncate inside route section
         truncated = full[:len(full) - 3]
         with pytest.raises(ValueError, match='truncated'):
-            decode_v5_handshake(truncated)
+            decode_handshake(truncated)
 
     def test_excessive_route_count(self):
         """Craft payload with route_count exceeding limit."""
         segs = [('s1', 100)]
-        encoded = encode_v5_client_handshake(segs, CAP_CALL)
+        encoded = encode_client_handshake(segs, CAP_CALL)
         # Append a fake route section with excessive count
         buf = bytearray(encoded)
         buf += struct.pack('<H', _MAX_HANDSHAKE_ROUTES + 1)
         with pytest.raises(ValueError, match='exceeds limit'):
-            decode_v5_handshake(bytes(buf))
+            decode_handshake(bytes(buf))
 
     def test_excessive_method_count(self):
         """Craft payload with method_count exceeding limit."""
         segs = [('s1', 100)]
-        encoded = encode_v5_client_handshake(segs, CAP_CALL)
+        encoded = encode_client_handshake(segs, CAP_CALL)
         # Append route section: 1 route, with excessive method count
         buf = bytearray(encoded)
         buf += struct.pack('<H', 1)     # route_count=1
@@ -126,7 +126,7 @@ class TestHandshakeV5BoundsChecking:
         buf += b'r1'                    # route_name
         buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
         with pytest.raises(ValueError, match='exceeds limit'):
-            decode_v5_handshake(bytes(buf))
+            decode_handshake(bytes(buf))
 
     def test_valid_roundtrip_after_hardening(self):
         """Ensure normal encode/decode still works after bounds checks."""
@@ -135,8 +135,8 @@ class TestHandshakeV5BoundsChecking:
             RouteInfo('ns1', [MethodEntry('add', 0), MethodEntry('mul', 1)]),
             RouteInfo('ns2', [MethodEntry('get', 0)]),
         ]
-        encoded = encode_v5_server_handshake(segs, CAP_CALL | CAP_METHOD_IDX, routes)
-        hs = decode_v5_handshake(encoded)
+        encoded = encode_server_handshake(segs, CAP_CALL | CAP_METHOD_IDX, routes)
+        hs = decode_handshake(encoded)
         assert len(hs.segments) == 2
         assert len(hs.routes) == 2
         assert hs.routes[0].methods[1].name == 'mul'

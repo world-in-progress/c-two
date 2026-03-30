@@ -3,9 +3,15 @@
 //! Runs axum + tokio in a background thread. Provides synchronous
 //! control methods (start, stop, register_upstream, etc.) that send
 //! commands to the async runtime via channels.
+//!
+//! Includes a configurable idle sweeper that periodically evicts
+//! upstream connections that have not been used recently. Evicted
+//! upstreams are lazily reconnected on the next HTTP request (see
+//! `router::try_reconnect`).
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -43,8 +49,9 @@ pub struct RelayServer {
 impl RelayServer {
     /// Start the relay server on a background thread.
     ///
-    /// Blocks until the HTTP listener is bound, then returns.
-    pub fn start(bind: &str) -> Result<Self, String> {
+    /// `idle_timeout_secs` controls how long an upstream can be idle
+    /// before the sweeper evicts its connection. Set to `0` to disable.
+    pub fn start(bind: &str, idle_timeout_secs: u64) -> Result<Self, String> {
         let addr: SocketAddr = bind
             .parse()
             .map_err(|e| format!("Invalid bind address '{bind}': {e}"))?;
@@ -64,7 +71,7 @@ impl RelayServer {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    Self::run(addr, state, cmd_rx, ready_tx).await;
+                    Self::run(addr, state, cmd_rx, ready_tx, idle_timeout_secs).await;
                 });
             })
             .map_err(|e| format!("Failed to spawn relay thread: {e}"))?;
@@ -144,6 +151,7 @@ impl RelayServer {
         state: RelayState,
         mut cmd_rx: mpsc::Receiver<Command>,
         ready_tx: oneshot::Sender<Result<(), String>>,
+        idle_timeout_secs: u64,
     ) {
         let app = router::build_router(state.clone());
 
@@ -159,11 +167,64 @@ impl RelayServer {
         };
 
         let server = axum::serve(listener, app);
+        let sweeper = Self::idle_sweeper(state.clone(), idle_timeout_secs);
 
-        // Run both the HTTP server and the command loop concurrently.
+        // Run the HTTP server, command loop, and idle sweeper concurrently.
         tokio::select! {
             _ = server => {},
             _ = Self::command_loop(state, &mut cmd_rx) => {},
+            _ = sweeper => {},
+        }
+    }
+
+    /// Periodically evict upstream connections that have been idle
+    /// longer than `idle_timeout_secs`.
+    async fn idle_sweeper(state: RelayState, idle_timeout_secs: u64) {
+        // When idle_timeout is 0, still sweep for dead connections every 30s.
+        let check_interval = if idle_timeout_secs == 0 {
+            30
+        } else {
+            std::cmp::max(idle_timeout_secs / 10, 5)
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
+        // idle_timeout_ms = u64::MAX means time-based eviction never fires,
+        // but is_connected() checks still catch dead connections.
+        let idle_timeout_ms = if idle_timeout_secs == 0 {
+            u64::MAX
+        } else {
+            idle_timeout_secs * 1000
+        };
+
+        loop {
+            interval.tick().await;
+
+            let idle_names = {
+                let pool = state.pool.read().unwrap();
+                pool.idle_entries(idle_timeout_ms)
+            };
+
+            if idle_names.is_empty() {
+                continue;
+            }
+
+            let mut pool = state.pool.write().unwrap();
+            for name in &idle_names {
+                if let Some(old_client) = pool.evict(name) {
+                    let dead = !old_client.is_connected();
+                    tokio::spawn(async move {
+                        let mut client = match Arc::try_unwrap(old_client) {
+                            Ok(c) => c,
+                            Err(_arc) => return, // still referenced elsewhere
+                        };
+                        client.close().await;
+                    });
+                    if dead {
+                        eprintln!("[relay] Evicted dead upstream: {name}");
+                    } else {
+                        eprintln!("[relay] Evicted idle upstream: {name}");
+                    }
+                }
+            }
         }
     }
 
@@ -194,9 +255,27 @@ impl RelayServer {
                     let _ = reply.send(result);
                 }
                 Command::UnregisterUpstream { name, reply } => {
-                    let mut pool = state.pool.write().unwrap();
-                    let result = pool.remove(&name);
-                    let _ = reply.send(result);
+                    let result = {
+                        let mut pool = state.pool.write().unwrap();
+                        pool.remove(&name)
+                    };
+                    match result {
+                        Ok(old_client) => {
+                            if let Some(arc_client) = old_client {
+                                tokio::spawn(async move {
+                                    let mut client = match Arc::try_unwrap(arc_client) {
+                                        Ok(c) => c,
+                                        Err(_) => return,
+                                    };
+                                    client.close().await;
+                                });
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
                 }
                 Command::ListRoutes { reply } => {
                     let pool = state.pool.read().unwrap();

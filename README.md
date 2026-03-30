@@ -1,415 +1,389 @@
-# C-Two (Greenhouse v0.2.7)
+<p align="center">
+  <img src="docs/images/logo.png" width="150">
+</p>
 
-[![PyPI version](https://badge.fury.io/py/c-two.svg)](https://badge.fury.io/py/c-two)
+<h1 align="center">C-Two</h1>
 
 <p align="center">
-<img align="center" width="150px" src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/logo.png">
-</p> 
+  A resource-oriented RPC framework for Python — turn stateful classes into location-transparent distributed resources.
+</p>
 
-C-Two is a **Remote Procedure Call (RPC) framework** that enables resource-oriented classes to be remotely invoked across different processes or machines. It is specifically designed for distributed resource computation systems. The framework provides a structured abstraction layer that enables remote method calling between **Components** and **Core Resource Models (CRMs)** with automatic serialization and protocol-agnostic communication.
+<p align="center">
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
+  <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
+</p>
 
-## What's New in v0.2.7
-- **SOTA API (`rpc_v2`)**: New `cc.register()` / `cc.connect()` / `cc.set_address()` API for multi-CRM hosting in a single process.
-- **Multi-CRM Server**: `ServerV2` hosts multiple CRM instances behind one IPC endpoint, routed by user-chosen names.
-- **SharedClient**: Concurrent multiplexed IPC v3 client — N ICRM consumers share 1 connection + 1 buddy pool (256 MB vs N × 256 MB).
-- **Wire v2**: Control-plane / data-plane separation — method routing in UDS inline frames, pure payload in SHM.
-- **Thread preference**: Same-process `cc.connect()` returns zero-serialization proxy.
-- Fixed a bug in the `@icrm` decorator that made type hinting into ICRMMeta forcefully.
+<p align="center">
+  <a href="README.zh-CN.md">中文版</a>
+</p>
 
-## WIP
-- Support for function validation between CRM and ICRM.
-- Built-in default serialization for common data classes (replacing python's pickle).
+---
 
-## Framework Overview
+## Basic Idea
 
-**The design philosophy of C-Two is not to define services, but to empower resources.**
+- **Resources, not services** — C-Two doesn't expose RPC endpoints. It makes Python classes remotely accessible while preserving their stateful, object-oriented nature.
 
-In scientific computation, resources that encapsulate complex state and domain-specific operations need to be organized into cohesive units or interaction models. We call these resource-oriented abstractions **Core Resource Models (CRMs)**. From a business logic perspective, applications care more about how to interact with resources and implement high-level logic, rather than where the resources are located or where they originate. We call these resource consumers **Components**. C-Two provides location transparency and uniform resource access for CRMs, allowing components to interact with them as if they were local objects. This approach is particularly valuable for geographic information systems, scientific computing, and other domains that require persistent resource management with distributed access patterns.
+- **Zero-copy when local, transparent when remote** — Same-process calls skip serialization entirely. Cross-process calls use shared memory. Cross-machine calls go over HTTP. Your code doesn't change.
 
-C-Two addresses the complexity of distributed computing by implementing a clear separation of concerns through interface-based programming and automatic type marshalling. The framework enables developers to write distributed applications using familiar local programming patterns.
+- **Built for scientific Python** — Native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
 
-This framework tries to transform isolated computational models into reusable, network-addressable assets, fostering long-term knowledge accumulation over short-term service proliferation.
+- **Rust-powered transport** — The IPC layer uses a Rust buddy allocator for shared memory and a Rust HTTP relay for high-throughput networking.
 
-### Core Architectural Principles
+---
 
-- **Resource-Oriented Design**: Focus on stateful computational resources rather than stateless function calls
-- **Interface Segregation**: Clean separation between interface definitions (ICRM) and implementations (CRM)
-- **Protocol Abstraction**: Transport-agnostic communication supporting multiple protocols (Thread, Memory, IPC, TCP, HTTP)
-- **Multi-CRM Hosting**: A single server process can host multiple CRM instances, each identified by a routing name, reducing process overhead
-
-## Architecture
-
-The framework implements a three-tier architecture:
-
-<img src="https://raw.githubusercontent.com/world-in-progress/c-two/main/doc/images/architecture.png" alt="Architecture" width="1500" />
-
-### Component Layer
-Client-side computational units that consume remote resources through Interface of Core Resource Models (ICRM), providing network transparency for distributed operations.
-
-### CRM Layer
-Server-side CRMs that maintain persistent state and implement domain-specific resource management, exposed through standardized ICRM interfaces.
-
-### Transport Layer
-Protocol-agnostic communication infrastructure supporting multiple transport mechanisms (Thread, Memory, IPC, TCP, HTTP) with automatic protocol detection, connection management, and message serialization. The framework automatically selects the appropriate transport implementation based on the address scheme.
-
-### RPC v2 Transport (`rpc_v2/`)
-Next-generation transport optimized for IPC v3. Features multi-CRM routing per server, wire v2 control-plane/data-plane separation, concurrent multiplexed `SharedClient`, and reference-counted `ClientPool`. Uses a Rust-based buddy allocator (`c_two.buddy`) for zero-syscall shared memory allocation, compiled automatically via maturin on `uv sync`.
-
-## Technical Requirements
-
-- Python ≥ 3.10
-- Type annotation support
-- Network connectivity for distributed deployment (TCP, HTTP protocols)
-
-## Installation
-
-### PyPI Installation
-
-Install the latest stable version from PyPI using pip:
+## Quick Start
 
 ```bash
 pip install c-two
 ```
 
-### Package Management with uv
-
-For better dependency resolution, use [uv](https://github.com/astral-sh/uv):
-
-```bash
-# Add c-two to your project
-uv add c-two
-```
-
-### Development Installation with uv
-
-For development, testing, or accessing the latest features:
-
-```bash
-# Clone the repository
-git clone https://github.com/world-in-progress/c-two.git
-
-# Navigate to the project directory
-cd c-two
-
-# Install dependencies (automatically compiles the Rust buddy allocator via maturin)
-uv sync
-
-# Run tests
-uv run pytest -q
-```
-
-> **Note**: Development installation requires a Rust toolchain (`cargo`). The Rust buddy allocator at `src/c_two/buddy/_buddy_core/` is compiled automatically by maturin during `uv sync`.
-
-## Implementation Guide
-
-### 1. Resource Model Implementation (CRM)
-
-Implement the CRM as a regular Python class that maintains resource state and implements domain-specific logic.
-
-```python
-from dataclasses import dataclass
-
-@dataclass
-class GridAttribute:
-    level: int
-    global_id: int
-    elevation: float
-
-# Define CRM ###########################################################
-
-class Grid:
-    def __init__(self, epsg: int, bounds: list[float], first_size: list[float], subdivide_rules: list[list[int]]):
-        # Resource initialization
-        pass
-    
-    def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        # Implement grid information retrieval logic
-        pass
-    
-    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
-        # Implement grid subdivision algorithm
-        pass
-    
-    def delete_grids(self, levels: list[int], global_ids: list[int]) -> None:
-        # Implement grid deletion logic
-        pass
-
-    def terminate(self):
-        # Implement resource cleanup logic
-        pass
-
-```
-
-### 2. Interface Definition (ICRM)
-
-Define remote interfaces using the `@icrm` decorator to establish contracts for distributed communication.
-You only need to expose the CRM methods that will be accessed remotely, not all methods.
+### Define a resource interface and its implementation
 
 ```python
 import c_two as cc
-from dataclasses import dataclass
 
-@dataclass
-class GridAttribute:
-    level: int
-    global_id: int
-    elevation: float
+# Interface — declares which methods are remotely accessible
+@cc.icrm(namespace='demo.counter', version='0.1.0')
+class ICounter:
+    def increment(self, amount: int) -> int: ...
 
-# Define ICRM ##############################################
+    @cc.read
+    def value(self) -> int: ...
 
-@cc.icrm(namespace='cc.demo', version='0.1.0')
-class IGrid:
-    def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        """Retrieve grid information for specified level and identifiers"""
-        ...
-    
-    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
-        """Perform grid subdivision operations"""
-        ...
+    def reset(self) -> int: ...
+
+
+# Implementation — a plain Python class holding state
+class Counter:
+    def __init__(self, initial: int = 0):
+        self._value = initial
+
+    def increment(self, amount: int) -> int:
+        self._value += amount
+        return self._value
+
+    def value(self) -> int:
+        return self._value
+
+    def reset(self) -> int:
+        old = self._value
+        self._value = 0
+        return old
 ```
 
-### 3. Custom Data Type Definition (Optional)
-
-Define serializable data structures using the `@transferable` decorator with custom serialization logic.
-In this example, we modify `GridAttribute` and create `GridAttributes` in the ICRM file to use Apache Arrow for efficient serialization.
+### Use it locally (zero serialization)
 
 ```python
-import c_two as cc
-import pyarrow as pa
+cc.register(ICounter, Counter(initial=100), name='counter')
+counter = cc.connect(ICounter, name='counter')
 
-# @transferable will decorate the class as data class automatically
+counter.increment(10)    # → 110
+counter.value()          # → 110
+counter.reset()          # → 110 (returns old value)
+counter.value()          # → 0
+
+cc.close(counter)
+```
+
+### Or remotely — same API, different address
+
+```python
+# Server process
+cc.set_address('ipc:///tmp/my_server')
+cc.register(ICounter, Counter(), name='counter')
+
+# Client process (separate terminal)
+counter = cc.connect(ICounter, name='counter', address='ipc:///tmp/my_server')
+counter.increment(5)     # works identically
+cc.close(counter)
+```
+
+> **See [`examples/`](examples/) for complete runnable demos.**
+
+---
+
+## Core Concepts
+
+### ICRM — Interface
+
+An ICRM (Interface of Core Resource Model) declares which CRM methods are remotely accessible. Decorated with `@cc.icrm()`, method bodies are `...` (pure interface — no implementation).
+
+```python
+@cc.icrm(namespace='demo.greeter', version='0.1.0')
+class IGreeter:
+    @cc.read                              # concurrent reads allowed
+    def greet(self, name: str) -> str: ...
+
+    @cc.read
+    def language(self) -> str: ...
+```
+
+Methods can be annotated with `@cc.read` (concurrent access allowed) or left as default write (exclusive access).
+
+### CRM — Core Resource Model
+
+A CRM is a plain Python class that holds state and implements domain logic. It is **not** decorated — the framework discovers its methods through the ICRM interface.
+
+```python
+class Greeter:
+    def __init__(self, lang: str = 'en'):
+        self._lang = lang
+        self._templates = {'en': 'Hello, {}!', 'zh': '你好, {}!'}
+
+    def greet(self, name: str) -> str:
+        return self._templates.get(self._lang, 'Hi, {}!').format(name)
+
+    def language(self) -> str:
+        return self._lang
+```
+
+### Component — Consumer
+
+Components consume CRM resources through ICRM proxies. The proxy is location-transparent — it works the same whether the CRM is in the same process or on a remote machine.
+
+```python
+greeter = cc.connect(IGreeter, name='greeter')
+greeter.greet('World')     # → 'Hello, World!'
+cc.close(greeter)
+```
+
+### @transferable — Custom Serialization
+
+For custom data types that need to cross the wire, use `@cc.transferable`. Without it, pickle is used as fallback.
+
+```python
 @cc.transferable
 class GridAttribute:
     level: int
     global_id: int
     elevation: float
-    
+
     def serialize(data: 'GridAttribute') -> bytes:
-        schema = pa.schema([
-            pa.field('level', pa.int32()),
-            pa.field('global_id', pa.int32()),
-            pa.field('elevation', pa.float64())
-        ])
-        table = pa.Table.from_pylist([data.__dict__], schema=schema)
-        return serialize_from_table(table)
-    
-    def deserialize(arrow_bytes: bytes) -> 'GridAttribute':
-        row = deserialize_to_rows(arrow_bytes)[0]
-        return GridAttribute(**row)
-
-@cc.transferable
-class GridAttributes:
-    """
-    A collection of GridAttribute objects with built-in serialization capabilities.
-    
-    The C-Two framework automatically handles serialization / deserialization
-    when this type is detected as a parameter or return type in CRM methods
-    (e.g., the return type of Grid.get_grid_infos()).
-    """
-    def serialize(data: list[GridAttribute]) -> bytes:
-        schema = pa.schema([
-            pa.field('attribute_bytes', pa.list_(pa.binary())),
-        ])
-        data_dict = {
-            'attribute_bytes': [GridAttribute.serialize(grid) for grid in data]
-        }
-        table = pa.Table.from_pylist([data_dict], schema=schema)
-        return serialize_from_table(table)
-
-    def deserialize(arrow_bytes: bytes) -> list[GridAttribute]:
-        table = deserialize_to_table(arrow_bytes)
-        grid_bytes = table.column('attribute_bytes').to_pylist()[0]
-        return [GridAttribute.deserialize(grid_byte) for grid_byte in grid_bytes]
-
-# Define ICRM ##############################################
-
-@cc.icrm(namespace='cc.demo', version='0.1.0')
-class IGrid:
-    def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
-        """Retrieve grid information for specified level and identifiers"""
-        ...
-    
-    def subdivide_grids(self, levels: list[int], global_ids: list[int]) -> list[str]:
-        """Perform grid subdivision operations"""
+        # Custom serialization (e.g., Apache Arrow)
         ...
 
-# Helpers ##################################################
-
-def serialize_from_table(table: pa.Table) -> bytes:
-    sink = pa.BufferOutputStream()
-    with pa.ipc.new_stream(sink, table.schema) as writer:
-        writer.write_table(table)
-    binary_data = sink.getvalue().to_pybytes()
-    return binary_data
-
-def deserialize_to_rows(serialized_data: bytes) -> dict:
-    buffer = pa.py_buffer(serialized_data)
-    with pa.ipc.open_stream(buffer) as reader:
-        table = reader.read_all()
-    return table.to_pylist()
+    def deserialize(raw: bytes) -> 'GridAttribute':
+        ...
 ```
 
-### 4. SOTA API — Simplified Registration & Connection (Recommended)
+> `serialize` and `deserialize` are written as instance-style methods but are automatically converted to `@staticmethod` by the framework.
 
-The `rpc_v2` module provides a streamlined API for multi-CRM hosting. Multiple CRMs share a single IPC server process, and same-process connections use zero-serialization thread preference.
+---
 
-#### Server Process
+## Examples
+
+### Single Process — Thread Preference
+
+When `cc.connect()` targets a CRM registered in the same process, the proxy calls methods directly with **zero serialization overhead**.
+
 ```python
 import c_two as cc
-from crm import Grid, Network
-from icrm import IGrid, INetwork
 
-# Optional: set explicit IPC address (default: auto-generated)
-cc.set_address('ipc-v3://my_server')
+# Register two CRMs in the same process
+cc.register(IGreeter, Greeter(lang='en'), name='greeter')
+cc.register(ICounter, Counter(initial=100), name='counter')
 
-# Register multiple CRMs — server starts automatically on first register
-grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
-cc.register(IGrid, grid, name='grid')
+# Connect — zero-serde thread-local proxies
+greeter = cc.connect(IGreeter, name='greeter')
+counter = cc.connect(ICounter, name='counter')
 
-network = Network(...)
-cc.register(INetwork, network, name='network')
-
-print(f'Server running at {cc.server_address()}')
-# Keep process alive...
+print(greeter.greet('World'))    # → Hello, World!
+print(counter.value())           # → 100
+counter.increment(10)
 
 # Cleanup
+cc.close(greeter)
+cc.close(counter)
 cc.shutdown()
 ```
 
-#### Client Process (Remote IPC)
+> **Best for:** local prototyping, testing, single-machine computation.
+
+### Multi-Process — IPC
+
+Separate server and client processes communicating over Unix domain sockets with shared memory.
+
+**Server** (`server.py`):
 ```python
 import c_two as cc
-from icrm import IGrid
 
-# Connect to remote server
-grid = cc.connect(IGrid, name='grid', address='ipc-v3://my_server')
+cc.set_address('ipc://my_server')
+cc.register(IGrid, grid_instance, name='grid')
+print(f'Listening at {cc.server_address()}')
+
+cc.serve()  # blocks until interrupted
+```
+
+**Client** (`client.py`):
+```python
+import c_two as cc
+
+grid = cc.connect(IGrid, name='grid', address='ipc://my_server')
 infos = grid.get_grid_infos(1, [0, 1, 2])
+keys = grid.subdivide_grids([1], [0])
 
-# Done
 cc.close(grid)
 cc.shutdown()
 ```
 
-#### Same-Process (Thread Preference)
+> **Best for:** multi-process on same host, worker isolation, high-throughput local IPC.
+
+### Cross-Machine — HTTP Relay
+
+An HTTP relay bridges network requests to CRM processes running on IPC.
+
+**CRM Server** (`resource.py`):
 ```python
-# When connect() targets a locally registered CRM,
-# the proxy uses direct method calls with zero serialization overhead.
-grid = cc.connect(IGrid, name='grid')  # no address → thread-local proxy
-grid.get_grid_infos(1, [0])            # direct call, no IPC
+import c_two as cc
+
+cc.set_address('ipc://grid_server')
+cc.register(IGrid, grid_instance, name='grid')
+# Auto-registers with relay when C2_RELAY_ADDRESS is set
+cc.serve()
+```
+
+**Relay** (`relay.py`):
+```python
+from c_two.transport.relay import Relay
+
+relay = Relay(bind='127.0.0.1:8080')
+relay.start(blocking=True)
+```
+
+**Client** (`client.py`):
+```python
+import c_two as cc
+
+# Same API — just change the address
+grid = cc.connect(IGrid, name='grid', address='http://127.0.0.1:8080')
+grid.get_grid_infos(1, [0])
+
 cc.close(grid)
 ```
 
-### 5. Legacy Server Deployment
+> **Best for:** network-accessible services, web integration, cross-machine deployment.
 
-Deploy the CRM as a networked service with automatic protocol detection.
-Services are accessible only through the defined ICRM interfaces.
+---
 
-```python
-import c_two as cc
-from crm import Grid
-from icrm import IGrid
+## Architecture
 
-# Resource initialization and server configuration
-grid = Grid(epsg=2326, bounds=[...], first_size=[64.0, 64.0], subdivide_rules=[...])
+**The design philosophy of C-Two is not to define services, but to empower resources.**
 
-# Create server configuration
-config = cc.rpc.ServerConfig(
-    name='GridProcessor',
-    crm=grid,
-    icrm=IGrid,
-    on_shutdown=grid.terminate,
-    bind_address='thread://grid_processor',     # thread server (in-process, thread-safe communication)
-    # bind_address='memory://grid_processor',   # memory server (shared memory, high-performance local communication)
-    # bind_address='ipc:///tmp/grid_processor', # IPC server (inter-process communication for Unix-like systems, local machine)
-    # bind_address='tcp://localhost:5555',      # TCP server (network-based, cross-machine)
-    # bind_address='http://localhost:8000',     # HTTP server (web-compatible, cross-platform)
-)
+In scientific computation, resources encapsulating complex state and domain-specific operations need to be organized into cohesive units. We call these **Core Resource Models (CRMs)**. Applications care more about *how to interact* with resources than *where they are located*. We call resource consumers **Components**. C-Two provides location transparency and uniform resource access, allowing components to interact with CRMs as if they were local objects.
 
-# Init server
-server = cc.rpc.Server(config)
+```mermaid
+graph LR
+    subgraph Component Layer
+        C1[Component] -->|cc.connect| P1[ICRM Proxy]
+        C2[Component] -->|cc.connect| P2[ICRM Proxy]
+    end
 
-# Same server lifecycle management regardless of protocol
-server.start()
-print('CRM server is running. Press Ctrl+C to stop.')
-try:
-    # Wait for server termination with optional timeout
-    server.wait_for_termination(timeout=10)
-    print('Timeout reached, stopping CRM server...')
-except KeyboardInterrupt:
-    print('Keyboard interrupt received, stopping CRM server...')
-finally:
-    server.stop()
-    print('CRM server stopped.')
+    subgraph Transport Layer
+        P1 --> T{Protocol<br/>Auto-detect}
+        P2 --> T
+        T -->|thread://| TH[Thread<br/>Direct Call]
+        T -->|ipc://| IPC[IPC<br/>UDS + SHM]
+        T -->|http://| HTTP[HTTP<br/>Relay]
+    end
+
+    subgraph CRM Layer
+        TH --> CRM1[CRM Instance]
+        IPC --> CRM1
+        HTTP --> CRM1
+    end
 ```
 
-### 6. Legacy Client Implementation
+### Component Layer
 
-The framework provides seamless, protocol-transparent connectivity to CRM services.
+Client-side consumers that access remote resources through ICRM proxies. The proxy provides full type safety and location transparency — components don't know (or care) where the CRM is running.
 
-#### Script-Based Component Approach
-```python
-# Thread connection
-with cc.compo.runtime.connect_crm('thread://grid_processor', IGrid) as grid:
-    infos = grid.get_grid_infos(1, [0, 1, 2])
-    keys = grid.subdivide_grids([1, 1], [0, 1])
+- **Script-based**: `cc.connect(ICRMClass, name='...', address='...')` returns a typed ICRM proxy
+- **Function-based**: `@cc.runtime.connect` decorator injects the ICRM proxy as the first parameter
 
-# Memory connection
-with cc.compo.runtime.connect_crm('memory://grid_processor', IGrid) as grid:
-    infos = grid.get_grid_infos(1, [0, 1, 2])
-    keys = grid.subdivide_grids([1, 1], [0, 1])
+### CRM Layer
 
-# IPC connection
-with cc.compo.runtime.connect_crm('ipc:///tmp/grid_processor', IGrid) as grid:
-    infos = grid.get_grid_infos(1, [0, 1, 2])
-    keys = grid.subdivide_grids([1, 1], [0, 1])
+Server-side stateful resources exposed through standardized ICRM interfaces.
 
-# TCP connection
-with cc.compo.runtime.connect_crm('tcp://localhost:5555', IGrid) as grid:
-    infos = grid.get_grid_infos(1, [0, 1, 2])
-    keys = grid.subdivide_grids([1, 1], [0, 1])
+- **CRM**: Plain Python class — state + domain logic. Not decorated.
+- **ICRM**: Interface class decorated with `@cc.icrm()`. Only methods declared here are remotely accessible.
+- **`@transferable`**: Custom serialization for domain data types (e.g., Apache Arrow for scientific data).
+- **`@cc.read` / `@cc.write`**: Concurrency annotations — parallel reads, exclusive writes.
 
-# HTTP connection
-with cc.compo.runtime.connect_crm('http://localhost:8000', IGrid) as grid:
-    infos = grid.get_grid_infos(1, [0, 1, 2])
-    keys = grid.subdivide_grids([1, 1], [0, 1])
+### Transport Layer
 
-print(f'Retrieved {len(infos)} grid attributes, generated {len(keys)} subdivisions')
+Protocol-agnostic communication with automatic protocol detection based on address scheme:
+
+| Scheme | Transport | Use case |
+|--------|-----------|----------|
+| `thread://` | In-process direct call | Zero serialization, testing |
+| `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
+| `http://host:port` | HTTP relay | Cross-machine, web-compatible |
+
+The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory — zero-copy on the data path.
+
+### Rust Native Layer
+
+Performance-critical components are implemented in Rust and compiled as a Python extension via [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
+
+- **Buddy Allocator** — Zero-syscall shared memory allocation for the IPC transport. Cross-process, lock-free on the fast path.
+- **HTTP Relay** — High-throughput [axum](https://github.com/tokio-rs/axum)-based gateway bridging HTTP to IPC. Handles connection pooling and request multiplexing.
+
+The Rust extension is compiled automatically during `pip install c-two` (from pre-built wheels) or `uv sync` (from source).
+
+---
+
+## Installation
+
+### From PyPI
+
+```bash
+pip install c-two
 ```
 
-#### Function-Based Component Approach
-```python
-@cc.runtime.connect
-def process_grids(grid: IGrid, target_level: int) -> list[str]:
-    """Reusable component for grid processing operations"""
-    infos = grid.get_grid_infos(target_level, [0, 1, 2, 3, 4])
-    candidates = [info.global_id for info in infos if hasattr(info, 'elevation') and info.elevation > 0]
-    return grid.subdivide_grids([target_level] * len(candidates), candidates)
+Pre-built wheels are available for:
+- **Linux**: x86_64, aarch64
+- **macOS**: Apple Silicon (aarch64), Intel (x86_64)
+- **Python**: 3.10, 3.11, 3.12, 3.13, 3.14, 3.14t (free-threading)
 
-# Protocol is automatically determined by the address
-result = process_grids(1, crm_address='thread://grid_processor')      # use Thread
-result = process_grids(1, crm_address='memory://grid_processor')      # use Memory
-result = process_grids(1, crm_address='ipc:///tmp/grid_processor')    # use IPC
-result = process_grids(1, crm_address='tcp://localhost:5555')         # use TCP
-result = process_grids(1, crm_address='http://localhost:8000')        # use HTTP
+If no pre-built wheel is available for your platform, pip will build from source (requires a [Rust toolchain](https://rustup.rs)).
 
-# OR ##################################################
+### Development Setup
 
-# Using a context manager with automatic protocol detection
-with cc.compo.connect_crm('thread://grid_processor'):
-    result = process_grids(1)
+```bash
+git clone https://github.com/world-in-progress/c-two.git
+cd c-two
+uv sync          # install dependencies + compile Rust extensions
+uv run pytest    # run the test suite
 ```
 
-### 7. External System Integration
+> Requires [uv](https://github.com/astral-sh/uv) and a Rust toolchain.
 
-Integrate with external systems using the Model Context Protocol (MCP):
+---
 
-```python
-from mcp.server.fastmcp import FastMCP
-import compo  # module containing function-based components
+## Roadmap
 
-mcp = FastMCP('GridAgent', instructions=cc.mcp.CC_INSTRUCTION)
-cc.mcp.register_mcp_tools_from_compo_module(mcp, compo)
+| Feature | Status |
+|---------|--------|
+| Core RPC framework (CRM / ICRM / Component) | ✅ Stable |
+| IPC transport with SHM buddy allocator | ✅ Stable |
+| HTTP relay (Rust-powered) | ✅ Stable |
+| Chunked streaming (payloads > 256 MB) | ✅ Stable |
+| Heartbeat & connection management | ✅ Stable |
+| Read/write concurrency control | ✅ Stable |
+| CI/CD & multi-platform PyPI publishing | ✅ Stable |
+| Async interfaces | 🔜 Planned |
+| Disk spill for extreme payloads | 🔜 Planned |
+| Cross-language clients (Rust/C++) | 🔮 Future |
 
-if __name__ == '__main__':
-    mcp.run()
-```
+See the [full roadmap](docs/plans/c-two-rpc-v2-roadmap.md) for details.
+
+---
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+<p align="center">Built for scientific Python. Powered by Rust.</p>

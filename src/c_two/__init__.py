@@ -1,3 +1,6 @@
+from importlib.metadata import version
+__version__ = version('c-two')
+
 from . import mcp
 from . import compo
 from . import error
@@ -16,32 +19,17 @@ from .transport.registry import (
     serve,
 )
 
-__version__ = '0.2.7'
+def _load_banner(name: str) -> str:
+    """Load a pre-generated banner from package resources.
 
-LOGO_ASCII ="""
-                                                  
-                                                  
-                       cccc                       
-                   cccccccccccc                   
-               ccc  ccccccccc    cc               
-          cccc      ccccccccc        ccc          
-      ccccccc       cccc cccc        ccccccc      
-     cccccccc       cccc cccc        ccccccc      
-     cccccccc       cccc cccc        ccccccc      
-     ccccccc        cccc cccc        ccccccc      
-     ccc            cccc cccc        ccc          
-                    cccc cccc                     
-                    cccc cccc                     
-                    cccc cccc                     
-           cc       cccc cccc              c      
-       cccccc       cccc cccc         cccccc      
-     cccccccc       cccc cccc        ccccccc      
-     cccccccc       cccc cccc        ccccccc      
-     cccccccc       cccc cccc        ccccccc      
-         cccc       cccc cccc       cccc          
-              cc    cccc cccc   cccc              
-                  cccccc ccccccc                  
-                      cc cc                       
-                                                  
-                                                  
-"""
+    Returns empty string if the file does not exist.
+    """
+    from importlib.resources import files
+    resource = files("c_two").joinpath(name)
+    try:
+        return resource.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+LOGO_UNICODE = _load_banner("banner_unicode.txt")

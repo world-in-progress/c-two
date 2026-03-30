@@ -1,4 +1,4 @@
-//! C-Two HTTP relay server — bridges HTTP requests to IPC v3.
+//! C-Two HTTP relay server — bridges HTTP requests to IPC.
 //!
 //! Supports multi-upstream dynamic registration: CRM processes register
 //! themselves at runtime via `POST /_register`.

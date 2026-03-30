@@ -49,7 +49,6 @@ def main():
 
     # Done
     cc.close(grid)
-    cc.shutdown()
     print('\nClient done.')
 
 

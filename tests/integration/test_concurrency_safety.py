@@ -44,14 +44,14 @@ _counter = 0
 def _next_addr():
     global _counter
     _counter += 1
-    return f'ipc-v3://test_conc_{os.getpid()}_{_counter}'
+    return f'ipc://test_conc_{os.getpid()}_{_counter}'
 
 
 def _wait_for_server(addr: str, timeout: float = 3.0):
     """Poll until server socket is ready."""
     import socket as _sock
     sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-    region = addr.replace('ipc-v3://', '').replace('ipc://', '')
+    region = addr.replace('ipc://', '')
     sock_path = os.path.join(sock_dir, region + '.sock')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -315,7 +315,7 @@ class TestClientPoolSafety:
         """Releasing an address never acquired should not crash."""
         pool = ClientPool(grace_seconds=1.0)
         # Should not raise, just warn.
-        pool.release('ipc-v3://nonexistent')
+        pool.release('ipc://nonexistent')
         pool.shutdown_all()
 
 
@@ -437,7 +437,7 @@ class TestServerMalformedFrames:
 
         try:
             sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-            region = addr.replace('ipc-v3://', '')
+            region = addr.replace('ipc://', '')
             sock_path = os.path.join(sock_dir, region + '.sock')
 
             # Send a malformed call frame (truncated call control).
@@ -482,7 +482,7 @@ class TestServerMalformedFrames:
 
         try:
             sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-            region = addr.replace('ipc-v3://', '')
+            region = addr.replace('ipc://', '')
             sock_path = os.path.join(sock_dir, region + '.sock')
 
             raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
@@ -523,7 +523,7 @@ class TestServerMalformedFrames:
 
         try:
             sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-            region = addr.replace('ipc-v3://', '')
+            region = addr.replace('ipc://', '')
             sock_path = os.path.join(sock_dir, region + '.sock')
 
             raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)

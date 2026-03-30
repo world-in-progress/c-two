@@ -22,7 +22,7 @@ use pyo3::prelude::*;
 /// Registers all buddy allocator classes + relay classes at the
 /// top level of the module (flat namespace, not submodules).
 #[cfg(feature = "python")]
-#[pymodule(name = "_native")]
+#[pymodule(name = "_native", gil_used = false)]
 fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     buddy_ffi::register_module(m)?;
     relay_ffi::register_module(m)?;

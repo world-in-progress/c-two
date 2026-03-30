@@ -85,7 +85,7 @@ class TestUpstreamPoolShutdownLogging:
         pool = UpstreamPool()
         # Inject a mock entry directly (skip real IPC connection).
         mock_client = MagicMock()
-        pool._entries['grid'] = _UpstreamEntry('grid', 'ipc-v3://fake', mock_client)
+        pool._entries['grid'] = _UpstreamEntry('grid', 'ipc://fake', mock_client)
 
         with caplog.at_level(logging.INFO):
             pool.shutdown()

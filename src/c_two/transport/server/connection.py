@@ -7,6 +7,7 @@ server sub-module imports data types from here rather than from the
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,6 +61,7 @@ class Connection:
     remote_segment_sizes: list[int] = field(default_factory=list)
     handshake_done: bool = False
     chunked_capable: bool = False
+    last_activity: float = field(default_factory=time.monotonic)
     # In-flight submit_inline request counter.  Incremented on the event
     # loop thread before submitting; decremented by worker threads via
     # call_soon_threadsafe.  The _idle event is set when the count drops
@@ -67,6 +69,14 @@ class Connection:
     # pending replies before closing the writer.
     _inflight: int = field(default=0, repr=False)
     _idle: asyncio.Event | None = field(default=None, repr=False)
+
+    def touch(self) -> None:
+        """Update last_activity to current time."""
+        self.last_activity = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        """Seconds since last activity."""
+        return time.monotonic() - self.last_activity
 
     def init_flight_tracking(self, loop: asyncio.AbstractEventLoop) -> None:
         self._idle = asyncio.Event()

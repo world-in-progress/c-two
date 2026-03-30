@@ -1,4 +1,4 @@
-"""IPC v3 specific tests: buddy handshake, SHM transport, concurrent requests."""
+"""IPC specific tests: buddy handshake, SHM transport, concurrent requests."""
 
 import os
 import threading
@@ -129,13 +129,13 @@ def _unique_region():
     global _counter
     with _lock:
         _counter += 1
-        return f'test_ipcv3_{os.getpid()}_{_counter}'
+        return f'test_ipc_{os.getpid()}_{_counter}'
 
 
 @pytest.fixture
-def ipc_v3_server():
-    """Start an IPC v3 server, yield address, shut down."""
-    addr = f'ipc-v3://{_unique_region()}'
+def ipc_server():
+    """Start an IPC server, yield address, shut down."""
+    addr = f'ipc://{_unique_region()}'
     server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
     server.start()
     _wait_for_server(addr)
@@ -147,29 +147,29 @@ def ipc_v3_server():
     _wait_for_shutdown(addr)
 
 
-class TestIPCv3Lifecycle:
-    def test_ping(self, ipc_v3_server):
-        assert SharedClient.ping(ipc_v3_server, timeout=1.0)
+class TestIPCLifecycle:
+    def test_ping(self, ipc_server):
+        assert SharedClient.ping(ipc_server, timeout=1.0)
 
-    def test_simple_call(self, ipc_v3_server):
-        with cc.compo.runtime.connect_crm(ipc_v3_server, IHello) as crm:
+    def test_simple_call(self, ipc_server):
+        with cc.compo.runtime.connect_crm(ipc_server, IHello) as crm:
             assert crm.greeting('World') == 'Hello, World!'
 
-    def test_v3_uses_buddy_transport(self, ipc_v3_server):
-        """Verify IPC v3 actually performs buddy handshake and uses SHM."""
-        with cc.compo.runtime.connect_crm(ipc_v3_server, IHello) as crm:
+    def test_uses_buddy_transport(self, ipc_server):
+        """Verify IPC actually performs buddy handshake and uses SHM."""
+        with cc.compo.runtime.connect_crm(ipc_server, IHello) as crm:
             crm.greeting('Probe')
-            v3_client = crm.client._client
-            assert v3_client._buddy_pool is not None, 'Buddy pool not initialized'
-            assert len(v3_client._seg_views) > 0, 'No segment views cached'
+            ipc_client = crm.client._client
+            assert ipc_client._buddy_pool is not None, 'Buddy pool not initialized'
+            assert len(ipc_client._seg_views) > 0, 'No segment views cached'
 
-    def test_multiple_calls(self, ipc_v3_server):
-        with cc.compo.runtime.connect_crm(ipc_v3_server, IHello) as crm:
+    def test_multiple_calls(self, ipc_server):
+        with cc.compo.runtime.connect_crm(ipc_server, IHello) as crm:
             assert crm.add(3, 4) == 7
-            assert crm.greeting('IPC v3') == 'Hello, IPC v3!'
+            assert crm.greeting('IPC') == 'Hello, IPC!'
 
     def test_shutdown(self):
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
         server.start()
         _wait_for_server(addr)
@@ -182,12 +182,12 @@ class TestIPCv3Lifecycle:
 # Concurrency stress test
 # ------------------------------------------------------------------
 
-class TestIPCv3Concurrency:
-    def test_concurrent_clients(self, ipc_v3_server):
+class TestIPCConcurrency:
+    def test_concurrent_clients(self, ipc_server):
         errors = []
         def client_worker(thread_id):
             try:
-                with cc.compo.runtime.connect_crm(ipc_v3_server, IHello) as crm:
+                with cc.compo.runtime.connect_crm(ipc_server, IHello) as crm:
                     for i in range(5):
                         result = crm.add(i, thread_id)
                         if result != i + thread_id:
@@ -207,10 +207,10 @@ class TestIPCv3Concurrency:
 # Buddy pool SHM data path
 # ------------------------------------------------------------------
 
-class TestIPCv3BuddyPath:
+class TestIPCBuddyPath:
     def test_large_payload_uses_buddy(self):
         """Send payload > shm_threshold to exercise the buddy SHM data path."""
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         ipc_config = IPCConfig(
             shm_threshold=1024,
             pool_segment_size=64 * 1024,
@@ -225,8 +225,8 @@ class TestIPCv3BuddyPath:
                 assert result == f'Hello, {large_name}!'
 
                 # Verify buddy transport was actually used
-                v3_client = crm.client._client
-                assert v3_client._buddy_pool is not None, \
+                ipc_client = crm.client._client
+                assert ipc_client._buddy_pool is not None, \
                     'Buddy pool not initialized for large payload'
         finally:
             try:
@@ -279,7 +279,7 @@ class TestOPTC1SafeBytesCopy:
 
     def test_buddy_response_returns_bytes(self):
         """Large payload response through buddy path must return bytes type."""
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         ipc_config = IPCConfig(
             shm_threshold=512,
             pool_segment_size=64 * 1024,
@@ -344,12 +344,12 @@ class TestBuddyProtocolEdgeCases:
         assert segments == []
 
 
-class TestIPCv3StressRecovery:
-    """Test that IPC v3 recovers from edge cases under load."""
+class TestIPCStressRecovery:
+    """Test that IPC recovers from edge cases under load."""
 
     def test_rapid_connect_disconnect(self):
         """Rapid connect/disconnect cycles should not leak resources."""
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
         server.start()
         _wait_for_server(addr)
@@ -366,7 +366,7 @@ class TestIPCv3StressRecovery:
 
     def test_concurrent_clients_heavy(self):
         """8 threads × 20 iterations stress test."""
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr, icrm_class=IHello, crm_instance=Hello(), name='default')
         server.start()
         _wait_for_server(addr)

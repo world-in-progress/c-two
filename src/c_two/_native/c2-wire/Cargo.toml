@@ -2,7 +2,7 @@
 name = "c2-wire"
 edition.workspace = true
 version.workspace = true
-description = "Wire protocol codec for C-Two IPC v3 / v2 frames"
+description = "Wire protocol codec for C-Two IPC frames"
 
 [features]
 default = ["std"]

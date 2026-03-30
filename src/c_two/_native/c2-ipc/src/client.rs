@@ -1,11 +1,11 @@
-//! Async IPC v3 client — connects to Python ServerV2 via UDS.
+//! Async IPC client — connects to Python ServerV2 via UDS.
 //!
-//! Performs handshake v5, then multiplexes concurrent requests over
+//! Performs handshake, then multiplexes concurrent requests over
 //! a single UDS connection using request IDs.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,7 +17,7 @@ use c2_wire::control::{decode_reply_control, ReplyControl};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
-    decode_handshake, encode_client_handshake, HandshakeV5, MethodEntry,
+    decode_handshake, encode_client_handshake, Handshake, MethodEntry,
     CAP_CALL_V2, CAP_METHOD_IDX,
 };
 
@@ -100,10 +100,10 @@ type PendingMap = HashMap<u32, oneshot::Sender<Result<Vec<u8>, IpcError>>>;
 
 // ── IpcClient ────────────────────────────────────────────────────────────
 
-/// Async IPC v3 client for the C-Two relay.
+/// Async IPC client for the C-Two relay.
 ///
 /// Connects to a Python `ServerV2` via Unix Domain Socket, performs
-/// handshake v5, and multiplexes concurrent CRM calls.
+/// handshake, and multiplexes concurrent CRM calls.
 pub struct IpcClient {
     socket_path: PathBuf,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
@@ -113,16 +113,17 @@ pub struct IpcClient {
     server_segments: Vec<(String, u32)>,
     seg_cache: Arc<RwLock<SegmentCache>>,
     recv_handle: Option<tokio::task::JoinHandle<()>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl IpcClient {
     /// Create a new IPC client targeting the given address.
     ///
-    /// The address should be like `ipc-v3://name` — the socket path is
-    /// derived as `/tmp/c_two_ipc/{name}.sock` (matching Python ServerV2).
+    /// The address should be like `ipc://name` — the socket path is
+    /// derived as `/tmp/c_two_ipc/{name}.sock` (matching Python Server).
     pub fn new(address: &str) -> Self {
         let name = address
-            .strip_prefix("ipc-v3://")
+            .strip_prefix("ipc://")
             .unwrap_or(address);
         let socket_path = PathBuf::from(format!("/tmp/c_two_ipc/{name}.sock"));
 
@@ -135,15 +136,16 @@ impl IpcClient {
             server_segments: Vec::new(),
             seg_cache: Arc::new(RwLock::new(SegmentCache::new())),
             recv_handle: None,
+            connected: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Connect and perform handshake v5.
+    /// Connect and perform handshake.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
         let stream = UnixStream::connect(&self.socket_path).await?;
         let (reader, mut writer) = tokio::io::split(stream);
 
-        // Perform handshake v5.
+        // Perform handshake.
         let hs = self.do_handshake(&mut writer, reader).await?;
 
         // Store method tables from the handshake response.
@@ -172,6 +174,8 @@ impl IpcClient {
 
         *self.writer.lock().await = Some(writer);
 
+        self.connected.store(true, Ordering::Release);
+
         // Spawn the receive loop — replaced below in `do_handshake`.
         // Actually, we need to spawn it with the reader after handshake.
         // The reader was consumed by do_handshake, so we get it back.
@@ -184,7 +188,7 @@ impl IpcClient {
         &self,
         writer: &mut tokio::io::WriteHalf<UnixStream>,
         mut reader: tokio::io::ReadHalf<UnixStream>,
-    ) -> Result<HandshakeV5, IpcError> {
+    ) -> Result<Handshake, IpcError> {
         // We don't create SHM segments from the relay side — the relay
         // reads from server segments only.  Send empty segments list.
         let payload = encode_client_handshake(&[], CAP_CALL_V2 | CAP_METHOD_IDX);
@@ -210,7 +214,7 @@ impl IpcClient {
         }
 
         let hs = decode_handshake(&payload_buf)
-            .map_err(|e| IpcError::Handshake(format!("v5 decode: {e}")))?;
+            .map_err(|e| IpcError::Handshake(format!("decode: {e}")))?;
 
         if hs.capability_flags & CAP_CALL_V2 == 0 {
             return Err(IpcError::Handshake(
@@ -221,11 +225,14 @@ impl IpcClient {
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
         let seg_cache = self.seg_cache.clone();
+        let writer_clone = self.writer.clone();
+        let connected = self.connected.clone();
         // Note: recv_handle is stored on self but we can't assign here
         // because &self is immutable. The caller (connect) handles this
         // via interior mutability or the recv task is detached.
         tokio::spawn(async move {
-            recv_loop(reader, pending, seg_cache).await;
+            recv_loop(reader, pending, seg_cache, writer_clone).await;
+            connected.store(false, Ordering::Release);
         });
 
         Ok(hs)
@@ -310,8 +317,34 @@ impl IpcClient {
         self.route_tables.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Whether the client has an active connection.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Manually override the connection flag.
+    ///
+    /// Intended for test scenarios where a real handshake is not
+    /// performed.  Production code should rely on [`connect`] / [`close`].
+    pub fn force_connected(&self, val: bool) {
+        self.connected.store(val, Ordering::Release);
+    }
+
     /// Close the client.
     pub async fn close(&mut self) {
+        self.connected.store(false, Ordering::Release);
+        // Best-effort: send DISCONNECT signal so the server can clean up
+        // immediately instead of waiting for heartbeat timeout.
+        {
+            let mut guard = self.writer.lock().await;
+            if let Some(w) = guard.as_mut() {
+                let disconnect_frame =
+                    frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
+                let _ = w.write_all(&disconnect_frame).await;
+            }
+        }
+        // Brief grace period for the server to reply DISCONNECT_ACK.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // Drop writer to close the write half.
         *self.writer.lock().await = None;
         // Abort recv task.
@@ -328,10 +361,17 @@ impl IpcClient {
 
 // ── Recv loop ────────────────────────────────────────────────────────────
 
+/// Signal byte constants (match Python `MsgType` enum).
+const SIG_PING: u8 = 0x01;
+const SIG_PONG: u8 = 0x02;
+const SIG_DISCONNECT: u8 = 0x08;
+const SIG_DISCONNECT_ACK: u8 = 0x09;
+
 async fn recv_loop(
     mut reader: tokio::io::ReadHalf<UnixStream>,
     pending: Arc<StdMutex<PendingMap>>,
     seg_cache: Arc<RwLock<SegmentCache>>,
+    writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
@@ -360,6 +400,30 @@ async fn recv_loop(
             if reader.read_exact(&mut recv_buf).await.is_err() {
                 break;
             }
+        }
+
+        // Handle signal frames.
+        if hdr.is_signal() {
+            if recv_buf.len() == 1 {
+                match recv_buf[0] {
+                    SIG_PING => {
+                        let pong = frame::encode_frame(
+                            hdr.request_id,
+                            flags::FLAG_RESPONSE | flags::FLAG_SIGNAL,
+                            &[SIG_PONG],
+                        );
+                        let mut guard = writer.lock().await;
+                        if let Some(w) = guard.as_mut() {
+                            let _ = w.write_all(&pong).await;
+                        }
+                    }
+                    SIG_DISCONNECT_ACK => {
+                        break; // Server acknowledged disconnect — exit cleanly.
+                    }
+                    _ => {} // Ignore unknown signals.
+                }
+            }
+            continue; // Don't dispatch signals to pending callers.
         }
 
         let rid = hdr.request_id as u32;

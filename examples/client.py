@@ -11,12 +11,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
-from examples.grid.igrid import (
+from grid.igrid import (
     IGrid,
     GridAttribute,
 )
 
-SERVER_ADDRESS = 'ipc-v3://grid'
+SERVER_ADDRESS = 'ipc://grid'
 
 
 def main():
@@ -51,7 +51,6 @@ def main():
 
     # Done
     cc.close(grid)
-    cc.shutdown()
     print('\nClient done.')
 
 

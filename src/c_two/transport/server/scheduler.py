@@ -4,8 +4,8 @@ Extracted and simplified from :mod:`c_two.rpc.server._Scheduler`.
 
 Three concurrency modes:
 
-- **EXCLUSIVE** (default): all CRM calls serialized via a single lock.
-- **READ_PARALLEL**: ``@cc.read`` methods run concurrently; ``@cc.write``
+- **EXCLUSIVE**: all CRM calls serialized via a single lock.
+- **READ_PARALLEL** (default): ``@cc.read`` methods run concurrently; ``@cc.write``
   methods acquire exclusive access (writer-priority RW lock).
 - **PARALLEL**: no locking — the CRM is assumed fully thread-safe.
 
@@ -40,14 +40,14 @@ from ...crm.meta import MethodAccess, get_method_access  # noqa: F401
 
 @enum.unique
 class ConcurrencyMode(enum.Enum):
+    PARALLEL = 'parallel'
     EXCLUSIVE = 'exclusive'
     READ_PARALLEL = 'read_parallel'
-    PARALLEL = 'parallel'
 
 
 @dataclass(frozen=True)
 class ConcurrencyConfig:
-    mode: ConcurrencyMode | str = ConcurrencyMode.EXCLUSIVE
+    mode: ConcurrencyMode | str = ConcurrencyMode.READ_PARALLEL
     max_workers: int | None = None
     max_pending: int | None = None
 

@@ -21,9 +21,9 @@ from c_two.transport.server.scheduler import (
 
 class TestConcurrencyConfig:
 
-    def test_default_exclusive(self):
+    def test_default_read_parallel(self):
         cfg = ConcurrencyConfig()
-        assert cfg.mode is ConcurrencyMode.EXCLUSIVE
+        assert cfg.mode is ConcurrencyMode.READ_PARALLEL
 
     def test_from_string(self):
         cfg = ConcurrencyConfig(mode='read_parallel')

@@ -27,7 +27,7 @@ def _unique_region() -> str:
 
 
 def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
-    region_id = addr.replace('ipc-v3://', '')
+    region_id = addr.replace('ipc://', '')
     sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -94,7 +94,7 @@ class TestICRMProxyIPC:
 
     @pytest.fixture
     def server_addr(self):
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(initial=50), name='counter')

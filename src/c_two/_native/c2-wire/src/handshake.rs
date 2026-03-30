@@ -1,4 +1,4 @@
-//! Handshake v5 codec — capability negotiation and method table exchange.
+//! Handshake codec — capability negotiation and method table exchange.
 //!
 //! ## Client → Server
 //!
@@ -28,7 +28,7 @@ use alloc::{string::String, vec, vec::Vec};
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_V5: u8 = 5;
+pub const HANDSHAKE_VERSION: u8 = 5;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -60,9 +60,9 @@ pub struct RouteInfo {
     pub methods: Vec<MethodEntry>,
 }
 
-/// Decoded handshake v5 payload.
+/// Decoded handshake payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HandshakeV5 {
+pub struct Handshake {
     /// SHM segments: `(name, size)`.
     pub segments: Vec<(String, u32)>,
     /// Capability flags.
@@ -73,13 +73,13 @@ pub struct HandshakeV5 {
 
 // ── Encoding: Client → Server ────────────────────────────────────────────
 
-/// Encode client→server handshake v5.
+/// Encode client→server handshake.
 pub fn encode_client_handshake(
     segments: &[(String, u32)],
     capability_flags: u16,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
-    buf.push(HANDSHAKE_V5);
+    buf.push(HANDSHAKE_VERSION);
     buf.extend_from_slice(&(segments.len() as u16).to_le_bytes());
     for (name, size) in segments {
         buf.extend_from_slice(&size.to_le_bytes());
@@ -93,7 +93,7 @@ pub fn encode_client_handshake(
 
 // ── Encoding: Server → Client (ACK) ─────────────────────────────────────
 
-/// Encode server→client handshake v5 ACK.
+/// Encode server→client handshake ACK.
 pub fn encode_server_handshake(
     segments: &[(String, u32)],
     capability_flags: u16,
@@ -118,17 +118,17 @@ pub fn encode_server_handshake(
 
 // ── Decoding (both directions) ───────────────────────────────────────────
 
-/// Decode handshake v5 from either direction.
+/// Decode handshake from either direction.
 ///
 /// Client payloads have no route section (detected by exhausting bytes
 /// after `capability_flags`).
-pub fn decode_handshake(buf: &[u8]) -> Result<HandshakeV5, DecodeError> {
+pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
     let len = buf.len();
     if len < 3 {
         return Err(DecodeError::BufferTooShort { need: 3, have: len });
     }
     let version = buf[0];
-    if version != HANDSHAKE_V5 {
+    if version != HANDSHAKE_VERSION {
         return Err(DecodeError::InvalidValue {
             field: "handshake version",
             value: version as u64,
@@ -205,7 +205,7 @@ pub fn decode_handshake(buf: &[u8]) -> Result<HandshakeV5, DecodeError> {
         }
     }
 
-    Ok(HandshakeV5 { segments, capability_flags, routes })
+    Ok(Handshake { segments, capability_flags, routes })
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────

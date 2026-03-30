@@ -1,4 +1,4 @@
-"""Integration tests for chunked streaming transfer (IPC v3).
+"""Integration tests for chunked streaming transfer (IPC).
 
 Tests verify end-to-end chunked transfer for payloads exceeding the buddy
 pool segment size.  Uses a small ``pool_segment_size`` (64 KB) to trigger
@@ -80,7 +80,7 @@ def _unique_region() -> str:
 
 
 def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
-    region = addr.replace('ipc-v3://', '')
+    region = addr.replace('ipc://', '')
     sock_path = os.path.join(_IPC_SOCK_DIR, f'{region}.sock')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -107,7 +107,7 @@ def _setup(
     Returns ``(addr, server, client, icrm)``.
     """
     if addr is None:
-        addr = f'ipc-v3://{_unique_region()}'
+        addr = f'ipc://{_unique_region()}'
     if cfg is None:
         cfg = _chunk_config()
 
@@ -308,7 +308,7 @@ class TestChunkedCapability:
     """Tests for chunked capability negotiation edge cases."""
 
     def test_chunked_capable_flag_set(self):
-        """Client._chunked_capable is True after v5 handshake with new server."""
+        """Client._chunked_capable is True after handshake with new server."""
         addr, server, client, _ = _setup()
         try:
             assert client._chunked_capable is True
