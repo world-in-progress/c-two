@@ -9,7 +9,6 @@
 
 use crate::segment::{DedicatedSegment, ShmSegment};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 /// Configuration for the buddy pool.
@@ -78,8 +77,6 @@ pub struct BuddyPool {
     segments: Vec<ShmSegment>,
     /// Dedicated segments for oversized allocations. Key is segment index.
     dedicated: HashMap<u32, DedicatedEntry>,
-    /// Counter for generating unique SHM names.
-    name_counter: AtomicU32,
     /// Base name prefix for SHM segments (includes PID).
     name_prefix: String,
     /// Next dedicated segment index (offset from max_segments to avoid collision).
@@ -104,7 +101,6 @@ impl BuddyPool {
             config,
             segments: Vec::new(),
             dedicated: HashMap::new(),
-            name_counter: AtomicU32::new(0),
             name_prefix,
             next_dedicated_idx: 256,
             idle_since: Vec::new(),
@@ -366,6 +362,11 @@ impl BuddyPool {
         self.dedicated.get(&idx).map(|e| e.segment.name())
     }
 
+    /// Get the pool name prefix (for handshake exchange).
+    pub fn prefix(&self) -> &str {
+        &self.name_prefix
+    }
+
     /// Open an existing buddy segment (for the remote side of a connection).
     pub fn open_segment(&mut self, name: &str, size: usize) -> Result<usize, String> {
         let seg = ShmSegment::open(name, size)?;
@@ -541,9 +542,9 @@ impl BuddyPool {
             }
         }
 
-        let name = self.next_name("d");
-        let seg = DedicatedSegment::create(&name, size)?;
         let idx = self.next_dedicated_idx;
+        let name = format!("{}_{}{:04x}", self.name_prefix, "d", idx);
+        let seg = DedicatedSegment::create(&name, size)?;
         self.next_dedicated_idx = self.next_dedicated_idx.checked_add(1)
             .expect("dedicated segment index overflow");
 
@@ -594,13 +595,9 @@ impl BuddyPool {
     }
 
     fn create_segment(&self) -> Result<ShmSegment, String> {
-        let name = self.next_name("b");
+        let idx = self.segments.len();
+        let name = format!("{}_{}{:04x}", self.name_prefix, "b", idx);
         ShmSegment::create(&name, self.config.segment_size, self.config.min_block_size)
-    }
-
-    fn next_name(&self, tag: &str) -> String {
-        let counter = self.name_counter.fetch_add(1, Ordering::Relaxed);
-        format!("{}_{}{:04x}", self.name_prefix, tag, counter)
     }
 }
 
@@ -631,6 +628,10 @@ mod tests {
             max_dedicated_segments: 2,
             dedicated_gc_delay_secs: 0.0,
         }
+    }
+
+    fn test_config() -> PoolConfig {
+        small_config()
     }
 
     #[test]
@@ -840,5 +841,83 @@ mod tests {
         let _ = removed;
 
         pool.free(&allocs[0]).unwrap();
+    }
+
+    #[test]
+    fn test_deterministic_buddy_naming() {
+        let mut pool = test_pool(PoolConfig {
+            max_segments: 4,
+            max_dedicated_segments: 2,
+            ..test_config()
+        });
+
+        // Allocate to force segment 0 creation.
+        let a0 = pool.alloc(4096).unwrap();
+        assert_eq!(a0.seg_idx, 0);
+        let name0 = pool.segment_name(0).unwrap();
+        assert!(name0.ends_with("_b0000"), "got: {}", name0);
+
+        // Fill segment 0 to force segment 1 creation.
+        let big = pool.config.segment_size;
+        pool.free(&a0).unwrap();
+        let a_big = pool.alloc(big).unwrap();
+        assert_eq!(a_big.seg_idx, 0);
+        let a1 = pool.alloc(4096).unwrap();
+        assert_eq!(a1.seg_idx, 1);
+        let name1 = pool.segment_name(1).unwrap();
+        assert!(name1.ends_with("_b0001"), "got: {}", name1);
+
+        // Interleave a dedicated allocation — should NOT affect buddy naming.
+        let a_ded = pool.alloc(big * 2).unwrap();
+        assert!(a_ded.is_dedicated);
+
+        // Buddy segment 2.
+        pool.free(&a1).unwrap();
+        let a1_big = pool.alloc(big).unwrap();
+        assert_eq!(a1_big.seg_idx, 1);
+        let a2 = pool.alloc(4096).unwrap();
+        assert_eq!(a2.seg_idx, 2);
+        let name2 = pool.segment_name(2).unwrap();
+        assert!(name2.ends_with("_b0002"), "got: {}", name2);
+
+        pool.free(&a_ded).unwrap();
+        pool.free(&a_big).unwrap();
+        pool.free(&a1_big).unwrap();
+        pool.free(&a2).unwrap();
+    }
+
+    #[test]
+    fn test_deterministic_dedicated_naming() {
+        let mut pool = test_pool(PoolConfig {
+            max_segments: 1,
+            max_dedicated_segments: 4,
+            ..test_config()
+        });
+
+        let a0 = pool.alloc(4096).unwrap();
+        pool.free(&a0).unwrap();
+
+        let big = pool.config.segment_size * 2;
+        let d0 = pool.alloc(big).unwrap();
+        assert!(d0.is_dedicated);
+        assert_eq!(d0.seg_idx, 256);
+        let dname0 = pool.dedicated_name(256).unwrap();
+        assert!(dname0.ends_with("_d0100"), "got: {}", dname0);
+
+        let d1 = pool.alloc(big).unwrap();
+        assert!(d1.is_dedicated);
+        assert_eq!(d1.seg_idx, 257);
+        let dname1 = pool.dedicated_name(257).unwrap();
+        assert!(dname1.ends_with("_d0101"), "got: {}", dname1);
+
+        pool.free(&d0).unwrap();
+        pool.free(&d1).unwrap();
+    }
+
+    #[test]
+    fn test_prefix_accessor() {
+        let pool = test_pool(test_config());
+        let prefix = pool.prefix();
+        assert!(prefix.starts_with("/cc3t"), "got: {}", prefix);
     }
 }
