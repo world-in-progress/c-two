@@ -15,10 +15,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
-from icrm import IGrid
-from crm import Grid
+import logging
+from grid.grid import Grid
+from grid.igrid import IGrid
 
 BIND_ADDRESS = 'ipc://grid'
+logging.basicConfig(level=logging.DEBUG)
 
 
 def main():

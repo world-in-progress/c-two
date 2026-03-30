@@ -37,6 +37,7 @@ from ..ipc.msg_type import (
     PONG_BYTES,
     SHUTDOWN_CLIENT_BYTES,
     SHUTDOWN_ACK_BYTES,
+    DISCONNECT_BYTES,
 )
 from ..ipc.frame import (
     IPCConfig,
@@ -238,6 +239,7 @@ class SharedClient:
         self._running = False
         self._closed = False
         self._close_lock = threading.Lock()
+        self._shutdown_ack = threading.Event()
 
         # Negotiated during handshake.
         self._method_table: MethodTable | None = None
@@ -353,6 +355,18 @@ class SharedClient:
             if self._closed:
                 return
             self._closed = True
+
+        # Best-effort graceful disconnect: notify server before closing.
+        # The recv thread is still running and will set _shutdown_ack
+        # when the server replies with DISCONNECT_ACK.
+        if self._sock is not None and self._recv_thread is not None and self._recv_thread.is_alive():
+            try:
+                frame = encode_frame(0, FLAG_SIGNAL, DISCONNECT_BYTES)
+                with self._send_lock:
+                    self._sock.sendall(frame)
+                self._shutdown_ack.wait(timeout=1.0)
+            except Exception:
+                pass  # best-effort: fall through to hard close
 
         self._running = False
 
@@ -724,6 +738,9 @@ class SharedClient:
                                 sock.sendall(pong)
                             except (ConnectionResetError, BrokenPipeError, OSError):
                                 break
+                    elif len(payload) == 1 and payload[0] == MsgType.DISCONNECT_ACK:
+                        self._shutdown_ack.set()
+                        break
                     continue
 
                 # Chunked reply: accumulate in assembler.

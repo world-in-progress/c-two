@@ -24,6 +24,7 @@ from ..ipc.msg_type import (
     MsgType,
     PONG_BYTES,
     SHUTDOWN_ACK_BYTES,
+    DISCONNECT_ACK_BYTES,
     _SIGNAL_TYPES,
 )
 from ..protocol import FLAG_SIGNAL, FLAG_CALL, FLAG_CHUNKED
@@ -473,6 +474,10 @@ class Server:
                             self._shutdown_event.set()
                         writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, SHUTDOWN_ACK_BYTES))
                         return  # close connection after shutdown ack
+                    elif sig_type == MsgType.DISCONNECT:
+                        writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, DISCONNECT_ACK_BYTES))
+                        logger.debug('Conn %d: graceful disconnect', conn.conn_id)
+                        return  # close this connection only
                     continue
 
                 # Periodic GC for stale chunk assemblers.

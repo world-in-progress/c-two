@@ -57,7 +57,6 @@ def main():
 
     # ── Cleanup ───────────────────────────────────────────────────
     cc.close(grid)
-    cc.shutdown()
     print('\n[Client] Done.')
 
 
