@@ -219,6 +219,7 @@ mod tests {
     fn touch_updates_last_activity() {
         let mut pool = UpstreamPool::new();
         let client = Arc::new(IpcClient::new("ipc://test"));
+        client.force_connected(true);
         pool.insert("r".into(), "ipc://test".into(), client).unwrap();
 
         // Manually set activity far in the past.
@@ -281,5 +282,33 @@ mod tests {
         let old = pool.remove("rm").unwrap();
         assert!(old.is_some());
         assert!(!pool.has_entry("rm"));
+    }
+
+    #[test]
+    fn idle_entries_returns_disconnected_client() {
+        // A client that is NOT idle by time but IS disconnected should
+        // still be returned by idle_entries (dead-connection detection).
+        let mut pool = UpstreamPool::new();
+        let client = Arc::new(IpcClient::new("ipc://dead"));
+        // Client starts disconnected (is_connected() == false).
+        assert!(!client.is_connected());
+        pool.insert("d".into(), "ipc://dead".into(), client).unwrap();
+
+        // last_activity was just set to now by insert(), so it is NOT
+        // idle by time (use a very large timeout to make sure).
+        let idle = pool.idle_entries(999_999_999);
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0], "d");
+    }
+
+    #[test]
+    fn idle_entries_ignores_connected_and_active_client() {
+        // A connected client with recent activity must NOT appear idle.
+        let mut pool = UpstreamPool::new();
+        let client = Arc::new(IpcClient::new("ipc://alive"));
+        client.force_connected(true);
+        pool.insert("a".into(), "ipc://alive".into(), client).unwrap();
+
+        assert!(pool.idle_entries(999_999_999).is_empty());
     }
 }

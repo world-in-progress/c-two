@@ -322,6 +322,14 @@ impl IpcClient {
         self.connected.load(Ordering::Acquire)
     }
 
+    /// Manually override the connection flag.
+    ///
+    /// Intended for test scenarios where a real handshake is not
+    /// performed.  Production code should rely on [`connect`] / [`close`].
+    pub fn force_connected(&self, val: bool) {
+        self.connected.store(val, Ordering::Release);
+    }
+
     /// Close the client.
     pub async fn close(&mut self) {
         self.connected.store(false, Ordering::Release);
