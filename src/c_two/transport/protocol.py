@@ -41,7 +41,7 @@ FLAG_SIGNAL     = 1 << 11  # 0x800 — frame carries a 1-byte signal (PING, SHUT
 # Handshake
 # ---------------------------------------------------------------------------
 
-HANDSHAKE_VERSION = 5
+HANDSHAKE_VERSION = 6
 
 # Capability flags (2 bytes, exchanged during handshake)
 CAP_CALL    = 1 << 0  # Supports call/reply frames
@@ -111,6 +111,7 @@ class Handshake:
     segments: list[tuple[str, int]]   # [(shm_name, segment_size), ...]
     capability_flags: int = 0
     routes: list[RouteInfo] = field(default_factory=list)
+    prefix: str = ''                  # pool name prefix for segment name derivation
 
 
 # ---------------------------------------------------------------------------
@@ -120,17 +121,23 @@ class Handshake:
 def encode_client_handshake(
     segments: list[tuple[str, int]],
     capability_flags: int = CAP_CALL | CAP_METHOD_IDX,
+    *,
+    prefix: str = '',
 ) -> bytes:
     """Encode client→server handshake.
 
-    Format::
+    Format (v6)::
 
-        [1B version=5]
+        [1B version=6]
+        [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
         [2B capability_flags LE]
     """
     parts: list[bytes] = [bytes([HANDSHAKE_VERSION])]
+    prefix_b = prefix.encode('utf-8')
+    parts.append(bytes([len(prefix_b)]))
+    parts.append(prefix_b)
     parts.append(_U16.pack(len(segments)))
     for name, size in segments:
         name_b = name.encode('utf-8')
@@ -149,12 +156,15 @@ def encode_server_handshake(
     segments: list[tuple[str, int]],
     capability_flags: int,
     routes: list[RouteInfo],
+    *,
+    prefix: str = '',
 ) -> bytes:
     """Encode server→client handshake ACK.
 
-    Format::
+    Format (v6)::
 
-        [1B version=5]
+        [1B version=6]
+        [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
         [2B capability_flags LE]
@@ -166,6 +176,10 @@ def encode_server_handshake(
         ]
     """
     parts: list[bytes] = [bytes([HANDSHAKE_VERSION])]
+    # Prefix
+    prefix_b = prefix.encode('utf-8')
+    parts.append(bytes([len(prefix_b)]))
+    parts.append(prefix_b)
     # Segments
     parts.append(_U16.pack(len(segments)))
     for name, size in segments:
@@ -216,6 +230,14 @@ def decode_handshake(
 
     off = 1
     buf_len = len(buf)
+
+    # Parse prefix (v6).
+    if off + 1 > buf_len:
+        raise ValueError('Handshake truncated: missing prefix length')
+    prefix_len = buf[off]; off += 1
+    if off + prefix_len > buf_len:
+        raise ValueError('Handshake truncated in prefix')
+    prefix = bytes(buf[off:off + prefix_len]).decode('utf-8'); off += prefix_len
 
     if off + 2 > buf_len:
         raise ValueError('Handshake truncated: missing segment count')
@@ -274,4 +296,5 @@ def decode_handshake(
         segments=segments,
         capability_flags=cap_flags,
         routes=routes,
+        prefix=prefix,
     )

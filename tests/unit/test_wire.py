@@ -278,7 +278,43 @@ class TestHandshake:
 
     def test_truncated_raises(self):
         with pytest.raises(ValueError):
-            decode_handshake(b'\x05')
+            decode_handshake(b'\x06')
+
+
+class TestHandshakePrefixExchange:
+    """Handshake v6: prefix field."""
+
+    def test_client_handshake_with_prefix(self):
+        segments = [('/cc3b00001234_b0000', 262144)]
+        prefix = '/cc3b00001234'
+        encoded = encode_client_handshake(segments, CAP_CALL | CAP_METHOD_IDX, prefix=prefix)
+        assert encoded[0] == HANDSHAKE_VERSION
+        hs = decode_handshake(encoded)
+        assert hs.prefix == prefix
+        assert hs.segments == segments
+        assert hs.capability_flags & CAP_CALL
+
+    def test_server_handshake_with_prefix(self):
+        segments = [('/cc3bABCD0000_b0000', 262144)]
+        prefix = '/cc3bABCD0000'
+        routes = [RouteInfo(name='grid', methods=[MethodEntry(name='get', index=0)])]
+        encoded = encode_server_handshake(segments, CAP_CALL, routes, prefix=prefix)
+        hs = decode_handshake(encoded)
+        assert hs.prefix == prefix
+        assert len(hs.routes) == 1
+        assert hs.routes[0].name == 'grid'
+
+    def test_empty_prefix_defaults(self):
+        segments = [('/seg0', 65536)]
+        encoded = encode_client_handshake(segments, CAP_CALL, prefix='')
+        hs = decode_handshake(encoded)
+        assert hs.prefix == ''
+
+    def test_prefix_none_uses_empty(self):
+        segments = [('/seg0', 65536)]
+        encoded = encode_client_handshake(segments, CAP_CALL)
+        hs = decode_handshake(encoded)
+        assert hs.prefix == ''
 
 
 # ---------------------------------------------------------------------------
