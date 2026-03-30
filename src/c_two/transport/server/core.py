@@ -650,9 +650,14 @@ class Server:
                 logger.warning('Conn %d: malformed chunked buddy payload: %s',
                                conn.conn_id, exc)
                 return
-            if conn.buddy_pool is None or seg_idx >= len(conn.seg_views):
+            if conn.buddy_pool is None:
                 return
-            seg_mv = conn.seg_views[seg_idx]
+            seg_mv = conn.seg_views.get(seg_idx)
+            if seg_mv is None:
+                from .handshake import lazy_open_peer_seg
+                seg_mv = lazy_open_peer_seg(conn, seg_idx)
+                if seg_mv is None:
+                    return
             if data_offset + data_size > len(seg_mv):
                 logger.warning('Conn %d: chunked buddy OOB', conn.conn_id)
                 return
@@ -855,8 +860,14 @@ class Server:
             logger.warning('Conn %d: malformed buddy payload: %s',
                            conn.conn_id, exc)
             return '', -1, None
-        if conn.buddy_pool is None or seg_idx >= len(conn.seg_views):
+        if conn.buddy_pool is None:
             return '', -1, None
+        seg_mv = conn.seg_views.get(seg_idx)
+        if seg_mv is None:
+            from .handshake import lazy_open_peer_seg
+            seg_mv = lazy_open_peer_seg(conn, seg_idx)
+            if seg_mv is None:
+                return '', -1, None
 
         ctrl_offset = BUDDY_PAYLOAD_STRUCT.size
         try:
@@ -866,7 +877,6 @@ class Server:
                            conn.conn_id, exc)
             return '', -1, None
 
-        seg_mv = conn.seg_views[seg_idx]
         if data_offset + data_size > len(seg_mv):
             logger.warning('Conn %d: buddy OOB: offset=%d + size=%d > seg_len=%d',
                            conn.conn_id, data_offset, data_size, len(seg_mv))

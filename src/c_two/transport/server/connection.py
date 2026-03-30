@@ -56,9 +56,10 @@ class Connection:
     writer: asyncio.StreamWriter
     config: IPCConfig
     buddy_pool: object = None          # BuddyPoolHandle
-    seg_views: list[memoryview] = field(default_factory=list)
+    seg_views: dict[int, memoryview] = field(default_factory=dict)
     remote_segment_names: list[str] = field(default_factory=list)
     remote_segment_sizes: list[int] = field(default_factory=list)
+    peer_prefix: str = ''
     handshake_done: bool = False
     chunked_capable: bool = False
     last_activity: float = field(default_factory=time.monotonic)
@@ -103,7 +104,7 @@ class Connection:
             await self._idle.wait()
 
     def cleanup(self) -> None:
-        self.seg_views = []
+        self.seg_views = {}
         if self.buddy_pool is not None:
             try:
                 self.buddy_pool.destroy()

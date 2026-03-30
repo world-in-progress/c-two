@@ -53,7 +53,7 @@ class TestHandshakeBoundsChecking:
 
     def test_truncated_segment_entry(self):
         """seg_count=1 but no segment data follows."""
-        buf = bytes([HANDSHAKE_VERSION]) + struct.pack('<H', 1)  # version + seg_count=1
+        buf = bytes([HANDSHAKE_VERSION, 0]) + struct.pack('<H', 1)  # version + prefix(0) + seg_count=1
         with pytest.raises(ValueError, match='truncated'):
             decode_handshake(buf)
 
@@ -61,6 +61,7 @@ class TestHandshakeBoundsChecking:
         """Segment name_len claims 10 bytes but only 2 available."""
         buf = bytearray()
         buf.append(HANDSHAKE_VERSION)
+        buf.append(0)                    # prefix_len=0
         buf += struct.pack('<H', 1)    # seg_count=1
         buf += struct.pack('<I', 256)  # segment size
         buf.append(10)                 # name_len = 10
@@ -72,6 +73,7 @@ class TestHandshakeBoundsChecking:
         """seg_count exceeds _MAX_HANDSHAKE_SEGMENTS."""
         buf = bytearray()
         buf.append(HANDSHAKE_VERSION)
+        buf.append(0)                    # prefix_len=0
         buf += struct.pack('<H', _MAX_HANDSHAKE_SEGMENTS + 1)
         with pytest.raises(ValueError, match='exceeds limit'):
             decode_handshake(bytes(buf))
@@ -87,6 +89,7 @@ class TestHandshakeBoundsChecking:
         """Payload has segment data but no capability_flags."""
         buf = bytearray()
         buf.append(HANDSHAKE_VERSION)
+        buf.append(0)                    # prefix_len=0
         buf += struct.pack('<H', 1)     # seg_count=1
         buf += struct.pack('<I', 256)   # segment size
         buf.append(2)                   # name_len=2

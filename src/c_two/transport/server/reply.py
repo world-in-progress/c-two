@@ -117,8 +117,11 @@ async def send_reply(
                 )
                 raise MemoryError('dedicated segment, fall back to inline')
 
-            seg_mv = conn.seg_views[alloc.seg_idx]
-            if alloc.offset + data_size > len(seg_mv):
+            seg_mv = conn.seg_views.get(alloc.seg_idx)
+            if seg_mv is None:
+                from .handshake import lazy_open_peer_seg
+                seg_mv = lazy_open_peer_seg(conn, alloc.seg_idx)
+            if seg_mv is None or alloc.offset + data_size > len(seg_mv):
                 conn.buddy_pool.free_at(
                     alloc.seg_idx, alloc.offset, data_size, alloc.is_dedicated,
                 )
@@ -170,7 +173,12 @@ async def send_chunked_reply(
                         alloc.seg_idx, alloc.offset, chunk_len, True,
                     )
                     raise MemoryError('dedicated')
-                seg_mv = conn.seg_views[alloc.seg_idx]
+                seg_mv = conn.seg_views.get(alloc.seg_idx)
+                if seg_mv is None:
+                    from .handshake import lazy_open_peer_seg
+                    seg_mv = lazy_open_peer_seg(conn, alloc.seg_idx)
+                if seg_mv is None:
+                    raise MemoryError('lazy open failed')
                 seg_mv[alloc.offset:alloc.offset + chunk_len] = chunk_data
                 frame = encode_buddy_chunked_reply_frame(
                     request_id, alloc.seg_idx, alloc.offset,

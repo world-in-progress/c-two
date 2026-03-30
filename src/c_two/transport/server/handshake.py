@@ -64,7 +64,7 @@ async def _handle_handshake_impl(
     except Exception as e:
         logger.warning('Conn %d: bad handshake: %s', conn.conn_id, e)
         return
-    open_segments(conn, hs.segments, config)
+    open_segments(conn, hs.segments, hs.prefix, config)
 
     # Build route / method table ACK for *all* registered CRMs.
     route_infos: list[RouteInfo] = []
@@ -98,6 +98,7 @@ async def _handle_handshake_impl(
 def open_segments(
     conn: Connection,
     segments: list[tuple[str, int]],
+    peer_prefix: str,
     config: IPCConfig,
 ) -> None:
     """Open the client's buddy SHM segments and cache memoryviews."""
@@ -112,6 +113,7 @@ def open_segments(
     try:
         from c_two.buddy import BuddyPoolHandle, PoolConfig
 
+        conn.peer_prefix = peer_prefix
         conn.buddy_pool = BuddyPoolHandle(PoolConfig(
             segment_size=config.pool_segment_size,
             min_block_size=4096,
@@ -123,15 +125,48 @@ def open_segments(
             conn.remote_segment_names.append(name)
             conn.remote_segment_sizes.append(size)
 
-        conn.seg_views = []
+        conn.seg_views = {}
         for seg_idx in range(conn.buddy_pool.segment_count()):
             base_addr, data_size = conn.buddy_pool.seg_data_info(seg_idx)
             mv = memoryview(
                 (ctypes.c_char * data_size).from_address(base_addr)
             ).cast('B')
-            conn.seg_views.append(mv)
+            conn.seg_views[seg_idx] = mv
 
         conn.handshake_done = True
     except Exception as e:
         logger.error('Conn %d: segment open failed: %s', conn.conn_id, e)
         conn.cleanup()
+
+
+def lazy_open_peer_seg(
+    conn: Connection,
+    seg_idx: int,
+) -> memoryview | None:
+    """Lazily open a client buddy segment not seen during handshake.
+
+    When the client's pool expands dynamically, new segments appear with
+    deterministic names derived from ``peer_prefix``.  The UDS FIFO
+    guarantees the SHM segment exists before we receive the data frame
+    referencing it.
+
+    Returns the memoryview for the segment, or None on failure.
+    """
+    if conn.buddy_pool is None or not conn.peer_prefix:
+        return None
+    try:
+        # Deterministic name: {peer_prefix}_b{seg_idx:04x}
+        name = f'{conn.peer_prefix}_b{seg_idx:04x}'
+        conn.buddy_pool.open_segment(name, conn.config.pool_segment_size)
+        base_addr, data_size = conn.buddy_pool.seg_data_info(seg_idx)
+        mv = memoryview(
+            (ctypes.c_char * data_size).from_address(base_addr)
+        ).cast('B')
+        conn.seg_views[seg_idx] = mv
+        logger.debug('Conn %d: lazily opened peer segment %d (%s)',
+                     conn.conn_id, seg_idx, name)
+        return mv
+    except Exception as e:
+        logger.warning('Conn %d: failed to lazy-open seg %d: %s',
+                       conn.conn_id, seg_idx, e)
+        return None
