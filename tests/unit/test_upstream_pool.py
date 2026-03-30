@@ -224,6 +224,36 @@ class TestUpstreamPoolLazyReconnect:
         assert entry.client is None
 
 
+# -- Dead client detection ------------------------------------------------
+
+class TestUpstreamPoolGetDeadClient:
+    """get() should detect dead clients and trigger reconnect."""
+
+    @patch('c_two.transport.relay.core.SharedClient')
+    def test_get_detects_dead_client_and_reconnects(self, MockClient):
+        """get() should not return a _closed client — should reconnect."""
+        new_client = _make_client()
+        MockClient.return_value = new_client
+
+        pool = _make_pool()
+        dead_client = _make_client(closed=True)
+        pool._entries['grid'] = _make_entry('grid', client=dead_client)
+
+        result = pool.get('grid')
+
+        assert result is new_client, 'Should return freshly reconnected client'
+        dead_client.terminate.assert_called_once()
+        new_client.connect.assert_called_once()
+
+    def test_get_returns_alive_client_directly(self):
+        pool = _make_pool()
+        alive = _make_client()
+        pool._entries['grid'] = _make_entry('grid', client=alive)
+
+        result = pool.get('grid')
+        assert result is alive
+
+
 # -- Shutdown -------------------------------------------------------------
 
 class TestUpstreamPoolShutdown:

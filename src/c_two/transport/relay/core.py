@@ -142,15 +142,22 @@ class UpstreamPool:
     def get(self, name: str) -> SharedClient | None:
         """Look up a SharedClient by route name.
 
-        If the client was evicted by the idle sweeper, attempts a lazy
-        reconnect before returning ``None``.
+        If the client was evicted by the idle sweeper or the connection
+        is dead, attempts a lazy reconnect before returning ``None``.
         """
         entry = self._entries.get(name)
         if entry is None:
             return None
         if entry.client is not None:
-            return entry.client
-        # Client was evicted — try lazy reconnect
+            if not entry.client._closed:
+                return entry.client
+            # Client is dead — terminate and trigger reconnect
+            try:
+                entry.client.terminate()
+            except Exception:
+                pass
+            entry.client = None
+        # Client was evicted or dead — try lazy reconnect
         return self._try_reconnect(entry)
 
     def touch(self, name: str) -> None:
