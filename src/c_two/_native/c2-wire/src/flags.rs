@@ -30,6 +30,9 @@ pub const FLAG_CALL_V2: u32 = 1 << 7;
 /// V2 reply frame — carries control-plane status in the frame payload.
 pub const FLAG_REPLY_V2: u32 = 1 << 8;
 
+/// Frame carries a 1-byte signal (PING, PONG, SHUTDOWN, DISCONNECT, etc.).
+pub const FLAG_SIGNAL: u32 = 1 << 11;
+
 // ── Convenience predicates ───────────────────────────────────────────────
 
 #[inline]
@@ -60,4 +63,9 @@ pub const fn is_call_v2(flags: u32) -> bool {
 #[inline]
 pub const fn is_reply_v2(flags: u32) -> bool {
     flags & FLAG_REPLY_V2 != 0
+}
+
+#[inline]
+pub const fn is_signal(flags: u32) -> bool {
+    flags & FLAG_SIGNAL != 0
 }

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -113,6 +113,7 @@ pub struct IpcClient {
     server_segments: Vec<(String, u32)>,
     seg_cache: Arc<RwLock<SegmentCache>>,
     recv_handle: Option<tokio::task::JoinHandle<()>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl IpcClient {
@@ -135,6 +136,7 @@ impl IpcClient {
             server_segments: Vec::new(),
             seg_cache: Arc::new(RwLock::new(SegmentCache::new())),
             recv_handle: None,
+            connected: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -171,6 +173,8 @@ impl IpcClient {
         }
 
         *self.writer.lock().await = Some(writer);
+
+        self.connected.store(true, Ordering::Release);
 
         // Spawn the receive loop — replaced below in `do_handshake`.
         // Actually, we need to spawn it with the reader after handshake.
@@ -222,11 +226,13 @@ impl IpcClient {
         let pending = self.pending.clone();
         let seg_cache = self.seg_cache.clone();
         let writer_clone = self.writer.clone();
+        let connected = self.connected.clone();
         // Note: recv_handle is stored on self but we can't assign here
         // because &self is immutable. The caller (connect) handles this
         // via interior mutability or the recv task is detached.
         tokio::spawn(async move {
             recv_loop(reader, pending, seg_cache, writer_clone).await;
+            connected.store(false, Ordering::Release);
         });
 
         Ok(hs)
@@ -311,8 +317,14 @@ impl IpcClient {
         self.route_tables.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Whether the client has an active connection.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
     /// Close the client.
     pub async fn close(&mut self) {
+        self.connected.store(false, Ordering::Release);
         // Best-effort: send DISCONNECT signal so the server can clean up
         // immediately instead of waiting for heartbeat timeout.
         {

@@ -29,17 +29,22 @@ use c2_relay::server::RelayServer;
 #[pyclass(name = "NativeRelay")]
 pub struct PyNativeRelay {
     bind: String,
+    idle_timeout_secs: u64,
     server: Option<RelayServer>,
 }
 
 #[pymethods]
 impl PyNativeRelay {
     /// Create a new relay targeting the given bind address.
+    ///
+    /// `idle_timeout_secs` controls how long an upstream can be idle
+    /// before its connection is evicted. Set to `0` to disable (default).
     #[new]
-    #[pyo3(signature = (bind = "0.0.0.0:8080"))]
-    fn new(bind: &str) -> Self {
+    #[pyo3(signature = (bind = "0.0.0.0:8080", idle_timeout_secs = 0))]
+    fn new(bind: &str, idle_timeout_secs: u64) -> Self {
         Self {
             bind: bind.to_string(),
+            idle_timeout_secs,
             server: None,
         }
     }
@@ -52,8 +57,9 @@ impl PyNativeRelay {
             return Err(PyRuntimeError::new_err("Relay is already running"));
         }
         let bind = self.bind.clone();
+        let idle_timeout_secs = self.idle_timeout_secs;
         let server = py
-            .allow_threads(|| RelayServer::start(&bind))
+            .allow_threads(|| RelayServer::start(&bind, idle_timeout_secs))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to start relay: {e}")))?;
         self.server = Some(server);
         Ok(())

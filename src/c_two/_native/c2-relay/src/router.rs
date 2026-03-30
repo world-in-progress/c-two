@@ -72,11 +72,14 @@ async fn handle_register(
     // Insert under write lock (brief)
     let mut pool = state.pool.write().unwrap();
     match pool.insert(name.clone(), address, Arc::new(client)) {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({"registered": name})),
-        )
-            .into_response(),
+        Ok(()) => {
+            pool.touch(&name);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({"registered": name})),
+            )
+                .into_response()
+        }
         Err(e) if e.contains("already registered") => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": e})),
@@ -105,11 +108,23 @@ async fn handle_unregister(
 
     let mut pool = state.pool.write().unwrap();
     match pool.remove(&name) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"unregistered": name})),
-        )
-            .into_response(),
+        Ok(old_client) => {
+            // Close old client asynchronously if present.
+            if let Some(arc_client) = old_client {
+                tokio::spawn(async move {
+                    let mut client = match Arc::try_unwrap(arc_client) {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    client.close().await;
+                });
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"unregistered": name})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": e})),
@@ -140,6 +155,9 @@ async fn health(State(state): State<RelayState>) -> impl IntoResponse {
 }
 
 /// `POST /{route_name}/{method_name}` — relay CRM call to upstream.
+///
+/// If the upstream was evicted by the idle sweeper, attempts a lazy
+/// reconnect before returning 502.
 async fn call_handler(
     State(state): State<RelayState>,
     Path((route_name, method_name)): Path<(String, String)>,
@@ -154,35 +172,77 @@ async fn call_handler(
     let client = match client {
         Some(c) => c,
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("No upstream registered for route: '{route_name}'")
-                })),
-            )
-                .into_response()
+            // Entry might exist but client is None (evicted). Try reconnect.
+            match try_reconnect(&state, &route_name).await {
+                Some(c) => c,
+                None => {
+                    // Distinguish "never registered" from "registered but unreachable".
+                    let has = state.pool.read().unwrap().has_entry(&route_name);
+                    if has {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": format!("Upstream '{route_name}' is registered but unreachable")
+                            })),
+                        )
+                            .into_response();
+                    }
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": format!("No upstream registered for route: '{route_name}'")
+                        })),
+                    )
+                        .into_response();
+                }
+            }
         }
     };
 
     match client.call(&route_name, &method_name, &body).await {
-        Ok(result) => (
-            StatusCode::OK,
-            [("content-type", "application/octet-stream")],
-            result,
-        )
-            .into_response(),
-        Err(c2_ipc::IpcError::CrmError(err_bytes)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [("content-type", "application/octet-stream")],
-            err_bytes,
-        )
-            .into_response(),
+        Ok(result) => {
+            { state.pool.read().unwrap().touch(&route_name); }
+            (
+                StatusCode::OK,
+                [("content-type", "application/octet-stream")],
+                result,
+            )
+                .into_response()
+        }
+        Err(c2_ipc::IpcError::CrmError(err_bytes)) => {
+            { state.pool.read().unwrap().touch(&route_name); }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/octet-stream")],
+                err_bytes,
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             [("content-type", "text/plain")],
             format!("relay error: {e}"),
         )
             .into_response(),
+    }
+}
+
+/// Attempt to reconnect an evicted upstream.
+async fn try_reconnect(state: &RelayState, route_name: &str) -> Option<Arc<IpcClient>> {
+    let address = { state.pool.read().unwrap().get_address(route_name)? };
+
+    let mut client = IpcClient::new(&address);
+    match client.connect().await {
+        Ok(()) => {
+            let client = Arc::new(client);
+            let mut pool = state.pool.write().unwrap();
+            pool.reconnect(route_name, client.clone());
+            Some(client)
+        }
+        Err(e) => {
+            eprintln!("[relay] Failed to reconnect upstream '{route_name}': {e}");
+            None
+        }
     }
 }
 

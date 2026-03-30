@@ -75,6 +75,11 @@ impl FrameHeader {
     pub const fn is_ctrl(&self) -> bool {
         flags::is_ctrl(self.flags)
     }
+
+    #[inline]
+    pub const fn is_signal(&self) -> bool {
+        flags::is_signal(self.flags)
+    }
 }
 
 // ── Encoding ─────────────────────────────────────────────────────────────
