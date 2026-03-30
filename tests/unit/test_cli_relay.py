@@ -106,3 +106,14 @@ class TestRelayClickCommand:
         runner = CliRunner()
         result = runner.invoke(cli, ['relay', '--help'])
         assert 'NAME=ADDRESS' in result.output
+
+    def test_idle_timeout_in_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ['relay', '--help'])
+        assert '--idle-timeout' in result.output
+        assert 'SECONDS' in result.output
+
+    def test_idle_timeout_default_in_help(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ['relay', '--help'])
+        assert '300' in result.output
