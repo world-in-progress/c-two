@@ -218,12 +218,19 @@ async fn call_handler(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            [("content-type", "text/plain")],
-            format!("relay error: {e}"),
-        )
-            .into_response(),
+        Err(e) => {
+            // Evict the dead client so next request triggers reconnect.
+            {
+                let mut pool = state.pool.write().unwrap();
+                pool.evict(&route_name);
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                [("content-type", "text/plain")],
+                format!("relay error: {e}"),
+            )
+                .into_response()
+        }
     }
 }
 
