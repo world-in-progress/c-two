@@ -221,11 +221,12 @@ impl IpcClient {
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
         let seg_cache = self.seg_cache.clone();
+        let writer_clone = self.writer.clone();
         // Note: recv_handle is stored on self but we can't assign here
         // because &self is immutable. The caller (connect) handles this
         // via interior mutability or the recv task is detached.
         tokio::spawn(async move {
-            recv_loop(reader, pending, seg_cache).await;
+            recv_loop(reader, pending, seg_cache, writer_clone).await;
         });
 
         Ok(hs)
@@ -312,6 +313,18 @@ impl IpcClient {
 
     /// Close the client.
     pub async fn close(&mut self) {
+        // Best-effort: send DISCONNECT signal so the server can clean up
+        // immediately instead of waiting for heartbeat timeout.
+        {
+            let mut guard = self.writer.lock().await;
+            if let Some(w) = guard.as_mut() {
+                let disconnect_frame =
+                    frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
+                let _ = w.write_all(&disconnect_frame).await;
+            }
+        }
+        // Brief grace period for the server to reply DISCONNECT_ACK.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // Drop writer to close the write half.
         *self.writer.lock().await = None;
         // Abort recv task.
@@ -328,10 +341,18 @@ impl IpcClient {
 
 // ── Recv loop ────────────────────────────────────────────────────────────
 
+/// Signal byte constants (match Python `MsgType` enum).
+const SIG_PING: u8 = 0x01;
+const SIG_PONG: u8 = 0x02;
+const SIG_DISCONNECT: u8 = 0x08;
+#[allow(dead_code)]
+const SIG_DISCONNECT_ACK: u8 = 0x09;
+
 async fn recv_loop(
     mut reader: tokio::io::ReadHalf<UnixStream>,
     pending: Arc<StdMutex<PendingMap>>,
     seg_cache: Arc<RwLock<SegmentCache>>,
+    writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
@@ -360,6 +381,22 @@ async fn recv_loop(
             if reader.read_exact(&mut recv_buf).await.is_err() {
                 break;
             }
+        }
+
+        // Handle signal frames (PING → PONG).
+        if hdr.is_signal() {
+            if recv_buf.len() == 1 && recv_buf[0] == SIG_PING {
+                let pong = frame::encode_frame(
+                    hdr.request_id,
+                    flags::FLAG_RESPONSE | flags::FLAG_SIGNAL,
+                    &[SIG_PONG],
+                );
+                let mut guard = writer.lock().await;
+                if let Some(w) = guard.as_mut() {
+                    let _ = w.write_all(&pong).await;
+                }
+            }
+            continue; // Don't dispatch signals to pending callers.
         }
 
         let rid = hdr.request_id as u32;
