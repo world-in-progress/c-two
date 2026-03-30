@@ -424,6 +424,27 @@ impl PyBuddyPoolHandle {
         Ok(pool.segment_name(idx).map(|s| s.to_string()))
     }
 
+    /// Get the pool name prefix (for handshake exchange / name derivation).
+    fn prefix(&self) -> PyResult<String> {
+        let pool = self.pool.read().map_err(|e| {
+            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
+        })?;
+        Ok(pool.prefix().to_string())
+    }
+
+    /// Derive the SHM name for a segment given its index and tier.
+    ///
+    /// Buddy segments: `{prefix}_b{seg_idx:04x}`
+    /// Dedicated segments: `{prefix}_d{seg_idx:04x}`
+    #[pyo3(signature = (seg_idx, is_dedicated = false))]
+    fn derive_segment_name(&self, seg_idx: u32, is_dedicated: bool) -> PyResult<String> {
+        let pool = self.pool.read().map_err(|e| {
+            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
+        })?;
+        let tag = if is_dedicated { "d" } else { "b" };
+        Ok(format!("{}_{}{:04x}", pool.prefix(), tag, seg_idx))
+    }
+
     /// Get the data region base address and size for a buddy segment.
     ///
     /// Returns (data_base_addr, data_region_size).  Python creates a persistent
