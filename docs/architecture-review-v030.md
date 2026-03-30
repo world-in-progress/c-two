@@ -46,5 +46,5 @@ This document records findings from the pre-release code review. Issues marked a
 3. Extract `MethodTable` from `wire.py` — low risk but low priority.
 4. Add stress/race-condition tests for concurrent sweeper + reconnect.
 5. Add integration test for full idle-evict-reconnect lifecycle.
-6. Clean up unused `SHUTDOWN_SERVER` signal.
-7. Explicit `DISCONNECT_ACK` handling in Rust `recv_loop`.
+6. ~~Clean up unused `SHUTDOWN_SERVER` signal.~~ → **Fixed** (2026-03-30, commit `51b001e`).
+7. ~~Explicit `DISCONNECT_ACK` handling in Rust `recv_loop`.~~ → **Fixed** (2026-03-30, commit `51b001e`).

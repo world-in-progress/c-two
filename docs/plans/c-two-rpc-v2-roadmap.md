@@ -1,6 +1,6 @@
 # C-Two 后续计划
 
-> Date: 2026-03-28 | Updated: 2026-03-29 (heartbeat §2.2 completed)
+> Date: 2026-03-28 | Updated: 2026-03-30 (v0.3.0 边界鲁棒性增强)
 > 基于: `doc/log/sota.md`（SOTA 设计文档）+ 当前代码库实现状态
 > 目的: 系统梳理 SOTA 设计目标与已有实现之间的差距，规划后续工作优先级
 
@@ -32,6 +32,16 @@
 | 线程优惠的并发控制 | `ICRMProxy.thread_local()` 接收 `Scheduler` + `access_map` | ✓ (2026-03-29) |
 | @cc.shutdown 声明式生命周期回调 | `crm/meta.py` + `server/core.py` + `registry.py` | ✓ (2026-03-29) |
 | 心跳检测 + 连接空闲清理 + SHM 孤儿回收 | `server/heartbeat.py` + `server/core.py` + `client/core.py` | ✓ (2026-03-29) |
+| 优雅断连协议（DISCONNECT / DISCONNECT_ACK） | `client/core.py` + `server/core.py` + `c2-ipc/client.rs` | ✓ (2026-03-30) |
+| Relay 空闲连接回收（Python + Rust 双实现） | `relay/core.py` + `c2-relay/state.rs` + `c2-relay/server.rs` | ✓ (2026-03-30) |
+| Relay 死连接主动检测（get() + sweeper） | `relay/core.py:get()` + `c2-relay/state.rs:get()` | ✓ (2026-03-30) |
+| Relay 调用失败即驱逐（Rust router） | `c2-relay/router.rs` 传输错误分支立即驱逐死客户端 | ✓ (2026-03-30) |
+| DISCONNECT_ACK 显式处理（Rust recv_loop） | `c2-ipc/client.rs:recv_loop` 匹配 ACK 后 clean break | ✓ (2026-03-30) |
+| 死代码清理（SHUTDOWN_SERVER 0x06） | `ipc/msg_type.py` 移除未使用的信号类型 | ✓ (2026-03-30) |
+| 测试环境 .env 隔离 | `transport/config.py:C2_ENV_FILE` + `tests/conftest.py` | ✓ (2026-03-30) |
+| CI 发布鲁棒性（skip-existing + verbose） | `.github/workflows/release.yml` | ✓ (2026-03-30) |
+| CLI banner + dev 命令保护 | `cli.py` + `banner_unicode.txt` | ✓ (2026-03-30) |
+| GIL-free 声明（Python 3.14t） | `c2-ffi` PyO3 模块声明 `GIL_USED=false` | ✓ (2026-03-30) |
 
 ### 仓库重构 (2026-03-29) ✓
 
@@ -114,6 +124,67 @@ Server 端主动心跳探测 + 客户端 PONG 自动响应 + SHM 孤儿回收，
 - `.github/scripts/check_version.py` — pyproject.toml vs PyPI 版本比对 (6 单元测试)
 - PyPI Trusted Publishing (OIDC) — 零 secret 认证
 - 平台: Linux x86_64/aarch64 + macOS x86_64(交叉编译)/aarch64
+
+**增补** (2026-03-30):
+- `skip-existing: true` — 部分上传后重跑不再全量 400
+- `verbose: true` — PyPI 拒绝时显示完整错误
+
+### 2.4 边界鲁棒性增强（v0.3.0 预发布加固）— ✅ 已完成 (2026-03-30)
+
+v0.3.0 发布前对传输层和 Relay 进行的系统性代码审查与加固。覆盖三类问题：功能缺陷修复、信号协议完善、测试隔离。
+
+#### 2.4.1 优雅断连协议
+
+**问题**: 客户端关闭后，服务器只能等待心跳超时（30s）才能发现连接断开。
+
+**方案**: 新增 DISCONNECT (0x08) / DISCONNECT_ACK (0x09) 信号握手：
+1. `SharedClient.terminate()` 发送 `DISCONNECT` 信号帧
+2. Server `_handle_client` 收到后回复 `DISCONNECT_ACK`，立即清理连接
+3. Rust `IpcClient.close()` 同样发送 DISCONNECT，`recv_loop` 匹配 DISCONNECT_ACK 后 clean break
+4. 100ms 宽限期：即使 ACK 未到达，客户端也继续关闭流程
+
+**改动范围**: `client/core.py` + `server/core.py` + `ipc/msg_type.py` + `c2-ipc/client.rs`
+
+#### 2.4.2 Relay 空闲连接回收
+
+**问题**: Relay 的 IPC 长连接（到上游 CRM）一旦建立就永不释放，CRM 进程重启后旧连接变成僵尸。
+
+**方案**: 周期性 sweeper + 懒重连：
+- **Python Relay**: `UpstreamPool._sweep_idle()` — asyncio task，可配置 `idle_timeout`（`--idle-timeout` CLI 参数）
+- **Rust Relay**: `spawn_idle_sweeper()` — tokio task，相同逻辑
+- Sweeper 同时检查**时间空闲**和**连接死亡**（`_closed` / `!is_connected()`）
+- `idle_timeout=0` 时仍以 30s 间隔运行，仅做死连接清理
+- 驱逐后下次 `get()` 懒重连
+
+**改动范围**: `relay/core.py` + `c2-relay/state.rs` + `c2-relay/server.rs` + `cli.py`
+
+#### 2.4.3 Relay 死连接检测三重保障
+
+**问题**: 上游 CRM 进程意外终止后，Relay 首次请求必然 502（`get()` 返回死客户端）。
+
+**修复**:
+1. **`get()` 即时检测**: Python `get()` 检查 `_closed`、Rust `get()` 检查 `is_connected()` — 死客户端不返回，触发即时重连
+2. **调用失败即驱逐**: Rust router 传输错误分支立即从 pool 驱逐死客户端（不等 sweeper）
+3. **周期性 sweeper 兜底**: 上述两条机制之外，sweeper 仍周期扫描作为最终兜底
+
+**改动范围**: `relay/core.py:get()` + `c2-relay/state.rs:get()` + `c2-relay/router.rs`
+
+#### 2.4.4 信号协议清理
+
+- ✅ 移除 `MsgType.SHUTDOWN_SERVER` (0x06) — 定义但从未发送/处理的死代码，枚举槽位保留为注释
+- ✅ Rust `recv_loop` 显式匹配 `DISCONNECT_ACK` — 之前 `#[allow(dead_code)]`，现在 match 后 break
+- ✅ 信号处理重构为 `match` 分支结构（替代 if/continue 链），覆盖 PING/DISCONNECT_ACK/unknown
+
+#### 2.4.5 测试加固
+
+| 类别 | 数量 | 覆盖内容 |
+|------|------|----------|
+| `test_upstream_pool.py` | 22 | 基本生命周期、空闲驱逐、死连接检测、懒重连、关闭流程 |
+| `test_cli_relay.py` | 2 | `--idle-timeout` 参数解析 |
+| Rust `state.rs` | 2 | 死连接驱逐的 `idle_entries()` 逻辑 |
+| 测试环境隔离 | — | `C2_ENV_FILE=''` 禁止 `.env` 污染测试；conftest 在 import 前设置 |
+
+**架构审查文档**: `docs/architecture-review-v030.md` — 记录大文件审计、信号协议一致性、并发模式、延迟改进项
 
 ---
 
@@ -247,7 +318,14 @@ P0.5 — 大 payload 支持 ✅
 P1 — 性能与可靠性增强
 ├─ 2.1 SHM Pool 动态扩容        优先级降低（Rust 侧已就绪，Python 层待实现）
 ├─ 2.2 心跳 + PID 存活检测      ✅ 已完成 (2026-03-29)
-└─ 2.3 CI/CD 发布集成           ✅ 已完成 (2025-07-26)
+├─ 2.3 CI/CD 发布集成           ✅ 已完成 (2025-07-26, 增补 2026-03-30)
+└─ 2.4 边界鲁棒性增强           ✅ 已完成 (2026-03-30)
+    ├─ 优雅断连协议              ✅ DISCONNECT/DISCONNECT_ACK
+    ├─ Relay 空闲连接回收        ✅ sweeper (Python + Rust)
+    ├─ Relay 死连接三重检测      ✅ get() + 调用失败驱逐 + sweeper
+    ├─ 信号协议清理              ✅ FF-1 DISCONNECT_ACK / FF-2 SHUTDOWN_SERVER
+    ├─ 测试隔离                  ✅ C2_ENV_FILE + 26 新单元测试
+    └─ CLI 增强                  ✅ banner + --idle-timeout + dev 保护
 
 P2 — 功能完善（v0.4.0 里程碑）
 ├─ 3.0 磁盘溢写兜底 (Plan C)
@@ -275,6 +353,8 @@ P3 — 长期演进（v1.0 方向）
 | Rust relay 35K+ QPS | §2.3 集成后即可作为生产级 HTTP 路由层 |
 | flight_inc/dec/wait_idle | §2.2 ✅ 心跳检测已复用 flight counter 判断连接活跃度 |
 | Chunked Streaming Transfer | ✅ 消除 256 MB 单次 RPC 限制，§2.1 SHM Pool 扩容优先级降低 |
+| DISCONNECT / DISCONNECT_ACK | §2.4 ✅ 优雅断连替代心跳超时被动发现 |
+| Relay idle sweeper + lazy reconnect | §2.4 ✅ IPC 长连接不再永久驻留，CRM 重启后自动恢复 |
 
 ### 优化报告中建议但未覆盖的后续方向
 
