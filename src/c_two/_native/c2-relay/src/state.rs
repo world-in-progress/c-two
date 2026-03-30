@@ -74,12 +74,17 @@ impl UpstreamPool {
 
     /// Get a cloned Arc to an upstream's IpcClient.
     ///
-    /// Returns `None` if the route is not registered **or** if the
-    /// client was evicted (use [`has_entry`] to distinguish).
+    /// Returns `None` if the route is not registered, if the client
+    /// was evicted, **or** if the client is disconnected (the caller
+    /// should trigger lazy reconnect via [`try_reconnect`]).
     pub fn get(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.entries
-            .get(name)
-            .and_then(|e| e.client.as_ref().cloned())
+        let entry = self.entries.get(name)?;
+        let client = entry.client.as_ref()?;
+        if client.is_connected() {
+            Some(client.clone())
+        } else {
+            None
+        }
     }
 
     /// Check whether an entry exists (even if evicted).
@@ -249,11 +254,13 @@ mod tests {
     fn reconnect_restores_client() {
         let mut pool = UpstreamPool::new();
         let c1 = Arc::new(IpcClient::new("ipc://a"));
+        c1.force_connected(true);
         pool.insert("y".into(), "ipc://a".into(), c1).unwrap();
         pool.evict("y");
         assert!(pool.get("y").is_none());
 
         let c2 = Arc::new(IpcClient::new("ipc://a"));
+        c2.force_connected(true);
         pool.reconnect("y", c2);
         assert!(pool.get("y").is_some());
     }
