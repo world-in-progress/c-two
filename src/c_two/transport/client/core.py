@@ -223,8 +223,9 @@ class SharedClient:
 
         # Buddy pool (owned by client, shared with server).
         self._buddy_pool = None
-        self._seg_views: list[memoryview] = []
-        self._seg_base_addrs: list[int] = []
+        self._seg_views: dict[int, memoryview] = {}
+        self._seg_base_addrs: dict[int, int] = {}
+        self._peer_prefix: str = ''
 
         # Concurrency primitives.
         self._send_lock = threading.Lock()      # Protects sendall atomicity
@@ -286,7 +287,7 @@ class SharedClient:
         self._buddy_pool = BuddyPoolHandle(PoolConfig(
             segment_size=self._config.pool_segment_size,
             min_block_size=4096,
-            max_segments=1,
+            max_segments=self._config.max_pool_segments,
             max_dedicated_segments=4,
         ))
 
@@ -303,8 +304,10 @@ class SharedClient:
         segments = [(seg_name, seg_size)]
 
         # Handshake (only supported protocol).
+        pool_prefix = self._buddy_pool.prefix()
         handshake_payload = encode_client_handshake(
             segments, CAP_CALL | CAP_METHOD_IDX | CAP_CHUNKED,
+            prefix=pool_prefix,
         )
         handshake_frame = encode_frame(0, 1 << 2, handshake_payload)  # FLAG_HANDSHAKE
         self._sock.sendall(handshake_frame)
@@ -321,6 +324,7 @@ class SharedClient:
             raise error.CompoClientError('Server does not support handshake')
 
         hs = decode_handshake(payload)
+        self._peer_prefix = hs.prefix
         if not (hs.capability_flags & CAP_CALL):
             raise error.CompoClientError('Server does not support routed calls')
 
@@ -337,17 +341,24 @@ class SharedClient:
             self._method_table = self._name_tables[self._default_name]
 
         # Cache persistent memoryviews for each buddy segment.
-        self._seg_views = []
-        self._seg_base_addrs = []
+        self._seg_views = {}
+        self._seg_base_addrs = {}
         for seg_idx in range(self._buddy_pool.segment_count()):
-            base_addr, data_size = self._buddy_pool.seg_data_info(seg_idx)
-            mv = memoryview(
-                (ctypes.c_char * data_size).from_address(base_addr)
-            ).cast('B')
-            self._seg_views.append(mv)
-            self._seg_base_addrs.append(base_addr)
+            self._cache_local_seg(seg_idx)
 
         logger.debug('Buddy handshake complete, pool segment: %s', seg_name)
+
+    def _cache_local_seg(self, seg_idx: int) -> memoryview:
+        """Cache memoryview for a local buddy segment (lazy expansion)."""
+        if seg_idx in self._seg_views:
+            return self._seg_views[seg_idx]
+        base_addr, data_size = self._buddy_pool.seg_data_info(seg_idx)
+        mv = memoryview(
+            (ctypes.c_char * data_size).from_address(base_addr)
+        ).cast('B')
+        self._seg_views[seg_idx] = mv
+        self._seg_base_addrs[seg_idx] = base_addr
+        return mv
 
     def terminate(self) -> None:
         """Shut down the client: stop recv thread, close socket, destroy pool."""
@@ -402,8 +413,8 @@ class SharedClient:
             self._pending.clear()
 
         # Destroy buddy pool.
-        self._seg_views = []
-        self._seg_base_addrs = []
+        self._seg_views = {}
+        self._seg_base_addrs = {}
         if self._buddy_pool is not None:
             try:
                 self._buddy_pool.destroy()
@@ -556,7 +567,7 @@ class SharedClient:
                     f'payload exceeds inline limit ({self._config.max_frame_size})',
                 )
 
-            seg_mv = self._seg_views[alloc.seg_idx]
+            seg_mv = self._cache_local_seg(alloc.seg_idx)
             shm_buf = seg_mv[alloc.offset : alloc.offset + size]
             return alloc, shm_buf
 
@@ -813,7 +824,7 @@ class SharedClient:
 
             if self._buddy_pool is None:
                 return None, error.CompoClientError('Buddy response but no pool')
-            if seg_idx >= len(self._seg_views):
+            if seg_idx not in self._seg_views:
                 return None, error.CompoClientError(f'Invalid seg_idx {seg_idx}')
 
             # Parse reply control (after buddy pointer).
@@ -887,7 +898,7 @@ class SharedClient:
         if is_buddy:
             from ..ipc.buddy import BUDDY_PAYLOAD_STRUCT as _BP
             seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
-            if self._buddy_pool is None or seg_idx >= len(self._seg_views):
+            if self._buddy_pool is None or seg_idx not in self._seg_views:
                 raise error.CompoClientError(f'Chunked reply: invalid seg_idx {seg_idx}')
             seg_mv = self._seg_views[seg_idx]
             chunk_data = bytes(seg_mv[data_offset:data_offset + data_size])
