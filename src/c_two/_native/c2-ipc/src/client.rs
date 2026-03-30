@@ -365,7 +365,6 @@ impl IpcClient {
 const SIG_PING: u8 = 0x01;
 const SIG_PONG: u8 = 0x02;
 const SIG_DISCONNECT: u8 = 0x08;
-#[allow(dead_code)]
 const SIG_DISCONNECT_ACK: u8 = 0x09;
 
 async fn recv_loop(
@@ -403,17 +402,25 @@ async fn recv_loop(
             }
         }
 
-        // Handle signal frames (PING → PONG).
+        // Handle signal frames.
         if hdr.is_signal() {
-            if recv_buf.len() == 1 && recv_buf[0] == SIG_PING {
-                let pong = frame::encode_frame(
-                    hdr.request_id,
-                    flags::FLAG_RESPONSE | flags::FLAG_SIGNAL,
-                    &[SIG_PONG],
-                );
-                let mut guard = writer.lock().await;
-                if let Some(w) = guard.as_mut() {
-                    let _ = w.write_all(&pong).await;
+            if recv_buf.len() == 1 {
+                match recv_buf[0] {
+                    SIG_PING => {
+                        let pong = frame::encode_frame(
+                            hdr.request_id,
+                            flags::FLAG_RESPONSE | flags::FLAG_SIGNAL,
+                            &[SIG_PONG],
+                        );
+                        let mut guard = writer.lock().await;
+                        if let Some(w) = guard.as_mut() {
+                            let _ = w.write_all(&pong).await;
+                        }
+                    }
+                    SIG_DISCONNECT_ACK => {
+                        break; // Server acknowledged disconnect — exit cleanly.
+                    }
+                    _ => {} // Ignore unknown signals.
                 }
             }
             continue; // Don't dispatch signals to pending callers.

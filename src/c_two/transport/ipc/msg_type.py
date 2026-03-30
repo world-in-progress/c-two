@@ -14,22 +14,26 @@ class MsgType(IntEnum):
     CRM_CALL         = 0x03
     CRM_REPLY        = 0x04
     SHUTDOWN_CLIENT  = 0x05
-    SHUTDOWN_SERVER  = 0x06
+    # 0x06 reserved (was SHUTDOWN_SERVER — never implemented)
     SHUTDOWN_ACK     = 0x07
+    DISCONNECT       = 0x08  # graceful per-connection disconnect
+    DISCONNECT_ACK   = 0x09
 
 
 # Pre-encoded 1-byte signal payloads (used as inline frame body)
 PING_BYTES = bytes([MsgType.PING])
 PONG_BYTES = bytes([MsgType.PONG])
 SHUTDOWN_CLIENT_BYTES = bytes([MsgType.SHUTDOWN_CLIENT])
-SHUTDOWN_SERVER_BYTES = bytes([MsgType.SHUTDOWN_SERVER])
 SHUTDOWN_ACK_BYTES = bytes([MsgType.SHUTDOWN_ACK])
+DISCONNECT_BYTES = bytes([MsgType.DISCONNECT])
+DISCONNECT_ACK_BYTES = bytes([MsgType.DISCONNECT_ACK])
 SIGNAL_SIZE = 1
 
 _SIGNAL_TYPES = frozenset({
     MsgType.PING,
     MsgType.PONG,
     MsgType.SHUTDOWN_CLIENT,
-    MsgType.SHUTDOWN_SERVER,
     MsgType.SHUTDOWN_ACK,
+    MsgType.DISCONNECT,
+    MsgType.DISCONNECT_ACK,
 })

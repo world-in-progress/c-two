@@ -1,4 +1,8 @@
 import os
+
+# Disable .env loading before any c_two import — must be first.
+os.environ['C2_ENV_FILE'] = ''
+
 import pytest
 import threading
 import time

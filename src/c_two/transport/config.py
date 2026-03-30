@@ -15,6 +15,8 @@ Recognised environment variables:
 - ``C2_RELAY_ADDRESS`` — HTTP address of the relay server for service
   discovery.  When set, :func:`cc.register` automatically registers
   the CRM with the relay via ``POST /_register``.
+- ``C2_ENV_FILE`` — path to the ``.env`` file. Set to empty string to
+  disable ``.env`` loading entirely (used by the test suite).
 
 Usage::
 
@@ -24,6 +26,9 @@ Usage::
     export C2_IPC_MAX_SEGMENTS=8
     export C2_RELAY_ADDRESS=http://127.0.0.1:8080
 
+    # Disable .env loading (e.g. in CI or tests)
+    export C2_ENV_FILE=
+
     # Python
     from c_two.transport.config import settings
     print(settings.ipc_address)        # 'ipc://my_server'
@@ -31,14 +36,20 @@ Usage::
 """
 from __future__ import annotations
 
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Resolve env_file at class-definition time so that tests can set
+# C2_ENV_FILE='' *before* importing c_two to suppress .env loading.
+_env_file = os.environ.get('C2_ENV_FILE', '.env') or None
 
 
 class C2Settings(BaseSettings):
     """C-Two runtime settings sourced from environment variables."""
 
     model_config = SettingsConfigDict(
-        env_file='.env',
+        env_file=_env_file,
         env_prefix='C2_',
         env_file_encoding='utf-8',
     )
