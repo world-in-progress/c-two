@@ -144,7 +144,7 @@ Components consume CRM resources through ICRM proxies. The proxy is location-tra
 
 ```python
 greeter = cc.connect(IGreeter, name='greeter')
-greeter.greet('World')     # → '你好, World!'
+greeter.greet('World')     # → 'Hello, World!'
 cc.close(greeter)
 ```
 
@@ -181,14 +181,14 @@ When `cc.connect()` targets a CRM registered in the same process, the proxy call
 import c_two as cc
 
 # Register two CRMs in the same process
-cc.register(IGreeter, Greeter(lang='zh'), name='greeter')
+cc.register(IGreeter, Greeter(lang='en'), name='greeter')
 cc.register(ICounter, Counter(initial=100), name='counter')
 
 # Connect — zero-serde thread-local proxies
 greeter = cc.connect(IGreeter, name='greeter')
 counter = cc.connect(ICounter, name='counter')
 
-print(greeter.greet('World'))    # → 你好, World!
+print(greeter.greet('World'))    # → Hello, World!
 print(counter.value())           # → 100
 counter.increment(10)
 
