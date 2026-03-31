@@ -29,12 +29,8 @@ from c_two._native import (
     cleanup_stale_shm,
 )
 
-# Backward-compatible alias
-BuddyPoolHandle = MemPool
-
 __all__ = [
     "MemPool",
-    "BuddyPoolHandle",
     "PoolAlloc",
     "PoolConfig",
     "PoolStats",

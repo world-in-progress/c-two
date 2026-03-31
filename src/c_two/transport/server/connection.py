@@ -55,7 +55,7 @@ class Connection:
     conn_id: int
     writer: asyncio.StreamWriter
     config: IPCConfig
-    buddy_pool: object = None          # BuddyPoolHandle
+    buddy_pool: object = None          # MemPool
     seg_views: dict[int, memoryview] = field(default_factory=dict)
     remote_segment_names: list[str] = field(default_factory=list)
     remote_segment_sizes: list[int] = field(default_factory=list)

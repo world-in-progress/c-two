@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from c_two.mem import MemPool as BuddyPoolHandle, PoolConfig, cleanup_stale_shm
+from c_two.mem import MemPool, PoolConfig, cleanup_stale_shm
 
 
 # ------------------------------------------------------------------
@@ -46,7 +46,7 @@ class TestPoolConfig:
 class TestBasicAllocation:
     @pytest.fixture
     def pool(self):
-        p = BuddyPoolHandle(PoolConfig(
+        p = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=4,
@@ -87,7 +87,7 @@ class TestBasicAllocation:
 class TestDataReadWrite:
     @pytest.fixture
     def pool(self):
-        p = BuddyPoolHandle(PoolConfig(
+        p = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=4,
@@ -141,7 +141,7 @@ class TestDataReadWrite:
 
 class TestSegmentManagement:
     def test_lazy_segment_creation(self):
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=4,
@@ -155,7 +155,7 @@ class TestSegmentManagement:
             pool.destroy()
 
     def test_segment_name(self):
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
         ))
@@ -170,7 +170,7 @@ class TestSegmentManagement:
 
     def test_open_segment(self):
         """Test that one pool can open another pool's segment."""
-        pool1 = BuddyPoolHandle(PoolConfig(
+        pool1 = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
         ))
@@ -182,7 +182,7 @@ class TestSegmentManagement:
             seg_name = pool1.segment_name(0)
 
             # Open same segment from second pool.
-            pool2 = BuddyPoolHandle(PoolConfig(
+            pool2 = MemPool(PoolConfig(
                 segment_size=64 * 1024,
                 min_block_size=4096,
             ))
@@ -206,7 +206,7 @@ class TestSegmentManagement:
 
 class TestDedicatedFallback:
     def test_oversized_alloc_uses_dedicated(self):
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=32 * 1024,
             min_block_size=4096,
             max_segments=1,
@@ -226,7 +226,7 @@ class TestDedicatedFallback:
 
     def test_segment_exhaustion_degradation(self):
         """Test fallback chain: buddy → dedicated → error."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,   # 64KB buddy segment
             min_block_size=4096,      # 4KB min block
             max_segments=1,           # No buddy expansion
@@ -271,7 +271,7 @@ class TestDedicatedFallback:
 
 class TestPoolStats:
     def test_stats_tracking(self):
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
         ))
@@ -295,7 +295,7 @@ class TestPoolStats:
 class TestThreadSafety:
     def test_concurrent_alloc_free(self):
         """Multiple threads allocating and freeing concurrently."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=256 * 1024,
             min_block_size=4096,
             max_segments=4,
@@ -328,7 +328,7 @@ class TestThreadSafety:
 
     def test_concurrent_read_at_free_at(self):
         """Test cross-process-style read_at/free_at under true concurrency."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=256 * 1024,
             min_block_size=4096,
             max_segments=4,
@@ -377,7 +377,7 @@ class TestThreadSafety:
 class TestBuddyMerge:
     def test_buddy_merge_correctness(self):
         """Stress test: alloc many small blocks, free in random order, verify full merge."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=1 * 1024 * 1024,  # 1MB
             min_block_size=4096,
             max_segments=1,
@@ -419,7 +419,7 @@ class TestBuddyMerge:
 class TestSHMCleanup:
     def test_destroy_unlinks_shm(self):
         """Verify destroy() unlinks POSIX SHM segments."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=1,
@@ -451,7 +451,7 @@ class TestBuddyPanicSafety:
 
     def test_oversized_dedicated_returns_error_not_panic(self):
         """BUDDY-PANIC-1: >4GB dedicated alloc must return error, not assert-crash."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=1,
@@ -473,7 +473,7 @@ class TestBuddyPanicSafety:
             max_dedicated_segments=1,
             dedicated_gc_delay_secs=-1.0,
         )
-        pool = BuddyPoolHandle(cfg)
+        pool = MemPool(cfg)
         try:
             # Allocate a dedicated segment, then GC should clamp delay to zero
             alloc = pool.alloc(128 * 1024)  # > segment_size → dedicated
@@ -500,7 +500,7 @@ class TestDoubleFreeSafety:
 
     def test_double_free_does_not_corrupt(self):
         """Double-free on the same block must raise or be safely no-op."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=1,
@@ -521,7 +521,7 @@ class TestDoubleFreeSafety:
 
     def test_alloc_after_double_free_still_works(self):
         """Pool must remain usable after a double-free attempt."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=1,
@@ -549,7 +549,7 @@ class TestSegmentExhaustion:
 
     def test_exhaustion_returns_error(self):
         """When both buddy and dedicated segments are exhausted, alloc must raise."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,  # 64KB buddy
             min_block_size=4096,
             max_segments=1,
@@ -573,7 +573,7 @@ class TestSegmentExhaustion:
 
     def test_dedicated_exhaustion_returns_error(self):
         """When max_dedicated_segments is reached, oversized alloc must raise."""
-        pool = BuddyPoolHandle(PoolConfig(
+        pool = MemPool(PoolConfig(
             segment_size=64 * 1024,
             min_block_size=4096,
             max_segments=1,

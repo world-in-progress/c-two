@@ -279,12 +279,12 @@ class SharedClient:
     def _do_buddy_handshake(self) -> None:
         """Create buddy pool and perform handshake with server."""
         try:
-            from c_two.mem import MemPool as BuddyPoolHandle, PoolConfig
+            from c_two.mem import MemPool, PoolConfig
         except ImportError:
             logger.warning('c_two.mem not available, falling back to inline-only')
             return
 
-        self._buddy_pool = BuddyPoolHandle(PoolConfig(
+        self._buddy_pool = MemPool(PoolConfig(
             segment_size=self._config.pool_segment_size,
             min_block_size=4096,
             max_segments=self._config.max_pool_segments,

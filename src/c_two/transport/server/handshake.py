@@ -111,10 +111,10 @@ def open_segments(
             logger.warning('Conn %d: invalid segment name: %r', conn.conn_id, name)
             return
     try:
-        from c_two.mem import MemPool as BuddyPoolHandle, PoolConfig
+        from c_two.mem import MemPool, PoolConfig
 
         conn.peer_prefix = peer_prefix
-        conn.buddy_pool = BuddyPoolHandle(PoolConfig(
+        conn.buddy_pool = MemPool(PoolConfig(
             segment_size=config.pool_segment_size,
             min_block_size=4096,
             max_segments=len(segments),
