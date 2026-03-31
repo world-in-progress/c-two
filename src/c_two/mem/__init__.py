@@ -27,6 +27,8 @@ from c_two._native import (
     PoolConfig,
     PoolStats,
     cleanup_stale_shm,
+    MemHandle,
+    ChunkAssembler,
 )
 
 __all__ = [
@@ -35,4 +37,6 @@ __all__ = [
     "PoolConfig",
     "PoolStats",
     "cleanup_stale_shm",
+    "MemHandle",
+    "ChunkAssembler",
 ]
