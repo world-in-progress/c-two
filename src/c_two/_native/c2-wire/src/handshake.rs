@@ -3,7 +3,8 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=5]
+//! [1B version=6]
+//! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
 //! [2B capability_flags LE]
@@ -28,7 +29,7 @@ use alloc::{string::String, vec, vec::Vec};
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 5;
+pub const HANDSHAKE_VERSION: u8 = 6;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -63,6 +64,8 @@ pub struct RouteInfo {
 /// Decoded handshake payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
+    /// Pool prefix for deterministic segment naming.
+    pub prefix: String,
     /// SHM segments: `(name, size)`.
     pub segments: Vec<(String, u32)>,
     /// Capability flags.
@@ -77,9 +80,15 @@ pub struct Handshake {
 pub fn encode_client_handshake(
     segments: &[(String, u32)],
     capability_flags: u16,
+    prefix: &str,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(HANDSHAKE_VERSION);
+    // Prefix
+    let prefix_b = prefix.as_bytes();
+    buf.push(prefix_b.len() as u8);
+    buf.extend_from_slice(prefix_b);
+    // Segments
     buf.extend_from_slice(&(segments.len() as u16).to_le_bytes());
     for (name, size) in segments {
         buf.extend_from_slice(&size.to_le_bytes());
@@ -98,8 +107,9 @@ pub fn encode_server_handshake(
     segments: &[(String, u32)],
     capability_flags: u16,
     routes: &[RouteInfo],
+    prefix: &str,
 ) -> Vec<u8> {
-    let mut buf = encode_client_handshake(segments, capability_flags);
+    let mut buf = encode_client_handshake(segments, capability_flags, prefix);
     buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
     for route in routes {
         let name_b = route.name.as_bytes();
@@ -136,6 +146,13 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
     }
 
     let mut off = 1usize;
+
+    // Prefix
+    check_remaining(buf, off, 1, "prefix length")?;
+    let prefix_len = buf[off] as usize; off += 1;
+    check_remaining(buf, off, prefix_len, "prefix")?;
+    let prefix = read_str(buf, off, prefix_len)?;
+    off += prefix_len;
 
     // Segments
     check_remaining(buf, off, 2, "segment count")?;
@@ -205,7 +222,7 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         }
     }
 
-    Ok(Handshake { segments, capability_flags, routes })
+    Ok(Handshake { prefix, segments, capability_flags, routes })
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────

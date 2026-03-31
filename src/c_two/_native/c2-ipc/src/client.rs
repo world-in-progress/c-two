@@ -191,7 +191,7 @@ impl IpcClient {
     ) -> Result<Handshake, IpcError> {
         // We don't create SHM segments from the relay side — the relay
         // reads from server segments only.  Send empty segments list.
-        let payload = encode_client_handshake(&[], CAP_CALL_V2 | CAP_METHOD_IDX);
+        let payload = encode_client_handshake(&[], CAP_CALL_V2 | CAP_METHOD_IDX, "");
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &payload);
         writer.write_all(&frame_bytes).await?;
 

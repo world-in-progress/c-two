@@ -77,7 +77,7 @@ mod client_tests {
     fn handshake_client_message() {
         // Client sends: [version][segments][cap_flags]
         let segments = vec![("seg0".into(), 268_435_456u32)];
-        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX);
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "");
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &encoded);
 
         let (hdr, payload) = frame::decode_frame(&frame_bytes).unwrap();
