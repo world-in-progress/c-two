@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import inspect
 import logging
 import os
 import struct
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,10 +53,9 @@ from ..wire import (
 from .scheduler import Scheduler, ConcurrencyConfig
 
 from .connection import Connection, CRMSlot, parse_call_inline
-from .chunk import ChunkAssembler, gc_chunk_assemblers
 from .reply import unpack_icrm_result, wrap_error, send_reply
 from .dispatcher import FastDispatcher
-from ...mem import cleanup_stale_shm
+from ...mem import cleanup_stale_shm, ChunkAssembler as RustChunkAssembler, MemPool as RustMemPool, PoolConfig as RustPoolConfig
 from .heartbeat import run_heartbeat
 from .handshake import handle_handshake, FLAG_HANDSHAKE
 
@@ -139,6 +140,14 @@ class Server:
         self._server: asyncio.Server | None = None
         self._started = threading.Event()
         self._shutdown_event: asyncio.Event | None = None
+
+        # Dedicated reassembly pool for Rust ChunkAssembler.
+        self._reassembly_pool = RustMemPool(RustPoolConfig(
+            segment_size=self._config.pool_segment_size,
+            min_block_size=4096,
+            max_segments=8,
+            max_dedicated_segments=4,
+        ))
 
         # Connection tracking.
         self._conn_counter = 0
@@ -421,7 +430,7 @@ class Server:
         # Pipelined dispatch: read next frame while previous dispatches
         # are still executing in the thread pool.
         pending: set[asyncio.Task] = set()
-        chunk_assemblers: dict[int, ChunkAssembler] = {}
+        chunk_assemblers: dict[int, tuple[RustChunkAssembler, float]] = {}
 
         try:
             max_frame = self._config.max_frame_size
@@ -483,8 +492,18 @@ class Server:
                 # Periodic GC for stale chunk assemblers.
                 frame_count += 1
                 if frame_count % self._config.chunk_gc_interval == 0 and chunk_assemblers:
-                    gc_chunk_assemblers(chunk_assemblers, conn.conn_id,
-                                       timeout=self._config.chunk_assembler_timeout)
+                    now = time.monotonic()
+                    expired = [
+                        rid for rid, (asm, created) in chunk_assemblers.items()
+                        if now - created > self._config.chunk_assembler_timeout
+                    ]
+                    for rid in expired:
+                        asm, _ = chunk_assemblers.pop(rid)
+                        logger.warning(
+                            'Conn %d: GC stale chunk assembler rid=%d (%d chunks)',
+                            conn.conn_id, rid, asm.received,
+                        )
+                        asm.abort()
 
                 # Chunked frame: accumulate in assembler, dispatch on completion.
                 if flags & FLAG_CHUNKED:
@@ -604,8 +623,8 @@ class Server:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             # Clean up stale chunk assemblers.
-            for asm in chunk_assemblers.values():
-                asm.discard()
+            for asm, _ in chunk_assemblers.values():
+                asm.abort()
             chunk_assemblers.clear()
             # Wait for submit_inline requests still executing in worker
             # threads.  Without this, writer.close() could discard replies
@@ -636,7 +655,7 @@ class Server:
         flags: int,
         payload: bytes,
         writer: asyncio.StreamWriter,
-        assemblers: dict[int, ChunkAssembler],
+        assemblers: dict[int, tuple[RustChunkAssembler, float]],
     ) -> None:
         """Process a single chunked frame, dispatching when all chunks arrive."""
         is_buddy = bool(flags & FLAG_BUDDY)
@@ -694,14 +713,9 @@ class Server:
 
             chunk_size = self._config.pool_segment_size // 2
             try:
-                asm = ChunkAssembler(
-                    total_chunks=total_chunks,
-                    chunk_size=chunk_size,
-                    route_name=route_name,
-                    method_idx=method_idx,
-                    max_total_chunks=self._config.max_total_chunks,
-                    max_reassembly_bytes=self._config.max_reassembly_bytes,
-                )
+                asm = RustChunkAssembler(self._reassembly_pool, total_chunks, chunk_size)
+                asm.route_name = route_name
+                asm.method_idx = method_idx
             except Exception as exc:
                 logger.error('Conn %d: failed to create chunk assembler: %s',
                              conn.conn_id, exc)
@@ -711,27 +725,36 @@ class Server:
                 ))
                 await writer.drain()
                 return
-            assemblers[request_id] = asm
+            assemblers[request_id] = (asm, time.monotonic())
         else:
-            asm = assemblers.get(request_id)
-            if asm is None:
+            entry = assemblers.get(request_id)
+            if entry is None:
                 logger.warning('Conn %d: orphan chunk (rid=%d, idx=%d)',
                                conn.conn_id, request_id, chunk_idx)
                 return
+            asm = entry[0]
             if not is_buddy:
                 chunk_data = bytes(payload[ctrl_off:])
 
-        complete = asm.add(chunk_idx, chunk_data)
+        complete = asm.feed_chunk(chunk_idx, chunk_data)
 
         if not complete:
             return
 
-        # All chunks received — assemble and dispatch.
+        # All chunks received — capture routing info before finish() consumes the assembler.
+        route_name = asm.route_name
+        method_idx = asm.method_idx
+
+        mem_handle = asm.finish()
         del assemblers[request_id]
-        args_bytes = asm.assemble()
+        try:
+            addr, length = mem_handle.buffer_info()
+            args_mv = memoryview((ctypes.c_char * length).from_address(addr)).cast('B')
+            args_bytes = bytes(args_mv)
+        finally:
+            mem_handle.release()
 
         # Resolve slot.
-        route_name = asm.route_name
         slot = self._resolve_slot(route_name)
         if slot is None:
             logger.warning('Conn %d: unknown route %r in chunked call',
@@ -743,13 +766,13 @@ class Server:
             await writer.drain()
             return
 
-        method_name = slot.method_table._idx_to_name.get(asm.method_idx)
+        method_name = slot.method_table._idx_to_name.get(method_idx)
         if method_name is None:
             logger.warning('Conn %d: unknown method idx %d for route %r',
-                           conn.conn_id, asm.method_idx, route_name)
+                           conn.conn_id, method_idx, route_name)
             writer.write(encode_error_reply_frame(
                 request_id,
-                f'Unknown method index {asm.method_idx}'.encode('utf-8'),
+                f'Unknown method index {method_idx}'.encode('utf-8'),
             ))
             await writer.drain()
             return
