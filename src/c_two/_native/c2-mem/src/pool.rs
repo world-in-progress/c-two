@@ -575,6 +575,7 @@ mod tests {
             max_segments: 4,
             max_dedicated_segments: 2,
             dedicated_gc_delay_secs: 0.0,
+            ..PoolConfig::default()
         }
     }
 
@@ -614,6 +615,7 @@ mod tests {
             max_segments: 4,
             max_dedicated_segments: 2,
             dedicated_gc_delay_secs: 0.0,
+            ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
         let a = pool.alloc(32 * 1024).unwrap();
@@ -634,6 +636,7 @@ mod tests {
             max_segments: 1,
             max_dedicated_segments: 2,
             dedicated_gc_delay_secs: 0.0,
+            ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
 
@@ -732,6 +735,7 @@ mod tests {
             max_segments: 4,
             max_dedicated_segments: 0,
             dedicated_gc_delay_secs: 0.0,
+            ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
 
@@ -765,6 +769,7 @@ mod tests {
             max_segments: 4,
             max_dedicated_segments: 0,
             dedicated_gc_delay_secs: 0.0,
+            ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
 

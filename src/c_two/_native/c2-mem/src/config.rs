@@ -13,6 +13,11 @@ pub struct PoolConfig {
     pub max_dedicated_segments: usize,
     /// Delay before reclaiming empty dedicated segments (seconds).
     pub dedicated_gc_delay_secs: f64,
+    /// Spill threshold ratio: when `requested > available_ram * threshold`,
+    /// use file-backed mmap.  Default 0.8 (80%).
+    pub spill_threshold: f64,
+    /// Directory for spill files.  Default: `/tmp/c_two_spill/`.
+    pub spill_dir: std::path::PathBuf,
 }
 
 impl Default for PoolConfig {
@@ -23,6 +28,8 @@ impl Default for PoolConfig {
             max_segments: 8,
             max_dedicated_segments: 4,
             dedicated_gc_delay_secs: 5.0,
+            spill_threshold: 0.8,
+            spill_dir: std::path::PathBuf::from("/tmp/c_two_spill/"),
         }
     }
 }

@@ -27,6 +27,10 @@ pub struct PyPoolConfig {
     pub max_dedicated_segments: usize,
     #[pyo3(get, set)]
     pub dedicated_gc_delay_secs: f64,
+    #[pyo3(get, set)]
+    pub spill_threshold: f64,
+    #[pyo3(get, set)]
+    pub spill_dir: String,
 }
 
 #[pymethods]
@@ -38,6 +42,8 @@ impl PyPoolConfig {
         max_segments = 8,
         max_dedicated_segments = 4,
         dedicated_gc_delay_secs = 5.0,
+        spill_threshold = 0.8,
+        spill_dir = String::from("/tmp/c_two_spill/"),
     ))]
     fn new(
         segment_size: usize,
@@ -45,6 +51,8 @@ impl PyPoolConfig {
         max_segments: usize,
         max_dedicated_segments: usize,
         dedicated_gc_delay_secs: f64,
+        spill_threshold: f64,
+        spill_dir: String,
     ) -> PyResult<Self> {
         if !min_block_size.is_power_of_two() {
             return Err(PyValueError::new_err("min_block_size must be a power of 2"));
@@ -60,19 +68,25 @@ impl PyPoolConfig {
         if dedicated_gc_delay_secs.is_nan() {
             return Err(PyValueError::new_err("dedicated_gc_delay_secs must not be NaN"));
         }
+        if spill_threshold < 0.0 || spill_threshold > 1.0 || spill_threshold.is_nan() {
+            return Err(PyValueError::new_err("spill_threshold must be in [0.0, 1.0]"));
+        }
         Ok(Self {
             segment_size,
             min_block_size,
             max_segments,
             max_dedicated_segments,
             dedicated_gc_delay_secs,
+            spill_threshold,
+            spill_dir,
         })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "PoolConfig(segment_size={}, min_block={}, max_seg={}, max_ded={})",
-            self.segment_size, self.min_block_size, self.max_segments, self.max_dedicated_segments
+            "PoolConfig(segment_size={}, min_block={}, max_seg={}, max_ded={}, spill_threshold={}, spill_dir='{}')",
+            self.segment_size, self.min_block_size, self.max_segments, self.max_dedicated_segments,
+            self.spill_threshold, self.spill_dir
         )
     }
 }
@@ -85,6 +99,8 @@ impl From<&PyPoolConfig> for PoolConfig {
             max_segments: py.max_segments,
             max_dedicated_segments: py.max_dedicated_segments,
             dedicated_gc_delay_secs: py.dedicated_gc_delay_secs,
+            spill_threshold: py.spill_threshold,
+            spill_dir: std::path::PathBuf::from(&py.spill_dir),
         }
     }
 }
