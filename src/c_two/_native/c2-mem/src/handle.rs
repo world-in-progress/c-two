@@ -50,6 +50,16 @@ impl MemHandle {
     pub fn is_dedicated(&self) -> bool {
         matches!(self, Self::Dedicated { .. })
     }
+
+    /// Shrink the logical length of this handle.
+    /// Used by ChunkAssembler to trim to actual received data.
+    pub fn set_len(&mut self, new_len: usize) {
+        match self {
+            MemHandle::Buddy { len, .. } => *len = new_len,
+            MemHandle::Dedicated { len, .. } => *len = new_len,
+            MemHandle::FileSpill { len, .. } => *len = new_len,
+        }
+    }
 }
 
 impl std::fmt::Debug for MemHandle {

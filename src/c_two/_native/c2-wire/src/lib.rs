@@ -24,6 +24,8 @@ pub mod frame;
 pub mod buddy;
 pub mod control;
 pub mod handshake;
+#[cfg(feature = "std")]
+pub mod assembler;
 
 #[cfg(test)]
 mod tests;

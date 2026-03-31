@@ -6,6 +6,7 @@ description = "Wire protocol codec for C-Two IPC frames"
 
 [features]
 default = ["std"]
-std = []
+std = ["c2-mem"]
 
 [dependencies]
+c2-mem = { path = "../c2-mem", optional = true }
