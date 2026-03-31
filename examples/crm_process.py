@@ -1,4 +1,4 @@
-"""SOTA API — server process.
+"""CRM resource process.
 
 Registers CRMs and keeps the process alive so remote clients can connect
 via IPC.  Press Ctrl-C to shut down.

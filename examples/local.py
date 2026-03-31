@@ -1,4 +1,4 @@
-"""SOTA API — single-process example with thread preference.
+"""Single-process example with thread preference.
 
 Demonstrates:
   - cc.register() to register multiple CRMs
