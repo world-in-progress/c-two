@@ -44,6 +44,12 @@ timeout = 30
 
 [tool.uv]
 package = true
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/c_two/_native/**/*.rs" },
+    { file = "src/c_two/_native/**/Cargo.toml" },
+]
 
 [project.scripts]
 c3 = "c_two.cli:cli"
