@@ -35,7 +35,8 @@ def _make_entry(name: str, address: str = 'ipc-v3://test',
 
 def _make_client(closed: bool = False) -> MagicMock:
     mock = MagicMock()
-    mock._closed = closed
+    mock._closed_event = MagicMock()
+    mock._closed_event.is_set.return_value = closed
     return mock
 
 

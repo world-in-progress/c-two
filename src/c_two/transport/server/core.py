@@ -339,10 +339,12 @@ class Server:
         await self._shutdown_event.wait()
 
         # Graceful shutdown.
-        for task in list(self._client_tasks):
+        with self._slots_lock:
+            tasks_snapshot = list(self._client_tasks)
+        for task in tasks_snapshot:
             task.cancel()
-        if self._client_tasks:
-            await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        if tasks_snapshot:
+            await asyncio.gather(*tasks_snapshot, return_exceptions=True)
         self._dispatcher.shutdown()
         self._server.close()
         await self._server.wait_closed()
@@ -426,7 +428,8 @@ class Server:
         conn = Connection(conn_id=conn_id, writer=writer, config=self._config)
         conn.init_flight_tracking(asyncio.get_running_loop())
         task = asyncio.current_task()
-        self._client_tasks.append(task)
+        with self._slots_lock:
+            self._client_tasks.append(task)
 
         # Pipelined dispatch: read next frame while previous dispatches
         # are still executing in the thread pool.
@@ -637,8 +640,9 @@ class Server:
                 await writer.wait_closed()
             except Exception:
                 pass
-            if task in self._client_tasks:
-                self._client_tasks.remove(task)
+            with self._slots_lock:
+                if task in self._client_tasks:
+                    self._client_tasks.remove(task)
 
             if heartbeat_expired:
                 logger.warning('Conn %d: disconnected (heartbeat timeout)', conn.conn_id)

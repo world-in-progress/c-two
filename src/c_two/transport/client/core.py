@@ -169,8 +169,8 @@ class SharedClient:
 
         # Receive thread.
         self._recv_thread: threading.Thread | None = None
-        self._running = False
-        self._closed = False
+        self._running_event = threading.Event()
+        self._closed_event = threading.Event()
         self._close_lock = threading.Lock()
         self._shutdown_ack = threading.Event()
 
@@ -194,7 +194,7 @@ class SharedClient:
         # thread promptly.  On macOS, socket.shutdown(SHUT_RDWR) from
         # another thread doesn't reliably unblock a blocked recv().
         self._sock.settimeout(0.1)
-        self._running = True
+        self._running_event.set()
         self._recv_thread = threading.Thread(
             target=self._recv_loop,
             name=f'c2-shared-recv-{self.region_id}',
@@ -295,9 +295,9 @@ class SharedClient:
     def terminate(self) -> None:
         """Shut down the client: stop recv thread, close socket, destroy pool."""
         with self._close_lock:
-            if self._closed:
+            if self._closed_event.is_set():
                 return
-            self._closed = True
+            self._closed_event.set()
 
         # Best-effort graceful disconnect: notify server before closing.
         # The recv thread is still running and will set _shutdown_ack
@@ -311,14 +311,14 @@ class SharedClient:
             except Exception:
                 pass  # best-effort: fall through to hard close
 
-        self._running = False
+        self._running_event.clear()
 
         # Close socket to unblock recv thread.
         if self._sock is not None:
             try:
                 # Set a very short timeout so the recv thread's blocking recv()
                 # returns quickly with a timeout error, allowing it to see
-                # _running=False and exit.  On macOS, shutdown(SHUT_RDWR) on a
+                # _running_event cleared and exit.  On macOS, shutdown(SHUT_RDWR) on a
                 # UDS doesn't reliably unblock a concurrent recv().
                 self._sock.settimeout(0.05)
             except Exception:
@@ -345,14 +345,16 @@ class SharedClient:
             self._pending.clear()
 
         # Destroy buddy pool.
-        self._seg_views = {}
-        self._seg_base_addrs = {}
-        if self._buddy_pool is not None:
+        with self._close_lock:
+            self._seg_views = {}
+            self._seg_base_addrs = {}
+            pool = self._buddy_pool
+            self._buddy_pool = None
+        if pool is not None:
             try:
-                self._buddy_pool.destroy()
+                pool.destroy()
             except Exception:
                 pass
-            self._buddy_pool = None
 
     # ------------------------------------------------------------------
     # RPC call (thread-safe, concurrent)
@@ -379,7 +381,7 @@ class SharedClient:
 
         Returns ``bytes`` (always copied from SHM for safety).
         """
-        if self._closed:
+        if self._closed_event.is_set():
             raise error.CompoClientError('Client is closed')
         if self._sock is None:
             self.connect()
@@ -431,7 +433,7 @@ class SharedClient:
 
     def relay(self, event_bytes: bytes) -> bytes:
         """Relay raw wire bytes to the server and return the response."""
-        if self._closed:
+        if self._closed_event.is_set():
             raise error.CompoClientError('Client is closed')
         if self._sock is None:
             self.connect()
@@ -471,10 +473,12 @@ class SharedClient:
         Raises :class:`~c_two.error.MemoryPressureError` when buddy pool
         is exhausted *and* the payload exceeds ``max_frame_size``.
         """
-        if size <= self._config.shm_threshold or self._buddy_pool is None:
+        if size <= self._config.shm_threshold:
             return None, None
 
         with self._alloc_lock:
+            if self._buddy_pool is None:
+                return None, None
             try:
                 alloc = self._buddy_pool.alloc(size)
             except Exception:
@@ -506,6 +510,8 @@ class SharedClient:
     def _free_buddy(self, alloc: object, size: int) -> None:
         """Free a buddy allocation (called on send failure)."""
         with self._alloc_lock:
+            if self._buddy_pool is None:
+                return
             self._buddy_pool.free_at(
                 alloc.seg_idx, alloc.offset, size, alloc.is_dedicated,
             )
@@ -653,7 +659,7 @@ class SharedClient:
         sock = self._sock
         reply_assemblers: dict[int, tuple[RustChunkAssembler, float]] = {}
         try:
-            while self._running and sock is not None:
+            while self._running_event.is_set() and sock is not None:
                 try:
                     header = _recv_exact(sock, 16)
                 except _socket.timeout:
@@ -686,11 +692,18 @@ class SharedClient:
                         break
                     continue
 
+                # Snapshot pool and seg_views under lock to prevent
+                # TOCTOU races with terminate() (H3/H4).
+                with self._close_lock:
+                    pool = self._buddy_pool
+                    seg_views = self._seg_views
+
                 # Chunked reply: accumulate in assembler.
                 if flags & FLAG_CHUNKED:
                     try:
                         result, complete = self._handle_chunked_reply(
                             flags, payload, request_id, reply_assemblers,
+                            pool, seg_views,
                         )
                     except Exception as exc:
                         with self._pending_lock:
@@ -710,7 +723,10 @@ class SharedClient:
 
                 # Decode response and dispatch.
                 try:
-                    result, err = self._decode_response(flags, payload, bool(flags & FLAG_BUDDY))
+                    result, err = self._decode_response(
+                        flags, payload, bool(flags & FLAG_BUDDY),
+                        pool, seg_views,
+                    )
                 except Exception as exc:
                     # Dispatch error to pending caller.
                     with self._pending_lock:
@@ -748,15 +764,16 @@ class SharedClient:
 
     def _decode_response(
         self, flags: int, payload: bytes, is_buddy: bool,
+        pool: object, seg_views: dict[int, memoryview],
     ) -> tuple[bytes | None, Exception | None]:
         """Decode a reply frame (FLAG_REPLY set)."""
         if is_buddy:
             # Buddy: [11B buddy_ptr][1B status][optional error]
             seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
 
-            if self._buddy_pool is None:
+            if pool is None:
                 return None, error.CompoClientError('Buddy response but no pool')
-            if seg_idx not in self._seg_views:
+            if seg_idx not in seg_views:
                 return None, error.CompoClientError(f'Invalid seg_idx {seg_idx}')
 
             # Parse reply control (after buddy pointer).
@@ -772,7 +789,7 @@ class SharedClient:
                 # Free buddy block (may be empty allocation).
                 with self._alloc_lock:
                     try:
-                        self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+                        pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
                     except Exception:
                         pass
                 if err_data:
@@ -782,14 +799,14 @@ class SharedClient:
                 return b'', None
 
             # Success: read pure payload from SHM.
-            seg_mv = self._seg_views[seg_idx]
+            seg_mv = seg_views[seg_idx]
             if data_offset + data_size > len(seg_mv):
                 return None, error.CompoClientError('Response out of bounds')
             result = bytes(seg_mv[data_offset : data_offset + data_size])
 
             with self._alloc_lock:
                 try:
-                    self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+                    pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
                 except Exception:
                     logger.warning('Failed to free buddy block', exc_info=True)
 
@@ -819,6 +836,8 @@ class SharedClient:
         payload: bytes,
         request_id: int,
         assemblers: dict[int, tuple[RustChunkAssembler, float]],
+        pool: object,
+        seg_views: dict[int, memoryview],
     ) -> tuple[bytes, bool]:
         """Process one chunked reply frame.
 
@@ -830,13 +849,13 @@ class SharedClient:
         if is_buddy:
             from ..ipc.shm_frame import BUDDY_PAYLOAD_STRUCT as _BP
             seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
-            if self._buddy_pool is None or seg_idx not in self._seg_views:
+            if pool is None or seg_idx not in seg_views:
                 raise error.CompoClientError(f'Chunked reply: invalid seg_idx {seg_idx}')
-            seg_mv = self._seg_views[seg_idx]
+            seg_mv = seg_views[seg_idx]
             chunk_data = bytes(seg_mv[data_offset:data_offset + data_size])
             with self._alloc_lock:
                 try:
-                    self._buddy_pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
+                    pool.free_at(seg_idx, free_offset, free_size, is_dedicated)
                 except Exception:
                     pass
             ctrl_off = _BP.size
@@ -862,7 +881,7 @@ class SharedClient:
                 chunk_data = bytes(payload[ctrl_off:])
 
             chunk_size = self._config.pool_segment_size // 2
-            asm = RustChunkAssembler(self._buddy_pool, total_chunks, chunk_size)
+            asm = RustChunkAssembler(pool, total_chunks, chunk_size)
             assemblers[request_id] = (asm, time.monotonic())
         else:
             entry = assemblers.get(request_id)

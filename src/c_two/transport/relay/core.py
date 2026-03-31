@@ -149,7 +149,7 @@ class UpstreamPool:
         if entry is None:
             return None
         if entry.client is not None:
-            if not entry.client._closed:
+            if not entry.client._closed_event.is_set():
                 return entry.client
             # Client is dead — terminate and trigger reconnect
             try:
@@ -232,7 +232,7 @@ class UpstreamPool:
             for entry in self._entries.values():
                 if entry.client is None:
                     continue
-                if entry.client._closed:
+                if entry.client._closed_event.is_set():
                     to_terminate.append((entry.client, entry.name, 'dead'))
                     entry.client = None
                 elif self._idle_timeout > 0 and (now - entry.last_activity) >= self._idle_timeout:

@@ -73,7 +73,7 @@ class TestSharedClientBasic:
         assert client._recv_thread is not None
         assert client._recv_thread.is_alive()
         client.terminate()
-        assert client._closed
+        assert client._closed_event.is_set()
 
     def test_basic_call(self, ipc_addr):
         """Simple RPC call through SharedClient → Server."""
