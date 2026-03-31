@@ -23,7 +23,6 @@ FLAG_RESPONSE = 1 << 1       # Server→client direction marker
 FLAG_HANDSHAKE = 1 << 2      # Pool SHM handshake message
 FLAG_POOL = 1 << 3           # Payload references pre-allocated pool SharedMemory
 FLAG_CTRL = 1 << 4           # Control message (segment announce, consumed signal)
-FLAG_DISK_SPILL = 1 << 5     # Reserved for Phase 2 disk spillover
 
 # ---------------------------------------------------------------------------
 # Pre-compiled struct objects for hot-path encoding/decoding

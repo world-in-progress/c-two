@@ -81,11 +81,7 @@ class Transferable(metaclass=TransferableMeta):
     - serialize: convert runtime `args` to `bytes` message
     - deserialize: convert `bytes` message to runtime `args`
 
-    Set ``__memoryview_aware__ = True`` on subclasses whose ``deserialize``
-    accepts ``memoryview`` directly (avoids a full ``bytes()`` copy on the
-    IPC hot path).
     """
-    __memoryview_aware__: bool = False
 
     def serialize(*args: any) -> bytes:
         """
@@ -174,7 +170,6 @@ def create_default_transferable(func, is_input: bool):
         if _is_single_bytes_param(func, filtered_params, type_hints):
             class DynamicInputTransferable(Transferable):
                 __module__ = 'Default'
-                __memoryview_aware__ = True
 
                 def serialize(data) -> bytes:
                     if isinstance(data, (bytes, memoryview)):
@@ -193,7 +188,6 @@ def create_default_transferable(func, is_input: bool):
             # memoryview-aware to avoid unnecessary bytes() conversion.
             class DynamicInputTransferable(Transferable):
                 __module__ = 'Default'  # mark as default
-                __memoryview_aware__ = True
                 
                 def serialize(*args) -> bytes:
                     """Default serialization: pickle args directly as tuple."""
@@ -250,7 +244,6 @@ def create_default_transferable(func, is_input: bool):
         # Define the dynamic transferable class for output
         attrs = {
             '__module__': 'Default',
-            '__memoryview_aware__': True,
             'serialize': serialize_func,
             'deserialize': deserialize_func,
         }
@@ -328,10 +321,6 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 stage = 'deserialize_output'
                 if not output_transferable:
                     return None
-                # Convert memoryview→bytes for legacy deserializers that don't handle memoryview.
-                if (not getattr(output, '__memoryview_aware__', False)
-                        and isinstance(result_bytes, memoryview)):
-                    result_bytes = bytes(result_bytes)
                 return output_transferable(result_bytes)
             
             except error.CCBaseError:
@@ -365,10 +354,6 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 # Deserialize input args if input_transferable is provided
                 # And if deserialized_args is not a tuple, convert it to a tuple
                 if request is not None and input_transferable is not None:
-                    # Convert memoryview→bytes for legacy deserializers.
-                    if (not getattr(input, '__memoryview_aware__', False)
-                            and isinstance(request, memoryview)):
-                        request = bytes(request)
                     deserialized_args = input_transferable(request)
                 else:
                     deserialized_args = tuple()

@@ -12,7 +12,6 @@ Frame flag bit allocation (32-bit LE flags field in the 16-byte frame header):
     Bit 2: FLAG_HANDSHAKE      — handshake message
     Bit 3: FLAG_POOL           — pool SHM (legacy)
     Bit 4: FLAG_CTRL           — control message
-    Bit 5: FLAG_DISK_SPILL     — reserved
     Bit 6: FLAG_BUDDY          — buddy-allocated SHM block
     Bit 7: FLAG_CALL           — call frame (control-plane routing)
     Bit 8: FLAG_REPLY          — reply frame (control-plane status)
