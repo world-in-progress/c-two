@@ -6,12 +6,14 @@
 //! - PoolConfig: configuration dataclass
 //! - PoolStats: statistics dataclass
 
+use c2_mem::handle::MemHandle;
 use c2_mem::{MemPool, PoolAllocation, PoolConfig};
+use c2_wire::assembler::ChunkAssembler;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Python-visible pool configuration.
 #[pyclass(name = "PoolConfig")]
@@ -185,7 +187,13 @@ impl PyPoolStats {
 /// write lock.  This allows concurrent readers without blocking.
 #[pyclass(name = "MemPool")]
 pub struct PyMemPool {
-    pool: RwLock<MemPool>,
+    pool: Arc<RwLock<MemPool>>,
+}
+
+impl PyMemPool {
+    pub(crate) fn pool_arc(&self) -> Arc<RwLock<MemPool>> {
+        Arc::clone(&self.pool)
+    }
 }
 
 #[pymethods]
@@ -195,7 +203,7 @@ impl PyMemPool {
     fn new(config: Option<&PyPoolConfig>) -> PyResult<Self> {
         let cfg = config.map(PoolConfig::from).unwrap_or_default();
         Ok(Self {
-            pool: RwLock::new(MemPool::new(cfg)),
+            pool: Arc::new(RwLock::new(MemPool::new(cfg))),
         })
     }
 
@@ -493,6 +501,245 @@ impl PyMemPool {
     }
 }
 
+/// Python-visible handle to a memory region (buddy SHM, dedicated SHM,
+/// or file-backed mmap). Supports write_at and buffer_info for zero-copy.
+#[pyclass(name = "MemHandle")]
+pub struct PyMemHandle {
+    handle: Option<MemHandle>,
+    pool: Arc<RwLock<MemPool>>,
+}
+
+#[pymethods]
+impl PyMemHandle {
+    #[getter]
+    fn len(&self) -> PyResult<usize> {
+        self.handle
+            .as_ref()
+            .map(|h| h.len())
+            .ok_or_else(|| PyRuntimeError::new_err("handle released"))
+    }
+
+    #[getter]
+    fn is_file_spill(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map(|h| h.is_file_spill())
+            .unwrap_or(false)
+    }
+
+    #[getter]
+    fn is_buddy(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map(|h| h.is_buddy())
+            .unwrap_or(false)
+    }
+
+    #[getter]
+    fn is_dedicated(&self) -> bool {
+        self.handle
+            .as_ref()
+            .map(|h| h.is_dedicated())
+            .unwrap_or(false)
+    }
+
+    /// Write `data` at byte `offset` within the handle.
+    #[pyo3(signature = (data, offset = 0))]
+    fn write_at(&mut self, data: &[u8], offset: usize) -> PyResult<()> {
+        let h = self
+            .handle
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("handle released"))?;
+        if offset + data.len() > h.len() {
+            return Err(PyRuntimeError::new_err("write_at out of bounds"));
+        }
+        let pool = self
+            .pool
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+        pool.handle_slice_mut(h)[offset..offset + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Get raw pointer + length for memoryview construction.
+    /// Returns (address, length) tuple.
+    fn buffer_info(&self) -> PyResult<(usize, usize)> {
+        let h = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("handle released"))?;
+        let pool = self
+            .pool
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+        let slice = pool.handle_slice(h);
+        Ok((slice.as_ptr() as usize, slice.len()))
+    }
+
+    /// Release the underlying memory. Idempotent.
+    fn release(&mut self) -> PyResult<()> {
+        if let Some(h) = self.handle.take() {
+            let mut pool = self
+                .pool
+                .write()
+                .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+            pool.release_handle(h);
+        }
+        Ok(())
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        self.len()
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.handle {
+            Some(h) => format!(
+                "MemHandle(len={}, type={})",
+                h.len(),
+                if h.is_buddy() {
+                    "buddy"
+                } else if h.is_dedicated() {
+                    "dedicated"
+                } else {
+                    "file_spill"
+                }
+            ),
+            None => "MemHandle(released)".into(),
+        }
+    }
+}
+
+impl Drop for PyMemHandle {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            if let Ok(mut pool) = self.pool.write() {
+                pool.release_handle(h);
+            }
+        }
+    }
+}
+
+/// Python wrapper for Rust ChunkAssembler.
+#[pyclass(name = "ChunkAssembler")]
+pub struct PyChunkAssembler {
+    inner: Option<ChunkAssembler>,
+    pool: Arc<RwLock<MemPool>>,
+}
+
+#[pymethods]
+impl PyChunkAssembler {
+    #[new]
+    fn new(
+        pool_handle: &PyMemPool,
+        total_chunks: usize,
+        chunk_size: usize,
+    ) -> PyResult<Self> {
+        let pool_arc = pool_handle.pool_arc();
+        let asm = {
+            let mut pool = pool_arc
+                .write()
+                .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+            ChunkAssembler::new(&mut pool, total_chunks, chunk_size)
+                .map_err(|e| PyRuntimeError::new_err(e))?
+        };
+        Ok(Self {
+            inner: Some(asm),
+            pool: pool_arc,
+        })
+    }
+
+    #[setter]
+    fn set_route_name(&mut self, name: String) -> PyResult<()> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("consumed"))?
+            .route_name = Some(name);
+        Ok(())
+    }
+
+    #[setter]
+    fn set_method_idx(&mut self, idx: u16) -> PyResult<()> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("consumed"))?
+            .method_idx = Some(idx);
+        Ok(())
+    }
+
+    #[getter]
+    fn route_name(&self) -> Option<String> {
+        self.inner.as_ref().and_then(|a| a.route_name.clone())
+    }
+
+    #[getter]
+    fn method_idx(&self) -> Option<u16> {
+        self.inner.as_ref().and_then(|a| a.method_idx)
+    }
+
+    /// Feed a chunk. Returns True when all chunks received.
+    fn feed_chunk(&mut self, chunk_idx: usize, data: &[u8]) -> PyResult<bool> {
+        let asm = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
+        let pool = self
+            .pool
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+        asm.feed_chunk(&pool, chunk_idx, data)
+            .map_err(|e| PyRuntimeError::new_err(e))
+    }
+
+    #[getter]
+    fn is_complete(&self) -> bool {
+        self.inner
+            .as_ref()
+            .map(|a| a.is_complete())
+            .unwrap_or(false)
+    }
+
+    #[getter]
+    fn received(&self) -> usize {
+        self.inner.as_ref().map(|a| a.received()).unwrap_or(0)
+    }
+
+    /// Finish reassembly → PyMemHandle.
+    fn finish(&mut self) -> PyResult<PyMemHandle> {
+        let asm = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
+        let handle = asm.finish().map_err(|e| PyRuntimeError::new_err(e))?;
+        Ok(PyMemHandle {
+            handle: Some(handle),
+            pool: Arc::clone(&self.pool),
+        })
+    }
+
+    /// Abort reassembly, releasing buffer.
+    fn abort(&mut self) -> PyResult<()> {
+        if let Some(asm) = self.inner.take() {
+            let mut pool = self
+                .pool
+                .write()
+                .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+            asm.abort(&mut pool);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PyChunkAssembler {
+    fn drop(&mut self) {
+        if let Some(asm) = self.inner.take() {
+            if let Ok(mut pool) = self.pool.write() {
+                asm.abort(&mut pool);
+            }
+        }
+    }
+}
+
 /// Clean up stale SHM segments left by crashed processes.
 ///
 /// Scans for SHM segments matching the "cc3b" prefix pattern, extracts the
@@ -513,6 +760,8 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPoolAlloc>()?;
     m.add_class::<PyPoolStats>()?;
     m.add_class::<PyMemPool>()?;
+    m.add_class::<PyMemHandle>()?;
+    m.add_class::<PyChunkAssembler>()?;
     m.add_function(wrap_pyfunction!(cleanup_stale_shm, m)?)?;
     Ok(())
 }

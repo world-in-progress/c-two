@@ -14,6 +14,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 c2-mem = { path = "../c2-mem" }
+c2-wire = { path = "../c2-wire" }
 c2-relay = { path = "../c2-relay" }
 c2-ipc = { path = "../c2-ipc" }
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
