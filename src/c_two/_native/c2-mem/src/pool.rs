@@ -9,6 +9,8 @@
 use crate::buddy_segment::BuddySegment;
 use crate::config::{PoolAllocation, PoolConfig, PoolStats};
 use crate::dedicated::DedicatedSegment;
+use crate::handle::MemHandle;
+use crate::spill;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -406,6 +408,126 @@ impl MemPool {
                 .get(seg_idx as usize)
                 .ok_or("invalid segment index")?;
             Ok(seg.allocator().data_ptr(offset))
+        }
+    }
+
+    // ── MemHandle API ──────────────────────────────────────────────
+
+    /// Unified allocation returning a [`MemHandle`].
+    ///
+    /// Decision flow (optimised — RAM check only when creating new mappings):
+    /// 1. size fits buddy AND existing segments have space → Buddy (no RAM check)
+    /// 2. Else: should_spill() → FileSpill if RAM scarce
+    /// 3. Else: expand buddy or create dedicated SHM
+    /// 4. If SHM creation fails → FileSpill fallback
+    pub fn alloc_handle(&mut self, size: usize) -> Result<MemHandle, String> {
+        if size == 0 {
+            return Err("cannot allocate 0 bytes".into());
+        }
+        let max_buddy = self.max_buddy_block_size();
+
+        // Fast path: existing buddy segments (bitmap only, no RAM query).
+        if max_buddy > 0 && size <= max_buddy {
+            for (idx, seg) in self.segments.iter().enumerate() {
+                if (seg.allocator().free_bytes() as usize) < size { continue; }
+                if let Some(a) = seg.allocator().alloc(size) {
+                    if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                    return Ok(MemHandle::Buddy {
+                        seg_idx: idx as u16, offset: a.offset, len: size,
+                    });
+                }
+            }
+        }
+
+        // Slow path: need new mapping — check RAM.
+        if spill::should_spill(size, self.config.spill_threshold) {
+            return self.alloc_file_spill(size);
+        }
+
+        // RAM fine: try buddy expansion.
+        if max_buddy > 0 && size <= max_buddy
+            && self.segments.len() < self.config.max_segments
+        {
+            match self.create_segment() {
+                Ok(seg) => {
+                    let idx = self.segments.len();
+                    self.segments.push(seg);
+                    self.idle_since.push(None);
+                    if let Some(a) = self.segments[idx].allocator().alloc(size) {
+                        return Ok(MemHandle::Buddy {
+                            seg_idx: idx as u16, offset: a.offset, len: size,
+                        });
+                    }
+                }
+                Err(_) => return self.alloc_file_spill(size),
+            }
+        }
+
+        // Large → dedicated SHM, file spill fallback.
+        match self.alloc_dedicated(size) {
+            Ok(alloc) => Ok(MemHandle::Dedicated {
+                seg_idx: alloc.seg_idx as u16, len: size,
+            }),
+            Err(_) => self.alloc_file_spill(size),
+        }
+    }
+
+    fn alloc_file_spill(&self, size: usize) -> Result<MemHandle, String> {
+        let (mmap, path) = spill::create_file_spill(size, &self.config.spill_dir)
+            .map_err(|e| format!("file spill failed: {e}"))?;
+        Ok(MemHandle::FileSpill { mmap, path, len: size })
+    }
+
+    /// Read-only slice from a handle.
+    pub fn handle_slice<'a>(&'a self, handle: &'a MemHandle) -> &'a [u8] {
+        match handle {
+            MemHandle::Buddy { seg_idx, offset, len } => {
+                let ptr = self.segments[*seg_idx as usize]
+                    .allocator().data_ptr(*offset);
+                unsafe { std::slice::from_raw_parts(ptr, *len) }
+            }
+            MemHandle::Dedicated { seg_idx, len } => {
+                let ptr = self.dedicated[&(*seg_idx as u32)]
+                    .segment.data_ptr();
+                unsafe { std::slice::from_raw_parts(ptr, *len) }
+            }
+            MemHandle::FileSpill { mmap, len, .. } => &mmap[..*len],
+        }
+    }
+
+    /// Mutable slice from a handle.
+    pub fn handle_slice_mut<'a>(
+        &'a self, handle: &'a mut MemHandle,
+    ) -> &'a mut [u8] {
+        match handle {
+            MemHandle::Buddy { seg_idx, offset, len } => {
+                let ptr = self.segments[*seg_idx as usize]
+                    .allocator().data_ptr(*offset);
+                unsafe { std::slice::from_raw_parts_mut(ptr, *len) }
+            }
+            MemHandle::Dedicated { seg_idx, len } => {
+                let ptr = self.dedicated[&(*seg_idx as u32)]
+                    .segment.data_ptr();
+                unsafe { std::slice::from_raw_parts_mut(ptr, *len) }
+            }
+            MemHandle::FileSpill { mmap, len, .. } => &mut mmap[..*len],
+        }
+    }
+
+    /// Release resources held by a [`MemHandle`].
+    pub fn release_handle(&mut self, handle: MemHandle) {
+        match handle {
+            MemHandle::Buddy { seg_idx, offset, len } => {
+                let _ = self.free_at(
+                    seg_idx as u32, offset, len as u32, false,
+                );
+            }
+            MemHandle::Dedicated { seg_idx, .. } => {
+                self.free_dedicated(seg_idx as u32);
+            }
+            MemHandle::FileSpill { .. } => {
+                // MmapMut dropped here → munmap; file already unlinked
+            }
         }
     }
 
@@ -872,5 +994,79 @@ mod tests {
         let pool = test_pool(test_config());
         let prefix = pool.prefix();
         assert!(prefix.starts_with("/cc3t"), "got: {}", prefix);
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use crate::config::PoolConfig;
+
+    fn test_config() -> PoolConfig {
+        PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 2,
+            max_dedicated_segments: 2,
+            dedicated_gc_delay_secs: 0.0,
+            spill_threshold: 1.0, // disable spill
+            spill_dir: std::env::temp_dir().join("c2_pool_handle_test"),
+        }
+    }
+
+    #[test]
+    fn test_alloc_handle_buddy() {
+        let mut pool = MemPool::new(test_config());
+        let handle = pool.alloc_handle(4096).unwrap();
+        assert!(handle.is_buddy());
+        assert_eq!(handle.len(), 4096);
+        pool.release_handle(handle);
+    }
+
+    #[test]
+    fn test_alloc_handle_dedicated() {
+        let mut pool = MemPool::new(test_config());
+        let handle = pool.alloc_handle(128 * 1024).unwrap();
+        assert!(handle.is_dedicated());
+        assert_eq!(handle.len(), 128 * 1024);
+        pool.release_handle(handle);
+    }
+
+    #[test]
+    fn test_alloc_handle_file_spill_forced() {
+        let dir = std::env::temp_dir().join("c2_pool_spill_test");
+        let config = PoolConfig {
+            spill_threshold: 0.0, spill_dir: dir.clone(), ..test_config()
+        };
+        let mut pool = MemPool::new(config);
+        let handle = pool.alloc_handle(4096).unwrap();
+        assert!(handle.is_file_spill());
+        pool.release_handle(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_handle_slice_write_read() {
+        let mut pool = MemPool::new(test_config());
+        let mut handle = pool.alloc_handle(4096).unwrap();
+        let pattern = b"test_data_pattern";
+        pool.handle_slice_mut(&mut handle)[..pattern.len()].copy_from_slice(pattern);
+        assert_eq!(&pool.handle_slice(&handle)[..pattern.len()], pattern);
+        pool.release_handle(handle);
+    }
+
+    #[test]
+    fn test_handle_slice_file_spill() {
+        let dir = std::env::temp_dir().join("c2_pool_spill_slice_test");
+        let config = PoolConfig {
+            spill_threshold: 0.0, spill_dir: dir.clone(), ..test_config()
+        };
+        let mut pool = MemPool::new(config);
+        let mut handle = pool.alloc_handle(8192).unwrap();
+        let pattern = b"spill_pattern_data";
+        pool.handle_slice_mut(&mut handle)[..pattern.len()].copy_from_slice(pattern);
+        assert_eq!(&pool.handle_slice(&handle)[..pattern.len()], pattern);
+        pool.release_handle(handle);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
