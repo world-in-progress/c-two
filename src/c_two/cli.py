@@ -190,7 +190,7 @@ def relay(
         if segment_size is not None:
             kwargs['pool_segment_size'] = parse_size(segment_size)
         if max_segments is not None:
-            kwargs['pool_max_segments'] = max_segments
+            kwargs['max_pool_segments'] = max_segments
         ipc_config = IPCConfig(**kwargs)
 
     # Create and start relay.

@@ -420,8 +420,9 @@ class Server:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        self._conn_counter += 1
-        conn_id = self._conn_counter
+        with self._slots_lock:
+            self._conn_counter += 1
+            conn_id = self._conn_counter
         conn = Connection(conn_id=conn_id, writer=writer, config=self._config)
         conn.init_flight_tracking(asyncio.get_running_loop())
         task = asyncio.current_task()

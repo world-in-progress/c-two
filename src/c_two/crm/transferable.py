@@ -2,6 +2,7 @@ from __future__ import annotations
 import pickle
 import inspect
 import logging
+import threading
 from abc import ABCMeta
 from functools import wraps
 from pydantic import BaseModel, create_model
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _TRANSFERABLE_MAP: dict[str, Transferable] = {}
 _TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
+_TRANSFERABLE_LOCK = threading.Lock()
 
 # Definition of Transferable ######################################################
 
@@ -63,11 +65,12 @@ class TransferableMeta(ABCMeta):
                 serialize_param_map = {}
                 for param in serialize_sig:
                     serialize_param_map[param.name] = param.annotation
-                _TRANSFERABLE_INFOS.append({
-                    'name': full_name,
-                    'module': cls.__module__,
-                    'param_map': serialize_param_map
-                })
+                with _TRANSFERABLE_LOCK:
+                    _TRANSFERABLE_INFOS.append({
+                        'name': full_name,
+                        'module': cls.__module__,
+                        'param_map': serialize_param_map
+                    })
 
                 logger.debug(f'Registered transferable: {full_name}')
         return cls
@@ -268,11 +271,13 @@ def create_default_transferable(func, is_input: bool):
 
 def register_transferable(transferable: Transferable) -> str:
     full_name = f'{transferable.__module__}.{transferable.__name__}' if transferable.__module__ else transferable.__name__
-    _TRANSFERABLE_MAP[full_name] = transferable
+    with _TRANSFERABLE_LOCK:
+        _TRANSFERABLE_MAP[full_name] = transferable
     return full_name
 
 def get_transferable(full_name: str) -> Transferable | None:
-    return None if full_name not in _TRANSFERABLE_MAP else _TRANSFERABLE_MAP[full_name]
+    with _TRANSFERABLE_LOCK:
+        return _TRANSFERABLE_MAP.get(full_name)
 
 # Transferable-related decorators #################################################
 
@@ -432,12 +437,13 @@ def auto_transfer(func: callable | None = None) -> callable:
                     param_module = getattr(param_type, '__module__', None)
                     param_name = getattr(param_type, '__name__', str(param_type))
                     full_name = f'{param_module}.{param_name}' if param_module else param_name
-                    if full_name in _TRANSFERABLE_MAP:
-                        input_transferable = get_transferable(full_name)
+                    input_transferable = get_transferable(full_name)
 
                 # Priority 2: Field name+type comparison (legacy path).
                 if input_transferable is None:
-                    for info in _TRANSFERABLE_INFOS:
+                    with _TRANSFERABLE_LOCK:
+                        infos_snapshot = list(_TRANSFERABLE_INFOS)
+                    for info in infos_snapshot:
                         if info.get('module') != func.__module__:
                             continue
                         registered_param_map = info.get('param_map', {})
@@ -472,9 +478,8 @@ def auto_transfer(func: callable | None = None) -> callable:
                 return_type_module = getattr(return_type, '__module__', None)
                 return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
                 
-                if return_type_full_name in _TRANSFERABLE_MAP:
-                    output_transferable = get_transferable(return_type_full_name)
-                else:
+                output_transferable = get_transferable(return_type_full_name)
+                if output_transferable is None:
                     origin = get_origin(return_type)
                     args = get_args(return_type)
                     expected_output_types = []
@@ -484,7 +489,9 @@ def auto_transfer(func: callable | None = None) -> callable:
                         expected_output_types = [return_type]
 
                     if expected_output_types:
-                        for info in _TRANSFERABLE_INFOS:
+                        with _TRANSFERABLE_LOCK:
+                            infos_snapshot = list(_TRANSFERABLE_INFOS)
+                        for info in infos_snapshot:
                             if info.get('module') != func.__module__:
                                 continue
                             registered_param_map = info.get('param_map', {})
