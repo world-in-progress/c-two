@@ -27,6 +27,7 @@ import os
 import socket as _socket
 import struct
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -77,6 +78,7 @@ from ..wire import (
     decode_chunk_header,
     decode_reply_control,
 )
+from c_two.mem import ChunkAssembler as RustChunkAssembler
 
 logger = logging.getLogger(__name__)
 
@@ -123,78 +125,8 @@ class PendingCall:
 
 
 # ---------------------------------------------------------------------------
-# ReplyChunkAssembler — client-side chunked reply reassembly
+# ReplyChunkAssembler — client-side chunked reply reassembly (Rust-backed)
 # ---------------------------------------------------------------------------
-
-class _ReplyChunkAssembler:
-    """Reassembles chunked reply frames into a single result bytes.
-
-    Uses ``mmap.mmap(-1, size)`` for deterministic OS-level release.
-    """
-
-    __slots__ = ('total_chunks', 'chunk_size', 'received', '_actual_total',
-                 '_buf', '_received_flags')
-
-    def __init__(
-        self,
-        total_chunks: int,
-        chunk_size: int,
-        *,
-        max_total_chunks: int = 512,
-        max_reassembly_bytes: int = 8 * (1 << 30),
-    ) -> None:
-        if total_chunks <= 0 or total_chunks > max_total_chunks:
-            raise ValueError(
-                f'total_chunks={total_chunks} out of range [1, {max_total_chunks}]'
-            )
-        alloc_size = total_chunks * chunk_size
-        if alloc_size > max_reassembly_bytes:
-            raise ValueError(
-                f'Reassembly buffer {alloc_size} bytes exceeds '
-                f'limit {max_reassembly_bytes}'
-            )
-        import mmap as _mmap
-        self.total_chunks = total_chunks
-        self.chunk_size = chunk_size
-        self.received = 0
-        self._actual_total = 0
-        self._buf = _mmap.mmap(-1, alloc_size)
-        self._received_flags = bytearray(total_chunks)
-
-    def add(self, idx: int, data: bytes | memoryview) -> bool:
-        """Write chunk data at the correct offset.  Returns True when complete."""
-        if self._received_flags[idx]:
-            return False
-        offset = idx * self.chunk_size
-        dlen = len(data)
-        self._buf[offset:offset + dlen] = data
-        self._received_flags[idx] = 1
-        self._actual_total += dlen
-        self.received += 1
-        return self.received == self.total_chunks
-
-    def assemble(self) -> bytes:
-        """Return reassembled payload and release the mmap.
-
-        .. note::
-
-           ``buf.read()`` creates a ``bytes`` copy while the mmap is still
-           alive, so peak RSS briefly doubles (mmap + bytes).  This is
-           inherent to any copy-out scheme and acceptable given that the
-           mmap is released immediately after via ``close()`` → ``munmap``.
-        """
-        buf = self._buf
-        self._buf = None
-        buf.seek(0)
-        result = buf.read(self._actual_total)
-        buf.close()
-        return result
-
-    def discard(self) -> None:
-        """Release the mmap without assembling."""
-        if self._buf is not None:
-            self._buf.close()
-            self._buf = None
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +651,7 @@ class SharedClient:
     def _recv_loop(self) -> None:
         """Background thread: read response frames, dispatch to pending callers."""
         sock = self._sock
-        reply_assemblers: dict[int, _ReplyChunkAssembler] = {}
+        reply_assemblers: dict[int, tuple[RustChunkAssembler, float]] = {}
         try:
             while self._running and sock is not None:
                 try:
@@ -805,8 +737,8 @@ class SharedClient:
             logger.error('recv_loop: unexpected error', exc_info=True)
         finally:
             # Clean up stale reply assemblers.
-            for asm in reply_assemblers.values():
-                asm.discard()
+            for asm, _ in reply_assemblers.values():
+                asm.abort()
             reply_assemblers.clear()
             # Wake up any remaining pending callers.
             with self._pending_lock:
@@ -886,7 +818,7 @@ class SharedClient:
         flags: int,
         payload: bytes,
         request_id: int,
-        assemblers: dict[int, '_ReplyChunkAssembler'],
+        assemblers: dict[int, tuple[RustChunkAssembler, float]],
     ) -> tuple[bytes, bool]:
         """Process one chunked reply frame.
 
@@ -930,29 +862,32 @@ class SharedClient:
                 chunk_data = bytes(payload[ctrl_off:])
 
             chunk_size = self._config.pool_segment_size // 2
-            asm = _ReplyChunkAssembler(
-                total_chunks=total_chunks,
-                chunk_size=chunk_size,
-                max_total_chunks=self._config.max_total_chunks,
-                max_reassembly_bytes=self._config.max_reassembly_bytes,
-            )
-            assemblers[request_id] = asm
+            asm = RustChunkAssembler(self._buddy_pool, total_chunks, chunk_size)
+            assemblers[request_id] = (asm, time.monotonic())
         else:
-            asm = assemblers.get(request_id)
-            if asm is None:
+            entry = assemblers.get(request_id)
+            if entry is None:
                 logger.warning('Orphan chunked reply chunk (rid=%d, idx=%d)',
                                request_id, chunk_idx)
                 return b'', False
+            asm = entry[0]
             if not is_buddy:
                 chunk_data = bytes(payload[ctrl_off:])
 
-        complete = asm.add(chunk_idx, chunk_data)
+        complete = asm.feed_chunk(chunk_idx, chunk_data)
 
         if not complete:
             return b'', False
 
+        mem_handle = asm.finish()
         del assemblers[request_id]
-        return asm.assemble(), True
+        try:
+            addr, length = mem_handle.buffer_info()
+            result_mv = memoryview((ctypes.c_char * length).from_address(addr)).cast('B')
+            result_bytes = bytes(result_mv)
+        finally:
+            mem_handle.release()
+        return result_bytes, True
 
     # ------------------------------------------------------------------
     # Static utility methods
