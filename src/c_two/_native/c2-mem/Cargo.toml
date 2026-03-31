@@ -9,3 +9,4 @@ name = "c2_mem"
 
 [dependencies]
 libc = "0.2"
+memmap2 = "0.9"

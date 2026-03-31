@@ -11,6 +11,7 @@ pub mod segment;
 pub mod buddy_segment;
 pub mod config;
 pub mod dedicated;
+pub mod spill;
 pub mod pool;
 
 pub use alloc::{BuddyAllocator, Allocation, SegmentHeader, ShmSpinlock};
@@ -19,3 +20,4 @@ pub use buddy_segment::BuddySegment;
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
 pub use pool::MemPool;
+pub use spill::{available_physical_memory, should_spill, create_file_spill};
