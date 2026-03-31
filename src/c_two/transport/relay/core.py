@@ -488,15 +488,19 @@ class Relay:
                     media_type='application/octet-stream',
                 )
             except error.CCBaseError as exc:
+                wrapped = error.CompoClientError(str(exc))
                 return Response(
-                    content=str(exc).encode('utf-8'),
+                    content=error.CCError.serialize(wrapped),
                     status_code=502,
+                    media_type='application/octet-stream',
                 )
             except Exception as exc:
                 logger.error('Relay error: %s/%s: %s', route_name, method_name, exc)
+                wrapped = error.CompoClientError(str(exc))
                 return Response(
-                    content=str(exc).encode('utf-8'),
+                    content=error.CCError.serialize(wrapped),
                     status_code=502,
+                    media_type='application/octet-stream',
                 )
 
         async def handle_health(request: Request) -> Response:
@@ -542,42 +546,44 @@ class Relay:
 
     def _serve(self) -> None:
         self._serve_done.clear()
-        self._event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._event_loop)
-
         try:
-            config = uvicorn.Config(
-                app=self._app,
-                host=self._host,
-                port=self._port,
-                log_level='error',
-            )
-            self._server = uvicorn.Server(config)
+            self._event_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._event_loop)
 
-            _original_startup = self._server.startup
+            try:
+                config = uvicorn.Config(
+                    app=self._app,
+                    host=self._host,
+                    port=self._port,
+                    log_level='error',
+                )
+                self._server = uvicorn.Server(config)
 
-            async def _patched_startup(sockets=None):
-                await _original_startup(sockets)
+                _original_startup = self._server.startup
+
+                async def _patched_startup(sockets=None):
+                    await _original_startup(sockets)
+                    self._server_started.set()
+
+                self._server.startup = _patched_startup
+
+                self._event_loop.run_until_complete(self._server.serve())
+            except Exception as exc:
+                if not self._shutdown_event.is_set():
+                    logger.error('Relay HTTP server error: %s', exc)
                 self._server_started.set()
-
-            self._server.startup = _patched_startup
-
-            self._event_loop.run_until_complete(self._server.serve())
-        except Exception as exc:
-            if not self._shutdown_event.is_set():
-                logger.error('Relay HTTP server error: %s', exc)
-            self._server_started.set()
+            finally:
+                if not self._event_loop.is_closed():
+                    try:
+                        pending = asyncio.all_tasks(self._event_loop)
+                        if pending:
+                            self._event_loop.run_until_complete(
+                                asyncio.gather(*pending, return_exceptions=True)
+                            )
+                        self._event_loop.close()
+                    except Exception:
+                        pass
         finally:
-            if not self._event_loop.is_closed():
-                try:
-                    pending = asyncio.all_tasks(self._event_loop)
-                    if pending:
-                        self._event_loop.run_until_complete(
-                            asyncio.gather(*pending, return_exceptions=True)
-                        )
-                    self._event_loop.close()
-                except Exception:
-                    pass
             self._serve_done.set()
 
     def _initiate_shutdown(self) -> None:

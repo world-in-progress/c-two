@@ -153,6 +153,13 @@ class ICRMProxy:
     # Client interface (compatible with rpc.Client)
     # ------------------------------------------------------------------
 
+    def __getattr__(self, name: str) -> Any:
+        if self._closed:
+            raise RuntimeError('Proxy is closed')
+        raise AttributeError(
+            f'{type(self).__name__!r} object has no attribute {name!r}',
+        )
+
     @property
     def supports_direct_call(self) -> bool:
         """``True`` for thread-local proxies (skip serialization)."""

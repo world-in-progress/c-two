@@ -438,11 +438,12 @@ class Server:
 
         try:
             max_frame = self._config.max_frame_size
-            slots = self._slots
-            default_name = self._default_name
+            with self._slots_lock:
+                slots = self._slots
+                default_name = self._default_name
+                cache_gen = self._slots_generation
             dispatcher = self._dispatcher
             dispatch_cache: dict[tuple[bytes, int], tuple] = {}
-            cache_gen = self._slots_generation
             frame_count = 0
 
             # Start heartbeat probe for this connection.
@@ -538,13 +539,17 @@ class Server:
                     args_bytes = payload[args_start:] if args_start < len(payload) else b''
 
                     # Invalidate dispatch cache when CRM registrations change.
-                    cur_gen = self._slots_generation
-                    if cur_gen != cache_gen:
-                        dispatch_cache.clear()
-                        cache_gen = cur_gen
-                        with self._slots_lock:
+                    with self._slots_lock:
+                        cur_gen = self._slots_generation
+                        if cur_gen != cache_gen:
                             slots = self._slots.copy()
                             default_name = self._default_name
+                            cache_gen = cur_gen
+                            stale = True
+                        else:
+                            stale = False
+                    if stale:
+                        dispatch_cache.clear()
 
                     # Combined cache: (route_bytes, method_idx) → dispatch tuple
                     cache_key = (bytes(route_key), method_idx)
