@@ -3,7 +3,7 @@
 //! These bypass the buddy allocator — the entire region serves
 //! one allocation.
 
-use c2_segment::ShmRegion;
+use crate::segment::ShmRegion;
 
 /// A dedicated SHM segment (no buddy allocator).
 pub struct DedicatedSegment {

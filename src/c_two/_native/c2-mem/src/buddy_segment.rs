@@ -3,8 +3,8 @@
 //! Composes `ShmRegion` (raw SHM lifecycle) with `BuddyAllocator`
 //! (block splitting/merging).
 
-use c2_alloc::BuddyAllocator;
-use c2_segment::ShmRegion;
+use crate::alloc::BuddyAllocator;
+use crate::segment::ShmRegion;
 
 /// A SHM region with a buddy allocator attached.
 pub struct BuddySegment {

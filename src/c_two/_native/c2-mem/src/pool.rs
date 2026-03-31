@@ -85,7 +85,7 @@ impl MemPool {
     /// approach by probing common names based on the prefix pattern.
     #[cfg(target_os = "linux")]
     pub fn cleanup_stale_segments(prefix: &str) -> usize {
-        use c2_alloc::spinlock::is_process_alive;
+        use crate::alloc::spinlock::is_process_alive;
 
         let mut removed = 0;
         let Ok(entries) = std::fs::read_dir("/dev/shm") else {

@@ -5,8 +5,8 @@
 //! level N = min_block_size). Allocation rounds up to the nearest power of two
 //! and searches the appropriate level. Free merges buddy pairs recursively.
 
-use crate::bitmap::LevelBitmap;
-use crate::spinlock::ShmSpinlock;
+use crate::alloc::bitmap::LevelBitmap;
+use crate::alloc::spinlock::ShmSpinlock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Magic number for segment validation.
@@ -443,7 +443,7 @@ impl BuddyAllocator {
     fn compute_data_offset(total_size: usize, min_block: usize) -> usize {
         let data_candidate = Self::round_down_pow2(total_size - HEADER_ALIGN);
         let bitmap_bytes =
-            crate::bitmap::total_bitmap_bytes(data_candidate, min_block);
+            crate::alloc::bitmap::total_bitmap_bytes(data_candidate, min_block);
         let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
         // Round up to page alignment.
         let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
@@ -460,14 +460,14 @@ impl BuddyAllocator {
         // Target data_size is the smallest power-of-2 >= min_data_capacity.
         let data_size = min_data_capacity.next_power_of_two();
         let bitmap_bytes =
-            crate::bitmap::total_bitmap_bytes(data_size, min_block);
+            crate::alloc::bitmap::total_bitmap_bytes(data_size, min_block);
         let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
         let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
         data_offset + data_size
     }
 
     fn count_levels(data_size: usize, min_block: usize) -> usize {
-        crate::bitmap::num_levels(data_size, min_block)
+        crate::alloc::bitmap::num_levels(data_size, min_block)
     }
 
     fn round_down_pow2(n: usize) -> usize {

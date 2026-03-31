@@ -13,7 +13,7 @@ default = ["python"]
 python = ["dep:pyo3"]
 
 [dependencies]
-c2-mempool = { path = "../c2-mempool" }
+c2-mem = { path = "../c2-mem" }
 c2-relay = { path = "../c2-relay" }
 c2-ipc = { path = "../c2-ipc" }
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }

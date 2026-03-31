@@ -6,7 +6,7 @@
 //! - PoolConfig: configuration dataclass
 //! - PoolStats: statistics dataclass
 
-use c2_mempool::{MemPool, PoolAllocation, PoolConfig};
+use c2_mem::{MemPool, PoolAllocation, PoolConfig};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -487,7 +487,7 @@ impl PyMemPool {
 #[pyfunction]
 #[pyo3(signature = (prefix="cc3b"))]
 fn cleanup_stale_shm(prefix: &str) -> usize {
-    use c2_mempool::MemPool;
+    use c2_mem::MemPool;
     MemPool::cleanup_stale_segments(prefix)
 }
 

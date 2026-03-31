@@ -1,8 +1,7 @@
 //! Pure buddy allocation algorithm.
 //!
 //! Operates on raw `*mut u8` pointers with no awareness of SHM,
-//! files, or any OS resource. The caller provides memory; this
-//! crate manages block splitting and merging.
+//! files, or any OS resource.
 
 pub mod buddy;
 pub mod bitmap;

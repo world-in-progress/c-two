@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// # Safety
 ///
 /// All methods on `LevelBitmap` assume the caller holds the segment's
-/// [`ShmSpinlock`](crate::spinlock::ShmSpinlock). The atomic operations
+/// [`ShmSpinlock`](crate::alloc::spinlock::ShmSpinlock). The atomic operations
 /// provide cross-process visibility (shared-memory coherence), **not**
 /// lock-free concurrency — concurrent unsynchronized access is undefined
 /// behavior at the allocator level.

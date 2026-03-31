@@ -1,0 +1,11 @@
+[package]
+name = "c2-mem"
+edition.workspace = true
+version.workspace = true
+description = "C-Two shared memory subsystem: buddy allocator, SHM regions, and unified pool"
+
+[lib]
+name = "c2_mem"
+
+[dependencies]
+libc = "0.2"
