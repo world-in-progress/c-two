@@ -1,68 +1,16 @@
-//! Multi-segment buddy pool with dedicated segment fallback.
+//! Unified memory pool with tiered fallback.
 //!
-//! The pool manages multiple buddy-allocated SHM segments and automatically
-//! creates dedicated segments for oversized payloads. Implements the three-layer
-//! fallback strategy from buddy.md:
-//!   1. Try existing segments
-//!   2. Create new segment (up to max_segments)
-//!   3. Fall back to dedicated segment
+//! Manages multiple buddy-allocated SHM segments and dedicated
+//! segments for oversized payloads.  Implements the fallback chain:
+//!   T1. Try existing buddy segments
+//!   T2. Create new buddy segment (up to max_segments)
+//!   T3. Fall back to dedicated segment
 
-use crate::segment::{DedicatedSegment, ShmSegment};
+use crate::buddy_segment::BuddySegment;
+use crate::config::{PoolAllocation, PoolConfig, PoolStats};
+use crate::dedicated::DedicatedSegment;
 use std::collections::HashMap;
 use std::time::Instant;
-
-/// Configuration for the buddy pool.
-#[derive(Debug, Clone)]
-pub struct PoolConfig {
-    /// Size of each buddy segment (default 256MB).
-    pub segment_size: usize,
-    /// Minimum allocation block (default 4KB).
-    pub min_block_size: usize,
-    /// Maximum number of buddy segments (default 8).
-    pub max_segments: usize,
-    /// Maximum number of dedicated segments (default 4).
-    pub max_dedicated_segments: usize,
-    /// Delay before reclaiming empty dedicated segments (seconds).
-    pub dedicated_gc_delay_secs: f64,
-}
-
-impl Default for PoolConfig {
-    fn default() -> Self {
-        Self {
-            segment_size: 256 * 1024 * 1024,
-            min_block_size: 4096,
-            max_segments: 8,
-            max_dedicated_segments: 4,
-            dedicated_gc_delay_secs: 5.0,
-        }
-    }
-}
-
-/// Result of a pool allocation.
-#[derive(Debug, Clone, Copy)]
-pub struct PoolAllocation {
-    /// Index of the segment (buddy or dedicated).
-    pub seg_idx: u32,
-    /// Offset within the segment's data region.
-    pub offset: u32,
-    /// Actual allocated size.
-    pub actual_size: u32,
-    /// Buddy level (only meaningful for buddy segments).
-    pub level: u16,
-    /// Whether this is a dedicated segment.
-    pub is_dedicated: bool,
-}
-
-/// Statistics about the pool.
-#[derive(Debug, Clone)]
-pub struct PoolStats {
-    pub total_segments: usize,
-    pub dedicated_segments: usize,
-    pub total_bytes: u64,
-    pub free_bytes: u64,
-    pub alloc_count: u32,
-    pub fragmentation_ratio: f64,
-}
 
 /// Tracking info for a dedicated segment.
 struct DedicatedEntry {
@@ -70,11 +18,11 @@ struct DedicatedEntry {
     freed_at: Option<Instant>,
 }
 
-/// Multi-segment buddy pool.
-pub struct BuddyPool {
+/// Unified memory pool — the main entry point.
+pub struct MemPool {
     config: PoolConfig,
     /// Buddy-managed segments.
-    segments: Vec<ShmSegment>,
+    segments: Vec<BuddySegment>,
     /// Dedicated segments for oversized allocations. Key is segment index.
     dedicated: HashMap<u32, DedicatedEntry>,
     /// Base name prefix for SHM segments (includes PID).
@@ -86,7 +34,7 @@ pub struct BuddyPool {
     idle_since: Vec<Option<Instant>>,
 }
 
-impl BuddyPool {
+impl MemPool {
     /// Create a new pool. Segments are lazily created on first alloc.
     pub fn new(config: PoolConfig) -> Self {
         let pid = std::process::id();
@@ -137,7 +85,7 @@ impl BuddyPool {
     /// approach by probing common names based on the prefix pattern.
     #[cfg(target_os = "linux")]
     pub fn cleanup_stale_segments(prefix: &str) -> usize {
-        use crate::spinlock::is_process_alive;
+        use c2_alloc::spinlock::is_process_alive;
 
         let mut removed = 0;
         let Ok(entries) = std::fs::read_dir("/dev/shm") else {
@@ -173,7 +121,7 @@ impl BuddyPool {
     #[cfg(not(target_os = "linux"))]
     pub fn cleanup_stale_segments(_prefix: &str) -> usize {
         // On macOS, POSIX SHM cannot be enumerated. The per-segment
-        // shm_unlink-before-create in ShmSegment::create() provides
+        // shm_unlink-before-create in BuddySegment::create() provides
         // partial cleanup for same-PID restarts. Cross-PID stale segments
         // are not automatically cleaned on this platform.
         0
@@ -342,7 +290,7 @@ impl BuddyPool {
     }
 
     /// Get a specific segment by index.
-    pub fn segment(&self, idx: usize) -> Option<&ShmSegment> {
+    pub fn segment(&self, idx: usize) -> Option<&BuddySegment> {
         self.segments.get(idx)
     }
 
@@ -369,7 +317,7 @@ impl BuddyPool {
 
     /// Open an existing buddy segment (for the remote side of a connection).
     pub fn open_segment(&mut self, name: &str, size: usize) -> Result<usize, String> {
-        let seg = ShmSegment::open(name, size)?;
+        let seg = BuddySegment::open(name, size)?;
         let idx = self.segments.len();
         self.segments.push(seg);
         self.idle_since.push(None);
@@ -465,7 +413,7 @@ impl BuddyPool {
 
     fn max_buddy_block_size(&self) -> usize {
         if self.segments.is_empty() && self.segments.len() < self.config.max_segments {
-            // ShmSegment::create auto-inflates so data region >= segment_size.
+            // BuddySegment::create auto-inflates so data region >= segment_size.
             // The data region is segment_size.next_power_of_two().
             return self.config.segment_size.next_power_of_two();
         }
@@ -594,14 +542,14 @@ impl BuddyPool {
         }
     }
 
-    fn create_segment(&self) -> Result<ShmSegment, String> {
+    fn create_segment(&self) -> Result<BuddySegment, String> {
         let idx = self.segments.len();
         let name = format!("{}_{}{:04x}", self.name_prefix, "b", idx);
-        ShmSegment::create(&name, self.config.segment_size, self.config.min_block_size)
+        BuddySegment::create(&name, self.config.segment_size, self.config.min_block_size)
     }
 }
 
-impl Drop for BuddyPool {
+impl Drop for MemPool {
     fn drop(&mut self) {
         self.destroy();
     }
@@ -614,10 +562,10 @@ mod tests {
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    fn test_pool(config: PoolConfig) -> BuddyPool {
+    fn test_pool(config: PoolConfig) -> MemPool {
         let id = TEST_COUNTER.fetch_add(1, AtOrd::Relaxed);
         let prefix = format!("/cc3t{:04x}{:04x}", std::process::id() as u16, id);
-        BuddyPool::new_with_prefix(config, prefix)
+        MemPool::new_with_prefix(config, prefix)
     }
 
     fn small_config() -> PoolConfig {

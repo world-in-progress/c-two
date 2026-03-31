@@ -1,28 +1,21 @@
-"""Buddy allocator for cross-process shared memory.
+"""Deprecated — use ``c_two.mem`` instead.
 
-Wraps the Rust ``c2_buddy`` native extension, providing zero-syscall
-dynamic allocation within pre-mapped POSIX shared memory segments for
-the C-Two IPC transport.
-
-Typical usage::
-
-    from c_two.buddy import BuddyPoolHandle, PoolConfig
-
-    pool = BuddyPoolHandle(PoolConfig(
-        segment_size=256 * 1024 * 1024,
-        min_block_size=4096,
-        max_segments=8,
-    ))
-    alloc = pool.alloc(65536)
-    pool.write(alloc, b'hello')
-    data = pool.read(alloc, 5)
-    pool.free(alloc)
-    pool.destroy()
+This module re-exports from ``c_two.mem`` for backward compatibility.
+``BuddyPoolHandle`` is an alias for ``MemPool``.
 """
 from __future__ import annotations
 
-from c_two._native import (
+import warnings as _warnings
+
+_warnings.warn(
+    "c_two.buddy is deprecated — use c_two.mem instead",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+from c_two.mem import (  # noqa: E402
     BuddyPoolHandle,
+    MemPool,
     PoolAlloc,
     PoolConfig,
     PoolStats,
@@ -31,6 +24,7 @@ from c_two._native import (
 
 __all__ = [
     "BuddyPoolHandle",
+    "MemPool",
     "PoolAlloc",
     "PoolConfig",
     "PoolStats",

@@ -2,7 +2,7 @@
 name = "c2-ffi"
 edition.workspace = true
 version.workspace = true
-description = "PyO3 bindings for C-Two native extensions (buddy allocator + HTTP relay)"
+description = "PyO3 bindings for C-Two native extensions (memory pool + HTTP relay)"
 
 [lib]
 name = "c2_ffi"
@@ -13,7 +13,7 @@ default = ["python"]
 python = ["dep:pyo3"]
 
 [dependencies]
-c2-buddy = { path = "../c2-buddy" }
+c2-mempool = { path = "../c2-mempool" }
 c2-relay = { path = "../c2-relay" }
 c2-ipc = { path = "../c2-ipc" }
 pyo3 = { version = "0.25", features = ["extension-module"], optional = true }

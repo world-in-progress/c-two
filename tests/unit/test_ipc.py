@@ -7,7 +7,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport.ipc.frame import IPCConfig
-from c_two.transport.ipc.buddy import (
+from c_two.transport.ipc.shm_frame import (
     encode_buddy_handshake,
     decode_buddy_handshake,
     encode_buddy_payload,
@@ -86,7 +86,7 @@ class TestBuddyProtocol:
     def test_buddy_reuse_payload_roundtrip(self):
         """Test the extended reuse payload format with separate free coordinates."""
         import struct
-        from c_two.transport.ipc.buddy import (
+        from c_two.transport.ipc.shm_frame import (
             BUDDY_PAYLOAD_STRUCT, BUDDY_REUSE_EXTRA,
         )
         # Build a reuse payload manually.

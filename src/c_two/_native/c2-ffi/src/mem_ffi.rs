@@ -1,12 +1,12 @@
-//! PyO3 bindings for the buddy allocator pool.
+//! PyO3 bindings for the unified memory pool.
 //!
 //! Exposes the pool to Python with a clean, safe API:
-//! - BuddyPoolHandle: main pool object
+//! - MemPool: main pool object (was MemPoolHandle)
 //! - PoolAlloc: allocation result (seg_idx, offset, size, level, is_dedicated)
 //! - PoolConfig: configuration dataclass
 //! - PoolStats: statistics dataclass
 
-use c2_buddy::pool::{BuddyPool, PoolAllocation, PoolConfig};
+use c2_mempool::{MemPool, PoolAllocation, PoolConfig};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -160,26 +160,26 @@ impl PyPoolStats {
     }
 }
 
-/// The main buddy pool handle exposed to Python.
+/// The main memory pool handle exposed to Python.
 ///
 /// Thread-safe via internal `RwLock`. Read-only operations (`stats`,
 /// `segment_name`, `segment_count`, `seg_data_info`, `data_addr`, `read_at`)
 /// take a shared read lock; mutating operations (`alloc`, `alloc_ptr`,
 /// `free`, `free_at`, `open_segment`, `gc`, `destroy`) take an exclusive
 /// write lock.  This allows concurrent readers without blocking.
-#[pyclass(name = "BuddyPoolHandle")]
-pub struct PyBuddyPoolHandle {
-    pool: RwLock<BuddyPool>,
+#[pyclass(name = "MemPool")]
+pub struct PyMemPool {
+    pool: RwLock<MemPool>,
 }
 
 #[pymethods]
-impl PyBuddyPoolHandle {
+impl PyMemPool {
     #[new]
     #[pyo3(signature = (config = None))]
     fn new(config: Option<&PyPoolConfig>) -> PyResult<Self> {
         let cfg = config.map(PoolConfig::from).unwrap_or_default();
         Ok(Self {
-            pool: RwLock::new(BuddyPool::new(cfg)),
+            pool: RwLock::new(MemPool::new(cfg)),
         })
     }
 
@@ -487,16 +487,16 @@ impl PyBuddyPoolHandle {
 #[pyfunction]
 #[pyo3(signature = (prefix="cc3b"))]
 fn cleanup_stale_shm(prefix: &str) -> usize {
-    use c2_buddy::pool::BuddyPool;
-    BuddyPool::cleanup_stale_segments(prefix)
+    use c2_mempool::MemPool;
+    MemPool::cleanup_stale_segments(prefix)
 }
 
-/// Register the c2_buddy Python module.
+/// Register the memory pool Python module.
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPoolConfig>()?;
     m.add_class::<PyPoolAlloc>()?;
     m.add_class::<PyPoolStats>()?;
-    m.add_class::<PyBuddyPoolHandle>()?;
+    m.add_class::<PyMemPool>()?;
     m.add_function(wrap_pyfunction!(cleanup_stale_shm, m)?)?;
     Ok(())
 }

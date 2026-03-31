@@ -35,7 +35,7 @@ from ..ipc.frame import (
     FLAG_CTRL,
     encode_frame,
 )
-from ..ipc.buddy import (
+from ..ipc.shm_frame import (
     FLAG_BUDDY,
     BUDDY_PAYLOAD_STRUCT,
     decode_buddy_payload,
@@ -54,7 +54,7 @@ from .connection import Connection, CRMSlot, parse_call_inline
 from .chunk import ChunkAssembler, gc_chunk_assemblers
 from .reply import unpack_icrm_result, wrap_error, send_reply
 from .dispatcher import FastDispatcher
-from ...buddy import cleanup_stale_shm
+from ...mem import cleanup_stale_shm
 from .heartbeat import run_heartbeat
 from .handshake import handle_handshake, FLAG_HANDSHAKE
 

@@ -1,4 +1,4 @@
-"""Unit tests for the Rust buddy allocator Python bindings (c_two.buddy)."""
+"""Unit tests for the Rust memory pool Python bindings (c_two.mem)."""
 
 import multiprocessing.shared_memory as shm
 import random
@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from c_two.buddy import BuddyPoolHandle, PoolConfig, cleanup_stale_shm
+from c_two.mem import MemPool as BuddyPoolHandle, PoolConfig, cleanup_stale_shm
 
 
 # ------------------------------------------------------------------

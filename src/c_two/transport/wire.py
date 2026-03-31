@@ -33,7 +33,7 @@ from .ipc.frame import (
     FLAG_RESPONSE,
     encode_frame,
 )
-from .ipc.buddy import (
+from .ipc.shm_frame import (
     FLAG_BUDDY,
     BUDDY_PAYLOAD_STRUCT,
     encode_buddy_payload,

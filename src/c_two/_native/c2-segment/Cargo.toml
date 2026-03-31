@@ -1,0 +1,11 @@
+[package]
+name = "c2-segment"
+edition.workspace = true
+version.workspace = true
+description = "POSIX shared memory region lifecycle for C-Two IPC"
+
+[lib]
+name = "c2_segment"
+
+[dependencies]
+libc = "0.2"

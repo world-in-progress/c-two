@@ -144,7 +144,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
-name = "c2-buddy"
+name = "c2-alloc"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -154,8 +154,8 @@ dependencies = [
 name = "c2-ffi"
 version = "0.1.0"
 dependencies = [
- "c2-buddy",
  "c2-ipc",
+ "c2-mempool",
  "c2-relay",
  "pyo3",
  "serde_json",
@@ -172,6 +172,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "c2-mempool"
+version = "0.1.0"
+dependencies = [
+ "c2-alloc",
+ "c2-segment",
+ "libc",
+]
+
+[[package]]
 name = "c2-relay"
 version = "0.1.0"
 dependencies = [
@@ -185,6 +194,13 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "c2-segment"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

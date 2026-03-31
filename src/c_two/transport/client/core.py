@@ -45,7 +45,7 @@ from ..ipc.frame import (
     FLAG_RESPONSE,
     encode_frame,
 )
-from ..ipc.buddy import (
+from ..ipc.shm_frame import (
     FLAG_BUDDY,
     decode_buddy_payload,
 )
@@ -279,9 +279,9 @@ class SharedClient:
     def _do_buddy_handshake(self) -> None:
         """Create buddy pool and perform handshake with server."""
         try:
-            from c_two.buddy import BuddyPoolHandle, PoolConfig
+            from c_two.mem import MemPool as BuddyPoolHandle, PoolConfig
         except ImportError:
-            logger.warning('c_two.buddy not available, falling back to inline-only')
+            logger.warning('c_two.mem not available, falling back to inline-only')
             return
 
         self._buddy_pool = BuddyPoolHandle(PoolConfig(
@@ -828,7 +828,7 @@ class SharedClient:
                 return None, error.CompoClientError(f'Invalid seg_idx {seg_idx}')
 
             # Parse reply control (after buddy pointer).
-            from ..ipc.buddy import BUDDY_PAYLOAD_STRUCT
+            from ..ipc.shm_frame import BUDDY_PAYLOAD_STRUCT
             ctrl_offset = BUDDY_PAYLOAD_STRUCT.size
             # Check for reuse flag (19 bytes total buddy payload).
             bp_flags = payload[10] if len(payload) > 10 else 0
@@ -896,7 +896,7 @@ class SharedClient:
         is_buddy = bool(flags & FLAG_BUDDY)
 
         if is_buddy:
-            from ..ipc.buddy import BUDDY_PAYLOAD_STRUCT as _BP
+            from ..ipc.shm_frame import BUDDY_PAYLOAD_STRUCT as _BP
             seg_idx, data_offset, data_size, is_dedicated, free_offset, free_size = decode_buddy_payload(payload)
             if self._buddy_pool is None or seg_idx not in self._seg_views:
                 raise error.CompoClientError(f'Chunked reply: invalid seg_idx {seg_idx}')

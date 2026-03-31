@@ -41,7 +41,7 @@ from c_two.transport.wire import (
     encode_inline_chunked_reply_frame,
 )
 from c_two.transport.ipc.frame import FRAME_STRUCT, FLAG_RESPONSE
-from c_two.transport.ipc.buddy import FLAG_BUDDY, BUDDY_PAYLOAD_STRUCT
+from c_two.transport.ipc.shm_frame import FLAG_BUDDY, BUDDY_PAYLOAD_STRUCT
 
 
 # ---------------------------------------------------------------------------
