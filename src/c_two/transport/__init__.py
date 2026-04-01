@@ -2,16 +2,14 @@
 
 Provides the complete transport stack for C-Two:
 - Server: asyncio-based multi-CRM IPC server
-- SharedClient: concurrent multiplexed IPC client
-- ClientPool: reference-counted client lifecycle
+- SharedClient: thin compatibility wrapper around Rust IPC client
 - ICRMProxy: unified proxy (thread-local / IPC / HTTP)
 - Registry: cc.register/connect/close/shutdown SOTA API
 """
 from __future__ import annotations
 
 __all__ = [
-    'SharedClient', 'ClientPool', 'ICRMProxy',
-    'HttpClient', 'HttpClientPool',
+    'SharedClient', 'ICRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
     'set_address', 'set_ipc_config', 'register', 'connect', 'close',
@@ -20,10 +18,7 @@ __all__ = [
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'SharedClient':      ('.client.core',        'SharedClient'),
-    'ClientPool':        ('.client.pool',         'ClientPool'),
     'ICRMProxy':         ('.client.proxy',        'ICRMProxy'),
-    'HttpClient':        ('.client.http',         'HttpClient'),
-    'HttpClientPool':    ('.client.http',         'HttpClientPool'),
     'Server':          ('.server.core',         'Server'),
     'CRMSlot':           ('.server.core',         'CRMSlot'),
     'Scheduler':         ('.server.scheduler',    'Scheduler'),

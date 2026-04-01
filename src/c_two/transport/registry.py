@@ -7,8 +7,8 @@ Provides a singleton :class:`_ProcessRegistry` that manages:
 2. **Thread preference** — ``connect()`` returns a zero-serialization
    :class:`ICRMProxy.thread_local` when the target CRM lives in the
    same process.
-3. **Client pooling** — remote connections reuse :class:`SharedClient`
-   instances via :class:`ClientPool`.
+3. **Client pooling** — remote connections reuse Rust IPC/HTTP clients
+   via :class:`RustClientPool` and :class:`RustHttpClientPool`.
 
 Usage::
 

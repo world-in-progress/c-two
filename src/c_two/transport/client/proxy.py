@@ -8,10 +8,10 @@ Three modes:
 
 - **thread-local**: ``supports_direct_call = True``.  Calls CRM methods
   directly via ``call_direct(method_name, args)`` — zero serialization.
-- **ipc**: ``supports_direct_call = False``.  Delegates to a
-  :class:`SharedClient` with routing-name-based ``call()`` / ``relay()``.
-- **http**: ``supports_direct_call = False``.  Delegates to an
-  :class:`HttpClient` for cross-node access via an HTTP relay.
+- **ipc**: ``supports_direct_call = False``.  Delegates to a Rust IPC
+  client with routing-name-based ``call()``.
+- **http**: ``supports_direct_call = False``.  Delegates to a Rust HTTP
+  client for cross-node access via an HTTP relay.
 
 Usage::
 
@@ -21,17 +21,17 @@ Usage::
     icrm.client = proxy
     icrm.greeting('World')       # → crm_instance.greeting('World')
 
-    # IPC (cross-process via SharedClient):
-    proxy = ICRMProxy.ipc(shared_client, 'hello')
+    # IPC (cross-process via RustClient):
+    proxy = ICRMProxy.ipc(rust_client, 'hello')
     icrm = IHello()
     icrm.client = proxy
-    icrm.greeting('World')       # → shared_client.call('greeting', ..., name='hello')
+    icrm.greeting('World')       # → rust_client.call('hello', 'greeting', ...)
 
-    # HTTP (cross-node via HttpClient):
+    # HTTP (cross-node via RustHttpClient):
     proxy = ICRMProxy.http(http_client, 'hello')
     icrm = IHello()
     icrm.client = proxy
-    icrm.greeting('World')       # → http_client.call('greeting', ..., name='hello')
+    icrm.greeting('World')       # → http_client.call('hello', 'greeting', ...)
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ class ICRMProxy:
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
         '_closed', '_close_lock', '_on_terminate',
-        '_scheduler', '_access_map', '_rust_ipc', '_rust_http',
+        '_scheduler', '_access_map',
     )
 
     # ------------------------------------------------------------------
@@ -101,38 +101,35 @@ class ICRMProxy:
         proxy._on_terminate = on_terminate
         proxy._scheduler = scheduler
         proxy._access_map = access_map
-        proxy._rust_ipc = False
-        proxy._rust_http = False
         return proxy
 
     @classmethod
     def ipc(
         cls,
-        shared_client: Any,  # SharedClient — avoid circular import
+        client: Any,
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
     ) -> ICRMProxy:
-        """Create an IPC proxy (cross-process via SharedClient).
+        """Create an IPC proxy (cross-process via Rust IPC client).
 
         Calls are routed to the CRM registered under *name* on the
-        remote server.
+        remote server.  When *name* is empty, auto-discovers the first
+        route from the server handshake.
         """
         proxy = object.__new__(cls)
         proxy._mode = 'ipc'
         proxy._crm = None
-        proxy._client = shared_client
+        proxy._client = client
         proxy._name = name
         proxy._close_lock = threading.Lock()
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
         proxy._access_map = None
-        # Detect Rust-backed client (route_names is Rust-only).
-        proxy._rust_ipc = hasattr(shared_client, 'route_names')
-        proxy._rust_http = False
-        if proxy._rust_ipc and not name:
-            names = shared_client.route_names()
+        # Auto-discover route name when not provided.
+        if not name and hasattr(client, 'route_names'):
+            names = client.route_names()
             if names:
                 proxy._name = names[0]
         return proxy
@@ -140,12 +137,12 @@ class ICRMProxy:
     @classmethod
     def http(
         cls,
-        http_client: Any,  # HttpClient — avoid circular import
+        http_client: Any,
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
     ) -> ICRMProxy:
-        """Create an HTTP proxy (cross-node via HttpClient + relay).
+        """Create an HTTP proxy (cross-node via Rust HTTP client + relay).
 
         Calls are sent to the relay server as
         ``POST /{name}/{method_name}`` with the serialized payload.
@@ -160,9 +157,6 @@ class ICRMProxy:
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
         proxy._access_map = None
-        proxy._rust_ipc = False
-        # Detect Rust-backed HTTP client (has no 'name' keyword on call).
-        proxy._rust_http = type(http_client).__name__ == 'RustHttpClient'
         return proxy
 
     # ------------------------------------------------------------------
@@ -191,36 +185,19 @@ class ICRMProxy:
         with self._close_lock:
             if self._closed:
                 raise RuntimeError('Proxy is closed')
-        if self._mode == 'ipc':
-            if self._rust_ipc:
-                try:
-                    return self._client.call(
-                        self._name, method_name, data or b'',
-                    )
-                except Exception as exc:
-                    error_bytes = getattr(exc, 'error_bytes', None)
-                    if error_bytes is not None:
-                        from ...error import CCError
-                        cc_err = CCError.deserialize(memoryview(error_bytes))
-                        if cc_err is not None:
-                            raise cc_err from exc
-                    raise
-            return self._client.call(method_name, data, name=self._name)
-        if self._mode == 'http':
-            if self._rust_http:
-                try:
-                    return self._client.call(
-                        self._name, method_name, data or b'',
-                    )
-                except Exception as exc:
-                    error_bytes = getattr(exc, 'error_bytes', None)
-                    if error_bytes is not None:
-                        from ...error import CCError
-                        cc_err = CCError.deserialize(memoryview(error_bytes))
-                        if cc_err is not None:
-                            raise cc_err from exc
-                    raise
-            return self._client.call(method_name, data, name=self._name)
+        if self._mode in ('ipc', 'http'):
+            try:
+                return self._client.call(
+                    self._name, method_name, data or b'',
+                )
+            except Exception as exc:
+                error_bytes = getattr(exc, 'error_bytes', None)
+                if error_bytes is not None:
+                    from ...error import CCError
+                    cc_err = CCError.deserialize(memoryview(error_bytes))
+                    if cc_err is not None:
+                        raise cc_err from exc
+                raise
         raise NotImplementedError(
             'call() not available in thread-local mode; use call_direct()',
         )

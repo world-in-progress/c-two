@@ -254,68 +254,6 @@ class TestReplyControlBoundsChecking:
 
 
 # ---------------------------------------------------------------------------
-# PendingCall thread safety
-# ---------------------------------------------------------------------------
-
-class TestPendingCallSafety:
-    """Validate PendingCall behavior under edge conditions."""
-
-    def test_double_set_result(self):
-        """Setting result twice is harmless (first wins on event)."""
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=0)
-        p.set_result(b'first')
-        p.set_result(b'second')
-        # Event is already set, wait returns immediately.
-        # Result is the last one set (Python assignment is atomic).
-        result = p.wait(timeout=1.0)
-        assert result in (b'first', b'second')
-
-    def test_set_error_then_result(self):
-        """Error takes precedence even if result is also set."""
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=0)
-        p.set_error(ValueError('test'))
-        p.set_result(b'data')
-        with pytest.raises(ValueError, match='test'):
-            p.wait(timeout=1.0)
-
-    def test_timeout_raises(self):
-        """wait() with short timeout raises TimeoutError."""
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=0)
-        with pytest.raises(TimeoutError):
-            p.wait(timeout=0.01)
-
-    def test_concurrent_wait_and_set(self):
-        """One thread waits, another sets result concurrently."""
-        import threading
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=42)
-        results = []
-
-        def waiter():
-            try:
-                r = p.wait(timeout=5.0)
-                results.append(r)
-            except Exception as e:
-                results.append(e)
-
-        def setter():
-            import time
-            time.sleep(0.05)
-            p.set_result(b'concurrent')
-
-        t1 = threading.Thread(target=waiter)
-        t2 = threading.Thread(target=setter)
-        t1.start()
-        t2.start()
-        t1.join(timeout=3.0)
-        t2.join(timeout=1.0)
-        assert results == [b'concurrent']
-
-
-# ---------------------------------------------------------------------------
 # MethodTable safety
 # ---------------------------------------------------------------------------
 
