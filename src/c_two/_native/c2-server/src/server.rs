@@ -15,7 +15,7 @@ use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use c2_wire::control::{decode_call_control, encode_reply_control, ReplyControl};
-use c2_wire::flags::{FLAG_HANDSHAKE, FLAG_RESPONSE, FLAG_SIGNAL};
+use c2_wire::flags::{FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{decode_frame_body, encode_frame};
 use c2_wire::handshake::{
     decode_handshake, encode_server_handshake, MethodEntry, RouteInfo, CAP_CALL_V2, CAP_METHOD_IDX,
@@ -411,9 +411,11 @@ async fn dispatch_call(
 // Reply helpers
 // ---------------------------------------------------------------------------
 
+const REPLY_FLAGS: u32 = FLAG_RESPONSE | FLAG_REPLY_V2;
+
 async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl: &ReplyControl) {
     let payload = encode_reply_control(ctrl);
-    let frame = encode_frame(request_id, FLAG_RESPONSE, &payload);
+    let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
     let _ = writer.lock().await.write_all(&frame).await;
 }
 
@@ -423,7 +425,7 @@ async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: 
     let mut payload = Vec::with_capacity(ctrl_bytes.len() + data.len());
     payload.extend_from_slice(&ctrl_bytes);
     payload.extend_from_slice(data);
-    let frame = encode_frame(request_id, FLAG_RESPONSE, &payload);
+    let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
     let _ = writer.lock().await.write_all(&frame).await;
 }
 

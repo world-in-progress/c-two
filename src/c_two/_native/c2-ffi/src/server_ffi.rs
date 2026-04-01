@@ -43,14 +43,27 @@ impl CrmCallback for PyCrmCallback {
     ) -> Result<Vec<u8>, CrmError> {
         Python::with_gil(|py| {
             let args = (route_name, method_idx, PyBytes::new(py, payload));
-            let result = self
-                .py_callable
-                .call1(py, args)
-                .map_err(|e| CrmError::InternalError(format!("{e}")))?;
-            let bytes: &Bound<'_, PyBytes> = result
-                .downcast_bound::<PyBytes>(py)
-                .map_err(|e| CrmError::InternalError(format!("expected bytes return: {e}")))?;
-            Ok(bytes.as_bytes().to_vec())
+            match self.py_callable.call1(py, args) {
+                Ok(result) => {
+                    let bytes: &Bound<'_, PyBytes> = result
+                        .downcast_bound::<PyBytes>(py)
+                        .map_err(|e| {
+                            CrmError::InternalError(format!("expected bytes return: {e}"))
+                        })?;
+                    Ok(bytes.as_bytes().to_vec())
+                }
+                Err(e) => {
+                    // Check for .error_bytes attribute (CrmCallError from Python).
+                    // This preserves serialized CCError bytes for the client.
+                    let val = e.value(py);
+                    if let Ok(attr) = val.getattr("error_bytes") {
+                        if let Ok(b) = attr.downcast::<PyBytes>() {
+                            return Err(CrmError::UserError(b.as_bytes().to_vec()));
+                        }
+                    }
+                    Err(CrmError::InternalError(format!("{e}")))
+                }
+            }
         })
     }
 }

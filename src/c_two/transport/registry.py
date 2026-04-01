@@ -49,7 +49,7 @@ from .client.http import HttpClientPool
 from .client.pool import ClientPool
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
-from .server.core import Server
+from .server.native import NativeServerBridge as Server
 
 from ..crm.meta import MethodAccess
 from .ipc.frame import IPCConfig

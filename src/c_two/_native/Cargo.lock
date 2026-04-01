@@ -150,6 +150,7 @@ dependencies = [
  "c2-ipc",
  "c2-mem",
  "c2-relay",
+ "c2-server",
  "c2-wire",
  "pyo3",
  "serde_json",
@@ -187,6 +188,16 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "c2-server"
+version = "0.1.0"
+dependencies = [
+ "c2-mem",
+ "c2-wire",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
