@@ -43,7 +43,7 @@ uv run python examples/compo.py          # terminal 2: client
 
 # CLI tool
 c3 --version
-c3 build <project_path> --base-image python:3.12-slim
+c3 relay --upstream ipc://my_server --bind 0.0.0.0:8080
 ```
 
 Tests use **pytest** with a 30-second per-test timeout. Tests live under `tests/unit/` and `tests/integration/`, with shared fixtures in `tests/fixtures/` (see `IHello` ICRM and `Hello` CRM).
@@ -111,8 +111,8 @@ A Cargo workspace of 7 crates, compiled into a single `c_two._native` Python ext
 
 **Import:** `from c_two.mem import MemPool, PoolConfig, MemHandle, ChunkAssembler`
 
-### Seed / CLI (`src/c_two/seed/`, `src/c_two/cli.py`)
-The `c3` CLI currently has one command: `build` — for generating Dockerfiles and building Docker images for CRM deployment.
+### CLI (`src/c_two/cli.py`)
+The `c3` CLI provides `relay` (HTTP relay server) and `dev` (developer tools) commands.
 
 ## Key Conventions
 
