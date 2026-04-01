@@ -16,10 +16,10 @@ use tracing::{debug, info, warn};
 
 use c2_mem::config::PoolConfig;
 use c2_mem::MemPool;
-use c2_wire::buddy::{decode_buddy_payload, BUDDY_PAYLOAD_SIZE};
+use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
 use c2_wire::chunk::decode_chunk_header;
 use c2_wire::control::{decode_call_control, encode_reply_control, ReplyControl};
-use c2_wire::flags::{FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE, FLAG_SIGNAL};
+use c2_wire::flags::{FLAG_BUDDY, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{decode_frame_body, encode_frame};
 use c2_wire::handshake::{
     decode_handshake, encode_server_handshake, MethodEntry, RouteInfo, CAP_CALL_V2, CAP_CHUNKED,
@@ -463,7 +463,10 @@ async fn dispatch_call(
         .await;
 
     match result {
-        Ok(data) => write_reply_with_data(writer, request_id, &data).await,
+        Ok(data) => smart_reply_with_data(
+            &server.response_pool, writer, request_id, &data,
+            server.config.shm_threshold,
+        ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
         }
@@ -562,7 +565,10 @@ async fn dispatch_buddy_call(
         .await;
 
     match result {
-        Ok(data) => write_reply_with_data(writer, request_id, &data).await,
+        Ok(data) => smart_reply_with_data(
+            &server.response_pool, writer, request_id, &data,
+            server.config.shm_threshold,
+        ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
         }
@@ -740,7 +746,10 @@ async fn dispatch_chunked_call(
             .await;
 
         match result {
-            Ok(data) => write_reply_with_data(writer, request_id, &data).await,
+            Ok(data) => smart_reply_with_data(
+                &server.response_pool, writer, request_id, &data,
+                server.config.shm_threshold,
+            ).await,
             Err(CrmError::UserError(b)) => {
                 write_reply(writer, request_id, &ReplyControl::Error(b)).await;
             }
@@ -773,6 +782,84 @@ async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: 
     payload.extend_from_slice(data);
     let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
     let _ = writer.lock().await.write_all(&frame).await;
+}
+
+/// Write a success reply via buddy SHM: allocate from response pool, write
+/// data, send 11-byte pointer frame. Falls back to inline on alloc failure.
+async fn write_buddy_reply_with_data(
+    response_pool: &std::sync::Mutex<MemPool>,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    data: &[u8],
+) {
+    // 1. Allocate from response pool.
+    let alloc = {
+        let mut pool = response_pool.lock().unwrap();
+        pool.alloc(data.len())
+    };
+    let alloc = match alloc {
+        Ok(a) => a,
+        Err(_) => {
+            write_reply_with_data(writer, request_id, data).await;
+            return;
+        }
+    };
+
+    // 2. Write data to SHM (single lock scope).
+    let write_ok = {
+        let pool = response_pool.lock().unwrap();
+        match pool.data_ptr(&alloc) {
+            Ok(ptr) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    };
+    if !write_ok {
+        {
+            let mut pool = response_pool.lock().unwrap();
+            let _ = pool.free(&alloc);
+        }
+        write_reply_with_data(writer, request_id, data).await;
+        return;
+    }
+
+    // 3. Encode buddy payload + reply control.
+    let bp = BuddyPayload {
+        seg_idx: alloc.seg_idx as u16,
+        offset: alloc.offset,
+        data_size: data.len() as u32,
+        is_dedicated: alloc.is_dedicated,
+    };
+    let buddy_bytes = encode_buddy_payload(&bp);
+    let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
+
+    let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
+    payload.extend_from_slice(&buddy_bytes);
+    payload.extend_from_slice(&ctrl_bytes);
+
+    // 4. Send frame with FLAG_BUDDY.
+    let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
+    let frame = encode_frame(request_id, flags, &payload);
+    let _ = writer.lock().await.write_all(&frame).await;
+}
+
+/// Choose buddy SHM or inline reply based on data size and threshold.
+async fn smart_reply_with_data(
+    response_pool: &std::sync::Mutex<MemPool>,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    data: &[u8],
+    shm_threshold: u64,
+) {
+    if data.len() as u64 > shm_threshold {
+        write_buddy_reply_with_data(response_pool, writer, request_id, data).await;
+    } else {
+        write_reply_with_data(writer, request_id, data).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
