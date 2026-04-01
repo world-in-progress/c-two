@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-01
 **Status:** Draft
-**Scope:** c2-wire (扩展), c2-server (新建), c2-ipc (扩展), c2-ffi (扩展), Python transport 层重构
+**Scope:** c2-wire (扩展), c2-server (新建), c2-ipc (扩展), c2-http (新建), c2-ffi (扩展), Python transport 层重构
 **Target:** v0.4.0
 
 ## Overview
@@ -34,14 +34,14 @@ Python 层仅保留业务逻辑（CRM 方法执行、序列化、类型代理）
 ├── registry.py          cc.register/connect/close/shutdown (调用 Rust FFI)
 ├── config.py            Python-only 业务配置
 ├── client/
-│   ├── proxy.py         ICRMProxy (类型安全代理, 不涉及 I/O)
-│   └── http.py          HttpClient (HTTP 传输)
+│   └── proxy.py         ICRMProxy (类型安全代理, 不涉及 I/O)
 └── crm/                 CRM 方法执行 + @transferable 序列化
 
 所有 transport / protocol / memory 管理在 Rust:
 ├── c2-mem               内存池 (已完成)
 ├── c2-wire              Wire 编解码 + Handshake + ChunkAssembler (已大部分完成)
 ├── c2-ipc               IPC client: async + sync wrapper (扩展)
+├── c2-http              HTTP client: reqwest (新建, WASM 复用)
 ├── c2-server            IPC server: tokio (新建)
 ├── c2-relay             HTTP relay (已完成)
 └── c2-ffi               PyO3 统一入口 (扩展)
@@ -733,13 +733,104 @@ class ICRMProxy:
 |------|------|------|
 | `client/core.py` (SharedClient) | 删除 | 982 |
 | `client/pool.py` (ClientPool) | 删除 | 185 |
-| **合计** | | **1167** |
+| `client/http.py` (HttpClient + HttpClientPool) | 删除 | 327 |
+| **合计** | | **1494** |
 
 **保留**:
 - `client/proxy.py` (ICRMProxy) — 类型安全代理，纯 Python 逻辑
-- `client/http.py` (HttpClient) — HTTP 传输，独立于 IPC
 
-### §3.6 线程优惠保持不变
+### §3.6 c2-http: Rust HTTP Client (新建)
+
+**目标**: 替代 Python `HttpClient` + `HttpClientPool`，完全用 Rust 实现。
+
+**战略意义**: c2-http 的核心逻辑（wire codec + HTTP 调用）可编译为 WASM，
+供未来 TypeScript 端的 ICRM 代理直接使用 — 实现 transport 层多语言复用。
+
+```
+c2-http/
+├── Cargo.toml
+└── src/
+    ├── lib.rs           # 公开 API
+    ├── client.rs        # HttpClient (reqwest, 单连接)
+    └── pool.rs          # HttpClientPool (引用计数 + 连接复用)
+```
+
+**依赖**:
+```toml
+[dependencies]
+c2-wire = { path = "../c2-wire" }         # Wire 编解码 (错误反序列化)
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.12", features = ["wasm"] }  # WASM: 使用 fetch API
+```
+
+**核心接口**:
+```rust
+pub struct HttpClient {
+    client: reqwest::Client,   // 内部连接池
+    base_url: String,
+    timeout: Duration,
+}
+
+impl HttpClient {
+    pub fn new(base_url: &str, timeout_secs: u64, max_connections: usize) -> Self;
+
+    /// 同步调用 (block_on)
+    pub fn call(&self, method_name: &str, payload: &[u8], route_name: &str) -> Result<Vec<u8>>;
+
+    /// 异步调用
+    pub async fn call_async(&self, method_name: &str, payload: &[u8], route_name: &str) -> Result<Vec<u8>>;
+
+    /// 健康检查
+    pub async fn health(&self) -> Result<bool>;
+}
+
+pub struct HttpClientPool {
+    clients: RwLock<HashMap<String, (Arc<HttpClient>, AtomicUsize)>>,  // (client, ref_count)
+    grace_period: Duration,
+}
+```
+
+**HTTP/2 支持**: reqwest 的 `rustls-tls` feature 默认支持 ALPN 协商 HTTP/2。
+当 relay 侧启用 HTTP/2 时，客户端自动升级，**零配置切换**。
+
+**PyO3 FFI (在 c2-ffi/http_ffi.rs)**:
+```rust
+#[pyclass]
+struct RustHttpClient(Arc<HttpClient>);
+
+#[pymethods]
+impl RustHttpClient {
+    #[new]
+    fn new(base_url: &str, timeout: f64, max_connections: usize) -> Self;
+    fn call(&self, method: &str, payload: &[u8], route: &str) -> PyResult<Vec<u8>>;
+    fn call_async<'py>(&self, py: Python<'py>, ...) -> PyResult<Bound<'py, PyAny>>;
+}
+
+#[pyclass]
+struct RustHttpClientPool(HttpClientPool);
+
+#[pymethods]
+impl RustHttpClientPool {
+    fn acquire(&self, address: &str) -> PyResult<RustHttpClient>;
+    fn release(&self, address: &str) -> PyResult<()>;
+}
+```
+
+**Python 侧集成** (registry.py 修改):
+```python
+# Before (v0.3.x):
+from c_two.transport.client.http import HttpClient, HttpClientPool
+
+# After (v0.4.0):
+from c_two._native import RustHttpClient, RustHttpClientPool
+```
+
+**消除 `httpx` 依赖** — pyproject.toml 中移除 `httpx>=0.28.1`。
+
+### §3.7 线程优惠保持不变
 
 `ICRMProxy.thread_local()` 路径完全不受影响 — 同进程直连，零序列化，
 直接调用 CRM 方法。这是性能最优路径，不经过任何 transport。
@@ -761,8 +852,7 @@ src/c_two/transport/
 ├── config.py            # Python-only 业务配置 (max_workers 等)
 ├── client/
 │   ├── __init__.py
-│   ├── proxy.py         # ICRMProxy (类型安全代理)
-│   └── http.py          # HttpClient (HTTP 传输)
+│   └── proxy.py         # ICRMProxy (类型安全代理)
 └── relay/
     └── __init__.py      # NativeRelay re-export
 ```
@@ -787,7 +877,8 @@ transport/
 │   └── heartbeat.py
 └── client/
     ├── core.py          # Phase 3 已迁移
-    └── pool.py          # Phase 3 已迁移
+    ├── pool.py          # Phase 3 已迁移
+    └── http.py          # Phase 3 已迁移 (→ c2-http)
 ```
 
 ### §4.2 v0.4.0 公开 API
@@ -870,13 +961,18 @@ src/c_two/_native/
 │   ├── router.rs       HTTP→IPC 路由
 │   └── state.rs        UpstreamPool
 │
+├── c2-http/            HTTP Client (Phase 3 新建)
+│   ├── client.rs       reqwest HttpClient (sync + async)
+│   └── pool.rs         HttpClientPool (引用计数)
+│
 └── c2-ffi/             PyO3 统一入口
     ├── lib.rs           模块注册
     ├── mem_ffi.rs       MemPool + MemHandle + ChunkAssembler (已完成)
     ├── relay_ffi.rs     NativeRelay (已完成)
     ├── wire_ffi.rs      Wire 编解码 FFI (Phase 1 新增)
     ├── server_ffi.rs    RustServer FFI (Phase 2 新增)
-    └── client_ffi.rs    RustClient + RustAsyncClient FFI (Phase 3 新增)
+    ├── client_ffi.rs    RustClient + RustAsyncClient FFI (Phase 3 新增)
+    └── http_ffi.rs      RustHttpClient + RustHttpClientPool FFI (Phase 3 新增)
 ```
 
 ### 依赖关系图
@@ -890,6 +986,8 @@ c2-wire ─────────┤──── c2-server ────┐
 c2-ipc ──────────┤──── c2-relay ─────┤──── c2-ffi (PyO3)
   (依赖 c2-wire) │  (依赖 c2-ipc)   │   (依赖全部)
                  │                   │
+c2-http ─────────┘                   │
+  (依赖 c2-wire)                     │
                  └───────────────────┘
 ```
 
@@ -901,12 +999,12 @@ c2-ipc ──────────┤──── c2-relay ─────┤
 |-------|----------|------------|------------|--------|
 | 1. 基础设施统一 | ~800 行 (wire_ffi.rs + msg_type.rs + config.rs) | ~840 行 | ~200 行 (shim) | -40 行 |
 | 2. Server 下沉 | ~2000 行 (c2-server + server_ffi.rs) | ~1774 行 | ~150 行 (registry.py) | +226 行 |
-| 3. Client 统一 | ~1200 行 (sync_client + pool + client_ffi) | ~1167 行 | ~100 行 (proxy.py) | +33 行 |
+| 3. Client + HTTP 统一 | ~1600 行 (sync_client + pool + c2-http + http_ffi) | ~1494 行 | ~100 行 (proxy.py) | +106 行 |
 | 4. 清理 | ~0 | ~200 行 (shim + envelope) | ~300 行 (测试 import) | -200 行 |
-| **合计** | **~4000 行 Rust** | **~3981 行 Python** | **~750 行 Python** | **+19 行** |
+| **合计** | **~4400 行 Rust** | **~4308 行 Python** | **~750 行 Python** | **+92 行** |
 
-**总结**: 净代码量几乎不变，但 ~4000 行 Python transport 代码被等量 Rust 替代，
-得到性能提升 (无 GIL I/O) + 类型安全 + 单一编解码实现。
+**总结**: 净代码量几乎不变，但 ~4300 行 Python transport 代码被等量 Rust 替代，
+得到性能提升 (无 GIL I/O) + 类型安全 + 单一编解码实现 + 多语言复用 (WASM)。
 
 ---
 
@@ -931,4 +1029,93 @@ c2-ipc ──────────┤──── c2-relay ─────┤
 | `c-two-rpc-v2-roadmap.md` §3.0-4.x | 本设计覆盖 P2 磁盘溢写(已完成) 之后的全部传输层演进 |
 | `2026-03-29-server-core-decoupling-design.md` | Phase 2 Server 下沉基于其解耦后的模块结构 |
 | `2026-03-30-unified-memory-fallback-design.md` | c2-mem 的 alloc_handle 三层架构在本设计中被 c2-server 直接使用 |
+
+---
+
+## §5 Future Extensions: 多语言复用与协议演进
+
+### §5.1 Transport-Agnostic Binding 架构
+
+下沉完成后，C-Two 的 transport 层形成一个语言无关的 Rust 核心：
+
+```
+                     ┌─────────────────────────────────┐
+                     │       Rust Transport Core       │
+                     │                                 │
+                     │  c2-wire (no_std, WASM-safe)    │
+                     │  c2-http (reqwest / fetch)      │
+                     │  c2-ipc  (tokio, UDS)           │
+                     │  c2-server (tokio)              │
+                     │  c2-relay (axum)                │
+                     └──────┬──────────────┬───────────┘
+                            │              │
+                     ┌──────▼──────┐ ┌─────▼──────────┐
+                     │ PyO3 FFI    │ │ wasm-bindgen   │
+                     │ (c2-ffi)    │ │ (c2-wasm)      │
+                     └──────┬──────┘ └─────┬──────────┘
+                            │              │
+                     ┌──────▼──────┐ ┌─────▼──────────┐
+                     │  Python     │ │  TypeScript     │
+                     │  binding    │ │  binding        │
+                     │  (registry, │ │  (icrm proxy,   │
+                     │   proxy,    │ │   type gen)     │
+                     │   crm)      │ │                 │
+                     └─────────────┘ └────────────────┘
+```
+
+高级语言只负责：
+1. **类型映射** — ICRM 接口定义、类型安全代理
+2. **业务逻辑** — CRM 方法执行、数据序列化
+3. **运行时集成** — Python asyncio / TS event loop 桥接
+
+所有传输细节（协议版本、编解码、连接管理、重试、心跳）由 Rust 层统一实现。
+
+### §5.2 TypeScript ICRM 代理 (c2-wasm)
+
+**目标**: 让浏览器/Node.js 端直接调用 C-Two CRM 资源。
+
+**可复用组件**:
+- `c2-wire` — 编译到 `wasm32-unknown-unknown`，提供 Wire 编解码
+- `c2-http` — WASM 构建使用 `reqwest` 的 `wasm` feature (底层为 `fetch` API)
+
+**不可复用** (需 TS 原生实现):
+- ICRM 类型代理 — TypeScript 泛型 + Proxy 对象
+- @transferable 序列化 — 需 TS 侧的 serialize/deserialize 实现
+
+**构建工具链**: `wasm-pack` → npm 包发布
+
+```
+@c-two/transport (npm)
+├── c2_wire_bg.wasm     # c2-wire 编译产物
+├── c2_http_bg.wasm     # c2-http 编译产物 (fetch backend)
+├── index.ts            # TypeScript binding
+└── proxy.ts            # ICRMProxy<T> 泛型代理
+```
+
+### §5.3 HTTP/2 升级路径
+
+**当前状态**: Relay (axum/hyper) 已支持 HTTP/2，但默认 HTTP/1.1。
+
+**升级步骤** (仅 Rust 配置变更，零 Python/TS 代码改动):
+
+1. **Relay 侧**: axum `serve()` 启用 TLS → hyper 自动 ALPN 协商 HTTP/2
+2. **Client 侧**: `reqwest` 已默认支持 HTTP/2 (有 TLS 时)
+3. **收益**:
+   - 多路复用 — 单 TCP 连接承载多个并发 RPC，消除 head-of-line blocking
+   - 头部压缩 (HPACK) — 减少重复 header 开销
+   - 服务器推送 — 可用于 CRM 事件通知 (未来)
+
+**长期**: HTTP/3 (QUIC) — `hyper` 和 `reqwest` 社区已有实验性支持。
+当 QUIC 稳定后，同样只需 Rust 层配置切换。
+
+### §5.4 迁移影响总结
+
+| 维度 | 当前 (v0.3.x) | 下沉后 (v0.4.0) | 长期 |
+|------|--------------|-----------------|------|
+| 传输实现 | Python + Rust 双重 | Rust 单一 | Rust 单一 |
+| 支持语言 | Python only | Python | Python + TypeScript |
+| HTTP 协议 | HTTP/1.1 (httpx) | HTTP/1.1 + 2 (reqwest) | + HTTP/3 (QUIC) |
+| Python 依赖 | httpx, asyncio | 无额外依赖 | 无额外依赖 |
+| Wire codec 修改 | 改两处 (Py + Rs) | 改一处 (Rust) | 改一处 (Rust) |
+| 新传输协议 | 需改 Python | 仅改 Rust | 仅改 Rust |
 
