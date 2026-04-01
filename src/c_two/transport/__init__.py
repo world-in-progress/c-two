@@ -2,14 +2,13 @@
 
 Provides the complete transport stack for C-Two:
 - Server: Rust tokio-based multi-CRM IPC server (via NativeServerBridge)
-- SharedClient: thin compatibility wrapper around Rust IPC client
 - ICRMProxy: unified proxy (thread-local / IPC / HTTP)
 - Registry: cc.register/connect/close/shutdown SOTA API
 """
 from __future__ import annotations
 
 __all__ = [
-    'SharedClient', 'ICRMProxy',
+    'ICRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
     'set_address', 'set_ipc_config', 'register', 'connect', 'close',
@@ -17,7 +16,6 @@ __all__ = [
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
-    'SharedClient':      ('.client.core',        'SharedClient'),
     'ICRMProxy':         ('.client.proxy',        'ICRMProxy'),
     'Server':          ('.server.native',       'NativeServerBridge'),
     'CRMSlot':           ('.server.native',       'CRMSlot'),

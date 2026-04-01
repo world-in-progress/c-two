@@ -20,8 +20,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport.ipc.frame import IPCConfig
-from c_two.transport.client.core import SharedClient
-from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.client.util import ping
 from c_two.transport.server import Server
 
 
@@ -56,7 +55,6 @@ class PoolTestCRM:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 _counter = 0
 
 _SEG_SIZE = 65536       # 64 KB per segment
@@ -69,11 +67,9 @@ def _unique_region() -> str:
 
 
 def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
-    region = addr.replace('ipc://', '')
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region}.sock')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
+        if ping(addr, timeout=0.5):
             return
         time.sleep(0.05)
     raise TimeoutError(f'Server {addr} did not start within {timeout}s')
@@ -90,10 +86,10 @@ def _pool_config(max_segs: int = 4) -> IPCConfig:
 def _setup(
     addr: str | None = None,
     cfg: IPCConfig | None = None,
-) -> tuple[str, Server, SharedClient, IPoolTest]:
-    """Spin up a Server + SharedClient pair with IPoolTest CRM.
+):
+    """Spin up a Server + SOTA proxy for IPoolTest CRM.
 
-    Returns ``(addr, server, client, icrm)``.
+    Returns ``(addr, server, proxy)``.
     """
     if addr is None:
         addr = f'ipc://{_unique_region()}'
@@ -105,19 +101,14 @@ def _setup(
     server.start()
     _wait_for_server(addr)
 
-    client = SharedClient(addr, ipc_config=cfg)
-    client.connect()
+    proxy = cc.connect(IPoolTest, name='pool', address=addr)
 
-    proxy = ICRMProxy.ipc(client, 'pool')
-    icrm = IPoolTest()
-    icrm.client = proxy
-
-    return addr, server, client, icrm
+    return addr, server, proxy
 
 
-def _teardown(server: Server, client: SharedClient) -> None:
+def _teardown(server: Server, proxy) -> None:
     try:
-        client.terminate()
+        cc.close(proxy)
     except Exception:
         pass
     try:
@@ -135,23 +126,15 @@ class TestPoolExpandsOnLargeAlloc:
 
     def test_pool_expands_on_large_alloc(self):
         cfg = _pool_config(max_segs=4)
-        addr, server, client, icrm = _setup(cfg=cfg)
+        addr, server, proxy = _setup(cfg=cfg)
         try:
             payload = b'\xAB' * 100_000  # ~100 KB, exceeds single 64 KB seg
-            result = icrm.echo(payload)
+            result = proxy.echo(payload)
 
             assert result == payload
             assert len(result) == 100_000
-
-            # After the round-trip the client pool should have expanded
-            # beyond its initial single segment.
-            if hasattr(client, '_buddy_pool') and client._buddy_pool is not None:
-                stats = client._buddy_pool.stats()
-                assert stats.total_segments >= 1, (
-                    f'Expected pool expansion, got {stats.total_segments} segment(s)'
-                )
         finally:
-            _teardown(server, client)
+            _teardown(server, proxy)
 
 
 # ===========================================================================
@@ -164,17 +147,14 @@ class TestMultiSegmentConcurrentCalls:
 
     def test_multi_segment_concurrent_calls(self):
         cfg = _pool_config(max_segs=8)
-        addr, server, client, _ = _setup(cfg=cfg)
+        addr, server, proxy = _setup(cfg=cfg)
         try:
             num_workers = 6
             payload_size = 50_000  # each > half a 64 KB segment
 
             def worker(tid: int) -> bytes:
-                proxy = ICRMProxy.ipc(client, 'pool')
-                local_icrm = IPoolTest()
-                local_icrm.client = proxy
                 payload = bytes([tid & 0xFF]) * payload_size
-                return local_icrm.echo(payload)
+                return proxy.echo(payload)
 
             with ThreadPoolExecutor(max_workers=num_workers) as pool:
                 futures = {pool.submit(worker, i): i for i in range(num_workers)}
@@ -187,7 +167,7 @@ class TestMultiSegmentConcurrentCalls:
                 assert len(data) == payload_size
                 assert data == bytes([tid & 0xFF]) * payload_size
         finally:
-            _teardown(server, client)
+            _teardown(server, proxy)
 
 
 # ===========================================================================
@@ -200,17 +180,17 @@ class TestServerLazyOpensNewSegments:
 
     def test_server_lazy_opens_new_segments(self):
         cfg = _pool_config(max_segs=8)
-        addr, server, client, icrm = _setup(cfg=cfg)
+        addr, server, proxy = _setup(cfg=cfg)
         try:
             # Escalating payloads: fits within Rust client's buddy pool.
             sizes = [10_000, 30_000, 50_000, 70_000]
             for size in sizes:
                 payload = b'\xCD' * size
-                result = icrm.echo(payload)
+                result = proxy.echo(payload)
                 assert len(result) == size
                 assert result == payload
         finally:
-            _teardown(server, client)
+            _teardown(server, proxy)
 
 
 # ===========================================================================
@@ -224,19 +204,12 @@ class TestExpansionDoesNotExceedMaxSegments:
 
     def test_expansion_does_not_exceed_max_segments(self):
         cfg = _pool_config(max_segs=2)
-        addr, server, client, icrm = _setup(cfg=cfg)
+        addr, server, proxy = _setup(cfg=cfg)
         try:
             payload = b'\xEF' * 80_000  # Within buddy pool range
-            result = icrm.echo(payload)
+            result = proxy.echo(payload)
 
             assert result == payload
             assert len(result) == 80_000
-
-            # Pool should not have grown past its cap.
-            if hasattr(client, '_buddy_pool') and client._buddy_pool is not None:
-                stats = client._buddy_pool.stats()
-                assert stats.total_segments <= 2, (
-                    f'Pool exceeded max segments: {stats.total_segments}'
-                )
         finally:
-            _teardown(server, client)
+            _teardown(server, proxy)

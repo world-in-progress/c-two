@@ -1,10 +1,8 @@
 """Concurrency safety and security integration tests.
 
 Tests:
-- Thread-safe concurrent calls through SharedClient
-- Request ID 32-bit wrapping correctness
-- Server segment limit enforcement
-- Double-terminate safety
+- Thread-safe concurrent calls via SOTA API
+- Server double-shutdown safety
 - Concurrent connect/close lifecycle
 """
 from __future__ import annotations
@@ -16,9 +14,9 @@ import threading
 import pytest
 
 import c_two as cc
-from c_two.transport.client.core import SharedClient
 from c_two.transport.server import Server
 from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport.client.util import ping
 
 
 # ---------------------------------------------------------------------------
@@ -46,40 +44,24 @@ def _next_addr():
 
 
 def _wait_for_server(addr: str, timeout: float = 3.0):
-    """Poll until server socket is ready."""
-    import socket as _sock
-    sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-    region = addr.replace('ipc://', '')
-    sock_path = os.path.join(sock_dir, region + '.sock')
+    """Poll until server responds to ping."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
-            try:
-                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-                s.connect(sock_path)
-                s.close()
-                return
-            except Exception:
-                pass
+        if ping(addr, timeout=0.5):
+            return
         time.sleep(0.02)
     raise TimeoutError(f'Server at {addr} not ready within {timeout}s')
 
 
 # ---------------------------------------------------------------------------
-# Request ID wrapping
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
-# Concurrent calls stress test
+# Concurrent calls stress test via SOTA API
 # ---------------------------------------------------------------------------
 
 class TestConcurrentCallSafety:
-    """Stress-test SharedClient concurrent call safety."""
+    """Stress-test concurrent call safety via SOTA API."""
 
     def test_32_threads_concurrent_echo(self):
-        """32 threads making concurrent echo calls through one SharedClient."""
+        """32 threads making concurrent echo calls via a shared proxy."""
         addr = _next_addr()
         cfg = IPCConfig(
             pool_segment_size=1 << 20,  # 1MB
@@ -87,13 +69,12 @@ class TestConcurrentCallSafety:
             max_pool_memory=2 << 20,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg)
-            client.connect()
+            proxy = cc.connect(IEcho, name='echo', address=addr)
 
             errors = []
             results = {}
@@ -102,7 +83,7 @@ class TestConcurrentCallSafety:
                 try:
                     for i in range(calls):
                         tag = f'{thread_id}:{i}'.encode()
-                        r = client.call('echo', tag)
+                        r = proxy.echo(tag)
                         assert r == tag, f'Thread {thread_id} call {i}: expected {tag!r}, got {r!r}'
                         results[(thread_id, i)] = True
                 except Exception as e:
@@ -120,8 +101,7 @@ class TestConcurrentCallSafety:
 
             assert not errors, f'Errors in threads: {errors}'
             assert len(results) == n_threads * calls_per_thread
-
-            client.terminate()
+            cc.close(proxy)
         finally:
             server.shutdown()
 
@@ -134,13 +114,12 @@ class TestConcurrentCallSafety:
             max_pool_memory=2 << 20,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg)
-            client.connect()
+            proxy = cc.connect(IEcho, name='echo', address=addr)
 
             errors = []
             sizes = [64, 256, 1024, 4096, 16384, 65536]
@@ -150,7 +129,7 @@ class TestConcurrentCallSafety:
                     data = bytes(range(256)) * (payload_size // 256 + 1)
                     data = data[:payload_size]
                     for _ in range(5):
-                        r = client.call('echo', data)
+                        r = proxy.echo(data)
                         assert r == data
                 except Exception as e:
                     errors.append((thread_id, payload_size, e))
@@ -164,39 +143,33 @@ class TestConcurrentCallSafety:
                 t.join(timeout=15)
 
             assert not errors, f'Errors: {errors}'
-            client.terminate()
+            cc.close(proxy)
         finally:
             server.shutdown()
 
 
 # ---------------------------------------------------------------------------
-# Double-terminate safety
+# Double-shutdown safety
 # ---------------------------------------------------------------------------
 
-class TestDoubleTerminate:
-    """Ensure calling terminate() multiple times is safe."""
+class TestDoubleShutdown:
+    """Ensure calling shutdown/close multiple times is safe."""
 
-    def test_client_double_terminate(self):
+    def test_proxy_double_close(self):
         addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server = Server(bind_address=addr)
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-            r = client.call('echo', b'hello')
+            proxy = cc.connect(IEcho, name='echo', address=addr)
+            r = proxy.echo(b'hello')
             assert r == b'hello'
 
-            # Terminate twice — should not raise.
-            client.terminate()
-            client.terminate()
+            # Close twice — should not raise.
+            cc.close(proxy)
+            cc.close(proxy)
         finally:
             server.shutdown()
 
@@ -208,47 +181,13 @@ class TestDoubleTerminate:
             max_pool_memory=65536,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
         # Shutdown twice — should not raise.
         server.shutdown()
         server.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Call after terminate raises cleanly
-# ---------------------------------------------------------------------------
-
-class TestCallAfterTerminate:
-    """Verify calling a terminated client reconnects cleanly."""
-
-    def test_call_after_terminate_reconnects(self):
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-            r = client.call('echo', b'ok')
-            assert r == b'ok'
-
-            client.terminate()
-
-            # Thin wrapper reconnects automatically on next call.
-            r2 = client.call('echo', b'reconnected')
-            assert r2 == b'reconnected'
-        finally:
-            server.shutdown()
 
 
 class TestSOTAAPIConcurrency:

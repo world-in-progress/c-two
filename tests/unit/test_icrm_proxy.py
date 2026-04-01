@@ -22,11 +22,11 @@ class _DummyCRM:
 
 
 # ---------------------------------------------------------------------------
-# Dummy SharedClient for IPC tests
+# Mock client for IPC tests
 # ---------------------------------------------------------------------------
 
-class _DummySharedClient:
-    """Fake SharedClient recording calls (Rust client API)."""
+class _MockClient:
+    """Fake client recording calls (Rust client API)."""
 
     def __init__(self):
         self.calls: list[tuple] = []
@@ -103,45 +103,45 @@ class TestThreadLocalProxy:
 class TestIPCProxy:
 
     def test_supports_direct_call_false(self):
-        proxy = ICRMProxy.ipc(_DummySharedClient(), 'test.ns')
+        proxy = ICRMProxy.ipc(_MockClient(), 'test.ns')
         assert proxy.supports_direct_call is False
 
     def test_call_delegates(self):
-        client = _DummySharedClient()
+        client = _MockClient()
         proxy = ICRMProxy.ipc(client, 'test.hello')
         result = proxy.call('greet', b'payload')
         assert result == b'result'
         assert client.calls == [('test.hello', 'greet', b'payload')]
 
     def test_call_none_data(self):
-        client = _DummySharedClient()
+        client = _MockClient()
         proxy = ICRMProxy.ipc(client, 'ns')
         proxy.call('method')
         assert client.calls == [('ns', 'method', b'')]
 
     def test_relay_delegates(self):
-        client = _DummySharedClient()
+        client = _MockClient()
         proxy = ICRMProxy.ipc(client, 'ns')
         result = proxy.relay(b'wire')
         assert result == b'relay_result'
         assert client.relays == [b'wire']
 
     def test_call_direct_raises(self):
-        proxy = ICRMProxy.ipc(_DummySharedClient(), 'ns')
+        proxy = ICRMProxy.ipc(_MockClient(), 'ns')
         with pytest.raises(NotImplementedError, match='thread-local'):
             proxy.call_direct('greet', ('x',))
 
     def test_terminate_callback(self):
         released = []
         proxy = ICRMProxy.ipc(
-            _DummySharedClient(), 'ns',
+            _MockClient(), 'ns',
             on_terminate=lambda: released.append(True),
         )
         proxy.terminate()
         assert released == [True]
 
     def test_call_after_terminate_raises(self):
-        proxy = ICRMProxy.ipc(_DummySharedClient(), 'ns')
+        proxy = ICRMProxy.ipc(_MockClient(), 'ns')
         proxy.terminate()
         with pytest.raises(RuntimeError, match='closed'):
             proxy.call('method', b'data')

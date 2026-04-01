@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 import os
-import pickle
-import socket
 import threading
 import time
 
 import pytest
 
-from c_two.transport import Server, SharedClient
+import c_two as cc
+from c_two.transport import Server
 from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport.client.util import ping
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -35,7 +35,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if SharedClient.ping(address, timeout=0.5):
+            if ping(address, timeout=0.5):
                 return
         except Exception:
             pass
@@ -49,33 +49,28 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 
 
 class TestHeartbeatIntegration:
-    """End-to-end heartbeat tests with real Server + SharedClient."""
+    """End-to-end heartbeat tests with real Server via SOTA API."""
 
     def test_active_connection_survives_heartbeat(self):
         """An active client is NOT disconnected by heartbeat probes."""
         config = IPCConfig(heartbeat_interval=0.3, heartbeat_timeout=0.8)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config)
+        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
-            client = SharedClient(address, ipc_config=config)
-            client.connect()
+            proxy = cc.connect(IHello, name='hello', address=address)
             try:
                 # Make repeated calls over 1s (longer than heartbeat_interval)
                 for _ in range(4):
-                    result = pickle.loads(
-                        client.call('greeting', pickle.dumps(('HB',)))
-                    )
+                    result = proxy.greeting('HB')
                     assert result == 'Hello, HB!'
                     time.sleep(0.25)
                 # Client should still be functional
-                result = pickle.loads(
-                    client.call('add', pickle.dumps((1, 2)))
-                )
+                result = proxy.add(1, 2)
                 assert result == 3
             finally:
-                client.terminate()
+                cc.close(proxy)
         finally:
             server.shutdown()
 
@@ -83,40 +78,41 @@ class TestHeartbeatIntegration:
         """An idle client that responds to PING survives heartbeat probes."""
         config = IPCConfig(heartbeat_interval=0.2, heartbeat_timeout=0.6)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config)
+        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
-            client = SharedClient(address, ipc_config=config)
-            client.connect()
+            proxy = cc.connect(IHello, name='hello', address=address)
             try:
                 # Do one call then go idle for longer than heartbeat_interval
-                result = pickle.loads(
-                    client.call('greeting', pickle.dumps(('Idle',)))
-                )
+                result = proxy.greeting('Idle')
                 assert result == 'Hello, Idle!'
-                # Idle — client _recv_loop auto-responds to PING
+                # Idle — client auto-responds to PING
                 time.sleep(0.5)
                 # Should still work
-                result = pickle.loads(
-                    client.call('add', pickle.dumps((10, 20)))
-                )
+                result = proxy.add(10, 20)
                 assert result == 30
             finally:
-                client.terminate()
+                cc.close(proxy)
         finally:
             server.shutdown()
 
     def test_dead_client_detected_by_heartbeat(self):
-        """A raw socket (no PONG capability) is detected within timeout."""
+        """A raw socket (no PONG capability) is detected within timeout.
+
+        This tests low-level transport behavior — the server must detect
+        and clean up dead connections without crashing.
+        """
+        import socket
         config = IPCConfig(heartbeat_interval=0.1, heartbeat_timeout=0.3)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config)
+        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
             region_id = address.replace('ipc://', '')
-            sock_path = f'/tmp/c_two_ipc/{region_id}.sock'
+            _ipc_sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
+            sock_path = os.path.join(_ipc_sock_dir, f'{region_id}.sock')
             raw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             raw_sock.connect(sock_path)
             raw_sock.settimeout(1.0)
@@ -125,15 +121,13 @@ class TestHeartbeatIntegration:
             # Server should have closed the connection
             try:
                 data = raw_sock.recv(4096)
-                # Empty read or data is fine — connection may have data
-                # before close. The key thing is server didn't crash.
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
             finally:
                 raw_sock.close()
 
             # Server should still be functional for new clients
-            assert SharedClient.ping(address, timeout=1.0)
+            assert ping(address, timeout=1.0)
         finally:
             server.shutdown()
 
@@ -141,20 +135,17 @@ class TestHeartbeatIntegration:
         """When heartbeat_interval=0, no probes are sent."""
         config = IPCConfig(heartbeat_interval=0, heartbeat_timeout=30)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config)
+        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
-            client = SharedClient(address, ipc_config=config)
-            client.connect()
+            proxy = cc.connect(IHello, name='hello', address=address)
             try:
                 # Idle for a while — should NOT be disconnected
                 time.sleep(0.3)
-                result = pickle.loads(
-                    client.call('greeting', pickle.dumps(('OK',)))
-                )
+                result = proxy.greeting('OK')
                 assert result == 'Hello, OK!'
             finally:
-                client.terminate()
+                cc.close(proxy)
         finally:
             server.shutdown()
