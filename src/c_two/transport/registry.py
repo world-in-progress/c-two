@@ -442,10 +442,8 @@ class _ProcessRegistry:
                 'The process will block but has nothing to serve.',
             )
 
-        # Print banner.
-        self._print_serve_banner(names, addr)
-
-        # Signal handlers — only installable from the main thread.
+        # Signal handlers — install BEFORE banner so that SIGINT is
+        # handled correctly as soon as the caller sees the output.
         def _handle_signal(signum, frame):  # noqa: ARG001
             self._serve_stop.set()
 
@@ -457,6 +455,9 @@ class _ProcessRegistry:
             # Not the main thread — signals cannot be registered.
             # Caller must arrange to call _serve_stop.set() externally.
             log.debug('cc.serve(): signal handlers skipped (not main thread)')
+
+        # Print banner (after signal handlers are ready).
+        self._print_serve_banner(names, addr)
 
         if not blocking:
             return
