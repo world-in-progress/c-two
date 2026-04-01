@@ -23,10 +23,33 @@ Reply Control::
 Frame identification (per frame header flags):
 - ``FLAG_CALL`` (bit 7): request frame carries call control.
 - ``FLAG_REPLY`` (bit 8): response frame carries reply control.
+
+.. note::
+
+   As of Phase 1, primitive codecs delegate to Rust (``c2-wire`` via
+   ``c_two._native``).  Composite frame builders remain in Python and
+   call the Rust primitives.
 """
 from __future__ import annotations
 
 import struct
+
+from c_two._native import (  # noqa: F401 — re-export
+    encode_call_control,
+    encode_chunk_header,
+    CHUNK_HEADER_SIZE,
+)
+
+# Rust FFI primitives — imported with underscore prefix; public wrappers below
+# preserve Python defaults (offset=0, error_data=None, is_dedicated=False).
+from c_two._native import (
+    decode_call_control as _ffi_decode_call_control,
+    encode_reply_control as _ffi_encode_reply_control,
+    decode_reply_control as _ffi_decode_reply_control,
+    encode_buddy_payload as _ffi_encode_buddy_payload,
+    decode_buddy_payload as _ffi_decode_buddy_payload,
+    decode_chunk_header as _ffi_decode_chunk_header,
+)
 
 from .ipc.frame import (
     FRAME_STRUCT,
@@ -36,7 +59,6 @@ from .ipc.frame import (
 from .ipc.shm_frame import (
     FLAG_BUDDY,
     BUDDY_PAYLOAD_STRUCT,
-    encode_buddy_payload,
 )
 from .protocol import (
     FLAG_CALL,
@@ -58,6 +80,44 @@ _U32 = struct.Struct('<I')
 U16_LE = _U16
 
 
+def decode_call_control(
+    data: bytes | memoryview, offset: int = 0,
+) -> tuple[str, int, int]:
+    """Decode call control → ``(route_name, method_idx, bytes_consumed)``."""
+    return _ffi_decode_call_control(bytes(data), offset)
+
+
+def encode_reply_control(status: int, error_data: bytes | None = None) -> bytes:
+    """Encode reply control payload."""
+    return _ffi_encode_reply_control(status, error_data)
+
+
+def decode_reply_control(
+    data: bytes | memoryview, offset: int = 0,
+) -> tuple[int, bytes | None, int]:
+    """Decode reply control → ``(status, error_data_or_none, bytes_consumed)``."""
+    return _ffi_decode_reply_control(bytes(data), offset)
+
+
+def encode_buddy_payload(
+    seg_idx: int, offset: int, data_size: int, is_dedicated: bool = False,
+) -> bytes:
+    """Encode a FLAG_BUDDY payload header (11 bytes)."""
+    return _ffi_encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
+
+
+def decode_buddy_payload(payload: bytes | memoryview) -> tuple[int, int, int, bool]:
+    """Decode a FLAG_BUDDY payload header → ``(seg_idx, offset, data_size, is_dedicated)``."""
+    return _ffi_decode_buddy_payload(bytes(payload))
+
+
+def decode_chunk_header(
+    data: bytes | memoryview, offset: int = 0,
+) -> tuple[int, int, int]:
+    """Decode chunk header → ``(chunk_idx, total_chunks, bytes_consumed)``."""
+    return _ffi_decode_chunk_header(bytes(data), offset)
+
+
 def payload_total_size(payload) -> int:
     """Return total byte length of *payload*.
 
@@ -71,119 +131,13 @@ def payload_total_size(payload) -> int:
     return len(payload)
 
 # ---------------------------------------------------------------------------
-# Call Control
+# Call Control — pre-computed cache for default-route hot path
 # ---------------------------------------------------------------------------
 
-
-# Pre-computed default-route (name='') call control payloads for method indices
-# 0–255.  Eliminates bytearray allocation + pack + bytes() on the hot path.
 _DEFAULT_ROUTE_CACHE: list[bytes] = []
 for _i in range(256):
-    _b = bytearray(3)
-    _b[0] = 0
-    _U16.pack_into(_b, 1, _i)
-    _DEFAULT_ROUTE_CACHE.append(bytes(_b))
-del _i, _b
-
-
-def encode_call_control(name: str, method_idx: int) -> bytes:
-    """Encode call control payload.
-
-    Format: ``[1B name_len][route_name UTF-8][2B method_idx LE]``
-    """
-    if name:
-        name_b = name.encode('utf-8')
-        buf = bytearray(1 + len(name_b) + 2)
-        buf[0] = len(name_b)
-        buf[1:1 + len(name_b)] = name_b
-        _U16.pack_into(buf, 1 + len(name_b), method_idx)
-        return bytes(buf)
-    if method_idx < 256:
-        return _DEFAULT_ROUTE_CACHE[method_idx]
-    buf = bytearray(3)
-    buf[0] = 0
-    _U16.pack_into(buf, 1, method_idx)
-    return bytes(buf)
-
-
-def decode_call_control(
-    data: bytes | memoryview, offset: int = 0,
-) -> tuple[str, int, int]:
-    """Decode call control payload.
-
-    Returns ``(route_name, method_idx, bytes_consumed)``.
-
-    Raises ``ValueError`` if the buffer is too short.
-    """
-    dlen = len(data)
-    if offset >= dlen:
-        raise ValueError('call control: offset beyond buffer')
-    name_len = data[offset]
-    # Minimum remaining: 1B name_len + name_len + 2B method_idx
-    if offset + 1 + name_len + 2 > dlen:
-        raise ValueError(
-            f'call control: buffer too short for name_len={name_len} '
-            f'(need {1 + name_len + 2}, have {dlen - offset})'
-        )
-    off = offset + 1
-    if name_len > 0:
-        name = bytes(data[off:off + name_len]).decode('utf-8')
-        off += name_len
-    else:
-        name = ''
-    method_idx = _U16.unpack_from(data, off)[0]
-    off += 2
-    return name, method_idx, off - offset
-
-
-# ---------------------------------------------------------------------------
-# Reply Control
-# ---------------------------------------------------------------------------
-
-
-def encode_reply_control(status: int, error_data: bytes | None = None) -> bytes:
-    """Encode reply control payload.
-
-    Format::
-
-        [1B status]
-        if STATUS_ERROR: [4B error_len LE][error_bytes]
-    """
-    if status == STATUS_ERROR and error_data:
-        buf = bytearray(1 + 4 + len(error_data))
-        buf[0] = STATUS_ERROR
-        _U32.pack_into(buf, 1, len(error_data))
-        buf[5:] = error_data
-        return bytes(buf)
-    return bytes([status])
-
-
-def decode_reply_control(
-    data: bytes | memoryview, offset: int = 0,
-) -> tuple[int, bytes | None, int]:
-    """Decode reply control payload.
-
-    Returns ``(status, error_data_or_none, bytes_consumed)``.
-
-    Raises ``ValueError`` if the buffer is too short.
-    """
-    dlen = len(data)
-    if offset >= dlen:
-        raise ValueError('reply control: offset beyond buffer')
-    status = data[offset]
-    off = offset + 1
-    if status == STATUS_ERROR:
-        if off + 4 > dlen:
-            raise ValueError('reply control: buffer too short for error length')
-        err_len = _U32.unpack_from(data, off)[0]; off += 4
-        if off + err_len > dlen:
-            raise ValueError(
-                f'reply control: error data claims {err_len} bytes '
-                f'but only {dlen - off} available'
-            )
-        error_data = bytes(data[off:off + err_len]); off += err_len
-        return status, error_data, off - offset
-    return status, None, off - offset
+    _DEFAULT_ROUTE_CACHE.append(encode_call_control('', _i))
+del _i
 
 
 # ---------------------------------------------------------------------------
@@ -293,32 +247,11 @@ def encode_error_reply_frame(
 
 
 # ---------------------------------------------------------------------------
-# Chunk Header Codec
+# Chunk Header — imported from Rust FFI (re-exported at module top)
 # ---------------------------------------------------------------------------
 
-_CHUNK_HDR = struct.Struct('<HH')  # 4 bytes: chunk_idx(u16) + total_chunks(u16)
-CHUNK_HEADER_SIZE = _CHUNK_HDR.size
-
-
-def encode_chunk_header(chunk_idx: int, total_chunks: int) -> bytes:
-    """Encode chunk header: ``[2B chunk_idx LE][2B total_chunks LE]``."""
-    return _CHUNK_HDR.pack(chunk_idx, total_chunks)
-
-
-def decode_chunk_header(
-    data: bytes | memoryview, offset: int = 0,
-) -> tuple[int, int, int]:
-    """Decode chunk header.
-
-    Returns ``(chunk_idx, total_chunks, bytes_consumed)``.
-    """
-    if offset + CHUNK_HEADER_SIZE > len(data):
-        raise ValueError(
-            f'chunk header: need {CHUNK_HEADER_SIZE} bytes at offset {offset}, '
-            f'have {len(data) - offset}'
-        )
-    chunk_idx, total_chunks = _CHUNK_HDR.unpack_from(data, offset)
-    return chunk_idx, total_chunks, CHUNK_HEADER_SIZE
+# encode_chunk_header, decode_chunk_header, CHUNK_HEADER_SIZE are imported
+# from c_two._native at the top of this module.
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +282,7 @@ def encode_buddy_chunked_call_frame(
     ``name`` and ``method_idx`` are ignored when ``chunk_idx > 0``.
     """
     buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
-    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    chunk_hdr = encode_chunk_header(chunk_idx, total_chunks)
     flags = FLAG_BUDDY | FLAG_CALL | FLAG_CHUNKED
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST
@@ -380,7 +313,7 @@ def encode_inline_chunked_call_frame(
 
     ``name`` and ``method_idx`` are ignored when ``chunk_idx > 0``.
     """
-    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    chunk_hdr = encode_chunk_header(chunk_idx, total_chunks)
     flags = FLAG_CALL | FLAG_CHUNKED
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST
@@ -420,7 +353,7 @@ def encode_buddy_chunked_reply_frame(
         [1B status]          ← only when chunk_idx==0 (always STATUS_SUCCESS)
     """
     buddy = encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
-    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    chunk_hdr = encode_chunk_header(chunk_idx, total_chunks)
     flags = _BUDDY_CHUNKED_REPLY_BASE_FLAGS
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST
@@ -446,7 +379,7 @@ def encode_inline_chunked_reply_frame(
         [1B status]          ← only when chunk_idx==0 (always STATUS_SUCCESS)
         [inline_data]
     """
-    chunk_hdr = _CHUNK_HDR.pack(chunk_idx, total_chunks)
+    chunk_hdr = encode_chunk_header(chunk_idx, total_chunks)
     flags = _INLINE_CHUNKED_REPLY_BASE_FLAGS
     if chunk_idx == total_chunks - 1:
         flags |= FLAG_CHUNK_LAST

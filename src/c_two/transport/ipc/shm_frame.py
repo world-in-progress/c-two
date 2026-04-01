@@ -9,11 +9,24 @@ Frame format is compatible with the base protocol (same 16-byte header) but uses
 FLAG_BUDDY flag and extended pool payload format.
 """
 
-import os
 import struct
 from dataclasses import dataclass, field
 from typing import Optional
 
+from c_two._native import (
+    encode_ctrl_buddy_announce,
+    decode_ctrl_buddy_announce,
+)
+
+# Buddy payload encode: wrap Rust FFI to preserve is_dedicated default
+from c_two._native import encode_buddy_payload as _ffi_encode_buddy_payload
+
+
+def encode_buddy_payload(
+    seg_idx: int, offset: int, data_size: int, is_dedicated: bool = False,
+) -> bytes:
+    """Encode a FLAG_BUDDY payload header (11 bytes)."""
+    return _ffi_encode_buddy_payload(seg_idx, offset, data_size, is_dedicated)
 from .frame import (
     FRAME_STRUCT,
     FRAME_HEADER_SIZE,
@@ -53,26 +66,11 @@ BUDDY_REUSE_EXTRA_SIZE = BUDDY_REUSE_EXTRA.size  # 8 bytes
 # ---------------------------------------------------------------------------
 # Handshake v4 (buddy pool)
 # ---------------------------------------------------------------------------
-# Client → Server:
-#   [1B version=4][2B seg_count][per-segment: [4B size LE][name_len 1B][name UTF-8]]
-# Server → Client (ACK):
-#   [1B version=4][2B seg_count][per-segment: [4B size LE][name_len 1B][name UTF-8]]
 HANDSHAKE_VERSION = 4
 
 # Control messages (extend v2)
 CTRL_BUDDY_ANNOUNCE = 0x03   # Announce a buddy segment to peer
 CTRL_BUDDY_FREE = 0x04       # Notify peer of a freed buddy block (for concurrent tracking)
-
-
-def encode_buddy_payload(
-    seg_idx: int,
-    offset: int,
-    data_size: int,
-    is_dedicated: bool = False,
-) -> bytes:
-    """Encode a FLAG_BUDDY payload header (11 bytes)."""
-    flags = 1 if is_dedicated else 0
-    return BUDDY_PAYLOAD_STRUCT.pack(seg_idx, offset, data_size, flags)
 
 
 def decode_buddy_payload(payload: bytes | memoryview) -> tuple[int, int, int, bool, int, int]:
@@ -188,28 +186,7 @@ def decode_buddy_handshake(payload: bytes | memoryview) -> list[tuple[str, int]]
 
 
 # ---------------------------------------------------------------------------
-# Buddy control messages
+# Buddy control messages — imported from Rust FFI
 # ---------------------------------------------------------------------------
-
-def encode_ctrl_buddy_announce(seg_idx: int, size: int, name: str) -> bytes:
-    """Encode a CTRL_BUDDY_ANNOUNCE message for a new buddy segment.
-
-    Format: [1B ctrl=0x03][2B seg_idx LE][4B size LE][name UTF-8]
-    """
-    name_bytes = name.encode('utf-8')
-    buf = bytearray(7 + len(name_bytes))
-    struct.pack_into('<BHI', buf, 0, CTRL_BUDDY_ANNOUNCE, seg_idx, size)
-    buf[7:] = name_bytes
-    return bytes(buf)
-
-
-def decode_ctrl_buddy_announce(payload: bytes | memoryview) -> tuple[int, int, str]:
-    """Decode a CTRL_BUDDY_ANNOUNCE message.
-
-    Returns (seg_idx, segment_size, shm_name).
-    """
-    if len(payload) < 7:
-        raise ValueError(f'CTRL_BUDDY_ANNOUNCE too short: {len(payload)}')
-    _, seg_idx, size = struct.unpack_from('<BHI', payload, 0)
-    name = bytes(payload[7:]).decode('utf-8')
-    return seg_idx, size, name
+# encode_ctrl_buddy_announce, decode_ctrl_buddy_announce are imported at
+# module top from c_two._native.  Re-exported for backward compatibility.
