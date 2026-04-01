@@ -5,7 +5,6 @@ Provides the complete transport stack for C-Two:
 - SharedClient: concurrent multiplexed IPC client
 - ClientPool: reference-counted client lifecycle
 - ICRMProxy: unified proxy (thread-local / IPC / HTTP)
-- Relay: HTTP → IPC bridge (Starlette + uvicorn)
 - Registry: cc.register/connect/close/shutdown SOTA API
 """
 from __future__ import annotations
@@ -15,7 +14,6 @@ __all__ = [
     'HttpClient', 'HttpClientPool',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
-    'Relay', 'UpstreamPool',
     'set_address', 'set_ipc_config', 'register', 'connect', 'close',
     'unregister', 'server_address', 'shutdown', 'serve',
 ]
@@ -31,8 +29,6 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'Scheduler':         ('.server.scheduler',    'Scheduler'),
     'ConcurrencyConfig': ('.server.scheduler',    'ConcurrencyConfig'),
     'ConcurrencyMode':   ('.server.scheduler',    'ConcurrencyMode'),
-    'Relay':           ('.relay.core',          'Relay'),
-    'UpstreamPool':      ('.relay.core',          'UpstreamPool'),
     'set_address':       ('.registry',            'set_address'),
     'set_ipc_config':    ('.registry',            'set_ipc_config'),
     'register':          ('.registry',            'register'),

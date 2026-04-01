@@ -1,6 +1,6 @@
 """Integration tests for the HTTP relay chain.
 
-Tests the full pipeline:  HttpClient → Relay → SharedClient → Server → CRM
+Tests the full pipeline:  HttpClient → NativeRelay → SharedClient → Server → CRM
 
 Also tests ``cc.connect(address='http://...')`` end-to-end.
 """
@@ -15,10 +15,10 @@ import pytest
 import httpx
 
 import c_two as cc
+from c_two._native import NativeRelay
 from c_two.transport.client.http import HttpClient
 from c_two.transport.client.proxy import ICRMProxy
 from c_two.transport.registry import _ProcessRegistry
-from c_two.transport.relay.core import Relay
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -63,11 +63,11 @@ def _clean_registry():
 
 @pytest.fixture
 def relay_stack():
-    """Start Server + Relay and return (relay_url, ipc_address).
+    """Start Server + NativeRelay and return (relay_url, ipc_address).
 
     Registers a Hello CRM as 'hello' and optionally a Counter CRM as
     'counter'.  The relay starts empty; upstreams are added
-    programmatically via ``upstream_pool.add()``.
+    programmatically via ``register_upstream()``.
     """
     ipc_addr = f'ipc://relay_test_{os.getpid()}_{_next_id()}'
     http_port = 19000 + _next_id()
@@ -78,15 +78,16 @@ def relay_stack():
     cc.register(ICounter, Counter(), name='counter')
 
     # Start relay (empty — no upstream param).
-    relay = Relay(bind=f'0.0.0.0:{http_port}')
-    relay.start(blocking=False)
-    _wait_for_relay(relay.url)
+    relay = NativeRelay(f'0.0.0.0:{http_port}')
+    relay.start()
+    relay_url = f'http://127.0.0.1:{http_port}'
+    _wait_for_relay(relay_url)
 
     # Register upstreams programmatically.
-    relay.upstream_pool.add('hello', ipc_addr)
-    relay.upstream_pool.add('counter', ipc_addr)
+    relay.register_upstream('hello', ipc_addr)
+    relay.register_upstream('counter', ipc_addr)
 
-    yield relay.url, ipc_addr
+    yield relay_url, ipc_addr
 
     relay.stop()
 
@@ -274,29 +275,30 @@ class TestRelayControlPlane:
         cc.set_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
-        relay = Relay(bind=f'0.0.0.0:{http_port}')
-        relay.start(blocking=False)
-        _wait_for_relay(relay.url)
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        _wait_for_relay(relay_url)
 
         try:
             transport = httpx.HTTPTransport()
             with httpx.Client(transport=transport) as http:
                 # Register via control endpoint.
                 resp = http.post(
-                    f'{relay.url}/_register',
+                    f'{relay_url}/_register',
                     json={'name': 'hello', 'address': ipc_addr},
                 )
                 assert resp.status_code == 201
                 assert resp.json()['registered'] == 'hello'
 
                 # Verify route appears in /_routes.
-                resp = http.get(f'{relay.url}/_routes')
+                resp = http.get(f'{relay_url}/_routes')
                 assert resp.status_code == 200
                 routes = resp.json()['routes']
                 assert any(r['name'] == 'hello' for r in routes)
 
             # Verify data-plane call works.
-            client = HttpClient(relay.url)
+            client = HttpClient(relay_url)
             try:
                 icrm = IHello()
                 icrm.client = ICRMProxy.http(client, 'hello')
@@ -314,22 +316,23 @@ class TestRelayControlPlane:
         cc.set_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
-        relay = Relay(bind=f'0.0.0.0:{http_port}')
-        relay.start(blocking=False)
-        _wait_for_relay(relay.url)
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        _wait_for_relay(relay_url)
 
         try:
             transport = httpx.HTTPTransport()
             with httpx.Client(transport=transport) as http:
                 resp = http.post(
-                    f'{relay.url}/_register',
+                    f'{relay_url}/_register',
                     json={'name': 'hello', 'address': ipc_addr},
                 )
                 assert resp.status_code == 201
 
                 # Duplicate registration.
                 resp = http.post(
-                    f'{relay.url}/_register',
+                    f'{relay_url}/_register',
                     json={'name': 'hello', 'address': ipc_addr},
                 )
                 assert resp.status_code == 409
@@ -344,32 +347,33 @@ class TestRelayControlPlane:
         cc.set_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
-        relay = Relay(bind=f'0.0.0.0:{http_port}')
-        relay.start(blocking=False)
-        _wait_for_relay(relay.url)
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        _wait_for_relay(relay_url)
 
         try:
             transport = httpx.HTTPTransport()
             with httpx.Client(transport=transport) as http:
                 # Register, then unregister.
                 http.post(
-                    f'{relay.url}/_register',
+                    f'{relay_url}/_register',
                     json={'name': 'hello', 'address': ipc_addr},
                 )
                 resp = http.post(
-                    f'{relay.url}/_unregister',
+                    f'{relay_url}/_unregister',
                     json={'name': 'hello'},
                 )
                 assert resp.status_code == 200
 
                 # Verify route is gone.
-                resp = http.get(f'{relay.url}/_routes')
+                resp = http.get(f'{relay_url}/_routes')
                 routes = resp.json()['routes']
                 assert not any(r['name'] == 'hello' for r in routes)
 
                 # Data-plane call should return 404.
                 resp = http.post(
-                    f'{relay.url}/hello/greeting',
+                    f'{relay_url}/hello/greeting',
                     content=b'test',
                 )
                 assert resp.status_code == 404
@@ -380,15 +384,16 @@ class TestRelayControlPlane:
         """POST /_unregister for unknown name returns 404."""
         http_port = 19000 + _next_id()
 
-        relay = Relay(bind=f'0.0.0.0:{http_port}')
-        relay.start(blocking=False)
-        _wait_for_relay(relay.url)
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        _wait_for_relay(relay_url)
 
         try:
             transport = httpx.HTTPTransport()
             with httpx.Client(transport=transport) as http:
                 resp = http.post(
-                    f'{relay.url}/_unregister',
+                    f'{relay_url}/_unregister',
                     json={'name': 'nonexistent'},
                 )
                 assert resp.status_code == 404
@@ -404,17 +409,18 @@ class TestRelayControlPlane:
         cc.register(IHello, Hello(), name='hello')
         cc.register(ICounter, Counter(), name='counter')
 
-        relay = Relay(bind=f'0.0.0.0:{http_port}')
-        relay.start(blocking=False)
-        _wait_for_relay(relay.url)
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        _wait_for_relay(relay_url)
 
         try:
-            relay.upstream_pool.add('hello', ipc_addr)
-            relay.upstream_pool.add('counter', ipc_addr)
+            relay.register_upstream('hello', ipc_addr)
+            relay.register_upstream('counter', ipc_addr)
 
             transport = httpx.HTTPTransport()
             with httpx.Client(transport=transport) as http:
-                resp = http.get(f'{relay.url}/health')
+                resp = http.get(f'{relay_url}/health')
                 health = resp.json()
                 assert health['status'] == 'ok'
                 assert set(health['routes']) == {'hello', 'counter'}
@@ -425,15 +431,16 @@ class TestRelayControlPlane:
         """POST /{route}/{method} for unregistered route returns 404."""
         http_port = 19000 + _next_id()
 
-        relay = Relay(bind=f'0.0.0.0:{http_port}')
-        relay.start(blocking=False)
-        _wait_for_relay(relay.url)
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        _wait_for_relay(relay_url)
 
         try:
             transport = httpx.HTTPTransport()
             with httpx.Client(transport=transport) as http:
                 resp = http.post(
-                    f'{relay.url}/nonexistent/method',
+                    f'{relay_url}/nonexistent/method',
                     content=b'data',
                 )
                 assert resp.status_code == 404
