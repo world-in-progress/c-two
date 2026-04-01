@@ -4,11 +4,40 @@
 //! `c_two.transport.server.connection` — tracks handshake status,
 //! SHM segments, activity timestamps, and in-flight request counting.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use tokio::sync::Notify;
+use tracing::warn;
+
+use c2_mem::config::PoolConfig;
+use c2_mem::MemPool;
+use c2_wire::assembler::ChunkAssembler;
+
+// ---------------------------------------------------------------------------
+// Peer SHM state (set once during handshake, read concurrently)
+// ---------------------------------------------------------------------------
+
+struct PeerShmState {
+    prefix: String,
+    segment_names: Vec<String>,
+    segment_sizes: Vec<u32>,
+    /// MemPool opened over the client's SHM segments for data access + free.
+    pool: Option<MemPool>,
+}
+
+impl PeerShmState {
+    fn new() -> Self {
+        Self {
+            prefix: String::new(),
+            segment_names: Vec::new(),
+            segment_sizes: Vec::new(),
+            pool: None,
+        }
+    }
+}
 
 /// Per-client connection state.
 pub struct Connection {
@@ -16,14 +45,8 @@ pub struct Connection {
     handshake_done: AtomicBool,
     chunked_capable: AtomicBool,
 
-    /// Client's SHM pool prefix (for lazy segment naming).
-    pub peer_prefix: String,
-
-    /// Opened SHM segment names received from the client.
-    pub remote_segment_names: Vec<String>,
-
-    /// Sizes (bytes) of the client-side SHM segments.
-    pub remote_segment_sizes: Vec<u64>,
+    /// Client's SHM pool state — prefix, segment names/sizes, opened MemPool.
+    peer_shm: Mutex<PeerShmState>,
 
     /// Monotonic timestamp of the last frame received/sent.
     last_activity: Mutex<Instant>,
@@ -33,6 +56,9 @@ pub struct Connection {
 
     /// Notified whenever `inflight` drops to zero.
     idle_notify: Notify,
+
+    /// In-progress chunked reassembly state, keyed by request_id.
+    assemblers: Mutex<HashMap<u64, ChunkAssembler>>,
 }
 
 impl Connection {
@@ -45,12 +71,11 @@ impl Connection {
             conn_id,
             handshake_done: AtomicBool::new(false),
             chunked_capable: AtomicBool::new(false),
-            peer_prefix: String::new(),
-            remote_segment_names: Vec::new(),
-            remote_segment_sizes: Vec::new(),
+            peer_shm: Mutex::new(PeerShmState::new()),
             last_activity: Mutex::new(Instant::now()),
             inflight: AtomicI32::new(0),
             idle_notify: Notify::new(),
+            assemblers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,6 +97,130 @@ impl Connection {
 
     pub fn set_chunked_capable(&self, v: bool) {
         self.chunked_capable.store(v, Ordering::Relaxed);
+    }
+
+    // -- peer SHM accessors -------------------------------------------------
+
+    /// Return the peer's SHM pool prefix (empty if handshake not done).
+    pub fn peer_prefix(&self) -> String {
+        self.peer_shm.lock().unwrap().prefix.clone()
+    }
+
+    /// Return cloned list of remote segment names.
+    pub fn remote_segment_names(&self) -> Vec<String> {
+        self.peer_shm.lock().unwrap().segment_names.clone()
+    }
+
+    /// Return cloned list of remote segment sizes.
+    pub fn remote_segment_sizes(&self) -> Vec<u32> {
+        self.peer_shm.lock().unwrap().segment_sizes.clone()
+    }
+
+    /// Initialise peer SHM state from handshake data.
+    ///
+    /// Creates a `MemPool` and eagerly opens all client segments so that
+    /// subsequent `read_peer_data` / `free_peer_block` calls can succeed
+    /// without additional SHM operations on the hot path.
+    pub fn init_peer_shm(&self, prefix: String, segments: Vec<(String, u32)>) {
+        let mut state = self.peer_shm.lock().unwrap();
+        state.prefix = prefix;
+        state.segment_names = segments.iter().map(|(n, _)| n.clone()).collect();
+        state.segment_sizes = segments.iter().map(|(_, s)| *s).collect();
+
+        if segments.is_empty() {
+            return;
+        }
+
+        let cfg = PoolConfig {
+            segment_size: 256 * 1024 * 1024,
+            min_block_size: 4096,
+            max_segments: 16,
+            max_dedicated_segments: 4,
+            dedicated_gc_delay_secs: 0.0,
+            spill_threshold: 1.0,
+            spill_dir: std::path::PathBuf::from("/tmp/c_two_spill_srv"),
+        };
+        let peer_prefix = state.prefix.clone();
+        let mut pool = MemPool::new_with_prefix(cfg, peer_prefix);
+
+        for (name, size) in &segments {
+            if let Err(e) = pool.open_segment(name, *size as usize) {
+                warn!(
+                    conn_id = self.conn_id,
+                    segment = name.as_str(),
+                    "failed to open peer segment: {e}"
+                );
+            }
+        }
+        state.pool = Some(pool);
+    }
+
+    /// Read `data_size` bytes from the peer's SHM at `(seg_idx, offset)`.
+    ///
+    /// Returns a copied `Vec<u8>` so the SHM lock is released immediately.
+    pub fn read_peer_data(
+        &self,
+        seg_idx: u16,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<Vec<u8>, String> {
+        let state = self.peer_shm.lock().unwrap();
+        let pool = state.pool.as_ref().ok_or("peer pool not initialised")?;
+        let ptr = pool.data_ptr_at(seg_idx as u32, offset, is_dedicated)?;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) };
+        Ok(slice.to_vec())
+    }
+
+    /// Free a buddy block in the peer's SHM pool.
+    pub fn free_peer_block(
+        &self,
+        seg_idx: u16,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) {
+        let mut state = self.peer_shm.lock().unwrap();
+        if let Some(pool) = state.pool.as_mut() {
+            if let Err(e) = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
+                warn!(
+                    conn_id = self.conn_id,
+                    seg_idx,
+                    offset,
+                    "peer free_at failed: {e}"
+                );
+            }
+        }
+    }
+
+    // -- chunk assembler management -----------------------------------------
+
+    /// Insert a new chunk assembler for the given `request_id`.
+    pub fn insert_assembler(&self, request_id: u64, asm: ChunkAssembler) {
+        self.assemblers.lock().unwrap().insert(request_id, asm);
+    }
+
+    /// Feed a chunk into the assembler for `request_id`.
+    ///
+    /// Returns `Ok(true)` when all chunks are received, `Ok(false)` otherwise.
+    /// Returns `Err` if no assembler exists for this request or on data error.
+    pub fn feed_chunk(
+        &self,
+        request_id: u64,
+        pool: &MemPool,
+        chunk_idx: usize,
+        data: &[u8],
+    ) -> Result<bool, String> {
+        let mut map = self.assemblers.lock().unwrap();
+        let asm = map
+            .get_mut(&request_id)
+            .ok_or_else(|| format!("no assembler for request {request_id}"))?;
+        asm.feed_chunk(pool, chunk_idx, data)
+    }
+
+    /// Remove and return the completed assembler for `request_id`.
+    pub fn take_assembler(&self, request_id: u64) -> Option<ChunkAssembler> {
+        self.assemblers.lock().unwrap().remove(&request_id)
     }
 
     /// Record activity — updates the last-activity timestamp to *now*.
@@ -142,10 +291,30 @@ mod tests {
         assert_eq!(conn.conn_id(), 42);
         assert!(!conn.handshake_done());
         assert!(!conn.chunked_capable());
-        assert!(conn.peer_prefix.is_empty());
-        assert!(conn.remote_segment_names.is_empty());
-        assert!(conn.remote_segment_sizes.is_empty());
+        assert!(conn.peer_prefix().is_empty());
+        assert!(conn.remote_segment_names().is_empty());
+        assert!(conn.remote_segment_sizes().is_empty());
         assert_eq!(conn.inflight_count(), 0);
+    }
+
+    #[test]
+    fn init_peer_shm_stores_state() {
+        let conn = Connection::new(1);
+        conn.init_peer_shm(
+            "/cc3b_test".into(),
+            vec![("seg0".into(), 4096), ("seg1".into(), 8192)],
+        );
+        assert_eq!(conn.peer_prefix(), "/cc3b_test");
+        assert_eq!(conn.remote_segment_names(), vec!["seg0", "seg1"]);
+        assert_eq!(conn.remote_segment_sizes(), vec![4096, 8192]);
+    }
+
+    #[test]
+    fn init_peer_shm_empty_segments() {
+        let conn = Connection::new(2);
+        conn.init_peer_shm("prefix".into(), vec![]);
+        assert_eq!(conn.peer_prefix(), "prefix");
+        assert!(conn.remote_segment_names().is_empty());
     }
 
     #[test]
