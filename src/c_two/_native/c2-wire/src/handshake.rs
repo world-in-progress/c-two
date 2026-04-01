@@ -39,6 +39,9 @@ pub const CAP_CALL_V2: u16 = 1 << 0;
 /// Supports method indexing (2-byte index vs UTF-8 name).
 pub const CAP_METHOD_IDX: u16 = 1 << 1;
 
+/// Supports chunked transfer for large payloads.
+pub const CAP_CHUNKED: u16 = 1 << 2;
+
 // ── Safety limits ────────────────────────────────────────────────────────
 
 const MAX_SEGMENTS: usize = 16;

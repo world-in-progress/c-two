@@ -195,60 +195,20 @@ class SegmentState(IntEnum):
 
 
 # ---------------------------------------------------------------------------
-# Control message codec
+# Control message codec — delegated to Rust FFI
 # ---------------------------------------------------------------------------
 # CTRL frame: [16B frame header (rid=0, flags=FLAG_CTRL)][1B ctrl_type][payload]
 
-CTRL_SEGMENT_ANNOUNCE = 0x01   # Announce a new pool segment to peer
-CTRL_CONSUMED = 0x02           # Signal that a segment has been consumed
-
-# Pool direction byte values
-POOL_DIR_OUTBOUND = 0   # Client → Server (request direction)
-POOL_DIR_RESPONSE = 1   # Server → Client (response direction)
-
-_CTRL_ANNOUNCE_HEADER = struct.Struct('<BBBI')  # ctrl_type(1) + direction(1) + index(1) + size(4)
-
-
-def encode_ctrl_segment_announce(direction: int, index: int, size: int, name: str) -> bytes:
-    """Encode a CTRL_SEGMENT_ANNOUNCE message.
-
-    Format: ``[1B ctrl=0x01][1B direction][1B index][4B size LE][name UTF-8]``
-    """
-    name_bytes = name.encode('utf-8')
-    buf = bytearray(7 + len(name_bytes))
-    _CTRL_ANNOUNCE_HEADER.pack_into(buf, 0, CTRL_SEGMENT_ANNOUNCE, direction, index, size)
-    buf[7:] = name_bytes
-    return bytes(buf)
-
-
-def decode_ctrl_segment_announce(payload: bytes | memoryview) -> tuple[int, int, int, str]:
-    """Decode a CTRL_SEGMENT_ANNOUNCE message.
-
-    Returns ``(direction, segment_index, segment_size, shm_name)``.
-    """
-    if len(payload) < 7:
-        raise ValueError(f'CTRL_SEGMENT_ANNOUNCE too short: {len(payload)}')
-    _, direction, index, size = _CTRL_ANNOUNCE_HEADER.unpack_from(payload, 0)
-    name = bytes(payload[7:]).decode('utf-8')
-    return direction, index, size, name
-
-
-def encode_ctrl_consumed(direction: int, index: int) -> bytes:
-    """Encode a CTRL_CONSUMED message.
-
-    Format: ``[1B ctrl=0x02][1B direction][1B index]``
-    """
-    return bytes((CTRL_CONSUMED, direction, index))
-
-
-def decode_ctrl_consumed(payload: bytes | memoryview) -> tuple[int, int]:
-    """Decode a CTRL_CONSUMED message.
-
-    Returns ``(direction, segment_index)``.
-    """
-    if len(payload) < 3:
-        raise ValueError(f'CTRL_CONSUMED too short: {len(payload)}')
-    return int(payload[1]), int(payload[2])
+from c_two._native import (  # noqa: E402,F811
+    CTRL_SEGMENT_ANNOUNCE,
+    CTRL_CONSUMED,
+    POOL_DIR_OUTBOUND,
+    POOL_DIR_RESPONSE,
+    encode_ctrl_segment_announce,
+    decode_ctrl_segment_announce,
+    encode_ctrl_consumed,
+    decode_ctrl_consumed,
+)
 
 
 # ---------------------------------------------------------------------------

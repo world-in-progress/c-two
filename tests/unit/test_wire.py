@@ -105,8 +105,8 @@ class TestReplyControl:
 
     def test_error_empty_data(self):
         encoded = encode_reply_control(STATUS_ERROR, b'')
-        # STATUS_ERROR with empty error_data → just status byte
-        assert encoded == bytes([STATUS_ERROR])
+        # Rust FFI always encodes error format: [status][4B error_len=0]
+        assert encoded == bytes([STATUS_ERROR, 0, 0, 0, 0])
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +273,7 @@ class TestHandshake:
 
     def test_bad_version_raises(self):
         bad = bytes([4, 0, 0])  # version=4, not expected
-        with pytest.raises(ValueError, match='Expected handshake'):
+        with pytest.raises(ValueError, match='version'):
             decode_handshake(bad)
 
     def test_truncated_raises(self):
@@ -346,7 +346,7 @@ class TestChunkHeader:
         assert consumed == CHUNK_HEADER_SIZE
 
     def test_decode_truncated_raises(self):
-        with pytest.raises(ValueError, match='chunk header'):
+        with pytest.raises(ValueError, match='too short|need.*bytes'):
             decode_chunk_header(b'\x00\x01', offset=0)  # only 2 of 4 bytes
 
     def test_memoryview(self):
