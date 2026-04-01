@@ -286,6 +286,19 @@ impl MemPool {
         }
     }
 
+    /// Ensure at least one buddy segment exists.
+    ///
+    /// Called before handshake so the client can announce its SHM segments
+    /// to the server.  Does nothing if segments already exist.
+    pub fn ensure_ready(&mut self) -> Result<(), String> {
+        if self.segments.is_empty() && self.config.max_segments > 0 {
+            let seg = self.create_segment()?;
+            self.segments.push(seg);
+            self.idle_since.push(None);
+        }
+        Ok(())
+    }
+
     /// Get the number of buddy segments.
     pub fn segment_count(&self) -> usize {
         self.segments.len()

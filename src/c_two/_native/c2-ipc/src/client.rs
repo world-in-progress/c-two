@@ -217,6 +217,13 @@ impl IpcClient {
         let stream = UnixStream::connect(&self.socket_path).await?;
         let (reader, mut writer) = tokio::io::split(stream);
 
+        // Pre-allocate first SHM segment so handshake announces it.
+        if let Some(ref pool_arc) = self.pool {
+            let mut pool = pool_arc.lock().unwrap();
+            pool.ensure_ready()
+                .map_err(|e| IpcError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        }
+
         // Perform handshake.
         let hs = self.do_handshake(&mut writer, reader).await?;
 
