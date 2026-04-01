@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex};
 
 use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
 use c2_wire::chunk::encode_chunk_header;
@@ -23,8 +23,6 @@ use c2_wire::handshake::{
 };
 
 use c2_mem::MemPool;
-
-use crate::shm::SegmentCache;
 
 // ── Config ───────────────────────────────────────────────────────────────
 
@@ -43,6 +41,71 @@ impl Default for IpcConfig {
             shm_threshold: 4096,
             chunk_size: 131072,
         }
+    }
+}
+
+// ── Server pool state ────────────────────────────────────────────────────
+
+/// State for reading server's SHM response data.
+/// Mirrors `PeerShmState` in c2-server/connection.rs.
+struct ServerPoolState {
+    prefix: String,
+    buddy_segment_size: usize,
+    pool: MemPool,
+}
+
+impl ServerPoolState {
+    fn buddy_segment_name(prefix: &str, idx: usize) -> String {
+        format!("{}_{}{:04x}", prefix, "b", idx)
+    }
+
+    fn dedicated_segment_name(prefix: &str, idx: u32) -> String {
+        format!("{}_{}{:04x}", prefix, "d", idx)
+    }
+
+    /// Ensure the pool has the buddy segment at `seg_idx` open.
+    fn ensure_buddy_segment(&mut self, seg_idx: u16) -> Result<(), String> {
+        let idx = seg_idx as usize;
+        if idx < self.pool.segment_count() {
+            return Ok(());
+        }
+        for i in self.pool.segment_count()..=idx {
+            let name = Self::buddy_segment_name(&self.prefix, i);
+            self.pool.open_segment(&name, self.buddy_segment_size)?;
+        }
+        Ok(())
+    }
+
+    /// Ensure a dedicated segment is open at the specific index.
+    fn ensure_dedicated_segment(&mut self, seg_idx: u16, min_size: usize) -> Result<(), String> {
+        let name = Self::dedicated_segment_name(&self.prefix, seg_idx as u32);
+        self.pool.open_dedicated_at(seg_idx as u32, &name, min_size)
+    }
+
+    /// Read data from server SHM and free the allocation.
+    fn read_and_free(
+        &mut self,
+        seg_idx: u16,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<Vec<u8>, String> {
+        if is_dedicated {
+            self.ensure_dedicated_segment(seg_idx, data_size as usize)?;
+        } else {
+            self.ensure_buddy_segment(seg_idx)?;
+        }
+
+        let ptr = self.pool.data_ptr_at(seg_idx as u32, offset, is_dedicated)?;
+        let data = unsafe {
+            std::slice::from_raw_parts(ptr, data_size as usize)
+        }.to_vec();
+
+        if let Err(e) = self.pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
+            eprintln!("Warning: server SHM free_at failed: {e}");
+        }
+
+        Ok(data)
     }
 }
 
@@ -137,7 +200,8 @@ pub struct IpcClient {
     rid_counter: AtomicU32,
     route_tables: HashMap<String, MethodTable>,
     server_segments: Vec<(String, u32)>,
-    seg_cache: Arc<RwLock<SegmentCache>>,
+    /// Server SHM pool state for reading buddy reply responses.
+    server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Option<tokio::task::JoinHandle<()>>,
     connected: Arc<AtomicBool>,
     pool: Option<Arc<StdMutex<MemPool>>>,
@@ -175,7 +239,7 @@ impl IpcClient {
             rid_counter: AtomicU32::new(1),
             route_tables: HashMap::new(),
             server_segments: Vec::new(),
-            seg_cache: Arc::new(RwLock::new(SegmentCache::new())),
+            server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: None,
             connected: Arc::new(AtomicBool::new(false)),
             pool: None,
@@ -204,7 +268,7 @@ impl IpcClient {
             rid_counter: AtomicU32::new(1),
             route_tables: HashMap::new(),
             server_segments: Vec::new(),
-            seg_cache: Arc::new(RwLock::new(SegmentCache::new())),
+            server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: None,
             connected: Arc::new(AtomicBool::new(false)),
             pool: Some(pool),
@@ -234,21 +298,29 @@ impl IpcClient {
         }
         self.server_segments = hs.segments.clone();
 
-        // Open server SHM segments for reading response data.
-        {
-            let mut cache = self.seg_cache.write().await;
-            for (idx, (name, size)) in hs.segments.iter().enumerate() {
-                // Server segments need the leading '/' for POSIX shm_open
-                let shm_name = if name.starts_with('/') {
-                    name.clone()
-                } else {
-                    format!("/{name}")
-                };
-                if let Err(e) = cache.open(idx as u16, &shm_name, *size as usize) {
-                    // Non-fatal: we can still do inline-only calls.
-                    eprintln!("Warning: failed to open server SHM segment {idx} ({name}): {e}");
+        // Open server SHM segments into a ServerPoolState for buddy response reads.
+        if !hs.segments.is_empty() {
+            let buddy_seg_size = hs.segments[0].1 as usize;
+            let cfg = c2_mem::config::PoolConfig {
+                segment_size: buddy_seg_size,
+                min_block_size: 4096,
+                max_segments: 16,
+                max_dedicated_segments: 8,
+                dedicated_gc_delay_secs: 60.0,
+                spill_threshold: 1.0,
+                spill_dir: std::path::PathBuf::from("/tmp"),
+            };
+            let mut pool = MemPool::new_with_prefix(cfg, hs.prefix.clone());
+            for (name, size) in &hs.segments {
+                if let Err(e) = pool.open_segment(name, *size as usize) {
+                    eprintln!("Warning: failed to open server SHM segment ({name}): {e}");
                 }
             }
+            *self.server_pool.lock().unwrap() = Some(ServerPoolState {
+                prefix: hs.prefix.clone(),
+                buddy_segment_size: buddy_seg_size,
+                pool,
+            });
         }
 
         *self.writer.lock().await = Some(writer);
@@ -317,14 +389,14 @@ impl IpcClient {
 
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
-        let seg_cache = self.seg_cache.clone();
+        let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
         let connected = self.connected.clone();
         // Note: recv_handle is stored on self but we can't assign here
         // because &self is immutable. The caller (connect) handles this
         // via interior mutability or the recv task is detached.
         tokio::spawn(async move {
-            recv_loop(reader, pending, seg_cache, writer_clone).await;
+            recv_loop(reader, pending, server_pool, writer_clone).await;
             connected.store(false, Ordering::Release);
         });
 
@@ -674,7 +746,7 @@ const SIG_DISCONNECT_ACK: u8 = 0x09;
 async fn recv_loop(
     mut reader: tokio::io::ReadHalf<UnixStream>,
     pending: Arc<StdMutex<PendingMap>>,
-    seg_cache: Arc<RwLock<SegmentCache>>,
+    server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
@@ -733,7 +805,7 @@ async fn recv_loop(
         let rid = hdr.request_id as u32;
 
         // Decode response.
-        let result = decode_response(&hdr, &recv_buf, &seg_cache).await;
+        let result = decode_response(&hdr, &recv_buf, &server_pool);
 
         // Dispatch to pending caller.
         let tx = {
@@ -751,21 +823,19 @@ async fn recv_loop(
     }
 }
 
-async fn decode_response(
+fn decode_response(
     hdr: &FrameHeader,
     payload: &[u8],
-    seg_cache: &Arc<RwLock<SegmentCache>>,
+    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
 ) -> Result<Vec<u8>, IpcError> {
     let is_v2 = hdr.is_reply_v2();
     let is_buddy = hdr.is_buddy();
 
     if !is_v2 {
-        // V1 reply — not expected from a v2 server, but handle gracefully.
         return Ok(payload.to_vec());
     }
 
     if is_buddy {
-        // Buddy reply: [11B buddy_ptr][1B+ reply_control]
         if payload.len() < BUDDY_PAYLOAD_SIZE + 1 {
             return Err(IpcError::Decode(DecodeError::BufferTooShort {
                 need: BUDDY_PAYLOAD_SIZE + 1,
@@ -778,26 +848,20 @@ async fn decode_response(
 
         match ctrl {
             ReplyControl::Success => {
-                // Read data from SHM segment.
-                let cache = seg_cache.read().await;
-                match cache.read(bp.seg_idx, bp.offset as usize, bp.data_size as usize) {
-                    Some(data) => Ok(data),
-                    None => Err(IpcError::Handshake(format!(
-                        "SHM segment {} not mapped",
-                        bp.seg_idx,
-                    ))),
-                }
+                let mut guard = server_pool.lock().unwrap();
+                let state = guard.as_mut().ok_or_else(|| {
+                    IpcError::Handshake("server pool not initialised for buddy reply".into())
+                })?;
+
+                state.read_and_free(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated)
+                    .map_err(|e| IpcError::Handshake(format!("buddy read: {e}")))
             }
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
     } else {
-        // Inline reply: [1B+ reply_control][inline_data]
         let (ctrl, consumed) = decode_reply_control(payload, 0)?;
         match ctrl {
-            ReplyControl::Success => {
-                let data = payload[consumed..].to_vec();
-                Ok(data)
-            }
+            ReplyControl::Success => Ok(payload[consumed..].to_vec()),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
     }
