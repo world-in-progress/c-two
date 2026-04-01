@@ -105,6 +105,7 @@ class NativeServerBridge:
             chunked_threshold=chunked_threshold,
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_timeout=self._config.heartbeat_timeout,
+            shm_threshold=self._config.shm_threshold,
         )
 
         # Register initial CRM if provided (compat with old Server constructor).

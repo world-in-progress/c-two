@@ -101,6 +101,7 @@ impl PyServer {
         chunked_threshold = 67_108_864,
         heartbeat_interval = 10.0,
         heartbeat_timeout = 30.0,
+        shm_threshold = 4096,
     ))]
     fn new(
         address: &str,
@@ -111,6 +112,7 @@ impl PyServer {
         chunked_threshold: u64,
         heartbeat_interval: f64,
         heartbeat_timeout: f64,
+        shm_threshold: u64,
     ) -> PyResult<Self> {
         let config = IpcConfig {
             max_frame_size,
@@ -119,7 +121,7 @@ impl PyServer {
             pool_segment_size: segment_size,
             heartbeat_interval,
             heartbeat_timeout,
-            // Derive chunked threshold ratio from absolute value and max_payload_size
+            shm_threshold,
             chunk_threshold_ratio: if max_payload_size > 0 {
                 chunked_threshold as f64 / max_payload_size as f64
             } else {
