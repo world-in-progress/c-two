@@ -5,6 +5,7 @@ members = [
     "c2-wire",
     "c2-ipc",
     "c2-relay",
+    "c2-server",
     "c2-ffi",
 ]
 
