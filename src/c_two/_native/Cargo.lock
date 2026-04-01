@@ -161,6 +161,7 @@ dependencies = [
 name = "c2-ipc"
 version = "0.1.0"
 dependencies = [
+ "c2-mem",
  "c2-wire",
  "libc",
  "tokio",

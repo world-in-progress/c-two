@@ -18,6 +18,6 @@ pub mod shm;
 #[cfg(test)]
 mod tests;
 
-pub use client::{IpcClient, IpcError, MethodTable};
+pub use client::{IpcClient, IpcConfig, IpcError, MethodTable};
 pub use shm::{MappedSegment, SegmentCache, ShmError};
 
