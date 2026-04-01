@@ -1,9 +1,41 @@
 # 通信·协议·传输层 Rust 下沉设计
 
 **Date:** 2026-04-01
-**Status:** Draft
+**Status:** In Progress — Phase 3 Rust 侧完成，Python 清理待 Phase 4
 **Scope:** c2-wire (扩展), c2-server (新建), c2-ipc (扩展), c2-http (新建), c2-ffi (扩展), Python transport 层重构
 **Target:** v0.4.0
+**Branch:** `phase3/client-sink`
+**Last Audit:** 2026-04-01
+
+## Implementation Status Summary
+
+| Phase | Rust 侧 | Python 删除 | 状态 |
+|-------|---------|------------|------|
+| 0. Free-threading | ⚠️ 部分完成 | N/A | 4 个 pyclass 未 frozen (PoolConfig, PoolAlloc, PoolStats, MemPool) |
+| 1. Wire FFI | ✅ 完成 | ❌ 未执行 | wire_ffi.rs 24 函数 + 3 类; Python 文件保留原始实现 |
+| 2. Server 下沉 | ✅ 完成 | ❌ 未执行 | c2-server 7 文件 + server_ffi.rs; Python server/ 全部保留 |
+| 3. Client 统一 | ✅ 大部分完成 | ⚠️ 部分完成 | pool.py/http.py 已删; core.py 保留为薄 wrapper; RustAsyncClient 未实现 |
+| 4. 清理 | ⏳ 未开始 | ⏳ 未开始 | 依赖 Phase 1-3 的 Python 清理积压 |
+
+### 关键偏差
+
+1. **Python 删除全部延迟至 Phase 4** — Phase 1 §1.3 和 Phase 2 §2.6 的删除清单未执行，
+   Python 文件保留完整实现（非 shim）。Rust FFI 已就绪但未切换 import。
+2. **RustAsyncClient 未实现** (§3.4) — 仅有同步 RustClient。async 支持需 pyo3-async
+   或手动 coroutine wrapper，延迟至后续迭代。
+3. **httpx 依赖未移除** (§3.6) — registry.py 中 relay 注册/注销仍用 httpx JSON POST，
+   与 Rust HttpClient 的 binary RPC 调用不同，需额外迁移工作。
+4. **IpcConfig 位置偏差** — 位于 c2-server/config.rs 和 c2-ipc/client.rs（各自独立），
+   而非 spec 设计的 c2-wire/config.rs 统一位置。
+5. **client/core.py 保留为 85 行薄 wrapper** — spec §3.5 要求删除，实际保留以兼容
+   现有测试的 `SharedClient` import 和 dual calling convention。
+
+### 测试状态
+
+- Python: 606 tests passing (原 679 → 删除 73 个纯 Python client 单元测试，对应功能已有 Rust 测试覆盖)
+- Rust c2-ipc: 25 tests passing
+- Rust c2-server: 45 tests passing
+- c2-ffi: 编译通过 (cargo check)
 
 ## Overview
 
@@ -58,6 +90,8 @@ Python 层仅保留业务逻辑（CRM 方法执行、序列化、类型代理）
 
 ## Phase 1: 基础设施统一 — Wire FFI + MsgType + Config
 
+> **实现状态**: ✅ Rust 侧完成 | ❌ Python 删除未执行 (延迟至 Phase 4)
+
 **目标**: 消除 Python/Rust 双重编解码，建立 Rust 为 codec/config/signal 的唯一真相源。
 
 **风险**: 低。纯重构，不改变运行时行为。
@@ -65,6 +99,8 @@ Python 层仅保留业务逻辑（CRM 方法执行、序列化、类型代理）
 ### §1.1 c2-wire 扩展
 
 #### MsgType 枚举
+
+> **✅ 已实现**: `c2-wire/src/msg_type.rs`，8 个变体完全匹配 spec。
 
 ```rust
 // c2-wire/src/msg_type.rs (新建)
@@ -94,6 +130,10 @@ impl MsgType {
 ```
 
 #### IpcConfig 结构体
+
+> **⚠️ 偏差**: IpcConfig 实际位于 `c2-server/src/config.rs` (22 字段) 和 `c2-ipc/src/client.rs`
+> (2 字段: shm_threshold + chunk_size)，而非 spec 设计的 `c2-wire/src/config.rs`。
+> 两个 crate 各自维护独立的 IpcConfig，server 版本字段更丰富。
 
 ```rust
 // c2-wire/src/config.rs (新建)
@@ -127,6 +167,12 @@ impl Default for IpcConfig { ... }
 ```
 
 ### §1.2 c2-ffi 扩展: wire_ffi.rs
+
+> **✅ 已实现**: `c2-ffi/src/wire_ffi.rs` (494 行)，24 个函数 + 3 个 PyO3 类
+> (MethodEntry, RouteInfo, Handshake，全部 frozen)。
+> 实现合并了 `encode_reply_control_ok` / `encode_reply_control_error` 为
+> 统一的 `encode_reply_control(status, data)` 接口。
+> 额外实现了 buddy payload / chunk header / ctrl segment 编解码。
 
 新建 `c2-ffi/src/wire_ffi.rs`，暴露以下 PyO3 接口：
 
@@ -175,6 +221,10 @@ struct PyIpcConfig { inner: IpcConfig }
 
 ### §1.3 Python 侧删除清单
 
+> **❌ 未执行 — 延迟至 Phase 4**。以下文件保留完整 Python 实现（非 shim）：
+> - `wire.py` (438 行), `protocol.py` (128 行), `frame.py` (310 行), `msg_type.py` (39 行)
+> - Rust FFI 已就绪，但 import 路径尚未切换。当前 Python server/client 仍依赖这些文件。
+
 | 文件 | 操作 | 行数 | 替代 |
 |------|------|------|------|
 | `transport/wire.py` | 删除编解码函数，保留为 re-export shim | ~400 | `c_two._native.encode_*` |
@@ -207,11 +257,17 @@ from c_two._native import (
 
 ## Phase 2: Server 下沉 — asyncio → tokio
 
+> **实现状态**: ✅ Rust 侧完成 | ❌ Python 删除未执行 (延迟至 Phase 4)
+
 **目标**: 新建 c2-server crate，用 tokio 完全替代 Python asyncio server。CRM 方法执行通过 PyO3 回调。
 
 **风险**: 中-高。涉及 Rust↔Python 回调、GIL 管理、并发调度。
 
 ### §2.1 新 Crate: c2-server
+
+> **✅ 已实现**: `c2-server/src/` 含 7 个文件 (server.rs 31KB, connection.rs 12KB,
+> dispatcher.rs 8KB, heartbeat.rs 7KB, scheduler.rs 8KB, config.rs 4KB, lib.rs)。
+> 45 个 Rust 测试通过。
 
 ```
 c2-server/
@@ -476,6 +532,12 @@ Server 持有接收端 `MemPool`:
 
 ### §2.6 Python 侧变更
 
+> **❌ 删除未执行 — 延迟至 Phase 4**。所有 Python server 文件保留：
+> core.py (954), connection.py (145), handshake.py (172), reply.py (213),
+> dispatcher.py (102), scheduler.py (264), heartbeat.py (68) = 共 1918 行。
+> 新增 `server/native.py` (315 行) 作为 Rust server 的 Python bridge。
+> registry.py 已改为调用 RustServer (通过 native.py)。
+
 **删除** (~1774 行):
 | 文件 | 行数 |
 |------|------|
@@ -488,6 +550,9 @@ Server 持有接收端 `MemPool`:
 | `server/heartbeat.py` | 68 |
 
 **新增** — `c2-ffi/src/server_ffi.rs`:
+
+> **✅ 已实现**: server_ffi.rs (300 行)，`RustServer` (frozen) 含 new/register_route/
+> unregister_route/start/shutdown + is_running/socket_path getter。
 ```rust
 #[pyclass(name = "RustServer")]
 pub struct PyServer {
@@ -534,11 +599,17 @@ server.start()  # 内部启动 tokio runtime 线程
 
 ## Phase 3: Client 统一 — SharedClient → Rust
 
+> **实现状态**: ✅ Rust 侧完成 | ⚠️ Python 部分完成 (pool.py/http.py 已删, core.py 保留薄 wrapper)
+> **未实现**: RustAsyncClient (§3.4), httpx 移除 (§3.6)
+
 **目标**: 扩展 c2-ipc 为通用 IPC client，支持 SHM buddy 收发，暴露 sync + async 双模式 Python API。
 
 **风险**: 中。c2-ipc 已有 async client 基础，主要是补充 SHM 路径和 sync 包装。
 
 ### §3.1 c2-ipc 扩展
+
+> **✅ 已实现**: `c2-ipc/src/client.rs` — call_full (line 354), call_inline (389),
+> call_buddy (455), call_chunked (541)。25 个 Rust 测试通过。
 
 当前 `IpcClient` 是 relay 专用（只走 inline frame，无 SHM）。扩展为全功能 client：
 
@@ -596,6 +667,9 @@ impl IpcClient {
 
 ### §3.2 SyncClient（新建）
 
+> **✅ 已实现**: `c2-ipc/src/sync_client.rs` (4927 bytes)，7 个 pub 方法:
+> connect, call, close, is_connected, route_table, route_names, runtime_ptr。
+
 为 Python 同步调用提供阻塞包装：
 
 ```rust
@@ -630,6 +704,10 @@ impl SyncClient {
 
 ### §3.3 ClientPool（新建）
 
+> **✅ 已实现**: `c2-ipc/src/pool.rs` (13367 bytes)，12 个 pub 方法包括
+> new, acquire, release, sweep_expired, shutdown_all, active_count, refcount,
+> has_client, instance (global singleton), reset_instance, set_default_config。
+
 ```rust
 // c2-ipc/src/pool.rs (新建)
 
@@ -653,6 +731,10 @@ impl ClientPool {
 ```
 
 ### §3.4 Python 双模式 API
+
+> **⚠️ 部分实现**: `client_ffi.rs` (228 行) 含 RustClient (frozen) + RustClientPool (frozen)。
+> **❌ RustAsyncClient 未实现** — 仅有同步 API。async 需 pyo3-async 或手动 coroutine wrapper。
+> ICRMProxy.ipc_async() classmethod 也未添加。
 
 **c2-ffi/src/client_ffi.rs (新建)**:
 
@@ -729,6 +811,13 @@ class ICRMProxy:
 
 ### §3.5 Python 侧删除清单
 
+> **⚠️ 部分完成**:
+> - `client/pool.py` ✅ 已删除
+> - `client/http.py` ✅ 已删除
+> - `client/core.py` ⚠️ **未删除** — 从 982 行缩减为 85 行薄 wrapper，委托给 RustClient，
+>   保留以兼容 `SharedClient` import 和 dual calling convention (`call(method, data, name=route)`
+>   vs `call(route, method, data)`)。新增 `client/util.py` (91 行) 提供独立 ping/shutdown。
+
 | 文件 | 操作 | 行数 |
 |------|------|------|
 | `client/core.py` (SharedClient) | 删除 | 982 |
@@ -740,6 +829,11 @@ class ICRMProxy:
 - `client/proxy.py` (ICRMProxy) — 类型安全代理，纯 Python 逻辑
 
 ### §3.6 c2-http: Rust HTTP Client (新建)
+
+> **✅ Rust 侧完成**: `c2-http/src/` — client.rs (4407B) + pool.rs (6739B) + lib.rs。
+> `http_ffi.rs` (5132B) 暴露 RustHttpClient + RustHttpClientPool (均 frozen)。
+> **❌ httpx 未移除** — registry.py 中 relay 注册/注销 (`_relay_register`, `_relay_unregister`)
+> 仍使用 httpx JSON POST，与 binary RPC 不同，需额外迁移。
 
 **目标**: 替代 Python `HttpClient` + `HttpClientPool`，完全用 Rust 实现。
 
@@ -832,6 +926,9 @@ from c_two._native import RustHttpClient, RustHttpClientPool
 
 ### §3.7 线程优惠保持不变
 
+> **✅ 已确认**: thread_local 路径、Scheduler、access_map 均保持不变。
+> proxy.py 中 `_close_lock` 已实现 (9 处使用)。
+
 `ICRMProxy.thread_local()` 路径完全不受影响 — 同进程直连，零序列化，
 不经过任何 transport。这是性能最优路径。
 
@@ -858,6 +955,12 @@ with self._scheduler.execution_guard(access):
 **目标**: 删除所有 Python transport 残留代码，定型 v0.4.0 公开 API。
 
 **风险**: 低。前三个 Phase 已完成所有迁移，Phase 4 仅做清理和测试。
+
+> **⏳ 未开始**: Phase 4 现在需要承担 Phase 1-3 延迟的所有 Python 删除工作：
+> - Phase 1 积压: wire.py (438), protocol.py (128), frame.py (310), msg_type.py (39) = 915 行
+> - Phase 2 积压: server/ 全部 7 文件 = 1918 行
+> - Phase 3 残留: core.py thin wrapper (85), util.py (91) = 176 行
+> - 合计待清理: ~3009 行 Python + import 路径更新 + httpx 移除
 
 ### §4.1 Python transport 目录最终结构
 
@@ -1146,6 +1249,12 @@ C-Two 明确以 Python 3.14t (free-threading / no-GIL) 为目标平台。
 本节定义 (1) 现有代码的修复清单 (Phase 0)，(2) 新代码必须遵循的并发安全模式。
 
 ### §6.1 Phase 0: 现有代码修复 (Phase 1 前置)
+
+> **⚠️ 部分完成**:
+> - PyNativeRelay frozen ✅, PyMemHandle frozen ✅, PyChunkAssembler frozen ✅
+> - ICRMProxy._close_lock ✅ (proxy.py, 9 处使用)
+> - **❌ 未修复**: PoolConfig, PoolAlloc, PoolStats, MemPool (mem_ffi.rs) 仍未 frozen
+> - ServerV2._client_tasks 加锁: 依赖 Phase 4 Python server 删除后不再需要
 
 Phase 0 不涉及功能变更，仅修复已有代码的自由线程安全性问题。
 
