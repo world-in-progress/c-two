@@ -9,7 +9,7 @@ import time
 import pytest
 
 from c_two.transport.client.core import SharedClient
-from c_two.transport.server.core import Server
+from c_two.transport.server import Server
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello

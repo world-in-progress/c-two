@@ -22,7 +22,7 @@ from c_two.transport.ipc.shm_frame import (
     BUDDY_REUSE_FLAG,
     HANDSHAKE_VERSION,
 )
-from c_two.transport.server.core import Server
+from c_two.transport.server import Server
 from c_two.transport.client.core import SharedClient
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello

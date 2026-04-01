@@ -18,7 +18,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport.client.core import SharedClient
-from c_two.transport.server.core import Server
+from c_two.transport.server import Server
 from c_two.transport.ipc.frame import IPCConfig
 
 

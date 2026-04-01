@@ -159,7 +159,7 @@ class TestShmCleanupOnShutdown:
 
     @patch('c_two.transport.server.core.cleanup_stale_shm')
     def test_shutdown_calls_cleanup(self, mock_cleanup):
-        from c_two.transport.server.core import Server
+        from c_two.transport.server import Server
 
         mock_cleanup.return_value = 0
         address = f'ipc://test_cleanup_{os.getpid()}'
@@ -169,7 +169,7 @@ class TestShmCleanupOnShutdown:
 
     @patch('c_two.transport.server.core.cleanup_stale_shm')
     def test_shutdown_resilient_to_cleanup_error(self, mock_cleanup):
-        from c_two.transport.server.core import Server
+        from c_two.transport.server import Server
 
         mock_cleanup.side_effect = OSError('shm error')
         address = f'ipc://test_cleanup_err_{os.getpid()}'
