@@ -72,9 +72,13 @@ class NativeServerBridge:
     def __init__(
         self,
         bind_address: str,
+        icrm_class: type | None = None,
+        crm_instance: object | None = None,
         ipc_config: IPCConfig | None = None,
         concurrency: ConcurrencyConfig | None = None,
         max_workers: int = 4,
+        *,
+        name: str | None = None,
     ) -> None:
         self._config = ipc_config or IPCConfig()
         self._address = bind_address
@@ -102,6 +106,12 @@ class NativeServerBridge:
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_timeout=self._config.heartbeat_timeout,
         )
+
+        # Register initial CRM if provided (compat with old Server constructor).
+        if icrm_class is not None and crm_instance is not None:
+            self.register_crm(
+                icrm_class, crm_instance, concurrency, name=name,
+            )
 
     # ------------------------------------------------------------------
     # CRM registration
