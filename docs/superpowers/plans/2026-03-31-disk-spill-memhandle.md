@@ -1,5 +1,8 @@
 # Disk Spill & MemHandle Implementation Plan
 
+> **Status: ✅ ALL 10 TASKS COMPLETE** — Implemented across commits from 2026-03-31 to 2026-07-20.
+> 55 Rust tests + 679 Python tests passing. Server and client both use Rust ChunkAssembler.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add unified MemHandle abstraction (buddy/dedicated/file-spill) with auto RAM detection, Rust ChunkAssembler, and zero-copy memoryview delivery to Python deserialize.
@@ -52,7 +55,7 @@
 - Modify: `src/c_two/_native/c2-mem/Cargo.toml`
 - Modify: `src/c_two/_native/c2-mem/src/lib.rs` (add `pub mod spill;`)
 
-- [ ] **Step 1: Add memmap2 dependency to c2-mem**
+- [x] **Step 1: Add memmap2 dependency to c2-mem**
 
 Edit `src/c_two/_native/c2-mem/Cargo.toml`:
 ```toml
@@ -70,7 +73,7 @@ libc = "0.2"
 memmap2 = "0.9"
 ```
 
-- [ ] **Step 2: Write spill.rs — platform memory detection**
+- [x] **Step 2: Write spill.rs — platform memory detection**
 
 Create `src/c_two/_native/c2-mem/src/spill.rs`:
 ```rust
@@ -269,7 +272,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Register spill module in lib.rs**
+- [x] **Step 3: Register spill module in lib.rs**
 
 Add to `src/c_two/_native/c2-mem/src/lib.rs` after `pub mod dedicated;`:
 ```rust
@@ -281,12 +284,12 @@ And add re-exports at the bottom:
 pub use spill::{available_physical_memory, should_spill, create_file_spill};
 ```
 
-- [ ] **Step 4: Run spill tests**
+- [x] **Step 4: Run spill tests**
 
 Run: `cd src/c_two/_native && cargo test -p c2-mem spill --no-default-features`
 Expected: All 5 tests pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/c_two/_native/c2-mem/
@@ -309,7 +312,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - Modify: `src/c_two/_native/c2-mem/src/config.rs`
 - Modify: `src/c_two/_native/c2-mem/src/lib.rs`
 
-- [ ] **Step 1: Write handle.rs — MemHandle enum**
+- [x] **Step 1: Write handle.rs — MemHandle enum**
 
 Create `src/c_two/_native/c2-mem/src/handle.rs`:
 ```rust
@@ -420,7 +423,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Extend config.rs with spill fields**
+- [x] **Step 2: Extend config.rs with spill fields**
 
 Add two fields to `PoolConfig` in `src/c_two/_native/c2-mem/src/config.rs`:
 
@@ -441,7 +444,7 @@ Update `Default` impl — add after `dedicated_gc_delay_secs: 5.0,`:
             spill_dir: std::path::PathBuf::from("/tmp/c_two_spill/"),
 ```
 
-- [ ] **Step 3: Register handle module in lib.rs**
+- [x] **Step 3: Register handle module in lib.rs**
 
 Add to `src/c_two/_native/c2-mem/src/lib.rs` after `pub mod spill;`:
 ```rust
@@ -453,12 +456,12 @@ Add re-export:
 pub use handle::MemHandle;
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cd src/c_two/_native && cargo test -p c2-mem --no-default-features`
 Expected: All previous tests + 3 new handle tests pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/c_two/_native/c2-mem/
@@ -478,7 +481,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 **Files:**
 - Modify: `src/c_two/_native/c2-mem/src/pool.rs`
 
-- [ ] **Step 1: Add imports and write tests at bottom of pool.rs**
+- [x] **Step 1: Add imports and write tests at bottom of pool.rs**
 
 At the top of `pool.rs`, add after existing imports:
 ```rust
@@ -563,12 +566,12 @@ mod handle_tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cd src/c_two/_native && cargo test -p c2-mem handle_tests --no-default-features`
 Expected: FAIL — `alloc_handle`, `handle_slice`, etc. not defined
 
-- [ ] **Step 3: Implement alloc_handle and helpers**
+- [x] **Step 3: Implement alloc_handle and helpers**
 
 Add to `impl MemPool` in pool.rs (after `data_ptr_at`, before the `// --- Internal methods ---` comment):
 
@@ -694,12 +697,12 @@ Add to `impl MemPool` in pool.rs (after `data_ptr_at`, before the `// --- Intern
     }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cd src/c_two/_native && cargo test -p c2-mem --no-default-features`
 Expected: All tests pass (existing + 5 new handle_tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/c_two/_native/c2-mem/src/pool.rs
@@ -717,7 +720,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - Modify: `src/c_two/_native/c2-wire/src/lib.rs`
 - Modify: `src/c_two/_native/c2-wire/Cargo.toml`
 
-- [ ] **Step 1: Add c2-mem dependency to c2-wire**
+- [x] **Step 1: Add c2-mem dependency to c2-wire**
 
 Edit `src/c_two/_native/c2-wire/Cargo.toml`:
 ```toml
@@ -725,7 +728,7 @@ Edit `src/c_two/_native/c2-wire/Cargo.toml`:
 c2-mem = { path = "../c2-mem" }
 ```
 
-- [ ] **Step 2: Write assembler.rs with tests**
+- [x] **Step 2: Write assembler.rs with tests**
 
 Create `src/c_two/_native/c2-wire/src/assembler.rs`:
 
@@ -966,7 +969,7 @@ mod tests {
 
 > **Note on `feed_chunk` borrow checker:** `feed_chunk` takes `&MemPool` (not `&mut`) for `handle_slice_mut`. This works because `handle_slice_mut` takes `&self` on pool (SHM pointers are interior-mutable) and `&mut self.handle`. If the borrow checker complains, adjust `handle_slice_mut` to take `&self` or pass pool as `&mut` and split borrows. During implementation, test and fix.
 
-- [ ] **Step 3: Add `set_len` to MemHandle**
+- [x] **Step 3: Add `set_len` to MemHandle**
 
 In `src/c_two/_native/c2-mem/src/handle.rs`, add to `impl MemHandle`:
 ```rust
@@ -981,24 +984,24 @@ In `src/c_two/_native/c2-mem/src/handle.rs`, add to `impl MemHandle`:
     }
 ```
 
-- [ ] **Step 4: Register assembler module in lib.rs**
+- [x] **Step 4: Register assembler module in lib.rs**
 
 Edit `src/c_two/_native/c2-wire/src/lib.rs`, add:
 ```rust
 pub mod assembler;
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run: `cd src/c_two/_native && cargo test -p c2-wire --no-default-features`
 Expected: All 7 assembler tests PASS
 
-- [ ] **Step 6: Run full workspace tests**
+- [x] **Step 6: Run full workspace tests**
 
 Run: `cd src/c_two/_native && cargo test --no-default-features`
 Expected: All tests pass across all crates
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/c_two/_native/c2-wire/ src/c_two/_native/c2-mem/src/handle.rs
@@ -1020,14 +1023,14 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - Modify: `src/c_two/_native/c2-ffi/Cargo.toml` (add c2-wire dep)
 - Modify: `src/c_two/_native/c2-ffi/src/mem_ffi.rs` (add classes + register)
 
-- [ ] **Step 1: Add c2-wire dependency to c2-ffi**
+- [x] **Step 1: Add c2-wire dependency to c2-ffi**
 
 Edit `src/c_two/_native/c2-ffi/Cargo.toml`, add to `[dependencies]`:
 ```toml
 c2-wire = { path = "../c2-wire" }
 ```
 
-- [ ] **Step 2: Change PyMemPool.pool to Arc\<RwLock\<MemPool\>\>**
+- [x] **Step 2: Change PyMemPool.pool to Arc\<RwLock\<MemPool\>\>**
 
 In `mem_ffi.rs`, change the `PyMemPool` struct:
 ```rust
@@ -1058,7 +1061,7 @@ impl PyMemPool {
 
 > All existing `self.pool.read()` / `self.pool.write()` calls remain unchanged (`Arc<RwLock<T>>` derefs to `RwLock<T>`).
 
-- [ ] **Step 3: Implement PyMemHandle**
+- [x] **Step 3: Implement PyMemHandle**
 
 Add after `PyMemPool` but before `cleanup_stale_shm`:
 
@@ -1163,7 +1166,7 @@ impl Drop for PyMemHandle {
 
 > **Buffer protocol note:** True `__getbuffer__` implementation depends on PyO3 0.25 API. The `buffer_info()` method provides a fallback — Python can build `memoryview` via `ctypes.c_char * len).from_address(addr)`. During implementation, attempt full buffer protocol first; if blocked, use the `buffer_info` approach.
 
-- [ ] **Step 4: Implement PyChunkAssembler**
+- [x] **Step 4: Implement PyChunkAssembler**
 
 Add after `PyMemHandle`:
 
@@ -1274,7 +1277,7 @@ impl Drop for PyChunkAssembler {
 }
 ```
 
-- [ ] **Step 5: Register new classes**
+- [x] **Step 5: Register new classes**
 
 Update `register_module`:
 ```rust
@@ -1290,12 +1293,12 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 ```
 
-- [ ] **Step 6: Compile**
+- [x] **Step 6: Compile**
 
 Run: `cd src/c_two/_native && cargo build`
 Expected: Compiles without errors
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/c_two/_native/c2-ffi/
@@ -1311,7 +1314,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 **Files:**
 - Modify: `src/c_two/mem/__init__.py`
 
-- [ ] **Step 1: Update mem/__init__.py exports**
+- [x] **Step 1: Update mem/__init__.py exports**
 
 Edit `src/c_two/mem/__init__.py` — replace the import block:
 ```python
@@ -1336,22 +1339,22 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 2: Rebuild native extension**
+- [x] **Step 2: Rebuild native extension**
 
 Run: `uv sync`
 Expected: maturin builds successfully
 
-- [ ] **Step 3: Smoke test imports**
+- [x] **Step 3: Smoke test imports**
 
 Run: `uv run python -c "from c_two.mem import MemHandle, ChunkAssembler; print('OK')"`
 Expected: Prints `OK`
 
-- [ ] **Step 4: Run existing test suite**
+- [x] **Step 4: Run existing test suite**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All existing tests pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/c_two/mem/__init__.py
@@ -1369,7 +1372,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 
 This task replaces the Python `ChunkAssembler` with the Rust `PyChunkAssembler` in the server's chunked frame processing. The key change: `_process_chunked_frame` creates a Rust `ChunkAssembler` (via `PyChunkAssembler`) instead of the Python dataclass, and on completion returns a `MemHandle` instead of `bytes`.
 
-- [ ] **Step 1: Update imports in server/core.py**
+- [x] **Step 1: Update imports in server/core.py**
 
 At line 54, change:
 ```python
@@ -1385,7 +1388,7 @@ from c_two.mem import ChunkAssembler as RustChunkAssembler
 
 > The `gc_chunk_assemblers` logic is reimplemented inline (simpler than maintaining a separate function).
 
-- [ ] **Step 2: Update assemblers dict type annotation**
+- [x] **Step 2: Update assemblers dict type annotation**
 
 At line 424 (approx), change:
 ```python
@@ -1400,7 +1403,7 @@ chunk_assemblers: dict[int, tuple[RustChunkAssembler, float]] = {}
 
 > We store `(assembler, created_at)` tuples because the Rust ChunkAssembler doesn't track creation time — that's a Python GC concern.
 
-- [ ] **Step 3: Rewrite gc_chunk_assemblers call**
+- [x] **Step 3: Rewrite gc_chunk_assemblers call**
 
 At line 486 (approx), replace the `gc_chunk_assemblers(...)` call:
 ```python
@@ -1427,7 +1430,7 @@ for rid in expired:
 
 > **Note:** Check if `chunk_gc_timeout` is the actual config attribute name. Adjust during implementation.
 
-- [ ] **Step 4: Rewrite _process_chunked_frame**
+- [x] **Step 4: Rewrite _process_chunked_frame**
 
 Replace lines 632-750+ with the new implementation. The key changes:
 1. `ChunkAssembler(...)` → `RustChunkAssembler(self._buddy_pool_py, total_chunks, chunk_size)`
@@ -1588,7 +1591,7 @@ Replace lines 632-750+ with the new implementation. The key changes:
 
 > **Critical implementation note:** The `mem_handle` must remain alive while `args_mv` is in use (memoryview references the handle's memory). The handle should be released only after the CRM method has fully processed the data. During implementation, ensure the handle is stored alongside the dispatch task and released in the completion callback.
 
-- [ ] **Step 5: Add `_buddy_pool_py` attribute to server**
+- [x] **Step 5: Add `_buddy_pool_py` attribute to server**
 
 The server needs to expose its `PyMemPool` instance for `RustChunkAssembler`. Check if the server already has a `MemPool` instance and expose it. If not, create one in `__init__` or `_start`:
 
@@ -1599,12 +1602,12 @@ self._buddy_pool_py = buddy_pool  # The PyMemPool instance
 
 > **Note:** The `conn.buddy_pool` is the server's local pool. The `RustChunkAssembler` needs access to a `PyMemPool` to allocate reassembly buffers. This may require creating a separate pool or sharing the server's pool. Check during implementation.
 
-- [ ] **Step 6: Run tests**
+- [x] **Step 6: Run tests**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/c_two/transport/server/core.py
@@ -1626,18 +1629,18 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 
 Replace `_ReplyChunkAssembler` with the Rust `PyChunkAssembler` in the client's chunked reply handling.
 
-- [ ] **Step 1: Remove _ReplyChunkAssembler class**
+- [x] **Step 1: Remove _ReplyChunkAssembler class**
 
 Delete lines 129-198 (the entire `_ReplyChunkAssembler` class).
 
-- [ ] **Step 2: Add Rust import**
+- [x] **Step 2: Add Rust import**
 
 At the top of `client/core.py`, add:
 ```python
 from c_two.mem import ChunkAssembler as RustChunkAssembler
 ```
 
-- [ ] **Step 3: Update _handle_chunked_reply**
+- [x] **Step 3: Update _handle_chunked_reply**
 
 Replace the method at lines 884-955:
 
@@ -1733,7 +1736,7 @@ Replace the method at lines 884-955:
 
 > **Note:** Initially we return `bytes` for compatibility. Phase 2 can pass the `MemHandle`/`memoryview` directly to skip the copy.
 
-- [ ] **Step 4: Update assemblers dict type in _recv_loop**
+- [x] **Step 4: Update assemblers dict type in _recv_loop**
 
 At line 722 (approx):
 ```python
@@ -1744,12 +1747,12 @@ import time
 reply_assemblers: dict[int, tuple[RustChunkAssembler, float]] = {}
 ```
 
-- [ ] **Step 5: Run tests**
+- [x] **Step 5: Run tests**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/c_two/transport/client/core.py
@@ -1771,7 +1774,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - Modify: `src/c_two/crm/transferable.py` (remove __memoryview_aware__)
 - Modify: `src/c_two/transport/ipc/frame.py` (remove FLAG_DISK_SPILL)
 
-- [ ] **Step 1: Delete chunk.py**
+- [x] **Step 1: Delete chunk.py**
 
 ```bash
 rm src/c_two/transport/server/chunk.py
@@ -1783,7 +1786,7 @@ grep -r "from .chunk import\|from ..server.chunk\|from transport.server.chunk" s
 ```
 Expected: Only the server/core.py import which was already removed in Task 7.
 
-- [ ] **Step 2: Remove __memoryview_aware__ from transferable.py**
+- [x] **Step 2: Remove __memoryview_aware__ from transferable.py**
 
 In `src/c_two/crm/transferable.py`:
 
@@ -1819,7 +1822,7 @@ if (not getattr(input, '__memoryview_aware__', False)
 # NEW: (remove these 3 lines)
 ```
 
-- [ ] **Step 3: Remove FLAG_DISK_SPILL from frame.py**
+- [x] **Step 3: Remove FLAG_DISK_SPILL from frame.py**
 
 In `src/c_two/transport/ipc/frame.py`, remove:
 ```python
@@ -1828,12 +1831,12 @@ FLAG_DISK_SPILL = 1 << 5     # Reserved for Phase 2 disk spillover
 
 > This flag was a Phase 2 placeholder. Disk spill is now internal to Rust (MemHandle decides backend) — no wire-level flag needed.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -1850,17 +1853,17 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 
 ### Task 10: Full Test Suite Verification
 
-- [ ] **Step 1: Run Rust tests**
+- [x] **Step 1: Run Rust tests**
 
 Run: `cd src/c_two/_native && cargo test --no-default-features`
 Expected: All tests pass (spill, handle, pool handle, assembler)
 
-- [ ] **Step 2: Run Python tests**
+- [x] **Step 2: Run Python tests**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass (should be same count as baseline ± tests removed with chunk.py)
 
-- [ ] **Step 3: Run integration examples**
+- [x] **Step 3: Run integration examples**
 
 ```bash
 # Terminal 1: Start server
@@ -1873,7 +1876,7 @@ kill %1
 ```
 Expected: Client connects, makes calls, receives responses.
 
-- [ ] **Step 4: Run relay example if applicable**
+- [x] **Step 4: Run relay example if applicable**
 
 ```bash
 c3 relay &
@@ -1884,7 +1887,7 @@ uv run python examples/relay/client.py
 ```
 Expected: Relay routes traffic correctly.
 
-- [ ] **Step 5: Final commit tag**
+- [x] **Step 5: Final commit tag**
 
 ```bash
 git tag -a v0.4.0-alpha.1 -m "feat: disk spill + unified MemHandle + Rust ChunkAssembler"

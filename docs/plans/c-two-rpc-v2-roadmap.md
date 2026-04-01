@@ -1,6 +1,6 @@
 # C-Two 后续计划
 
-> Date: 2026-03-28 | Updated: 2026-03-31 (Rust 模块重构 + 动态扩容完成)
+> Date: 2026-03-28 | Updated: 2026-07-20 (磁盘溢写 + 架构质量审查 + Relay 加固)
 > 基于: `doc/log/sota.md`（SOTA 设计文档）+ 当前代码库实现状态
 > 目的: 系统梳理 SOTA 设计目标与已有实现之间的差距，规划后续工作优先级
 
@@ -22,7 +22,7 @@
 | SHM Pool 动态扩容（Segment Chain） | client 自动扩段 + server 懒加载 + 确定性命名 | ✓ (2026-03-31) |
 | SharedClient（N 消费者 → 1 UDS + 1 Pool） | `client/core.py:SharedClient` | ✓ |
 | 统一代理对象（thread / ipc / http 三模式） | `proxy.py:ICRMProxy` | ✓ — 满足 sota.md §4.2 |
-| HTTP relay（Python + Rust） | `relay/core.py:Relay` + `c2-relay` (Rust crate) | ✓ |
+| HTTP relay（Rust 原生） | `c2-relay` Rust crate + `c_two.relay.NativeRelay` | ✓ |
 | HTTP client + 跨节点访问 | `client/http.py:HttpClient` | ✓ |
 | Rust SDK（c2-mem, c2-wire, c2-ipc, c2-relay, c2-ffi） | `src/c_two/_native/` workspace (5 crates) | ✓ |
 | @cc.read / @cc.write 并发控制 | `server/scheduler.py:Scheduler` + `_WriterPriorityReadWriteLock` | ✓ |
@@ -45,6 +45,12 @@
 | GIL-free 声明（Python 3.14t） | `c2-ffi` PyO3 模块声明 `GIL_USED=false` | ✓ (2026-03-30) |
 | Rust 模块三层重构 + Python API 重命名 | `c2-mem` (alloc/ + segment/ + pool) + `c_two.mem.MemPool` | ✓ (2026-03-31) |
 | uv 自动检测 Rust 源码变更并重编译 | `pyproject.toml:cache-keys` 追踪 `_native/**/*.rs` | ✓ (2026-03-31) |
+| 磁盘溢写兜底（MemHandle + Rust ChunkAssembler） | `c2-mem/spill.rs` + `c2-mem/handle.rs` + `c2-wire/assembler.rs` + `c2-ffi/mem_ffi.rs` | ✓ (2026-07-20) |
+| Free-threading 并发安全审计（CRITICAL + HIGH） | `registry.py` + `server/core.py` + `client/core.py` — 竞态修复 | ✓ (2026-07-20) |
+| Python Relay 删除，统一 Rust NativeRelay | 删除 `relay/core.py` (610 行)，`c_two.relay` 直接暴露 Rust | ✓ (2026-07-20) |
+| Legacy event error 类型清理 | `error.py` 重构：移除 Event 相关类型，改名 FrameDecodeError | ✓ (2026-07-20) |
+| Relay 大 payload 支持（HTTP 413 + IPC 帧限制） | `c2-relay/router.rs` DefaultBodyLimit + `frame.py` 2GB 帧上限 | ✓ (2026-07-20) |
+| 综合性能基准测试（三模式 + dict/bytes 对比） | `benchmarks/three_mode_benchmark.py` — 64B→1GB 全覆盖 | ✓ (2026-07-20) |
 
 ### 仓库重构 ✓
 
@@ -57,6 +63,9 @@
 | 配置暴露 | 11 项硬编码常量移入 `IPCConfig`，3 项僵尸常量删除 | 2026-03-29 |
 | Rust 模块重构 | `c2-buddy` → `c2-mem` (alloc/ + segment/ + pool)，Python `c_two.buddy` → `c_two.mem` | 2026-03-31 |
 | SHM 帧模块重命名 | `transport/ipc/buddy.py` → `transport/ipc/shm_frame.py` | 2026-03-31 |
+| Python Relay 删除 | 删除 `relay/core.py` (610 行)，统一使用 Rust `NativeRelay` | 2026-07-20 |
+| Error 模块重构 | 移除 `EventSerializeError`/`EventDeserializeError` 等遗留类型 | 2026-07-20 |
+| 僵尸代码清理 | 删除 `server/chunk.py`、`__memoryview_aware__`、`FLAG_DISK_SPILL` | 2026-07-20 |
 
 ### 未实现 ✗
 
@@ -66,7 +75,6 @@
 | 异步接口 | §4.3 | 无 `cc.connect_async()` 或 `async with cc.connect()` |
 | 自适应分代 GC | 附录 A.3 | per-request SHM 与 pool SHM 使用相同超时 |
 | 跨语言 CRM Client（Rust/C++） | 附录 Rust §代码组织 | `c2-wire` + `c2-ipc` 已存在，但无 Rust 端的 ICRM 代码生成 |
-| 磁盘溢写兜底 | — | Chunk reassembly 匿名 mmap 在物理内存不足时无降级路径 |
 
 ---
 
@@ -191,17 +199,26 @@ v0.3.0 发布前对传输层和 Relay 进行的系统性代码审查与加固。
 
 ## 3. P2 — 功能完善
 
-### 3.0 磁盘溢写兜底（Plan C）
+### 3.0 磁盘溢写兜底（Plan C）— ✅ 已完成 (2026-07-20)
 
-**背景**: 分块流式传输解决了大 payload 突破 256 MB 限制的问题，但当系统物理内存不足以容纳 reassembly buffer（接收端使用 `mmap.mmap(-1, total_size)` 匿名映射）时，仍需要磁盘级兜底策略。
+**实现方案**: Rust 原生 MemHandle + ChunkAssembler，替代 Python mmap 实现。三层分配策略：
 
-**方案**: 当 mmap 分配失败或检测到系统可用内存低于阈值时，`_ChunkAssembler` / `_ReplyChunkAssembler` 切换到文件支持的 mmap（`mmap.mmap(fd, size)`），将 reassembly buffer 溢写到临时文件。具体设计参见 spike 文档 `docs/spikes/performance-shm-streaming-large-payload-spike.md` 中的 Plan C。
+1. **Buddy 快速路径**: 现有 segment 直接分配（不查 RAM），零开销
+2. **弹性扩容**: 需创建新 segment 时走 `should_spill()` 检查
+3. **文件溢写**: RAM 不足时 `create_file_spill()` 创建 unlink-on-create 的文件 mmap
 
-**触发条件**: 可通过 `IPCConfig.disk_spill_threshold` 配置（默认 None = 不启用），当 `total_payload > threshold` 或 `mmap(-1, ...)` 抛出 `OSError` 时自动降级。
+**实现内容**:
+- ✅ `c2-mem/spill.rs` — macOS/Linux 平台 RAM 检测 + 文件 mmap 创建
+- ✅ `c2-mem/handle.rs` — `MemHandle` 枚举 (Buddy/Dedicated/FileSpill)
+- ✅ `c2-mem/pool.rs` — `alloc_handle()`, `handle_slice()`, `release_handle()` 三层决策
+- ✅ `c2-wire/assembler.rs` — Rust `ChunkAssembler`（512 chunk / 8GB 上限）
+- ✅ `c2-ffi/mem_ffi.rs` — PyMemHandle (buffer protocol) + PyChunkAssembler
+- ✅ Server/Client 集成 — Python 侧完全使用 Rust ChunkAssembler
+- ✅ 清理 — 删除 `chunk.py`、`__memoryview_aware__`、`FLAG_DISK_SPILL`
 
-**改动范围**: `server/chunk.py:ChunkAssembler` + `client/core.py:_ReplyChunkAssembler`（增加文件 mmap 分支） + `IPCConfig`（新增配置项）
-
-**前置条件**: 动态扩容已完成 ✅，磁盘溢写是 T4 层的最后一环。Rust `c2-mem` 的三层架构（alloc → segment → pool）已为 T4 扩展预留接口。
+**设计文档**: `docs/superpowers/specs/2026-03-31-disk-spill-memhandle-design.md`
+**实施计划**: `docs/superpowers/plans/2026-03-31-disk-spill-memhandle.md` (10 tasks, all complete)
+**测试**: 55 Rust tests (c2-mem) + 679 Python tests passing
 
 ### 3.1 版本兼容性检查
 
@@ -338,10 +355,22 @@ P1 — 性能与可靠性增强 ✅ 全部完成
     └─ CLI 增强                  ✅ banner + --idle-timeout + dev 保护
 
 P2 — 功能完善（v0.4.0 里程碑）
-├─ 3.0 磁盘溢写兜底 (Plan C)    待实现
+├─ 3.0 磁盘溢写兜底 (Plan C)    ✅ 已完成 (2026-07-20)
+│   ├─ Rust MemHandle 三层分配   ✅ Buddy/Dedicated/FileSpill
+│   ├─ Rust ChunkAssembler      ✅ c2-wire, 替代 Python 实现
+│   ├─ PyO3 buffer protocol     ✅ 零拷贝 memoryview
+│   └─ Server/Client 集成       ✅ 完全替换 Python ChunkAssembler
 ├─ 3.1 版本兼容性检查           待实现
 ├─ 3.2 异步接口                 待实现
 └─ 3.3 自适应分代 GC            待实现
+
+架构质量审查 ✅ (2026-07-20)
+├─ Free-threading 并发安全      ✅ CRITICAL/HIGH/MEDIUM 竞态修复
+├─ Python Relay 删除            ✅ 统一 Rust NativeRelay
+├─ Error 模块重构               ✅ 移除 event 遗留类型
+├─ Relay 大 payload 支持        ✅ HTTP 413 + IPC 帧限制修复
+├─ Flaky 测试消除               ✅ 信号处理器竞态 + SHM 握手竞态
+└─ 综合基准测试                 ✅ 三模式 + dict/bytes 对比
 
 P3 — 长期演进（v1.0 方向）
 ├─ 4.1 跨语言 CRM Client        待实现
@@ -366,7 +395,7 @@ P3 — 长期演进（v1.0 方向）
 | DISCONNECT / DISCONNECT_ACK | §2.4 ✅ 优雅断连替代心跳超时被动发现 |
 | Relay idle sweeper + lazy reconnect | §2.4 ✅ IPC 长连接不再永久驻留，CRM 重启后自动恢复 |
 | SHM Pool 动态扩容 | §2.1 ✅ Handshake v6 前缀 + 确定性命名 + Client/Server 双端实现 |
-| Rust c2-mem 三层架构 | 为 §3.0 磁盘溢写预留 T4 扩展点 |
+| Rust c2-mem 三层架构 | ✅ §3.0 磁盘溢写已基于此实现 MemHandle + ChunkAssembler |
 
 ### 优化报告中建议但未覆盖的后续方向
 
@@ -388,14 +417,18 @@ P3 — 长期演进（v1.0 方向）
 c2-mem                    共享内存子系统
 ├─ src/alloc/             纯 buddy 分配算法（BuddyAllocator, bitmap, spinlock）
 ├─ src/segment/           POSIX SHM 生命周期（ShmRegion: create/open/unlink）
-├─ src/pool.rs            统一池 MemPool = BuddySegment + DedicatedSegment
+├─ src/pool.rs            统一池 MemPool = BuddySegment + DedicatedSegment + FileSpill
 ├─ src/buddy_segment.rs   ShmRegion + BuddyAllocator 组合
 ├─ src/dedicated.rs       超大分配专用 segment
-└─ src/config.rs          PoolConfig, PoolAllocation, PoolStats
+├─ src/config.rs          PoolConfig (含 spill_threshold/spill_dir), PoolAllocation, PoolStats
+├─ src/handle.rs          MemHandle 枚举（Buddy/Dedicated/FileSpill）— 统一分配抽象
+└─ src/spill.rs           平台 RAM 检测 + 文件 mmap 溢写
 
 c2-wire                   IPC 帧编解码（Handshake v6, 信号帧）
+└─ src/assembler.rs       Rust ChunkAssembler（基于 MemHandle 的分块重组）
+
 c2-ipc                    Rust async IPC client (tokio, UDS + SHM)
-c2-relay                  HTTP relay server (axum → IPC 转发)
+c2-relay                  HTTP relay server (axum → IPC 转发, DefaultBodyLimit 已禁用)
 c2-ffi                    PyO3 统一入口 → Python c_two._native
 ```
 
@@ -403,9 +436,11 @@ Python 侧对应关系：
 
 | Rust 层 | Python 模块 | 主要类型 |
 |---------|------------|---------|
-| `c2-mem` → `c2-ffi:mem_ffi.rs` | `c_two.mem` | `MemPool`, `PoolConfig`, `PoolAlloc`, `PoolStats` |
+| `c2-mem` → `c2-ffi:mem_ffi.rs` | `c_two.mem` | `MemPool`, `PoolConfig`, `PoolAlloc`, `PoolStats`, `MemHandle`, `ChunkAssembler` |
 | `c2-relay` → `c2-ffi:relay_ffi.rs` | `c_two.relay` | `NativeRelay` |
 | `c2-mem::alloc` | (内部使用) | `BuddyAllocator`, `ShmSpinlock` |
 | `c2-mem::segment` | (内部使用) | `ShmRegion` |
+| `c2-mem::spill` | (内部使用) | `available_physical_memory`, `should_spill`, `create_file_spill` |
+| `c2-wire::assembler` | (通过 c2-ffi 暴露) | `ChunkAssembler` |
 
-**演进方向**: `c2-mem` 的三层内部结构（alloc → segment → pool）为未来 T4 磁盘溢写层预留了接口——只需在 pool 层新增一种 segment 类型（如 `FileSegment`），无需修改 alloc 或 segment 层。
+**演进方向**: `c2-mem` 的三层架构 + MemHandle + ChunkAssembler 已完整实现。磁盘溢写兜底（§3.0）已完成。下一步可扩展方向：自适应 spill threshold（基于运行时 RSS 趋势）、SHM-backed relay 转发（消除 relay 大 payload 的内存缓冲）。
