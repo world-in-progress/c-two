@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     from PIL import Image
 
 from . import __version__
-from .seed import build
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,9 +70,6 @@ def parse_upstream(value: str) -> tuple[str, str]:
 @click.version_option(version=__version__, prog_name='C-Two')
 def cli():
     """C-Two Command-Line Interface (cccli, c3)"""
-
-
-cli.command(build)
 
 
 # ---------------------------------------------------------------------------
