@@ -100,6 +100,24 @@ impl SyncClient {
     }
 }
 
+// ── Test-only helpers ────────────────────────────────────────────────────
+
+#[cfg(test)]
+impl SyncClient {
+    /// Create an unconnected `SyncClient` for pool bookkeeping tests.
+    ///
+    /// The resulting client is **not** connected to any server —
+    /// `is_connected()` returns `false` and `call()` will fail.
+    pub(crate) fn new_unconnected(address: &str) -> Self {
+        let rt = get_or_create_runtime();
+        let inner = IpcClient::new(address);
+        Self {
+            inner,
+            rt: rt.handle().clone(),
+        }
+    }
+}
+
 // ── Unit tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

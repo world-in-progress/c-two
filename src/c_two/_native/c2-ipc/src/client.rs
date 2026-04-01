@@ -61,6 +61,8 @@ pub enum IpcError {
     CrmError(Vec<u8>),
     /// Client is closed or connection lost.
     Closed,
+    /// Pool management error.
+    Pool(String),
 }
 
 impl std::fmt::Display for IpcError {
@@ -71,6 +73,7 @@ impl std::fmt::Display for IpcError {
             Self::Handshake(msg) => write!(f, "IPC handshake failed: {msg}"),
             Self::CrmError(_) => write!(f, "CRM method error"),
             Self::Closed => write!(f, "IPC client closed"),
+            Self::Pool(msg) => write!(f, "Pool error: {msg}"),
         }
     }
 }

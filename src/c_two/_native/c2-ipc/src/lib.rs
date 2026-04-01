@@ -13,6 +13,7 @@
 //! ```
 
 pub mod client;
+pub mod pool;
 pub mod shm;
 pub mod sync_client;
 
@@ -20,6 +21,7 @@ pub mod sync_client;
 mod tests;
 
 pub use client::{IpcClient, IpcConfig, IpcError, MethodTable};
+pub use pool::ClientPool;
 pub use shm::{MappedSegment, SegmentCache, ShmError};
 pub use sync_client::SyncClient;
 
