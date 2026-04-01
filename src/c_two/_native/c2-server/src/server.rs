@@ -345,6 +345,22 @@ async fn handle_handshake(
         conn.set_chunked_capable(true);
     }
 
+    // Collect response pool segment info for handshake.
+    let (server_segments, server_prefix) = {
+        let pool = server.response_pool.lock().unwrap();
+        let count = pool.segment_count();
+        let mut segs = Vec::with_capacity(count);
+        for i in 0..count {
+            if let Some(name) = pool.segment_name(i) {
+                if let Some(seg) = pool.segment(i) {
+                    segs.push((name.to_string(), seg.allocator().data_size() as u32));
+                }
+            }
+        }
+        let prefix = pool.prefix().to_string();
+        (segs, prefix)
+    };
+
     let dispatcher = server.dispatcher.read().await;
     let routes: Vec<RouteInfo> = dispatcher
         .routes_snapshot()
@@ -364,8 +380,8 @@ async fn handle_handshake(
         .collect();
     drop(dispatcher);
 
-    let cap = CAP_CALL_V2 | CAP_METHOD_IDX;
-    let hs_bytes = encode_server_handshake(&[], cap, &routes, "server");
+    let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
+    let hs_bytes = encode_server_handshake(&server_segments, cap, &routes, &server_prefix);
     let frame = encode_frame(request_id, FLAG_HANDSHAKE | FLAG_RESPONSE, &hs_bytes);
 
     writer.lock().await.write_all(&frame).await?;
