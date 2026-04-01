@@ -46,7 +46,6 @@ import httpx
 
 from .config import settings
 from .client.http import HttpClientPool
-from .client.pool import ClientPool
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
 from .server.native import NativeServerBridge as Server
@@ -117,7 +116,8 @@ class _ProcessRegistry:
         self._server_address: str | None = None
         self._explicit_address: str | None = None
         self._explicit_ipc_config: IPCConfig | None = None
-        self._pool = ClientPool()
+        from c_two._native import RustClientPool
+        self._pool = RustClientPool.instance()
         self._http_pool = HttpClientPool()
 
     # ------------------------------------------------------------------
@@ -227,8 +227,7 @@ class _ProcessRegistry:
                 ipc_cfg = self._build_ipc_config()
                 self._server = Server(bind_address=addr, ipc_config=ipc_cfg)
                 self._server_address = addr
-                # Share the same config with the client pool.
-                self._pool.set_default_config(ipc_cfg)
+                # Rust pool uses its own defaults; skip Python IPCConfig.
 
             self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
             scheduler, access_map = self._server.get_slot_info(name)
