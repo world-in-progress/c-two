@@ -8,10 +8,18 @@
 //! release the Python GIL via `py.allow_threads()` so the Python ServerV2
 //! asyncio loop can continue processing connections during handshake.
 
+use std::sync::Mutex;
+
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use c2_relay::server::RelayServer;
+
+struct RelayState {
+    bind: String,
+    idle_timeout_secs: u64,
+    server: Option<RelayServer>,
+}
 
 /// An embedded HTTP relay server backed by Rust (axum + tokio).
 ///
@@ -26,11 +34,9 @@ use c2_relay::server::RelayServer;
 /// relay.list_routes()  # [{"name": "grid", "address": "ipc://my_server"}]
 /// relay.stop()
 /// ```
-#[pyclass(name = "NativeRelay")]
+#[pyclass(name = "NativeRelay", frozen)]
 pub struct PyNativeRelay {
-    bind: String,
-    idle_timeout_secs: u64,
-    server: Option<RelayServer>,
+    state: Mutex<RelayState>,
 }
 
 #[pymethods]
@@ -43,80 +49,96 @@ impl PyNativeRelay {
     #[pyo3(signature = (bind = "0.0.0.0:8080", idle_timeout_secs = 0))]
     fn new(bind: &str, idle_timeout_secs: u64) -> Self {
         Self {
-            bind: bind.to_string(),
-            idle_timeout_secs,
-            server: None,
+            state: Mutex::new(RelayState {
+                bind: bind.to_string(),
+                idle_timeout_secs,
+                server: None,
+            }),
         }
     }
 
     /// Start the relay HTTP server on a background thread.
     ///
     /// Releases the GIL while waiting for the listener to bind.
-    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.server.is_some() {
-            return Err(PyRuntimeError::new_err("Relay is already running"));
-        }
-        let bind = self.bind.clone();
-        let idle_timeout_secs = self.idle_timeout_secs;
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        let (bind, idle_timeout_secs) = {
+            let state = self.state.lock().unwrap();
+            if state.server.is_some() {
+                return Err(PyRuntimeError::new_err("Relay is already running"));
+            }
+            (state.bind.clone(), state.idle_timeout_secs)
+        }; // lock dropped before allow_threads
         let server = py
             .allow_threads(|| RelayServer::start(&bind, idle_timeout_secs))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to start relay: {e}")))?;
-        self.server = Some(server);
+        self.state.lock().unwrap().server = Some(server);
         Ok(())
     }
 
     /// Stop the relay gracefully.
     ///
     /// Releases the GIL while waiting for shutdown.
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
-        match self.server.as_mut() {
-            Some(s) => {
-                py.allow_threads(|| s.stop())
-                    .map_err(|e| PyRuntimeError::new_err(format!("Stop failed: {e}")))?;
-                self.server = None;
-                Ok(())
-            }
-            None => Err(PyRuntimeError::new_err("Relay is not running")),
-        }
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
+        let mut server = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .server
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("Relay is not running"))?
+        }; // lock dropped before allow_threads
+        py.allow_threads(|| server.stop())
+            .map_err(|e| PyRuntimeError::new_err(format!("Stop failed: {e}")))?;
+        Ok(())
     }
 
     /// Register a new upstream IPC connection.
     ///
     /// Releases the GIL while connecting to the upstream (UDS + handshake).
+    /// The Mutex is acquired inside `allow_threads` to prevent GIL↔Mutex
+    /// deadlock.
     fn register_upstream(&self, py: Python<'_>, name: &str, address: &str) -> PyResult<()> {
-        let server = self
-            .server
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Relay is not running"))?;
         let name = name.to_string();
         let address = address.to_string();
-        py.allow_threads(|| server.register_upstream(&name, &address))
-            .map_err(|e| PyRuntimeError::new_err(e))
+        py.allow_threads(|| {
+            let state = self.state.lock().unwrap();
+            let server = state
+                .server
+                .as_ref()
+                .ok_or_else(|| "Relay is not running".to_string())?;
+            server.register_upstream(&name, &address)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     /// Remove a registered upstream.
     ///
     /// Releases the GIL while waiting for the command to complete.
     fn unregister_upstream(&self, py: Python<'_>, name: &str) -> PyResult<()> {
-        let server = self
-            .server
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Relay is not running"))?;
         let name = name.to_string();
-        py.allow_threads(|| server.unregister_upstream(&name))
-            .map_err(|e| PyRuntimeError::new_err(e))
+        py.allow_threads(|| {
+            let state = self.state.lock().unwrap();
+            let server = state
+                .server
+                .as_ref()
+                .ok_or_else(|| "Relay is not running".to_string())?;
+            server.unregister_upstream(&name)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     /// List all registered routes.
     ///
     /// Returns a list of dicts with "name" and "address" keys.
     fn list_routes(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let server = self
-            .server
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Relay is not running"))?;
         let routes = py
-            .allow_threads(|| server.list_routes())
+            .allow_threads(|| {
+                let state = self.state.lock().unwrap();
+                let server = state
+                    .server
+                    .as_ref()
+                    .ok_or_else(|| "Relay is not running".to_string())?;
+                server.list_routes()
+            })
             .map_err(|e| PyRuntimeError::new_err(e))?;
 
         let list = pyo3::types::PyList::empty(py);
@@ -132,13 +154,13 @@ impl PyNativeRelay {
     /// Check if the relay is currently running.
     #[getter]
     fn is_running(&self) -> bool {
-        self.server.is_some()
+        self.state.lock().unwrap().server.is_some()
     }
 
     /// The configured bind address.
     #[getter]
-    fn bind_address(&self) -> &str {
-        &self.bind
+    fn bind_address(&self) -> String {
+        self.state.lock().unwrap().bind.clone()
     }
 }
 
