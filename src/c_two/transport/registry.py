@@ -42,8 +42,6 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeVar
 
-import httpx
-
 from .config import settings
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
@@ -504,25 +502,31 @@ class _ProcessRegistry:
         Does nothing if ``C2_RELAY_ADDRESS`` is not set.  Raises on
         failure when the env var *is* set (hard error, not warning).
         """
+        import json
+        import urllib.request
+
         relay_addr = settings.relay_address
         if not relay_addr:
             return
 
         url = f'{relay_addr.rstrip("/")}/_register'
+        body = json.dumps({'name': name, 'address': ipc_address}).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
         try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport, timeout=timeout) as client:
-                resp = client.post(url, json={'name': name, 'address': ipc_address})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
         except Exception as exc:
             raise ConnectionError(
                 f'Failed to register CRM {name!r} with relay at {relay_addr}: {exc}',
             ) from exc
 
-        if resp.status_code not in (200, 201):
-            detail = resp.text[:200] if resp.text else resp.reason_phrase
+        if status not in (200, 201):
             raise RuntimeError(
-                f'Relay rejected registration of {name!r}: '
-                f'HTTP {resp.status_code} — {detail}',
+                f'Relay rejected registration of {name!r}: HTTP {status}',
             )
 
         log.info('Registered CRM %s with relay at %s', name, relay_addr)
@@ -534,25 +538,31 @@ class _ProcessRegistry:
         Does nothing if ``C2_RELAY_ADDRESS`` is not set.  Raises on
         failure when the env var *is* set (hard error, not warning).
         """
+        import json
+        import urllib.request
+
         relay_addr = settings.relay_address
         if not relay_addr:
             return
 
         url = f'{relay_addr.rstrip("/")}/_unregister'
+        body = json.dumps({'name': name}).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
         try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport, timeout=timeout) as client:
-                resp = client.post(url, json={'name': name})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
         except Exception as exc:
             raise ConnectionError(
                 f'Failed to unregister CRM {name!r} from relay at {relay_addr}: {exc}',
             ) from exc
 
-        if resp.status_code not in (200, 204):
-            detail = resp.text[:200] if resp.text else resp.reason_phrase
+        if status not in (200, 204):
             raise RuntimeError(
-                f'Relay rejected unregistration of {name!r}: '
-                f'HTTP {resp.status_code} — {detail}',
+                f'Relay rejected unregistration of {name!r}: HTTP {status}',
             )
 
         log.info('Unregistered CRM %s from relay at %s', name, relay_addr)
