@@ -19,8 +19,8 @@ __all__ = [
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'SharedClient':      ('.client.core',        'SharedClient'),
     'ICRMProxy':         ('.client.proxy',        'ICRMProxy'),
-    'Server':          ('.server.core',         'Server'),
-    'CRMSlot':           ('.server.core',         'CRMSlot'),
+    'Server':          ('.server.native',       'NativeServerBridge'),
+    'CRMSlot':           ('.server.native',       'CRMSlot'),
     'Scheduler':         ('.server.scheduler',    'Scheduler'),
     'ConcurrencyConfig': ('.server.scheduler',    'ConcurrencyConfig'),
     'ConcurrencyMode':   ('.server.scheduler',    'ConcurrencyMode'),

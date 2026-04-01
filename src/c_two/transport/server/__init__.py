@@ -1,4 +1,2 @@
-from .core import Server
-from .native import NativeServerBridge
-from .connection import CRMSlot
+from .native import NativeServerBridge as Server, CRMSlot
 from .scheduler import Scheduler, ConcurrencyConfig, ConcurrencyMode
