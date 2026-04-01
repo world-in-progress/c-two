@@ -14,6 +14,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+/// Monotonic counter ensuring each `Server` instance gets a unique SHM prefix,
+/// even when multiple servers are created within the same PID (e.g. benchmarks
+/// or tests that reset the registry).
+static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
+
 use c2_mem::config::PoolConfig;
 use c2_mem::MemPool;
 use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
@@ -116,7 +121,8 @@ impl Server {
         };
         let mut response_pool = {
             let pid = std::process::id();
-            let prefix = format!("/cc3r{:08x}", pid);
+            let generation = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed);
+            let prefix = format!("/cc3r{:08x}{:02x}", pid, (generation & 0xFF) as u8);
             MemPool::new_with_prefix(response_cfg, prefix)
         };
         response_pool.ensure_ready()
