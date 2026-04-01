@@ -2,9 +2,8 @@ import pytest
 import c_two.error as error
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
-    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
-    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    FrameDecodeError,
+    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction,
+    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling,
 )
 
 
@@ -14,15 +13,12 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING == 1
         assert ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING == 2
         assert ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING == 3
-        assert ERROR_Code.ERROR_AT_CRM_SERVER == 4
         assert ERROR_Code.ERROR_AT_COMPO_INPUT_SERIALIZING == 5
         assert ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING == 6
         assert ERROR_Code.ERROR_AT_COMPO_CRM_CALLING == 7
-        assert ERROR_Code.ERROR_AT_COMPO_CLIENT == 8
-        assert ERROR_Code.ERROR_AT_FRAME_DECODING == 10
 
-    def test_has_exactly_10_members(self):
-        assert len(ERROR_Code) == 10
+    def test_has_exactly_7_members(self):
+        assert len(ERROR_Code) == 7
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -39,21 +35,21 @@ class TestCCError:
         assert err.message == 'Error occurred when using C-Two.'
 
     def test_custom_creation(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_CRM_SERVER, message='something broke')
-        assert err.code == ERROR_Code.ERROR_AT_CRM_SERVER
+        err = CCError(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message='something broke')
+        assert err.code == ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING
         assert err.message == 'something broke'
 
     def test_str_format(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_CRM_SERVER, message='oops')
-        assert str(err) == 'ERROR_AT_CRM_SERVER: oops'
+        err = CCError(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message='oops')
+        assert str(err) == 'ERROR_AT_CRM_FUNCTION_EXECUTING: oops'
 
     def test_str_format_default(self):
         err = CCError()
         assert str(err) == 'ERROR_UNKNOWN: Error occurred when using C-Two.'
 
     def test_repr_format(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_CRM_SERVER, message='oops')
-        assert repr(err) == 'CCError(code=4, message=oops)'
+        err = CCError(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message='oops')
+        assert repr(err) == 'CCError(code=3, message=oops)'
 
     def test_repr_format_default(self):
         err = CCError()
@@ -71,7 +67,7 @@ class TestCCError:
 
 class TestCCErrorSerialization:
     def test_round_trip(self):
-        original = CCError(code=ERROR_Code.ERROR_AT_CRM_SERVER, message='test msg')
+        original = CCError(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message='test msg')
         data = CCError.serialize(original)
         restored = CCError.deserialize(memoryview(data))
         assert restored is not None
@@ -92,8 +88,8 @@ class TestCCErrorSerialization:
         assert restored.message == 'host:port:extra'
 
     def test_serialize_produces_expected_bytes(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_CRM_SERVER, message='hello')
-        assert CCError.serialize(err) == b'4:hello'
+        err = CCError(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message='hello')
+        assert CCError.serialize(err) == b'3:hello'
 
     def test_round_trip_default_error(self):
         original = CCError()
@@ -108,12 +104,9 @@ SUBCLASS_PARAMS = [
     (CRMDeserializeInput,   ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING,    'deserializing input at CRM'),
     (CRMSerializeOutput,    ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING,     'serializing output at CRM'),
     (CRMExecuteFunction,    ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING,     'executing function at CRM'),
-    (CRMServerError,        ERROR_Code.ERROR_AT_CRM_SERVER,                 'at CRM server'),
     (CompoSerializeInput,   ERROR_Code.ERROR_AT_COMPO_INPUT_SERIALIZING,    'serializing input at Compo'),
     (CompoDeserializeOutput,ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING, 'deserializing output at Compo'),
     (CompoCRMCalling,       ERROR_Code.ERROR_AT_COMPO_CRM_CALLING,          'calling CRM from Compo'),
-    (CompoClientError,      ERROR_Code.ERROR_AT_COMPO_CLIENT,               'at Compo client'),
-    (FrameDecodeError,      ERROR_Code.ERROR_AT_FRAME_DECODING,             'decoding IPC frame'),
 ]
 
 
@@ -149,12 +142,9 @@ ALL_SUBCLASSES = [
     error.CRMDeserializeInput,
     error.CRMSerializeOutput,
     error.CRMExecuteFunction,
-    error.CRMServerError,
     error.CompoSerializeInput,
     error.CompoDeserializeOutput,
     error.CompoCRMCalling,
-    error.CompoClientError,
-    error.FrameDecodeError,
 ]
 
 

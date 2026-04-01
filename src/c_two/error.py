@@ -7,27 +7,12 @@ class ERROR_Code(IntEnum):
     ERROR_AT_CRM_INPUT_DESERIALIZING        = 1
     ERROR_AT_CRM_OUTPUT_SERIALIZING         = 2
     ERROR_AT_CRM_FUNCTION_EXECUTING         = 3
-    ERROR_AT_CRM_SERVER                     = 4
     ERROR_AT_COMPO_INPUT_SERIALIZING        = 5
     ERROR_AT_COMPO_OUTPUT_DESERIALIZING     = 6
     ERROR_AT_COMPO_CRM_CALLING              = 7
-    ERROR_AT_COMPO_CLIENT                   = 8
-    ERROR_AT_FRAME_DECODING                 = 10
 
 class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
-
-
-class MemoryPressureError(CCBaseError):
-    """Raised when a buddy pool allocation fails and the payload is too large
-    for inline fallback (exceeds ``max_frame_size``).
-
-    Callers may retry after freeing resources or reconfiguring the pool.
-    """
-
-    def __init__(self, message: str | None = None):
-        self.message = message or 'Buddy pool exhausted and payload exceeds inline limit'
-        super().__init__(self.message)
 
 class CCError(CCBaseError):
     """
@@ -104,11 +89,6 @@ class CRMExecuteFunction(CCError):
         message = 'Error occurred when executing function at CRM' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message=message)
 
-class CRMServerError(CCError):
-    def __init__(self, message: str | None = None):
-        message = 'Error occurred at CRM server' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CRM_SERVER, message=message)
-
 class CompoSerializeInput(CCError):
     def __init__(self, message: str | None = None):
         message = 'Error occurred when serializing input at Compo' + (f':\n{message}' if message else '')
@@ -123,25 +103,12 @@ class CompoCRMCalling(CCError):
     def __init__(self, message: str | None = None):
         message = 'Error occurred when calling CRM from Compo' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_COMPO_CRM_CALLING, message=message)
-        
-class CompoClientError(CCError):
-    def __init__(self, message: str | None = None):
-        message = 'Error occurred at Compo client' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_COMPO_CLIENT, message=message)
-
-class FrameDecodeError(CCError):
-    def __init__(self, message: str | None = None):
-        message = 'Error occurred when decoding IPC frame' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_FRAME_DECODING, message=message)
 
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING:    CRMDeserializeInput,
     ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING:     CRMSerializeOutput,
     ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING:     CRMExecuteFunction,
-    ERROR_Code.ERROR_AT_CRM_SERVER:                 CRMServerError,
     ERROR_Code.ERROR_AT_COMPO_INPUT_SERIALIZING:    CompoSerializeInput,
     ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING: CompoDeserializeOutput,
     ERROR_Code.ERROR_AT_COMPO_CRM_CALLING:          CompoCRMCalling,
-    ERROR_Code.ERROR_AT_COMPO_CLIENT:               CompoClientError,
-    ERROR_Code.ERROR_AT_FRAME_DECODING:             FrameDecodeError,
 }

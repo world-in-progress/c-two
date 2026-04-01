@@ -186,9 +186,6 @@ cython_debug/
 *.pptx
 *.arrow
 
-template/
-temp/
-
 Dockerfile
 log/
 # Rust build artifacts (maturin)
