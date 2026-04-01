@@ -80,7 +80,6 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 | `server/native.py` | `NativeServerBridge` (exported as `Server`) — Python↔Rust server bridge |
 | `server/scheduler.py` | Read/write-aware CRM method execution scheduler |
 | `server/reply.py` | `unpack_icrm_result` + `wrap_error` — CRM reply handling |
-| `client/core.py` | `SharedClient` — backward-compatible Python wrapper around `RustClient` |
 | `client/proxy.py` | `ICRMProxy` — unified proxy supporting both thread-local and IPC modes |
 | `client/util.py` | Standalone `ping()` and `shutdown()` — lightweight server probes via raw UDS |
 
