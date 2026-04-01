@@ -759,3 +759,41 @@ git commit -m "chore: final Phase 4 cleanup — verify no dangling imports"
 | 9 | Fix/delete broken tests | ~-400 |
 | 10 | Final verification | ~0 |
 | **Total** | | **~-2800 lines** |
+
+---
+
+## Post-Phase 4: Remaining Work
+
+### Phase 5: SharedClient Migration (Blocked → Ready)
+
+**Scope**: Delete `client/core.py` (85L) + `client/util.py` (91L) by migrating all 11 test files + `conftest.py` from `SharedClient` API to `cc.connect()` / `cc.close()` SOTA API.
+
+**Files requiring migration**:
+
+| File | SharedClient Uses | Migration Strategy |
+|------|-------------------|-------------------|
+| `tests/conftest.py` | `SharedClient.ping` in fixtures | Replace with `from c_two.transport.client.util import ping` |
+| `tests/integration/test_server.py` | 20+ uses | Largest file — migrate to `cc.connect(ICRM, name=..., address=addr)` |
+| `tests/integration/test_concurrency_safety.py` | 4 test classes | Migrate to SOTA API |
+| `tests/integration/test_dynamic_pool.py` | Multiple | Migrate to SOTA API |
+| `tests/integration/test_heartbeat.py` | Multiple | Migrate to SOTA API |
+| `tests/integration/test_multi_crm_server.py` | Multiple | Migrate to SOTA API |
+| `tests/integration/test_icrm_proxy.py` | Multiple | Migrate to SOTA API |
+| `tests/integration/test_error_propagation.py` | Multiple | Migrate to SOTA API |
+| `tests/integration/test_registry.py` | Multiple | Migrate to SOTA API |
+| `tests/unit/test_icrm_proxy.py` | Multiple | Migrate to SOTA API |
+| `tests/unit/test_shared_client.py` | Entire file | Delete or convert to RustClient tests |
+| `src/c_two/transport/registry.py:302` | Comment only | Already uses RustClientPool (comment fixed) |
+
+**Recommended approach**:
+1. New branch `phase5/remove-shared-client` from `phase4/cleanup`
+2. Start with `conftest.py` (fixture changes affect all tests)
+3. Then `test_server.py` (most complex, 20+ uses)
+4. Then remaining integration tests
+5. Finally delete `client/core.py`, `client/util.py`, update `client/__init__.py`
+
+### Other Future Work
+
+- **RustAsyncClient** (spec §3.4) — `cc.connect_async()` + async ICRMProxy
+- **IpcConfig unification** — merge c2-server and c2-ipc configs into c2-wire
+- **`_MAX_HANDSHAKE_*` constants** — move to Rust (c2-wire) to allow protocol.py deletion

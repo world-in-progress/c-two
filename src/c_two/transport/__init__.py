@@ -1,7 +1,7 @@
 """Transport layer for C-Two.
 
 Provides the complete transport stack for C-Two:
-- Server: asyncio-based multi-CRM IPC server
+- Server: Rust tokio-based multi-CRM IPC server (via NativeServerBridge)
 - SharedClient: thin compatibility wrapper around Rust IPC client
 - ICRMProxy: unified proxy (thread-local / IPC / HTTP)
 - Registry: cc.register/connect/close/shutdown SOTA API

@@ -298,7 +298,7 @@ class _ProcessRegistry:
                 on_terminate=lambda addr=address: self._http_pool.release(addr),
             )
         elif address is not None:
-            # Remote IPC via pooled SharedClient.
+            # Remote IPC via pooled RustClient.
             client = self._pool.acquire(address)
             proxy = ICRMProxy.ipc(
                 client,
