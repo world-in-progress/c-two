@@ -344,7 +344,7 @@ def decode_frame(body: bytes) -> tuple[int, int, bytes]:
     """Decode a frame body (without the leading 4-byte total_len) into ``(request_id, flags, payload)``."""
     body_len = len(body)
     if body_len < 12:
-        raise error.EventDeserializeError(f'Frame body too small: {body_len} < 12')
+        raise error.FrameDecodeError(f'Frame body too small: {body_len} < 12')
     request_id, flags = U64_STRUCT.unpack_from(body, 0)[0], U32_STRUCT.unpack_from(body, 8)[0]
     payload = body[12:]
     return request_id, flags, payload

@@ -16,7 +16,7 @@ from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
     CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
     CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    EventSerializeError, EventDeserializeError,
+    FrameDecodeError,
 )
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello, HelloData
@@ -149,7 +149,7 @@ class TestCompoClientError:
 ALL_SUBCLASSES = [
     CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
     CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    EventSerializeError, EventDeserializeError,
+    FrameDecodeError,
 ]
 
 

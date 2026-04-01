@@ -1,7 +1,6 @@
 from importlib.metadata import version
 __version__ = version('c-two')
 
-from . import mcp
 from . import compo
 from . import error
 from .compo import runtime

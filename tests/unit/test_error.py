@@ -4,7 +4,7 @@ from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
     CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
     CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    EventSerializeError, EventDeserializeError,
+    FrameDecodeError,
 )
 
 
@@ -19,11 +19,10 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING == 6
         assert ERROR_Code.ERROR_AT_COMPO_CRM_CALLING == 7
         assert ERROR_Code.ERROR_AT_COMPO_CLIENT == 8
-        assert ERROR_Code.ERROR_AT_EVENT_SERIALIZING == 9
-        assert ERROR_Code.ERROR_AT_EVENT_DESERIALIZING == 10
+        assert ERROR_Code.ERROR_AT_FRAME_DECODING == 10
 
-    def test_has_exactly_11_members(self):
-        assert len(ERROR_Code) == 11
+    def test_has_exactly_10_members(self):
+        assert len(ERROR_Code) == 10
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -114,8 +113,7 @@ SUBCLASS_PARAMS = [
     (CompoDeserializeOutput,ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING, 'deserializing output at Compo'),
     (CompoCRMCalling,       ERROR_Code.ERROR_AT_COMPO_CRM_CALLING,          'calling CRM from Compo'),
     (CompoClientError,      ERROR_Code.ERROR_AT_COMPO_CLIENT,               'at Compo client'),
-    (EventSerializeError,   ERROR_Code.ERROR_AT_EVENT_SERIALIZING,          'serializing event'),
-    (EventDeserializeError, ERROR_Code.ERROR_AT_EVENT_DESERIALIZING,        'deserializing event'),
+    (FrameDecodeError,      ERROR_Code.ERROR_AT_FRAME_DECODING,             'decoding IPC frame'),
 ]
 
 
@@ -156,8 +154,7 @@ ALL_SUBCLASSES = [
     error.CompoDeserializeOutput,
     error.CompoCRMCalling,
     error.CompoClientError,
-    error.EventSerializeError,
-    error.EventDeserializeError,
+    error.FrameDecodeError,
 ]
 
 
