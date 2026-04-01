@@ -114,7 +114,11 @@ impl Server {
             spill_threshold: 0.8,
             spill_dir: PathBuf::from("/tmp/c_two_response_spill"),
         };
-        let mut response_pool = MemPool::new(response_cfg);
+        let mut response_pool = {
+            let pid = std::process::id();
+            let prefix = format!("/cc3r{:08x}", pid);
+            MemPool::new_with_prefix(response_cfg, prefix)
+        };
         response_pool.ensure_ready()
             .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
         Ok(Self {
