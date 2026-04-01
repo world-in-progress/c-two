@@ -116,6 +116,19 @@ pub struct IpcClient {
     connected: Arc<AtomicBool>,
 }
 
+// Compile-time assertion: IpcClient is Send+Sync because all fields are
+// Arc-wrapped (Send+Sync), atomic (Send+Sync), or standard collections
+// of Send+Sync types. This is required for safe use from PyO3 frozen
+// pyclass wrappers under Python 3.14t free-threading.
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+    fn _assertions() {
+        _assert_send::<IpcClient>();
+        _assert_sync::<IpcClient>();
+    }
+};
+
 impl IpcClient {
     /// Create a new IPC client targeting the given address.
     ///
