@@ -1,6 +1,6 @@
 """Integration tests for the HTTP relay chain.
 
-Tests the full pipeline:  HttpClient → NativeRelay → SharedClient → Server → CRM
+Tests the full pipeline:  RustHttpClient → NativeRelay → RustClient → Server → CRM
 
 Also tests ``cc.connect(address='http://...')`` end-to-end.
 """
@@ -15,8 +15,7 @@ import pytest
 import httpx
 
 import c_two as cc
-from c_two._native import NativeRelay
-from c_two.transport.client.http import HttpClient
+from c_two._native import NativeRelay, RustHttpClientPool
 from c_two.transport.client.proxy import ICRMProxy
 from c_two.transport.registry import _ProcessRegistry
 
@@ -43,10 +42,24 @@ def _next_id() -> int:
 def _wait_for_relay(url: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if HttpClient.ping(url, timeout=0.5):
-            return
+        try:
+            resp = httpx.get(f'{url}/health', timeout=0.5)
+            if resp.status_code == 200:
+                return
+        except Exception:
+            pass
         time.sleep(0.1)
     raise TimeoutError(f'Relay at {url} not ready after {timeout}s')
+
+
+def _acquire_http(url: str):
+    """Acquire a RustHttpClient from the singleton pool."""
+    return RustHttpClientPool.instance().acquire(url)
+
+
+def _release_http(url: str):
+    """Release a RustHttpClient reference back to the pool."""
+    RustHttpClientPool.instance().release(url)
 
 
 # ---------------------------------------------------------------------------
@@ -102,43 +115,43 @@ class TestHttpRelayFullChain:
     def test_hello_via_http(self, relay_stack):
         """Simple string call through HTTP relay."""
         relay_url, _ = relay_stack
-        client = HttpClient(relay_url)
+        client = _acquire_http(relay_url)
         try:
             icrm = IHello()
             icrm.client = ICRMProxy.http(client, 'hello')
             result = icrm.greeting('HTTP')
             assert result == 'Hello, HTTP!'
         finally:
-            client.terminate()
+            _release_http(relay_url)
 
     def test_add_via_http(self, relay_stack):
         """Numeric call through HTTP relay."""
         relay_url, _ = relay_stack
-        client = HttpClient(relay_url)
+        client = _acquire_http(relay_url)
         try:
             icrm = IHello()
             icrm.client = ICRMProxy.http(client, 'hello')
             result = icrm.add(42, 58)
             assert result == 100
         finally:
-            client.terminate()
+            _release_http(relay_url)
 
     def test_get_items_via_http(self, relay_stack):
         """List return through HTTP relay."""
         relay_url, _ = relay_stack
-        client = HttpClient(relay_url)
+        client = _acquire_http(relay_url)
         try:
             icrm = IHello()
             icrm.client = ICRMProxy.http(client, 'hello')
             result = icrm.get_items([10, 20, 30])
             assert result == ['item-10', 'item-20', 'item-30']
         finally:
-            client.terminate()
+            _release_http(relay_url)
 
     def test_get_data_transferable_via_http(self, relay_stack):
         """Custom transferable round-trip through HTTP relay."""
         relay_url, _ = relay_stack
-        client = HttpClient(relay_url)
+        client = _acquire_http(relay_url)
         try:
             icrm = IHello()
             icrm.client = ICRMProxy.http(client, 'hello')
@@ -146,12 +159,12 @@ class TestHttpRelayFullChain:
             assert result.name == 'data-5'
             assert result.value == 50
         finally:
-            client.terminate()
+            _release_http(relay_url)
 
     def test_multi_crm_routing(self, relay_stack):
         """Route to different CRMs by name through HTTP relay."""
         relay_url, _ = relay_stack
-        client = HttpClient(relay_url)
+        client = _acquire_http(relay_url)
         try:
             # Hello CRM
             hello = IHello()
@@ -165,22 +178,22 @@ class TestHttpRelayFullChain:
             counter.increment(1)
             assert counter.get() == 2
         finally:
-            client.terminate()
+            _release_http(relay_url)
 
     def test_health_endpoint(self, relay_stack):
-        """GET /health returns JSON."""
+        """GET /health returns OK."""
         relay_url, _ = relay_stack
-        client = HttpClient(relay_url)
+        client = _acquire_http(relay_url)
         try:
             health = client.health()
-            assert health['status'] == 'ok'
+            assert health is True
         finally:
-            client.terminate()
+            _release_http(relay_url)
 
     def test_concurrent_http_calls(self, relay_stack):
         """Multiple threads calling through HTTP relay."""
         relay_url, _ = relay_stack
-        client = HttpClient(relay_url)
+        client = _acquire_http(relay_url)
         errors: list[str] = []
         n_threads = 8
         n_calls = 5
@@ -204,7 +217,7 @@ class TestHttpRelayFullChain:
                 t.join(timeout=60)
             assert errors == [], f'Errors: {errors}'
         finally:
-            client.terminate()
+            _release_http(relay_url)
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +311,13 @@ class TestRelayControlPlane:
                 assert any(r['name'] == 'hello' for r in routes)
 
             # Verify data-plane call works.
-            client = HttpClient(relay_url)
+            client = _acquire_http(relay_url)
             try:
                 icrm = IHello()
                 icrm.client = ICRMProxy.http(client, 'hello')
                 assert icrm.greeting('Control') == 'Hello, Control!'
             finally:
-                client.terminate()
+                _release_http(relay_url)
         finally:
             relay.stop()
 

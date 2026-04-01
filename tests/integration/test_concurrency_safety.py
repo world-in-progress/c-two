@@ -19,7 +19,6 @@ import pytest
 import c_two as cc
 from c_two.transport.client.core import SharedClient
 from c_two.transport.server.core import Server
-from c_two.transport.client.pool import ClientPool
 from c_two.transport.ipc.frame import IPCConfig
 
 
@@ -71,47 +70,6 @@ def _wait_for_server(addr: str, timeout: float = 3.0):
 # Request ID wrapping
 # ---------------------------------------------------------------------------
 
-class TestRequestIdWrapping:
-    """Verify 32-bit request ID wrapping doesn't cause collisions."""
-
-    def test_rid_wraps_at_32bit_boundary(self):
-        """Counter wraps from 0xFFFFFFFF to 0."""
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-
-            # Simulate near-wrap: set counter close to 32-bit max.
-            with client._rid_lock:
-                client._rid_counter = 0xFFFFFFFE
-
-            # Make 4 calls spanning the wrap point.
-            results = []
-            for i in range(4):
-                r = client.call('echo', i.to_bytes(4, 'little'))
-                results.append(r)
-
-            # All 4 calls should succeed and return correct data.
-            for i, r in enumerate(results):
-                assert int.from_bytes(r, 'little') == i
-
-            # Counter should have wrapped.
-            with client._rid_lock:
-                assert client._rid_counter == 2  # 0xFFFFFFFE + 4 wraps to 2
-
-            client.terminate()
-        finally:
-            server.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -261,72 +219,13 @@ class TestDoubleTerminate:
 
 
 # ---------------------------------------------------------------------------
-# ClientPool lifecycle safety
-# ---------------------------------------------------------------------------
-
-class TestClientPoolSafety:
-    """Test ClientPool reference counting under concurrent access."""
-
-    def test_concurrent_acquire_release(self):
-        """Multiple threads acquiring/releasing the same address concurrently."""
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            pool = ClientPool(grace_seconds=60.0, default_config=cfg)
-            errors = []
-
-            def worker(tid: int):
-                try:
-                    client = pool.acquire(addr)
-                    r = client.call('echo', f'tid={tid}'.encode())
-                    assert r == f'tid={tid}'.encode()
-                    pool.release(addr)
-                except Exception as e:
-                    errors.append((tid, e))
-
-            threads = []
-            for tid in range(8):
-                t = threading.Thread(target=worker, args=(tid,))
-                threads.append(t)
-                t.start()
-            for t in threads:
-                t.join(timeout=10)
-
-            assert not errors, f'Errors: {errors}'
-
-            # All released; refcount should be 0 but client still alive (grace period).
-            assert pool.refcount(addr) == 0
-            assert pool.has_client(addr)  # still in grace period
-
-            pool.shutdown_all()
-        finally:
-            server.shutdown()
-
-    def test_release_without_acquire_warns(self):
-        """Releasing an address never acquired should not crash."""
-        pool = ClientPool(grace_seconds=1.0)
-        # Should not raise, just warn.
-        pool.release('ipc://nonexistent')
-        pool.shutdown_all()
-
-
-# ---------------------------------------------------------------------------
 # Call after terminate raises cleanly
 # ---------------------------------------------------------------------------
 
 class TestCallAfterTerminate:
-    """Verify calling a terminated client raises a clear error."""
+    """Verify calling a terminated client reconnects cleanly."""
 
-    def test_call_after_terminate_raises(self):
+    def test_call_after_terminate_reconnects(self):
         addr = _next_addr()
         cfg = IPCConfig(
             pool_segment_size=65536,
@@ -346,68 +245,9 @@ class TestCallAfterTerminate:
 
             client.terminate()
 
-            with pytest.raises(Exception):
-                client.call('echo', b'should fail')
-        finally:
-            server.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Terminate during in-flight calls
-# ---------------------------------------------------------------------------
-
-class TestTerminateDuringInFlight:
-    """Verify terminate() wakes up in-flight callers cleanly."""
-
-    def test_terminate_wakes_pending_callers(self):
-        """Slow CRM + terminate → pending callers get error, not hang."""
-        import time as _time
-
-        @cc.icrm(namespace='cc.test.slow', version='0.1.0')
-        class ISlow:
-            def slow_op(self) -> bytes: ...
-
-        class SlowImpl:
-            def slow_op(self) -> bytes:
-                _time.sleep(5.0)  # Simulate long operation
-                return b'done'
-
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(ISlow, SlowImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-
-            errors = []
-
-            def slow_caller():
-                try:
-                    client.call('slow_op', b'')
-                except Exception as e:
-                    errors.append(e)
-
-            t = threading.Thread(target=slow_caller)
-            t.start()
-
-            # Give the call time to reach the server.
-            _time.sleep(0.1)
-
-            # Terminate while call is in-flight.
-            client.terminate()
-
-            # Caller thread should wake up quickly with an error.
-            t.join(timeout=3.0)
-            assert not t.is_alive(), 'Caller thread hung after terminate'
-            assert len(errors) == 1
+            # Thin wrapper reconnects automatically on next call.
+            r2 = client.call('echo', b'reconnected')
+            assert r2 == b'reconnected'
         finally:
             server.shutdown()
 

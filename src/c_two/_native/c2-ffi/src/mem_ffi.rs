@@ -16,22 +16,22 @@ use pyo3::types::PyBytes;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Python-visible pool configuration.
-#[pyclass(name = "PoolConfig")]
+#[pyclass(name = "PoolConfig", frozen)]
 #[derive(Debug, Clone)]
 pub struct PyPoolConfig {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub segment_size: usize,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub min_block_size: usize,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub max_segments: usize,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub max_dedicated_segments: usize,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub dedicated_gc_delay_secs: f64,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub spill_threshold: f64,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub spill_dir: String,
 }
 
@@ -108,7 +108,7 @@ impl From<&PyPoolConfig> for PoolConfig {
 }
 
 /// Python-visible allocation result.
-#[pyclass(name = "PoolAlloc")]
+#[pyclass(name = "PoolAlloc", frozen)]
 #[derive(Debug, Clone)]
 pub struct PyPoolAlloc {
     #[pyo3(get)]
@@ -146,7 +146,7 @@ impl From<PoolAllocation> for PyPoolAlloc {
 }
 
 /// Python-visible pool statistics.
-#[pyclass(name = "PoolStats")]
+#[pyclass(name = "PoolStats", frozen)]
 #[derive(Debug, Clone)]
 pub struct PyPoolStats {
     #[pyo3(get)]
@@ -185,7 +185,7 @@ impl PyPoolStats {
 /// take a shared read lock; mutating operations (`alloc`, `alloc_ptr`,
 /// `free`, `free_at`, `open_segment`, `gc`, `destroy`) take an exclusive
 /// write lock.  This allows concurrent readers without blocking.
-#[pyclass(name = "MemPool")]
+#[pyclass(name = "MemPool", frozen)]
 pub struct PyMemPool {
     pool: Arc<RwLock<MemPool>>,
 }

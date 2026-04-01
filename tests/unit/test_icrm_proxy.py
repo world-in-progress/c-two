@@ -26,14 +26,14 @@ class _DummyCRM:
 # ---------------------------------------------------------------------------
 
 class _DummySharedClient:
-    """Fake SharedClient recording calls."""
+    """Fake SharedClient recording calls (Rust client API)."""
 
     def __init__(self):
         self.calls: list[tuple] = []
         self.relays: list[bytes] = []
 
-    def call(self, method_name: str, data: bytes | None = None, *, name: str | None = None) -> bytes:
-        self.calls.append((method_name, data, name))
+    def call(self, route_name: str, method_name: str, data: bytes = b'') -> bytes:
+        self.calls.append((route_name, method_name, data))
         return b'result'
 
     def relay(self, event_bytes: bytes) -> bytes:
@@ -111,13 +111,13 @@ class TestIPCProxy:
         proxy = ICRMProxy.ipc(client, 'test.hello')
         result = proxy.call('greet', b'payload')
         assert result == b'result'
-        assert client.calls == [('greet', b'payload', 'test.hello')]
+        assert client.calls == [('test.hello', 'greet', b'payload')]
 
     def test_call_none_data(self):
         client = _DummySharedClient()
         proxy = ICRMProxy.ipc(client, 'ns')
         proxy.call('method')
-        assert client.calls == [('method', None, 'ns')]
+        assert client.calls == [('ns', 'method', b'')]
 
     def test_relay_delegates(self):
         client = _DummySharedClient()

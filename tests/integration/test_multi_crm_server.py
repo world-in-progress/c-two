@@ -194,18 +194,10 @@ class TestMultiCRMRouting:
         client = SharedClient(addr)
         client.connect()
         try:
-            # The method tables should contain methods from both routes.
-            name_tables = client._name_tables
-            assert 'hello' in name_tables
-            assert 'counter' in name_tables
-            # Verify method names.
-            hello_methods = name_tables['hello']
-            assert hello_methods.has_name('greeting')
-            assert hello_methods.has_name('add')
-            counter_methods = name_tables['counter']
-            assert counter_methods.has_name('get')
-            assert counter_methods.has_name('increment')
-            assert counter_methods.has_name('reset')
+            # Route names should contain both routes.
+            names = client.route_names()
+            assert 'hello' in names
+            assert 'counter' in names
         finally:
             client.terminate()
 
@@ -222,25 +214,6 @@ class TestMultiCRMRouting:
         finally:
             client.terminate()
 
-
-# ---------------------------------------------------------------------------
-# Tests — v1 backward compat with multi-CRM
-# ---------------------------------------------------------------------------
-
-class TestMultiCRMV1Compat:
-
-    def test_v1_uses_default_name(self, multi_crm_addr):
-        """V1 calls (no name in wire) route to the first registered CRM."""
-        addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
-        try:
-            result = pickle.loads(client.call(
-                'greeting', pickle.dumps(('V1Client',)),
-            ))
-            assert result == 'Hello, V1Client!'
-        finally:
-            client.terminate()
 
 
 # ---------------------------------------------------------------------------

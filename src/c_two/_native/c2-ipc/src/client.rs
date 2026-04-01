@@ -12,16 +12,39 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex, RwLock};
 
-use c2_wire::buddy::{decode_buddy_payload, BUDDY_PAYLOAD_SIZE};
-use c2_wire::control::{decode_reply_control, ReplyControl};
+use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
+use c2_wire::chunk::encode_chunk_header;
+use c2_wire::control::{decode_reply_control, encode_call_control, ReplyControl};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
     decode_handshake, encode_client_handshake, Handshake, MethodEntry,
-    CAP_CALL_V2, CAP_METHOD_IDX,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX,
 };
 
+use c2_mem::MemPool;
+
 use crate::shm::SegmentCache;
+
+// ── Config ───────────────────────────────────────────────────────────────
+
+/// Transport thresholds for IPC path selection.
+#[derive(Debug, Clone)]
+pub struct IpcConfig {
+    /// Data sizes above this use buddy SHM path (default 4096 bytes).
+    pub shm_threshold: usize,
+    /// Chunk size for chunked transfer (default 128 KB).
+    pub chunk_size: usize,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        Self {
+            shm_threshold: 4096,
+            chunk_size: 131072,
+        }
+    }
+}
 
 // ── Error type ───────────────────────────────────────────────────────────
 
@@ -38,6 +61,8 @@ pub enum IpcError {
     CrmError(Vec<u8>),
     /// Client is closed or connection lost.
     Closed,
+    /// Pool management error.
+    Pool(String),
 }
 
 impl std::fmt::Display for IpcError {
@@ -48,6 +73,7 @@ impl std::fmt::Display for IpcError {
             Self::Handshake(msg) => write!(f, "IPC handshake failed: {msg}"),
             Self::CrmError(_) => write!(f, "CRM method error"),
             Self::Closed => write!(f, "IPC client closed"),
+            Self::Pool(msg) => write!(f, "Pool error: {msg}"),
         }
     }
 }
@@ -114,6 +140,8 @@ pub struct IpcClient {
     seg_cache: Arc<RwLock<SegmentCache>>,
     recv_handle: Option<tokio::task::JoinHandle<()>>,
     connected: Arc<AtomicBool>,
+    pool: Option<Arc<StdMutex<MemPool>>>,
+    config: IpcConfig,
 }
 
 // Compile-time assertion: IpcClient is Send+Sync because all fields are
@@ -150,6 +178,37 @@ impl IpcClient {
             seg_cache: Arc::new(RwLock::new(SegmentCache::new())),
             recv_handle: None,
             connected: Arc::new(AtomicBool::new(false)),
+            pool: None,
+            config: IpcConfig::default(),
+        }
+    }
+
+    /// Create a new IPC client with a buddy pool for SHM transfers.
+    ///
+    /// The pool is used for outgoing buddy allocations when data exceeds
+    /// `config.shm_threshold`.
+    pub fn with_pool(
+        address: &str,
+        pool: Arc<StdMutex<MemPool>>,
+        config: IpcConfig,
+    ) -> Self {
+        let name = address
+            .strip_prefix("ipc://")
+            .unwrap_or(address);
+        let socket_path = PathBuf::from(format!("/tmp/c_two_ipc/{name}.sock"));
+
+        Self {
+            socket_path,
+            writer: Arc::new(Mutex::new(None)),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            rid_counter: AtomicU32::new(1),
+            route_tables: HashMap::new(),
+            server_segments: Vec::new(),
+            seg_cache: Arc::new(RwLock::new(SegmentCache::new())),
+            recv_handle: None,
+            connected: Arc::new(AtomicBool::new(false)),
+            pool: Some(pool),
+            config,
         }
     }
 
@@ -202,9 +261,23 @@ impl IpcClient {
         writer: &mut tokio::io::WriteHalf<UnixStream>,
         mut reader: tokio::io::ReadHalf<UnixStream>,
     ) -> Result<Handshake, IpcError> {
-        // We don't create SHM segments from the relay side — the relay
-        // reads from server segments only.  Send empty segments list.
-        let payload = encode_client_handshake(&[], CAP_CALL_V2 | CAP_METHOD_IDX, "");
+        // Build segment list and prefix from pool (if available).
+        let (segments, prefix, cap_flags) = if let Some(ref pool_arc) = self.pool {
+            let pool = pool_arc.lock().unwrap();
+            let count = pool.segment_count();
+            let mut segs = Vec::with_capacity(count);
+            for i in 0..count {
+                if let (Some(name), Some(seg)) = (pool.segment_name(i), pool.segment(i)) {
+                    segs.push((name.to_string(), seg.allocator().data_size() as u32));
+                }
+            }
+            let pfx = pool.prefix().to_string();
+            (segs, pfx, CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED)
+        } else {
+            (vec![], String::new(), CAP_CALL_V2 | CAP_METHOD_IDX)
+        };
+
+        let payload = encode_client_handshake(&segments, cap_flags, &prefix);
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &payload);
         writer.write_all(&frame_bytes).await?;
 
@@ -251,7 +324,7 @@ impl IpcClient {
         Ok(hs)
     }
 
-    /// Send a CRM call and wait for the response.
+    /// Send a CRM call and wait for the response (inline path only).
     ///
     /// This is the primary API for the relay: HTTP handler calls this
     /// with the route name, method name, and serialized payload.
@@ -269,6 +342,56 @@ impl IpcClient {
             .index_of(method_name)
             .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
 
+        self.call_inline(route_name, method_idx, data).await
+    }
+
+    /// Send a CRM call with automatic transport path selection.
+    ///
+    /// Selects the optimal transport based on data size and pool availability:
+    /// - Buddy SHM for data above `config.shm_threshold` (when pool available)
+    /// - Chunked transfer for data above `config.chunk_size`
+    /// - Inline for small payloads
+    pub async fn call_full(
+        &self,
+        route_name: &str,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<Vec<u8>, IpcError> {
+        let table = self
+            .route_tables
+            .get(route_name)
+            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
+        let method_idx = table
+            .index_of(method_name)
+            .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
+
+        // Try buddy SHM for large payloads when pool is available.
+        if self.pool.is_some() && data.len() > self.config.shm_threshold {
+            match self.call_buddy(route_name, method_idx, data).await {
+                Ok(result) => return Ok(result),
+                Err(IpcError::Handshake(_)) => {
+                    // Pool alloc failed — fall through to chunked/inline.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Use chunked transfer for data exceeding chunk size.
+        if data.len() > self.config.chunk_size {
+            return self.call_chunked(route_name, method_idx, data).await;
+        }
+
+        // Default: inline.
+        self.call_inline(route_name, method_idx, data).await
+    }
+
+    /// Inline call path — sends call control + data in a single frame.
+    async fn call_inline(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        data: &[u8],
+    ) -> Result<Vec<u8>, IpcError> {
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
 
         // Register pending call.
@@ -284,7 +407,7 @@ impl IpcClient {
         let total_len = (12 + payload_len) as u32;
         let frame_size = frame::HEADER_SIZE + payload_len;
 
-        {
+        let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
 
@@ -306,11 +429,172 @@ impl IpcClient {
                 hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
                 hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
                 hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
-                let ctrl = c2_wire::control::encode_call_control(route_name, method_idx);
+                let ctrl = encode_call_control(route_name, method_idx);
                 writer.write_all(&hdr_buf).await?;
                 writer.write_all(&ctrl).await?;
                 writer.write_all(data).await?;
             }
+            Ok(())
+        }.await;
+
+        if let Err(e) = send_result {
+            self.pending.lock().unwrap().remove(&rid);
+            return Err(e);
+        }
+
+        // Await response.
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(IpcError::Closed),
+        }
+    }
+
+    /// Buddy SHM call path — allocates from MemPool and sends buddy frame.
+    ///
+    /// The server reads data from SHM and frees the allocation.
+    async fn call_buddy(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        data: &[u8],
+    ) -> Result<Vec<u8>, IpcError> {
+        let pool_arc = self.pool.as_ref().unwrap();
+
+        // Allocate and write data to SHM.
+        let alloc = {
+            let mut pool = pool_arc.lock().unwrap();
+            pool.alloc(data.len()).map_err(|e| {
+                IpcError::Handshake(format!("buddy alloc failed: {e}"))
+            })?
+        };
+
+        // Write data into the SHM region.
+        {
+            let pool = pool_arc.lock().unwrap();
+            let ptr = match pool.data_ptr(&alloc) {
+                Ok(p) => p,
+                Err(e) => {
+                    drop(pool);
+                    let _ = pool_arc.lock().unwrap().free(&alloc);
+                    return Err(IpcError::Handshake(format!("buddy data_ptr failed: {e}")));
+                }
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            }
+        }
+
+        // Build buddy payload.
+        let bp = BuddyPayload {
+            seg_idx: alloc.seg_idx as u16,
+            offset: alloc.offset,
+            data_size: data.len() as u32,
+            is_dedicated: alloc.is_dedicated,
+        };
+        let buddy_bytes = encode_buddy_payload(&bp);
+
+        // Build call control.
+        let ctrl = encode_call_control(route_name, method_idx);
+
+        // Assemble frame payload: [11B buddy][call_control]
+        let payload_len = buddy_bytes.len() + ctrl.len();
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&buddy_bytes);
+        payload.extend_from_slice(&ctrl);
+
+        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Register pending call.
+        let (tx, rx) = oneshot::channel();
+        {
+            self.pending.lock().unwrap().insert(rid, tx);
+        }
+
+        // Send frame — free buddy allocation if send fails.
+        let frame_flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
+        let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
+        {
+            let mut writer_guard = self.writer.lock().await;
+            let writer = match writer_guard.as_mut() {
+                Some(w) => w,
+                None => {
+                    let _ = pool_arc.lock().unwrap().free(&alloc);
+                    self.pending.lock().unwrap().remove(&rid);
+                    return Err(IpcError::Closed);
+                }
+            };
+            if let Err(e) = writer.write_all(&frame_bytes).await {
+                let _ = pool_arc.lock().unwrap().free(&alloc);
+                self.pending.lock().unwrap().remove(&rid);
+                return Err(e.into());
+            }
+        }
+
+        // Await response (server frees the buddy allocation after reading).
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(IpcError::Closed),
+        }
+    }
+
+    /// Chunked call path — splits data into chunks and sends with FLAG_CHUNKED.
+    async fn call_chunked(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        data: &[u8],
+    ) -> Result<Vec<u8>, IpcError> {
+        let chunk_size = self.config.chunk_size;
+        let total_chunks = (data.len() + chunk_size - 1) / chunk_size;
+
+        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Register pending call ONCE — reply comes after last chunk.
+        let (tx, rx) = oneshot::channel();
+        {
+            self.pending.lock().unwrap().insert(rid, tx);
+        }
+
+        // Build call control (included only in chunk 0).
+        let ctrl = encode_call_control(route_name, method_idx);
+
+        let send_result: Result<(), IpcError> = async {
+            let mut writer_guard = self.writer.lock().await;
+            let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+
+            for i in 0..total_chunks {
+                let chunk_start = i * chunk_size;
+                let chunk_end = std::cmp::min(chunk_start + chunk_size, data.len());
+                let chunk_data = &data[chunk_start..chunk_end];
+
+                let is_last = i == total_chunks - 1;
+                let mut frame_flags = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED;
+                if is_last {
+                    frame_flags |= flags::FLAG_CHUNK_LAST;
+                }
+
+                let chunk_hdr = encode_chunk_header(i as u16, total_chunks as u16);
+
+                // Chunk 0 includes call_control; subsequent chunks are data-only.
+                let payload_len = chunk_hdr.len()
+                    + if i == 0 { ctrl.len() } else { 0 }
+                    + chunk_data.len();
+                let mut payload = Vec::with_capacity(payload_len);
+                payload.extend_from_slice(&chunk_hdr);
+                if i == 0 {
+                    payload.extend_from_slice(&ctrl);
+                }
+                payload.extend_from_slice(chunk_data);
+
+                let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
+                writer.write_all(&frame_bytes).await?;
+            }
+            Ok(())
+        }.await;
+
+        if let Err(e) = send_result {
+            self.pending.lock().unwrap().remove(&rid);
+            return Err(e);
         }
 
         // Await response.

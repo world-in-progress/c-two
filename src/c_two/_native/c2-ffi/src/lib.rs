@@ -10,9 +10,15 @@
 //! ```
 
 #[cfg(feature = "python")]
+mod client_ffi;
+#[cfg(feature = "python")]
+mod http_ffi;
+#[cfg(feature = "python")]
 mod mem_ffi;
 #[cfg(feature = "python")]
 mod relay_ffi;
+#[cfg(feature = "python")]
+mod server_ffi;
 #[cfg(feature = "python")]
 mod wire_ffi;
 
@@ -26,8 +32,11 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 #[pymodule(name = "_native", gil_used = false)]
 fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    client_ffi::register_module(m)?;
+    http_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;
     relay_ffi::register_module(m)?;
+    server_ffi::register_module(m)?;
     wire_ffi::register_module(m)?;
     Ok(())
 }

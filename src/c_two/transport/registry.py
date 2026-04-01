@@ -7,8 +7,8 @@ Provides a singleton :class:`_ProcessRegistry` that manages:
 2. **Thread preference** — ``connect()`` returns a zero-serialization
    :class:`ICRMProxy.thread_local` when the target CRM lives in the
    same process.
-3. **Client pooling** — remote connections reuse :class:`SharedClient`
-   instances via :class:`ClientPool`.
+3. **Client pooling** — remote connections reuse Rust IPC/HTTP clients
+   via :class:`RustClientPool` and :class:`RustHttpClientPool`.
 
 Usage::
 
@@ -45,11 +45,9 @@ from typing import TypeVar
 import httpx
 
 from .config import settings
-from .client.http import HttpClientPool
-from .client.pool import ClientPool
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
-from .server.core import Server
+from .server.native import NativeServerBridge as Server
 
 from ..crm.meta import MethodAccess
 from .ipc.frame import IPCConfig
@@ -117,8 +115,9 @@ class _ProcessRegistry:
         self._server_address: str | None = None
         self._explicit_address: str | None = None
         self._explicit_ipc_config: IPCConfig | None = None
-        self._pool = ClientPool()
-        self._http_pool = HttpClientPool()
+        from c_two._native import RustClientPool, RustHttpClientPool
+        self._pool = RustClientPool.instance()
+        self._http_pool = RustHttpClientPool.instance()
 
     # ------------------------------------------------------------------
     # Public API
@@ -227,8 +226,7 @@ class _ProcessRegistry:
                 ipc_cfg = self._build_ipc_config()
                 self._server = Server(bind_address=addr, ipc_config=ipc_cfg)
                 self._server_address = addr
-                # Share the same config with the client pool.
-                self._pool.set_default_config(ipc_cfg)
+                # Rust pool uses its own defaults; skip Python IPCConfig.
 
             self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
             scheduler, access_map = self._server.get_slot_info(name)

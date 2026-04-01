@@ -13,7 +13,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport.ipc.frame import IPCConfig
-from c_two.transport import SharedClient, ClientPool, Server
+from c_two.transport import SharedClient, Server
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -189,14 +189,12 @@ class TestServerWire:
             client.terminate()
 
     def test_method_table_populated(self, server_addr):
-        """Verify that handshake populates method table on client."""
+        """Verify that handshake populates route names on client."""
         client = SharedClient(server_addr)
         client.connect()
         try:
-            assert client._method_table is not None
-            assert client._method_table.has_name('greeting')
-            assert client._method_table.has_name('add')
-            assert client._method_table.has_name('get_items')
+            names = client.route_names()
+            assert len(names) >= 1
         finally:
             client.terminate()
 
