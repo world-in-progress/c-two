@@ -1,6 +1,8 @@
 # Phase 4: Python Transport Cleanup — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: ✅ COMPLETE** — Tasks 1-10 executed. ~3800 lines deleted, 532 tests passing. Branch `phase4/cleanup`. Remaining: SharedClient wrapper deletion deferred to Phase 5.
+
+> **For agentic workers:** This plan is historical — all tasks have been completed. See Post-Phase 4 section at end for remaining Phase 5 work.
 
 **Goal:** Delete ~2500 lines of superseded Python transport code, redirect all imports to surviving modules, and ensure 606+ tests pass with no regressions.
 

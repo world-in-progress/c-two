@@ -1,6 +1,8 @@
 # Heartbeat Detection Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: ✅ COMPLETE** — Implemented in v0.3.0. Server-side heartbeat now runs in Rust (`c2-server`); Python heartbeat code was removed in Phase 4 cleanup (2026-04-01).
+
+> **For agentic workers:** This plan is historical — all tasks have been completed.
 
 **Goal:** Implement server-side heartbeat probing, connection idle cleanup, and SHM orphan cleanup so dead clients are detected, connections torn down, and leaked shared memory reclaimed.
 

@@ -1,5 +1,7 @@
 # 统一内存降级链设计：SHM Pool 动态扩容 + 磁盘溢写兜底
 
+> **Status: ✅ COMPLETE** — Full three-tier memory system implemented in `c2-mem` crate: buddy SHM (dynamic expansion), dedicated SHM, and file-spill fallback. See `disk-spill-memhandle-design.md` for final implementation details.
+
 > Date: 2026-03-30
 > Status: Approved
 > Scope: `c_two._native/c2-buddy` (Rust) + `c_two.transport` (Python)

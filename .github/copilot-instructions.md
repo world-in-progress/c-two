@@ -74,13 +74,15 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 |------|---------|
 | `registry.py` | SOTA API surface: `cc.register()`, `cc.connect()`, `cc.close()`, `cc.shutdown()` etc. |
 | `config.py` | `C2Settings` pydantic model — env vars `C2_IPC_ADDRESS`, `C2_RELAY_ADDRESS` etc. |
-| `protocol.py` | Handshake codec, `Handshake` dataclass, capability negotiation |
-| `wire.py` | `MethodTable` — maps ICRM method names to indices for wire dispatch |
+| `protocol.py` | Re-export facade for Rust handshake codec — `Handshake`, `RouteInfo`, flag constants |
+| `wire.py` | `MethodTable` — maps ICRM method names to indices for wire dispatch; thin FFI wrappers |
+| `ipc/frame.py` | `IPCConfig` dataclass — transport tuning (SHM threshold, pool size, heartbeat, etc.) |
 | `server/native.py` | `NativeServerBridge` (exported as `Server`) — Python↔Rust server bridge |
 | `server/scheduler.py` | Read/write-aware CRM method execution scheduler |
 | `server/reply.py` | `unpack_icrm_result` + `wrap_error` — CRM reply handling |
 | `client/core.py` | `SharedClient` — backward-compatible Python wrapper around `RustClient` |
 | `client/proxy.py` | `ICRMProxy` — unified proxy supporting both thread-local and IPC modes |
+| `client/util.py` | Standalone `ping()` and `shutdown()` — lightweight server probes via raw UDS |
 
 **Transport modes:**
 - **Thread-local** (same process): `cc.connect()` returns a zero-serialization proxy that calls CRM methods directly.
@@ -193,7 +195,7 @@ Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Err
 - CRM routing names: user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)` — distinct from ICRM namespace
 
 ### Performance-Sensitive Code
-Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize zero-copy and single-allocation patterns. The Python `wire.py` retains only `MethodTable` (method-name → index mapping) used by `NativeServerBridge` for dispatch. The `thread://` transport skips serialization entirely. SHM segments use deterministic naming for lazy peer-side opening — no explicit segment announcement protocol is needed. The buddy allocator's `alloc()`/`free_at()` are thread-safe.
+Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize zero-copy and single-allocation patterns. The Python `wire.py` retains `MethodTable` (method-name → index mapping) used by `NativeServerBridge` for dispatch, `payload_total_size` (scatter-write aware), and thin wrappers for `decode_call_control`/`encode_reply_control`/`decode_reply_control` that preserve Python default arguments (`offset=0`, `error_data=None`). The `thread://` transport skips serialization entirely. SHM segments use deterministic naming for lazy peer-side opening — no explicit segment announcement protocol is needed. The buddy allocator's `alloc()`/`free_at()` are thread-safe.
 
 ### Environment Variables
 | Variable | Purpose | Default |

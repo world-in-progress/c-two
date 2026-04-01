@@ -1,5 +1,7 @@
 # Rust Native Module Redesign: Three-Tier Memory Architecture
 
+> **Status: ✅ SUPERSEDED** — Original 3-crate design (c2-alloc/c2-segment/c2-mempool) was consolidated into unified `c2-mem` crate. See `disk-spill-memhandle-design.md` for the final architecture.
+
 **Date:** 2026-03-31
 **Status:** Draft
 **Scope:** Restructure `c2-buddy` into three Rust crates + rename Python interfaces

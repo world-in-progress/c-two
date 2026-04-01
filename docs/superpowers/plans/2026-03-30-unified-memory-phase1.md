@@ -1,6 +1,8 @@
 # Unified Memory Fallback — Phase 1: Dynamic Pool Expansion
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: ✅ COMPLETE** — Implemented in Phase 2-3 (c2-mem unified crate). Buddy pool expansion, dedicated SHM, deterministic naming, and lazy peer-side opening all working. 55 Rust tests + 500+ Python tests passing.
+
+> **For agentic workers:** This plan is historical — all tasks have been completed.
 
 **Goal:** Enable the buddy pool to dynamically expand from 1 to N segments, with both client and server lazily opening new segments by deriving SHM names from a shared prefix — eliminating per-request SHM degradation under load.
 

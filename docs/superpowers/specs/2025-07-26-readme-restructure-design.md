@@ -1,5 +1,7 @@
 # README Restructure Design Spec
 
+> **Status: ✅ COMPLETE** — README.md and README.zh-CN.md published.
+
 **Date**: 2025-07-26
 **Scope**: Rewrite README.md (English, primary) + create README.zh-CN.md (Chinese mirror)
 **Constraint**: No "SOTA" terminology. No MCP/Seed/CRM Template sections.

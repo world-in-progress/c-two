@@ -1,5 +1,7 @@
 # CI/CD Workflows Design Spec
 
+> **Status: ✅ COMPLETE** — CI and release workflows deployed. See `.github/workflows/`.
+
 **Date**: 2025-07-26
 **Scope**: P1 §2.3 — PR 测试 + 版本门控发布 + 多平台 wheel 构建
 **Target repo**: `world-in-progress/c-two`
