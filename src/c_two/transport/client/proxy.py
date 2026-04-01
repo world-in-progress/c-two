@@ -60,7 +60,7 @@ class ICRMProxy:
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
         '_closed', '_close_lock', '_on_terminate',
-        '_scheduler', '_access_map', '_rust_ipc',
+        '_scheduler', '_access_map', '_rust_ipc', '_rust_http',
     )
 
     # ------------------------------------------------------------------
@@ -102,6 +102,7 @@ class ICRMProxy:
         proxy._scheduler = scheduler
         proxy._access_map = access_map
         proxy._rust_ipc = False
+        proxy._rust_http = False
         return proxy
 
     @classmethod
@@ -129,6 +130,7 @@ class ICRMProxy:
         proxy._access_map = None
         # Detect Rust-backed client (route_names is Rust-only).
         proxy._rust_ipc = hasattr(shared_client, 'route_names')
+        proxy._rust_http = False
         if proxy._rust_ipc and not name:
             names = shared_client.route_names()
             if names:
@@ -159,6 +161,8 @@ class ICRMProxy:
         proxy._scheduler = None
         proxy._access_map = None
         proxy._rust_ipc = False
+        # Detect Rust-backed HTTP client (has no 'name' keyword on call).
+        proxy._rust_http = type(http_client).__name__ == 'RustHttpClient'
         return proxy
 
     # ------------------------------------------------------------------
@@ -203,6 +207,19 @@ class ICRMProxy:
                     raise
             return self._client.call(method_name, data, name=self._name)
         if self._mode == 'http':
+            if self._rust_http:
+                try:
+                    return self._client.call(
+                        self._name, method_name, data or b'',
+                    )
+                except Exception as exc:
+                    error_bytes = getattr(exc, 'error_bytes', None)
+                    if error_bytes is not None:
+                        from ...error import CCError
+                        cc_err = CCError.deserialize(memoryview(error_bytes))
+                        if cc_err is not None:
+                            raise cc_err from exc
+                    raise
             return self._client.call(method_name, data, name=self._name)
         raise NotImplementedError(
             'call() not available in thread-local mode; use call_direct()',

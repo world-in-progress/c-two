@@ -45,7 +45,6 @@ from typing import TypeVar
 import httpx
 
 from .config import settings
-from .client.http import HttpClientPool
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
 from .server.native import NativeServerBridge as Server
@@ -116,9 +115,9 @@ class _ProcessRegistry:
         self._server_address: str | None = None
         self._explicit_address: str | None = None
         self._explicit_ipc_config: IPCConfig | None = None
-        from c_two._native import RustClientPool
+        from c_two._native import RustClientPool, RustHttpClientPool
         self._pool = RustClientPool.instance()
-        self._http_pool = HttpClientPool()
+        self._http_pool = RustHttpClientPool.instance()
 
     # ------------------------------------------------------------------
     # Public API
