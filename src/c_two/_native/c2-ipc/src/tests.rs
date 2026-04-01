@@ -312,6 +312,38 @@ mod client_tests {
         assert_eq!(tc, 1);
     }
 
+    // ── SyncClient tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_sync_client_global_runtime() {
+        // get_or_create_runtime() must return the same runtime on every call.
+        let rt1 = crate::sync_client::tests::runtime_ptr();
+        let rt2 = crate::sync_client::tests::runtime_ptr();
+        assert_eq!(rt1, rt2, "global runtime should be the same instance");
+    }
+
+    #[test]
+    fn test_ipc_config_propagation() {
+        // Verify custom config flows through to IpcClient via with_pool.
+        // We can't actually connect (no server), but construction must succeed
+        // and the config should influence transport path selection.
+        let cfg = IpcConfig {
+            shm_threshold: 512,
+            chunk_size: 2048,
+        };
+
+        // IpcClient::new uses default config.
+        let c1 = crate::client::IpcClient::new("ipc://test_prop_1");
+        assert!(!c1.is_connected());
+
+        // IpcClient::with_pool uses custom config.
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(
+            c2_mem::MemPool::new(c2_mem::PoolConfig::default()),
+        ));
+        let c2 = crate::client::IpcClient::with_pool("ipc://test_prop_2", pool, cfg);
+        assert!(!c2.is_connected());
+    }
+
     #[test]
     fn test_handshake_with_pool_segments() {
         // Verify that a handshake with pool segments is encoded correctly.

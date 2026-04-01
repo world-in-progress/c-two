@@ -14,10 +14,12 @@
 
 pub mod client;
 pub mod shm;
+pub mod sync_client;
 
 #[cfg(test)]
 mod tests;
 
 pub use client::{IpcClient, IpcConfig, IpcError, MethodTable};
 pub use shm::{MappedSegment, SegmentCache, ShmError};
+pub use sync_client::SyncClient;
 
