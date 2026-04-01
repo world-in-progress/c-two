@@ -3,6 +3,7 @@ name = "c-two"
 version = "0.4.0"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.2.1",
@@ -32,6 +33,7 @@ manifest-path = "src/c_two/_native/c2-ffi/Cargo.toml"
 module-name = "c_two._native"
 python-source = "src"
 features = ["pyo3/extension-module"]
+include = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
