@@ -1,9 +1,13 @@
 """Benchmark: Thread-local vs IPC vs Relay (HTTP) — payload 64B to 1GB.
 
-Measures P50 round-trip latency for echo(bytes)->bytes across three transport modes:
+Measures P50 round-trip latency for echo across three transport modes:
   - Thread-local: same process, zero serialization
   - IPC: full serialize + SHM + UDS (2GB buddy segments)
   - Relay: HTTP → NativeRelay → IPC → CRM → reverse
+
+Two payload types compared:
+  - bytes: identity fast path (skips pickle)
+  - dict:  full pickle serialization (realistic workload)
 
 Payload sizes: 64B, 256B, 1KB, 4KB, 64KB, 1MB, 10MB, 50MB, 100MB, 500MB, 1GB
 
@@ -27,7 +31,7 @@ from c_two._native import NativeRelay
 from c_two.transport.registry import _ProcessRegistry
 
 # ---------------------------------------------------------------------------
-# Echo CRM — raw bytes to measure pure transport overhead
+# Echo CRMs — bytes (identity fast path) vs dict (pickle path)
 # ---------------------------------------------------------------------------
 
 @cc.icrm(namespace='bench.three_mode', version='0.1.0')
@@ -36,6 +40,15 @@ class IEcho:
 
 class Echo:
     def echo(self, data: bytes) -> bytes:
+        return data
+
+
+@cc.icrm(namespace='bench.three_mode_dict', version='0.1.0')
+class IDictEcho:
+    def echo(self, data: dict) -> dict: ...
+
+class DictEcho:
+    def echo(self, data: dict) -> dict:
         return data
 
 
@@ -96,7 +109,7 @@ def _wait_sock(address: str, timeout: float = 5.0):
     return False
 
 
-def _measure(proxy, payload: bytes, rounds: int) -> float:
+def _measure(proxy, payload, rounds: int, validate_len: bool = True) -> float:
     """Warmup + timed rounds, return P50 latency in ms."""
     for _ in range(WARMUP):
         proxy.echo(payload)
@@ -112,7 +125,8 @@ def _measure(proxy, payload: bytes, rounds: int) -> float:
     finally:
         gc.enable()
 
-    assert len(result) == len(payload), f'size mismatch: {len(result)} != {len(payload)}'
+    if validate_len:
+        assert len(result) == len(payload), f'size mismatch: {len(result)} != {len(payload)}'
     return statistics.median(latencies) * 1000
 
 
@@ -201,6 +215,42 @@ def bench_relay(payload_size: int) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# IPC mode — dict payload (pickle path)
+# ---------------------------------------------------------------------------
+
+# dict sizes capped at 100MB — pickle is too slow beyond that
+_DICT_MAX_SIZE = 100 * 1024 * 1024
+
+def _make_dict_payload(size: int) -> dict:
+    """Create a dict whose pickled size is approximately `size` bytes."""
+    return {'payload': b'\xAB' * size}
+
+
+def bench_ipc_dict(payload_size: int) -> float | None:
+    if payload_size > _DICT_MAX_SIZE:
+        return None
+    global _ipc_counter
+    _ipc_counter += 1
+    _ProcessRegistry.reset()
+    address = f'ipc://bench_3m_dict_{_ipc_counter}'
+
+    cc.set_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_address(address)
+    cc.register(IDictEcho, DictEcho(), name='echo_dict')
+    _wait_sock(address)
+
+    payload = _make_dict_payload(payload_size)
+    try:
+        icrm = cc.connect(IDictEcho, name='echo_dict', address=address)
+        result_ms = _measure(icrm, payload, _rounds(payload_size), validate_len=False)
+        cc.close(icrm)
+    finally:
+        cc.unregister('echo_dict')
+        cc.shutdown()
+    return result_ms
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -224,14 +274,17 @@ def _fmt(v: float | None) -> str:
 def main():
     _cleanup()
 
-    print('=' * 100)
+    print('=' * 120)
     print('Three-Mode Benchmark: Thread-local vs IPC vs Relay (HTTP)')
+    print(f'Payload types: bytes (identity fast path) | dict (pickle serde)')
     print(f'Warmup: {WARMUP}  |  Adaptive rounds (100/20/5)')
     print(f'Python: {sys.version}')
-    print('=' * 100)
-    header = f'{"Size":>8s}  {"Rounds":>6s}  {"Thread (ms)":>12s}  {"IPC (ms)":>12s}  {"Relay (ms)":>12s}  {"IPC/Thd":>8s}  {"Relay/Thd":>10s}'
+    print('=' * 120)
+    header = (f'{"Size":>8s}  {"Rounds":>6s}  {"Thread (ms)":>12s}  '
+              f'{"IPC-bytes":>12s}  {"IPC-dict":>12s}  {"dict/bytes":>11s}  '
+              f'{"Relay (ms)":>12s}  {"IPC/Thd":>8s}')
     print(header)
-    print('-' * 100)
+    print('-' * 120)
 
     results: list[dict] = []
 
@@ -240,34 +293,41 @@ def main():
 
         t_ms = bench_thread(size_bytes)
         i_ms = bench_ipc(size_bytes)
+        d_ms = bench_ipc_dict(size_bytes)
         r_ms = bench_relay(size_bytes)
 
         ipc_ratio = f'{i_ms / t_ms:.1f}×' if t_ms > 0 else '—'
-        relay_ratio = f'{r_ms / t_ms:.1f}×' if (r_ms is not None and t_ms > 0) else '—'
+        dict_ratio = f'{d_ms / i_ms:.1f}×' if (d_ms is not None and i_ms > 0) else '—'
 
-        print(f'{label:>8s}  {rounds:>6d}  {_fmt(t_ms):>12s}  {_fmt(i_ms):>12s}  {_fmt(r_ms):>12s}  {ipc_ratio:>8s}  {relay_ratio:>10s}')
+        print(f'{label:>8s}  {rounds:>6d}  {_fmt(t_ms):>12s}  '
+              f'{_fmt(i_ms):>12s}  {_fmt(d_ms):>12s}  {dict_ratio:>11s}  '
+              f'{_fmt(r_ms):>12s}  {ipc_ratio:>8s}')
 
         results.append({
             'size': label, 'size_bytes': size_bytes, 'rounds': rounds,
-            'thread_ms': t_ms, 'ipc_ms': i_ms, 'relay_ms': r_ms,
+            'thread_ms': t_ms, 'ipc_ms': i_ms, 'ipc_dict_ms': d_ms, 'relay_ms': r_ms,
         })
 
     # Summary
     t_vals = [r['thread_ms'] for r in results]
     i_vals = [r['ipc_ms'] for r in results]
+    d_vals = [r['ipc_dict_ms'] for r in results if r['ipc_dict_ms'] is not None]
     r_vals = [r['relay_ms'] for r in results if r['relay_ms'] is not None]
 
-    print('-' * 100)
-    print(f'{"GeoMean":>8s}  {"":>6s}  {_fmt(_geomean(t_vals)):>12s}  {_fmt(_geomean(i_vals)):>12s}  {_fmt(_geomean(r_vals)):>12s}')
-    print('=' * 100)
+    print('-' * 120)
+    print(f'{"GeoMean":>8s}  {"":>6s}  {_fmt(_geomean(t_vals)):>12s}  '
+          f'{_fmt(_geomean(i_vals)):>12s}  {_fmt(_geomean(d_vals)):>12s}  {"":>11s}  '
+          f'{_fmt(_geomean(r_vals)):>12s}')
+    print('=' * 120)
 
     # Write TSV
     tsv_path = os.path.join(os.path.dirname(__file__), '..', 'benchmark_results.tsv')
     with open(tsv_path, 'w') as f:
-        f.write('size\tsize_bytes\trounds\tthread_ms\tipc_ms\trelay_ms\n')
+        f.write('size\tsize_bytes\trounds\tthread_ms\tipc_bytes_ms\tipc_dict_ms\trelay_ms\n')
         for r in results:
+            dict_str = f'{r["ipc_dict_ms"]:.4f}' if r['ipc_dict_ms'] is not None else 'N/A'
             relay_str = f'{r["relay_ms"]:.4f}' if r['relay_ms'] is not None else 'N/A'
-            f.write(f'{r["size"]}\t{r["size_bytes"]}\t{r["rounds"]}\t{r["thread_ms"]:.4f}\t{r["ipc_ms"]:.4f}\t{relay_str}\n')
+            f.write(f'{r["size"]}\t{r["size_bytes"]}\t{r["rounds"]}\t{r["thread_ms"]:.4f}\t{r["ipc_ms"]:.4f}\t{dict_str}\t{relay_str}\n')
     print(f'\nResults written to {os.path.abspath(tsv_path)}')
 
     _cleanup()
