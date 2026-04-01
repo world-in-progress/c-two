@@ -997,11 +997,12 @@ c2-http ─────────┘                   │
 
 | Phase | Rust 新增 | Python 删除 | Python 修改 | 净变化 |
 |-------|----------|------------|------------|--------|
+| 0. Free-threading 修复 | ~120 行 (frozen 重构) | 0 | ~60 行 (加锁) | +180 行 |
 | 1. 基础设施统一 | ~800 行 (wire_ffi.rs + msg_type.rs + config.rs) | ~840 行 | ~200 行 (shim) | -40 行 |
 | 2. Server 下沉 | ~2000 行 (c2-server + server_ffi.rs) | ~1774 行 | ~150 行 (registry.py) | +226 行 |
 | 3. Client + HTTP 统一 | ~1600 行 (sync_client + pool + c2-http + http_ffi) | ~1494 行 | ~100 行 (proxy.py) | +106 行 |
 | 4. 清理 | ~0 | ~200 行 (shim + envelope) | ~300 行 (测试 import) | -200 行 |
-| **合计** | **~4400 行 Rust** | **~4308 行 Python** | **~750 行 Python** | **+92 行** |
+| **合计** | **~4520 行 Rust** | **~4308 行 Python** | **~810 行 Python** | **+272 行** |
 
 **总结**: 净代码量几乎不变，但 ~4300 行 Python transport 代码被等量 Rust 替代，
 得到性能提升 (无 GIL I/O) + 类型安全 + 单一编解码实现 + 多语言复用 (WASM)。
@@ -1012,7 +1013,9 @@ c2-http ─────────┘                   │
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
-| PyO3 GIL 交互在 3.14t 下的行为变化 | Phase 2-3 | c2-ffi 已声明 `gil_used=false`；CRM 回调使用 `Python::with_gil()` 兼容两种模式 |
+| PyO3 `&mut self` 在 3.14t 下的 data race | Phase 0 | 全部 `#[pyclass(frozen)]` + 内部可变性 (§6.1.1) |
+| CRM 回调并发执行 Python 方法 | Phase 2 | Scheduler read/write 注解 + `tokio::sync::RwLock` (§6.3) |
+| `Py<PyAny>` 跨 tokio 任务安全性 | Phase 2-3 | PyO3 0.23+ 中 `Py<T>` 已是 `Send + Sync`；回调仍需 `Python::with_gil()` (§6.2) |
 | tokio runtime 与 Python asyncio 冲突 | Phase 2-3 | Rust server 使用独立 tokio runtime（非 Python 主线程的 asyncio loop） |
 | Handshake 协议版本升级 | Phase 1 | Rust 和 Python 共享同一 `HANDSHAKE_VERSION`，通过 FFI 确保一致 |
 | pyo3-async crate 稳定性 | Phase 3 | 备选方案：手动实现 Python coroutine wrapper (已有社区示例) |
@@ -1118,4 +1121,241 @@ c2-http ─────────┘                   │
 | Python 依赖 | httpx, asyncio | 无额外依赖 | 无额外依赖 |
 | Wire codec 修改 | 改两处 (Py + Rs) | 改一处 (Rust) | 改一处 (Rust) |
 | 新传输协议 | 需改 Python | 仅改 Rust | 仅改 Rust |
+
+---
+
+## §6 Free-Threading Safety (Python 3.14t)
+
+C-Two 明确以 Python 3.14t (free-threading / no-GIL) 为目标平台。
+本节定义 (1) 现有代码的修复清单 (Phase 0)，(2) 新代码必须遵循的并发安全模式。
+
+### §6.1 Phase 0: 现有代码修复 (Phase 1 前置)
+
+Phase 0 不涉及功能变更，仅修复已有代码的自由线程安全性问题。
+
+#### 6.1.1 Rust FFI: `#[pyclass(frozen)]` + 内部可变性
+
+**问题**: 当前 `#[pyclass]` 类型使用 `&mut self` 方法，在 free-threading 下
+多线程并发调用会导致未定义行为 (data race on Rust side)。
+
+**修复模式**: 所有 `#[pyclass]` 统一采用 `frozen` + 内部可变性：
+
+```rust
+// ❌ 当前 (不安全)
+#[pyclass(name = "NativeRelay")]
+pub struct PyNativeRelay {
+    server: Option<RelayServer>,
+}
+#[pymethods]
+impl PyNativeRelay {
+    fn start(&mut self, py: Python<'_>) -> PyResult<()> { ... }
+}
+
+// ✅ 修复后
+#[pyclass(name = "NativeRelay", frozen)]
+pub struct PyNativeRelay {
+    state: Mutex<RelayState>,  // 内部可变性
+}
+#[pymethods]
+impl PyNativeRelay {
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        let mut state = self.state.lock().unwrap();
+        // ...
+    }
+}
+```
+
+**需修复的类型**:
+
+| PyClass | 文件 | `&mut self` 方法 | 修复方式 |
+|---------|------|-----------------|---------|
+| `PyNativeRelay` | relay_ffi.rs | `start`, `stop` | `Mutex<RelayState>` |
+| `PyMemHandle` | mem_ffi.rs | `write_at`, `release`, `drop` | `Mutex<Option<MemHandle>>` |
+| `PyChunkAssembler` | mem_ffi.rs | `feed_chunk`, `finish`, `abort` | `Mutex<AssemblerState>` |
+
+**已安全的类型** (无需修改):
+- `PyMemPool` — 已使用 `Arc<RwLock<MemPool>>`，方法为 `&self` ✅
+
+#### 6.1.2 Python: 竞态条件修复
+
+**ICRMProxy._closed 标志** (`proxy.py`):
+```python
+# ❌ 当前: 无锁读写
+def call_direct(self, method_name, args):
+    if self._closed:  # race
+        raise RuntimeError(...)
+
+# ✅ 修复: 加锁 (或使用 threading 原子操作)
+def __init__(self):
+    self._close_lock = threading.Lock()
+    self._closed = False
+
+def call_direct(self, method_name, args):
+    with self._close_lock:
+        if self._closed:
+            raise RuntimeError(...)
+```
+
+**ServerV2._client_tasks** (`server/core.py`):
+```python
+# ❌ 当前: append/remove 无锁
+self._client_tasks.append(task)
+
+# ✅ 修复: 统一用 _slots_lock 保护
+with self._slots_lock:
+    self._client_tasks.append(task)
+```
+
+#### 6.1.3 Phase 0 完整修复清单
+
+| 优先级 | 组件 | 修复 | 影响范围 |
+|--------|------|------|---------|
+| P0 | PyNativeRelay | `frozen` + `Mutex` | relay_ffi.rs |
+| P0 | PyMemHandle | `frozen` + `Mutex<Option<>>` | mem_ffi.rs |
+| P0 | PyChunkAssembler | `frozen` + `Mutex` | mem_ffi.rs |
+| P1 | ICRMProxy._closed | 加 `_close_lock` | proxy.py |
+| P1 | ServerV2._client_tasks | 加锁保护 | server/core.py |
+| P2 | IpcClient | 显式 `unsafe impl Send + Sync` | client.rs |
+
+### §6.2 PyO3 安全模式规范 (所有新代码)
+
+Phase 1-4 中所有新建的 `#[pyclass]` 必须遵循以下规范：
+
+#### 规则 1: 全部使用 `#[pyclass(frozen)]`
+
+```rust
+// 强制 frozen — Python 侧不可赋值属性
+#[pyclass(name = "RustServer", frozen)]
+pub struct PyRustServer { ... }
+```
+
+**理由**: `frozen` 使 PyO3 在编译期阻止 `&mut self` 方法，
+强制开发者使用内部可变性，从源头消除 data race。
+
+#### 规则 2: 内部可变性选择标准
+
+| 场景 | 选用 | 理由 |
+|------|------|------|
+| 短暂互斥 (< 1ms) | `std::sync::Mutex` | 简单，低争用下性能好 |
+| 读多写少 | `std::sync::RwLock` | 允许并发读 |
+| 简单标志/计数器 | `AtomicBool` / `AtomicU64` | 无锁，零开销 |
+| 跨 await 持有 | `tokio::sync::Mutex` | 异步友好，不阻塞 runtime |
+| 一次初始化 | `OnceLock<T>` | 零运行时开销 |
+
+#### 规则 3: Python 对象引用
+
+```rust
+// ❌ 禁止在 #[pyclass] 中存储裸 PyObject
+struct Bad {
+    callback: PyObject,  // 不安全: PyObject 非 Send
+}
+
+// ✅ 使用 Py<T> + Send 包装
+struct Good {
+    callback: Py<PyAny>,  // Py<T> 在 free-threading 下是 Send
+}
+```
+
+`Py<PyAny>` 在 PyO3 0.23+ 中是 `Send + Sync`，可安全跨线程持有。
+但调用 Python 方法仍需 `Python::with_gil()`。
+
+#### 规则 4: CRM 回调的 GIL 交互 (Phase 2 关键)
+
+```rust
+// c2-server 中的 CRM 回调执行
+async fn dispatch_crm_call(
+    callback: &Py<PyAny>,
+    method_idx: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    // 在 spawn_blocking 中执行，避免阻塞 tokio runtime
+    tokio::task::spawn_blocking(move || {
+        // with_gil: free-threading 下不真正获取 GIL，
+        // 但确保 Python 解释器可用
+        Python::with_gil(|py| {
+            let result = callback.call1(py, (method_idx, payload))?;
+            result.extract::<Vec<u8>>(py)
+        })
+    }).await?
+}
+```
+
+**Free-threading 下的行为差异**:
+- `Python::with_gil()` 不再阻塞等待 GIL，近乎零开销
+- 多个 `spawn_blocking` 任务可**真正并行**执行 Python CRM 方法
+- **CRM 方法本身**需要线程安全 — 这是用户的责任，框架通过 Scheduler 的
+  read/write 注解提供保护
+
+### §6.3 各 Phase 并发设计要点
+
+#### Phase 1: Wire FFI
+
+- `wire_ffi.rs` 中的编解码函数均为**无状态函数** (`#[pyfunction]`)
+- 无 `#[pyclass]`，无共享状态 → **天然线程安全**
+- `MsgType` 和 `IpcConfig` 若暴露为 `#[pyclass]`，用 `frozen` + 只读属性
+
+#### Phase 2: Server
+
+```rust
+#[pyclass(name = "RustServer", frozen)]
+pub struct PyRustServer {
+    // 所有状态通过 Arc 共享给 tokio 任务
+    inner: Arc<ServerInner>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+struct ServerInner {
+    slots: RwLock<HashMap<String, CrmSlot>>,  // CRM 注册表
+    shutdown: tokio::sync::Notify,             // 关闭信号
+}
+
+struct CrmSlot {
+    callback: Py<PyAny>,        // CRM 实例 (Send + Sync via Py<T>)
+    access_map: Vec<AccessMode>,  // 方法级 read/write 标注
+}
+```
+
+- `Py<PyAny>` 持有 CRM Python 对象，跨 tokio 任务安全共享
+- Scheduler 使用 `tokio::sync::RwLock` 实现 read 并行 / write 互斥
+- 注册/注销操作通过 `slots: RwLock<...>` 保护
+
+#### Phase 3: Client + HTTP
+
+```rust
+#[pyclass(name = "RustClient", frozen)]
+pub struct PyRustClient {
+    inner: Arc<SyncClient>,  // SyncClient 内部全 Arc + Mutex
+}
+
+#[pyclass(name = "RustHttpClient", frozen)]
+pub struct PyRustHttpClient {
+    client: Arc<HttpClient>,  // reqwest::Client 自身是 Clone + Send + Sync
+}
+
+#[pyclass(name = "RustHttpClientPool", frozen)]
+pub struct PyRustHttpClientPool {
+    pool: Arc<RwLock<HashMap<String, PoolEntry>>>,
+}
+```
+
+- `reqwest::Client` 原生 `Send + Sync`，内置连接池
+- `SyncClient` 通过 `Arc<IpcClient>` + `rt.block_on()` 实现阻塞调用
+- `PyRustHttpClientPool` 用 `RwLock` 保护连接映射
+
+### §6.4 测试策略
+
+```bash
+# Phase 0 验证: 在 free-threading 模式下跑全量测试
+PYTHON_GIL=0 uv run pytest tests/ -q --timeout=30
+
+# 并发压力测试: 多线程同时调用同一 CRM
+uv run pytest tests/integration/test_free_threading.py -q
+```
+
+**新增测试用例**:
+- `test_concurrent_proxy_close`: 多线程同时 close 同一 proxy
+- `test_concurrent_crm_read`: 多线程并行读操作 (应不阻塞)
+- `test_concurrent_crm_write`: 多线程写操作 (应串行)
+- `test_relay_concurrent_start_stop`: 并发 start/stop relay
+- `test_mem_handle_concurrent_write_at`: 并发写入同一 MemHandle (应正确阻塞或报错)
 
