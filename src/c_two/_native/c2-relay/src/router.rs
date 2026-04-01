@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -26,6 +26,7 @@ pub fn build_router(state: RelayState) -> Router {
         .route("/_echo", post(echo_handler))
         .route("/{route_name}/{method_name}", post(call_handler))
         .with_state(state)
+        .layer(DefaultBodyLimit::disable())
 }
 
 // -- Control-plane handlers -----------------------------------------------

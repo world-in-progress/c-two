@@ -41,7 +41,7 @@ POOL_PAYLOAD_HEADER_SIZE = 9           # 1B segment_index + 8B data_size
 # Default configuration values
 # ---------------------------------------------------------------------------
 DEFAULT_SHM_THRESHOLD = 4_096                       # 4 KB — inline vs SHM cutover
-DEFAULT_MAX_FRAME_SIZE = 16_777_216                  # 16 MB — max inline frame
+DEFAULT_MAX_FRAME_SIZE = 2_147_483_648                # 2 GB — max inline frame
 DEFAULT_MAX_PAYLOAD_SIZE = 17_179_869_184            # 16 GB — max SHM payload
 DEFAULT_MAX_PENDING_REQUESTS = 1024                  # per-server total
 DEFAULT_POOL_SEGMENT_SIZE = 268_435_456              # 256 MB — pool SHM segment
