@@ -140,51 +140,86 @@ Under GIL-free execution, every shared mutable state must be explicitly protecte
 | Rounds | 100 (≤1MB), 20 (10-100MB), 5 (500MB-1GB) |
 | Metric | P50 (median) round-trip latency |
 
-### 3.2 Latency Table (P50, milliseconds)
+### 3.2 Latency Table — bytes payload (P50, milliseconds)
 
-| Size | Rounds | Thread | IPC | Relay | IPC/Thread | Relay/Thread |
-|-----:|-------:|-------:|----:|------:|-----------:|-------------:|
-| 64B | 100 | 0.0096 | 0.354 | 3.379 | 36.7× | 350.3× |
-| 256B | 100 | 0.0100 | 0.459 | 1.750 | 46.1× | 175.7× |
-| 1KB | 100 | 0.0093 | 0.337 | 2.060 | 36.1× | 220.7× |
-| 4KB | 100 | 0.0100 | 0.426 | 2.079 | 42.6× | 207.9× |
-| 64KB | 100 | 0.0097 | 0.592 | 5.965 | 61.0× | 614.4× |
-| 1MB | 100 | 0.0098 | 1.367 | 59.915 | 139.0× | 6,093× |
-| 10MB | 20 | 0.0096 | 9.271 | — | 969.6× | — |
-| 50MB | 20 | 0.0094 | 39.851 | — | 4,260× | — |
-| 100MB | 20 | 0.0094 | 85.047 | — | 9,011× | — |
-| 500MB | 5 | 0.0132 | 473.4 | — | 35,951× | — |
-| 1GB | 5 | 0.0164 | 2,215.1 | — | 135,276× | — |
-| **GeoMean** | | **0.0104** | **6.301** | **4.565** | | |
+> **Note:** The bytes echo CRM uses the identity fast-path (`transferable.py`): single `bytes` parameter and `bytes` return type skip pickle entirely. See §3.5 for the dict payload comparison that reveals true serialization cost.
 
-> **"—"** = Relay returned HTTP 413 (axum body size limit exceeded).
+| Size | Rounds | Thread | IPC | Relay | IPC/Thread | Relay/IPC |
+|-----:|-------:|-------:|----:|------:|-----------:|----------:|
+| 64B | 100 | 0.003 | 0.129 | 0.864 | 40× | 6.7× |
+| 256B | 100 | 0.003 | 0.195 | 1.041 | 58× | 5.3× |
+| 1KB | 100 | 0.003 | 0.190 | 1.137 | 58× | 6.0× |
+| 4KB | 100 | 0.003 | 0.201 | 0.980 | 62× | 4.9× |
+| 64KB | 100 | 0.003 | 0.323 | 1.941 | 97× | 6.0× |
+| 1MB | 100 | 0.004 | 0.500 | 14.51 | 134× | 29× |
+| 10MB | 20 | 0.003 | 2.134 | 145.4 | 640× | 68× |
+| 50MB | 20 | 0.003 | 9.017 | 751.5 | 2,689× | 83× |
+| 100MB | 20 | 0.004 | 17.87 | 1,558 | 5,137× | 87× |
+| 500MB | 5 | 0.004 | 139.3 | 8,687 | 33,105× | 62× |
+| 1GB | 5 | 0.009 | 1,082 | 21,953 | 118,623× | 20× |
+
+> Relay now works for all sizes after fixing axum body limit + IPC max frame size (see §3.4).
 
 ### 3.3 Analysis
 
-**Thread-local mode** is essentially free (~10 µs) regardless of payload size. This confirms the zero-serialization design: `call_direct()` passes Python objects by reference with no copy.
+**Thread-local mode** is essentially free (~3 µs) regardless of payload size. This confirms the zero-serialization design: `call_direct()` passes Python objects by reference with no copy.
 
 **IPC mode** shows clear linear scaling with payload size:
-- **Small payloads (≤4KB):** ~0.3-0.5 ms, dominated by UDS round-trip + buddy alloc/free overhead.
-- **Medium payloads (64KB-1MB):** 0.6-1.4 ms, serialization cost becomes visible.
-- **Large payloads (10-100MB):** 9-85 ms, approaching memcpy throughput limits (~1.2 GB/s effective for 100MB in 85ms).
-- **Huge payloads (500MB-1GB):** 0.5-2.2 seconds. At 1GB, the effective throughput is ~450 MB/s (serialize + SHM copy + deserialize).
+- **Small payloads (≤4KB):** ~0.13-0.20 ms, dominated by UDS round-trip + buddy alloc/free overhead.
+- **Medium payloads (64KB-1MB):** 0.3-0.5 ms, SHM memcpy cost becomes visible.
+- **Large payloads (10-100MB):** 2-18 ms, approaching ~5.6 GB/s effective throughput (100MB in 18ms).
+- **Huge payloads (500MB-1GB):** 139ms-1.1s. At 1GB, effective throughput is ~920 MB/s.
 
-**Relay (HTTP) mode** works for payloads ≤1MB but fails for ≥10MB:
-- At 1MB, latency is ~60ms (44× IPC overhead from HTTP encode/decode + two extra copies).
-- At ≥10MB, axum's default request body limit (likely 2MB or configurable) triggers HTTP 413 rejection.
-- **Action required:** Configure `axum::extract::DefaultBodyLimit` in `c2-relay` to support larger payloads, or implement chunked transfer encoding.
+> ⚠️ **These IPC numbers use the bytes identity fast-path** — no pickle serialization. Real-world dict/object payloads are ~2-2.5× slower at ≥10MB (see §3.5).
 
-**Throughput equivalents (IPC):**
-- 64B @ 0.35ms → ~2,857 calls/sec (~178 KB/s)
-- 1MB @ 1.37ms → ~730 calls/sec (~730 MB/s)
-- 100MB @ 85ms → ~11.8 calls/sec (~1.18 GB/s)
-- 1GB @ 2.2s → ~0.45 calls/sec (~450 MB/s, limited by 2× memcpy)
+**Relay (HTTP) mode** works end-to-end for all sizes after two fixes (see §3.4):
+- **Small payloads (≤64KB):** ~1 ms, dominated by HTTP round-trip overhead (~5-6× IPC).
+- **Medium payloads (1-10MB):** 14-145 ms, HTTP encode/decode + two extra memcpy (~29-68× IPC).
+- **Large payloads (50-100MB):** 0.75-1.6 seconds (~83-87× IPC). The relay buffers the entire payload in memory (no SHM).
+- **Huge payloads (500MB-1GB):** 8.7-22 seconds. At 1GB, the relay throughput is ~47 MB/s vs IPC's 920 MB/s.
+- **Remaining optimization:** SHM-backed relay forwarding would eliminate the HTTP buffering overhead for large payloads.
 
-### 3.4 Relay Body Limit Root Cause
+**Throughput equivalents (IPC, bytes fast-path):**
+- 64B @ 0.13ms → ~7,700 calls/sec (~480 KB/s)
+- 1MB @ 0.50ms → ~2,000 calls/sec (~2.0 GB/s)
+- 100MB @ 18ms → ~56 calls/sec (~5.6 GB/s)
+- 1GB @ 1.08s → ~0.9 calls/sec (~920 MB/s)
 
-The NativeRelay uses axum with the default body size limit. In `c2-relay/src/handler.rs` (or equivalent), the route handlers do not override `DefaultBodyLimit`. Axum's default is 2MB for JSON extractors and unlimited for `Body` — but the relay likely uses `Bytes` extractor which has a 2MB default.
+### 3.4 Relay Payload Limit Fixes (Resolved)
 
-**Fix:** Add `.layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))` to the axum router, or use streaming body extraction.
+Two limits prevented the relay from handling large payloads:
+
+**1. Axum HTTP body limit (2MB → disabled)**
+- `c2-relay/src/router.rs`: Added `.layer(DefaultBodyLimit::disable())` to the axum router.
+- Previously, axum's implicit 2MB `Bytes` extractor limit caused HTTP 413 for any payload >2MB.
+
+**2. IPC max frame size (16MB → 2GB)**
+- `transport/ipc/frame.py`: `DEFAULT_MAX_FRAME_SIZE` raised from 16MB to 2GB.
+- The relay sends payloads inline on UDS (no SHM), so the server's frame size check rejected frames >16MB with "Frame too large", causing broken pipe (HTTP 502).
+
+### 3.5 Serialization Overhead: bytes vs dict (IPC mode)
+
+The bytes echo benchmark uses the `@transferable` identity fast-path: when an ICRM method has a single `bytes` parameter and `bytes` return type, `transferable.py` skips pickle entirely (4 pickle ops saved per round-trip). To quantify this bias, we ran a parallel benchmark using `dict→dict` payloads (`{'payload': b'\xAB' * N}`) which go through the full pickle serialization path.
+
+| Size | IPC-bytes (ms) | IPC-dict (ms) | dict/bytes | Pickle overhead |
+|-----:|---------------:|--------------:|-----------:|----------------:|
+| 64B | 0.129 | 0.207 | 1.6× | 38% |
+| 256B | 0.195 | 0.186 | 1.0× | ~0% |
+| 1KB | 0.190 | 0.215 | 1.1× | 10% |
+| 4KB | 0.201 | 0.344 | 1.7× | 41% |
+| 64KB | 0.323 | 0.353 | 1.1× | 9% |
+| 1MB | 0.500 | 0.717 | 1.4× | 30% |
+| 10MB | 2.134 | 4.374 | 2.0× | 51% |
+| 50MB | 9.017 | 23.65 | 2.6× | 62% |
+| 100MB | 17.87 | 45.36 | 2.5× | 61% |
+
+> dict benchmarks capped at 100MB (pickle becomes prohibitively slow beyond this).
+
+**Key findings:**
+- **Small payloads (≤1KB):** Pickle overhead is negligible (~0-10%). UDS round-trip dominates.
+- **Medium payloads (4KB-1MB):** Pickle contributes 30-41% of latency. Noticeable but not dominant.
+- **Large payloads (≥10MB):** Pickle contributes **51-62% of total latency** — more than the SHM memcpy. The bytes fast-path benchmark understates real-world latency by ~2-2.5×.
+- **Conclusion:** The bytes identity fast-path is a valid optimization for binary data (e.g., Arrow, Parquet, numpy). For structured Python objects, users should expect ~2× the IPC latency shown in §3.2.
 
 ---
 
@@ -222,8 +257,8 @@ The NativeRelay uses axum with the default body size limit. In `c2-relay/src/han
 
 | Item | Action |
 |------|--------|
-| Relay body limit | Configure `DefaultBodyLimit::max()` in axum router |
-| Relay large payloads | Implement chunked transfer or streaming body |
+| Relay body limit | ~~Configure `DefaultBodyLimit::max()` in axum router~~ ✅ Fixed |
+| Relay large payloads | ~~Implement chunked transfer or streaming body~~ ✅ Fixed (inline + raised frame limit) |
 | IPC 1GB throughput | Consider `io_uring` or `splice()` for zero-copy SHM → UDS |
 
 ---
