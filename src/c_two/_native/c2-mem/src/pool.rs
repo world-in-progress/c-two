@@ -339,7 +339,7 @@ impl MemPool {
         Ok(idx)
     }
 
-    /// Open an existing dedicated segment.
+    /// Open an existing dedicated segment (auto-assign index).
     pub fn open_dedicated(&mut self, name: &str, size: usize) -> Result<u32, String> {
         let seg = DedicatedSegment::open(name, size)?;
         let idx = self.next_dedicated_idx;
@@ -353,6 +353,31 @@ impl MemPool {
             },
         );
         Ok(idx)
+    }
+
+    /// Open an existing dedicated segment at a specific index.
+    ///
+    /// Used by the server to lazy-open peer dedicated segments, where the
+    /// index must match the producer's `seg_idx` from the wire frame.
+    /// No-op if the index already exists in the map.
+    pub fn open_dedicated_at(&mut self, idx: u32, name: &str, min_size: usize) -> Result<(), String> {
+        if self.dedicated.contains_key(&idx) {
+            return Ok(());
+        }
+        let seg = DedicatedSegment::open(name, min_size)?;
+        self.dedicated.insert(
+            idx,
+            DedicatedEntry {
+                segment: seg,
+                freed_at: None,
+            },
+        );
+        // Keep next_dedicated_idx ahead of all known keys to avoid collision.
+        if idx >= self.next_dedicated_idx {
+            self.next_dedicated_idx = idx.checked_add(1)
+                .expect("dedicated segment index overflow");
+        }
+        Ok(())
     }
 
     /// Free a block given its offset and the original requested data size.

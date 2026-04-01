@@ -126,7 +126,6 @@ class TestConcurrentCallSafety:
         finally:
             server.shutdown()
 
-    @pytest.mark.xfail(reason="Rust server: large SHM payload handling gap")
     def test_concurrent_calls_different_sizes(self):
         """Concurrent calls with varied payload sizes (inline + buddy paths)."""
         addr = _next_addr()
