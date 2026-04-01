@@ -833,7 +833,23 @@ from c_two._native import RustHttpClient, RustHttpClientPool
 ### §3.7 线程优惠保持不变
 
 `ICRMProxy.thread_local()` 路径完全不受影响 — 同进程直连，零序列化，
-直接调用 CRM 方法。这是性能最优路径，不经过任何 transport。
+不经过任何 transport。这是性能最优路径。
+
+**读写锁保护**: thread_local proxy 在构造时由 `registry.py` 注入
+共享的 `Scheduler` 实例和 `access_map`。`call_direct()` 通过
+`scheduler.execution_guard(access)` 强制执行 read 并行 / write 独占：
+
+```python
+# proxy.py — call_direct() 关键路径
+access = self._access_map.get(method_name, MethodAccess.WRITE)
+with self._scheduler.execution_guard(access):
+    return method(*args)  # 受读写锁保护
+```
+
+**Free-threading 下的行为**:
+- 多个 `@cc.read` 方法**真正并行**执行 (3.14t 下无 GIL 限制)
+- `@cc.write` 方法独占执行 (writer-priority RW lock)
+- Scheduler 使用 `threading.Condition`，不依赖 GIL，free-threading 下行为不变
 
 ---
 
