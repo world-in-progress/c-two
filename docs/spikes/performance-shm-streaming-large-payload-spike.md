@@ -1,7 +1,7 @@
 ---
 title: "SHM 流式传输：处理超越 Segment 容量的大 Payload"
 category: "Performance"
-status: "🟡 In Progress"
+status: "✅ Complete (implemented in c2-wire chunked transfer)"
 priority: "High"
 timebox: "1 week"
 created: 2026-03-28

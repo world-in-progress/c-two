@@ -1,7 +1,7 @@
 ---
 title: "RPC v2 架构：共享 Client + 控制面路由 + 模块重构"
 category: "Architecture"
-status: "🟡 In Progress"
+status: "✅ Complete (superseded by Rust transport sink)"
 priority: "Critical"
 timebox: "2 weeks"
 created: 2026-03-26

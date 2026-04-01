@@ -1,7 +1,7 @@
 ---
 title: "IPC v3 单Server多CRM资源托管方案"
 category: "Architecture"
-status: "🟡 In Progress"
+status: "✅ Complete (superseded by Rust transport sink)"
 priority: "High"
 timebox: "2 weeks"
 created: 2026-03-26

@@ -1,7 +1,7 @@
 ---
 title: "IPC v3 OOM Protection — Inline Fallback 的局限性与工业级内存压力防护方案"
 category: "Architecture"
-status: "🟡 In Progress"
+status: "✅ Complete (superseded by Rust transport sink)"
 priority: "High"
 timebox: "1 week"
 created: 2026-03-27
