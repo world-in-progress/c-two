@@ -82,6 +82,8 @@ pub struct Server {
     conn_counter: AtomicU64,
     /// Server-side MemPool for chunked reassembly buffers.
     reassembly_pool: std::sync::Mutex<MemPool>,
+    /// Server-side MemPool for writing buddy SHM responses.
+    response_pool: std::sync::Mutex<MemPool>,
 }
 
 impl Server {
@@ -103,6 +105,18 @@ impl Server {
             spill_dir: PathBuf::from("/tmp/c_two_reassembly"),
         };
         let reassembly_pool = MemPool::new(reassembly_cfg);
+        let response_cfg = PoolConfig {
+            segment_size: config.pool_segment_size as usize,
+            min_block_size: 4096,
+            max_segments: config.max_pool_segments as usize,
+            max_dedicated_segments: 4,
+            dedicated_gc_delay_secs: 5.0,
+            spill_threshold: 0.8,
+            spill_dir: PathBuf::from("/tmp/c_two_response_spill"),
+        };
+        let mut response_pool = MemPool::new(response_cfg);
+        response_pool.ensure_ready()
+            .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
         Ok(Self {
             config,
             socket_path,
@@ -111,6 +125,7 @@ impl Server {
             shutdown_rx,
             conn_counter: AtomicU64::new(0),
             reassembly_pool: std::sync::Mutex::new(reassembly_pool),
+            response_pool: std::sync::Mutex::new(response_pool),
         })
     }
 
