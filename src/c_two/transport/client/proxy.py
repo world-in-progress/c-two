@@ -35,6 +35,7 @@ Usage::
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable, TYPE_CHECKING
 
 from ...crm.meta import MethodAccess
@@ -58,7 +59,7 @@ class ICRMProxy:
 
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
-        '_closed', '_on_terminate',
+        '_closed', '_close_lock', '_on_terminate',
         '_scheduler', '_access_map',
     )
 
@@ -95,6 +96,7 @@ class ICRMProxy:
         proxy._crm = crm_instance
         proxy._client = None
         proxy._name = ''
+        proxy._close_lock = threading.Lock()
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = scheduler
@@ -119,6 +121,7 @@ class ICRMProxy:
         proxy._crm = None
         proxy._client = shared_client
         proxy._name = name
+        proxy._close_lock = threading.Lock()
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
@@ -143,6 +146,7 @@ class ICRMProxy:
         proxy._crm = None
         proxy._client = http_client
         proxy._name = name
+        proxy._close_lock = threading.Lock()
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
@@ -154,8 +158,9 @@ class ICRMProxy:
     # ------------------------------------------------------------------
 
     def __getattr__(self, name: str) -> Any:
-        if self._closed:
-            raise RuntimeError('Proxy is closed')
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
         raise AttributeError(
             f'{type(self).__name__!r} object has no attribute {name!r}',
         )
@@ -171,8 +176,9 @@ class ICRMProxy:
         Raises :class:`NotImplementedError` in thread-local mode — use
         :meth:`call_direct` instead.
         """
-        if self._closed:
-            raise RuntimeError('Proxy is closed')
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
         if self._mode in ('ipc', 'http'):
             return self._client.call(method_name, data, name=self._name)
         raise NotImplementedError(
@@ -187,8 +193,9 @@ class ICRMProxy:
 
         Raises :class:`NotImplementedError` in IPC mode.
         """
-        if self._closed:
-            raise RuntimeError('Proxy is closed')
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
         if self._mode != 'thread':
             raise NotImplementedError(
                 'call_direct() only available in thread-local mode',
@@ -206,8 +213,9 @@ class ICRMProxy:
 
     def relay(self, event_bytes: bytes) -> bytes:
         """Relay raw wire bytes to the server (IPC mode only)."""
-        if self._closed:
-            raise RuntimeError('Proxy is closed')
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
         if self._mode == 'ipc':
             return self._client.relay(event_bytes)
         raise NotImplementedError(
@@ -216,8 +224,9 @@ class ICRMProxy:
 
     def terminate(self) -> None:
         """Release the proxy and invoke cleanup callback if set."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         if self._on_terminate is not None:
             self._on_terminate()
