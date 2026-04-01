@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "c2-buddy",
+    "c2-mem",
     "c2-wire",
     "c2-ipc",
+    "c2-http",
     "c2-relay",
+    "c2-server",
     "c2-ffi",
 ]
 

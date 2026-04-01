@@ -1,21 +1,19 @@
 [project]
 name = "c-two"
-version = "0.3.0"
+version = "0.4.0"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.2.1",
     "docker>=7.1.0",
-    "httpx>=0.28.1",
-    "mcp[cli]>=1.6.0",
-    "requests>=2.32.4",
-    "starlette>=0.46.0",
+    "pydantic-settings>=2.0.0",
 ]
 
 [dependency-groups]
 dev = [
     "anthropic>=0.49.0",
+    "httpx>=0.28.1",
     "numpy>=2.2.4",
     "openai>=1.76.0",
     "pandas>=2.2.3",
@@ -44,6 +42,12 @@ timeout = 30
 
 [tool.uv]
 package = true
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/c_two/_native/**/*.rs" },
+    { file = "src/c_two/_native/**/Cargo.toml" },
+]
 
 [project.scripts]
 c3 = "c_two.cli:cli"

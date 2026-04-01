@@ -6,22 +6,18 @@ distinct routing names, routed via control-plane name field.
 from __future__ import annotations
 
 import os
-import pickle
 import time
 import uuid
 
 import pytest
 
+import c_two as cc
 from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
-from c_two.transport.client.core import SharedClient
-from c_two.transport.wire import MethodTable
+from c_two.transport.client.util import ping
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello
 from tests.fixtures.counter import ICounter, Counter
-
-
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 
 def _unique_region() -> str:
@@ -29,14 +25,12 @@ def _unique_region() -> str:
 
 
 def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
-    region_id = addr.replace('ipc://', '')
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
+        if ping(addr, timeout=0.5):
             return
         time.sleep(0.05)
-    raise RuntimeError(f'Server at {sock_path} not ready')
+    raise RuntimeError(f'Server at {addr} not ready')
 
 
 # ---------------------------------------------------------------------------
@@ -126,121 +120,58 @@ class TestRegistrationAPI:
 
 
 # ---------------------------------------------------------------------------
-# Tests — multi-CRM routing
+# Tests — multi-CRM routing via SOTA API
 # ---------------------------------------------------------------------------
 
 class TestMultiCRMRouting:
 
     def test_hello_greeting(self, multi_crm_addr):
         addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
+        proxy = cc.connect(IHello, name='hello', address=addr)
         try:
-            result = pickle.loads(client.call(
-                'greeting', pickle.dumps(('World',)), name='hello',
-            ))
-            assert result == 'Hello, World!'
+            assert proxy.greeting('World') == 'Hello, World!'
         finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_counter_get(self, multi_crm_addr):
         addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
+        proxy = cc.connect(ICounter, name='counter', address=addr)
         try:
-            result = pickle.loads(client.call(
-                'get', pickle.dumps(()), name='counter',
-            ))
-            assert result == 100  # initial=100 in fixture
+            assert proxy.get() == 100  # initial=100 in fixture
         finally:
-            client.terminate()
+            cc.close(proxy)
 
-    def test_both_names_same_client(self, multi_crm_addr):
-        """A single client can call methods on both CRMs."""
+    def test_both_names_same_server(self, multi_crm_addr):
+        """A single server can serve calls to both CRMs."""
         addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
+        hello = cc.connect(IHello, name='hello', address=addr)
+        counter = cc.connect(ICounter, name='counter', address=addr)
         try:
-            r1 = pickle.loads(client.call(
-                'greeting', pickle.dumps(('Multi',)), name='hello',
-            ))
-            r2 = pickle.loads(client.call(
-                'get', pickle.dumps(()), name='counter',
-            ))
-            assert r1 == 'Hello, Multi!'
-            assert r2 == 100
+            assert hello.greeting('Multi') == 'Hello, Multi!'
+            assert counter.get() == 100
         finally:
-            client.terminate()
+            cc.close(hello)
+            cc.close(counter)
 
     def test_counter_increment(self, multi_crm_addr):
         """Stateful CRM — increment counter and read back."""
         addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
+        proxy = cc.connect(ICounter, name='counter', address=addr)
         try:
-            r1 = pickle.loads(client.call(
-                'increment', pickle.dumps((5,)), name='counter',
-            ))
-            assert r1 == 105  # 100 + 5
-            r2 = pickle.loads(client.call(
-                'get', pickle.dumps(()), name='counter',
-            ))
-            assert r2 == 105
+            assert proxy.increment(5) == 105  # 100 + 5
+            assert proxy.get() == 105
         finally:
-            client.terminate()
-
-    def test_handshake_returns_all_routes(self, multi_crm_addr):
-        addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
-        try:
-            # The method tables should contain methods from both routes.
-            name_tables = client._name_tables
-            assert 'hello' in name_tables
-            assert 'counter' in name_tables
-            # Verify method names.
-            hello_methods = name_tables['hello']
-            assert hello_methods.has_name('greeting')
-            assert hello_methods.has_name('add')
-            counter_methods = name_tables['counter']
-            assert counter_methods.has_name('get')
-            assert counter_methods.has_name('increment')
-            assert counter_methods.has_name('reset')
-        finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_unknown_name_returns_error(self, multi_crm_addr):
-        """Calling a non-existent route name returns an error."""
+        """Connecting to a non-existent route name raises an error."""
         addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
-        try:
-            # The name doesn't exist in the server's routing tables,
-            # and won't exist in the client's local tables — KeyError.
-            with pytest.raises((KeyError, Exception)):
-                client.call('greeting', pickle.dumps(('x',)), name='nonexistent')
-        finally:
-            client.terminate()
-
-
-# ---------------------------------------------------------------------------
-# Tests — v1 backward compat with multi-CRM
-# ---------------------------------------------------------------------------
-
-class TestMultiCRMV1Compat:
-
-    def test_v1_uses_default_name(self, multi_crm_addr):
-        """V1 calls (no name in wire) route to the first registered CRM."""
-        addr, _server = multi_crm_addr
-        client = SharedClient(addr)
-        client.connect()
-        try:
-            result = pickle.loads(client.call(
-                'greeting', pickle.dumps(('V1Client',)),
-            ))
-            assert result == 'Hello, V1Client!'
-        finally:
-            client.terminate()
+        with pytest.raises(Exception):
+            proxy = cc.connect(IHello, name='nonexistent', address=addr)
+            try:
+                proxy.greeting('x')
+            finally:
+                cc.close(proxy)
 
 
 # ---------------------------------------------------------------------------
@@ -259,15 +190,11 @@ class TestDynamicRegistration:
         assert set(server.names) == {'hello', 'counter'}
 
         # Connect and call the new CRM.
-        client = SharedClient(addr)
-        client.connect()
+        proxy = cc.connect(ICounter, name='counter', address=addr)
         try:
-            result = pickle.loads(client.call(
-                'get', pickle.dumps(()), name='counter',
-            ))
-            assert result == 42
+            assert proxy.get() == 42
         finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_unregister_default_shifts(self):
         """Unregistering the default route shifts to the next one."""

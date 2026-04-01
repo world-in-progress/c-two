@@ -1,5 +1,7 @@
 # Server Core Decoupling Design
 
+> **Status: ✅ SUPERSEDED** — `server/core.py` was replaced by Rust `c2-server` + `NativeServerBridge` (325L) in Phase 3. The Python monolith this spec targets no longer exists. See `rust-transport-sink-design.md` §2.
+
 **Date:** 2026-03-29
 **Status:** Draft
 **Scope:** `src/c_two/transport/server/core.py` — 1497 lines → ~550 lines

@@ -1,11 +1,10 @@
-"""Integration tests for Server + SharedClient.
+"""Integration tests for Server via SOTA API.
 
-Tests SharedClient → Server via handshake protocol.
+Tests Server functionality through the cc.connect ICRM proxy.
 """
 from __future__ import annotations
 
 import os
-import pickle
 import threading
 import time
 
@@ -13,7 +12,8 @@ import pytest
 
 import c_two as cc
 from c_two.transport.ipc.frame import IPCConfig
-from c_two.transport import SharedClient, ClientPool, Server
+from c_two.transport import Server
+from c_two.transport.client.util import ping, shutdown
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -39,7 +39,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if SharedClient.ping(address, timeout=0.5):
+            if ping(address, timeout=0.5):
                 return
         except Exception:
             pass
@@ -59,6 +59,7 @@ def server_addr():
         bind_address=addr,
         icrm_class=IHello,
         crm_instance=Hello(),
+        name='hello',
     )
     server.start()
     _wait_for_server(addr)
@@ -76,6 +77,7 @@ def server_small_shm():
         icrm_class=IHello,
         crm_instance=Hello(),
         ipc_config=config,
+        name='hello',
     )
     server.start()
     _wait_for_server(addr)
@@ -84,121 +86,95 @@ def server_small_shm():
 
 
 # ---------------------------------------------------------------------------
-# V1 mode: SharedClient (v4 handshake) → Server
+# Basic server functionality via SOTA API
 # ---------------------------------------------------------------------------
 
-class TestServerBackwardCompat:
-    """Server must handle v1 wire frames from a v4-handshake client."""
+class TestServerBasic:
+    """Server must handle standard RPC calls via SOTA API."""
 
-    def test_greeting_legacy(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+    def test_greeting(self, server_addr):
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            result = pickle.loads(client.call('greeting', pickle.dumps(('World',))))
+            result = proxy.greeting('World')
             assert result == 'Hello, World!'
         finally:
-            client.terminate()
+            cc.close(proxy)
 
-    def test_add_legacy(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+    def test_add(self, server_addr):
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            result = pickle.loads(client.call('add', pickle.dumps((7, 8))))
+            result = proxy.add(7, 8)
             assert result == 15
         finally:
-            client.terminate()
+            cc.close(proxy)
 
-    def test_list_legacy(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+    def test_list(self, server_addr):
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            result = pickle.loads(
-                client.call('get_items', pickle.dumps(([1, 2, 3],)))
-            )
+            result = proxy.get_items([1, 2, 3])
             assert result == ['item-1', 'item-2', 'item-3']
         finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_ping(self, server_addr):
-        assert SharedClient.ping(server_addr)
+        assert ping(server_addr)
 
-    def test_shutdown_v1(self):
+    def test_shutdown(self):
         addr = f'ipc://{_unique_region("shut")}'
         server = Server(
             bind_address=addr,
             icrm_class=IHello,
             crm_instance=Hello(),
+            name='hello',
         )
         server.start()
         _wait_for_server(addr)
-        assert SharedClient.shutdown(addr)
+        assert shutdown(addr)
         # Server should be shutting down; give it a moment.
         time.sleep(0.3)
 
 
 # ---------------------------------------------------------------------------
-# SharedClient → Server (handshake)
+# ICRM method routing
 # ---------------------------------------------------------------------------
 
-class TestServerWire:
-    """SharedClient against Server — control-plane routing."""
+class TestServerRouting:
+    """Server routes ICRM method calls correctly."""
 
     def test_greeting_routed(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            
-            result = pickle.loads(client.call('greeting', pickle.dumps(('V2',))))
+            result = proxy.greeting('V2')
             assert result == 'Hello, V2!'
         finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_add_routed(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            result = pickle.loads(client.call('add', pickle.dumps((100, 200))))
+            result = proxy.add(100, 200)
             assert result == 300
         finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_list_routed(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            result = pickle.loads(
-                client.call('get_items', pickle.dumps(([5, 10],)))
-            )
+            result = proxy.get_items([5, 10])
             assert result == ['item-5', 'item-10']
         finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_custom_type_routed(self, server_addr):
-        """Test transferable type round-trip via control-plane routing."""
-        client = SharedClient(server_addr)
-        client.connect()
+        """Test transferable type round-trip via SOTA API."""
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            raw = client.call('get_data', pickle.dumps((42,)))
-            # HelloData.serialize produces pickle.dumps(dict), so wire result
-            # is a pickled dict.  Deserialize with the transferable's deserializer.
             from tests.fixtures.ihello import HelloData
-            result = HelloData.deserialize(raw)
+            result = proxy.get_data(42)
             assert result.name == 'data-42'
             assert result.value == 420
         finally:
-            client.terminate()
-
-    def test_method_table_populated(self, server_addr):
-        """Verify that handshake populates method table on client."""
-        client = SharedClient(server_addr)
-        client.connect()
-        try:
-            assert client._method_table is not None
-            assert client._method_table.has_name('greeting')
-            assert client._method_table.has_name('add')
-            assert client._method_table.has_name('get_items')
-        finally:
-            client.terminate()
+            cc.close(proxy)
 
 
 # ---------------------------------------------------------------------------
@@ -209,16 +185,12 @@ class TestServerInlinePath:
     """Force the inline path by using a very small SHM threshold."""
 
     def test_greeting_inline(self, server_small_shm):
-        client = SharedClient(
-            server_small_shm,
-            ipc_config=IPCConfig(shm_threshold=16),
-        )
-        client.connect()
+        proxy = cc.connect(IHello, name='hello', address=server_small_shm)
         try:
-            result = pickle.loads(client.call('greeting', pickle.dumps(('Inline',))))
+            result = proxy.greeting('Inline')
             assert result == 'Hello, Inline!'
         finally:
-            client.terminate()
+            cc.close(proxy)
 
 
 # ---------------------------------------------------------------------------
@@ -228,16 +200,15 @@ class TestServerInlinePath:
 class TestServerConcurrent:
     """Multiple concurrent calls to Server."""
 
-    def test_concurrent_legacy(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+    def test_concurrent_calls(self, server_addr):
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         errors: list[str] = []
 
         def worker(tid: int) -> None:
             try:
                 for i in range(5):
                     a, b = tid * 100 + i, i
-                    r = pickle.loads(client.call('add', pickle.dumps((a, b))))
+                    r = proxy.add(a, b)
                     if r != a + b:
                         errors.append(f'T{tid}[{i}]: expected {a + b}, got {r}')
             except Exception as e:
@@ -251,30 +222,4 @@ class TestServerConcurrent:
                 t.join(timeout=30)
             assert errors == [], f'Errors: {errors}'
         finally:
-            client.terminate()
-
-    def test_concurrent_routed(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
-        errors: list[str] = []
-
-        def worker(tid: int) -> None:
-            try:
-                for i in range(5):
-                    a, b = tid * 100 + i, i
-                    r = pickle.loads(client.call('add', pickle.dumps((a, b))))
-                    if r != a + b:
-                        errors.append(f'T{tid}[{i}]: expected {a + b}, got {r}')
-            except Exception as e:
-                errors.append(f'T{tid}: {e}')
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
-        try:
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=30)
-            assert errors == [], f'Errors: {errors}'
-        finally:
-            client.terminate()
-
+            cc.close(proxy)

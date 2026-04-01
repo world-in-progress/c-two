@@ -10,13 +10,13 @@ import threading
 import pytest
 
 import c_two as cc
-from c_two.transport.server.core import Server
-from c_two.transport.client.core import SharedClient
+from c_two.transport.server import Server
+from c_two.transport.client.util import ping
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
     CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
     CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    EventSerializeError, EventDeserializeError,
+    FrameDecodeError,
 )
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello, HelloData
@@ -66,7 +66,7 @@ def error_server():
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         try:
-            if SharedClient.ping(address, timeout=0.5):
+            if ping(address, timeout=0.5):
                 break
         except Exception:
             pass
@@ -140,7 +140,7 @@ class TestCompoClientError:
 
     def test_ping_nonexistent_returns_false(self):
         address = f'ipc://nonexistent_{_next_id()}'
-        assert SharedClient.ping(address, timeout=0.5) is False
+        assert ping(address, timeout=0.5) is False
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ class TestCompoClientError:
 ALL_SUBCLASSES = [
     CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
     CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    EventSerializeError, EventDeserializeError,
+    FrameDecodeError,
 ]
 
 

@@ -1,10 +1,8 @@
 """Concurrency safety and security integration tests.
 
 Tests:
-- Thread-safe concurrent calls through SharedClient
-- Request ID 32-bit wrapping correctness
-- Server segment limit enforcement
-- Double-terminate safety
+- Thread-safe concurrent calls via SOTA API
+- Server double-shutdown safety
 - Concurrent connect/close lifecycle
 """
 from __future__ import annotations
@@ -12,15 +10,13 @@ from __future__ import annotations
 import os
 import time
 import threading
-import struct
 
 import pytest
 
 import c_two as cc
-from c_two.transport.client.core import SharedClient
-from c_two.transport.server.core import Server
-from c_two.transport.client.pool import ClientPool
+from c_two.transport.server import Server
 from c_two.transport.ipc.frame import IPCConfig
+from c_two.transport.client.util import ping
 
 
 # ---------------------------------------------------------------------------
@@ -48,81 +44,24 @@ def _next_addr():
 
 
 def _wait_for_server(addr: str, timeout: float = 3.0):
-    """Poll until server socket is ready."""
-    import socket as _sock
-    sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-    region = addr.replace('ipc://', '')
-    sock_path = os.path.join(sock_dir, region + '.sock')
+    """Poll until server responds to ping."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
-            try:
-                s = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-                s.connect(sock_path)
-                s.close()
-                return
-            except Exception:
-                pass
+        if ping(addr, timeout=0.5):
+            return
         time.sleep(0.02)
     raise TimeoutError(f'Server at {addr} not ready within {timeout}s')
 
 
 # ---------------------------------------------------------------------------
-# Request ID wrapping
-# ---------------------------------------------------------------------------
-
-class TestRequestIdWrapping:
-    """Verify 32-bit request ID wrapping doesn't cause collisions."""
-
-    def test_rid_wraps_at_32bit_boundary(self):
-        """Counter wraps from 0xFFFFFFFF to 0."""
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-
-            # Simulate near-wrap: set counter close to 32-bit max.
-            with client._rid_lock:
-                client._rid_counter = 0xFFFFFFFE
-
-            # Make 4 calls spanning the wrap point.
-            results = []
-            for i in range(4):
-                r = client.call('echo', i.to_bytes(4, 'little'))
-                results.append(r)
-
-            # All 4 calls should succeed and return correct data.
-            for i, r in enumerate(results):
-                assert int.from_bytes(r, 'little') == i
-
-            # Counter should have wrapped.
-            with client._rid_lock:
-                assert client._rid_counter == 2  # 0xFFFFFFFE + 4 wraps to 2
-
-            client.terminate()
-        finally:
-            server.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Concurrent calls stress test
+# Concurrent calls stress test via SOTA API
 # ---------------------------------------------------------------------------
 
 class TestConcurrentCallSafety:
-    """Stress-test SharedClient concurrent call safety."""
+    """Stress-test concurrent call safety via SOTA API."""
 
     def test_32_threads_concurrent_echo(self):
-        """32 threads making concurrent echo calls through one SharedClient."""
+        """32 threads making concurrent echo calls via a shared proxy."""
         addr = _next_addr()
         cfg = IPCConfig(
             pool_segment_size=1 << 20,  # 1MB
@@ -130,13 +69,12 @@ class TestConcurrentCallSafety:
             max_pool_memory=2 << 20,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg)
-            client.connect()
+            proxy = cc.connect(IEcho, name='echo', address=addr)
 
             errors = []
             results = {}
@@ -145,7 +83,7 @@ class TestConcurrentCallSafety:
                 try:
                     for i in range(calls):
                         tag = f'{thread_id}:{i}'.encode()
-                        r = client.call('echo', tag)
+                        r = proxy.echo(tag)
                         assert r == tag, f'Thread {thread_id} call {i}: expected {tag!r}, got {r!r}'
                         results[(thread_id, i)] = True
                 except Exception as e:
@@ -163,8 +101,7 @@ class TestConcurrentCallSafety:
 
             assert not errors, f'Errors in threads: {errors}'
             assert len(results) == n_threads * calls_per_thread
-
-            client.terminate()
+            cc.close(proxy)
         finally:
             server.shutdown()
 
@@ -177,13 +114,12 @@ class TestConcurrentCallSafety:
             max_pool_memory=2 << 20,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg)
-            client.connect()
+            proxy = cc.connect(IEcho, name='echo', address=addr)
 
             errors = []
             sizes = [64, 256, 1024, 4096, 16384, 65536]
@@ -193,7 +129,7 @@ class TestConcurrentCallSafety:
                     data = bytes(range(256)) * (payload_size // 256 + 1)
                     data = data[:payload_size]
                     for _ in range(5):
-                        r = client.call('echo', data)
+                        r = proxy.echo(data)
                         assert r == data
                 except Exception as e:
                     errors.append((thread_id, payload_size, e))
@@ -207,39 +143,33 @@ class TestConcurrentCallSafety:
                 t.join(timeout=15)
 
             assert not errors, f'Errors: {errors}'
-            client.terminate()
+            cc.close(proxy)
         finally:
             server.shutdown()
 
 
 # ---------------------------------------------------------------------------
-# Double-terminate safety
+# Double-shutdown safety
 # ---------------------------------------------------------------------------
 
-class TestDoubleTerminate:
-    """Ensure calling terminate() multiple times is safe."""
+class TestDoubleShutdown:
+    """Ensure calling shutdown/close multiple times is safe."""
 
-    def test_client_double_terminate(self):
+    def test_proxy_double_close(self):
         addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server = Server(bind_address=addr)
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
         try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-            r = client.call('echo', b'hello')
+            proxy = cc.connect(IEcho, name='echo', address=addr)
+            r = proxy.echo(b'hello')
             assert r == b'hello'
 
-            # Terminate twice — should not raise.
-            client.terminate()
-            client.terminate()
+            # Close twice — should not raise.
+            cc.close(proxy)
+            cc.close(proxy)
         finally:
             server.shutdown()
 
@@ -251,7 +181,7 @@ class TestDoubleTerminate:
             max_pool_memory=65536,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
+        server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
 
@@ -259,294 +189,6 @@ class TestDoubleTerminate:
         server.shutdown()
         server.shutdown()
 
-
-# ---------------------------------------------------------------------------
-# ClientPool lifecycle safety
-# ---------------------------------------------------------------------------
-
-class TestClientPoolSafety:
-    """Test ClientPool reference counting under concurrent access."""
-
-    def test_concurrent_acquire_release(self):
-        """Multiple threads acquiring/releasing the same address concurrently."""
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            pool = ClientPool(grace_seconds=60.0, default_config=cfg)
-            errors = []
-
-            def worker(tid: int):
-                try:
-                    client = pool.acquire(addr)
-                    r = client.call('echo', f'tid={tid}'.encode())
-                    assert r == f'tid={tid}'.encode()
-                    pool.release(addr)
-                except Exception as e:
-                    errors.append((tid, e))
-
-            threads = []
-            for tid in range(8):
-                t = threading.Thread(target=worker, args=(tid,))
-                threads.append(t)
-                t.start()
-            for t in threads:
-                t.join(timeout=10)
-
-            assert not errors, f'Errors: {errors}'
-
-            # All released; refcount should be 0 but client still alive (grace period).
-            assert pool.refcount(addr) == 0
-            assert pool.has_client(addr)  # still in grace period
-
-            pool.shutdown_all()
-        finally:
-            server.shutdown()
-
-    def test_release_without_acquire_warns(self):
-        """Releasing an address never acquired should not crash."""
-        pool = ClientPool(grace_seconds=1.0)
-        # Should not raise, just warn.
-        pool.release('ipc://nonexistent')
-        pool.shutdown_all()
-
-
-# ---------------------------------------------------------------------------
-# Call after terminate raises cleanly
-# ---------------------------------------------------------------------------
-
-class TestCallAfterTerminate:
-    """Verify calling a terminated client raises a clear error."""
-
-    def test_call_after_terminate_raises(self):
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-            r = client.call('echo', b'ok')
-            assert r == b'ok'
-
-            client.terminate()
-
-            with pytest.raises(Exception):
-                client.call('echo', b'should fail')
-        finally:
-            server.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Terminate during in-flight calls
-# ---------------------------------------------------------------------------
-
-class TestTerminateDuringInFlight:
-    """Verify terminate() wakes up in-flight callers cleanly."""
-
-    def test_terminate_wakes_pending_callers(self):
-        """Slow CRM + terminate → pending callers get error, not hang."""
-        import time as _time
-
-        @cc.icrm(namespace='cc.test.slow', version='0.1.0')
-        class ISlow:
-            def slow_op(self) -> bytes: ...
-
-        class SlowImpl:
-            def slow_op(self) -> bytes:
-                _time.sleep(5.0)  # Simulate long operation
-                return b'done'
-
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(ISlow, SlowImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            client = SharedClient(addr, cfg)
-            client.connect()
-
-            errors = []
-
-            def slow_caller():
-                try:
-                    client.call('slow_op', b'')
-                except Exception as e:
-                    errors.append(e)
-
-            t = threading.Thread(target=slow_caller)
-            t.start()
-
-            # Give the call time to reach the server.
-            _time.sleep(0.1)
-
-            # Terminate while call is in-flight.
-            client.terminate()
-
-            # Caller thread should wake up quickly with an error.
-            t.join(timeout=3.0)
-            assert not t.is_alive(), 'Caller thread hung after terminate'
-            assert len(errors) == 1
-        finally:
-            server.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Malformed frame handling — server stays alive
-# ---------------------------------------------------------------------------
-
-class TestServerMalformedFrames:
-    """Verify server gracefully handles malformed frames without crashing."""
-
-    def test_server_survives_malformed_payload(self):
-        """Send truncated call control; server should disconnect client
-        but keep serving others."""
-        import socket as _sock
-
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-            region = addr.replace('ipc://', '')
-            sock_path = os.path.join(sock_dir, region + '.sock')
-
-            # Send a malformed call frame (truncated call control).
-            raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-            raw.connect(sock_path)
-            raw.settimeout(2.0)
-
-            from c_two.transport.ipc.frame import encode_frame
-            from c_two.transport.protocol import FLAG_CALL
-
-            # FLAG_CALL frame with only 1 byte payload (name_len=5 but no data).
-            malformed_payload = bytes([5])  # name_len=5, but no name or method_idx
-            frame = encode_frame(1, FLAG_CALL, malformed_payload)
-            raw.sendall(frame)
-            # Server should handle error (close conn or return error), not crash.
-            time.sleep(0.2)
-            raw.close()
-
-            # Verify server is still alive by making a normal call.
-            client = SharedClient(addr, cfg)
-            client.connect()
-            r = client.call('echo', b'still alive')
-            assert r == b'still alive'
-            client.terminate()
-        finally:
-            server.shutdown()
-
-    def test_server_survives_zero_length_payload(self):
-        """Empty call payload should not crash server."""
-        import socket as _sock
-
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-            region = addr.replace('ipc://', '')
-            sock_path = os.path.join(sock_dir, region + '.sock')
-
-            raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-            raw.connect(sock_path)
-            raw.settimeout(2.0)
-
-            from c_two.transport.ipc.frame import encode_frame
-            from c_two.transport.protocol import FLAG_CALL
-
-            frame = encode_frame(1, FLAG_CALL, b'')
-            raw.sendall(frame)
-            time.sleep(0.2)
-            raw.close()
-
-            # Server should still be alive.
-            client = SharedClient(addr, cfg)
-            client.connect()
-            r = client.call('echo', b'ok')
-            assert r == b'ok'
-            client.terminate()
-        finally:
-            server.shutdown()
-
-    def test_server_survives_corrupted_control(self):
-        """Routed call with garbage control bytes should not crash server."""
-        import socket as _sock
-
-        addr = _next_addr()
-        cfg = IPCConfig(
-            pool_segment_size=65536,
-            max_pool_segments=1,
-            max_pool_memory=65536,
-        )
-        server = Server(bind_address=addr, ipc_config=cfg)
-        server.register_crm(IEcho, EchoImpl())
-        server.start()
-        _wait_for_server(addr)
-
-        try:
-            sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-            region = addr.replace('ipc://', '')
-            sock_path = os.path.join(sock_dir, region + '.sock')
-
-            raw = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
-            raw.connect(sock_path)
-            raw.settimeout(2.0)
-
-            from c_two.transport.ipc.frame import encode_frame
-            from c_two.transport.protocol import FLAG_CALL
-
-            # Send a call with garbage control bytes (too short to parse)
-            frame = encode_frame(1, FLAG_CALL, b'\xff\x01')
-            raw.sendall(frame)
-            time.sleep(0.2)
-            raw.close()
-
-            # Server should still be alive.
-            client = SharedClient(addr, cfg)
-            client.connect()
-            r = client.call('echo', b'ok')
-            assert r == b'ok'
-            client.terminate()
-        finally:
-            server.shutdown()
 
 class TestSOTAAPIConcurrency:
     """Test the high-level cc.register/connect/close API under concurrency."""

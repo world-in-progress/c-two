@@ -1,5 +1,7 @@
 # rpc_v2 Promotion Refactor: `rpc/` → `transport/`
 
+> **Status: ✅ COMPLETE** — `rpc_v2/` promoted to `transport/`, all v1 legacy removed. Completed 2026-03-28.
+
 **Date**: 2026-03-28
 **Status**: Approved
 **Scope**: Promote `rpc_v2/` as sole RPC implementation, remove all v1 legacy, restructure into `transport/` package

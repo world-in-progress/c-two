@@ -123,8 +123,8 @@ class TestNativeRelayWithServer:
         import os
         import httpx
         import c_two as cc
+        from c_two._native import RustHttpClientPool
         from c_two.transport.registry import _ProcessRegistry
-        from c_two.transport.client.http import HttpClient
         from c_two.transport.client.proxy import ICRMProxy
         from tests.fixtures.hello import Hello
         from tests.fixtures.ihello import IHello
@@ -142,15 +142,16 @@ class TestNativeRelayWithServer:
             try:
                 relay.register_upstream('hello', ipc_addr)
 
-                # Use HttpClient to call through the native relay
-                client = HttpClient('http://127.0.0.1:19906')
+                pool = RustHttpClientPool.instance()
+                url = 'http://127.0.0.1:19906'
+                client = pool.acquire(url)
                 try:
                     icrm = IHello()
                     icrm.client = ICRMProxy.http(client, 'hello')
                     result = icrm.greeting('NativeRelay')
                     assert result == 'Hello, NativeRelay!'
                 finally:
-                    client.terminate()
+                    pool.release(url)
             finally:
                 relay.stop()
         finally:

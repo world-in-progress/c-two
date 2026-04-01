@@ -441,64 +441,6 @@ class TestSerializeDeserializeConsistency:
         assert bytes(t.deserialize(memoryview(b'mv'))) == b'mv'
 
 
-# ---------------------------------------------------------------------------
-# OPT-T3: __memoryview_aware__ flag behavior
-# ---------------------------------------------------------------------------
-
-class TestMemoryviewAwareFlag:
-    """Tests for the __memoryview_aware__ optimization flag on Transferable."""
-
-    def test_default_flag_is_false(self):
-        """Transferable base class has __memoryview_aware__ = False."""
-        assert Transferable.__memoryview_aware__ is False
-
-    def test_custom_transferable_can_set_flag(self):
-        """A @transferable subclass can set __memoryview_aware__ = True."""
-        @cc.transferable
-        class MvAwareData:
-            __memoryview_aware__ = True
-            value: int
-            def serialize(d: 'MvAwareData') -> bytes:
-                return pickle.dumps(d.value)
-            def deserialize(b: bytes) -> 'MvAwareData':
-                return MvAwareData(value=pickle.loads(b))
-
-        assert MvAwareData.__memoryview_aware__ is True
-
-    def test_flag_not_set_defaults_false(self):
-        """A @transferable without the flag should default to False."""
-        @cc.transferable
-        class NoFlagData:
-            value: int
-            def serialize(d: 'NoFlagData') -> bytes:
-                return pickle.dumps(d.value)
-            def deserialize(b: bytes) -> 'NoFlagData':
-                return NoFlagData(value=pickle.loads(b))
-
-        assert NoFlagData.__memoryview_aware__ is False
-
-    def test_getattr_works_for_flag_check(self):
-        """The framework checks flag via getattr(..., '__memoryview_aware__', False)."""
-        @cc.transferable
-        class FlagCheckData:
-            __memoryview_aware__ = True
-            x: int
-            def serialize(d: 'FlagCheckData') -> bytes:
-                return b''
-            def deserialize(b: bytes) -> 'FlagCheckData':
-                return FlagCheckData(x=0)
-
-        assert getattr(FlagCheckData, '__memoryview_aware__', False) is True
-
-        @cc.transferable
-        class NoFlagCheckData:
-            y: int
-            def serialize(d: 'NoFlagCheckData') -> bytes:
-                return b''
-            def deserialize(b: bytes) -> 'NoFlagCheckData':
-                return NoFlagCheckData(y=0)
-
-        assert getattr(NoFlagCheckData, '__memoryview_aware__', False) is False
 
 
 # ---------------------------------------------------------------------------

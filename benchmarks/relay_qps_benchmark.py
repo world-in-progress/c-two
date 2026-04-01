@@ -41,7 +41,7 @@ def cleanup_stale():
         except OSError:
             pass
     try:
-        from c_two.buddy import cleanup_stale_shm
+        from c_two.mem import cleanup_stale_shm
         cleanup_stale_shm()
     except Exception:
         pass

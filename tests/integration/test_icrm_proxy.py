@@ -5,36 +5,20 @@ replacements for rpc.Client when assigned to ``icrm.client``.
 """
 from __future__ import annotations
 
-import os
-import time
 import uuid
 
 import pytest
 
+import c_two as cc
 from c_two.transport import Server, ICRMProxy
-from c_two.transport.client.core import SharedClient
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello
 from tests.fixtures.counter import ICounter, Counter
 
 
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-
-
 def _unique_region() -> str:
     return f'test_proxy_{uuid.uuid4().hex[:12]}'
-
-
-def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
-    region_id = addr.replace('ipc://', '')
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
-            return
-        time.sleep(0.05)
-    raise RuntimeError(f'Server at {sock_path} not ready')
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +70,11 @@ class TestICRMProxyThreadLocal:
 
 
 # ---------------------------------------------------------------------------
-# IPC proxy + real ICRM (end-to-end)
+# IPC proxy via SOTA API (end-to-end)
 # ---------------------------------------------------------------------------
 
 class TestICRMProxyIPC:
-    """ICRMProxy.ipc() with real Server + SharedClient."""
+    """ICRMProxy.ipc() via SOTA cc.register/connect API."""
 
     @pytest.fixture
     def server_addr(self):
@@ -99,50 +83,40 @@ class TestICRMProxyIPC:
         server.register_crm(IHello, Hello(), name='hello')
         server.register_crm(ICounter, Counter(initial=50), name='counter')
         server.start()
-        _wait_for_server(addr)
+        from c_two.transport.client.util import ping
+        deadline = __import__('time').monotonic() + 5.0
+        while __import__('time').monotonic() < deadline:
+            if ping(addr, timeout=0.5):
+                break
+            __import__('time').sleep(0.05)
         yield addr
         server.shutdown()
 
     def test_hello_via_ipc_proxy(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+        proxy = cc.connect(IHello, name='hello', address=server_addr)
         try:
-            proxy = ICRMProxy.ipc(client, 'hello')
-            icrm = IHello()
-            icrm.client = proxy
-            assert icrm.greeting('IPC') == 'Hello, IPC!'
-            assert icrm.add(10, 20) == 30
+            assert proxy.greeting('IPC') == 'Hello, IPC!'
+            assert proxy.add(10, 20) == 30
         finally:
-            client.terminate()
+            cc.close(proxy)
 
     def test_counter_via_ipc_proxy(self, server_addr):
-        client = SharedClient(server_addr)
-        client.connect()
+        proxy = cc.connect(ICounter, name='counter', address=server_addr)
         try:
-            proxy = ICRMProxy.ipc(client, 'counter')
-            icrm = ICounter()
-            icrm.client = proxy
-            assert icrm.get() == 50
-            assert icrm.increment(7) == 57
+            assert proxy.get() == 50
+            assert proxy.increment(7) == 57
         finally:
-            client.terminate()
+            cc.close(proxy)
 
-    def test_two_proxies_same_client(self, server_addr):
-        """Two different ICRM proxies share the same SharedClient."""
-        client = SharedClient(server_addr)
-        client.connect()
+    def test_two_proxies_same_server(self, server_addr):
+        """Two different ICRM proxies connect to the same server."""
+        hello = cc.connect(IHello, name='hello', address=server_addr)
+        counter = cc.connect(ICounter, name='counter', address=server_addr)
         try:
-            hello_proxy = ICRMProxy.ipc(client, 'hello')
-            counter_proxy = ICRMProxy.ipc(client, 'counter')
-
-            hello = IHello()
-            hello.client = hello_proxy
-            counter = ICounter()
-            counter.client = counter_proxy
-
             assert hello.greeting('Shared') == 'Hello, Shared!'
             assert counter.get() == 50
             assert counter.increment(10) == 60
             assert hello.add(1, 2) == 3
         finally:
-            client.terminate()
+            cc.close(hello)
+            cc.close(counter)

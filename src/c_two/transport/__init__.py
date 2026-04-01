@@ -1,38 +1,27 @@
 """Transport layer for C-Two.
 
 Provides the complete transport stack for C-Two:
-- Server: asyncio-based multi-CRM IPC server
-- SharedClient: concurrent multiplexed IPC client
-- ClientPool: reference-counted client lifecycle
+- Server: Rust tokio-based multi-CRM IPC server (via NativeServerBridge)
 - ICRMProxy: unified proxy (thread-local / IPC / HTTP)
-- Relay: HTTP → IPC bridge (Starlette + uvicorn)
 - Registry: cc.register/connect/close/shutdown SOTA API
 """
 from __future__ import annotations
 
 __all__ = [
-    'SharedClient', 'ClientPool', 'ICRMProxy',
-    'HttpClient', 'HttpClientPool',
+    'ICRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
-    'Relay', 'UpstreamPool',
     'set_address', 'set_ipc_config', 'register', 'connect', 'close',
     'unregister', 'server_address', 'shutdown', 'serve',
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
-    'SharedClient':      ('.client.core',        'SharedClient'),
-    'ClientPool':        ('.client.pool',         'ClientPool'),
     'ICRMProxy':         ('.client.proxy',        'ICRMProxy'),
-    'HttpClient':        ('.client.http',         'HttpClient'),
-    'HttpClientPool':    ('.client.http',         'HttpClientPool'),
-    'Server':          ('.server.core',         'Server'),
-    'CRMSlot':           ('.server.core',         'CRMSlot'),
+    'Server':          ('.server.native',       'NativeServerBridge'),
+    'CRMSlot':           ('.server.native',       'CRMSlot'),
     'Scheduler':         ('.server.scheduler',    'Scheduler'),
     'ConcurrencyConfig': ('.server.scheduler',    'ConcurrencyConfig'),
     'ConcurrencyMode':   ('.server.scheduler',    'ConcurrencyMode'),
-    'Relay':           ('.relay.core',          'Relay'),
-    'UpstreamPool':      ('.relay.core',          'UpstreamPool'),
     'set_address':       ('.registry',            'set_address'),
     'set_ipc_config':    ('.registry',            'set_ipc_config'),
     'register':          ('.registry',            'register'),

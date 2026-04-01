@@ -1,6 +1,8 @@
 # README Restructure Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: ✅ COMPLETE** — README.md (English) and README.zh-CN.md (Chinese) written and published.
+
+> **For agentic workers:** This plan is historical — all tasks have been completed.
 
 **Goal:** Rewrite README.md (English) and create README.zh-CN.md (Chinese), following the narrative structure defined in the design spec.
 

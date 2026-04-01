@@ -8,8 +8,8 @@ import threading
 import time
 import c_two as cc
 
-from c_two.transport.server.core import Server
-from c_two.transport.client.core import SharedClient
+from c_two.transport.server import Server
+from c_two.transport.client.util import ping
 
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
@@ -55,7 +55,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if SharedClient.ping(address, timeout=0.5):
+            if ping(address, timeout=0.5):
                 return
         except Exception:
             pass

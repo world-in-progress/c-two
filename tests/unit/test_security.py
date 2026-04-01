@@ -48,32 +48,34 @@ class TestHandshakeBoundsChecking:
             decode_handshake(b'')
 
     def test_wrong_version(self):
-        with pytest.raises(ValueError, match='Expected handshake'):
+        with pytest.raises(ValueError, match='version'):
             decode_handshake(bytes([4, 0, 0]))
 
     def test_truncated_segment_entry(self):
         """seg_count=1 but no segment data follows."""
-        buf = bytes([HANDSHAKE_VERSION]) + struct.pack('<H', 1)  # version + seg_count=1
-        with pytest.raises(ValueError, match='truncated'):
+        buf = bytes([HANDSHAKE_VERSION, 0]) + struct.pack('<H', 1)  # version + prefix(0) + seg_count=1
+        with pytest.raises(ValueError, match='need.*bytes'):
             decode_handshake(buf)
 
     def test_truncated_segment_name(self):
         """Segment name_len claims 10 bytes but only 2 available."""
         buf = bytearray()
         buf.append(HANDSHAKE_VERSION)
+        buf.append(0)                    # prefix_len=0
         buf += struct.pack('<H', 1)    # seg_count=1
         buf += struct.pack('<I', 256)  # segment size
         buf.append(10)                 # name_len = 10
         buf += b'ab'                   # only 2 bytes of name
-        with pytest.raises(ValueError, match='truncated'):
+        with pytest.raises(ValueError, match='need.*bytes'):
             decode_handshake(bytes(buf))
 
     def test_excessive_segment_count(self):
         """seg_count exceeds _MAX_HANDSHAKE_SEGMENTS."""
         buf = bytearray()
         buf.append(HANDSHAKE_VERSION)
+        buf.append(0)                    # prefix_len=0
         buf += struct.pack('<H', _MAX_HANDSHAKE_SEGMENTS + 1)
-        with pytest.raises(ValueError, match='exceeds limit'):
+        with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))
 
     def test_max_segment_count_ok(self):
@@ -87,12 +89,13 @@ class TestHandshakeBoundsChecking:
         """Payload has segment data but no capability_flags."""
         buf = bytearray()
         buf.append(HANDSHAKE_VERSION)
+        buf.append(0)                    # prefix_len=0
         buf += struct.pack('<H', 1)     # seg_count=1
         buf += struct.pack('<I', 256)   # segment size
         buf.append(2)                   # name_len=2
         buf += b'ab'                    # name
         # Missing 2-byte capability_flags
-        with pytest.raises(ValueError, match='missing capability_flags'):
+        with pytest.raises(ValueError, match='capability'):
             decode_handshake(bytes(buf))
 
     def test_truncated_route_entry(self):
@@ -102,7 +105,7 @@ class TestHandshakeBoundsChecking:
         full = encode_server_handshake(segs, CAP_CALL, routes)
         # Truncate inside route section
         truncated = full[:len(full) - 3]
-        with pytest.raises(ValueError, match='truncated'):
+        with pytest.raises(ValueError, match='need.*bytes'):
             decode_handshake(truncated)
 
     def test_excessive_route_count(self):
@@ -112,7 +115,7 @@ class TestHandshakeBoundsChecking:
         # Append a fake route section with excessive count
         buf = bytearray(encoded)
         buf += struct.pack('<H', _MAX_HANDSHAKE_ROUTES + 1)
-        with pytest.raises(ValueError, match='exceeds limit'):
+        with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))
 
     def test_excessive_method_count(self):
@@ -125,7 +128,7 @@ class TestHandshakeBoundsChecking:
         buf.append(2)                   # route_name_len=2
         buf += b'r1'                    # route_name
         buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
-        with pytest.raises(ValueError, match='exceeds limit'):
+        with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))
 
     def test_valid_roundtrip_after_hardening(self):
@@ -154,19 +157,19 @@ class TestCallControlBoundsChecking:
             decode_call_control(b'', 0)
 
     def test_offset_beyond_buffer(self):
-        with pytest.raises(ValueError, match='offset beyond buffer'):
+        with pytest.raises(ValueError, match='too short|beyond'):
             decode_call_control(b'\x00\x00\x00', 5)
 
     def test_name_len_exceeds_buffer(self):
         """name_len=10 but only 3 total bytes in buffer."""
         buf = bytes([10, 0x41, 0x42])  # name_len=10, only 2 bytes of name
-        with pytest.raises(ValueError, match='buffer too short'):
+        with pytest.raises(ValueError, match='need.*bytes|too short'):
             decode_call_control(buf, 0)
 
     def test_missing_method_idx_after_name(self):
         """Name is complete but no room for 2-byte method_idx."""
         buf = bytes([2, 0x41, 0x42])  # name_len=2, name='AB', but no method_idx
-        with pytest.raises(ValueError, match='buffer too short'):
+        with pytest.raises(ValueError, match='need.*bytes|too short'):
             decode_call_control(buf, 0)
 
     def test_zero_name_insufficient_idx(self):
@@ -203,19 +206,19 @@ class TestReplyControlBoundsChecking:
             decode_reply_control(b'', 0)
 
     def test_offset_beyond_buffer(self):
-        with pytest.raises(ValueError, match='offset beyond buffer'):
+        with pytest.raises(ValueError, match='too short|beyond'):
             decode_reply_control(b'\x00', 5)
 
     def test_error_missing_length(self):
         """STATUS_ERROR but no error_len follows."""
         buf = bytes([STATUS_ERROR])  # status=error, no length
-        with pytest.raises(ValueError, match='buffer too short for error length'):
+        with pytest.raises(ValueError, match='need.*bytes|too short'):
             decode_reply_control(buf, 0)
 
     def test_error_truncated_length(self):
         """STATUS_ERROR with partial error_len (only 2 of 4 bytes)."""
         buf = bytes([STATUS_ERROR, 0x00, 0x00])
-        with pytest.raises(ValueError, match='buffer too short for error length'):
+        with pytest.raises(ValueError, match='need.*bytes|too short'):
             decode_reply_control(buf, 0)
 
     def test_error_len_exceeds_buffer(self):
@@ -223,7 +226,7 @@ class TestReplyControlBoundsChecking:
         buf = bytearray([STATUS_ERROR])
         buf += struct.pack('<I', 1000)  # err_len = 1000
         buf += b'hello'                 # only 5 bytes of error data
-        with pytest.raises(ValueError, match='error data claims'):
+        with pytest.raises(ValueError, match='need.*bytes|error data'):
             decode_reply_control(bytes(buf), 0)
 
     def test_error_len_zero(self):
@@ -248,68 +251,6 @@ class TestReplyControlBoundsChecking:
         status, dec_err, consumed = decode_reply_control(encoded)
         assert status == STATUS_ERROR
         assert dec_err == err_data
-
-
-# ---------------------------------------------------------------------------
-# PendingCall thread safety
-# ---------------------------------------------------------------------------
-
-class TestPendingCallSafety:
-    """Validate PendingCall behavior under edge conditions."""
-
-    def test_double_set_result(self):
-        """Setting result twice is harmless (first wins on event)."""
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=0)
-        p.set_result(b'first')
-        p.set_result(b'second')
-        # Event is already set, wait returns immediately.
-        # Result is the last one set (Python assignment is atomic).
-        result = p.wait(timeout=1.0)
-        assert result in (b'first', b'second')
-
-    def test_set_error_then_result(self):
-        """Error takes precedence even if result is also set."""
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=0)
-        p.set_error(ValueError('test'))
-        p.set_result(b'data')
-        with pytest.raises(ValueError, match='test'):
-            p.wait(timeout=1.0)
-
-    def test_timeout_raises(self):
-        """wait() with short timeout raises TimeoutError."""
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=0)
-        with pytest.raises(TimeoutError):
-            p.wait(timeout=0.01)
-
-    def test_concurrent_wait_and_set(self):
-        """One thread waits, another sets result concurrently."""
-        import threading
-        from c_two.transport.client.core import PendingCall
-        p = PendingCall(rid=42)
-        results = []
-
-        def waiter():
-            try:
-                r = p.wait(timeout=5.0)
-                results.append(r)
-            except Exception as e:
-                results.append(e)
-
-        def setter():
-            import time
-            time.sleep(0.05)
-            p.set_result(b'concurrent')
-
-        t1 = threading.Thread(target=waiter)
-        t2 = threading.Thread(target=setter)
-        t1.start()
-        t2.start()
-        t1.join(timeout=3.0)
-        t2.join(timeout=1.0)
-        assert results == [b'concurrent']
 
 
 # ---------------------------------------------------------------------------

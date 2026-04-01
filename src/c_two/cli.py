@@ -110,19 +110,6 @@ _RELAY_BANNER = """\
     help='HTTP listen address (host:port).',
 )
 @click.option(
-    '--workers', '-w',
-    default=32,
-    show_default=True,
-    type=int,
-    help='Thread pool size for concurrent relay calls.',
-)
-@click.option(
-    '--native/--python',
-    default=True,
-    show_default=True,
-    help='Relay engine: Rust NativeRelay (default) or Python Relay.',
-)
-@click.option(
     '--upstream', '-u',
     multiple=True,
     metavar='NAME=ADDRESS',
@@ -146,28 +133,11 @@ _RELAY_BANNER = """\
     metavar='SECONDS',
     help='Disconnect idle upstream IPC connections after this many seconds (0=disabled).',
 )
-@click.option(
-    '--segment-size',
-    default=None,
-    metavar='SIZE',
-    help='Buddy pool segment size, e.g. 128MB (default: 256MB).',
-)
-@click.option(
-    '--max-segments',
-    default=None,
-    type=int,
-    metavar='N',
-    help='Max buddy pool segments (default: 4).',
-)
 def relay(
     bind: str,
-    workers: int,
-    native: bool,
     upstream: tuple[str, ...],
     log_level: str,
     idle_timeout: int,
-    segment_size: str | None,
-    max_segments: int | None,
 ):
     """Start the C-Two HTTP relay server.
 
@@ -182,34 +152,35 @@ def relay(
     for u in upstream:
         parsed_upstreams.append(parse_upstream(u))
 
-    # Build IPC config if overrides provided.
-    ipc_config = None
-    if segment_size is not None or max_segments is not None:
-        from .transport.ipc.frame import IPCConfig
-        kwargs: dict = {}
-        if segment_size is not None:
-            kwargs['pool_segment_size'] = parse_size(segment_size)
-        if max_segments is not None:
-            kwargs['pool_max_segments'] = max_segments
-        ipc_config = IPCConfig(**kwargs)
-
     # Create and start relay.
-    if native:
-        relay_instance = _start_native_relay(bind, parsed_upstreams, idle_timeout)
-        engine = 'Rust (NativeRelay)'
-    else:
-        relay_instance = _start_python_relay(
-            bind, workers, ipc_config, parsed_upstreams, idle_timeout,
+    try:
+        from .relay import NativeRelay
+    except ImportError:
+        click.echo(
+            'Error: NativeRelay (Rust) not available. '
+            'Build with `uv sync`.',
+            err=True,
         )
-        engine = 'Python (Relay)'
+        sys.exit(1)
+
+    relay_instance = NativeRelay(bind, idle_timeout_secs=idle_timeout)
+    relay_instance.start()
+
+    for name, address in parsed_upstreams:
+        try:
+            relay_instance.register_upstream(name, address)
+        except Exception as exc:
+            click.echo(f'Error: failed to register upstream {name!r}: {exc}', err=True)
+            relay_instance.stop()
+            sys.exit(1)
 
     # Print banner.
     url = _relay_url(bind)
     idle_str = f'{idle_timeout}s' if idle_timeout > 0 else 'disabled'
     click.echo(_RELAY_BANNER.format(
         url=url,
-        engine=engine,
-        workers=str(workers),
+        engine='Rust (NativeRelay)',
+        workers='-',
         idle_timeout=idle_str,
     ))
 
@@ -226,7 +197,7 @@ def relay(
 
     # Graceful shutdown.
     click.echo('\n Shutting down relay…')
-    _stop_relay(relay_instance, native)
+    relay_instance.stop()
     click.echo(' Relay stopped.')
 
 
@@ -239,62 +210,6 @@ def _relay_url(bind: str) -> str:
     if host in ('0.0.0.0', '::'):
         host = '127.0.0.1'
     return f'http://{host}:{port}'
-
-
-def _start_python_relay(
-    bind: str,
-    workers: int,
-    ipc_config,
-    upstreams: list[tuple[str, str]],
-    idle_timeout: int,
-):
-    from .transport.relay import Relay
-
-    relay = Relay(bind=bind, max_workers=workers, ipc_config=ipc_config, idle_timeout=float(idle_timeout))
-    relay.start(blocking=False)
-
-    for name, address in upstreams:
-        try:
-            relay.upstream_pool.add(name, address)
-        except Exception as exc:
-            click.echo(f'Error: failed to register upstream {name!r}: {exc}', err=True)
-            relay.stop()
-            sys.exit(1)
-
-    return relay
-
-
-def _start_native_relay(
-    bind: str,
-    upstreams: list[tuple[str, str]],
-    idle_timeout: int,
-):
-    try:
-        from .relay import NativeRelay
-    except ImportError:
-        click.echo(
-            'Error: NativeRelay (Rust) not available. '
-            'Build with `uv sync` or omit --native.',
-            err=True,
-        )
-        sys.exit(1)
-
-    relay = NativeRelay(bind, idle_timeout_secs=idle_timeout)
-    relay.start()
-
-    for name, address in upstreams:
-        try:
-            relay.register_upstream(name, address)
-        except Exception as exc:
-            click.echo(f'Error: failed to register upstream {name!r}: {exc}', err=True)
-            relay.stop()
-            sys.exit(1)
-
-    return relay
-
-
-def _stop_relay(relay_instance, native: bool) -> None:
-    relay_instance.stop()
 
 
 # ---------------------------------------------------------------------------

@@ -7,8 +7,8 @@ Provides a singleton :class:`_ProcessRegistry` that manages:
 2. **Thread preference** — ``connect()`` returns a zero-serialization
    :class:`ICRMProxy.thread_local` when the target CRM lives in the
    same process.
-3. **Client pooling** — remote connections reuse :class:`SharedClient`
-   instances via :class:`ClientPool`.
+3. **Client pooling** — remote connections reuse Rust IPC/HTTP clients
+   via :class:`RustClientPool` and :class:`RustHttpClientPool`.
 
 Usage::
 
@@ -42,14 +42,10 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeVar
 
-import httpx
-
 from .config import settings
-from .client.http import HttpClientPool
-from .client.pool import ClientPool
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
-from .server.core import Server
+from .server.native import NativeServerBridge as Server
 
 from ..crm.meta import MethodAccess
 from .ipc.frame import IPCConfig
@@ -117,8 +113,9 @@ class _ProcessRegistry:
         self._server_address: str | None = None
         self._explicit_address: str | None = None
         self._explicit_ipc_config: IPCConfig | None = None
-        self._pool = ClientPool()
-        self._http_pool = HttpClientPool()
+        from c_two._native import RustClientPool, RustHttpClientPool
+        self._pool = RustClientPool.instance()
+        self._http_pool = RustHttpClientPool.instance()
 
     # ------------------------------------------------------------------
     # Public API
@@ -227,8 +224,7 @@ class _ProcessRegistry:
                 ipc_cfg = self._build_ipc_config()
                 self._server = Server(bind_address=addr, ipc_config=ipc_cfg)
                 self._server_address = addr
-                # Share the same config with the client pool.
-                self._pool.set_default_config(ipc_cfg)
+                # Rust pool uses its own defaults; skip Python IPCConfig.
 
             self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
             scheduler, access_map = self._server.get_slot_info(name)
@@ -302,7 +298,7 @@ class _ProcessRegistry:
                 on_terminate=lambda addr=address: self._http_pool.release(addr),
             )
         elif address is not None:
-            # Remote IPC via pooled SharedClient.
+            # Remote IPC via pooled RustClient.
             client = self._pool.acquire(address)
             proxy = ICRMProxy.ipc(
                 client,
@@ -442,10 +438,8 @@ class _ProcessRegistry:
                 'The process will block but has nothing to serve.',
             )
 
-        # Print banner.
-        self._print_serve_banner(names, addr)
-
-        # Signal handlers — only installable from the main thread.
+        # Signal handlers — install BEFORE banner so that SIGINT is
+        # handled correctly as soon as the caller sees the output.
         def _handle_signal(signum, frame):  # noqa: ARG001
             self._serve_stop.set()
 
@@ -457,6 +451,9 @@ class _ProcessRegistry:
             # Not the main thread — signals cannot be registered.
             # Caller must arrange to call _serve_stop.set() externally.
             log.debug('cc.serve(): signal handlers skipped (not main thread)')
+
+        # Print banner (after signal handlers are ready).
+        self._print_serve_banner(names, addr)
 
         if not blocking:
             return
@@ -505,25 +502,31 @@ class _ProcessRegistry:
         Does nothing if ``C2_RELAY_ADDRESS`` is not set.  Raises on
         failure when the env var *is* set (hard error, not warning).
         """
+        import json
+        import urllib.request
+
         relay_addr = settings.relay_address
         if not relay_addr:
             return
 
         url = f'{relay_addr.rstrip("/")}/_register'
+        body = json.dumps({'name': name, 'address': ipc_address}).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
         try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport, timeout=timeout) as client:
-                resp = client.post(url, json={'name': name, 'address': ipc_address})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
         except Exception as exc:
             raise ConnectionError(
                 f'Failed to register CRM {name!r} with relay at {relay_addr}: {exc}',
             ) from exc
 
-        if resp.status_code not in (200, 201):
-            detail = resp.text[:200] if resp.text else resp.reason_phrase
+        if status not in (200, 201):
             raise RuntimeError(
-                f'Relay rejected registration of {name!r}: '
-                f'HTTP {resp.status_code} — {detail}',
+                f'Relay rejected registration of {name!r}: HTTP {status}',
             )
 
         log.info('Registered CRM %s with relay at %s', name, relay_addr)
@@ -535,25 +538,31 @@ class _ProcessRegistry:
         Does nothing if ``C2_RELAY_ADDRESS`` is not set.  Raises on
         failure when the env var *is* set (hard error, not warning).
         """
+        import json
+        import urllib.request
+
         relay_addr = settings.relay_address
         if not relay_addr:
             return
 
         url = f'{relay_addr.rstrip("/")}/_unregister'
+        body = json.dumps({'name': name}).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
         try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport, timeout=timeout) as client:
-                resp = client.post(url, json={'name': name})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
         except Exception as exc:
             raise ConnectionError(
                 f'Failed to unregister CRM {name!r} from relay at {relay_addr}: {exc}',
             ) from exc
 
-        if resp.status_code not in (200, 204):
-            detail = resp.text[:200] if resp.text else resp.reason_phrase
+        if status not in (200, 204):
             raise RuntimeError(
-                f'Relay rejected unregistration of {name!r}: '
-                f'HTTP {resp.status_code} — {detail}',
+                f'Relay rejected unregistration of {name!r}: HTTP {status}',
             )
 
         log.info('Unregistered CRM %s from relay at %s', name, relay_addr)

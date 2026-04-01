@@ -1,5 +1,7 @@
 # Per-Connection Write Barrier for ServerV2 Fast Path
 
+> **Status: ✅ SUPERSEDED** — Write barrier was implemented in the Python server, which has since been replaced by Rust `c2-server` (Phase 3). The equivalent concurrency control now lives in Rust.
+
 > Date: 2026-03-28
 > Branch: `autoresearch/python-qps-mar27`
 > Status: Approved

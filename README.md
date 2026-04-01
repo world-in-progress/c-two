@@ -373,7 +373,7 @@ uv run pytest    # run the test suite
 | Read/write concurrency control | ✅ Stable |
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
 | Async interfaces | 🔜 Planned |
-| Disk spill for extreme payloads | 🔜 Planned |
+| Disk spill for extreme payloads | ✅ Stable |
 | Cross-language clients (Rust/C++) | 🔮 Future |
 
 See the [full roadmap](docs/plans/c-two-rpc-v2-roadmap.md) for details.

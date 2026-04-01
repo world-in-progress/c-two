@@ -2,6 +2,7 @@ from __future__ import annotations
 import pickle
 import inspect
 import logging
+import threading
 from abc import ABCMeta
 from functools import wraps
 from pydantic import BaseModel, create_model
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _TRANSFERABLE_MAP: dict[str, Transferable] = {}
 _TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
+_TRANSFERABLE_LOCK = threading.Lock()
 
 # Definition of Transferable ######################################################
 
@@ -63,11 +65,12 @@ class TransferableMeta(ABCMeta):
                 serialize_param_map = {}
                 for param in serialize_sig:
                     serialize_param_map[param.name] = param.annotation
-                _TRANSFERABLE_INFOS.append({
-                    'name': full_name,
-                    'module': cls.__module__,
-                    'param_map': serialize_param_map
-                })
+                with _TRANSFERABLE_LOCK:
+                    _TRANSFERABLE_INFOS.append({
+                        'name': full_name,
+                        'module': cls.__module__,
+                        'param_map': serialize_param_map
+                    })
 
                 logger.debug(f'Registered transferable: {full_name}')
         return cls
@@ -81,11 +84,7 @@ class Transferable(metaclass=TransferableMeta):
     - serialize: convert runtime `args` to `bytes` message
     - deserialize: convert `bytes` message to runtime `args`
 
-    Set ``__memoryview_aware__ = True`` on subclasses whose ``deserialize``
-    accepts ``memoryview`` directly (avoids a full ``bytes()`` copy on the
-    IPC hot path).
     """
-    __memoryview_aware__: bool = False
 
     def serialize(*args: any) -> bytes:
         """
@@ -174,7 +173,6 @@ def create_default_transferable(func, is_input: bool):
         if _is_single_bytes_param(func, filtered_params, type_hints):
             class DynamicInputTransferable(Transferable):
                 __module__ = 'Default'
-                __memoryview_aware__ = True
 
                 def serialize(data) -> bytes:
                     if isinstance(data, (bytes, memoryview)):
@@ -193,7 +191,6 @@ def create_default_transferable(func, is_input: bool):
             # memoryview-aware to avoid unnecessary bytes() conversion.
             class DynamicInputTransferable(Transferable):
                 __module__ = 'Default'  # mark as default
-                __memoryview_aware__ = True
                 
                 def serialize(*args) -> bytes:
                     """Default serialization: pickle args directly as tuple."""
@@ -250,7 +247,6 @@ def create_default_transferable(func, is_input: bool):
         # Define the dynamic transferable class for output
         attrs = {
             '__module__': 'Default',
-            '__memoryview_aware__': True,
             'serialize': serialize_func,
             'deserialize': deserialize_func,
         }
@@ -275,11 +271,13 @@ def create_default_transferable(func, is_input: bool):
 
 def register_transferable(transferable: Transferable) -> str:
     full_name = f'{transferable.__module__}.{transferable.__name__}' if transferable.__module__ else transferable.__name__
-    _TRANSFERABLE_MAP[full_name] = transferable
+    with _TRANSFERABLE_LOCK:
+        _TRANSFERABLE_MAP[full_name] = transferable
     return full_name
 
 def get_transferable(full_name: str) -> Transferable | None:
-    return None if full_name not in _TRANSFERABLE_MAP else _TRANSFERABLE_MAP[full_name]
+    with _TRANSFERABLE_LOCK:
+        return _TRANSFERABLE_MAP.get(full_name)
 
 # Transferable-related decorators #################################################
 
@@ -328,10 +326,6 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 stage = 'deserialize_output'
                 if not output_transferable:
                     return None
-                # Convert memoryview→bytes for legacy deserializers that don't handle memoryview.
-                if (not getattr(output, '__memoryview_aware__', False)
-                        and isinstance(result_bytes, memoryview)):
-                    result_bytes = bytes(result_bytes)
                 return output_transferable(result_bytes)
             
             except error.CCBaseError:
@@ -365,10 +359,6 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 # Deserialize input args if input_transferable is provided
                 # And if deserialized_args is not a tuple, convert it to a tuple
                 if request is not None and input_transferable is not None:
-                    # Convert memoryview→bytes for legacy deserializers.
-                    if (not getattr(input, '__memoryview_aware__', False)
-                            and isinstance(request, memoryview)):
-                        request = bytes(request)
                     deserialized_args = input_transferable(request)
                 else:
                     deserialized_args = tuple()
@@ -447,12 +437,13 @@ def auto_transfer(func: callable | None = None) -> callable:
                     param_module = getattr(param_type, '__module__', None)
                     param_name = getattr(param_type, '__name__', str(param_type))
                     full_name = f'{param_module}.{param_name}' if param_module else param_name
-                    if full_name in _TRANSFERABLE_MAP:
-                        input_transferable = get_transferable(full_name)
+                    input_transferable = get_transferable(full_name)
 
                 # Priority 2: Field name+type comparison (legacy path).
                 if input_transferable is None:
-                    for info in _TRANSFERABLE_INFOS:
+                    with _TRANSFERABLE_LOCK:
+                        infos_snapshot = list(_TRANSFERABLE_INFOS)
+                    for info in infos_snapshot:
                         if info.get('module') != func.__module__:
                             continue
                         registered_param_map = info.get('param_map', {})
@@ -487,9 +478,8 @@ def auto_transfer(func: callable | None = None) -> callable:
                 return_type_module = getattr(return_type, '__module__', None)
                 return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
                 
-                if return_type_full_name in _TRANSFERABLE_MAP:
-                    output_transferable = get_transferable(return_type_full_name)
-                else:
+                output_transferable = get_transferable(return_type_full_name)
+                if output_transferable is None:
                     origin = get_origin(return_type)
                     args = get_args(return_type)
                     expected_output_types = []
@@ -499,7 +489,9 @@ def auto_transfer(func: callable | None = None) -> callable:
                         expected_output_types = [return_type]
 
                     if expected_output_types:
-                        for info in _TRANSFERABLE_INFOS:
+                        with _TRANSFERABLE_LOCK:
+                            infos_snapshot = list(_TRANSFERABLE_INFOS)
+                        for info in infos_snapshot:
                             if info.get('module') != func.__module__:
                                 continue
                             registered_param_map = info.get('param_map', {})

@@ -41,10 +41,25 @@ This document records findings from the pre-release code review. Issues marked a
 
 ## 6. Deferred Items
 
-1. Split `client/core.py` — requires careful extraction of socket lifecycle.
-2. Split `registry.py` — needs API compatibility preservation.
-3. Extract `MethodTable` from `wire.py` — low risk but low priority.
-4. Add stress/race-condition tests for concurrent sweeper + reconnect.
-5. Add integration test for full idle-evict-reconnect lifecycle.
-6. Clean up unused `SHUTDOWN_SERVER` signal.
-7. Explicit `DISCONNECT_ACK` handling in Rust `recv_loop`.
+1. ~~Split `client/core.py` — requires careful extraction of socket lifecycle.~~ → **Resolved** (Phase 3-4): Original 1017L `SharedClient` replaced by Rust `RustClient` + 85L thin compatibility wrapper.
+2. Split `registry.py` — needs API compatibility preservation. *(Still open)*
+3. ~~Extract `MethodTable` from `wire.py` — low risk but low priority.~~ → **Resolved** (Phase 4): `wire.py` slimmed to 93L; `MethodTable` is now the primary content.
+4. Add stress/race-condition tests for concurrent sweeper + reconnect. *(Still open)*
+5. Add integration test for full idle-evict-reconnect lifecycle. *(Still open)*
+6. ~~Clean up unused `SHUTDOWN_SERVER` signal.~~ → **Fixed** (2026-03-30, commit `51b001e`).
+7. ~~Explicit `DISCONNECT_ACK` handling in Rust `recv_loop`.~~ → **Fixed** (2026-03-30, commit `51b001e`).
+
+---
+
+## Post-Phase 4 Update (2026-04-01)
+
+The following §1 findings are now resolved by the Phase 3-4 Rust transport sink:
+
+| File (v0.3.0) | Lines | v0.4.0 Status |
+|------|-------|---------------|
+| `transport/client/core.py` | ~1017 | Replaced by Rust `RustClient` (c2-ipc). 85L thin `SharedClient` wrapper remains for test compat. |
+| `transport/server/core.py` | ~911 | **Deleted**. Replaced by Rust `c2-server` + `NativeServerBridge` (325L). |
+| `transport/registry.py` | ~731 | 740L — still intact; split deferred. |
+| `transport/wire.py` | ~505 | 93L — `MethodTable` + `payload_total_size` + thin FFI wrappers. All codec in Rust. |
+
+§3 concurrency notes: Server is now Rust tokio (not Python asyncio). `SharedClient` is a thin wrapper around `RustClient`. Async client (`RustAsyncClient`) is a future item.

@@ -2,7 +2,7 @@
 
 Tests cover:
 - Thread-local preference (same-process zero-serde)
-- IPC connect (cross-process via SharedClient)
+- IPC connect (cross-process via SOTA API)
 - Multi-CRM registration
 - Lifecycle: register → connect → close → unregister → shutdown
 - Error cases

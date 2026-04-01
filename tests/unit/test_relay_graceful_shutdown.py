@@ -72,41 +72,16 @@ class TestUnregisterRelayAbsence:
         assert any('unreachable' in r.message.lower() or 'relay' in r.message.lower()
                     for r in caplog.records)
 
-
-# -- Tests: UpstreamPool shutdown logging ----------------------------------
-
-class TestUpstreamPoolShutdownLogging:
-    """Relay's UpstreamPool logs upstream names on shutdown."""
-
-    def test_shutdown_logs_upstream_names(self, caplog):
-        """UpstreamPool.shutdown() logs names of disconnected upstreams."""
-        from c_two.transport.relay.core import UpstreamPool, _UpstreamEntry
-
-        pool = UpstreamPool()
-        # Inject a mock entry directly (skip real IPC connection).
-        mock_client = MagicMock()
-        pool._entries['grid'] = _UpstreamEntry('grid', 'ipc://fake', mock_client)
-
-        with caplog.at_level(logging.INFO):
-            pool.shutdown()
-
-        assert any('grid' in r.message and 'disconnecting' in r.message.lower()
-                    for r in caplog.records)
-        mock_client.terminate.assert_called_once()
-
-
 # -- Tests: c3 relay defaults to native -----------------------------------
 
 class TestRelayDefaultNative:
-    """Verify --native is default, --python overrides."""
+    """Verify relay command uses NativeRelay."""
 
-    def test_default_native_in_help(self):
+    def test_relay_help_shows_bind(self):
         from click.testing import CliRunner
         from c_two.cli import cli
 
         runner = CliRunner()
         result = runner.invoke(cli, ['relay', '--help'])
         assert result.exit_code == 0
-        # The flag pair --native/--python should show in help.
-        assert '--native' in result.output
-        assert '--python' in result.output
+        assert '--bind' in result.output

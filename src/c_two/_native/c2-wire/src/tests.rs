@@ -232,9 +232,10 @@ mod handshake_tests {
             ("seg0".into(), 268_435_456u32),
             ("seg1".into(), 268_435_456u32),
         ];
-        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX);
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "");
         let decoded = decode_handshake(&encoded).unwrap();
 
+        assert_eq!(decoded.prefix, "");
         assert_eq!(decoded.segments.len(), 2);
         assert_eq!(decoded.segments[0].0, "seg0");
         assert_eq!(decoded.segments[0].1, 268_435_456);
@@ -262,7 +263,7 @@ mod handshake_tests {
                 ],
             },
         ];
-        let encoded = encode_server_handshake(&segments, CAP_CALL_V2, &routes);
+        let encoded = encode_server_handshake(&segments, CAP_CALL_V2, &routes, "");
         let decoded = decode_handshake(&encoded).unwrap();
 
         assert_eq!(decoded.segments.len(), 1);
@@ -291,9 +292,10 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 5, 0 segments, cap_flags=0
-        let buf = [5, 0, 0, 0, 0];
+        // Version 6, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [6, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
+        assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
         assert_eq!(decoded.capability_flags, 0);
         assert!(decoded.routes.is_empty());
@@ -377,8 +379,10 @@ mod cross_lang_tests {
 
     #[test]
     fn python_client_handshake_decode() {
-        let bytes = hex_to_bytes("0501000000001004736567300300");
+        // v6: [06][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("060001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
+        assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
         assert_eq!(hs.segments[0].0, "seg0");
         assert_eq!(hs.segments[0].1, 268_435_456);
@@ -388,10 +392,12 @@ mod cross_lang_tests {
 
     #[test]
     fn python_server_handshake_decode() {
+        // v6: [06][00 prefix_len] then same body
         let bytes = hex_to_bytes(
-            "05010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
+            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
         );
         let hs = decode_handshake(&bytes).unwrap();
+        assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
         assert_eq!(hs.segments[0].0, "srv0");
         assert_eq!(hs.segments[0].1, 134_217_728);
@@ -439,8 +445,9 @@ mod cross_lang_tests {
     #[test]
     fn rust_encode_matches_python_client_handshake() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
-        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX);
-        let expected = hex_to_bytes("0501000000001004736567300300");
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "");
+        // v6: [06][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("060001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -454,9 +461,10 @@ mod cross_lang_tests {
                 MethodEntry { name: "add".into(), index: 1 },
             ],
         }];
-        let encoded = encode_server_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, &routes);
+        let encoded = encode_server_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, &routes, "");
+        // v6: [06][00 prefix_len] then same body as v5
         let expected = hex_to_bytes(
-            "05010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
+            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
         );
         assert_eq!(encoded, expected);
     }

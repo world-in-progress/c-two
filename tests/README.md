@@ -40,8 +40,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `test_wire_v2.py` | Wire v2 codec — call/reply control encoding, default-route cache |
 | `test_scheduler.py` | Read/write concurrency scheduler for CRM method dispatch |
 | `test_concurrency.py` | Read/write lock semantics for ICRM method scheduling |
-| `test_shared_client.py` | `SharedClient` — multiplexed IPC client lifecycle |
-| `test_client_pool.py` | `ClientPool` — ref-counted SharedClient management, grace period |
+| `test_client_pool.py` | `ClientPool` — ref-counted IPC client management, grace period |
 | `test_icrm_proxy.py` | `ICRMProxy` — thread-local and IPC modes, method routing |
 | `test_proxy_concurrency.py` | ICRMProxy concurrency under read/write access control |
 | `test_chunk_assembler.py` | Chunk assembler — OOM validation, reassembly, boundary checks |
@@ -73,7 +72,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | File | Description |
 |------|-------------|
 | `test_rpc_v2_server.py` | ServerV2 end-to-end — multi-CRM hosting, handshake, method dispatch |
-| `test_rpc_v2_basic.py` | SharedClient backward compatibility with legacy IPC server |
+| `test_rpc_v2_basic.py` | IPC client backward compatibility with legacy IPC server |
 | `test_registry.py` | `cc.register()` / `cc.connect()` / `cc.close()` SOTA API lifecycle |
 | `test_multi_crm_server.py` | Multi-CRM routing — name-based dispatch, concurrent access |
 | `test_icrm_proxy.py` | ICRMProxy integration — thread-local + IPC modes end-to-end |

@@ -1,6 +1,8 @@
 # CI/CD Workflows Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: ✅ COMPLETE** — CI (`ci.yml`) and release (`release.yml`) workflows deployed. PR testing on Python 3.12 + 3.14t, OIDC Trusted Publishing active.
+
+> **For agentic workers:** This plan is historical — all tasks have been completed.
 
 **Goal:** Create PR testing (ci.yml) and version-gated release (release.yml) GitHub Actions workflows for world-in-progress/c-two.
 
