@@ -99,10 +99,12 @@ impl PyResponseBuffer {
         match guard.as_ref() {
             Some(ResponseBufferInner::Inline(vec)) => Ok(PyBytes::new(py, vec)),
             Some(ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated }) => {
-                let pool_guard = pool.lock().unwrap();
-                let state = pool_guard.as_ref().ok_or_else(|| {
+                let mut pool_guard = pool.lock().unwrap();
+                let state = pool_guard.as_mut().ok_or_else(|| {
                     PyRuntimeError::new_err("server pool not initialised")
                 })?;
+                state.ensure_segment(*seg_idx, *data_size, *is_dedicated)
+                    .map_err(|e| PyRuntimeError::new_err(format!("SHM lazy-open: {e}")))?;
                 let ptr = state.pool.data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
                     .map_err(|e| PyRuntimeError::new_err(format!("SHM read: {e}")))?;
                 let slice = unsafe { std::slice::from_raw_parts(ptr, *data_size as usize) };
@@ -132,6 +134,7 @@ impl PyResponseBuffer {
             Some(ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated }) => {
                 if let Ok(mut pool_guard) = pool.lock() {
                     if let Some(state) = pool_guard.as_mut() {
+                        let _ = state.ensure_segment(seg_idx, data_size, is_dedicated);
                         let _ = state.pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
                     }
                 }
@@ -163,10 +166,12 @@ impl PyResponseBuffer {
         let (ptr, len) = match inner {
             ResponseBufferInner::Inline(vec) => (vec.as_ptr(), vec.len()),
             ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated } => {
-                let pool_guard = pool.lock().unwrap();
-                let state = pool_guard.as_ref().ok_or_else(|| {
+                let mut pool_guard = pool.lock().unwrap();
+                let state = pool_guard.as_mut().ok_or_else(|| {
                     PyBufferError::new_err("server pool not initialised")
                 })?;
+                state.ensure_segment(*seg_idx, *data_size, *is_dedicated)
+                    .map_err(|e| PyBufferError::new_err(format!("SHM lazy-open: {e}")))?;
                 let raw_ptr = state.pool.data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
                     .map_err(|e| PyBufferError::new_err(format!("SHM access: {e}")))?;
                 (raw_ptr as *const u8, *data_size as usize)
@@ -225,6 +230,7 @@ impl Drop for PyResponseBuffer {
                 }) => {
                     if let Ok(mut pool_guard) = pool.lock() {
                         if let Some(state) = pool_guard.as_mut() {
+                            let _ = state.ensure_segment(seg_idx, data_size, is_dedicated);
                             let _ = state.pool.free_at(
                                 seg_idx as u32, offset, data_size, is_dedicated,
                             );

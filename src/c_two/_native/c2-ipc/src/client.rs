@@ -87,6 +87,24 @@ impl ServerPoolState {
         self.pool.open_dedicated_at(seg_idx as u32, &name, min_size)
     }
 
+    /// Lazy-open the segment for the given coordinates if not yet mapped.
+    ///
+    /// Called transparently by `PyResponseBuffer` before any SHM access
+    /// (`__getbuffer__`, `release`, `Drop`).  Python never needs to know
+    /// about segment management — this keeps it entirely inside Rust.
+    pub fn ensure_segment(
+        &mut self,
+        seg_idx: u16,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<(), String> {
+        if is_dedicated {
+            self.ensure_dedicated_segment(seg_idx, data_size as usize)
+        } else {
+            self.ensure_buddy_segment(seg_idx)
+        }
+    }
+
     /// Read data from server SHM and free the allocation.
     pub fn read_and_free(
         &mut self,
