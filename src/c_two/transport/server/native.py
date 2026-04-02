@@ -294,20 +294,35 @@ class NativeServerBridge:
 
     def _make_dispatcher(
         self, route_name: str, slot: CRMSlot,
-    ) -> Callable[[str, int, bytes], bytes]:
+    ) -> Callable[[str, int, object, object], object]:
         """Build the Python callable passed to ``RustServer.register_route()``.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
-        held.  It resolves the method, calls the ICRM, and returns result
-        bytes.  For errors, it raises :class:`CrmCallError` whose
+        held.  Signature: ``(route_name, method_idx, shm_buffer, response_pool)``.
+        It reads the request via ``memoryview(shm_buffer)``, resolves the
+        method, calls the ICRM, and returns result bytes (or *None* for empty
+        responses).  For errors, it raises :class:`CrmCallError` whose
         ``error_bytes`` attribute is picked up by ``PyCrmCallback``.
         """
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
 
         def dispatch(
-            _route_name: str, method_idx: int, payload: bytes,
-        ) -> bytes:
+            _route_name: str, method_idx: int,
+            request_buf: object, _response_pool: object,
+        ) -> object:
+            # 1. Read request payload via zero-copy memoryview
+            try:
+                mv = memoryview(request_buf)
+                payload = bytes(mv)
+                mv.release()
+            finally:
+                try:
+                    request_buf.release()
+                except Exception:
+                    pass  # Best-effort release — ShmBuffer.drop() is the safety net
+
+            # 2. Resolve method
             method_name = idx_to_name.get(method_idx)
             if method_name is None:
                 raise RuntimeError(
@@ -317,10 +332,14 @@ class NativeServerBridge:
             if entry is None:
                 raise RuntimeError(f'Method not found: {method_name}')
             method, _access = entry
+
+            # 3. Call CRM method
             result = method(payload)
+
+            # 4. Unpack result
             res_part, err_part = unpack_icrm_result(result)
             if err_part:
                 raise CrmCallError(err_part)
-            return res_part if res_part else b''
+            return res_part if res_part else None
 
         return dispatch
