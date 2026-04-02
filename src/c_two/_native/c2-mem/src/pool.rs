@@ -29,6 +29,9 @@ pub enum FreeResult {
 struct DedicatedEntry {
     segment: DedicatedSegment,
     freed_at: Option<Instant>,
+    /// `true` if this process created the segment (owns shm_unlink).
+    /// `false` if opened from a peer (reader side, munmap-only on drop).
+    is_creator: bool,
 }
 
 /// Unified memory pool — the main entry point.
@@ -157,6 +160,7 @@ impl MemPool {
 
     /// Allocate memory from the pool.
     pub fn alloc(&mut self, size: usize) -> Result<PoolAllocation, String> {
+        self.gc_dedicated();
         if size == 0 {
             return Err("cannot allocate 0 bytes".into());
         }
@@ -174,6 +178,7 @@ impl MemPool {
 
     /// Free a previously allocated block.
     pub fn free(&mut self, alloc: &PoolAllocation) -> Result<(), String> {
+        self.gc_dedicated();
         if alloc.is_dedicated {
             self.free_dedicated(alloc.seg_idx);
             Ok(())
@@ -271,12 +276,18 @@ impl MemPool {
     }
 
     /// Run garbage collection on freed dedicated segments.
+    ///
+    /// For creator entries: reclaim when the reader has set `read_done = 1`
+    /// in the SHM header, or after a crash-recovery timeout.
+    /// For reader entries: reclaim immediately (munmap only, no shm_unlink).
     pub fn gc_dedicated(&mut self) {
-        let secs = self.config.dedicated_crash_timeout_secs;
-        let delay = if secs < 0.0 {
-            std::time::Duration::ZERO
-        } else {
-            std::time::Duration::from_secs_f64(secs)
+        let crash_timeout = {
+            let secs = self.config.dedicated_crash_timeout_secs;
+            if secs < 0.0 {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_secs_f64(secs)
+            }
         };
         let now = Instant::now();
         let to_remove: Vec<u32> = self
@@ -284,7 +295,17 @@ impl MemPool {
             .iter()
             .filter_map(|(&idx, entry)| {
                 if let Some(freed_at) = entry.freed_at {
-                    if now.duration_since(freed_at) >= delay {
+                    if entry.is_creator {
+                        // Primary: peer set read_done in SHM header
+                        if entry.segment.is_read_done() {
+                            return Some(idx);
+                        }
+                        // Fallback: peer likely crashed — safety net
+                        if now.duration_since(freed_at) >= crash_timeout {
+                            return Some(idx);
+                        }
+                    } else {
+                        // Reader side: can drop immediately (munmap only)
                         return Some(idx);
                     }
                 }
@@ -293,7 +314,7 @@ impl MemPool {
             .collect();
 
         for idx in to_remove {
-            self.dedicated.remove(&idx); // Drop triggers munmap + shm_unlink.
+            self.dedicated.remove(&idx);
         }
     }
 
@@ -361,6 +382,7 @@ impl MemPool {
             DedicatedEntry {
                 segment: seg,
                 freed_at: None,
+                is_creator: false,
             },
         );
         Ok(idx)
@@ -381,6 +403,7 @@ impl MemPool {
             DedicatedEntry {
                 segment: seg,
                 freed_at: None,
+                is_creator: false,
             },
         );
         // Keep next_dedicated_idx ahead of all known keys to avoid collision.
@@ -396,6 +419,7 @@ impl MemPool {
     /// This recomputes the buddy level from the data size, enabling cross-process
     /// freeing where the remote side only knows (offset, data_size) from the wire.
     pub fn free_at(&mut self, seg_idx: u32, offset: u32, data_size: u32, is_dedicated: bool) -> Result<FreeResult, String> {
+        self.gc_dedicated();
         if is_dedicated {
             self.free_dedicated(seg_idx);
             Ok(FreeResult::DedicatedFreed { seg_idx: seg_idx as u16 })
@@ -716,6 +740,7 @@ impl MemPool {
             DedicatedEntry {
                 segment: seg,
                 freed_at: None,
+                is_creator: true,
             },
         );
 
@@ -746,6 +771,9 @@ impl MemPool {
 
     fn free_dedicated(&mut self, seg_idx: u32) {
         if let Some(entry) = self.dedicated.get_mut(&seg_idx) {
+            if !entry.is_creator {
+                entry.segment.mark_read_done();
+            }
             entry.freed_at = Some(Instant::now());
         }
     }
@@ -1080,6 +1108,73 @@ mod tests {
         let pool = test_pool(test_config());
         let prefix = pool.prefix();
         assert!(prefix.starts_with("/cc3t"), "got: {}", prefix);
+    }
+
+    #[test]
+    fn test_dedicated_gc_flag_based() {
+        let config = PoolConfig {
+            segment_size: 32 * 1024,
+            min_block_size: 4096,
+            max_segments: 1,
+            max_dedicated_segments: 2,
+            dedicated_crash_timeout_secs: 60.0,
+            ..PoolConfig::default()
+        };
+        let mut pool = test_pool(config);
+
+        let a = pool.alloc(64 * 1024).unwrap();
+        assert!(a.is_dedicated);
+        let seg_idx = a.seg_idx;
+
+        // Creator frees → freed_at set, but read_done still 0
+        pool.free(&a).unwrap();
+
+        // GC should NOT remove (read_done == 0, timeout not reached)
+        pool.gc_dedicated();
+        assert!(pool.dedicated.contains_key(&seg_idx));
+
+        // Simulate reader: set read_done via the segment
+        pool.dedicated.get(&seg_idx).unwrap().segment.mark_read_done();
+
+        // Now GC should remove
+        pool.gc_dedicated();
+        assert!(!pool.dedicated.contains_key(&seg_idx));
+    }
+
+    #[test]
+    fn test_dedicated_reader_gc_immediate() {
+        let config = PoolConfig {
+            segment_size: 32 * 1024,
+            min_block_size: 4096,
+            max_segments: 1,
+            max_dedicated_segments: 2,
+            dedicated_crash_timeout_secs: 60.0,
+            ..PoolConfig::default()
+        };
+        let mut creator_pool = test_pool(config.clone());
+        let a = creator_pool.alloc(64 * 1024).unwrap();
+        assert!(a.is_dedicated);
+        let seg_name = creator_pool.dedicated.get(&a.seg_idx).unwrap()
+            .segment.name().to_string();
+        let data_size = 64 * 1024;
+
+        // Open in a second pool (simulates reader/peer side)
+        let mut reader_pool = test_pool(config);
+        reader_pool.open_dedicated_at(a.seg_idx, &seg_name, data_size).unwrap();
+        assert!(reader_pool.dedicated.contains_key(&a.seg_idx));
+
+        // Reader frees → should mark read_done + be immediately removable
+        reader_pool.free_at(a.seg_idx, 0, data_size as u32, true).unwrap();
+        reader_pool.gc_dedicated();
+        assert!(!reader_pool.dedicated.contains_key(&a.seg_idx));
+
+        // Creator sees read_done
+        assert!(creator_pool.dedicated.get(&a.seg_idx).unwrap()
+            .segment.is_read_done());
+
+        creator_pool.free(&a).unwrap();
+        creator_pool.gc_dedicated();
+        assert!(!creator_pool.dedicated.contains_key(&a.seg_idx));
     }
 }
 
