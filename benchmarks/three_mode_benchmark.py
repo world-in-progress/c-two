@@ -294,7 +294,7 @@ def main():
         t_ms = bench_thread(size_bytes)
         i_ms = bench_ipc(size_bytes)
         d_ms = bench_ipc_dict(size_bytes)
-        r_ms = bench_relay(size_bytes)
+        r_ms = bench_relay(size_bytes) if size_bytes <= 100 * 1024 * 1024 else None
 
         ipc_ratio = f'{i_ms / t_ms:.1f}×' if t_ms > 0 else '—'
         dict_ratio = f'{d_ms / i_ms:.1f}×' if (d_ms is not None and i_ms > 0) else '—'

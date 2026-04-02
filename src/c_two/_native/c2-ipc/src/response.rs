@@ -31,17 +31,43 @@ impl ResponseData {
         self.len() == 0
     }
 
-    /// Extract the inline bytes, panicking if this is an SHM variant.
+    /// Extract inline bytes directly. Panics on SHM/Handle variants.
     ///
-    /// Used by the relay where responses are always inline.
+    /// Prefer `into_bytes_with_pool()` when SHM responses are possible.
     pub fn into_inline_bytes(self) -> Vec<u8> {
         match self {
             ResponseData::Inline(v) => v,
             ResponseData::Shm { .. } => {
-                panic!("into_inline_bytes called on SHM response — relay must use inline transport")
+                panic!("into_inline_bytes called on SHM response — use into_bytes_with_pool()")
             }
             ResponseData::Handle(_) => {
-                panic!("into_inline_bytes called on Handle response — relay must use inline transport")
+                panic!("into_inline_bytes called on Handle response — use into_bytes_with_pool()")
+            }
+        }
+    }
+
+    /// Materialize response into owned bytes, reading from SHM if needed.
+    ///
+    /// Used by the relay which must copy data before forwarding over HTTP.
+    pub fn into_bytes_with_pool(
+        self,
+        server_pool: &std::sync::Arc<std::sync::Mutex<Option<super::client::ServerPoolState>>>,
+        reassembly_pool: &std::sync::Arc<std::sync::Mutex<c2_mem::MemPool>>,
+    ) -> Result<Vec<u8>, String> {
+        match self {
+            ResponseData::Inline(v) => Ok(v),
+            ResponseData::Shm { seg_idx, offset, data_size, is_dedicated } => {
+                let mut guard = server_pool.lock().unwrap();
+                let state = guard.as_mut().ok_or("server pool not initialised")?;
+                let (data, _) = state.read_and_free(seg_idx, offset, data_size, is_dedicated)?;
+                Ok(data)
+            }
+            ResponseData::Handle(handle) => {
+                let mut pool = reassembly_pool.lock().unwrap();
+                let slice = pool.handle_slice(&handle);
+                let data = slice.to_vec();
+                pool.release_handle(handle);
+                Ok(data)
             }
         }
     }

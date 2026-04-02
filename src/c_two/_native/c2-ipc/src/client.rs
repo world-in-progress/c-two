@@ -88,7 +88,7 @@ impl ServerPoolState {
     }
 
     /// Read data from server SHM and free the allocation.
-    fn read_and_free(
+    pub fn read_and_free(
         &mut self,
         seg_idx: u16,
         offset: u32,
@@ -423,6 +423,16 @@ impl IpcClient {
         });
 
         Ok(hs)
+    }
+
+    /// Get a reference to the server SHM pool (for materialising SHM responses).
+    pub fn server_pool_arc(&self) -> &Arc<StdMutex<Option<ServerPoolState>>> {
+        &self.server_pool
+    }
+
+    /// Get a reference to the reassembly pool (for materialising Handle responses).
+    pub fn reassembly_pool_arc(&self) -> &Arc<StdMutex<MemPool>> {
+        &self.reassembly_pool
     }
 
     /// Send a CRM call and wait for the response (inline path only).

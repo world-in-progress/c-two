@@ -203,10 +203,14 @@ async fn call_handler(
     match client.call(&route_name, &method_name, &body).await {
         Ok(result) => {
             { state.pool.read().unwrap().touch(&route_name); }
+            let bytes = result.into_bytes_with_pool(
+                client.server_pool_arc(),
+                client.reassembly_pool_arc(),
+            ).unwrap_or_default();
             (
                 StatusCode::OK,
                 [("content-type", "application/octet-stream")],
-                result.into_inline_bytes(),
+                bytes,
             )
                 .into_response()
         }
