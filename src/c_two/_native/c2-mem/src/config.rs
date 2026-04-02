@@ -11,8 +11,9 @@ pub struct PoolConfig {
     pub max_segments: usize,
     /// Maximum number of dedicated segments (default 4).
     pub max_dedicated_segments: usize,
-    /// Delay before reclaiming empty dedicated segments (seconds).
-    pub dedicated_gc_delay_secs: f64,
+    /// Crash-recovery timeout for dedicated segments (seconds).
+    /// Normal GC uses SHM read_done flag; this is a safety net for peer crashes.
+    pub dedicated_crash_timeout_secs: f64,
     /// Spill threshold ratio: when `requested > available_ram * threshold`,
     /// use file-backed mmap.  Default 0.8 (80%).
     pub spill_threshold: f64,
@@ -27,7 +28,7 @@ impl Default for PoolConfig {
             min_block_size: 4096,
             max_segments: 8,
             max_dedicated_segments: 4,
-            dedicated_gc_delay_secs: 5.0,
+            dedicated_crash_timeout_secs: 60.0,
             spill_threshold: 0.8,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_spill/"),
         }

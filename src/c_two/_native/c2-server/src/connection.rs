@@ -192,7 +192,7 @@ impl Connection {
             min_block_size: 4096,
             max_segments: 16,
             max_dedicated_segments: 4,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_spill_srv"),
         };

@@ -82,8 +82,8 @@ impl MemPool {
                 config.segment_size, config.min_block_size
             ));
         }
-        if config.dedicated_gc_delay_secs.is_nan() {
-            return Err("dedicated_gc_delay_secs must not be NaN".into());
+        if config.dedicated_crash_timeout_secs.is_nan() {
+            return Err("dedicated_crash_timeout_secs must not be NaN".into());
         }
         Ok(())
     }
@@ -241,7 +241,7 @@ impl MemPool {
     /// indices are encoded in wire frames). Always retains at least one segment.
     /// Returns the number of segments reclaimed.
     pub fn gc_buddy(&mut self) -> usize {
-        let secs = self.config.dedicated_gc_delay_secs;
+        let secs = self.config.dedicated_crash_timeout_secs;
         let delay = if secs < 0.0 {
             std::time::Duration::ZERO
         } else {
@@ -272,7 +272,7 @@ impl MemPool {
 
     /// Run garbage collection on freed dedicated segments.
     pub fn gc_dedicated(&mut self) {
-        let secs = self.config.dedicated_gc_delay_secs;
+        let secs = self.config.dedicated_crash_timeout_secs;
         let delay = if secs < 0.0 {
             std::time::Duration::ZERO
         } else {
@@ -782,7 +782,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 2,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             ..PoolConfig::default()
         }
     }
@@ -822,7 +822,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 2,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
@@ -843,7 +843,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 1,
             max_dedicated_segments: 2,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
@@ -919,7 +919,7 @@ mod tests {
     #[should_panic(expected = "invalid PoolConfig")]
     fn test_validate_nan_gc_delay() {
         let config = PoolConfig {
-            dedicated_gc_delay_secs: f64::NAN,
+            dedicated_crash_timeout_secs: f64::NAN,
             ..small_config()
         };
         test_pool(config);
@@ -929,7 +929,7 @@ mod tests {
     fn test_validate_negative_gc_delay_ok() {
         // Negative gc_delay is allowed (clamped to 0 at runtime)
         let config = PoolConfig {
-            dedicated_gc_delay_secs: -1.0,
+            dedicated_crash_timeout_secs: -1.0,
             ..small_config()
         };
         let _pool = test_pool(config);
@@ -942,7 +942,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
@@ -976,7 +976,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
@@ -1094,7 +1094,7 @@ mod handle_tests {
             min_block_size: 4096,
             max_segments: 2,
             max_dedicated_segments: 2,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             spill_threshold: 1.0, // disable spill
             spill_dir: std::env::temp_dir().join("c2_pool_handle_test"),
         }

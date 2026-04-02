@@ -28,7 +28,7 @@ pub struct PyPoolConfig {
     #[pyo3(get)]
     pub max_dedicated_segments: usize,
     #[pyo3(get)]
-    pub dedicated_gc_delay_secs: f64,
+    pub dedicated_crash_timeout_secs: f64,
     #[pyo3(get)]
     pub spill_threshold: f64,
     #[pyo3(get)]
@@ -43,7 +43,7 @@ impl PyPoolConfig {
         min_block_size = 4096,
         max_segments = 8,
         max_dedicated_segments = 4,
-        dedicated_gc_delay_secs = 5.0,
+        dedicated_crash_timeout_secs = 60.0,
         spill_threshold = 0.8,
         spill_dir = String::from("/tmp/c_two_spill/"),
     ))]
@@ -52,7 +52,7 @@ impl PyPoolConfig {
         min_block_size: usize,
         max_segments: usize,
         max_dedicated_segments: usize,
-        dedicated_gc_delay_secs: f64,
+        dedicated_crash_timeout_secs: f64,
         spill_threshold: f64,
         spill_dir: String,
     ) -> PyResult<Self> {
@@ -67,8 +67,8 @@ impl PyPoolConfig {
         if !segment_size.is_power_of_two() {
             return Err(PyValueError::new_err("segment_size must be a power of 2"));
         }
-        if dedicated_gc_delay_secs.is_nan() {
-            return Err(PyValueError::new_err("dedicated_gc_delay_secs must not be NaN"));
+        if dedicated_crash_timeout_secs.is_nan() {
+            return Err(PyValueError::new_err("dedicated_crash_timeout_secs must not be NaN"));
         }
         if spill_threshold < 0.0 || spill_threshold > 1.0 || spill_threshold.is_nan() {
             return Err(PyValueError::new_err("spill_threshold must be in [0.0, 1.0]"));
@@ -78,7 +78,7 @@ impl PyPoolConfig {
             min_block_size,
             max_segments,
             max_dedicated_segments,
-            dedicated_gc_delay_secs,
+            dedicated_crash_timeout_secs,
             spill_threshold,
             spill_dir,
         })
@@ -100,7 +100,7 @@ impl From<&PyPoolConfig> for PoolConfig {
             min_block_size: py.min_block_size,
             max_segments: py.max_segments,
             max_dedicated_segments: py.max_dedicated_segments,
-            dedicated_gc_delay_secs: py.dedicated_gc_delay_secs,
+            dedicated_crash_timeout_secs: py.dedicated_crash_timeout_secs,
             spill_threshold: py.spill_threshold,
             spill_dir: std::path::PathBuf::from(&py.spill_dir),
         }

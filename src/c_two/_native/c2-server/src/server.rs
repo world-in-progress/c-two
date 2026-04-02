@@ -105,7 +105,7 @@ impl Server {
             min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 4,
-            dedicated_gc_delay_secs: 5.0,
+            dedicated_crash_timeout_secs: 5.0,
             spill_threshold: 0.8,
             spill_dir: PathBuf::from("/tmp/c_two_reassembly"),
         };
@@ -115,7 +115,7 @@ impl Server {
             min_block_size: 4096,
             max_segments: config.max_pool_segments as usize,
             max_dedicated_segments: 4,
-            dedicated_gc_delay_secs: 5.0,
+            dedicated_crash_timeout_secs: 5.0,
             spill_threshold: 0.8,
             spill_dir: PathBuf::from("/tmp/c_two_response_spill"),
         };
@@ -1179,7 +1179,7 @@ mod tests {
             min_block_size: 4096,
             max_segments: 2,
             max_dedicated_segments: 2,
-            dedicated_gc_delay_secs: 0.0,
+            dedicated_crash_timeout_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_srv_chunk_test"),
         };
