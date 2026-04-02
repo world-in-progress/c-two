@@ -94,7 +94,7 @@ pub struct Server {
 impl Server {
     /// Create a new server for the given IPC address.
     ///
-    /// Address format: `ipc://region_id` or `ipc-v3://region_id`
+    /// Address format: `ipc://region_id`
     /// → socket at `/tmp/c_two_ipc/region_id.sock`
     pub fn new(address: &str, config: IpcConfig) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
@@ -220,8 +220,7 @@ impl Server {
 
 fn parse_socket_path(address: &str) -> Result<PathBuf, ServerError> {
     let region = address
-        .strip_prefix("ipc-v3://")
-        .or_else(|| address.strip_prefix("ipc://"))
+        .strip_prefix("ipc://")
         .ok_or_else(|| ServerError::Config(format!("invalid IPC address: {address}")))?;
     if region.is_empty() {
         return Err(ServerError::Config("empty region ID".into()));
@@ -917,6 +916,15 @@ async fn write_buddy_reply_with_data(
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
     let frame = encode_frame(request_id, flags, &payload);
     let _ = writer.lock().await.write_all(&frame).await;
+
+    // 5. Server-side free for dedicated segments: the client will lazy-open
+    //    and read from SHM before gc_delay expires.  Buddy allocs use SHM
+    //    atomics so the client's free_at is already cross-process visible.
+    if alloc.is_dedicated {
+        let mut pool = response_pool.write().unwrap();
+        let _ = pool.free(&alloc);
+    }
+
     Ok(())
 }
 
@@ -983,6 +991,12 @@ async fn send_response_meta(
             let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
             let frame = encode_frame(request_id, flags, &payload);
             let _ = writer.lock().await.write_all(&frame).await;
+
+            // Server-side free for dedicated segments (same as write_buddy_reply_with_data).
+            if is_dedicated {
+                let mut pool = response_pool.write().unwrap();
+                let _ = pool.free_at(seg_idx as u32, offset, data_size, true);
+            }
         }
     }
 }
@@ -1033,9 +1047,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_ipc_v3_address() {
-        let p = parse_socket_path("ipc-v3://region42").unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/c_two_ipc/region42.sock"));
+    fn parse_legacy_v3_rejected() {
+        assert!(parse_socket_path("ipc-v3://region42").is_err());
     }
 
     #[test]

@@ -681,26 +681,21 @@ impl MemPool {
     }
 
     fn alloc_dedicated(&mut self, size: usize) -> Result<PoolAllocation, String> {
-        // Check dedicated segment limit.
+        // Always GC expired dedicated segments to reclaim SHM resources.
+        // This must run unconditionally because freed-but-not-GC'd segments
+        // still hold mapped memory even though they don't count as "active".
+        self.gc_dedicated();
+
         let active_dedicated = self
             .dedicated
             .values()
             .filter(|e| e.freed_at.is_none())
             .count();
         if active_dedicated >= self.config.max_dedicated_segments {
-            // Try GC first.
-            self.gc_dedicated();
-            let active_after = self
-                .dedicated
-                .values()
-                .filter(|e| e.freed_at.is_none())
-                .count();
-            if active_after >= self.config.max_dedicated_segments {
-                return Err(format!(
-                    "dedicated segment limit reached ({} active)",
-                    active_after
-                ));
-            }
+            return Err(format!(
+                "dedicated segment limit reached ({} active)",
+                active_dedicated
+            ));
         }
 
         let idx = self.next_dedicated_idx;

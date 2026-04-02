@@ -92,7 +92,7 @@ impl CrmCallback for PyCrmCallback {
 ///
 /// ```python
 /// from c_two._native import RustServer
-/// srv = RustServer("ipc-v3://my_server")
+/// srv = RustServer("ipc://my_server")
 /// srv.register_route("grid", dispatcher_fn, ["step", "query"], {0: "read", 1: "write"})
 /// srv.start()
 /// # ... serve requests ...

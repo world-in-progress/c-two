@@ -9,7 +9,7 @@ from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 19985
-ipc_addr = f'ipc-v3://bench_full_{os.getpid()}'
+ipc_addr = f'ipc://bench_full_{os.getpid()}'
 
 _ProcessRegistry.reset()
 cc.set_address(ipc_addr)

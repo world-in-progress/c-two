@@ -123,7 +123,7 @@ _ipc_counter = 0
 def bench_ipc(payload_size: int) -> float:
     global _ipc_counter
     _ipc_counter += 1
-    address = f'ipc-v3://bench_tipc_{_ipc_counter}'
+    address = f'ipc://bench_tipc_{_ipc_counter}'
 
     # 2 GB buddy segments to handle up to 1 GB payloads.
     cc.set_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
@@ -131,7 +131,7 @@ def bench_ipc(payload_size: int) -> float:
     cc.register(IEcho, Echo(), name='echo_ipc')
 
     # Wait for server socket.
-    region_id = address.replace('ipc-v3://', '')
+    region_id = address.replace('ipc://', '')
     sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:

@@ -661,7 +661,17 @@ impl IpcClient {
 
         // Await response (server frees the buddy allocation after reading).
         match rx.await {
-            Ok(result) => result,
+            Ok(result) => {
+                // Free dedicated request allocation — server has read the data
+                // and only its local peer pool was freed.  Buddy allocs are
+                // freed by the server via cross-process SHM atomics; freeing
+                // them again here would corrupt the allocator.
+                if alloc.is_dedicated {
+                    let mut pool = pool_arc.lock().unwrap();
+                    let _ = pool.free(&alloc);
+                }
+                result
+            }
             Err(_) => Err(IpcError::Closed),
         }
     }

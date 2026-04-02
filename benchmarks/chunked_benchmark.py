@@ -48,7 +48,7 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 
 def _wait_for_server(addr: str, timeout: float = 10.0) -> None:
-    region = addr.replace('ipc-v3://', '')
+    region = addr.replace('ipc://', '')
     sock_path = os.path.join(_IPC_SOCK_DIR, f'{region}.sock')
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -102,7 +102,7 @@ def main() -> None:
     # Default config (256 MB segments) for realistic benchmarking.
     cfg = IPCConfig()
 
-    addr = f'ipc-v3://bench_chunk_{os.getpid()}'
+    addr = f'ipc://bench_chunk_{os.getpid()}'
     server = Server(bind_address=addr, ipc_config=cfg)
     server.register_crm(IBenchChunk, BenchChunk(), name='bench')
     server.start()
