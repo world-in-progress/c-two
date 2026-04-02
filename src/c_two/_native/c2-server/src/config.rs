@@ -23,6 +23,7 @@ pub struct IpcConfig {
     pub chunk_threshold_ratio: f64,
     pub chunk_assembler_timeout: f64,
     pub max_reassembly_bytes: u64,
+    pub reply_chunk_size: usize,
 
     // Heartbeat settings
     pub heartbeat_interval: f64,
@@ -51,6 +52,7 @@ impl Default for IpcConfig {
             chunk_threshold_ratio: 0.9,
             chunk_assembler_timeout: 60.0,
             max_reassembly_bytes: 8_589_934_592, // 8 GB
+            reply_chunk_size: 131_072,             // 128 KB
 
             // Heartbeat settings
             heartbeat_interval: 15.0,

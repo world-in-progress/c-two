@@ -22,9 +22,9 @@ static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 use c2_mem::config::PoolConfig;
 use c2_mem::MemPool;
 use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
-use c2_wire::chunk::decode_chunk_header;
+use c2_wire::chunk::{decode_chunk_header, encode_reply_chunk_meta, REPLY_CHUNK_META_SIZE};
 use c2_wire::control::{decode_call_control, encode_reply_control, ReplyControl};
-use c2_wire::flags::{FLAG_BUDDY, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE, FLAG_SIGNAL};
+use c2_wire::flags::{FLAG_BUDDY, FLAG_CHUNKED, FLAG_CHUNK_LAST, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
     decode_handshake, encode_server_handshake, MethodEntry, RouteInfo, CAP_CALL_V2, CAP_CHUNKED,
@@ -475,7 +475,7 @@ async fn dispatch_call(
     match result {
         Ok(data) => smart_reply_with_data(
             &server.response_pool, writer, request_id, &data,
-            server.config.shm_threshold,
+            server.config.shm_threshold, server.config.reply_chunk_size,
         ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -584,7 +584,7 @@ async fn dispatch_buddy_call(
     match result {
         Ok(data) => smart_reply_with_data(
             &server.response_pool, writer, request_id, &data,
-            server.config.shm_threshold,
+            server.config.shm_threshold, server.config.reply_chunk_size,
         ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -772,7 +772,7 @@ async fn dispatch_chunked_call(
         match result {
             Ok(data) => smart_reply_with_data(
                 &server.response_pool, writer, request_id, &data,
-                server.config.shm_threshold,
+                server.config.shm_threshold, server.config.reply_chunk_size,
             ).await,
             Err(CrmError::UserError(b)) => {
                 write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -890,6 +890,40 @@ async fn write_buddy_reply_with_data(
     Ok(())
 }
 
+/// Write a success reply via chunked transfer: split data into chunks,
+/// each with reply chunk meta header. Uses FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_CHUNKED.
+/// Last chunk also sets FLAG_CHUNK_LAST.
+async fn write_chunked_reply(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    data: &[u8],
+    chunk_size: usize,
+) {
+    let total_chunks = ((data.len() + chunk_size - 1) / chunk_size) as u32;
+    let total_size = data.len() as u64;
+
+    for (idx, chunk) in data.chunks(chunk_size).enumerate() {
+        let meta = encode_reply_chunk_meta(total_size, total_chunks, idx as u32);
+        let mut flags = REPLY_FLAGS | FLAG_CHUNKED;
+        if idx as u32 == total_chunks - 1 {
+            flags |= FLAG_CHUNK_LAST;
+        }
+
+        // Build frame: header + meta + chunk data
+        let payload_len = REPLY_CHUNK_META_SIZE + chunk.len();
+        let total_len = (12 + payload_len) as u32;
+
+        let mut frame = Vec::with_capacity(frame::HEADER_SIZE + payload_len);
+        frame.extend_from_slice(&total_len.to_le_bytes());
+        frame.extend_from_slice(&request_id.to_le_bytes());
+        frame.extend_from_slice(&flags.to_le_bytes());
+        frame.extend_from_slice(&meta);
+        frame.extend_from_slice(chunk);
+
+        let _ = writer.lock().await.write_all(&frame).await;
+    }
+}
+
 /// Choose buddy SHM or inline reply based on data size and threshold.
 async fn smart_reply_with_data(
     response_pool: &std::sync::Mutex<MemPool>,
@@ -897,12 +931,17 @@ async fn smart_reply_with_data(
     request_id: u64,
     data: &[u8],
     shm_threshold: u64,
+    chunk_size: usize,
 ) {
     if data.len() as u64 > shm_threshold {
-        // Try buddy SHM first; degrade to inline on failure.
-        // Phase 3 will add chunked fallback between buddy and inline.
+        // Try buddy SHM first
         if write_buddy_reply_with_data(response_pool, writer, request_id, data).await.is_err() {
-            write_reply_with_data(writer, request_id, data).await;
+            // SHM failed — use chunked for large data, inline for small
+            if data.len() > chunk_size {
+                write_chunked_reply(writer, request_id, data, chunk_size).await;
+            } else {
+                write_reply_with_data(writer, request_id, data).await;
+            }
         }
     } else {
         write_reply_with_data(writer, request_id, data).await;
