@@ -532,29 +532,16 @@ async fn dispatch_buddy_call(
         }
     };
 
-    // 3. Read data from peer SHM.
-    let args = match conn.read_peer_data(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated) {
-        Ok(data) => data,
-        Err(e) => {
-            warn!(conn_id = conn.conn_id(), %e, "buddy SHM read failed");
-            let msg = format!("buddy SHM read: {e}");
-            write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
-            conn.flight_dec();
-            return;
-        }
-    };
-
-    // 4. Free the client's allocation.
-    let free_result = conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
-    if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
-        let conn2 = Arc::clone(&conn);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            conn2.gc_peer_buddy();
-        });
+    // 3. Ensure peer SHM segment is mapped (lazy-open only, NO data read).
+    if let Err(e) = conn.ensure_peer_segment(bp.seg_idx, bp.data_size, bp.is_dedicated) {
+        warn!(conn_id = conn.conn_id(), %e, "ensure_peer_segment failed");
+        let msg = format!("buddy SHM segment open: {e}");
+        write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+        conn.flight_dec();
+        return;
     }
 
-    // 5. Check for inline args appended after control header.
+    // 4. Check for extra inline args appended after control header.
     let inline_start = BUDDY_PAYLOAD_SIZE + ctrl_consumed;
     let extra_args = if inline_start < payload.len() {
         &payload[inline_start..]
@@ -562,13 +549,40 @@ async fn dispatch_buddy_call(
         &[]
     };
 
-    // Combine SHM data with any trailing inline data.
-    let full_args = if extra_args.is_empty() {
-        args
+    // 5. Build request — zero-copy SHM or fallback to inline if extra args present.
+    let request = if extra_args.is_empty() {
+        let peer_pool = match conn.peer_pool_arc() {
+            Some(p) => p,
+            None => {
+                warn!(conn_id = conn.conn_id(), "no peer SHM state");
+                conn.flight_dec();
+                return;
+            }
+        };
+        RequestData::Shm {
+            pool: peer_pool,
+            seg_idx: bp.seg_idx,
+            offset: bp.offset,
+            data_size: bp.data_size,
+            is_dedicated: bp.is_dedicated,
+        }
     } else {
+        // Rare edge case: extra inline args after buddy payload — fall back to copy.
+        warn!(conn_id = conn.conn_id(), extra_len = extra_args.len(), "buddy call has trailing inline args, falling back to copy");
+        let args = match conn.read_peer_data(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(conn_id = conn.conn_id(), %e, "buddy SHM read failed (fallback)");
+                let msg = format!("buddy SHM read: {e}");
+                write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+                conn.flight_dec();
+                return;
+            }
+        };
+        conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
         let mut combined = args;
         combined.extend_from_slice(extra_args);
-        combined
+        RequestData::Inline(combined)
     };
 
     // 6. Route + execute.
@@ -590,7 +604,7 @@ async fn dispatch_buddy_call(
 
     let result = route
         .scheduler
-        .execute(idx, move || callback.invoke(&name, idx, RequestData::Inline(full_args), resp_pool))
+        .execute(idx, move || callback.invoke(&name, idx, request, resp_pool))
         .await;
 
     match result {
@@ -749,14 +763,11 @@ async fn dispatch_chunked_call(
             }
         };
 
-        let args = {
-            let pool = server.reassembly_pool.read().unwrap();
-            pool.handle_slice(&handle).to_vec()
+        let reassembly_pool_arc = server.reassembly_pool_arc();
+        let request = RequestData::Handle {
+            handle,
+            pool: reassembly_pool_arc,
         };
-        {
-            let mut pool = server.reassembly_pool.write().unwrap();
-            pool.release_handle(handle);
-        }
 
         // Now dispatch like a normal call.
         conn.flight_inc();
@@ -779,7 +790,7 @@ async fn dispatch_chunked_call(
 
         let result = route
             .scheduler
-            .execute(idx, move || callback.invoke(&name, idx, RequestData::Inline(args), resp_pool))
+            .execute(idx, move || callback.invoke(&name, idx, request, resp_pool))
             .await;
 
         match result {

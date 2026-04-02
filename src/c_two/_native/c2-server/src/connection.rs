@@ -212,6 +212,17 @@ impl Connection {
         state.pool = Some(Arc::new(RwLock::new(pool)));
     }
 
+    /// Ensure the peer's SHM segment at `seg_idx` is mapped (lazy-open).
+    /// Does NOT read data — just ensures the segment is available for ShmBuffer access.
+    pub fn ensure_peer_segment(&self, seg_idx: u16, data_size: u32, is_dedicated: bool) -> Result<(), String> {
+        let state = self.peer_shm.lock().unwrap();
+        if is_dedicated {
+            state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)
+        } else {
+            state.ensure_buddy_segment(seg_idx as u32)
+        }
+    }
+
     /// Read `data_size` bytes from the peer's SHM at `(seg_idx, offset)`.
     ///
     /// Lazy-opens the segment if it hasn't been seen before — the name is
