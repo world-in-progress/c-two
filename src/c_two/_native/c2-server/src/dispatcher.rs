@@ -68,6 +68,24 @@ pub enum RequestData {
     },
 }
 
+/// Explicitly release SHM resources held by a RequestData.
+/// Must be called on error paths where the request won't be consumed by a CRM callback.
+pub fn cleanup_request(request: RequestData) {
+    match request {
+        RequestData::Shm { pool, seg_idx, offset, data_size, is_dedicated } => {
+            if let Ok(mut p) = pool.write() {
+                let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+            }
+        }
+        RequestData::Handle { handle, pool } => {
+            if let Ok(mut p) = pool.write() {
+                p.release_handle(handle);
+            }
+        }
+        RequestData::Inline(_) => {}
+    }
+}
+
 impl std::fmt::Debug for RequestData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

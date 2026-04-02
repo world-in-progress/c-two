@@ -34,7 +34,7 @@ use c2_wire::msg_type::{MsgType, DISCONNECT_ACK_BYTES, PONG_BYTES, SHUTDOWN_ACK_
 
 use crate::config::IpcConfig;
 use crate::connection::Connection;
-use crate::dispatcher::{CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta};
+use crate::dispatcher::{CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request};
 use crate::heartbeat::run_heartbeat;
 
 const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
@@ -532,14 +532,17 @@ async fn dispatch_buddy_call(
         }
     };
 
-    // 3. Ensure peer SHM segment is mapped (lazy-open only, NO data read).
-    if let Err(e) = conn.ensure_peer_segment(bp.seg_idx, bp.data_size, bp.is_dedicated) {
-        warn!(conn_id = conn.conn_id(), %e, "ensure_peer_segment failed");
-        let msg = format!("buddy SHM segment open: {e}");
-        write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
-        conn.flight_dec();
-        return;
-    }
+    // 3. Ensure peer SHM segment is mapped and get pool Arc (single lock).
+    let peer_pool = match conn.ensure_and_get_peer_pool(bp.seg_idx, bp.data_size, bp.is_dedicated) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(conn_id = conn.conn_id(), %e, "ensure_and_get_peer_pool failed");
+            let msg = format!("buddy SHM segment open: {e}");
+            write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+            conn.flight_dec();
+            return;
+        }
+    };
 
     // 4. Check for extra inline args appended after control header.
     let inline_start = BUDDY_PAYLOAD_SIZE + ctrl_consumed;
@@ -551,14 +554,6 @@ async fn dispatch_buddy_call(
 
     // 5. Build request — zero-copy SHM or fallback to inline if extra args present.
     let request = if extra_args.is_empty() {
-        let peer_pool = match conn.peer_pool_arc() {
-            Some(p) => p,
-            None => {
-                warn!(conn_id = conn.conn_id(), "no peer SHM state");
-                conn.flight_dec();
-                return;
-            }
-        };
         RequestData::Shm {
             pool: peer_pool,
             seg_idx: bp.seg_idx,
@@ -579,7 +574,14 @@ async fn dispatch_buddy_call(
                 return;
             }
         };
-        conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+        let free_result = conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+        if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
+            let conn2 = Arc::clone(&conn);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                conn2.gc_peer_buddy();
+            });
+        }
         let mut combined = args;
         combined.extend_from_slice(extra_args);
         RequestData::Inline(combined)
@@ -590,6 +592,7 @@ async fn dispatch_buddy_call(
     let route = match route {
         Some(r) => r,
         None => {
+            cleanup_request(request);
             let msg = format!("route not found: {}", ctrl.route_name);
             write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
             conn.flight_dec();
@@ -639,6 +642,8 @@ async fn dispatch_chunked_call(
     let mut offset: usize = 0;
 
     // 1. If buddy-backed chunk, read data from SHM first.
+    // NOTE: Per-chunk data must be copied into the reassembly buffer — zero-copy
+    // is applied only to the final assembled result (RequestData::Handle above).
     let shm_data: Option<Vec<u8>>;
     if is_buddy {
         let (bp, bp_consumed) = match decode_buddy_payload(payload) {
@@ -776,6 +781,7 @@ async fn dispatch_chunked_call(
         let route = match route {
             Some(r) => r,
             None => {
+                cleanup_request(request);
                 let msg = format!("route not found: {route_name}");
                 write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
                 conn.flight_dec();
