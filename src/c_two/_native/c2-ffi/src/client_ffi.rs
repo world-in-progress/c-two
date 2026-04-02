@@ -316,19 +316,62 @@ impl PyRustClient {
         let inner = Arc::clone(&self.inner);
         let route = route_name.to_string();
         let method = method_name.to_string();
-        let payload = data.to_vec();
 
+        // Fast path: direct SHM write for large payloads.
+        // While GIL is held, `data` is a zero-copy &[u8] from Python.
+        // Write directly to SHM (single copy), then release GIL to send
+        // buddy frame with just coordinates (no data movement).
+        if inner.should_use_shm(data.len()) {
+            match inner.pool_alloc_and_write(data) {
+                Ok(alloc) => {
+                    let data_size = data.len();
+                    let result = py.allow_threads(move || {
+                        inner.call_prealloc(&route, &method, &alloc, data_size)
+                    });
+                    return match result {
+                        Ok(response_data) => {
+                            let pool = self.inner.server_pool_arc();
+                            let reassembly = self.inner.reassembly_pool_arc();
+                            Ok(PyResponseBuffer::from_response_data(
+                                response_data, pool, reassembly,
+                            ))
+                        }
+                        Err(IpcError::CrmError(err_bytes)) => {
+                            let exc = PyErr::new::<CrmCallError, _>("CRM method error");
+                            exc.value(py)
+                                .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
+                            Err(exc)
+                        }
+                        Err(e) => {
+                            // call_with_prealloc already freed on send failure.
+                            // For receive failures (Closed), server already consumed.
+                            Err(PyRuntimeError::new_err(format!("{e}")))
+                        }
+                    };
+                }
+                Err(_) => {
+                    // Pool alloc failed — fall through to inline path.
+                }
+            }
+        }
+
+        // Fallback: inline/chunked path (small payloads or pool unavailable).
+        // to_vec() is needed because allow_threads requires owned data.
+        let payload = data.to_vec();
         let result = py.allow_threads(move || inner.call(&route, &method, &payload));
 
         match result {
             Ok(response_data) => {
                 let pool = self.inner.server_pool_arc();
                 let reassembly = self.inner.reassembly_pool_arc();
-                Ok(PyResponseBuffer::from_response_data(response_data, pool, reassembly))
+                Ok(PyResponseBuffer::from_response_data(
+                    response_data, pool, reassembly,
+                ))
             }
             Err(IpcError::CrmError(err_bytes)) => {
                 let exc = PyErr::new::<CrmCallError, _>("CRM method error");
-                exc.value(py).setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
+                exc.value(py)
+                    .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
                 Err(exc)
             }
             Err(e) => Err(PyRuntimeError::new_err(format!("{e}"))),
