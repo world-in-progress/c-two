@@ -25,7 +25,7 @@ use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, B
 use c2_wire::chunk::decode_chunk_header;
 use c2_wire::control::{decode_call_control, encode_reply_control, ReplyControl};
 use c2_wire::flags::{FLAG_BUDDY, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE, FLAG_SIGNAL};
-use c2_wire::frame::{decode_frame_body, encode_frame};
+use c2_wire::frame::{self, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
     decode_handshake, encode_server_handshake, MethodEntry, RouteInfo, CAP_CALL_V2, CAP_CHUNKED,
     CAP_METHOD_IDX,
@@ -785,13 +785,33 @@ async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl:
 }
 
 /// Write a success reply: control header (STATUS_SUCCESS) + result data.
+/// Uses stack buffer for small responses (≤1024B total frame) to avoid heap allocation.
 async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, data: &[u8]) {
     let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
-    let mut payload = Vec::with_capacity(ctrl_bytes.len() + data.len());
-    payload.extend_from_slice(&ctrl_bytes);
-    payload.extend_from_slice(data);
-    let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
-    let _ = writer.lock().await.write_all(&frame).await;
+    let payload_len = ctrl_bytes.len() + data.len();
+    let total_len = (12 + payload_len) as u32;
+    let frame_size = frame::HEADER_SIZE + payload_len;
+
+    if frame_size <= 1024 {
+        // Stack buffer: single write_all, zero heap allocation
+        let mut buf = [0u8; 1024];
+        buf[0..4].copy_from_slice(&total_len.to_le_bytes());
+        buf[4..12].copy_from_slice(&request_id.to_le_bytes());
+        buf[12..16].copy_from_slice(&REPLY_FLAGS.to_le_bytes());
+        let mut off = frame::HEADER_SIZE;
+        buf[off..off + ctrl_bytes.len()].copy_from_slice(&ctrl_bytes);
+        off += ctrl_bytes.len();
+        buf[off..off + data.len()].copy_from_slice(data);
+        off += data.len();
+        let _ = writer.lock().await.write_all(&buf[..off]).await;
+    } else {
+        // Large response: heap Vec (existing path)
+        let mut payload = Vec::with_capacity(ctrl_bytes.len() + data.len());
+        payload.extend_from_slice(&ctrl_bytes);
+        payload.extend_from_slice(data);
+        let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
+        let _ = writer.lock().await.write_all(&frame).await;
+    }
 }
 
 /// Write a success reply via buddy SHM: allocate from response pool, write
