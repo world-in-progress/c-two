@@ -124,12 +124,19 @@ impl PyResponseBuffer {
     /// Must be called after all memoryviews are released.
     /// For inline responses, this is a no-op (Vec is dropped).
     fn release(&self) -> PyResult<()> {
+        // Fast-path: avoid locking if exports are obviously active
         if self.exports.load(Ordering::Acquire) > 0 {
             return Err(PyBufferError::new_err(
                 "cannot release: buffer is currently exported as memoryview",
             ));
         }
         let mut guard = self.inner.lock().unwrap();
+        // Re-check under lock to close the TOCTOU window
+        if self.exports.load(Ordering::Acquire) > 0 {
+            return Err(PyBufferError::new_err(
+                "cannot release: buffer is currently exported as memoryview",
+            ));
+        }
         match guard.take() {
             Some(ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated }) => {
                 if let Ok(mut pool_guard) = pool.lock() {

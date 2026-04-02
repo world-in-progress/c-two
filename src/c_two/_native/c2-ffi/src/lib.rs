@@ -20,6 +20,8 @@ mod relay_ffi;
 #[cfg(feature = "python")]
 mod server_ffi;
 #[cfg(feature = "python")]
+pub(crate) mod shm_buffer;
+#[cfg(feature = "python")]
 mod wire_ffi;
 
 #[cfg(feature = "python")]
@@ -37,6 +39,7 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     mem_ffi::register_module(m)?;
     relay_ffi::register_module(m)?;
     server_ffi::register_module(m)?;
+    shm_buffer::register_module(m)?;
     wire_ffi::register_module(m)?;
     Ok(())
 }
