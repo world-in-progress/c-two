@@ -225,14 +225,14 @@ pub struct IpcClient {
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
     pending: Arc<StdMutex<PendingMap>>,
     rid_counter: AtomicU32,
-    route_tables: HashMap<String, MethodTable>,
+    pub(crate) route_tables: HashMap<String, MethodTable>,
     server_segments: Vec<(String, u32)>,
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Option<tokio::task::JoinHandle<()>>,
     connected: Arc<AtomicBool>,
-    pool: Option<Arc<StdMutex<MemPool>>>,
-    config: IpcConfig,
+    pub(crate) pool: Option<Arc<StdMutex<MemPool>>>,
+    pub(crate) config: IpcConfig,
     /// Client-side pool for reassembling chunked responses.
     pub(crate) reassembly_pool: Arc<StdMutex<MemPool>>,
 }

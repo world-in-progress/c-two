@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
-use c2_mem::MemPool;
+use c2_mem::{MemPool, PoolAllocation};
 
 use crate::client::{IpcClient, IpcConfig, IpcError, MethodTable, ServerPoolState};
 use crate::response::ResponseData;
@@ -78,6 +78,59 @@ impl SyncClient {
     ) -> Result<ResponseData, IpcError> {
         self.rt
             .block_on(self.inner.call_full(route_name, method_name, data))
+    }
+
+    /// Whether the client has a SHM pool and data exceeds the threshold.
+    pub fn should_use_shm(&self, data_len: usize) -> bool {
+        self.inner.pool.is_some() && data_len > self.inner.config.shm_threshold
+    }
+
+    /// Allocate from the client SHM pool and write data in a single lock scope.
+    ///
+    /// Returns the allocation coordinates. On error, the caller should
+    /// fall back to the inline `call()` path.
+    pub fn pool_alloc_and_write(&self, data: &[u8]) -> Result<PoolAllocation, IpcError> {
+        let pool_arc = self.inner.pool.as_ref()
+            .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
+        let mut pool = pool_arc.lock().unwrap();
+        let alloc = pool.alloc(data.len())
+            .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
+        let ptr = pool.data_ptr(&alloc)
+            .map_err(|e| {
+                let _ = pool.free(&alloc);
+                IpcError::Pool(format!("data_ptr failed: {e}"))
+            })?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }
+        Ok(alloc)
+    }
+
+    /// Free a pool allocation (used on send failure for cleanup).
+    pub fn pool_free(&self, alloc: &PoolAllocation) {
+        if let Some(ref pool_arc) = self.inner.pool {
+            let mut pool = pool_arc.lock().unwrap();
+            let _ = pool.free(alloc);
+        }
+    }
+
+    /// Synchronous CRM call with pre-allocated SHM data — blocks until reply.
+    pub fn call_prealloc(
+        &self,
+        route_name: &str,
+        method_name: &str,
+        alloc: &PoolAllocation,
+        data_size: usize,
+    ) -> Result<ResponseData, IpcError> {
+        let table = self.inner
+            .route_tables
+            .get(route_name)
+            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
+        let method_idx = table
+            .index_of(method_name)
+            .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
+        self.rt
+            .block_on(self.inner.call_with_prealloc(route_name, method_idx, alloc, data_size))
     }
 
     /// Get a reference to the server SHM pool (for FFI layer).
