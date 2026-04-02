@@ -737,8 +737,19 @@ impl IpcClient {
         }
 
         // Await response — server already consumed the SHM allocation.
+        // For dedicated segments, the server only freed its local peer-pool
+        // copy; the client must also free its own allocation so the dedicated
+        // segment can be GC'd and the slot reused.
         match rx.await {
-            Ok(result) => result,
+            Ok(result) => {
+                if alloc.is_dedicated {
+                    if let Some(ref pool_arc) = self.pool {
+                        let mut pool = pool_arc.lock().unwrap();
+                        let _ = pool.free(alloc);
+                    }
+                }
+                result
+            }
             Err(_) => Err(IpcError::Closed),
         }
     }
