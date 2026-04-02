@@ -495,6 +495,21 @@ impl MemPool {
         if max_buddy > 0 && size <= max_buddy
             && self.segments.len() < self.config.max_segments
         {
+            // GC before expanding — may free trailing idle segments
+            let reclaimed = self.gc_buddy();
+            if reclaimed > 0 {
+                // Retry existing segments after GC
+                for (idx, seg) in self.segments.iter().enumerate() {
+                    if (seg.allocator().free_bytes() as usize) < size { continue; }
+                    if let Some(a) = seg.allocator().alloc(size) {
+                        if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                        return Ok(MemHandle::Buddy {
+                            seg_idx: idx as u16, offset: a.offset, len: size,
+                        });
+                    }
+                }
+            }
+
             match self.create_segment() {
                 Ok(seg) => {
                     let idx = self.segments.len();
@@ -612,6 +627,29 @@ impl MemPool {
                     level: a.level,
                     is_dedicated: false,
                 });
+            }
+        }
+
+        // Layer 1.5: GC before expansion — reclaim idle trailing segments
+        let reclaimed = self.gc_buddy();
+        if reclaimed > 0 {
+            // Retry existing segments after GC freed some
+            for (idx, seg) in self.segments.iter().enumerate() {
+                if (seg.allocator().free_bytes() as usize) < size {
+                    continue;
+                }
+                if let Some(a) = seg.allocator().alloc(size) {
+                    if idx < self.idle_since.len() {
+                        self.idle_since[idx] = None;
+                    }
+                    return Ok(PoolAllocation {
+                        seg_idx: idx as u32,
+                        offset: a.offset,
+                        actual_size: a.actual_size,
+                        level: a.level,
+                        is_dedicated: false,
+                    });
+                }
             }
         }
 
