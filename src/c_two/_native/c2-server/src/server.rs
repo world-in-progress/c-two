@@ -835,7 +835,7 @@ async fn write_buddy_reply_with_data(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     data: &[u8],
-) {
+) -> Result<(), String> {
     // 1. Allocate from response pool.
     let alloc = {
         let mut pool = response_pool.lock().unwrap();
@@ -843,9 +843,8 @@ async fn write_buddy_reply_with_data(
     };
     let alloc = match alloc {
         Ok(a) => a,
-        Err(_) => {
-            write_reply_with_data(writer, request_id, data).await;
-            return;
+        Err(e) => {
+            return Err(format!("alloc failed: {e}"));
         }
     };
 
@@ -867,8 +866,7 @@ async fn write_buddy_reply_with_data(
             let mut pool = response_pool.lock().unwrap();
             let _ = pool.free(&alloc);
         }
-        write_reply_with_data(writer, request_id, data).await;
-        return;
+        return Err("data_ptr failed".into());
     }
 
     // 3. Encode buddy payload + reply control.
@@ -889,6 +887,7 @@ async fn write_buddy_reply_with_data(
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
     let frame = encode_frame(request_id, flags, &payload);
     let _ = writer.lock().await.write_all(&frame).await;
+    Ok(())
 }
 
 /// Choose buddy SHM or inline reply based on data size and threshold.
@@ -900,7 +899,11 @@ async fn smart_reply_with_data(
     shm_threshold: u64,
 ) {
     if data.len() as u64 > shm_threshold {
-        write_buddy_reply_with_data(response_pool, writer, request_id, data).await;
+        // Try buddy SHM first; degrade to inline on failure.
+        // Phase 3 will add chunked fallback between buddy and inline.
+        if write_buddy_reply_with_data(response_pool, writer, request_id, data).await.is_err() {
+            write_reply_with_data(writer, request_id, data).await;
+        }
     } else {
         write_reply_with_data(writer, request_id, data).await;
     }
