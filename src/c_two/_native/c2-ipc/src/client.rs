@@ -38,6 +38,9 @@ pub struct IpcConfig {
     pub shm_threshold: usize,
     /// Chunk size for chunked transfer (default 128 KB).
     pub chunk_size: usize,
+    /// Client-side buddy pool segment size (default: PoolConfig::default().segment_size = 256 MB).
+    /// When set, overrides the default segment_size for the client MemPool.
+    pub pool_segment_size: Option<usize>,
 }
 
 impl Default for IpcConfig {
@@ -45,6 +48,7 @@ impl Default for IpcConfig {
         Self {
             shm_threshold: 4096,
             chunk_size: 131072,
+            pool_segment_size: None,
         }
     }
 }

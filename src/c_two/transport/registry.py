@@ -176,6 +176,11 @@ class _ProcessRegistry:
                 overrides['max_pool_segments'] = max_segments
             if overrides:
                 self._explicit_ipc_config = self._make_ipc_config(**overrides)
+            # Also configure the client-side pool segment size.
+            if segment_size is not None:
+                self._pool.set_default_config(
+                    pool_segment_size=segment_size,
+                )
 
     def register(
         self,
