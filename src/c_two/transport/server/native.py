@@ -301,15 +301,17 @@ class NativeServerBridge:
         held.  Signature: ``(route_name, method_idx, shm_buffer, response_pool)``.
         It reads the request via ``memoryview(shm_buffer)``, resolves the
         method, calls the ICRM, and returns result bytes (or *None* for empty
-        responses).  For errors, it raises :class:`CrmCallError` whose
-        ``error_bytes`` attribute is picked up by ``PyCrmCallback``.
+        responses).  For large responses (> shm_threshold), allocates from
+        ``response_pool`` SHM and returns a ``(seg_idx, offset, data_size,
+        is_dedicated)`` tuple — Rust sends the buddy frame directly.
         """
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
+        shm_threshold = self._config.shm_threshold
 
         def dispatch(
             _route_name: str, method_idx: int,
-            request_buf: object, _response_pool: object,
+            request_buf: object, response_pool: object,
         ) -> object:
             # 1. Read request payload via zero-copy memoryview
             try:
@@ -340,6 +342,20 @@ class NativeServerBridge:
             res_part, err_part = unpack_icrm_result(result)
             if err_part:
                 raise CrmCallError(err_part)
-            return res_part if res_part else None
+            if not res_part:
+                return None
+
+            # 5. For large responses, write directly to response pool SHM
+            if response_pool is not None and len(res_part) > shm_threshold:
+                try:
+                    alloc = response_pool.alloc(len(res_part))
+                    response_pool.write(alloc, res_part)
+                    # Cast seg_idx to u16 as expected by Rust FFI
+                    seg_idx = int(alloc.seg_idx) & 0xFFFF  # Ensure u16 range
+                    return (seg_idx, alloc.offset, len(res_part), alloc.is_dedicated)
+                except Exception:
+                    pass  # SHM alloc failed — fall through to inline
+
+            return res_part
 
         return dispatch
