@@ -142,7 +142,7 @@ impl PyResponseBuffer {
             }
             Some(ResponseBufferInner::Handle { handle, pool }) => {
                 if let Ok(mut p) = pool.lock() {
-                    p.release_handle(handle);
+                    let _ = p.release_handle(handle);
                 }
                 Ok(())
             }
@@ -239,7 +239,7 @@ impl Drop for PyResponseBuffer {
                 }
                 Some(ResponseBufferInner::Handle { handle, pool }) => {
                     if let Ok(mut p) = pool.lock() {
-                        p.release_handle(handle);
+                        let _ = p.release_handle(handle);
                     }
                 }
                 _ => {}

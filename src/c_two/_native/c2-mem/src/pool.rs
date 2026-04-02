@@ -21,6 +21,8 @@ pub enum FreeResult {
     Normal,
     /// Block freed and the segment is now completely idle (zero active allocations).
     SegmentIdle { seg_idx: u16 },
+    /// Dedicated segment freed — caller may schedule delayed GC.
+    DedicatedFreed { seg_idx: u16 },
 }
 
 /// Tracking info for a dedicated segment.
@@ -396,7 +398,7 @@ impl MemPool {
     pub fn free_at(&mut self, seg_idx: u32, offset: u32, data_size: u32, is_dedicated: bool) -> Result<FreeResult, String> {
         if is_dedicated {
             self.free_dedicated(seg_idx);
-            Ok(FreeResult::Normal)
+            Ok(FreeResult::DedicatedFreed { seg_idx: seg_idx as u16 })
         } else if let Some(seg) = self.segments.get(seg_idx as usize) {
             let actual_size = (data_size as usize)
                 .next_power_of_two()
@@ -577,18 +579,22 @@ impl MemPool {
     }
 
     /// Release resources held by a [`MemHandle`].
-    pub fn release_handle(&mut self, handle: MemHandle) {
+    ///
+    /// Returns `FreeResult` so callers can trigger deferred GC.
+    /// For `FileSpill`, always returns `Normal` (OS handles cleanup via Drop).
+    pub fn release_handle(&mut self, handle: MemHandle) -> FreeResult {
         match handle {
             MemHandle::Buddy { seg_idx, offset, len } => {
-                let _ = self.free_at(
-                    seg_idx as u32, offset, len as u32, false,
-                );
+                self.free_at(seg_idx as u32, offset, len as u32, false)
+                    .unwrap_or(FreeResult::Normal)
             }
             MemHandle::Dedicated { seg_idx, .. } => {
                 self.free_dedicated(seg_idx as u32);
+                FreeResult::DedicatedFreed { seg_idx }
             }
             MemHandle::FileSpill { .. } => {
                 // MmapMut dropped here → munmap; file already unlinked
+                FreeResult::Normal
             }
         }
     }
@@ -1114,7 +1120,8 @@ mod handle_tests {
         let handle = pool.alloc_handle(128 * 1024).unwrap();
         assert!(handle.is_dedicated());
         assert_eq!(handle.len(), 128 * 1024);
-        pool.release_handle(handle);
+        let result = pool.release_handle(handle);
+        assert!(matches!(result, FreeResult::DedicatedFreed { .. }));
     }
 
     #[test]
