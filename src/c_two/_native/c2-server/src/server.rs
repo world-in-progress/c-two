@@ -86,7 +86,7 @@ pub struct Server {
     shutdown_rx: watch::Receiver<bool>,
     conn_counter: AtomicU64,
     /// Server-side MemPool for chunked reassembly buffers.
-    reassembly_pool: std::sync::Mutex<MemPool>,
+    reassembly_pool: Arc<std::sync::RwLock<MemPool>>,
     /// Server-side MemPool for writing buddy SHM responses.
     response_pool: Arc<std::sync::RwLock<MemPool>>,
 }
@@ -134,7 +134,7 @@ impl Server {
             shutdown_tx,
             shutdown_rx,
             conn_counter: AtomicU64::new(0),
-            reassembly_pool: std::sync::Mutex::new(reassembly_pool),
+            reassembly_pool: Arc::new(std::sync::RwLock::new(reassembly_pool)),
             response_pool: Arc::new(std::sync::RwLock::new(response_pool)),
         })
     }
@@ -152,6 +152,16 @@ impl Server {
     /// Filesystem path of the bound UDS socket.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Get a shared reference to the response pool (for zero-copy dispatch).
+    pub fn response_pool_arc(&self) -> Arc<std::sync::RwLock<MemPool>> {
+        Arc::clone(&self.response_pool)
+    }
+
+    /// Get a shared reference to the reassembly pool.
+    pub fn reassembly_pool_arc(&self) -> Arc<std::sync::RwLock<MemPool>> {
+        Arc::clone(&self.reassembly_pool)
     }
 
     /// Run the accept loop.  Blocks until [`shutdown`](Self::shutdown) is called.
@@ -680,7 +690,7 @@ async fn dispatch_chunked_call(
         }
 
         let asm = {
-            let mut pool = server.reassembly_pool.lock().unwrap();
+            let mut pool = server.reassembly_pool.write().unwrap();
             match c2_wire::assembler::ChunkAssembler::new(
                 &mut pool,
                 total_chunks as usize,
@@ -709,7 +719,7 @@ async fn dispatch_chunked_call(
 
     // 5. Feed chunk to assembler.
     let complete = {
-        let pool = server.reassembly_pool.lock().unwrap();
+        let pool = server.reassembly_pool.read().unwrap();
         match conn.feed_chunk(request_id, &pool, chunk_idx as usize, chunk_data) {
             Ok(complete) => complete,
             Err(e) => {
@@ -740,11 +750,11 @@ async fn dispatch_chunked_call(
         };
 
         let args = {
-            let pool = server.reassembly_pool.lock().unwrap();
+            let pool = server.reassembly_pool.read().unwrap();
             pool.handle_slice(&handle).to_vec()
         };
         {
-            let mut pool = server.reassembly_pool.lock().unwrap();
+            let mut pool = server.reassembly_pool.write().unwrap();
             pool.release_handle(handle);
         }
 

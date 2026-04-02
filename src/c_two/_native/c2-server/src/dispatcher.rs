@@ -52,7 +52,7 @@ pub enum RequestData {
     /// SHM coordinates from peer (buddy or dedicated).
     /// ShmBuffer.release() frees via pool.free_at().
     Shm {
-        pool: Arc<std::sync::Mutex<MemPool>>,
+        pool: Arc<std::sync::RwLock<MemPool>>,
         seg_idx: u16,
         offset: u32,
         data_size: u32,
@@ -64,7 +64,7 @@ pub enum RequestData {
     /// ShmBuffer.release() returns handle to pool.
     Handle {
         handle: MemHandle,
-        pool: Arc<std::sync::Mutex<MemPool>>,
+        pool: Arc<std::sync::RwLock<MemPool>>,
     },
 }
 

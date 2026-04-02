@@ -5,7 +5,7 @@
 //! for `memoryview()` zero-copy access.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::ffi;
@@ -22,7 +22,7 @@ enum ShmBufferInner {
     Inline(Vec<u8>),
     /// Peer-side SHM coordinates — the pool has segments already opened.
     PeerShm {
-        pool: Arc<Mutex<MemPool>>,
+        pool: Arc<RwLock<MemPool>>,
         seg_idx: u16,
         offset: u32,
         data_size: u32,
@@ -31,7 +31,7 @@ enum ShmBufferInner {
     /// Reassembled handle from the local pool.
     Handle {
         handle: MemHandle,
-        pool: Arc<Mutex<MemPool>>,
+        pool: Arc<RwLock<MemPool>>,
     },
 }
 
@@ -68,7 +68,7 @@ impl PyShmBuffer {
 
     /// Wrap peer-side SHM coordinates.
     pub fn from_peer_shm(
-        pool: Arc<Mutex<MemPool>>,
+        pool: Arc<RwLock<MemPool>>,
         seg_idx: u16,
         offset: u32,
         data_size: u32,
@@ -88,7 +88,7 @@ impl PyShmBuffer {
     }
 
     /// Wrap a reassembled `MemHandle`.
-    pub fn from_handle(handle: MemHandle, pool: Arc<Mutex<MemPool>>) -> Self {
+    pub fn from_handle(handle: MemHandle, pool: Arc<RwLock<MemPool>>) -> Self {
         let data_len = handle.len();
         Self {
             inner: Mutex::new(Some(ShmBufferInner::Handle { handle, pool })),
@@ -148,13 +148,13 @@ impl PyShmBuffer {
             Some(ShmBufferInner::PeerShm {
                 pool, seg_idx, offset, data_size, is_dedicated,
             }) => {
-                if let Ok(mut p) = pool.lock() {
+                if let Ok(mut p) = pool.write() {
                     let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
                 }
                 Ok(())
             }
             Some(ShmBufferInner::Handle { handle, pool }) => {
-                if let Ok(mut p) = pool.lock() {
+                if let Ok(mut p) = pool.write() {
                     let _ = p.release_handle(handle);
                 }
                 Ok(())
@@ -181,7 +181,7 @@ impl PyShmBuffer {
             ShmBufferInner::PeerShm {
                 pool, seg_idx, offset, data_size, is_dedicated,
             } => {
-                let pool_guard = pool.lock()
+                let pool_guard = pool.read()
                     .map_err(|_| PyBufferError::new_err("pool lock poisoned"))?;
                 let raw_ptr = pool_guard
                     .data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
@@ -189,12 +189,18 @@ impl PyShmBuffer {
                 (raw_ptr as *const u8, *data_size as usize)
             }
             ShmBufferInner::Handle { handle, pool } => {
-                let pool_guard = pool.lock()
+                let pool_guard = pool.read()
                     .map_err(|_| PyBufferError::new_err("pool lock poisoned"))?;
                 let slice = pool_guard.handle_slice(handle);
                 (slice.as_ptr(), slice.len())
             }
         };
+
+        // SAFETY: `pool_guard` (read lock) is released after extracting the raw pointer,
+        // but `ptr` remains valid because:
+        // (1) `self.inner` is still `Some` (guarded by the inner Mutex held above),
+        // (2) `exports` will be incremented below, preventing `release()` from freeing the block,
+        // (3) an un-freed block keeps its SHM segment non-idle, so GC cannot reclaim/unmap it.
 
         // Fill the Py_buffer fields — same pattern as PyResponseBuffer.
         unsafe {
@@ -245,12 +251,12 @@ impl Drop for PyShmBuffer {
                     ShmBufferInner::PeerShm {
                         pool, seg_idx, offset, data_size, is_dedicated,
                     } => {
-                        if let Ok(mut p) = pool.lock() {
+                        if let Ok(mut p) = pool.write() {
                             let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
                         }
                     }
                     ShmBufferInner::Handle { handle, pool } => {
-                        if let Ok(mut p) = pool.lock() {
+                        if let Ok(mut p) = pool.write() {
                             let _ = p.release_handle(handle);
                         }
                     }
