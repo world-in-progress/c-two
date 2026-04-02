@@ -25,7 +25,7 @@ use c2_wire::handshake::{
 };
 
 use c2_mem::config::PoolConfig;
-use c2_mem::MemPool;
+use c2_mem::{MemPool, PoolAllocation};
 
 use crate::response::ResponseData;
 
@@ -672,6 +672,73 @@ impl IpcClient {
                 }
                 result
             }
+            Err(_) => Err(IpcError::Closed),
+        }
+    }
+
+    /// Buddy SHM call path with pre-allocated data — sends buddy frame for
+    /// data that was already written to the client's SHM pool.
+    ///
+    /// Unlike `call_buddy()`, this does NOT alloc or write — the caller
+    /// already did that. On send failure, frees the allocation from the pool.
+    pub(crate) async fn call_with_prealloc(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        alloc: &PoolAllocation,
+        data_size: usize,
+    ) -> Result<ResponseData, IpcError> {
+        // Build buddy payload from pre-allocated coordinates.
+        let bp = BuddyPayload {
+            seg_idx: alloc.seg_idx as u16,
+            offset: alloc.offset,
+            data_size: data_size as u32,
+            is_dedicated: alloc.is_dedicated,
+        };
+        let buddy_bytes = encode_buddy_payload(&bp);
+
+        // Build call control.
+        let ctrl = encode_call_control(route_name, method_idx);
+
+        // Assemble frame payload: [11B buddy][call_control]
+        let payload_len = buddy_bytes.len() + ctrl.len();
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&buddy_bytes);
+        payload.extend_from_slice(&ctrl);
+
+        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
+
+        // Register pending call.
+        let (tx, rx) = oneshot::channel();
+        {
+            self.pending.lock().unwrap().insert(rid, tx);
+        }
+
+        // Send buddy frame.
+        let flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
+        let frame = frame::encode_frame(rid as u64, flags, &payload);
+
+        let send_result: Result<(), IpcError> = async {
+            let mut writer_guard = self.writer.lock().await;
+            let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+            writer.write_all(&frame).await?;
+            Ok(())
+        }.await;
+
+        if let Err(e) = send_result {
+            // Send failed — server never saw the allocation. Free it.
+            // This matches call_buddy() behavior.
+            if let Some(ref pool_arc) = self.pool {
+                let mut pool = pool_arc.lock().unwrap();
+                let _ = pool.free(alloc);
+            }
+            self.pending.lock().unwrap().remove(&rid);
+            return Err(e);
+        }
+
+        // Await response — server already consumed the SHM allocation.
+        match rx.await {
+            Ok(result) => result,
             Err(_) => Err(IpcError::Closed),
         }
     }
