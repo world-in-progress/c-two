@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use c2_mem::MemPool;
 
-use crate::client::{IpcClient, IpcConfig, IpcError, MethodTable};
+use crate::client::{IpcClient, IpcConfig, IpcError, MethodTable, ServerPoolState};
+use crate::response::ResponseData;
 
 // ── Global shared runtime ────────────────────────────────────────────────
 
@@ -74,9 +75,14 @@ impl SyncClient {
         route_name: &str,
         method_name: &str,
         data: &[u8],
-    ) -> Result<Vec<u8>, IpcError> {
+    ) -> Result<ResponseData, IpcError> {
         self.rt
             .block_on(self.inner.call_full(route_name, method_name, data))
+    }
+
+    /// Get a reference to the server SHM pool (for FFI layer).
+    pub fn server_pool_arc(&self) -> Arc<StdMutex<Option<ServerPoolState>>> {
+        self.inner.server_pool.clone()
     }
 
     /// Synchronous close.

@@ -25,6 +25,8 @@ use c2_wire::handshake::{
 
 use c2_mem::MemPool;
 
+use crate::response::ResponseData;
+
 // ── Config ───────────────────────────────────────────────────────────────
 
 /// Transport thresholds for IPC path selection.
@@ -49,7 +51,7 @@ impl Default for IpcConfig {
 
 /// State for reading server's SHM response data.
 /// Mirrors `PeerShmState` in c2-server/connection.rs.
-struct ServerPoolState {
+pub struct ServerPoolState {
     prefix: String,
     buddy_segment_size: usize,
     pool: MemPool,
@@ -190,7 +192,7 @@ impl MethodTable {
 
 // ── Pending call ─────────────────────────────────────────────────────────
 
-type PendingMap = HashMap<u32, oneshot::Sender<Result<Vec<u8>, IpcError>>>;
+type PendingMap = HashMap<u32, oneshot::Sender<Result<ResponseData, IpcError>>>;
 
 // ── IpcClient ────────────────────────────────────────────────────────────
 
@@ -206,7 +208,7 @@ pub struct IpcClient {
     route_tables: HashMap<String, MethodTable>,
     server_segments: Vec<(String, u32)>,
     /// Server SHM pool state for reading buddy reply responses.
-    server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
+    pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Option<tokio::task::JoinHandle<()>>,
     connected: Arc<AtomicBool>,
     pool: Option<Arc<StdMutex<MemPool>>>,
@@ -417,7 +419,7 @@ impl IpcClient {
         route_name: &str,
         method_name: &str,
         data: &[u8],
-    ) -> Result<Vec<u8>, IpcError> {
+    ) -> Result<ResponseData, IpcError> {
         let table = self
             .route_tables
             .get(route_name)
@@ -440,7 +442,7 @@ impl IpcClient {
         route_name: &str,
         method_name: &str,
         data: &[u8],
-    ) -> Result<Vec<u8>, IpcError> {
+    ) -> Result<ResponseData, IpcError> {
         let table = self
             .route_tables
             .get(route_name)
@@ -475,7 +477,7 @@ impl IpcClient {
         route_name: &str,
         method_idx: u16,
         data: &[u8],
-    ) -> Result<Vec<u8>, IpcError> {
+    ) -> Result<ResponseData, IpcError> {
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
 
         // Register pending call.
@@ -541,7 +543,7 @@ impl IpcClient {
         route_name: &str,
         method_idx: u16,
         data: &[u8],
-    ) -> Result<Vec<u8>, IpcError> {
+    ) -> Result<ResponseData, IpcError> {
         let pool_arc = self.pool.as_ref().unwrap();
 
         // Allocate and write data to SHM.
@@ -627,7 +629,7 @@ impl IpcClient {
         route_name: &str,
         method_idx: u16,
         data: &[u8],
-    ) -> Result<Vec<u8>, IpcError> {
+    ) -> Result<ResponseData, IpcError> {
         let chunk_size = self.config.chunk_size;
         let total_chunks = (data.len() + chunk_size - 1) / chunk_size;
 
@@ -751,7 +753,7 @@ const SIG_DISCONNECT_ACK: u8 = 0x09;
 async fn recv_loop(
     mut reader: tokio::io::ReadHalf<UnixStream>,
     pending: Arc<StdMutex<PendingMap>>,
-    server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
+    _server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
@@ -810,7 +812,7 @@ async fn recv_loop(
         let rid = hdr.request_id as u32;
 
         // Decode response.
-        let result = decode_response(&hdr, &recv_buf, &server_pool);
+        let result = decode_response(&hdr, &recv_buf);
 
         // Dispatch to pending caller.
         let tx = {
@@ -831,13 +833,12 @@ async fn recv_loop(
 fn decode_response(
     hdr: &FrameHeader,
     payload: &[u8],
-    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
-) -> Result<Vec<u8>, IpcError> {
+) -> Result<ResponseData, IpcError> {
     let is_v2 = hdr.is_reply_v2();
     let is_buddy = hdr.is_buddy();
 
     if !is_v2 {
-        return Ok(payload.to_vec());
+        return Ok(ResponseData::Inline(payload.to_vec()));
     }
 
     if is_buddy {
@@ -853,21 +854,19 @@ fn decode_response(
 
         match ctrl {
             ReplyControl::Success => {
-                let mut guard = server_pool.lock().unwrap();
-                let state = guard.as_mut().ok_or_else(|| {
-                    IpcError::Handshake("server pool not initialised for buddy reply".into())
-                })?;
-
-                let (data, _free_result) = state.read_and_free(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated)
-                    .map_err(|e| IpcError::Handshake(format!("buddy read: {e}")))?;
-                Ok(data)
+                Ok(ResponseData::Shm {
+                    seg_idx: bp.seg_idx,
+                    offset: bp.offset,
+                    data_size: bp.data_size,
+                    is_dedicated: bp.is_dedicated,
+                })
             }
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
     } else {
         let (ctrl, consumed) = decode_reply_control(payload, 0)?;
         match ctrl {
-            ReplyControl::Success => Ok(payload[consumed..].to_vec()),
+            ReplyControl::Success => Ok(ResponseData::Inline(payload[consumed..].to_vec())),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
     }
