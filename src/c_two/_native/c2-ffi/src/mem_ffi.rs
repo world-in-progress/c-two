@@ -401,7 +401,7 @@ impl PyMemPool {
         let mut pool = self.pool.write().map_err(|e| {
             PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
         })?;
-        pool.free_at(seg_idx, offset, data_size, is_dedicated)
+        let _ = pool.free_at(seg_idx, offset, data_size, is_dedicated)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(())
     }

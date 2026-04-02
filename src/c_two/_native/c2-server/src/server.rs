@@ -494,7 +494,7 @@ async fn dispatch_call(
 
 async fn dispatch_buddy_call(
     server: &Server,
-    conn: &Connection,
+    conn: &Arc<Connection>,
     request_id: u64,
     payload: &[u8],
     writer: &Arc<Mutex<OwnedWriteHalf>>,
@@ -534,7 +534,14 @@ async fn dispatch_buddy_call(
     };
 
     // 4. Free the client's allocation.
-    conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+    let free_result = conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+    if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
+        let conn2 = Arc::clone(&conn);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            conn2.gc_peer_buddy();
+        });
+    }
 
     // 5. Check for inline args appended after control header.
     let inline_start = BUDDY_PAYLOAD_SIZE + ctrl_consumed;
@@ -596,7 +603,7 @@ async fn dispatch_buddy_call(
 
 async fn dispatch_chunked_call(
     server: &Server,
-    conn: &Connection,
+    conn: &Arc<Connection>,
     request_id: u64,
     flags: u32,
     payload: &[u8],
@@ -618,7 +625,14 @@ async fn dispatch_chunked_call(
         offset = bp_consumed;
         match conn.read_peer_data(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated) {
             Ok(data) => {
-                conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+                let free_result = conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+                if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
+                    let conn2 = Arc::clone(&conn);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        conn2.gc_peer_buddy();
+                    });
+                }
                 shm_data = Some(data);
             }
             Err(e) => {

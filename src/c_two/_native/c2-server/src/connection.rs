@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use c2_mem::config::PoolConfig;
-use c2_mem::MemPool;
+use c2_mem::{FreeResult, MemPool};
 use c2_wire::assembler::ChunkAssembler;
 
 // ---------------------------------------------------------------------------
@@ -220,13 +220,14 @@ impl Connection {
     /// Free a buddy block in the peer's SHM pool.
     ///
     /// Lazy-opens the segment if not yet mapped.
+    /// Returns `FreeResult` so callers can trigger deferred GC on idle segments.
     pub fn free_peer_block(
         &self,
         seg_idx: u16,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
-    ) {
+    ) -> FreeResult {
         let mut state = self.peer_shm.lock().unwrap();
         // Lazy-open the segment before freeing.
         let lazy_res = if is_dedicated {
@@ -240,17 +241,29 @@ impl Connection {
                 seg_idx,
                 "lazy-open for free failed: {e}"
             );
-            return;
+            return FreeResult::Normal;
         }
         if let Some(pool) = state.pool.as_mut() {
-            if let Err(e) = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
-                warn!(
-                    conn_id = self.conn_id,
-                    seg_idx,
-                    offset,
-                    "peer free_at failed: {e}"
-                );
+            match pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
+                Ok(result) => return result,
+                Err(e) => {
+                    warn!(
+                        conn_id = self.conn_id,
+                        seg_idx,
+                        offset,
+                        "peer free_at failed: {e}"
+                    );
+                }
             }
+        }
+        FreeResult::Normal
+    }
+
+    /// Run buddy GC on the peer's SHM pool — reclaim idle trailing segments.
+    pub fn gc_peer_buddy(&self) {
+        let mut state = self.peer_shm.lock().unwrap();
+        if let Some(pool) = state.pool.as_mut() {
+            pool.gc_buddy();
         }
     }
 

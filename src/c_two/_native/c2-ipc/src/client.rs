@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex};
 
+use c2_mem::FreeResult;
 use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
 use c2_wire::chunk::encode_chunk_header;
 use c2_wire::control::{decode_reply_control, encode_call_control, ReplyControl};
@@ -89,7 +90,7 @@ impl ServerPoolState {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(Vec<u8>, FreeResult), String> {
         if is_dedicated {
             self.ensure_dedicated_segment(seg_idx, data_size as usize)?;
         } else {
@@ -101,11 +102,15 @@ impl ServerPoolState {
             std::slice::from_raw_parts(ptr, data_size as usize)
         }.to_vec();
 
-        if let Err(e) = self.pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
-            eprintln!("Warning: server SHM free_at failed: {e}");
-        }
+        let free_result = match self.pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Warning: server SHM free_at failed: {e}");
+                FreeResult::Normal
+            }
+        };
 
-        Ok(data)
+        Ok((data, free_result))
     }
 }
 
@@ -853,8 +858,9 @@ fn decode_response(
                     IpcError::Handshake("server pool not initialised for buddy reply".into())
                 })?;
 
-                state.read_and_free(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated)
-                    .map_err(|e| IpcError::Handshake(format!("buddy read: {e}")))
+                let (data, _free_result) = state.read_and_free(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated)
+                    .map_err(|e| IpcError::Handshake(format!("buddy read: {e}")))?;
+                Ok(data)
             }
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
