@@ -7,7 +7,7 @@ pub mod server;
 
 pub use config::IpcConfig;
 pub use connection::Connection;
-pub use dispatcher::{CrmCallback, CrmError, CrmRoute, Dispatcher};
+pub use dispatcher::{CrmCallback, CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta};
 pub use heartbeat::{run_heartbeat, HeartbeatResult};
 pub use scheduler::{AccessLevel, ConcurrencyMode, Scheduler};
 pub use server::{Server, ServerError};

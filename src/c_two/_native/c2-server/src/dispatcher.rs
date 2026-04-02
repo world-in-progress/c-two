@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use c2_mem::{MemHandle, MemPool};
+
 use crate::scheduler::Scheduler;
 
 /// Error from CRM method invocation
@@ -23,27 +25,77 @@ impl std::fmt::Display for CrmError {
 
 impl std::error::Error for CrmError {}
 
+/// Metadata describing how the CRM callback produced its response.
+///
+/// Returned by `CrmCallback::invoke()`. The server reads these coordinates
+/// to build the reply frame — no payload data crosses the FFI boundary.
+#[derive(Debug)]
+pub enum ResponseMeta {
+    /// CRM wrote result into response SHM (via pool.alloc + pool.write).
+    ShmAlloc {
+        seg_idx: u16,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    },
+    /// Small result returned as inline bytes (< shm_threshold).
+    Inline(Vec<u8>),
+    /// Method returned None / empty.
+    Empty,
+}
+
+/// Input data for a CRM method call.
+///
+/// Pure Rust types — no PyO3 dependency. The `PyCrmCallback` impl in c2-ffi
+/// converts these into Python objects (ShmBuffer/bytes) under GIL.
+pub enum RequestData {
+    /// SHM coordinates from peer (buddy or dedicated).
+    /// ShmBuffer.release() frees via pool.free_at().
+    Shm {
+        pool: Arc<std::sync::Mutex<MemPool>>,
+        seg_idx: u16,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    },
+    /// Inline bytes from UDS frame.
+    Inline(Vec<u8>),
+    /// Reassembled MemHandle from chunked transfer.
+    /// ShmBuffer.release() returns handle to pool.
+    Handle {
+        handle: MemHandle,
+        pool: Arc<std::sync::Mutex<MemPool>>,
+    },
+}
+
+impl std::fmt::Debug for RequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestData::Shm { seg_idx, offset, data_size, is_dedicated, .. } =>
+                write!(f, "RequestData::Shm(seg={seg_idx}, off={offset}, size={data_size}, ded={is_dedicated})"),
+            RequestData::Inline(v) =>
+                write!(f, "RequestData::Inline({} bytes)", v.len()),
+            RequestData::Handle { .. } =>
+                write!(f, "RequestData::Handle"),
+        }
+    }
+}
+
 /// Trait for calling CRM methods from Rust.
 ///
-/// Implementations hold Python callable references via PyO3.
-/// `invoke()` acquires the GIL internally, so callers must NOT
-/// hold the GIL when calling this.
+/// `invoke()` acquires the GIL internally (in PyCrmCallback impl),
+/// so callers must NOT hold the GIL when calling this.
+///
+/// Uses pure Rust types (RequestData, ResponseMeta) — no PyO3 types
+/// in the trait interface. PyCrmCallback converts to/from Python objects.
 pub trait CrmCallback: Send + Sync + 'static {
-    /// Execute a CRM method call.
-    ///
-    /// # Arguments
-    /// * `route_name` — CRM routing name (from cc.register(name=...))
-    /// * `method_idx` — Method index (negotiated during handshake)
-    /// * `payload` — Serialized arguments (bytes)
-    ///
-    /// # Returns
-    /// Serialized result bytes, or CrmError
     fn invoke(
         &self,
         route_name: &str,
         method_idx: u16,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, CrmError>;
+        request: RequestData,
+        response_pool: Arc<std::sync::RwLock<MemPool>>,
+    ) -> Result<ResponseMeta, CrmError>;
 }
 
 /// Per-CRM route entry in the server.
@@ -127,6 +179,7 @@ impl Default for Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use c2_mem::PoolConfig;
     use crate::scheduler::ConcurrencyMode;
     use std::collections::HashMap;
 
@@ -137,9 +190,10 @@ mod tests {
             &self,
             _route: &str,
             _method_idx: u16,
-            payload: &[u8],
-        ) -> Result<Vec<u8>, CrmError> {
-            Ok(payload.to_vec()) // echo
+            _request: RequestData,
+            _response_pool: Arc<std::sync::RwLock<MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            Ok(ResponseMeta::Inline(b"echo".to_vec()))
         }
     }
 
@@ -162,8 +216,15 @@ mod tests {
         assert_eq!(route.method_names.len(), 2);
 
         // invoke the callback through the route
-        let result = route.callback.invoke("grid", 0, b"hello").unwrap();
-        assert_eq!(result, b"hello");
+        let pool = Arc::new(std::sync::RwLock::new(
+            MemPool::new(PoolConfig::default())
+        ));
+        let result = route.callback.invoke(
+            "grid", 0,
+            RequestData::Inline(b"test".to_vec()),
+            pool.clone(),
+        ).unwrap();
+        assert!(matches!(result, ResponseMeta::Inline(ref v) if v == b"echo"));
     }
 
     #[test]
@@ -250,14 +311,22 @@ mod tests {
                 &self,
                 _route: &str,
                 _method_idx: u16,
-                _payload: &[u8],
-            ) -> Result<Vec<u8>, CrmError> {
+                _request: RequestData,
+                _response_pool: Arc<std::sync::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
                 Err(CrmError::InternalError("method not found".into()))
             }
         }
 
+        let pool = Arc::new(std::sync::RwLock::new(
+            MemPool::new(PoolConfig::default())
+        ));
         let cb: Arc<dyn CrmCallback> = Arc::new(FailCallback);
-        let err = cb.invoke("grid", 99, b"").unwrap_err();
+        let err = cb.invoke(
+            "grid", 99,
+            RequestData::Inline(b"test".to_vec()),
+            pool,
+        ).unwrap_err();
         assert!(matches!(err, CrmError::InternalError(_)));
     }
 }

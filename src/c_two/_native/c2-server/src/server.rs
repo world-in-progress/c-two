@@ -34,7 +34,7 @@ use c2_wire::msg_type::{MsgType, DISCONNECT_ACK_BYTES, PONG_BYTES, SHUTDOWN_ACK_
 
 use crate::config::IpcConfig;
 use crate::connection::Connection;
-use crate::dispatcher::{CrmError, CrmRoute, Dispatcher};
+use crate::dispatcher::{CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta};
 use crate::heartbeat::run_heartbeat;
 
 const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
@@ -88,7 +88,7 @@ pub struct Server {
     /// Server-side MemPool for chunked reassembly buffers.
     reassembly_pool: std::sync::Mutex<MemPool>,
     /// Server-side MemPool for writing buddy SHM responses.
-    response_pool: std::sync::Mutex<MemPool>,
+    response_pool: Arc<std::sync::RwLock<MemPool>>,
 }
 
 impl Server {
@@ -135,7 +135,7 @@ impl Server {
             shutdown_rx,
             conn_counter: AtomicU64::new(0),
             reassembly_pool: std::sync::Mutex::new(reassembly_pool),
-            response_pool: std::sync::Mutex::new(response_pool),
+            response_pool: Arc::new(std::sync::RwLock::new(response_pool)),
         })
     }
 
@@ -357,7 +357,7 @@ async fn handle_handshake(
 
     // Collect response pool segment info for handshake.
     let (server_segments, server_prefix) = {
-        let pool = server.response_pool.lock().unwrap();
+        let pool = server.response_pool.read().unwrap();
         let count = pool.segment_count();
         let mut segs = Vec::with_capacity(count);
         for i in 0..count {
@@ -466,15 +466,16 @@ async fn dispatch_call(
     let name = ctrl.route_name;
     let idx = ctrl.method_idx;
     let args = payload[consumed..].to_vec();
+    let resp_pool = Arc::clone(&server.response_pool);
 
     let result = route
         .scheduler
-        .execute(idx, move || callback.invoke(&name, idx, &args))
+        .execute(idx, move || callback.invoke(&name, idx, RequestData::Inline(args), resp_pool))
         .await;
 
     match result {
-        Ok(data) => smart_reply_with_data(
-            &server.response_pool, writer, request_id, &data,
+        Ok(meta) => send_response_meta(
+            &server.response_pool, writer, request_id, meta,
             server.config.shm_threshold, server.config.reply_chunk_size,
         ).await,
         Err(CrmError::UserError(b)) => {
@@ -575,15 +576,16 @@ async fn dispatch_buddy_call(
     let callback = Arc::clone(&route.callback);
     let name = ctrl.route_name;
     let idx = ctrl.method_idx;
+    let resp_pool = Arc::clone(&server.response_pool);
 
     let result = route
         .scheduler
-        .execute(idx, move || callback.invoke(&name, idx, &full_args))
+        .execute(idx, move || callback.invoke(&name, idx, RequestData::Inline(full_args), resp_pool))
         .await;
 
     match result {
-        Ok(data) => smart_reply_with_data(
-            &server.response_pool, writer, request_id, &data,
+        Ok(meta) => send_response_meta(
+            &server.response_pool, writer, request_id, meta,
             server.config.shm_threshold, server.config.reply_chunk_size,
         ).await,
         Err(CrmError::UserError(b)) => {
@@ -763,15 +765,16 @@ async fn dispatch_chunked_call(
         let callback = Arc::clone(&route.callback);
         let name = route_name;
         let idx = method_idx;
+        let resp_pool = Arc::clone(&server.response_pool);
 
         let result = route
             .scheduler
-            .execute(idx, move || callback.invoke(&name, idx, &args))
+            .execute(idx, move || callback.invoke(&name, idx, RequestData::Inline(args), resp_pool))
             .await;
 
         match result {
-            Ok(data) => smart_reply_with_data(
-                &server.response_pool, writer, request_id, &data,
+            Ok(meta) => send_response_meta(
+                &server.response_pool, writer, request_id, meta,
                 server.config.shm_threshold, server.config.reply_chunk_size,
             ).await,
             Err(CrmError::UserError(b)) => {
@@ -831,14 +834,14 @@ async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: 
 /// Write a success reply via buddy SHM: allocate from response pool, write
 /// data, send 11-byte pointer frame. Falls back to inline on alloc failure.
 async fn write_buddy_reply_with_data(
-    response_pool: &std::sync::Mutex<MemPool>,
+    response_pool: &std::sync::RwLock<MemPool>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     data: &[u8],
 ) -> Result<(), String> {
     // 1. Allocate from response pool.
     let alloc = {
-        let mut pool = response_pool.lock().unwrap();
+        let mut pool = response_pool.write().unwrap();
         pool.alloc(data.len())
     };
     let alloc = match alloc {
@@ -850,7 +853,7 @@ async fn write_buddy_reply_with_data(
 
     // 2. Write data to SHM (single lock scope).
     let write_ok = {
-        let pool = response_pool.lock().unwrap();
+        let pool = response_pool.read().unwrap();
         match pool.data_ptr(&alloc) {
             Ok(ptr) => {
                 unsafe {
@@ -863,7 +866,7 @@ async fn write_buddy_reply_with_data(
     };
     if !write_ok {
         {
-            let mut pool = response_pool.lock().unwrap();
+            let mut pool = response_pool.write().unwrap();
             let _ = pool.free(&alloc);
         }
         return Err("data_ptr failed".into());
@@ -924,9 +927,42 @@ async fn write_chunked_reply(
     }
 }
 
+/// Dispatch a `ResponseMeta` to the appropriate reply path.
+async fn send_response_meta(
+    response_pool: &std::sync::RwLock<MemPool>,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    meta: ResponseMeta,
+    shm_threshold: u64,
+    chunk_size: usize,
+) {
+    match meta {
+        ResponseMeta::Inline(data) => {
+            smart_reply_with_data(
+                response_pool, writer, request_id, &data, shm_threshold, chunk_size,
+            ).await;
+        }
+        ResponseMeta::Empty => {
+            write_reply_with_data(writer, request_id, &[]).await;
+        }
+        ResponseMeta::ShmAlloc { seg_idx, offset, data_size, is_dedicated } => {
+            // CRM already wrote into our response pool — send buddy pointer.
+            let bp = BuddyPayload { seg_idx, offset, data_size, is_dedicated };
+            let buddy_bytes = encode_buddy_payload(&bp);
+            let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
+            let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
+            payload.extend_from_slice(&buddy_bytes);
+            payload.extend_from_slice(&ctrl_bytes);
+            let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
+            let frame = encode_frame(request_id, flags, &payload);
+            let _ = writer.lock().await.write_all(&frame).await;
+        }
+    }
+}
+
 /// Choose buddy SHM or inline reply based on data size and threshold.
 async fn smart_reply_with_data(
-    response_pool: &std::sync::Mutex<MemPool>,
+    response_pool: &std::sync::RwLock<MemPool>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     data: &[u8],
@@ -1008,8 +1044,14 @@ mod tests {
 
     struct Echo;
     impl CrmCallback for Echo {
-        fn invoke(&self, _: &str, _: u16, p: &[u8]) -> Result<Vec<u8>, CrmError> {
-            Ok(p.to_vec())
+        fn invoke(
+            &self,
+            _: &str,
+            _: u16,
+            _request: RequestData,
+            _response_pool: Arc<std::sync::RwLock<MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            Ok(ResponseMeta::Inline(b"echo".to_vec()))
         }
     }
 
