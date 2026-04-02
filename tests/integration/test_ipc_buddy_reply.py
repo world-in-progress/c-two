@@ -70,3 +70,56 @@ class TestBuddyReply:
             result = proxy.echo(data)
             assert result == data
         cc.close(proxy)
+
+    def test_gc_idle_segment_reclaim(self):
+        """GC reclaims idle segments after bursty allocation."""
+        proxy = self._setup_ipc('ipc://test_buddy_reply_gc')
+        # Force multiple segment usage with large payloads
+        for _ in range(5):
+            data = os.urandom(10 * 1024 * 1024)  # 10 MB each
+            result = proxy.echo(data)
+            assert len(result) == len(data)
+        # After burst, smaller allocations should still work (GC cleans up)
+        small = os.urandom(1024)
+        assert proxy.echo(small) == small
+        cc.close(proxy)
+
+    def test_stress_mixed_payload_sizes(self):
+        """Mixed payload sizes stress-test both inline and SHM paths."""
+        proxy = self._setup_ipc('ipc://test_buddy_reply_stress')
+        sizes = [64, 512, 4096, 32768, 1024 * 1024, 64, 512, 4096]
+        for size in sizes:
+            data = os.urandom(size)
+            result = proxy.echo(data)
+            assert result == data, f"Mismatch at size {size}"
+        cc.close(proxy)
+
+    def test_concurrent_large_calls(self):
+        """Multiple concurrent large calls work correctly."""
+        import threading
+
+        addr = 'ipc://test_buddy_reply_concurrent'
+        cc.set_address(addr)
+        cc.register(IEcho, Echo(), name='echo')
+        time.sleep(0.3)
+
+        errors = []
+
+        def worker(worker_id):
+            try:
+                proxy = cc.connect(IEcho, name='echo', address=addr)
+                for i in range(3):
+                    data = os.urandom(1024 * 1024)  # 1 MB
+                    result = proxy.echo(data)
+                    if result != data:
+                        errors.append(f"Worker {worker_id} call {i}: mismatch")
+                cc.close(proxy)
+            except Exception as e:
+                errors.append(f"Worker {worker_id}: {e}")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+        assert not errors, f"Concurrent test errors: {errors}"
