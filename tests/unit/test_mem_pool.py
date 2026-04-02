@@ -471,7 +471,7 @@ class TestBuddyPanicSafety:
             min_block_size=4096,
             max_segments=1,
             max_dedicated_segments=1,
-            dedicated_gc_delay_secs=-1.0,
+            dedicated_crash_timeout_secs=-1.0,
         )
         pool = MemPool(cfg)
         try:
@@ -487,7 +487,7 @@ class TestBuddyPanicSafety:
     def test_nan_gc_delay_rejected(self):
         """Config validation: NaN gc_delay_secs must be rejected."""
         with pytest.raises(ValueError, match='NaN'):
-            PoolConfig(dedicated_gc_delay_secs=float('nan'))
+            PoolConfig(dedicated_crash_timeout_secs=float('nan'))
 
     def test_non_power_of_two_segment_rejected(self):
         """Config validation: non-power-of-2 segment_size must be rejected."""
