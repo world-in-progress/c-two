@@ -194,6 +194,11 @@ impl PyMemPool {
     pub(crate) fn pool_arc(&self) -> Arc<RwLock<MemPool>> {
         Arc::clone(&self.pool)
     }
+
+    /// Create from an existing shared pool (used by server_ffi to expose response_pool).
+    pub(crate) fn from_arc(pool: Arc<RwLock<MemPool>>) -> Self {
+        Self { pool }
+    }
 }
 
 #[pymethods]
