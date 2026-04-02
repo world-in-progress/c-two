@@ -25,4 +25,16 @@ impl ResponseData {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Extract the inline bytes, panicking if this is an SHM variant.
+    ///
+    /// Used by the relay where responses are always inline.
+    pub fn into_inline_bytes(self) -> Vec<u8> {
+        match self {
+            ResponseData::Inline(v) => v,
+            ResponseData::Shm { .. } => {
+                panic!("into_inline_bytes called on SHM response — relay must use inline transport")
+            }
+        }
+    }
 }

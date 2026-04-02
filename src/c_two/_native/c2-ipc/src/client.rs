@@ -54,7 +54,7 @@ impl Default for IpcConfig {
 pub struct ServerPoolState {
     prefix: String,
     buddy_segment_size: usize,
-    pool: MemPool,
+    pub pool: MemPool,
 }
 
 impl ServerPoolState {

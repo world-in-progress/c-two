@@ -206,7 +206,7 @@ async fn call_handler(
             (
                 StatusCode::OK,
                 [("content-type", "application/octet-stream")],
-                result,
+                result.into_inline_bytes(),
             )
                 .into_response()
         }
