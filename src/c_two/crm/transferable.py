@@ -320,13 +320,26 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 
                 # Call CRM
                 stage = 'call_crm'
-                result_bytes = client.call(method_name, serialized_args)
+                response = client.call(method_name, serialized_args)
                 
                 # Deserialize output
                 stage = 'deserialize_output'
                 if not output_transferable:
+                    if hasattr(response, 'release'):
+                        response.release()
                     return None
-                return output_transferable(result_bytes)
+                if hasattr(response, 'release'):
+                    mv = memoryview(response)
+                    try:
+                        result = output_transferable(mv)
+                        if isinstance(result, memoryview):
+                            result = bytes(result)
+                    finally:
+                        mv.release()
+                        response.release()
+                else:
+                    result = output_transferable(response)
+                return result
             
             except error.CCBaseError:
                 raise

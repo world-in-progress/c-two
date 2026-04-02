@@ -123,3 +123,34 @@ class TestBuddyReply:
         for t in threads:
             t.join(timeout=20)
         assert not errors, f"Concurrent test errors: {errors}"
+
+    def test_response_buffer_memoryview(self):
+        """ResponseBuffer supports zero-copy memoryview access."""
+        proxy = self._setup_ipc('ipc://test_buddy_reply_mv')
+        rust_client = proxy.client._client
+        route_name = proxy.client._name
+        data = os.urandom(1024 * 1024)  # 1 MB — above SHM threshold
+        response = rust_client.call(route_name, 'echo', data)
+        mv = memoryview(response)
+        assert len(mv) == len(data)
+        assert bytes(mv) == data
+        del mv
+        response.release()
+        cc.close(proxy)
+
+    def test_response_buffer_auto_release(self):
+        """ResponseBuffer auto-releases SHM on garbage collection."""
+        proxy = self._setup_ipc('ipc://test_buddy_reply_autorel')
+        rust_client = proxy.client._client
+        route_name = proxy.client._name
+        import gc
+        for _ in range(5):
+            data = os.urandom(1024 * 1024)
+            response = rust_client.call(route_name, 'echo', data)
+            del response
+            gc.collect()
+        # Should still work after GC
+        small = os.urandom(64)
+        result = proxy.echo(small)
+        assert result == small
+        cc.close(proxy)
