@@ -14,6 +14,15 @@ use crate::spill;
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// Result of a free operation — signals whether the segment became fully idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeResult {
+    /// Block freed normally, segment still has active allocations.
+    Normal,
+    /// Block freed and the segment is now completely idle (zero active allocations).
+    SegmentIdle { seg_idx: u16 },
+}
+
 /// Tracking info for a dedicated segment.
 struct DedicatedEntry {
     segment: DedicatedSegment,
@@ -384,24 +393,24 @@ impl MemPool {
     ///
     /// This recomputes the buddy level from the data size, enabling cross-process
     /// freeing where the remote side only knows (offset, data_size) from the wire.
-    pub fn free_at(&mut self, seg_idx: u32, offset: u32, data_size: u32, is_dedicated: bool) -> Result<(), String> {
+    pub fn free_at(&mut self, seg_idx: u32, offset: u32, data_size: u32, is_dedicated: bool) -> Result<FreeResult, String> {
         if is_dedicated {
             self.free_dedicated(seg_idx);
-            Ok(())
+            Ok(FreeResult::Normal)
         } else if let Some(seg) = self.segments.get(seg_idx as usize) {
             let actual_size = (data_size as usize)
                 .next_power_of_two()
                 .max(self.config.min_block_size);
             if let Some(level) = seg.allocator().size_to_level(actual_size) {
                 seg.allocator().free(offset, level as u16)?;
-                // Track idle: if segment is now empty, record the time.
                 let idx = seg_idx as usize;
                 if seg.allocator().alloc_count() == 0 {
                     if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
                         self.idle_since[idx] = Some(Instant::now());
                     }
+                    return Ok(FreeResult::SegmentIdle { seg_idx: seg_idx as u16 });
                 }
-                Ok(())
+                Ok(FreeResult::Normal)
             } else {
                 Err("could not determine buddy level for free_at".into())
             }

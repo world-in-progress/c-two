@@ -20,6 +20,6 @@ pub use segment::ShmRegion;
 pub use buddy_segment::BuddySegment;
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
-pub use pool::MemPool;
+pub use pool::{FreeResult, MemPool};
 pub use spill::{available_physical_memory, should_spill, create_file_spill};
 pub use handle::MemHandle;
