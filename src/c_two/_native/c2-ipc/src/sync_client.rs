@@ -85,6 +85,11 @@ impl SyncClient {
         self.inner.server_pool.clone()
     }
 
+    /// Get a reference to the client reassembly pool (for FFI layer).
+    pub fn reassembly_pool_arc(&self) -> Arc<StdMutex<MemPool>> {
+        self.inner.reassembly_pool.clone()
+    }
+
     /// Synchronous close.
     pub fn close(&mut self) {
         self.rt.block_on(self.inner.close());

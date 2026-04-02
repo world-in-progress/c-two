@@ -16,6 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use c2_ipc::{ClientPool, IpcConfig, IpcError, ResponseData, ServerPoolState, SyncClient};
+use c2_mem::MemPool;
 
 // ---------------------------------------------------------------------------
 // CrmCallError — custom exception carrying serialised error bytes
@@ -37,6 +38,10 @@ enum ResponseBufferInner {
         data_size: u32,
         is_dedicated: bool,
     },
+    Handle {
+        handle: c2_mem::MemHandle,
+        pool: Arc<StdMutex<MemPool>>,
+    },
 }
 
 /// Zero-copy response buffer supporting Python buffer protocol.
@@ -57,12 +62,16 @@ impl PyResponseBuffer {
     fn from_response_data(
         data: ResponseData,
         pool: Arc<StdMutex<Option<ServerPoolState>>>,
+        reassembly_pool: Arc<StdMutex<MemPool>>,
     ) -> Self {
         let data_len = data.len();
         let inner = match data {
             ResponseData::Inline(vec) => ResponseBufferInner::Inline(vec),
             ResponseData::Shm { seg_idx, offset, data_size, is_dedicated } => {
                 ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated }
+            }
+            ResponseData::Handle(handle) => {
+                ResponseBufferInner::Handle { handle, pool: reassembly_pool }
             }
         };
         Self {
@@ -99,6 +108,11 @@ impl PyResponseBuffer {
                 let slice = unsafe { std::slice::from_raw_parts(ptr, *data_size as usize) };
                 Ok(PyBytes::new(py, slice))
             }
+            Some(ResponseBufferInner::Handle { handle, pool }) => {
+                let pool_guard = pool.lock().unwrap();
+                let slice = pool_guard.handle_slice(handle);
+                Ok(PyBytes::new(py, slice))
+            }
             None => Err(PyValueError::new_err("buffer already released")),
         }
     }
@@ -120,6 +134,12 @@ impl PyResponseBuffer {
                     if let Some(state) = pool_guard.as_mut() {
                         let _ = state.pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
                     }
+                }
+                Ok(())
+            }
+            Some(ResponseBufferInner::Handle { handle, pool }) => {
+                if let Ok(mut p) = pool.lock() {
+                    p.release_handle(handle);
                 }
                 Ok(())
             }
@@ -150,6 +170,11 @@ impl PyResponseBuffer {
                 let raw_ptr = state.pool.data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
                     .map_err(|e| PyBufferError::new_err(format!("SHM access: {e}")))?;
                 (raw_ptr as *const u8, *data_size as usize)
+            }
+            ResponseBufferInner::Handle { handle, pool } => {
+                let pool_guard = pool.lock().unwrap();
+                let slice = pool_guard.handle_slice(handle);
+                (slice.as_ptr(), slice.len())
             }
         };
 
@@ -192,19 +217,26 @@ impl PyResponseBuffer {
 
 impl Drop for PyResponseBuffer {
     fn drop(&mut self) {
-        // Auto-release SHM if Python forgot to call release()
+        // Auto-release SHM/Handle if Python forgot to call release()
         if let Ok(mut guard) = self.inner.lock() {
-            if let Some(ResponseBufferInner::Shm {
-                pool, seg_idx, offset, data_size, is_dedicated,
-            }) = guard.take()
-            {
-                if let Ok(mut pool_guard) = pool.lock() {
-                    if let Some(state) = pool_guard.as_mut() {
-                        let _ = state.pool.free_at(
-                            seg_idx as u32, offset, data_size, is_dedicated,
-                        );
+            match guard.take() {
+                Some(ResponseBufferInner::Shm {
+                    pool, seg_idx, offset, data_size, is_dedicated,
+                }) => {
+                    if let Ok(mut pool_guard) = pool.lock() {
+                        if let Some(state) = pool_guard.as_mut() {
+                            let _ = state.pool.free_at(
+                                seg_idx as u32, offset, data_size, is_dedicated,
+                            );
+                        }
                     }
                 }
+                Some(ResponseBufferInner::Handle { handle, pool }) => {
+                    if let Ok(mut p) = pool.lock() {
+                        p.release_handle(handle);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -278,7 +310,8 @@ impl PyRustClient {
         match result {
             Ok(response_data) => {
                 let pool = self.inner.server_pool_arc();
-                Ok(PyResponseBuffer::from_response_data(response_data, pool))
+                let reassembly = self.inner.reassembly_pool_arc();
+                Ok(PyResponseBuffer::from_response_data(response_data, pool, reassembly))
             }
             Err(IpcError::CrmError(err_bytes)) => {
                 let exc = PyErr::new::<CrmCallError, _>("CRM method error");

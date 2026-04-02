@@ -1,4 +1,6 @@
-//! Unified response data — either inline bytes or SHM coordinates.
+//! Unified response data — either inline bytes, SHM coordinates, or a reassembled handle.
+
+use c2_mem::MemHandle;
 
 /// Response data from a CRM call.
 #[derive(Debug)]
@@ -12,6 +14,8 @@ pub enum ResponseData {
         data_size: u32,
         is_dedicated: bool,
     },
+    /// Reassembled chunked response (owned by client's reassembly pool).
+    Handle(MemHandle),
 }
 
 impl ResponseData {
@@ -19,6 +23,7 @@ impl ResponseData {
         match self {
             ResponseData::Inline(v) => v.len(),
             ResponseData::Shm { data_size, .. } => *data_size as usize,
+            ResponseData::Handle(h) => h.len(),
         }
     }
 
@@ -34,6 +39,9 @@ impl ResponseData {
             ResponseData::Inline(v) => v,
             ResponseData::Shm { .. } => {
                 panic!("into_inline_bytes called on SHM response — relay must use inline transport")
+            }
+            ResponseData::Handle(_) => {
+                panic!("into_inline_bytes called on Handle response — relay must use inline transport")
             }
         }
     }

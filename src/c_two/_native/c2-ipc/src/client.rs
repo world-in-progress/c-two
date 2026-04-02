@@ -13,6 +13,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex};
 
 use c2_mem::FreeResult;
+use c2_wire::assembler::ChunkAssembler;
 use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
 use c2_wire::chunk::encode_chunk_header;
 use c2_wire::control::{decode_reply_control, encode_call_control, ReplyControl};
@@ -23,6 +24,7 @@ use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX,
 };
 
+use c2_mem::config::PoolConfig;
 use c2_mem::MemPool;
 
 use crate::response::ResponseData;
@@ -213,6 +215,8 @@ pub struct IpcClient {
     connected: Arc<AtomicBool>,
     pool: Option<Arc<StdMutex<MemPool>>>,
     config: IpcConfig,
+    /// Client-side pool for reassembling chunked responses.
+    pub(crate) reassembly_pool: Arc<StdMutex<MemPool>>,
 }
 
 // Compile-time assertion: IpcClient is Send+Sync because all fields are
@@ -229,6 +233,14 @@ const _: () = {
 };
 
 impl IpcClient {
+    fn default_reassembly_pool() -> Arc<StdMutex<MemPool>> {
+        Arc::new(StdMutex::new(MemPool::new(PoolConfig {
+            segment_size: 256 * 1024 * 1024,
+            max_segments: 4,
+            ..PoolConfig::default()
+        })))
+    }
+
     /// Create a new IPC client targeting the given address.
     ///
     /// The address should be like `ipc://name` — the socket path is
@@ -251,6 +263,7 @@ impl IpcClient {
             connected: Arc::new(AtomicBool::new(false)),
             pool: None,
             config: IpcConfig::default(),
+            reassembly_pool: Self::default_reassembly_pool(),
         }
     }
 
@@ -280,6 +293,7 @@ impl IpcClient {
             connected: Arc::new(AtomicBool::new(false)),
             pool: Some(pool),
             config,
+            reassembly_pool: Self::default_reassembly_pool(),
         }
     }
 
@@ -399,11 +413,12 @@ impl IpcClient {
         let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
         let connected = self.connected.clone();
+        let reassembly_pool = self.reassembly_pool.clone();
         // Note: recv_handle is stored on self but we can't assign here
         // because &self is immutable. The caller (connect) handles this
         // via interior mutability or the recv task is detached.
         tokio::spawn(async move {
-            recv_loop(reader, pending, server_pool, writer_clone).await;
+            recv_loop(reader, pending, server_pool, writer_clone, reassembly_pool).await;
             connected.store(false, Ordering::Release);
         });
 
@@ -755,9 +770,11 @@ async fn recv_loop(
     pending: Arc<StdMutex<PendingMap>>,
     _server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+    reassembly_pool: Arc<StdMutex<MemPool>>,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
+    let mut assemblers: HashMap<u32, ChunkAssembler> = HashMap::new();
     loop {
         // Read frame header.
         if reader.read_exact(&mut header_buf).await.is_err() {
@@ -811,7 +828,88 @@ async fn recv_loop(
 
         let rid = hdr.request_id as u32;
 
-        // Decode response.
+        // Handle chunked response frames.
+        if hdr.is_response() && flags::is_chunked(hdr.flags) {
+            use c2_wire::chunk::decode_reply_chunk_meta;
+
+            let (total_size, total_chunks, chunk_idx, meta_consumed) =
+                match decode_reply_chunk_meta(&recv_buf, 0) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Warning: reply chunk meta decode error: {e:?}");
+                        continue;
+                    }
+                };
+            let chunk_data = &recv_buf[meta_consumed..];
+
+            // First chunk: create assembler.
+            if chunk_idx == 0 {
+                let chunk_size = if total_chunks > 1 {
+                    chunk_data.len()
+                } else {
+                    total_size as usize
+                };
+                let mut pool = reassembly_pool.lock().unwrap();
+                match ChunkAssembler::new(&mut pool, total_chunks as usize, chunk_size) {
+                    Ok(asm) => { assemblers.insert(rid, asm); }
+                    Err(e) => {
+                        eprintln!("Warning: reply chunk assembler creation failed: {e}");
+                        let tx = pending.lock().unwrap().remove(&rid);
+                        if let Some(tx) = tx {
+                            let _ = tx.send(Err(IpcError::Handshake(
+                                format!("chunked reply assembler failed: {e}"),
+                            )));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Feed chunk.
+            if let Some(asm) = assemblers.get_mut(&rid) {
+                let pool = reassembly_pool.lock().unwrap();
+                if let Err(e) = asm.feed_chunk(&pool, chunk_idx as usize, chunk_data) {
+                    drop(pool);
+                    eprintln!("Warning: reply chunk feed error: {e}");
+                    if let Some(failed) = assemblers.remove(&rid) {
+                        let mut pool = reassembly_pool.lock().unwrap();
+                        failed.abort(&mut pool);
+                    }
+                    let tx = pending.lock().unwrap().remove(&rid);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(Err(IpcError::Handshake(
+                            format!("chunked reply feed error: {e}"),
+                        )));
+                    }
+                    continue;
+                }
+
+                // Complete: finish and send to caller.
+                if asm.is_complete() {
+                    drop(pool);
+                    let asm = assemblers.remove(&rid).unwrap();
+                    match asm.finish() {
+                        Ok(handle) => {
+                            let tx = pending.lock().unwrap().remove(&rid);
+                            if let Some(tx) = tx {
+                                let _ = tx.send(Ok(ResponseData::Handle(handle)));
+                            }
+                        }
+                        Err(e) => {
+                            let tx = pending.lock().unwrap().remove(&rid);
+                            if let Some(tx) = tx {
+                                let _ = tx.send(Err(IpcError::Handshake(
+                                    format!("chunked reply finish error: {e}"),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            continue; // Don't fall through to decode_response.
+        }
+
+        // Decode non-chunked response.
         let result = decode_response(&hdr, &recv_buf);
 
         // Dispatch to pending caller.
@@ -820,6 +918,14 @@ async fn recv_loop(
         };
         if let Some(tx) = tx {
             let _ = tx.send(result);
+        }
+    }
+
+    // Connection lost — abort in-flight assemblers.
+    if !assemblers.is_empty() {
+        let mut pool = reassembly_pool.lock().unwrap();
+        for (_, asm) in assemblers.drain() {
+            asm.abort(&mut pool);
         }
     }
 
