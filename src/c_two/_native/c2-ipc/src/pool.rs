@@ -383,6 +383,7 @@ mod tests {
         let cfg = IpcConfig {
             shm_threshold: 1024,
             chunk_size: 65536,
+            ..IpcConfig::default()
         };
         pool.set_default_config(cfg);
         // Verify the config is stored (indirectly — acquire would use it).

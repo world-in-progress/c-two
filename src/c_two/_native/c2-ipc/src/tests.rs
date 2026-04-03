@@ -266,6 +266,7 @@ mod client_tests {
         let cfg = IpcConfig {
             shm_threshold: 100,
             chunk_size: 500,
+            ..IpcConfig::default()
         };
 
         // Below shm_threshold → inline
@@ -330,6 +331,7 @@ mod client_tests {
         let cfg = IpcConfig {
             shm_threshold: 512,
             chunk_size: 2048,
+            ..IpcConfig::default()
         };
 
         // IpcClient::new uses default config.
