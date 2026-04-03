@@ -2,7 +2,7 @@
 
 Compares cc.connect() in two modes:
   - Thread-local (same process, zero serialization)
-  - IPC (full serialize + SHM + UDS, 2GB buddy pool via cc.set_ipc_config)
+  - IPC (full serialize + SHM + UDS, 2GB buddy pool via cc.set_server_ipc_config / cc.set_client_ipc_config)
 
 Uses @transferable Payload wrapper to avoid the raw bytes fast-path.
 100 rounds per size, P50 latency.
@@ -126,7 +126,8 @@ def bench_ipc(payload_size: int) -> float:
     address = f'ipc://bench_tipc_{_ipc_counter}'
 
     # 2 GB buddy segments to handle up to 1 GB payloads.
-    cc.set_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
     cc.set_address(address)
     cc.register(IEcho, Echo(), name='echo_ipc')
 

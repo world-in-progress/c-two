@@ -158,7 +158,8 @@ def bench_ipc(payload_size: int) -> float:
     _ProcessRegistry.reset()
     address = f'ipc://bench_3m_ipc_{_ipc_counter}'
 
-    cc.set_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
     cc.set_address(address)
     cc.register(IEcho, Echo(), name='echo_ipc')
     _wait_sock(address)
@@ -186,7 +187,8 @@ def bench_relay(payload_size: int) -> float | None:
     address = f'ipc://bench_3m_relay_{_ipc_counter}'
     relay_addr = f'127.0.0.1:{_relay_port}'
 
-    cc.set_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
     cc.set_address(address)
     cc.register(IEcho, Echo(), name='echo_relay')
     _wait_sock(address)
@@ -234,7 +236,8 @@ def bench_ipc_dict(payload_size: int) -> float | None:
     _ProcessRegistry.reset()
     address = f'ipc://bench_3m_dict_{_ipc_counter}'
 
-    cc.set_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
     cc.set_address(address)
     cc.register(IDictEcho, DictEcho(), name='echo_dict')
     _wait_sock(address)
