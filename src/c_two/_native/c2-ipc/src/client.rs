@@ -41,6 +41,10 @@ pub struct IpcConfig {
     /// Client-side buddy pool segment size (default: PoolConfig::default().segment_size = 256 MB).
     /// When set, overrides the default segment_size for the client MemPool.
     pub pool_segment_size: Option<usize>,
+    /// Reassembly pool segment size override (default 256 MB).
+    pub reassembly_segment_size: Option<usize>,
+    /// Reassembly pool max segments override (default 4).
+    pub reassembly_max_segments: Option<usize>,
 }
 
 impl Default for IpcConfig {
@@ -49,6 +53,8 @@ impl Default for IpcConfig {
             shm_threshold: 4096,
             chunk_size: 131072,
             pool_segment_size: None,
+            reassembly_segment_size: None,
+            reassembly_max_segments: None,
         }
     }
 }
@@ -255,10 +261,12 @@ const _: () = {
 };
 
 impl IpcClient {
-    fn default_reassembly_pool() -> Arc<StdMutex<MemPool>> {
+    fn make_reassembly_pool(config: &IpcConfig) -> Arc<StdMutex<MemPool>> {
+        let seg_size = config.reassembly_segment_size.unwrap_or(256 * 1024 * 1024);
+        let max_segs = config.reassembly_max_segments.unwrap_or(4);
         Arc::new(StdMutex::new(MemPool::new(PoolConfig {
-            segment_size: 256 * 1024 * 1024,
-            max_segments: 4,
+            segment_size: seg_size,
+            max_segments: max_segs,
             ..PoolConfig::default()
         })))
     }
@@ -285,7 +293,7 @@ impl IpcClient {
             connected: Arc::new(AtomicBool::new(false)),
             pool: None,
             config: IpcConfig::default(),
-            reassembly_pool: Self::default_reassembly_pool(),
+            reassembly_pool: Self::make_reassembly_pool(&IpcConfig::default()),
         }
     }
 
@@ -314,8 +322,8 @@ impl IpcClient {
             recv_handle: None,
             connected: Arc::new(AtomicBool::new(false)),
             pool: Some(pool),
+            reassembly_pool: Self::make_reassembly_pool(&config),
             config,
-            reassembly_pool: Self::default_reassembly_pool(),
         }
     }
 

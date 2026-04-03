@@ -118,6 +118,8 @@ impl PyServer {
         heartbeat_interval = 10.0,
         heartbeat_timeout = 30.0,
         shm_threshold = 4096,
+        reassembly_segment_size = 67_108_864,
+        reassembly_max_segments = 4,
     ))]
     fn new(
         address: &str,
@@ -129,6 +131,8 @@ impl PyServer {
         heartbeat_interval: f64,
         heartbeat_timeout: f64,
         shm_threshold: u64,
+        reassembly_segment_size: u64,
+        reassembly_max_segments: u32,
     ) -> PyResult<Self> {
         let config = IpcConfig {
             max_frame_size,
@@ -138,6 +142,8 @@ impl PyServer {
             heartbeat_interval,
             heartbeat_timeout,
             shm_threshold,
+            reassembly_segment_size,
+            reassembly_max_segments,
             chunk_threshold_ratio: if max_payload_size > 0 {
                 chunked_threshold as f64 / max_payload_size as f64
             } else {

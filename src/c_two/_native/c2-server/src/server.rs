@@ -101,9 +101,9 @@ impl Server {
         let socket_path = parse_socket_path(address)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let reassembly_cfg = PoolConfig {
-            segment_size: 64 * 1024 * 1024,
+            segment_size: config.reassembly_segment_size as usize,
             min_block_size: 4096,
-            max_segments: 4,
+            max_segments: config.reassembly_max_segments as usize,
             max_dedicated_segments: 4,
             dedicated_crash_timeout_secs: 5.0,
             spill_threshold: 0.8,

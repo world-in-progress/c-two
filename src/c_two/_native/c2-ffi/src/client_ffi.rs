@@ -276,18 +276,22 @@ pub struct PyRustClient {
 impl PyRustClient {
     /// Create and connect to the given IPC address.
     #[new]
-    #[pyo3(signature = (address, shm_threshold=4096, chunk_size=131072, pool_segment_size=None))]
+    #[pyo3(signature = (address, shm_threshold=4096, chunk_size=131072, pool_segment_size=None, reassembly_segment_size=None, reassembly_max_segments=None))]
     fn new(
         py: Python<'_>,
         address: &str,
         shm_threshold: usize,
         chunk_size: usize,
         pool_segment_size: Option<usize>,
+        reassembly_segment_size: Option<usize>,
+        reassembly_max_segments: Option<usize>,
     ) -> PyResult<Self> {
         let config = IpcConfig {
             shm_threshold,
             chunk_size,
             pool_segment_size,
+            reassembly_segment_size,
+            reassembly_max_segments,
         };
         let addr = address.to_string();
         let client = py.allow_threads(move || {
@@ -441,7 +445,7 @@ impl PyRustClientPool {
     ///
     /// Increments the internal reference count.  Call `release()` when
     /// the client is no longer needed.
-    #[pyo3(signature = (address, shm_threshold=None, chunk_size=None, pool_segment_size=None))]
+    #[pyo3(signature = (address, shm_threshold=None, chunk_size=None, pool_segment_size=None, reassembly_segment_size=None, reassembly_max_segments=None))]
     fn acquire(
         &self,
         py: Python<'_>,
@@ -449,12 +453,19 @@ impl PyRustClientPool {
         shm_threshold: Option<usize>,
         chunk_size: Option<usize>,
         pool_segment_size: Option<usize>,
+        reassembly_segment_size: Option<usize>,
+        reassembly_max_segments: Option<usize>,
     ) -> PyResult<PyRustClient> {
-        let config = if shm_threshold.is_some() || chunk_size.is_some() || pool_segment_size.is_some() {
+        let config = if shm_threshold.is_some() || chunk_size.is_some()
+            || pool_segment_size.is_some() || reassembly_segment_size.is_some()
+            || reassembly_max_segments.is_some()
+        {
             Some(IpcConfig {
                 shm_threshold: shm_threshold.unwrap_or(4096),
                 chunk_size: chunk_size.unwrap_or(131072),
                 pool_segment_size,
+                reassembly_segment_size,
+                reassembly_max_segments,
             })
         } else {
             None
@@ -475,12 +486,21 @@ impl PyRustClientPool {
     }
 
     /// Set the default IPC config for newly created clients.
-    #[pyo3(signature = (shm_threshold=4096, chunk_size=131072, pool_segment_size=None))]
-    fn set_default_config(&self, shm_threshold: usize, chunk_size: usize, pool_segment_size: Option<usize>) {
+    #[pyo3(signature = (shm_threshold=4096, chunk_size=131072, pool_segment_size=None, reassembly_segment_size=None, reassembly_max_segments=None))]
+    fn set_default_config(
+        &self,
+        shm_threshold: usize,
+        chunk_size: usize,
+        pool_segment_size: Option<usize>,
+        reassembly_segment_size: Option<usize>,
+        reassembly_max_segments: Option<usize>,
+    ) {
         self.inner.set_default_config(IpcConfig {
             shm_threshold,
             chunk_size,
             pool_segment_size,
+            reassembly_segment_size,
+            reassembly_max_segments,
         });
     }
 

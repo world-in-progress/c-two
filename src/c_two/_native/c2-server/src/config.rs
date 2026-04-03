@@ -17,6 +17,10 @@ pub struct IpcConfig {
     pub max_pool_segments: u32,
     pub pool_segment_size: u64,
 
+    // Reassembly pool settings
+    pub reassembly_segment_size: u64,
+    pub reassembly_max_segments: u32,
+
     // Chunked transfer settings
     pub max_total_chunks: u32,
     pub chunk_gc_interval: u32,
@@ -45,6 +49,10 @@ impl Default for IpcConfig {
             max_pool_memory: 1_073_741_824,    // 1 GB
             max_pool_segments: 4,
             pool_segment_size: 268_435_456,    // 256 MB
+
+            // Reassembly pool
+            reassembly_segment_size: 64 * 1024 * 1024,  // 64 MB
+            reassembly_max_segments: 4,
 
             // Chunked transfer settings
             max_total_chunks: 512,
