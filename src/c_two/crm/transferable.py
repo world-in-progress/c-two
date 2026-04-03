@@ -123,19 +123,6 @@ def _default_deserialize_func(data: memoryview | None):
         return None
     return pickle.loads(data)
 
-def _is_single_bytes_param(func, filtered_params, type_hints) -> bool:
-    """Check if a function takes exactly one parameter of type bytes."""
-    if len(filtered_params) != 1:
-        return False
-    param_type = type_hints.get(filtered_params[0])
-    return param_type is bytes
-
-
-def _is_bytes_return(func) -> bool:
-    """Check if a function has return type bytes."""
-    type_hints = get_type_hints(func)
-    return type_hints.get('return') is bytes
-
 
 def create_default_transferable(func, is_input: bool):
     """
@@ -167,50 +154,31 @@ def create_default_transferable(func, is_input: bool):
                 continue
             filtered_params.append(name)
 
-        # Fast path: single bytes parameter — skip pickle entirely.
-        # The deserializer returns the data as-is (including memoryview) to
-        # enable zero-copy reads when the transport provides memoryview.
-        if _is_single_bytes_param(func, filtered_params, type_hints):
-            class DynamicInputTransferable(Transferable):
-                __module__ = 'Default'
+        # All input types use pickle-based serialization.
+        # pickle.loads() accepts memoryview since Python 3.8, so the
+        # deserializer is memoryview-aware for zero-copy transport.
+        class DynamicInputTransferable(Transferable):
+            __module__ = 'Default'
 
-                def serialize(data) -> bytes:
-                    if isinstance(data, (bytes, memoryview)):
-                        return data
-                    raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(data).__name__}")
+            def serialize(*args) -> bytes:
+                """Default serialization: pickle args directly as tuple."""
+                try:
+                    if len(args) == 1:
+                        return pickle.dumps(args[0])
+                    return pickle.dumps(args)
+                except Exception as e:
+                    logger.error(f'Failed to serialize input data: {e}')
+                    raise
 
-                def deserialize(data: memoryview | bytes):
-                    if data is None:
+            def deserialize(data: memoryview | bytes):
+                """Default deserialization: unpickle and return value or tuple."""
+                try:
+                    if data is None or len(data) == 0:
                         return None
-                    return data
-
-        else:
-            # Define the dynamic transferable class for input.
-            # pickle.loads() accepts memoryview since Python 3.8, so we
-            # can safely mark the default pickle-based class as
-            # memoryview-aware to avoid unnecessary bytes() conversion.
-            class DynamicInputTransferable(Transferable):
-                __module__ = 'Default'  # mark as default
-                
-                def serialize(*args) -> bytes:
-                    """Default serialization: pickle args directly as tuple."""
-                    try:
-                        if len(args) == 1:
-                            return pickle.dumps(args[0])
-                        return pickle.dumps(args)
-                    except Exception as e:
-                        logger.error(f'Failed to serialize input data: {e}')
-                        raise
-                
-                def deserialize(data: memoryview | bytes):
-                    """Default deserialization: unpickle and return value or tuple."""
-                    try:
-                        if data is None or len(data) == 0:
-                            return None
-                        unpickled = pickle.loads(data)
-                        return unpickled
-                    except Exception as e:
-                        raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
+                    unpickled = pickle.loads(data)
+                    return unpickled
+                except Exception as e:
+                    raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
         
         # Set the dynamic class properties
         DynamicInputTransferable._is_input = True
@@ -230,19 +198,8 @@ def create_default_transferable(func, is_input: bool):
         type_hints = get_type_hints(func)
         return_type = type_hints.get('return')
 
-        # Fast path: bytes return type — skip pickle entirely.
-        # The serializer passes memoryview through to enable zero-copy
-        # SHM→SHM writes in transports that support it (ipc buddy).
-        if return_type is bytes:
-            def _bytes_output_serialize(val):
-                if isinstance(val, (bytes, memoryview)):
-                    return val
-                raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(val).__name__}")
-            serialize_func = staticmethod(_bytes_output_serialize)
-            deserialize_func = staticmethod(lambda data: data if isinstance(data, (bytes, memoryview)) else pickle.loads(data) if data is not None else None)
-        else:
-            serialize_func = staticmethod(_default_serialize_func)
-            deserialize_func = staticmethod(_default_deserialize_func)
+        serialize_func = staticmethod(_default_serialize_func)
+        deserialize_func = staticmethod(_default_deserialize_func)
 
         # Define the dynamic transferable class for output
         attrs = {
