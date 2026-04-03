@@ -310,41 +310,6 @@ impl PyMemPool {
         Ok(PyBytes::new(py, slice))
     }
 
-    /// Get a memoryview into the allocated SHM block (zero-copy).
-    ///
-    /// Returns a Python memoryview pointing directly at the SHM data.
-    /// The caller MUST free the allocation AFTER releasing the memoryview.
-    fn get_memoryview<'py>(
-        &self,
-        py: Python<'py>,
-        alloc: &PyPoolAlloc,
-        size: usize,
-    ) -> PyResult<Bound<'py, pyo3::types::PyMemoryView>> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
-        let pa = PoolAllocation {
-            seg_idx: alloc.seg_idx,
-            offset: alloc.offset,
-            actual_size: alloc.actual_size,
-            level: alloc.level,
-            is_dedicated: alloc.is_dedicated,
-        };
-        let ptr = pool.data_ptr(&pa).map_err(|e| PyRuntimeError::new_err(e))?;
-        if size > alloc.actual_size as usize {
-            return Err(PyValueError::new_err("size exceeds allocation"));
-        }
-
-        // Create a bytes-like view using PyBytes as backing and then slicing.
-        // For true zero-copy, we use the buffer protocol via a custom wrapper.
-        // For now, create a memoryview from a bytes object (1 copy).
-        // TODO: Phase 2 — implement buffer protocol for zero-copy.
-        let slice = unsafe { std::slice::from_raw_parts(ptr, size) };
-        let bytes = PyBytes::new(py, slice);
-        let mv = pyo3::types::PyMemoryView::from(&bytes)?;
-        Ok(mv.unbind().into_bound(py))
-    }
-
     /// Write data from a Python buffer (bytes-like) into an allocated block.
     /// Uses buffer protocol for zero-copy from Python side.
     fn write_from_buffer(&self, py: Python<'_>, data: PyBuffer<u8>, alloc: &PyPoolAlloc) -> PyResult<()> {
