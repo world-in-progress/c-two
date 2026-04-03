@@ -10,6 +10,8 @@ DEFAULT_MAX_PENDING_REQUESTS = 1024
 DEFAULT_POOL_SEGMENT_SIZE = 268_435_456
 DEFAULT_MAX_POOL_SEGMENTS = 4
 DEFAULT_MAX_POOL_MEMORY = DEFAULT_POOL_SEGMENT_SIZE * DEFAULT_MAX_POOL_SEGMENTS
+DEFAULT_REASSEMBLY_SEGMENT_SIZE = 268_435_456  # 256 MB (client default)
+DEFAULT_REASSEMBLY_MAX_SEGMENTS = 4
 
 
 @dataclass
@@ -27,6 +29,8 @@ class IPCConfig:
         pool_segment_size: Size of each pool SHM segment (default 256 MB).
         pool_decay_seconds: Idle seconds before pool teardown (default 60).
         max_pool_memory: Memory budget per pool direction (default 1 GB).
+        reassembly_segment_size: Size of each reassembly pool segment (default 256 MB).
+        reassembly_max_segments: Max segments for reassembly pool (default 4).
 
     Heartbeat:
         heartbeat_interval: Seconds between PING probes (default 15; <=0 disables).
@@ -42,6 +46,8 @@ class IPCConfig:
     max_pool_memory: int = DEFAULT_MAX_POOL_MEMORY
     max_pool_segments: int = DEFAULT_MAX_POOL_SEGMENTS
     pool_segment_size: int = DEFAULT_POOL_SEGMENT_SIZE
+    reassembly_segment_size: int = DEFAULT_REASSEMBLY_SEGMENT_SIZE
+    reassembly_max_segments: int = DEFAULT_REASSEMBLY_MAX_SEGMENTS
 
     max_total_chunks: int = 512
     chunk_gc_interval: int = 100
@@ -75,6 +81,12 @@ class IPCConfig:
             raise ValueError(
                 f'max_pool_segments must be >= 1 and <= 255, got {self.max_pool_segments}'
             )
+        if not (1 <= self.reassembly_max_segments <= 255):
+            raise ValueError(
+                f'reassembly_max_segments must be >= 1 and <= 255, got {self.reassembly_max_segments}'
+            )
+        if self.reassembly_segment_size <= 0:
+            raise ValueError('reassembly_segment_size must be > 0')
         if self.max_pool_memory < self.pool_segment_size:
             raise ValueError(
                 f'max_pool_memory ({self.max_pool_memory}) must be >= '

@@ -108,6 +108,8 @@ class NativeServerBridge:
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_timeout=self._config.heartbeat_timeout,
             shm_threshold=self._config.shm_threshold,
+            reassembly_segment_size=self._config.reassembly_segment_size,
+            reassembly_max_segments=self._config.reassembly_max_segments,
         )
 
         # Register initial CRM if provided (compat with old Server constructor).
