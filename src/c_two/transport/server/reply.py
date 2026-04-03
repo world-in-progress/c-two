@@ -10,20 +10,20 @@ from typing import Any
 from ... import error
 
 
-def unpack_icrm_result(result: Any) -> tuple[bytes, bytes]:
-    """Unpack ICRM ``'<-'`` result into ``(result_bytes, error_bytes)``."""
+def unpack_icrm_result(result: Any) -> tuple[bytes | memoryview, bytes]:
+    """Unpack ICRM ``'<-'`` result into ``(result_data, error_bytes)``.
+
+    ``result_data`` may be ``bytes`` or ``memoryview`` — the caller
+    decides whether to materialise.  Error bytes are always ``bytes``.
+    """
     if isinstance(result, tuple):
         err_part = result[0] if result[0] else b''
         res_part = result[1] if len(result) > 1 and result[1] else b''
         if isinstance(err_part, memoryview):
             err_part = bytes(err_part)
-        if isinstance(res_part, memoryview):
-            res_part = bytes(res_part)
         return res_part, err_part
     if result is None:
         return b'', b''
-    if isinstance(result, memoryview):
-        return bytes(result), b''
     return result, b''
 
 

@@ -375,12 +375,15 @@ class NativeServerBridge:
             if response_pool is not None and len(res_part) > shm_threshold:
                 try:
                     alloc = response_pool.alloc(len(res_part))
-                    response_pool.write(alloc, res_part)
+                    response_pool.write_from_buffer(res_part, alloc)
                     seg_idx = int(alloc.seg_idx) & 0xFFFF
                     return (seg_idx, alloc.offset, len(res_part), alloc.is_dedicated)
                 except Exception:
                     pass
 
+            # Inline path — must be bytes for wire encoding.
+            if isinstance(res_part, memoryview):
+                res_part = bytes(res_part)
             return res_part
 
         return dispatch
