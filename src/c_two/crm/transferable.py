@@ -327,10 +327,10 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 else:
                     raise error.CompoDeserializeOutput(str(e)) from e
         
-        def crm_to_com(*args: any) -> tuple[any, any]:
-            # Get transferable
+        def crm_to_com(*args: any, _release_fn=None) -> tuple[any, any]:
             input_transferable = input.deserialize if input else None
             output_transferable = output.serialize if output else None
+            input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
 
             err = None
             result = None
@@ -339,22 +339,34 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             try:
                 if len(args) < 1:
                     raise ValueError('Instance method requires self, but only get one argument.')
-                
-                # Parse input args
+
                 iicrm = args[0]
                 crm = iicrm.crm
                 request = args[1] if len(args) > 1 else None
-                
-                # Deserialize input args if input_transferable is provided
-                # And if deserialized_args is not a tuple, convert it to a tuple
+
                 if request is not None and input_transferable is not None:
-                    deserialized_args = input_transferable(request)
+                    if input_buffer_mode == 'copy':
+                        request_copy = bytes(request) if not isinstance(request, bytes) else request
+                        if _release_fn is not None:
+                            _release_fn()
+                            _release_fn = None
+                        deserialized_args = input_transferable(request_copy)
+                    elif input_buffer_mode == 'view':
+                        deserialized_args = input_transferable(request)
+                        if _release_fn is not None:
+                            _release_fn()
+                            _release_fn = None
+                    else:  # hold
+                        deserialized_args = input_transferable(request)
                 else:
                     deserialized_args = tuple()
+                    if _release_fn is not None:
+                        _release_fn()
+                        _release_fn = None
+
                 if not isinstance(deserialized_args, tuple):
                     deserialized_args = (deserialized_args,)
 
-                # Call CRM method with the same name
                 crm_method = getattr(crm, method_name, None)
                 if crm_method is None:
                     raise ValueError(f'Method "{method_name}" not found on CRM class.')
@@ -362,9 +374,14 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 stage = 'execute_function'
                 result = crm_method(*deserialized_args)
                 err = None
-                
+
             except Exception as e:
                 result = None
+                if _release_fn is not None:
+                    try:
+                        _release_fn()
+                    except Exception:
+                        pass
                 if stage == 'deserialize_input':
                     err = error.CRMDeserializeInput(str(e))
                 elif stage == 'execute_function':
@@ -384,7 +401,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             return (serialized_error, serialized_result)
         
         @wraps(func)
-        def transfer_wrapper(*args: any) -> any:
+        def transfer_wrapper(*args: any, **kwargs: any) -> any:
             if not args:
                 raise ValueError('No arguments provided to determine direction.')
             
@@ -395,10 +412,14 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             if icrm.direction == '->':
                 return com_to_crm(*args)
             elif icrm.direction == '<-':
-                return crm_to_com(*args)
+                return crm_to_com(*args, **kwargs)
             else:
                 raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
         
+        # Expose buffer mode attributes for dispatch table introspection
+        transfer_wrapper._input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
+        transfer_wrapper._output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
+
         return transfer_wrapper
     
     return decorator

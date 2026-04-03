@@ -550,3 +550,109 @@ class TestBufferMode:
         assert t_out._buffer_mode == 'view'
 
 
+class TestCrmToComBufferModes:
+    """Test that crm_to_com handles _release_fn based on input buffer mode."""
+
+    def _setup(self, input_trans):
+        """Create a transfer-wrapped echo function with given input transferable."""
+        from c_two.crm.transferable import transfer
+        decorator = transfer(input=input_trans, output=None)
+        def echo(self, x):
+            return x
+        return decorator(echo)
+
+    def _make_icrm(self):
+        class MockCRM:
+            def echo(self, x):
+                return x
+        class MockICRM:
+            direction = '<-'
+            crm = MockCRM()
+        return MockICRM()
+
+    def test_copy_mode_calls_release(self):
+        """In copy mode, _release_fn is called (before deserialize)."""
+        released = []
+
+        @cc.transferable(buffer='copy')
+        class CopyIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data: bytes) -> int:
+                return pickle.loads(data)
+
+        wrapped = self._setup(CopyIn)
+        icrm = self._make_icrm()
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert released, '_release_fn was not called in copy mode'
+
+    def test_view_mode_calls_release(self):
+        """In view mode, _release_fn is called (after deserialize)."""
+        released = []
+        def fn(self, x: int) -> int: ...
+        input_trans = create_default_transferable(fn, is_input=True)
+        assert input_trans._buffer_mode == 'view'
+
+        wrapped = self._setup(input_trans)
+        icrm = self._make_icrm()
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert released, '_release_fn was not called in view mode'
+
+    def test_hold_mode_skips_release(self):
+        """In hold mode, _release_fn is NOT called (RAII)."""
+        released = []
+
+        @cc.transferable(buffer='hold')
+        class HoldIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data) -> int:
+                return pickle.loads(data) if isinstance(data, (bytes, memoryview)) else data
+
+        wrapped = self._setup(HoldIn)
+        icrm = self._make_icrm()
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert not released, '_release_fn should NOT be called in hold mode'
+
+    def test_no_release_fn_works(self):
+        """When _release_fn is None (thread-local), all modes work fine."""
+        def fn(self, x: int) -> int: ...
+        input_trans = create_default_transferable(fn, is_input=True)
+        wrapped = self._setup(input_trans)
+        icrm = self._make_icrm()
+        # No _release_fn — must not crash
+        result = wrapped(icrm, pickle.dumps(42))
+        # result is (error_bytes, result_bytes) tuple
+        assert isinstance(result, tuple)
+
+    def test_release_called_on_exception(self):
+        """_release_fn must be called even if deserialize raises."""
+        released = []
+
+        @cc.transferable(buffer='copy')
+        class BadDeser:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data: bytes) -> int:
+                raise RuntimeError('boom')
+
+        wrapped = self._setup(BadDeser)
+        icrm = self._make_icrm()
+        # Should not raise — crm_to_com catches exceptions
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert released, '_release_fn must be called even on error'
+
+    def test_transfer_wrapper_has_buffer_mode_attrs(self):
+        """transfer_wrapper should expose _input_buffer_mode and _output_buffer_mode."""
+        @cc.transferable(buffer='view')
+        class ViewIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data) -> int:
+                return pickle.loads(data)
+
+        wrapped = self._setup(ViewIn)
+        assert hasattr(wrapped, '_input_buffer_mode')
+        assert wrapped._input_buffer_mode == 'view'
+
+
