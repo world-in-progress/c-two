@@ -94,6 +94,22 @@ class TestBuddyReply:
             assert result == data, f"Mismatch at size {size}"
         cc.close(proxy)
 
+    def test_view_mode_large_payload(self):
+        """View mode (default pickle) works for large payloads through IPC."""
+        proxy = self._setup_ipc('ipc://test_buddy_reply_view')
+        data = b'V' * (2 * 1024 * 1024)  # 2MB
+        result = proxy.echo(data)
+        assert result == data
+        cc.close(proxy)
+
+    def test_copy_mode_custom_transferable(self):
+        """Custom @cc.transferable (copy mode default) works through IPC."""
+        proxy = self._setup_ipc('ipc://test_buddy_reply_copy_compat')
+        data = b'C' * (1024 * 1024)  # 1MB
+        result = proxy.echo(data)
+        assert result == data
+        cc.close(proxy)
+
     def test_concurrent_large_calls(self):
         """Multiple concurrent large calls work correctly."""
         import threading
