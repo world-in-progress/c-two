@@ -48,7 +48,7 @@ class CRMSlot:
     scheduler: Scheduler
     methods: list[str]
     shutdown_method: str | None = None
-    _dispatch_table: dict[str, tuple[Any, MethodAccess]] = field(
+    _dispatch_table: dict[str, tuple[Any, MethodAccess, str]] = field(
         default_factory=dict, repr=False,
     )
 
@@ -58,7 +58,9 @@ class CRMSlot:
                 continue
             method = getattr(self.icrm, name, None)
             if method is not None:
-                self._dispatch_table[name] = (method, get_method_access(method))
+                access = get_method_access(method)
+                buffer_mode = getattr(method, '_input_buffer_mode', 'copy')
+                self._dispatch_table[name] = (method, access, buffer_mode)
 
 
 class NativeServerBridge:
@@ -154,7 +156,7 @@ class NativeServerBridge:
         for idx, mname in enumerate(methods):
             entry = slot._dispatch_table.get(mname)
             if entry is not None:
-                _, access = entry
+                _, access, _bm = entry
                 access_map[idx] = (
                     'read' if access is MethodAccess.READ else 'write'
                 )
@@ -194,7 +196,7 @@ class NativeServerBridge:
             raise KeyError(f'Name not registered: {name!r}')
         access_map = {
             mname: access
-            for mname, (_, access) in slot._dispatch_table.items()
+            for mname, (_, access, _bm) in slot._dispatch_table.items()
         }
         return slot.scheduler, access_map
 
@@ -313,18 +315,7 @@ class NativeServerBridge:
             _route_name: str, method_idx: int,
             request_buf: object, response_pool: object,
         ) -> object:
-            # 1. Read request payload via zero-copy memoryview
-            try:
-                mv = memoryview(request_buf)
-                payload = bytes(mv)
-                mv.release()
-            finally:
-                try:
-                    request_buf.release()
-                except Exception:
-                    pass  # Best-effort release — ShmBuffer.drop() is the safety net
-
-            # 2. Resolve method
+            # 1. Resolve method
             method_name = idx_to_name.get(method_idx)
             if method_name is None:
                 raise RuntimeError(
@@ -333,28 +324,60 @@ class NativeServerBridge:
             entry = dispatch_table.get(method_name)
             if entry is None:
                 raise RuntimeError(f'Method not found: {method_name}')
-            method, _access = entry
+            method, _access, buffer_mode = entry
 
-            # 3. Call CRM method
-            result = method(payload)
+            # 2. Buffer-mode-aware request handling
+            if buffer_mode == 'copy':
+                # Materialize to bytes, release SHM immediately
+                try:
+                    mv = memoryview(request_buf)
+                    payload = bytes(mv)
+                    mv.release()
+                finally:
+                    try:
+                        request_buf.release()
+                    except Exception:
+                        pass
+                result = method(payload)
+            elif buffer_mode == 'view':
+                # Pass memoryview; _release_fn frees SHM after deserialize
+                mv = memoryview(request_buf)
+                released = False
+                def release_fn():
+                    nonlocal released
+                    if not released:
+                        released = True
+                        mv.release()
+                        try:
+                            request_buf.release()
+                        except Exception:
+                            pass
+                try:
+                    result = method(mv, _release_fn=release_fn)
+                finally:
+                    if not released:
+                        release_fn()
+            else:  # hold
+                # Pass memoryview directly; RAII handles lifetime
+                mv = memoryview(request_buf)
+                result = method(mv)
 
-            # 4. Unpack result
+            # 3. Unpack result
             res_part, err_part = unpack_icrm_result(result)
             if err_part:
                 raise CrmCallError(err_part)
             if not res_part:
                 return None
 
-            # 5. For large responses, write directly to response pool SHM
+            # 4. For large responses, write to response pool SHM
             if response_pool is not None and len(res_part) > shm_threshold:
                 try:
                     alloc = response_pool.alloc(len(res_part))
                     response_pool.write(alloc, res_part)
-                    # Cast seg_idx to u16 as expected by Rust FFI
-                    seg_idx = int(alloc.seg_idx) & 0xFFFF  # Ensure u16 range
+                    seg_idx = int(alloc.seg_idx) & 0xFFFF
                     return (seg_idx, alloc.offset, len(res_part), alloc.is_dedicated)
                 except Exception:
-                    pass  # SHM alloc failed — fall through to inline
+                    pass
 
             return res_part
 
