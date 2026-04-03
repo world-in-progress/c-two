@@ -86,6 +86,8 @@ class Transferable(metaclass=TransferableMeta):
 
     """
 
+    _buffer_mode: str = 'copy'  # 'copy' | 'view' | 'hold'
+
     def serialize(*args: any) -> bytes:
         """
         serialize is a static method, and the decorator @staticmethod is added in the metaclass.  
@@ -187,6 +189,7 @@ def create_default_transferable(func, is_input: bool):
         DynamicInputTransferable._type_hints = type_hints
         DynamicInputTransferable.__qualname__ = class_name
         DynamicInputTransferable._param_names = filtered_params
+        DynamicInputTransferable._buffer_mode = 'view'
         
         return DynamicInputTransferable
     
@@ -221,6 +224,7 @@ def create_default_transferable(func, is_input: bool):
         DynamicOutputTransferable._original_func = func
         DynamicOutputTransferable.__qualname__ = class_name
         DynamicOutputTransferable._return_type = return_type
+        DynamicOutputTransferable._buffer_mode = 'view'
         
         return DynamicOutputTransferable
 
@@ -238,15 +242,30 @@ def get_transferable(full_name: str) -> Transferable | None:
 
 # Transferable-related decorators #################################################
 
-def transferable(cls: Type[T]) -> Type[T]:
+_VALID_BUFFER_MODES = frozenset(('copy', 'view', 'hold'))
+
+def transferable(cls=None, *, buffer: str = 'copy'):
+    """Decorator to make a class inherit from Transferable.
+
+    Supports both ``@cc.transferable`` and ``@cc.transferable(buffer='view')``.
     """
-    A decorator to make a class automatically inherit from Transferable.
-    """
-    # Dynamically create a new class that inherits from both the original class and Transferable
-    new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
-    new_cls.__module__ = cls.__module__  # preserve the original module
-    new_cls.__qualname__ = cls.__qualname__  # preserve the original qualified name
-    return new_cls
+    if buffer not in _VALID_BUFFER_MODES:
+        raise ValueError(
+            f"buffer must be one of {sorted(_VALID_BUFFER_MODES)}, got {buffer!r}"
+        )
+
+    def wrap(cls):
+        new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
+        new_cls.__module__ = cls.__module__
+        new_cls.__qualname__ = cls.__qualname__
+        new_cls._buffer_mode = buffer
+        return new_cls
+
+    if cls is not None:
+        # Called as @cc.transferable (no parentheses)
+        return wrap(cls)
+    # Called as @cc.transferable(buffer='view')
+    return wrap
 
 def transfer(input: Transferable | None = None, output: Transferable | None = None) -> callable:
 

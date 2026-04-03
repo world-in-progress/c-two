@@ -471,3 +471,82 @@ class TestWireScatterWrite:
         assert payload_total_size([b'a', b'bc', b'def']) == 6
 
 
+# ---------------------------------------------------------------------------
+# OPT-T5: buffer='copy|view|hold' parameter on @cc.transferable
+# ---------------------------------------------------------------------------
+
+class TestBufferMode:
+    """Tests for the buffer='copy|view|hold' parameter on @cc.transferable."""
+
+    def test_default_buffer_mode_is_copy(self):
+        """@cc.transferable without buffer= defaults to 'copy'."""
+        @cc.transferable
+        class CopyData:
+            x: int
+            def serialize(d: 'CopyData') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> 'CopyData':
+                return CopyData(x=pickle.loads(b))
+
+        assert CopyData._buffer_mode == 'copy'
+
+    def test_explicit_copy_mode(self):
+        """@cc.transferable(buffer='copy') sets _buffer_mode='copy'."""
+        @cc.transferable(buffer='copy')
+        class ExplicitCopy:
+            v: int
+            def serialize(d: 'ExplicitCopy') -> bytes:
+                return pickle.dumps(d.v)
+            def deserialize(b: bytes) -> 'ExplicitCopy':
+                return ExplicitCopy(v=pickle.loads(b))
+
+        assert ExplicitCopy._buffer_mode == 'copy'
+
+    def test_view_mode(self):
+        """@cc.transferable(buffer='view') sets _buffer_mode='view'."""
+        @cc.transferable(buffer='view')
+        class ViewData:
+            v: int
+            def serialize(d: 'ViewData') -> bytes:
+                return pickle.dumps(d.v)
+            def deserialize(data: memoryview) -> 'ViewData':
+                return ViewData(v=pickle.loads(data))
+
+        assert ViewData._buffer_mode == 'view'
+
+    def test_hold_mode(self):
+        """@cc.transferable(buffer='hold') sets _buffer_mode='hold'."""
+        @cc.transferable(buffer='hold')
+        class HoldData:
+            v: int
+            def serialize(d: 'HoldData') -> bytes:
+                return pickle.dumps(d.v)
+            def deserialize(data: memoryview) -> 'HoldData':
+                return HoldData(v=pickle.loads(data))
+
+        assert HoldData._buffer_mode == 'hold'
+
+    def test_invalid_buffer_mode_raises(self):
+        """Invalid buffer= value raises ValueError."""
+        with pytest.raises(ValueError, match='buffer'):
+            @cc.transferable(buffer='invalid')
+            class Bad:
+                x: int
+                def serialize(d: 'Bad') -> bytes:
+                    return b''
+                def deserialize(b: bytes) -> 'Bad':
+                    return Bad(x=0)
+
+    def test_existing_hello_data_has_copy_mode(self):
+        """Pre-existing @cc.transferable classes default to 'copy'."""
+        assert HelloData._buffer_mode == 'copy'
+
+    def test_default_transferable_has_view_mode(self):
+        """Default pickle transferable (auto-generated) uses 'view' mode."""
+        def fn(self, x: int) -> int: ...
+        t_in = create_default_transferable(fn, is_input=True)
+        t_out = create_default_transferable(fn, is_input=False)
+        assert t_in._buffer_mode == 'view'
+        assert t_out._buffer_mode == 'view'
+
+
