@@ -113,6 +113,8 @@ class _ProcessRegistry:
         self._server_address: str | None = None
         self._explicit_address: str | None = None
         self._explicit_ipc_config: IPCConfig | None = None
+        self._shm_threshold: int | None = None
+        self._client_ipc_overrides: dict[str, int] = {}
         from c_two._native import RustClientPool, RustHttpClientPool
         self._pool = RustClientPool.instance()
         self._http_pool = RustHttpClientPool.instance()
@@ -142,45 +144,103 @@ class _ProcessRegistry:
                 )
             self._explicit_address = address
 
-    def set_ipc_config(
+    def set_shm_threshold(self, threshold: int) -> None:
+        """Set the SHM threshold globally (server + client).
+
+        Payloads smaller than *threshold* bytes are sent inline;
+        larger payloads use shared memory.  Default: 4096 bytes.
+
+        Must be called **before** any :func:`register` or :func:`connect`.
+
+        Parameters
+        ----------
+        threshold:
+            Size in bytes.  Must be > 0.
+        """
+        if threshold <= 0:
+            raise ValueError(f'shm_threshold must be > 0, got {threshold}')
+        with self._lock:
+            if self._server is not None:
+                raise RuntimeError(
+                    'Cannot set shm_threshold after CRMs have been registered. '
+                    'Call set_shm_threshold() before register().',
+                )
+            self._shm_threshold = threshold
+
+    def set_server_ipc_config(
         self,
         *,
         segment_size: int | None = None,
         max_segments: int | None = None,
+        reassembly_segment_size: int | None = None,
+        reassembly_max_segments: int | None = None,
     ) -> None:
-        """Set IPC transport parameters programmatically.
-
-        Priority: ``set_ipc_config()`` > ``C2_IPC_SEGMENT_SIZE`` /
-        ``C2_IPC_MAX_SEGMENTS`` env vars > defaults.
+        """Configure the IPC server's memory pools.
 
         Must be called **before** any :func:`register` call.
 
         Parameters
         ----------
         segment_size:
-            Buddy pool segment size in bytes.  Determines the maximum
-            single-call payload size.  Default: 256 MB.
+            Server buddy pool segment size in bytes (default 256 MB).
         max_segments:
-            Maximum number of buddy pool segments (1–255).  Default: 4.
+            Max buddy pool segments, 1–255 (default 4).
+        reassembly_segment_size:
+            Server reassembly pool segment size in bytes (default 64 MB).
+        reassembly_max_segments:
+            Max reassembly pool segments, 1–255 (default 4).
         """
         with self._lock:
             if self._server is not None:
                 raise RuntimeError(
-                    'Cannot set IPC config after CRMs have been registered. '
-                    'Call set_ipc_config() before register().',
+                    'Cannot set server IPC config after CRMs have been registered. '
+                    'Call set_server_ipc_config() before register().',
                 )
             overrides: dict[str, int] = {}
             if segment_size is not None:
                 overrides['pool_segment_size'] = segment_size
             if max_segments is not None:
                 overrides['max_pool_segments'] = max_segments
+            if reassembly_segment_size is not None:
+                overrides['reassembly_segment_size'] = reassembly_segment_size
+            if reassembly_max_segments is not None:
+                overrides['reassembly_max_segments'] = reassembly_max_segments
             if overrides:
                 self._explicit_ipc_config = self._make_ipc_config(**overrides)
-            # Also configure the client-side pool segment size.
-            if segment_size is not None:
-                self._pool.set_default_config(
-                    pool_segment_size=segment_size,
-                )
+
+    def set_client_ipc_config(
+        self,
+        *,
+        segment_size: int | None = None,
+        max_segments: int | None = None,
+        reassembly_segment_size: int | None = None,
+        reassembly_max_segments: int | None = None,
+    ) -> None:
+        """Configure the IPC client's memory pools.
+
+        Must be called **before** any :func:`connect` call.
+
+        Parameters
+        ----------
+        segment_size:
+            Client buddy pool segment size in bytes (default 256 MB).
+        max_segments:
+            Max buddy pool segments, 1–255 (default 4).
+        reassembly_segment_size:
+            Client reassembly pool segment size in bytes (default 256 MB).
+        reassembly_max_segments:
+            Max reassembly pool segments, 1–255 (default 4).
+        """
+        kwargs: dict[str, int] = {}
+        if segment_size is not None:
+            kwargs['pool_segment_size'] = segment_size
+        if reassembly_segment_size is not None:
+            kwargs['reassembly_segment_size'] = reassembly_segment_size
+        if reassembly_max_segments is not None:
+            kwargs['reassembly_max_segments'] = reassembly_max_segments
+        self._client_ipc_overrides = kwargs
+        # Apply to the pooled client factory.
+        self._pool.set_default_config(**kwargs)
 
     def register(
         self,
@@ -381,6 +441,8 @@ class _ProcessRegistry:
             self._server_address = None
             self._explicit_address = None
             self._explicit_ipc_config = None
+            self._shm_threshold = None
+            self._client_ipc_overrides = {}
             self._registrations.clear()
 
         # Best-effort relay unregistration (ignore failures during shutdown).
@@ -579,20 +641,24 @@ class _ProcessRegistry:
     def _build_ipc_config(self) -> IPCConfig:
         """Build an :class:`IPCConfig` from the three-level priority chain.
 
-        Priority: ``set_ipc_config()`` > env vars > defaults.
+        Priority: ``set_server_ipc_config()`` > env vars > defaults.
+        The ``shm_threshold`` from ``set_shm_threshold()`` is always
+        injected if set.
         """
         if self._explicit_ipc_config is not None:
-            return self._explicit_ipc_config
+            cfg = self._explicit_ipc_config
+        else:
+            overrides: dict[str, int] = {}
+            if settings.ipc_segment_size is not None:
+                overrides['pool_segment_size'] = settings.ipc_segment_size
+            if settings.ipc_max_segments is not None:
+                overrides['max_pool_segments'] = settings.ipc_max_segments
+            cfg = self._make_ipc_config(**overrides) if overrides else IPCConfig()
 
-        overrides: dict[str, int] = {}
-        if settings.ipc_segment_size is not None:
-            overrides['pool_segment_size'] = settings.ipc_segment_size
-        if settings.ipc_max_segments is not None:
-            overrides['max_pool_segments'] = settings.ipc_max_segments
-
-        if overrides:
-            return self._make_ipc_config(**overrides)
-        return IPCConfig()
+        if self._shm_threshold is not None:
+            from dataclasses import replace
+            cfg = replace(cfg, shm_threshold=self._shm_threshold)
+        return cfg
 
     @staticmethod
     def _make_ipc_config(**overrides: int) -> IPCConfig:
@@ -650,21 +716,52 @@ def set_address(address: str) -> None:
     _ProcessRegistry.get().set_address(address)
 
 
-def set_ipc_config(
+def set_shm_threshold(threshold: int) -> None:
+    """Set the SHM threshold globally (applies to both server and client).
+
+    Payloads smaller than *threshold* are sent inline; larger use SHM.
+    Default: 4096 bytes.
+
+    See :meth:`_ProcessRegistry.set_shm_threshold`.
+    """
+    _ProcessRegistry.get().set_shm_threshold(threshold)
+
+
+def set_server_ipc_config(
     *,
     segment_size: int | None = None,
     max_segments: int | None = None,
+    reassembly_segment_size: int | None = None,
+    reassembly_max_segments: int | None = None,
 ) -> None:
-    """Set IPC transport parameters before registering any CRM.
+    """Configure IPC server memory pools before registering CRMs.
 
-    Priority: ``set_ipc_config()`` > ``C2_IPC_SEGMENT_SIZE`` /
-    ``C2_IPC_MAX_SEGMENTS`` env vars > defaults (256 MB / 4 segments).
-
-    See :meth:`_ProcessRegistry.set_ipc_config`.
+    See :meth:`_ProcessRegistry.set_server_ipc_config`.
     """
-    _ProcessRegistry.get().set_ipc_config(
+    _ProcessRegistry.get().set_server_ipc_config(
         segment_size=segment_size,
         max_segments=max_segments,
+        reassembly_segment_size=reassembly_segment_size,
+        reassembly_max_segments=reassembly_max_segments,
+    )
+
+
+def set_client_ipc_config(
+    *,
+    segment_size: int | None = None,
+    max_segments: int | None = None,
+    reassembly_segment_size: int | None = None,
+    reassembly_max_segments: int | None = None,
+) -> None:
+    """Configure IPC client memory pools before connecting.
+
+    See :meth:`_ProcessRegistry.set_client_ipc_config`.
+    """
+    _ProcessRegistry.get().set_client_ipc_config(
+        segment_size=segment_size,
+        max_segments=max_segments,
+        reassembly_segment_size=reassembly_segment_size,
+        reassembly_max_segments=reassembly_max_segments,
     )
 
 

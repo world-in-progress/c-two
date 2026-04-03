@@ -8,7 +8,9 @@ from .crm.meta import icrm, read, write, on_shutdown
 from .crm.transferable import transferable
 from .transport.registry import (
     set_address,
-    set_ipc_config,
+    set_shm_threshold,
+    set_server_ipc_config,
+    set_client_ipc_config,
     register,
     connect,
     close,

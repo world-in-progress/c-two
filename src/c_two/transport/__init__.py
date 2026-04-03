@@ -11,7 +11,8 @@ __all__ = [
     'ICRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
-    'set_address', 'set_ipc_config', 'register', 'connect', 'close',
+    'set_address', 'set_shm_threshold', 'set_server_ipc_config',
+    'set_client_ipc_config', 'register', 'connect', 'close',
     'unregister', 'server_address', 'shutdown', 'serve',
 ]
 
@@ -23,7 +24,9 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'ConcurrencyConfig': ('.server.scheduler',    'ConcurrencyConfig'),
     'ConcurrencyMode':   ('.server.scheduler',    'ConcurrencyMode'),
     'set_address':       ('.registry',            'set_address'),
-    'set_ipc_config':    ('.registry',            'set_ipc_config'),
+    'set_shm_threshold': ('.registry',            'set_shm_threshold'),
+    'set_server_ipc_config': ('.registry',        'set_server_ipc_config'),
+    'set_client_ipc_config': ('.registry',        'set_client_ipc_config'),
     'register':          ('.registry',            'register'),
     'connect':           ('.registry',            'connect'),
     'close':             ('.registry',            'close'),

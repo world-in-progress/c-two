@@ -197,7 +197,7 @@ class TestSOTAAPIConcurrency:
         """Multiple threads rapidly connect/use/close the same CRM."""
         addr = _next_addr()
         cc.set_address(addr)
-        cc.set_ipc_config(segment_size=1 << 20, max_segments=2)
+        cc.set_server_ipc_config(segment_size=1 << 20, max_segments=2)
         cc.register(IEcho, EchoImpl(), name='echo_conc')
 
         try:
