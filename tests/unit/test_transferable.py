@@ -656,3 +656,70 @@ class TestCrmToComBufferModes:
         assert wrapped._input_buffer_mode == 'view'
 
 
+class TestComToCrmBufferModes:
+    """Test that com_to_crm handles response based on output buffer mode."""
+
+    def _make_mock_response(self, data: bytes):
+        """Create a mock PyShmBuffer-like response."""
+        class MockResponse:
+            def __init__(self, data):
+                self._data = data
+                self.released = False
+            def release(self):
+                self.released = True
+            def __buffer__(self, flags):
+                return memoryview(self._data)
+        return MockResponse(data)
+
+    def _make_icrm(self, response_data):
+        mock_resp = self._make_mock_response(response_data)
+        class MockClient:
+            supports_direct_call = False
+            def __init__(self, resp):
+                self.response = resp
+            def call(self, method, data):
+                return self.response
+        class MockICRM:
+            direction = '->'
+            def __init__(self, client):
+                self.client = client
+        client = MockClient(mock_resp)
+        return MockICRM(client), mock_resp
+
+    def test_copy_mode_releases_response(self):
+        """copy mode: response is materialized and released."""
+        @cc.transferable(buffer='copy')
+        class CopyOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data: bytes) -> int:
+                assert isinstance(data, bytes)
+                return pickle.loads(data)
+
+        from c_two.crm.transferable import transfer
+        icrm, mock_resp = self._make_icrm(pickle.dumps(42))
+        decorator = transfer(input=None, output=CopyOut)
+        def fn(self) -> int: ...
+        wrapped = decorator(fn)
+        result = wrapped(icrm)
+        assert result == 42
+        assert mock_resp.released
+
+    def test_hold_mode_skips_release(self):
+        """hold mode: response is NOT released (RAII)."""
+        @cc.transferable(buffer='hold')
+        class HoldOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data) -> int:
+                return pickle.loads(bytes(data)) if isinstance(data, memoryview) else pickle.loads(data)
+
+        from c_two.crm.transferable import transfer
+        icrm, mock_resp = self._make_icrm(pickle.dumps(42))
+        decorator = transfer(input=None, output=HoldOut)
+        def fn(self) -> int: ...
+        wrapped = decorator(fn)
+        result = wrapped(icrm)
+        assert result == 42
+        assert not mock_resp.released
+

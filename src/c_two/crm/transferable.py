@@ -276,6 +276,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             # Get transferable
             input_transferable = input.serialize if input else None
             output_transferable = output.deserialize if output else None
+            output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
 
             try:
                 if len(args) < 1:
@@ -306,13 +307,23 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                     return None
                 if hasattr(response, 'release'):
                     mv = memoryview(response)
-                    try:
+                    if output_buffer_mode == 'copy':
+                        try:
+                            data = bytes(mv)
+                        finally:
+                            mv.release()
+                            response.release()
+                        result = output_transferable(data)
+                    elif output_buffer_mode == 'view':
+                        try:
+                            result = output_transferable(mv)
+                            if isinstance(result, memoryview):
+                                result = bytes(result)
+                        finally:
+                            mv.release()
+                            response.release()
+                    else:  # hold — RAII, no explicit release
                         result = output_transferable(mv)
-                        if isinstance(result, memoryview):
-                            result = bytes(result)
-                    finally:
-                        mv.release()
-                        response.release()
                 else:
                     result = output_transferable(response)
                 return result
