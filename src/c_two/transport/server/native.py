@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -217,9 +219,6 @@ class NativeServerBridge:
     def start(self, timeout: float = 5.0) -> None:
         self._rust_server.start()
         # Wait for the UDS socket to be created by the Rust server.
-        import os
-        import time
-
         socket_path = self._rust_server.socket_path
         deadline = time.monotonic() + timeout
         while not os.path.exists(socket_path):
@@ -243,9 +242,8 @@ class NativeServerBridge:
                 logger.warning('Error shutting down RustServer', exc_info=True)
             self._started = False
 
-        with self._slots_lock:
-            for slot in self._slots.values():
-                slot.scheduler.shutdown()
+        for slot in slots_snapshot:
+            slot.scheduler.shutdown()
 
     # ------------------------------------------------------------------
     # ICRM helpers
