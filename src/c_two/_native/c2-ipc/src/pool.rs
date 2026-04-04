@@ -12,7 +12,11 @@ use std::time::{Duration, Instant};
 use c2_mem::{MemPool, PoolConfig};
 
 /// Monotonic counter so each client MemPool gets a unique SHM prefix
-/// within the same process.  Format: `/cc3c{pid:08x}{gen:04x}`.
+/// within the same process.  Format: `/cc3c{pid:08x}{counter:08x}`.
+///
+/// Uses 32-bit range (~4 billion unique prefixes per process).
+/// Combined with `_b{idx:04x}` suffix, max SHM name length is 27 chars
+/// (within POSIX 31-char limit on macOS).
 static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 use crate::client::{IpcConfig, IpcError};
@@ -102,9 +106,8 @@ impl ClientPool {
         // Create a fresh MemPool for the client, respecting pool_segment_size.
         let mut pc = PoolConfig::default();
         pc.segment_size = cfg.pool_segment_size as usize;
-        let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed);
-        let ctr16 = (counter & 0xFFFF) as u16;
-        let prefix = format!("/cc3c{:08x}{:04x}", std::process::id(), ctr16);
+        let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
+        let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
         let pool = Arc::new(StdMutex::new(MemPool::new_with_prefix(pc, prefix)));
 
         // Drop the entries lock before connecting (connect may block).

@@ -176,6 +176,9 @@ impl Connection {
     /// Always creates a `MemPool` with the peer's prefix so that later
     /// `read_peer_data` / `free_peer_block` can lazy-open segments by
     /// deriving their names from `{prefix}_b{idx:04x}`.
+    /// Minimum buddy segment size required by the allocator (2 × min_block_size).
+    const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
+
     pub fn init_peer_shm(&self, prefix: String, segments: Vec<(String, u32)>) {
         let mut state = self.peer_shm.lock().unwrap();
         state.prefix = prefix;
@@ -185,6 +188,17 @@ impl Connection {
         // Derive buddy segment size from first segment, or keep default.
         if let Some(&(_, size)) = segments.first() {
             state.buddy_segment_size = size as usize;
+        }
+
+        // Defend against undersized segments from peer handshake.
+        if state.buddy_segment_size < Self::MIN_BUDDY_SEGMENT_SIZE {
+            warn!(
+                conn_id = self.conn_id,
+                segment_size = state.buddy_segment_size,
+                min_required = Self::MIN_BUDDY_SEGMENT_SIZE,
+                "peer buddy segment too small, clamping to minimum",
+            );
+            state.buddy_segment_size = Self::MIN_BUDDY_SEGMENT_SIZE;
         }
 
         let cfg = PoolConfig {
@@ -437,6 +451,19 @@ mod tests {
         conn.init_peer_shm("prefix".into(), vec![]);
         assert_eq!(conn.peer_prefix(), "prefix");
         assert!(conn.remote_segment_names().is_empty());
+    }
+
+    #[test]
+    fn init_peer_shm_clamps_undersized_segment() {
+        // Peer sends segment_size < 2*min_block_size. Should not panic;
+        // init_peer_shm clamps to MIN_BUDDY_SEGMENT_SIZE instead.
+        let conn = Connection::new(3);
+        conn.init_peer_shm(
+            "/cc3b_tiny".into(),
+            vec![("seg0".into(), 4096)],
+        );
+        assert_eq!(conn.peer_prefix(), "/cc3b_tiny");
+        assert_eq!(conn.remote_segment_names(), vec!["seg0"]);
     }
 
     #[test]

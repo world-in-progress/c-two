@@ -58,8 +58,18 @@ impl MemPool {
         Self::new_with_prefix(config, name_prefix)
     }
 
+    /// Maximum SHM prefix length.  Buddy/dedicated segment names append
+    /// `_b{idx:04x}` or `_d{idx:04x}` (6 chars + NUL), and macOS limits
+    /// POSIX SHM names to 31 characters.  31 − 7 = 24.
+    const MAX_SHM_PREFIX_LEN: usize = 24;
+
     /// Create a new pool with a custom name prefix (for testing / multi-pool).
     pub fn new_with_prefix(config: PoolConfig, name_prefix: String) -> Self {
+        assert!(
+            name_prefix.len() <= Self::MAX_SHM_PREFIX_LEN,
+            "SHM prefix '{}' is {} chars, exceeds max {} (macOS 31-char limit)",
+            name_prefix, name_prefix.len(), Self::MAX_SHM_PREFIX_LEN,
+        );
         Self::validate_config(&config).expect("invalid PoolConfig");
         Self {
             config,

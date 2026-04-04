@@ -17,6 +17,11 @@ use tracing::{debug, info, warn};
 /// Monotonic counter ensuring each `Server` instance gets a unique SHM prefix,
 /// even when multiple servers are created within the same PID (e.g. benchmarks
 /// or tests that reset the registry).
+///
+/// Uses 32-bit range (~4 billion unique prefixes).  Response pool prefix
+/// format: `/cc3r{pid:08x}{gen:08x}` (21 chars); reassembly pool prefix
+/// format: `/cc3s{pid:08x}{gen:08x}` (21 chars).  With `_b{idx:04x}`
+/// suffix the max SHM name is 27 chars (within macOS 31-char limit).
 static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 use c2_mem::config::PoolConfig;
@@ -109,7 +114,12 @@ impl Server {
             spill_threshold: 0.8,
             spill_dir: PathBuf::from("/tmp/c_two_reassembly"),
         };
-        let reassembly_pool = MemPool::new(reassembly_cfg);
+        let reassembly_pool = {
+            let pid = std::process::id();
+            let ra_gen = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
+            let prefix = format!("/cc3s{:08x}{:08x}", pid, ra_gen);
+            MemPool::new_with_prefix(reassembly_cfg, prefix)
+        };
         let response_cfg = PoolConfig {
             segment_size: config.pool_segment_size as usize,
             min_block_size: 4096,
@@ -122,7 +132,7 @@ impl Server {
         let mut response_pool = {
             let pid = std::process::id();
             let generation = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed);
-            let prefix = format!("/cc3r{:08x}{:02x}", pid, (generation & 0xFF) as u8);
+            let prefix = format!("/cc3r{:08x}{:08x}", pid, generation as u32);
             MemPool::new_with_prefix(response_cfg, prefix)
         };
         response_pool.ensure_ready()

@@ -233,15 +233,15 @@ const _: () = {
 };
 
 /// Monotonic counter so each reassembly MemPool gets a unique SHM prefix.
+/// Format: `/cc3a{pid:08x}{counter:08x}` — 32-bit range, 27 chars max.
 static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 impl IpcClient {
     fn make_reassembly_pool(config: &IpcConfig) -> Arc<StdMutex<MemPool>> {
         let seg_size = config.reassembly_segment_size as usize;
         let max_segs = config.reassembly_max_segments as usize;
-        let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed);
-        let ctr16 = (counter & 0xFFFF) as u16;
-        let prefix = format!("/cc3a{:08x}{:04x}", std::process::id(), ctr16);
+        let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
+        let prefix = format!("/cc3a{:08x}{:08x}", std::process::id(), counter);
         Arc::new(StdMutex::new(MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: seg_size,
