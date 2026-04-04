@@ -485,7 +485,7 @@ async fn dispatch_call(
     match result {
         Ok(meta) => send_response_meta(
             &server.response_pool, writer, request_id, meta,
-            server.config.shm_threshold, server.config.reply_chunk_size,
+            server.config.shm_threshold, server.config.chunk_size,
         ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -612,7 +612,7 @@ async fn dispatch_buddy_call(
     match result {
         Ok(meta) => send_response_meta(
             &server.response_pool, writer, request_id, meta,
-            server.config.shm_threshold, server.config.reply_chunk_size,
+            server.config.shm_threshold, server.config.chunk_size,
         ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -801,7 +801,7 @@ async fn dispatch_chunked_call(
         match result {
             Ok(meta) => send_response_meta(
                 &server.response_pool, writer, request_id, meta,
-                server.config.shm_threshold, server.config.reply_chunk_size,
+                server.config.shm_threshold, server.config.chunk_size,
             ).await,
             Err(CrmError::UserError(b)) => {
                 write_reply(writer, request_id, &ReplyControl::Error(b)).await;

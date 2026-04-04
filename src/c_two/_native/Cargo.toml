@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "c2-config",
     "c2-mem",
     "c2-wire",
     "c2-ipc",

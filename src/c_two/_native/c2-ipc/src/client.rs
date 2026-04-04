@@ -29,35 +29,7 @@ use c2_mem::{MemPool, PoolAllocation};
 
 use crate::response::ResponseData;
 
-// ── Config ───────────────────────────────────────────────────────────────
-
-/// Transport thresholds for IPC path selection.
-#[derive(Debug, Clone)]
-pub struct IpcConfig {
-    /// Data sizes above this use buddy SHM path (default 4096 bytes).
-    pub shm_threshold: usize,
-    /// Chunk size for chunked transfer (default 128 KB).
-    pub chunk_size: usize,
-    /// Client-side buddy pool segment size (default: PoolConfig::default().segment_size = 256 MB).
-    /// When set, overrides the default segment_size for the client MemPool.
-    pub pool_segment_size: Option<usize>,
-    /// Reassembly pool segment size override (default 256 MB).
-    pub reassembly_segment_size: Option<usize>,
-    /// Reassembly pool max segments override (default 4).
-    pub reassembly_max_segments: Option<usize>,
-}
-
-impl Default for IpcConfig {
-    fn default() -> Self {
-        Self {
-            shm_threshold: 4096,
-            chunk_size: 131072,
-            pool_segment_size: None,
-            reassembly_segment_size: None,
-            reassembly_max_segments: None,
-        }
-    }
-}
+pub use c2_config::IpcConfig;
 
 // ── Server pool state ────────────────────────────────────────────────────
 
@@ -262,8 +234,8 @@ const _: () = {
 
 impl IpcClient {
     fn make_reassembly_pool(config: &IpcConfig) -> Arc<StdMutex<MemPool>> {
-        let seg_size = config.reassembly_segment_size.unwrap_or(256 * 1024 * 1024);
-        let max_segs = config.reassembly_max_segments.unwrap_or(4);
+        let seg_size = config.reassembly_segment_size as usize;
+        let max_segs = config.reassembly_max_segments as usize;
         Arc::new(StdMutex::new(MemPool::new(PoolConfig {
             segment_size: seg_size,
             max_segments: max_segs,
@@ -507,7 +479,7 @@ impl IpcClient {
             .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
 
         // Try buddy SHM for large payloads when pool is available.
-        if self.pool.is_some() && data.len() > self.config.shm_threshold {
+        if self.pool.is_some() && data.len() > self.config.shm_threshold as usize {
             match self.call_buddy(route_name, method_idx, data).await {
                 Ok(result) => return Ok(result),
                 Err(IpcError::Handshake(_)) => {

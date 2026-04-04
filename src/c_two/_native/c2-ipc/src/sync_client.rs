@@ -82,7 +82,7 @@ impl SyncClient {
 
     /// Whether the client has a SHM pool and data exceeds the threshold.
     pub fn should_use_shm(&self, data_len: usize) -> bool {
-        self.inner.pool.is_some() && data_len > self.inner.config.shm_threshold
+        self.inner.pool.is_some() && data_len > self.inner.config.shm_threshold as usize
     }
 
     /// Allocate from the client SHM pool and write data in a single lock scope.

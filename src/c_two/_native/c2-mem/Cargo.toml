@@ -8,5 +8,6 @@ description = "C-Two shared memory subsystem: buddy allocator, SHM regions, and 
 name = "c2_mem"
 
 [dependencies]
+c2-config = { path = "../c2-config" }
 libc = "0.2"
 memmap2 = "0.9"

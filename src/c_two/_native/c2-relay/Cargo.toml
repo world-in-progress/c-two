@@ -5,6 +5,7 @@ version.workspace = true
 description = "HTTP relay server for C-Two (axum → IPC)"
 
 [dependencies]
+c2-config = { path = "../c2-config" }
 c2-wire = { path = "../c2-wire" }
 c2-ipc = { path = "../c2-ipc" }
 axum = "0.8"

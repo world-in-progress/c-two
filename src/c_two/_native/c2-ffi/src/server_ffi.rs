@@ -16,7 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 
 use c2_mem::MemPool;
-use c2_server::config::IpcConfig;
+use c2_config::IpcConfig;
 use c2_server::dispatcher::{CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta};
 use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler};
 use c2_server::Server;

@@ -15,7 +15,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use c2_ipc::{ClientPool, IpcConfig, IpcError, ResponseData, ServerPoolState, SyncClient};
+use c2_config::IpcConfig;
+use c2_ipc::{ClientPool, IpcError, ResponseData, ServerPoolState, SyncClient};
 use c2_mem::MemPool;
 
 // ---------------------------------------------------------------------------
@@ -280,25 +281,28 @@ impl PyRustClient {
     fn new(
         py: Python<'_>,
         address: &str,
-        shm_threshold: usize,
+        shm_threshold: u64,
         chunk_size: usize,
-        pool_segment_size: Option<usize>,
-        reassembly_segment_size: Option<usize>,
-        reassembly_max_segments: Option<usize>,
+        pool_segment_size: Option<u64>,
+        reassembly_segment_size: Option<u64>,
+        reassembly_max_segments: Option<u32>,
     ) -> PyResult<Self> {
         let config = IpcConfig {
             shm_threshold,
             chunk_size,
-            pool_segment_size,
-            reassembly_segment_size,
-            reassembly_max_segments,
+            pool_segment_size: pool_segment_size
+                .unwrap_or(IpcConfig::default().pool_segment_size),
+            reassembly_segment_size: reassembly_segment_size
+                .unwrap_or(IpcConfig::default().reassembly_segment_size),
+            reassembly_max_segments: reassembly_max_segments
+                .unwrap_or(IpcConfig::default().reassembly_max_segments),
+            ..IpcConfig::default()
         };
+        let seg_size = config.pool_segment_size as usize;
         let addr = address.to_string();
         let client = py.allow_threads(move || {
             let mut pc = c2_mem::PoolConfig::default();
-            if let Some(seg_size) = pool_segment_size {
-                pc.segment_size = seg_size;
-            }
+            pc.segment_size = seg_size;
             let pool = Arc::new(std::sync::Mutex::new(
                 c2_mem::MemPool::new(pc),
             ));
@@ -450,22 +454,27 @@ impl PyRustClientPool {
         &self,
         py: Python<'_>,
         address: &str,
-        shm_threshold: Option<usize>,
+        shm_threshold: Option<u64>,
         chunk_size: Option<usize>,
-        pool_segment_size: Option<usize>,
-        reassembly_segment_size: Option<usize>,
-        reassembly_max_segments: Option<usize>,
+        pool_segment_size: Option<u64>,
+        reassembly_segment_size: Option<u64>,
+        reassembly_max_segments: Option<u32>,
     ) -> PyResult<PyRustClient> {
+        let defaults = IpcConfig::default();
         let config = if shm_threshold.is_some() || chunk_size.is_some()
             || pool_segment_size.is_some() || reassembly_segment_size.is_some()
             || reassembly_max_segments.is_some()
         {
             Some(IpcConfig {
-                shm_threshold: shm_threshold.unwrap_or(4096),
-                chunk_size: chunk_size.unwrap_or(131072),
-                pool_segment_size,
-                reassembly_segment_size,
-                reassembly_max_segments,
+                shm_threshold: shm_threshold.unwrap_or(defaults.shm_threshold),
+                chunk_size: chunk_size.unwrap_or(defaults.chunk_size),
+                pool_segment_size: pool_segment_size
+                    .unwrap_or(defaults.pool_segment_size),
+                reassembly_segment_size: reassembly_segment_size
+                    .unwrap_or(defaults.reassembly_segment_size),
+                reassembly_max_segments: reassembly_max_segments
+                    .unwrap_or(defaults.reassembly_max_segments),
+                ..defaults
             })
         } else {
             None
@@ -489,18 +498,23 @@ impl PyRustClientPool {
     #[pyo3(signature = (shm_threshold=4096, chunk_size=131072, pool_segment_size=None, reassembly_segment_size=None, reassembly_max_segments=None))]
     fn set_default_config(
         &self,
-        shm_threshold: usize,
+        shm_threshold: u64,
         chunk_size: usize,
-        pool_segment_size: Option<usize>,
-        reassembly_segment_size: Option<usize>,
-        reassembly_max_segments: Option<usize>,
+        pool_segment_size: Option<u64>,
+        reassembly_segment_size: Option<u64>,
+        reassembly_max_segments: Option<u32>,
     ) {
+        let defaults = IpcConfig::default();
         self.inner.set_default_config(IpcConfig {
             shm_threshold,
             chunk_size,
-            pool_segment_size,
-            reassembly_segment_size,
-            reassembly_max_segments,
+            pool_segment_size: pool_segment_size
+                .unwrap_or(defaults.pool_segment_size),
+            reassembly_segment_size: reassembly_segment_size
+                .unwrap_or(defaults.reassembly_segment_size),
+            reassembly_max_segments: reassembly_max_segments
+                .unwrap_or(defaults.reassembly_max_segments),
+            ..defaults
         });
     }
 

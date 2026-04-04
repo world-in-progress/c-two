@@ -5,6 +5,7 @@ version.workspace = true
 description = "Tokio-based UDS server for C-Two IPC transport"
 
 [dependencies]
+c2-config = { path = "../c2-config" }
 c2-wire = { path = "../c2-wire" }
 c2-mem = { path = "../c2-mem" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "io-util", "time"] }

@@ -96,9 +96,7 @@ impl ClientPool {
 
         // Create a fresh MemPool for the client, respecting pool_segment_size.
         let mut pc = PoolConfig::default();
-        if let Some(seg_size) = cfg.pool_segment_size {
-            pc.segment_size = seg_size;
-        }
+        pc.segment_size = cfg.pool_segment_size as usize;
         let pool = Arc::new(StdMutex::new(MemPool::new(pc)));
 
         // Drop the entries lock before connecting (connect may block).

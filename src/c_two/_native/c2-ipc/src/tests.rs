@@ -271,11 +271,11 @@ mod client_tests {
 
         // Below shm_threshold → inline
         let small = vec![0u8; 50];
-        assert!(small.len() <= cfg.shm_threshold);
+        assert!(small.len() <= cfg.shm_threshold as usize);
 
         // Between shm_threshold and chunk_size → buddy (if pool) or inline
         let medium = vec![0u8; 200];
-        assert!(medium.len() > cfg.shm_threshold);
+        assert!(medium.len() > cfg.shm_threshold as usize);
         assert!(medium.len() <= cfg.chunk_size);
 
         // Above chunk_size → chunked (if no pool) or buddy first
