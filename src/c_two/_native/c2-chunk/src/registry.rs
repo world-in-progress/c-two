@@ -472,4 +472,56 @@ mod tests {
         pool.write().unwrap().release_handle(handle);
         assert_eq!(reg.active_count(), 0);
     }
+
+    #[test]
+    fn sharding_isolates_connections() {
+        let pool = test_pool();
+        let reg = Arc::new(ChunkRegistry::new(pool.clone(), ChunkConfig::default()));
+        let mut handles = vec![];
+        for conn_id in 0u64..8 {
+            let reg = reg.clone();
+            let pool = pool.clone();
+            let h = std::thread::spawn(move || {
+                for req_id in 0u64..10 {
+                    reg.insert(conn_id, req_id, 1, 64).unwrap();
+                    reg.feed(conn_id, req_id, 0, &[conn_id as u8; 64]).unwrap();
+                    let handle = reg.finish(conn_id, req_id).unwrap();
+                    pool.write().unwrap().release_handle(handle);
+                }
+            });
+            handles.push(h);
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_same_conn_no_corruption() {
+        let pool = test_pool();
+        let reg = Arc::new(ChunkRegistry::new(pool.clone(), ChunkConfig::default()));
+        let mut handles = vec![];
+        let conn_id = 42u64;
+        for thread_idx in 0u64..4 {
+            let reg = reg.clone();
+            let pool = pool.clone();
+            let h = std::thread::spawn(move || {
+                for i in 0u64..20 {
+                    let req_id = thread_idx * 1000 + i;
+                    reg.insert(conn_id, req_id, 1, 64).unwrap();
+                    reg.feed(conn_id, req_id, 0, &[0u8; 64]).unwrap();
+                    let handle = reg.finish(conn_id, req_id).unwrap();
+                    pool.write().unwrap().release_handle(handle);
+                }
+            });
+            handles.push(h);
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+    }
 }
