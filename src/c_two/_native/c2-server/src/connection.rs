@@ -421,13 +421,14 @@ mod tests {
     #[test]
     fn init_peer_shm_stores_state() {
         let conn = Connection::new(1);
+        // segment_size must be >= 2 * min_block_size (4096), so use 8192+.
         conn.init_peer_shm(
             "/cc3b_test".into(),
-            vec![("seg0".into(), 4096), ("seg1".into(), 8192)],
+            vec![("seg0".into(), 8192), ("seg1".into(), 16384)],
         );
         assert_eq!(conn.peer_prefix(), "/cc3b_test");
         assert_eq!(conn.remote_segment_names(), vec!["seg0", "seg1"]);
-        assert_eq!(conn.remote_segment_sizes(), vec![4096, 8192]);
+        assert_eq!(conn.remote_segment_sizes(), vec![8192, 16384]);
     }
 
     #[test]

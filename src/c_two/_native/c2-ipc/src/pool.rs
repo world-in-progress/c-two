@@ -5,10 +5,15 @@
 //! kept alive for a grace period before being destroyed.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use c2_mem::{MemPool, PoolConfig};
+
+/// Monotonic counter so each client MemPool gets a unique SHM prefix
+/// within the same process.  Format: `/cc3c{pid:08x}{gen:04x}`.
+static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 use crate::client::{IpcConfig, IpcError};
 use crate::sync_client::SyncClient;
@@ -97,7 +102,10 @@ impl ClientPool {
         // Create a fresh MemPool for the client, respecting pool_segment_size.
         let mut pc = PoolConfig::default();
         pc.segment_size = cfg.pool_segment_size as usize;
-        let pool = Arc::new(StdMutex::new(MemPool::new(pc)));
+        let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed);
+        let ctr16 = (counter & 0xFFFF) as u16;
+        let prefix = format!("/cc3c{:08x}{:04x}", std::process::id(), ctr16);
+        let pool = Arc::new(StdMutex::new(MemPool::new_with_prefix(pc, prefix)));
 
         // Drop the entries lock before connecting (connect may block).
         drop(entries);
