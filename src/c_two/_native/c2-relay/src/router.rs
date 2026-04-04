@@ -205,7 +205,7 @@ async fn call_handler(
             { state.pool.read().unwrap().touch(&route_name); }
             let bytes = result.into_bytes_with_pool(
                 client.server_pool_arc(),
-                client.reassembly_pool_arc(),
+                &client.reassembly_pool_arc(),
             ).unwrap_or_default();
             (
                 StatusCode::OK,

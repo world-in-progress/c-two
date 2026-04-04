@@ -8,7 +8,7 @@
 //! for free-threading builds.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
@@ -41,7 +41,7 @@ enum ResponseBufferInner {
     },
     Handle {
         handle: c2_mem::MemHandle,
-        pool: Arc<StdMutex<MemPool>>,
+        pool: Arc<RwLock<MemPool>>,
     },
 }
 
@@ -63,7 +63,7 @@ impl PyResponseBuffer {
     fn from_response_data(
         data: ResponseData,
         pool: Arc<StdMutex<Option<ServerPoolState>>>,
-        reassembly_pool: Arc<StdMutex<MemPool>>,
+        reassembly_pool: Arc<RwLock<MemPool>>,
     ) -> Self {
         let data_len = data.len();
         let inner = match data {
@@ -112,7 +112,7 @@ impl PyResponseBuffer {
                 Ok(PyBytes::new(py, slice))
             }
             Some(ResponseBufferInner::Handle { handle, pool }) => {
-                let pool_guard = pool.lock().unwrap();
+                let pool_guard = pool.read().unwrap();
                 let slice = pool_guard.handle_slice(handle);
                 Ok(PyBytes::new(py, slice))
             }
@@ -149,7 +149,7 @@ impl PyResponseBuffer {
                 Ok(())
             }
             Some(ResponseBufferInner::Handle { handle, pool }) => {
-                if let Ok(mut p) = pool.lock() {
+                if let Ok(mut p) = pool.write() {
                     let _ = p.release_handle(handle);
                 }
                 Ok(())
@@ -185,7 +185,7 @@ impl PyResponseBuffer {
                 (raw_ptr as *const u8, *data_size as usize)
             }
             ResponseBufferInner::Handle { handle, pool } => {
-                let pool_guard = pool.lock().unwrap();
+                let pool_guard = pool.read().unwrap();
                 let slice = pool_guard.handle_slice(handle);
                 (slice.as_ptr(), slice.len())
             }
@@ -246,7 +246,7 @@ impl Drop for PyResponseBuffer {
                     }
                 }
                 Some(ResponseBufferInner::Handle { handle, pool }) => {
-                    if let Ok(mut p) = pool.lock() {
+                    if let Ok(mut p) = pool.write() {
                         let _ = p.release_handle(handle);
                     }
                 }

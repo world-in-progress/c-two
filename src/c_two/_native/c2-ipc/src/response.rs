@@ -52,7 +52,7 @@ impl ResponseData {
     pub fn into_bytes_with_pool(
         self,
         server_pool: &std::sync::Arc<std::sync::Mutex<Option<super::client::ServerPoolState>>>,
-        reassembly_pool: &std::sync::Arc<std::sync::Mutex<c2_mem::MemPool>>,
+        reassembly_pool: &std::sync::Arc<std::sync::RwLock<c2_mem::MemPool>>,
     ) -> Result<Vec<u8>, String> {
         match self {
             ResponseData::Inline(v) => Ok(v),
@@ -63,10 +63,11 @@ impl ResponseData {
                 Ok(data)
             }
             ResponseData::Handle(handle) => {
-                let mut pool = reassembly_pool.lock().unwrap();
+                let pool = reassembly_pool.read().unwrap();
                 let slice = pool.handle_slice(&handle);
                 let data = slice.to_vec();
-                pool.release_handle(handle);
+                drop(pool);
+                reassembly_pool.write().unwrap().release_handle(handle);
                 Ok(data)
             }
         }

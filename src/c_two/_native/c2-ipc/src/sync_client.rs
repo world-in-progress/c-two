@@ -3,7 +3,7 @@
 //! Wraps [`IpcClient`] for blocking calls from Python (via PyO3).
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 
 use c2_mem::{MemPool, PoolAllocation};
 
@@ -139,8 +139,8 @@ impl SyncClient {
     }
 
     /// Get a reference to the client reassembly pool (for FFI layer).
-    pub fn reassembly_pool_arc(&self) -> Arc<StdMutex<MemPool>> {
-        self.inner.reassembly_pool.clone()
+    pub fn reassembly_pool_arc(&self) -> Arc<RwLock<MemPool>> {
+        self.inner.reassembly_pool_arc()
     }
 
     /// Synchronous close.

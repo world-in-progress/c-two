@@ -6,14 +6,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex};
 
+use c2_chunk::{ChunkConfig, ChunkRegistry};
 use c2_mem::FreeResult;
-use c2_wire::assembler::ChunkAssembler;
 use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
 use c2_wire::chunk::encode_chunk_header;
 use c2_wire::control::{decode_reply_control, encode_call_control, ReplyControl};
@@ -215,8 +215,10 @@ pub struct IpcClient {
     connected: Arc<AtomicBool>,
     pub(crate) pool: Option<Arc<StdMutex<MemPool>>>,
     pub(crate) config: IpcConfig,
-    /// Client-side pool for reassembling chunked responses.
-    pub(crate) reassembly_pool: Arc<StdMutex<MemPool>>,
+    /// Client-side chunk registry for reassembling chunked responses.
+    pub(crate) chunk_registry: Arc<ChunkRegistry>,
+    /// Unique connection identifier for the chunk registry.
+    conn_id: u64,
 }
 
 // Compile-time assertion: IpcClient is Send+Sync because all fields are
@@ -236,20 +238,25 @@ const _: () = {
 /// Format: `/cc3a{pid:08x}{counter:08x}` — 32-bit range, 27 chars max.
 static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic counter so each IpcClient gets a unique conn_id.
+static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 impl IpcClient {
-    fn make_reassembly_pool(config: &IpcConfig) -> Arc<StdMutex<MemPool>> {
+    fn make_chunk_registry(config: &IpcConfig) -> Arc<ChunkRegistry> {
         let seg_size = config.reassembly_segment_size as usize;
         let max_segs = config.reassembly_max_segments as usize;
         let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3a{:08x}{:08x}", std::process::id(), counter);
-        Arc::new(StdMutex::new(MemPool::new_with_prefix(
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: seg_size,
                 max_segments: max_segs,
                 ..PoolConfig::default()
             },
             prefix,
-        )))
+        )));
+        let chunk_config = ChunkConfig::from_ipc(config);
+        Arc::new(ChunkRegistry::new(pool, chunk_config))
     }
 
     /// Create a new IPC client targeting the given address.
@@ -274,7 +281,8 @@ impl IpcClient {
             connected: Arc::new(AtomicBool::new(false)),
             pool: None,
             config: IpcConfig::default(),
-            reassembly_pool: Self::make_reassembly_pool(&IpcConfig::default()),
+            chunk_registry: Self::make_chunk_registry(&IpcConfig::default()),
+            conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -303,7 +311,8 @@ impl IpcClient {
             recv_handle: None,
             connected: Arc::new(AtomicBool::new(false)),
             pool: Some(pool),
-            reassembly_pool: Self::make_reassembly_pool(&config),
+            chunk_registry: Self::make_chunk_registry(&config),
+            conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
             config,
         }
     }
@@ -424,12 +433,13 @@ impl IpcClient {
         let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
         let connected = self.connected.clone();
-        let reassembly_pool = self.reassembly_pool.clone();
+        let chunk_registry = self.chunk_registry.clone();
+        let conn_id = self.conn_id;
         // Note: recv_handle is stored on self but we can't assign here
         // because &self is immutable. The caller (connect) handles this
         // via interior mutability or the recv task is detached.
         tokio::spawn(async move {
-            recv_loop(reader, pending, server_pool, writer_clone, reassembly_pool).await;
+            recv_loop(reader, pending, server_pool, writer_clone, chunk_registry, conn_id).await;
             connected.store(false, Ordering::Release);
         });
 
@@ -442,8 +452,8 @@ impl IpcClient {
     }
 
     /// Get a reference to the reassembly pool (for materialising Handle responses).
-    pub fn reassembly_pool_arc(&self) -> &Arc<StdMutex<MemPool>> {
-        &self.reassembly_pool
+    pub fn reassembly_pool_arc(&self) -> Arc<RwLock<MemPool>> {
+        self.chunk_registry.pool().clone()
     }
 
     /// Send a CRM call and wait for the response (inline path only).
@@ -879,11 +889,11 @@ async fn recv_loop(
     pending: Arc<StdMutex<PendingMap>>,
     _server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
-    reassembly_pool: Arc<StdMutex<MemPool>>,
+    chunk_registry: Arc<ChunkRegistry>,
+    conn_id: u64,
 ) {
     let mut header_buf = [0u8; HEADER_SIZE];
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
-    let mut assemblers: HashMap<u32, ChunkAssembler> = HashMap::new();
     loop {
         // Read frame header.
         if reader.read_exact(&mut header_buf).await.is_err() {
@@ -951,71 +961,56 @@ async fn recv_loop(
                 };
             let chunk_data = &recv_buf[meta_consumed..];
 
-            // First chunk: create assembler.
+            // First chunk: create assembler in registry.
             if chunk_idx == 0 {
                 let chunk_size = if total_chunks > 1 {
                     chunk_data.len()
                 } else {
                     total_size as usize
                 };
-                let mut pool = reassembly_pool.lock().unwrap();
-                match ChunkAssembler::new(
-                    &mut pool, total_chunks as usize, chunk_size,
-                    512, // TODO: pass from config
-                    8 * (1 << 30), // TODO: pass from config
+                if let Err(e) = chunk_registry.insert(
+                    conn_id, rid as u64, total_chunks as usize, chunk_size,
                 ) {
-                    Ok(asm) => { assemblers.insert(rid, asm); }
-                    Err(e) => {
-                        eprintln!("Warning: reply chunk assembler creation failed: {e}");
-                        let tx = pending.lock().unwrap().remove(&rid);
-                        if let Some(tx) = tx {
-                            let _ = tx.send(Err(IpcError::Handshake(
-                                format!("chunked reply assembler failed: {e}"),
-                            )));
-                        }
-                        continue;
+                    eprintln!("Warning: reply chunk assembler creation failed: {e}");
+                    let tx = pending.lock().unwrap().remove(&rid);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(Err(IpcError::Handshake(
+                            format!("chunked reply assembler failed: {e}"),
+                        )));
                     }
+                    continue;
                 }
             }
 
-            // Feed chunk.
-            if let Some(asm) = assemblers.get_mut(&rid) {
-                let pool = reassembly_pool.lock().unwrap();
-                if let Err(e) = asm.feed_chunk(&pool, chunk_idx as usize, chunk_data) {
-                    drop(pool);
-                    eprintln!("Warning: reply chunk feed error: {e}");
-                    if let Some(failed) = assemblers.remove(&rid) {
-                        let mut pool = reassembly_pool.lock().unwrap();
-                        failed.abort(&mut pool);
+            // Feed chunk via registry.
+            match chunk_registry.feed(conn_id, rid as u64, chunk_idx as usize, chunk_data) {
+                Ok(complete) => {
+                    if complete {
+                        match chunk_registry.finish(conn_id, rid as u64) {
+                            Ok(finished) => {
+                                let tx = pending.lock().unwrap().remove(&rid);
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(Ok(ResponseData::Handle(finished.handle)));
+                                }
+                            }
+                            Err(e) => {
+                                let tx = pending.lock().unwrap().remove(&rid);
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(Err(IpcError::Handshake(
+                                        format!("chunked reply finish error: {e}"),
+                                    )));
+                                }
+                            }
+                        }
                     }
+                }
+                Err(e) => {
+                    eprintln!("Warning: reply chunk feed error: {e}");
                     let tx = pending.lock().unwrap().remove(&rid);
                     if let Some(tx) = tx {
                         let _ = tx.send(Err(IpcError::Handshake(
                             format!("chunked reply feed error: {e}"),
                         )));
-                    }
-                    continue;
-                }
-
-                // Complete: finish and send to caller.
-                if asm.is_complete() {
-                    drop(pool);
-                    let asm = assemblers.remove(&rid).unwrap();
-                    match asm.finish() {
-                        Ok(handle) => {
-                            let tx = pending.lock().unwrap().remove(&rid);
-                            if let Some(tx) = tx {
-                                let _ = tx.send(Ok(ResponseData::Handle(handle)));
-                            }
-                        }
-                        Err(e) => {
-                            let tx = pending.lock().unwrap().remove(&rid);
-                            if let Some(tx) = tx {
-                                let _ = tx.send(Err(IpcError::Handshake(
-                                    format!("chunked reply finish error: {e}"),
-                                )));
-                            }
-                        }
                     }
                 }
             }
@@ -1034,13 +1029,8 @@ async fn recv_loop(
         }
     }
 
-    // Connection lost — abort in-flight assemblers.
-    if !assemblers.is_empty() {
-        let mut pool = reassembly_pool.lock().unwrap();
-        for (_, asm) in assemblers.drain() {
-            asm.abort(&mut pool);
-        }
-    }
+    // Connection lost — cleanup all in-flight assemblies for this connection.
+    chunk_registry.cleanup_connection(conn_id);
 
     // Connection lost — wake all pending callers.
     let mut pending_guard = pending.lock().unwrap();
@@ -1098,12 +1088,12 @@ mod tests {
     #[test]
     fn reassembly_pool_unique_prefixes() {
         let cfg = IpcConfig::default();
-        let p1 = IpcClient::make_reassembly_pool(&cfg);
-        let p2 = IpcClient::make_reassembly_pool(&cfg);
-        let p3 = IpcClient::make_reassembly_pool(&cfg);
-        let prefix1 = p1.lock().unwrap().prefix().to_string();
-        let prefix2 = p2.lock().unwrap().prefix().to_string();
-        let prefix3 = p3.lock().unwrap().prefix().to_string();
+        let r1 = IpcClient::make_chunk_registry(&cfg);
+        let r2 = IpcClient::make_chunk_registry(&cfg);
+        let r3 = IpcClient::make_chunk_registry(&cfg);
+        let prefix1 = r1.pool().read().unwrap().prefix().to_string();
+        let prefix2 = r2.pool().read().unwrap().prefix().to_string();
+        let prefix3 = r3.pool().read().unwrap().prefix().to_string();
         assert_ne!(prefix1, prefix2);
         assert_ne!(prefix2, prefix3);
         assert_ne!(prefix1, prefix3);
