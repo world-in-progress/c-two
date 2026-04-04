@@ -1121,6 +1121,23 @@ mod tests {
     }
 
     #[test]
+    fn test_prefix_max_valid_length() {
+        // 24 chars is the maximum allowed prefix (macOS 31-char SHM limit
+        // minus 7 for suffix `_bXXXX\0`).
+        let prefix = "/cc3t".to_string() + &"x".repeat(24 - 5); // exactly 24
+        assert_eq!(prefix.len(), 24);
+        let _ = MemPool::new_with_prefix(test_config(), prefix);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds max")]
+    fn test_prefix_too_long_panics() {
+        let prefix = "/cc3t".to_string() + &"x".repeat(24 - 5 + 1); // 25 chars
+        assert_eq!(prefix.len(), 25);
+        let _ = MemPool::new_with_prefix(test_config(), prefix);
+    }
+
+    #[test]
     fn test_dedicated_gc_flag_based() {
         let config = PoolConfig {
             segment_size: 32 * 1024,

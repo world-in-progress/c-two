@@ -405,6 +405,24 @@ mod tests {
 
     // ── Helper ───────────────────────────────────────────────────────────
 
+    #[test]
+    fn test_client_pool_unique_prefixes() {
+        // Verify that successive client MemPool creations get different
+        // SHM prefixes via CLIENT_POOL_GEN counter.
+        let pc = PoolConfig::default();
+        let c1 = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
+        let p1 = format!("/cc3c{:08x}{:08x}", std::process::id(), c1);
+        let c2 = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
+        let p2 = format!("/cc3c{:08x}{:08x}", std::process::id(), c2);
+        assert_ne!(p1, p2, "consecutive prefixes must differ");
+        assert!(p1.len() <= 24, "prefix must fit SHM name limit");
+        // Verify the pools can be created with these prefixes.
+        let pool1 = MemPool::new_with_prefix(pc.clone(), p1.clone());
+        let pool2 = MemPool::new_with_prefix(pc, p2.clone());
+        assert_eq!(pool1.prefix(), &p1);
+        assert_eq!(pool2.prefix(), &p2);
+    }
+
     /// Create a disconnected SyncClient for testing pool bookkeeping.
     fn make_disconnected_client() -> SyncClient {
         SyncClient::new_unconnected("ipc:///pool_test_fake")

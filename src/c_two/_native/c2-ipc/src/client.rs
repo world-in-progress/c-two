@@ -1086,3 +1086,24 @@ fn decode_response(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reassembly_pool_unique_prefixes() {
+        let cfg = IpcConfig::default();
+        let p1 = IpcClient::make_reassembly_pool(&cfg);
+        let p2 = IpcClient::make_reassembly_pool(&cfg);
+        let p3 = IpcClient::make_reassembly_pool(&cfg);
+        let prefix1 = p1.lock().unwrap().prefix().to_string();
+        let prefix2 = p2.lock().unwrap().prefix().to_string();
+        let prefix3 = p3.lock().unwrap().prefix().to_string();
+        assert_ne!(prefix1, prefix2);
+        assert_ne!(prefix2, prefix3);
+        assert_ne!(prefix1, prefix3);
+        assert!(prefix1.starts_with("/cc3a"), "unexpected prefix: {prefix1}");
+        assert!(prefix1.len() <= 24, "prefix exceeds SHM name limit: {}", prefix1.len());
+    }
+}

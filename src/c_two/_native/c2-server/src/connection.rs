@@ -167,6 +167,12 @@ impl Connection {
     }
 
     /// Return cloned list of remote segment sizes.
+    /// Effective buddy segment size after clamping (test-only accessor).
+    #[cfg(test)]
+    pub fn buddy_segment_size(&self) -> usize {
+        self.peer_shm.lock().unwrap().buddy_segment_size
+    }
+
     pub fn remote_segment_sizes(&self) -> Vec<u32> {
         self.peer_shm.lock().unwrap().segment_sizes.clone()
     }
@@ -464,6 +470,47 @@ mod tests {
         );
         assert_eq!(conn.peer_prefix(), "/cc3b_tiny");
         assert_eq!(conn.remote_segment_names(), vec!["seg0"]);
+        assert_eq!(
+            conn.buddy_segment_size(),
+            Connection::MIN_BUDDY_SEGMENT_SIZE,
+            "undersized segment must be clamped to MIN_BUDDY_SEGMENT_SIZE",
+        );
+    }
+
+    #[test]
+    fn init_peer_shm_clamps_zero_segment() {
+        let conn = Connection::new(4);
+        conn.init_peer_shm("/cc3b_zero".into(), vec![("z0".into(), 0)]);
+        assert_eq!(
+            conn.buddy_segment_size(),
+            Connection::MIN_BUDDY_SEGMENT_SIZE,
+        );
+    }
+
+    #[test]
+    fn init_peer_shm_clamps_boundary_below() {
+        // 8191 is 1 below MIN_BUDDY_SEGMENT_SIZE (8192) — must clamp.
+        let conn = Connection::new(5);
+        conn.init_peer_shm("/cc3b_8191".into(), vec![("s0".into(), 8191)]);
+        assert_eq!(
+            conn.buddy_segment_size(),
+            Connection::MIN_BUDDY_SEGMENT_SIZE,
+        );
+    }
+
+    #[test]
+    fn init_peer_shm_accepts_boundary_exact() {
+        // 8192 == MIN_BUDDY_SEGMENT_SIZE — should pass through unchanged.
+        let conn = Connection::new(6);
+        conn.init_peer_shm("/cc3b_8192".into(), vec![("s0".into(), 8192)]);
+        assert_eq!(conn.buddy_segment_size(), 8192);
+    }
+
+    #[test]
+    fn init_peer_shm_accepts_large_segment() {
+        let conn = Connection::new(7);
+        conn.init_peer_shm("/cc3b_big".into(), vec![("s0".into(), 65536)]);
+        assert_eq!(conn.buddy_segment_size(), 65536);
     }
 
     #[test]
