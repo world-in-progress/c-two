@@ -1,6 +1,7 @@
 # Chunk Lifecycle Management — Design Spec
 
 **Date:** 2026-04-04
+**Revised:** 2026-04-04 (post-audit — fixed 6 issues from concurrency/safety review)
 **Status:** Approved
 **Resolves:** `docs/issues/chunk-management-gaps.md`
 
@@ -84,14 +85,25 @@ struct TrackedAssembler {
 ### ChunkRegistry
 
 ```rust
+/// Number of shards — must be power of two.
+const SHARD_COUNT: usize = 16;
+
 pub struct ChunkRegistry {
-    assemblers: Mutex<HashMap<(u64, u64), TrackedAssembler>>,
+    /// Sharded by conn_id to minimize cross-connection lock contention.
+    /// Each shard owns an independent Mutex<HashMap>.
+    /// Shard index = conn_id % SHARD_COUNT.
+    shards: [Mutex<HashMap<(u64, u64), TrackedAssembler>>; SHARD_COUNT],
     pool: Arc<RwLock<MemPool>>,
     config: ChunkConfig,
+    /// Global counters (atomic, lock-free) for soft-limit checks.
+    active_count: AtomicUsize,
+    total_bytes: AtomicU64,
 }
 ```
 
-Key: `(conn_id, request_id)`. Server uses actual connection IDs; client uses its own connection ID (constant per `recv_loop` lifetime).
+Key: `(conn_id, request_id)`. Server uses actual connection IDs; client uses a fabricated unique conn_id (from an atomic counter, see Client Integration below).
+
+**Why sharded?** The server spawns a separate tokio task per chunk frame (`tokio::spawn` at line 321 of server.rs). Even chunks for the same request run as independent tasks. A single global Mutex would serialize ALL connections — unacceptable under load. Sharding by `conn_id` restores per-connection isolation: tasks for the same connection contend only with each other (same as the current per-connection Mutex), while cross-connection contention is eliminated.
 
 ---
 
@@ -151,11 +163,16 @@ impl ChunkRegistry {
 
     // ── Query ────────────────────────────────────────────────────
 
-    /// Number of in-flight assemblies.
+    /// Number of in-flight assemblies (lock-free atomic read).
     pub fn active_count(&self) -> usize;
 
-    /// Total bytes allocated by all in-flight assemblies.
+    /// Total bytes allocated by all in-flight assemblies (lock-free atomic read).
     pub fn total_bytes(&self) -> u64;
+
+    // ── Internal ─────────────────────────────────────────────────
+
+    /// Shard selection: &shards[conn_id as usize % SHARD_COUNT]
+    fn shard(&self, conn_id: u64) -> &Mutex<HashMap<(u64, u64), TrackedAssembler>>;
 }
 
 pub struct GcStats {
@@ -174,34 +191,48 @@ pub struct GcStats {
 ```
 insert(conn_id, req_id, total_chunks, chunk_size):
   1. alloc_size = total_chunks × chunk_size
-  2. if active_count() >= soft_limit:
-       stats = gc_sweep()           // immediate GC attempt
-       if active_count() >= soft_limit:
+  2. if self.active_count.load(Relaxed) >= soft_limit:   // atomic, no lock
+       stats = gc_sweep()                                // locks each shard briefly
+       if self.active_count.load(Relaxed) >= soft_limit:
            warn!("chunk registry: soft limit {soft_limit} still exceeded after GC")
        // continue regardless — soft limit, not hard
-  3. if total_bytes() + alloc_size > max_reassembly_bytes:
-       gc_sweep()                   // immediate GC attempt
-       if total_bytes() + alloc_size > max_reassembly_bytes:
+  3. if self.total_bytes.load(Relaxed) + alloc_size > max_reassembly_bytes:
+       gc_sweep()
+       if self.total_bytes.load(Relaxed) + alloc_size > max_reassembly_bytes:
            warn!("chunk registry: reassembly bytes exceed {max_reassembly_bytes}")
        // continue regardless
   4. pool.write().alloc_handle(alloc_size)
        → buddy/dedicated/FileSpill (transparent fallback)
        → Err only on physical exhaustion (true hard limit)
-  5. store TrackedAssembler { created_at: now, last_activity: now, total_bytes: alloc_size }
+  5. let shard = self.shard(conn_id)
+     shard.lock().insert((conn_id, req_id), TrackedAssembler { ... })
+     self.active_count.fetch_add(1, Relaxed)
+     self.total_bytes.fetch_add(alloc_size, Relaxed)
 ```
+
+Note: soft limit checks are lock-free (atomic reads). The check-then-insert has a benign TOCTOU race, acceptable for advisory limits.
 
 ### GC Sweep
 
 ```
 gc_sweep():
   now = Instant::now()
-  for each (key, tracked) in assemblers:
-    if now - tracked.last_activity > assembler_timeout:
-      tracked.inner.abort(&mut pool.write())
-      remove from map
-      warn!("chunk GC: expired assembly conn={} req={} age={:.1}s",
-            key.0, key.1, (now - tracked.created_at).as_secs_f64())
-  return GcStats { expired, remaining, freed_bytes }
+  total_expired = 0
+  total_freed = 0
+  for shard in &self.shards:             // iterate ALL shards
+    let mut map = shard.lock()
+    let expired_keys: Vec<_> = map.iter()
+        .filter(|(_, t)| now - t.last_activity > assembler_timeout)
+        .map(|(k, _)| *k).collect()
+    for key in expired_keys:
+      let tracked = map.remove(&key).unwrap()
+      tracked.inner.abort(&mut pool.write())   // free MemHandle
+      self.active_count.fetch_sub(1, Relaxed)
+      self.total_bytes.fetch_sub(tracked.total_bytes, Relaxed)
+      warn!("chunk GC: expired conn={} req={} age={:.1}s", ...)
+      total_expired += 1
+      total_freed += tracked.total_bytes
+  return GcStats { expired: total_expired, remaining: active_count(), freed_bytes: total_freed }
 ```
 
 The GC timer is **not** owned by `ChunkRegistry`. Callers (`c2-server` / `c2-ipc`) spawn their own `tokio::interval` task that calls `gc_sweep()` periodically. This keeps `ChunkRegistry` runtime-agnostic (no tokio dependency in c2-chunk).
@@ -210,8 +241,20 @@ The GC timer is **not** owned by `ChunkRegistry`. Callers (`c2-server` / `c2-ipc
 
 ```
 finish(conn_id, req_id):
-  1. remove TrackedAssembler from map
-  2. handle = tracked.inner.finish()?
+  1. let shard = self.shard(conn_id)
+     let tracked = shard.lock().remove((conn_id, req_id))
+         .ok_or("unknown assembly")?
+     self.active_count.fetch_sub(1, Relaxed)
+     self.total_bytes.fetch_sub(tracked.total_bytes, Relaxed)
+  2. match tracked.inner.finish():
+       Ok(handle) => proceed to step 3
+       Err(e) =>
+         // CRITICAL: ChunkAssembler::finish(self) consumes self.
+         // On error, the inner MemHandle is dropped — but MemHandle has
+         // NO Drop impl, so Buddy/Dedicated SHM segments would leak.
+         // Solution: ChunkAssembler MUST implement Drop that calls abort()
+         // on the inner MemHandle. See "ChunkAssembler Drop Safety" below.
+         return Err(e)
   3. if handle.is_file_spill():
        match promote_to_shm(&mut pool.write(), handle):
          Ok(shm_handle) => debug!("promoted FileSpill → SHM"); return Ok(shm_handle)
@@ -219,17 +262,52 @@ finish(conn_id, req_id):
   4. return Ok(handle)
 ```
 
+#### ChunkAssembler Drop Safety
+
+**Problem:** `ChunkAssembler::finish(self)` consumes `self`. If it returns `Err`, the inner `MemHandle` is dropped. Neither `ChunkAssembler` nor `MemHandle` implements `Drop` — Buddy/Dedicated SHM segments leak permanently (FileSpill is safe because `MmapMut` auto-unmaps).
+
+**Solution (implemented in c2-chunk, not c2-wire):** `TrackedAssembler` implements `Drop`:
+
+```rust
+impl Drop for TrackedAssembler {
+    fn drop(&mut self) {
+        // If this TrackedAssembler is being dropped without finish() or abort()
+        // having been called, the inner ChunkAssembler still holds a MemHandle.
+        // We must free it. Since we need &mut MemPool, we go through the
+        // Arc<RwLock<MemPool>> stored in the registry.
+        //
+        // In practice, this path is only hit on panic or logic error.
+        // Normal paths call finish() or abort() which consume the inner.
+        if self.inner_not_consumed {
+            warn!("TrackedAssembler dropped without finish/abort — freeing MemHandle");
+            // self.inner.abort(pool) — but we don't have pool here.
+            // Instead: ChunkAssembler gains a take_handle() -> Option<MemHandle>
+            // and TrackedAssembler stores Arc<RwLock<MemPool>> for emergency cleanup.
+        }
+    }
+}
+```
+
+**Practical implementation:** Rather than a complex Drop, we use a simpler approach:
+1. `ChunkAssembler` gains `pub fn take_handle(&mut self) -> Option<MemHandle>` — extracts the handle without consuming self.
+2. `ChunkRegistry::finish()` calls `take_handle()` first, then `finish_with_handle()` (a new method that operates on the extracted handle). If any step fails, the handle is still owned by the registry and can be freed via `pool.release_handle()`.
+3. All error paths in `finish()` explicitly call `pool.write().release_handle(handle)` before returning `Err`.
+
 ### Connection Cleanup
 
 ```
 cleanup_connection(conn_id):
-  let to_remove: Vec<_> = map.keys()
+  let shard = self.shard(conn_id)          // O(1) — all entries for this conn in one shard
+  let mut map = shard.lock()
+  let conn_keys: Vec<_> = map.keys()
       .filter(|(cid, _)| *cid == conn_id)
       .copied().collect()
-  for key in to_remove:
-      tracked = map.remove(&key).unwrap()
-      tracked.inner.abort(&mut pool)
-      warn!("cleanup: aborted assembly conn={} req={}", key.0, key.1)
+  for key in conn_keys:
+    let tracked = map.remove(&key).unwrap()
+    tracked.inner.abort(&mut pool.write())
+    self.active_count.fetch_sub(1, Relaxed)
+    self.total_bytes.fetch_sub(tracked.total_bytes, Relaxed)
+    warn!("cleanup: aborted assembly conn={} req={}", key.0, key.1)
 ```
 
 ---
@@ -256,6 +334,21 @@ pub fn promote_to_shm(
     // Phase 2: Copy data.
     // handle_slice / handle_slice_mut both take &self on pool,
     // so concurrent immutable reborrows are fine.
+    //
+    // BORROW SAFETY NOTE (Audit Issue #6):
+    // handle_slice(&self, &MemHandle) -> &[u8] and
+    // handle_slice_mut(&self, &mut MemHandle) -> &mut [u8]
+    // both take &self on pool. The borrow checker may reject simultaneous
+    // calls because &file_handle and &mut shm_handle create conflicting
+    // borrows through pool's &self.
+    //
+    // Fallback: if borrow checker rejects, use a temp buffer:
+    //   let data = pool.handle_slice(&file_handle).to_vec();
+    //   pool.handle_slice_mut(&mut shm_handle)[..len].copy_from_slice(&data);
+    //
+    // The to_vec() adds one allocation + copy. For typical chunk sizes
+    // (hundreds of KB to a few MB), this is acceptable for the rare
+    // FileSpill→SHM promotion path.
     {
         let src = pool.handle_slice(&file_handle);
         let dst = pool.handle_slice_mut(&mut shm_handle);
@@ -305,6 +398,39 @@ Implementation: same logic as `alloc_handle()` lines 513–570, but the final Fi
 registry.cleanup_connection(conn_id);   // NEW — abort orphaned assemblers
 ```
 
+**CRITICAL: `wait_idle()` vs chunk task race (Audit Issue #2)**
+
+Current problem: `dispatch_chunked_call()` is spawned per chunk frame (`tokio::spawn` at line 321). `flight_inc()` is only called at line 787 when ALL chunks are assembled — NOT per chunk task. So after the connection read loop exits:
+1. `wait_idle()` sees inflight=0 and returns immediately
+2. `cleanup_connection()` removes assemblers
+3. But spawned chunk tasks may still be running and try `registry.feed()` on removed assemblers
+
+**Solution:** Each spawned chunk task must call `conn.flight_inc()` at entry and `conn.flight_dec()` on exit (via a guard or explicit finally). This ensures `wait_idle()` blocks until ALL chunk tasks complete — including partial ones that haven't finished reassembly.
+
+```rust
+// In dispatch_chunked_call() (spawned task body):
+conn.flight_inc();                           // NEW — at task entry
+let _guard = FlightGuard::new(&conn);        // RAII: calls flight_dec on drop
+// ... existing chunk processing ...
+// flight_dec called automatically when _guard drops
+```
+
+`FlightGuard` is a simple RAII struct:
+```rust
+struct FlightGuard<'a> { conn: &'a Connection }
+impl<'a> FlightGuard<'a> {
+    fn new(conn: &'a Connection) -> Self {
+        conn.flight_inc();
+        Self { conn }
+    }
+}
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) { self.conn.flight_dec(); }
+}
+```
+
+This guarantees: `wait_idle()` returns ONLY when all chunk tasks (including partial ones) have completed → `cleanup_connection()` can safely remove all entries.
+
 **`dispatch_chunked_call()` changes:**
 - Replace `conn.insert_assembler()` → `registry.insert(conn_id, req_id, ...)`
 - Replace `conn.feed_chunk()` → `registry.feed(conn_id, req_id, ...)`
@@ -316,10 +442,35 @@ registry.cleanup_connection(conn_id);   // NEW — abort orphaned assemblers
 
 ### c2-ipc (client)
 
+**Client `conn_id` generation (Audit Issue #5):**
+
+`IpcClient` does not have a `conn_id` field. We fabricate one using an atomic counter:
+
+```rust
+// In c2-ipc/src/client.rs or c2-ipc/src/pool.rs:
+static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+impl IpcClient {
+    pub fn new(...) -> Self {
+        let conn_id = CLIENT_CONN_COUNTER.fetch_add(1, Relaxed);
+        // ...
+    }
+}
+```
+
+Each `IpcClient` instance gets a unique `conn_id` at construction time. This ID is used as the first element of the `(conn_id, request_id)` registry key. Since a single `IpcClient` runs one `recv_loop()`, all chunks for that client share the same shard — preserving the current zero-contention property.
+
+**Client `request_id` type (Audit Issue #4):**
+
+The wire protocol uses `u64` request IDs, but `IpcClient` uses `AtomicU32` (`rid_counter`) and truncates at line 938: `let rid = hdr.request_id as u32`.
+
+**Decision:** Keep `u32` in the registry key for now. The truncation is safe as long as fewer than 2³² concurrent requests exist per client (practically impossible). Add a `TODO` comment at the truncation site. The registry key type for client is `(u64, u64)` — the request_id is widened to u64 via `as u64` when calling registry methods. This avoids breaking the wire protocol or client dispatch table (which uses `u32` keys).
+
 **`recv_loop()` changes:**
 - Remove local `let mut assemblers: HashMap<u32, ChunkAssembler>`
 - Accept `Arc<ChunkRegistry>` parameter (passed from Client/ClientPool)
 - Replace manual assembler HashMap operations → `registry.insert/feed/finish`
+  (with `request_id as u64` widening for registry calls)
 - Replace manual abort loop on disconnect → `registry.cleanup_connection(conn_id)`
 
 **GC timer:**
@@ -386,6 +537,10 @@ Other chunk fields unchanged — they're already correct types.
 5. **finish promotes FileSpill** — force FileSpill alloc, then finish with SHM available
 6. **finish keeps FileSpill when SHM full** — force FileSpill, keep SHM full, verify FileSpill handle returned
 7. **feed updates last_activity** — insert, wait, feed, verify GC does not expire
+8. **finish error path does not leak** — trigger finish error, verify MemHandle freed (active_count=0, total_bytes=0)
+9. **sharding isolation** — insert for N different conn_ids in parallel threads, verify no cross-shard interference
+10. **cleanup_connection touches only target shard** — insert for conn 1 and conn 2 (different shards), cleanup conn 1, verify conn 2 untouched
+11. **concurrent insert/feed/finish** — spawn M threads doing insert+feed+finish on same conn_id, verify no data corruption
 
 ### Integration Tests
 
@@ -412,13 +567,32 @@ Every test must verify: after cleanup/gc, `active_count() == 0` and `total_bytes
 
 ### Locking Discipline
 
-`ChunkRegistry` holds two locks: `assemblers: Mutex` and `pool: Arc<RwLock<MemPool>>`.
+`ChunkRegistry` uses `SHARD_COUNT` (16) independent `Mutex<HashMap>` shards, plus `pool: Arc<RwLock<MemPool>>`.
 
-**Lock order:** Always `assemblers` → `pool`. Never reverse.
+**Lock order:** Always `shard[i]` → `pool`. Never reverse.
 
-**Soft limit checks in `insert()`:** The active count / total bytes checks must happen **outside** the assemblers lock. `gc_sweep()` acquires the assemblers lock internally, so calling it while already holding the lock would deadlock. The check-then-insert has a benign TOCTOU race (another thread may insert between check and lock), which is acceptable for a soft advisory limit.
+**Cross-shard:** `gc_sweep()` iterates shards sequentially (lock shard 0, process, unlock, lock shard 1, ...). This means GC can never deadlock with insert/feed/finish (which only lock one shard). GC holds at most one shard lock + pool lock at a time.
+
+**Soft limit checks in `insert()`:** The `active_count` / `total_bytes` checks use lock-free atomic reads. `gc_sweep()` acquires shard locks internally, so it's safe to call before locking a shard. The check-then-insert has a benign TOCTOU race (another thread may insert between check and shard lock), which is acceptable for a soft advisory limit.
+
+**Atomic ordering:** All counter updates use `Relaxed` ordering. Exact counts don't affect correctness (soft limits are advisory). Worst case: a GC sweep is triggered one insert too late or too early.
 
 ### `ChunkAssembler::abort()` Ownership
 
 `abort(self, &mut MemPool)` consumes the assembler. This aligns with `HashMap::remove()` which returns the owned value — remove then abort is safe and clean.
+
+---
+
+## Audit Findings Summary (2026-04-04)
+
+This section records the issues found during the concurrency/safety audit and their resolutions in this spec revision.
+
+| # | Severity | Issue | Resolution | Section |
+|---|----------|-------|------------|---------|
+| 1 | 🔴 Critical | Global Mutex contention — single lock serializes all connections | Sharded by conn_id (16 shards), restoring per-connection isolation | ChunkRegistry struct, Locking Discipline |
+| 2 | 🔴 Critical | `wait_idle()` returns before chunk tasks complete → use-after-cleanup race | FlightGuard RAII — each chunk task does flight_inc/dec, wait_idle blocks until all tasks done | Server Integration: wait_idle section |
+| 3 | 🔴 Critical | `finish()` error path leaks MemHandle (no Drop impl) | ChunkAssembler gains `take_handle()`, finish uses explicit handle ownership, all error paths call `release_handle()` | ChunkAssembler Drop Safety |
+| 4 | 🟠 High | Client request_id is u32 (truncated from wire u64) | Accept u32→u64 widening at registry call site, add TODO for full u64 migration | Client Integration |
+| 5 | 🟠 High | Client has no conn_id field | Fabricate via `CLIENT_CONN_COUNTER: AtomicU64` at IpcClient construction | Client Integration |
+| 6 | 🟡 Medium | `promote_to_shm` Phase 2 borrow safety uncertain | Added `.to_vec()` fallback strategy if borrow checker rejects direct slice access | promote_to_shm code comment |
 
