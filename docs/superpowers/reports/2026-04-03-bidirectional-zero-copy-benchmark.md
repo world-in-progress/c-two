@@ -203,7 +203,8 @@ operate directly on SHM-backed buffers (a fundamentally different programming mo
 
 Users can configure via:
 ```python
-cc.set_ipc_config(segment_size=2 * 1024**3)  # 2 GB segments
+cc.set_server_ipc_config(segment_size=2 * 1024**3)  # 2 GB segments
+cc.set_client_ipc_config(segment_size=2 * 1024**3)
 ```
 
 ### 6.2 Serialization Strategy
