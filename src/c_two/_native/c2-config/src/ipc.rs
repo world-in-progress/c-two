@@ -38,8 +38,8 @@ pub struct IpcConfig {
     // ── Chunked transfer settings ────────────────────────────────────────
     /// Max concurrent in-flight chunked transfers (default 512).
     pub max_total_chunks: u32,
-    /// GC sweep interval in completed-request cycles (default 100).
-    pub chunk_gc_interval: u32,
+    /// GC sweep interval in seconds (default 5.0).
+    pub chunk_gc_interval: f64,
     /// Ratio of pool capacity triggering chunked transfer (default 0.9).
     pub chunk_threshold_ratio: f64,
     /// Timeout for incomplete chunked assemblies in seconds (default 60.0).
@@ -74,7 +74,7 @@ impl Default for IpcConfig {
             reassembly_max_segments: 4,
 
             max_total_chunks: 512,
-            chunk_gc_interval: 100,
+            chunk_gc_interval: 5.0,
             chunk_threshold_ratio: 0.9,
             chunk_assembler_timeout: 60.0,
             max_reassembly_bytes: 8_589_934_592,
@@ -172,5 +172,12 @@ mod tests {
     fn reject_zero_chunk_size() {
         let cfg = IpcConfig { chunk_size: 0, ..Default::default() };
         assert!(cfg.validate().unwrap_err().contains("chunk_size must be > 0"));
+    }
+
+    #[test]
+    fn chunk_gc_interval_is_f64() {
+        let cfg = IpcConfig::default();
+        let _secs: f64 = cfg.chunk_gc_interval; // compile-time type check
+        assert!((cfg.chunk_gc_interval - 5.0).abs() < f64::EPSILON);
     }
 }
