@@ -570,6 +570,68 @@ impl MemPool {
         }
     }
 
+    /// Allocate from Buddy or Dedicated SHM only — no FileSpill fallback.
+    ///
+    /// Used by `promote_to_shm` when upgrading a FileSpill handle.
+    /// Returns `Err` if neither buddy nor dedicated has capacity.
+    pub fn try_alloc_shm(&mut self, size: usize) -> Result<MemHandle, String> {
+        if size == 0 {
+            return Err("cannot allocate 0 bytes".into());
+        }
+        let max_buddy = self.max_buddy_block_size();
+
+        // Try existing buddy segments.
+        if max_buddy > 0 && size <= max_buddy {
+            for (idx, seg) in self.segments.iter().enumerate() {
+                if (seg.allocator().free_bytes() as usize) < size { continue; }
+                if let Some(a) = seg.allocator().alloc(size) {
+                    if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                    return Ok(MemHandle::Buddy {
+                        seg_idx: idx as u16, offset: a.offset, len: size,
+                    });
+                }
+            }
+        }
+
+        // Try buddy expansion (no RAM check — caller already has data in RAM).
+        if max_buddy > 0 && size <= max_buddy
+            && self.segments.len() < self.config.max_segments
+        {
+            let reclaimed = self.gc_buddy();
+            if reclaimed > 0 {
+                for (idx, seg) in self.segments.iter().enumerate() {
+                    if (seg.allocator().free_bytes() as usize) < size { continue; }
+                    if let Some(a) = seg.allocator().alloc(size) {
+                        if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                        return Ok(MemHandle::Buddy {
+                            seg_idx: idx as u16, offset: a.offset, len: size,
+                        });
+                    }
+                }
+            }
+            if let Ok(seg) = self.create_segment() {
+                let idx = self.segments.len();
+                self.segments.push(seg);
+                self.idle_since.push(None);
+                if let Some(a) = self.segments[idx].allocator().alloc(size) {
+                    return Ok(MemHandle::Buddy {
+                        seg_idx: idx as u16, offset: a.offset, len: size,
+                    });
+                }
+            }
+        }
+
+        // Try dedicated SHM — NO FileSpill fallback.
+        match self.alloc_dedicated(size) {
+            Ok(alloc) => Ok(MemHandle::Dedicated {
+                seg_idx: alloc.seg_idx as u16, len: size,
+            }),
+            Err(_) => Err(format!(
+                "try_alloc_shm: no SHM capacity for {size} bytes"
+            )),
+        }
+    }
+
     fn alloc_file_spill(&self, size: usize) -> Result<MemHandle, String> {
         let (mmap, path) = spill::create_file_spill(size, &self.config.spill_dir)
             .map_err(|e| format!("file spill failed: {e}"))?;
@@ -1202,6 +1264,41 @@ mod tests {
         creator_pool.free(&a).unwrap();
         creator_pool.gc_dedicated();
         assert!(!creator_pool.dedicated.contains_key(&a.seg_idx));
+    }
+
+    #[test]
+    fn try_alloc_shm_returns_buddy() {
+        let mut pool = test_pool(small_config());
+        let h = pool.try_alloc_shm(4096).unwrap();
+        assert!(h.is_buddy());
+        pool.release_handle(h);
+    }
+
+    #[test]
+    fn try_alloc_shm_never_file_spills() {
+        // Pool with 1 small buddy segment, no dedicated, spill disabled.
+        let cfg = PoolConfig {
+            segment_size: 8192,
+            min_block_size: 4096,
+            max_segments: 1,
+            max_dedicated_segments: 0,
+            dedicated_crash_timeout_secs: 0.0,
+            spill_threshold: 1.0,
+            spill_dir: std::env::temp_dir().join("c2_try_shm_test"),
+        };
+        let mut pool = test_pool(cfg);
+        // Fill the single buddy segment completely
+        let mut held = Vec::new();
+        loop {
+            match pool.alloc_handle(4096) {
+                Ok(h) if h.is_buddy() => held.push(h),
+                _ => break,
+            }
+        }
+        assert!(!held.is_empty(), "should have allocated at least one buddy block");
+        // Now try_alloc_shm should fail — NOT fall back to FileSpill
+        let result = pool.try_alloc_shm(4096);
+        assert!(result.is_err());
     }
 }
 
