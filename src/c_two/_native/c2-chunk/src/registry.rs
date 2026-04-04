@@ -123,8 +123,17 @@ impl ChunkRegistry {
             total_bytes: alloc_bytes,
         };
 
-        // Lock shard and insert.
+        // Lock shard and insert — reject duplicates to prevent silent leaks.
         let mut shard = self.shard(conn_id).lock().unwrap();
+        if shard.contains_key(&(conn_id, request_id)) {
+            // Abort the newly allocated assembler before returning error.
+            tracked
+                .inner
+                .abort(&mut self.pool.write().unwrap());
+            return Err(format!(
+                "duplicate assembly for ({conn_id}, {request_id})"
+            ));
+        }
         shard.insert((conn_id, request_id), tracked);
         drop(shard);
 
@@ -192,6 +201,9 @@ impl ChunkRegistry {
                 "incomplete assembly for ({conn_id}, {request_id})"
             ));
         }
+
+        // Trim logical length to actual written data (last chunk may be short).
+        handle.set_len(inner.written_end());
 
         // Try SHM promotion if this is a FileSpill.
         if handle.is_file_spill() {
@@ -329,6 +341,8 @@ mod tests {
         assert!(!reg.feed(1, 400, 0, &[0u8; 128]).unwrap());
         assert!(reg.feed(1, 400, 2, &[2u8; 128]).unwrap());
         let handle = reg.finish(1, 400).unwrap();
+        // Logical length must be trimmed to actual data (last chunk is 64, not 128).
+        assert_eq!(handle.len(), 128 * 3 + 64); // 448, not 512
         // Verify data integrity
         let p = pool.read().unwrap();
         let slice = p.handle_slice(&handle);
@@ -338,5 +352,20 @@ mod tests {
         assert_eq!(&slice[384..384 + 64], &[3u8; 64]);
         drop(p);
         pool.write().unwrap().release_handle(handle);
+    }
+
+    #[test]
+    fn duplicate_insert_rejected() {
+        let pool = test_pool();
+        let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
+        reg.insert(1, 500, 2, 64).unwrap();
+        assert_eq!(reg.active_count(), 1);
+        // Second insert for same key must fail.
+        let err = reg.insert(1, 500, 3, 128).unwrap_err();
+        assert!(err.contains("duplicate"), "expected duplicate error: {err}");
+        // Original entry still intact, counter unchanged.
+        assert_eq!(reg.active_count(), 1);
+        // Cleanup.
+        reg.abort(1, 500);
     }
 }

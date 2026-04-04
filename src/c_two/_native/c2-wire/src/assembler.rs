@@ -155,6 +155,11 @@ impl ChunkAssembler {
         }
     }
 
+    /// One past the last byte written (actual data length).
+    pub fn written_end(&self) -> usize {
+        self.written_end
+    }
+
     /// Extract the underlying MemHandle without consuming self.
     ///
     /// Returns `None` if the handle was already taken (by a previous
