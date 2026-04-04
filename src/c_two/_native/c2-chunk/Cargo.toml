@@ -1,0 +1,11 @@
+[package]
+name = "c2-chunk"
+edition.workspace = true
+version.workspace = true
+description = "Chunk reassembly lifecycle management for C-Two IPC transport"
+
+[dependencies]
+c2-config = { path = "../c2-config" }
+c2-mem = { path = "../c2-mem" }
+c2-wire = { path = "../c2-wire", features = ["std"] }
+tracing = "0.1"
