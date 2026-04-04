@@ -9,4 +9,4 @@ pub mod registry;
 
 pub use config::ChunkConfig;
 pub use promote::promote_to_shm;
-pub use registry::{ChunkRegistry, GcStats};
+pub use registry::{ChunkRegistry, FinishedChunk, GcStats};

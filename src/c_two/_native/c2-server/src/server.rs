@@ -90,8 +90,8 @@ pub struct Server {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     conn_counter: AtomicU64,
-    /// Server-side MemPool for chunked reassembly buffers.
-    reassembly_pool: Arc<std::sync::RwLock<MemPool>>,
+    /// Sharded chunk reassembly lifecycle manager.
+    chunk_registry: Arc<c2_chunk::ChunkRegistry>,
     /// Server-side MemPool for writing buddy SHM responses.
     response_pool: Arc<std::sync::RwLock<MemPool>>,
 }
@@ -120,6 +120,11 @@ impl Server {
             let prefix = format!("/cc3s{:08x}{:08x}", pid, ra_gen);
             MemPool::new_with_prefix(reassembly_cfg, prefix)
         };
+        let chunk_config = c2_chunk::ChunkConfig::from_ipc(&config);
+        let chunk_registry = Arc::new(c2_chunk::ChunkRegistry::new(
+            Arc::new(std::sync::RwLock::new(reassembly_pool)),
+            chunk_config,
+        ));
         let response_cfg = PoolConfig {
             segment_size: config.pool_segment_size as usize,
             min_block_size: 4096,
@@ -144,7 +149,7 @@ impl Server {
             shutdown_tx,
             shutdown_rx,
             conn_counter: AtomicU64::new(0),
-            reassembly_pool: Arc::new(std::sync::RwLock::new(reassembly_pool)),
+            chunk_registry,
             response_pool: Arc::new(std::sync::RwLock::new(response_pool)),
         })
     }
@@ -169,9 +174,9 @@ impl Server {
         Arc::clone(&self.response_pool)
     }
 
-    /// Get a shared reference to the reassembly pool.
-    pub fn reassembly_pool_arc(&self) -> Arc<std::sync::RwLock<MemPool>> {
-        Arc::clone(&self.reassembly_pool)
+    /// Get the chunk registry (for FFI or external use).
+    pub fn chunk_registry(&self) -> &Arc<c2_chunk::ChunkRegistry> {
+        &self.chunk_registry
     }
 
     /// Run the accept loop.  Blocks until [`shutdown`](Self::shutdown) is called.
@@ -191,6 +196,21 @@ impl Server {
         }
 
         info!(path = %self.socket_path.display(), "server listening");
+
+        // Spawn periodic GC sweep for expired chunk assemblies.
+        let gc_registry = self.chunk_registry.clone();
+        let gc_interval = self.chunk_registry.config().gc_interval;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(gc_interval);
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                let stats = gc_registry.gc_sweep();
+                if stats.expired > 0 {
+                    info!(expired = stats.expired, freed = stats.freed_bytes, "chunk GC sweep");
+                }
+            }
+        });
 
         let mut shutdown_rx = self.shutdown_rx.clone();
         loop {
@@ -349,6 +369,7 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
     debug!(conn_id, "connection closing, draining in-flight");
     hb_handle.abort();
     conn.wait_idle().await;
+    server.chunk_registry.cleanup_connection(conn_id);
     debug!(conn_id, "connection closed");
 }
 
@@ -694,7 +715,7 @@ async fn dispatch_chunked_call(
     };
     offset += ch_consumed;
 
-    // 3. On first chunk, decode call control and create assembler.
+    // 3. On first chunk, decode call control and register with ChunkRegistry.
     if chunk_idx == 0 {
         let (ctrl, ctrl_consumed) = match decode_call_control(payload, offset) {
             Ok(v) => v,
@@ -717,27 +738,21 @@ async fn dispatch_chunked_call(
             return;
         }
 
-        let asm = {
-            let mut pool = server.reassembly_pool.write().unwrap();
-            match c2_wire::assembler::ChunkAssembler::new(
-                &mut pool,
-                total_chunks as usize,
-                chunk_size,
-                server.config.max_total_chunks as usize,
-                server.config.max_reassembly_bytes as usize,
-            ) {
-                Ok(mut a) => {
-                    a.route_name = Some(ctrl.route_name);
-                    a.method_idx = Some(ctrl.method_idx);
-                    a
-                }
-                Err(e) => {
-                    warn!(conn_id = conn.conn_id(), %e, "chunk assembler creation failed");
-                    return;
-                }
-            }
-        };
-        conn.insert_assembler(request_id, asm);
+        if let Err(e) = server.chunk_registry.insert(
+            conn.conn_id(),
+            request_id,
+            total_chunks as usize,
+            chunk_size,
+        ) {
+            warn!(conn_id = conn.conn_id(), %e, "chunk insert failed");
+            return;
+        }
+        server.chunk_registry.set_route_info(
+            conn.conn_id(),
+            request_id,
+            ctrl.route_name,
+            ctrl.method_idx,
+        );
     }
 
     // 4. Get chunk data.
@@ -747,46 +762,40 @@ async fn dispatch_chunked_call(
         &payload[offset..]
     };
 
-    // 5. Feed chunk to assembler.
-    let complete = {
-        let pool = server.reassembly_pool.read().unwrap();
-        match conn.feed_chunk(request_id, &pool, chunk_idx as usize, chunk_data) {
-            Ok(complete) => complete,
-            Err(e) => {
-                warn!(conn_id = conn.conn_id(), %e, "chunk feed error");
-                return;
-            }
+    // 5. Feed chunk to registry.
+    let complete = match server.chunk_registry.feed(
+        conn.conn_id(),
+        request_id,
+        chunk_idx as usize,
+        chunk_data,
+    ) {
+        Ok(complete) => complete,
+        Err(e) => {
+            warn!(conn_id = conn.conn_id(), %e, "chunk feed error");
+            return;
         }
     };
 
-    // 6. If complete, extract data and dispatch.
+    // 6. If complete, finish and dispatch.
     if complete {
-        let asm = match conn.take_assembler(request_id) {
-            Some(a) => a,
-            None => {
-                warn!(conn_id = conn.conn_id(), "assembler missing after completion");
-                return;
-            }
-        };
-        let route_name = asm.route_name.clone().unwrap_or_default();
-        let method_idx = asm.method_idx.unwrap_or(0);
-
-        let handle = match asm.finish() {
-            Ok(h) => h,
+        let finished = match server.chunk_registry.finish(conn.conn_id(), request_id) {
+            Ok(f) => f,
             Err(e) => {
                 warn!(conn_id = conn.conn_id(), %e, "chunk finish failed");
                 return;
             }
         };
+        let route_name = finished.route_name.unwrap_or_default();
+        let method_idx = finished.method_idx.unwrap_or(0);
 
-        let reassembly_pool_arc = server.reassembly_pool_arc();
+        let pool_arc = server.chunk_registry.pool().clone();
         let request = RequestData::Handle {
-            handle,
-            pool: reassembly_pool_arc,
+            handle: finished.handle,
+            pool: pool_arc,
         };
 
-        // Now dispatch like a normal call.
-        conn.flight_inc();
+        // FlightGuard: increments on create, decrements on drop.
+        let _flight = crate::connection::FlightGuard::new(conn);
 
         let route = server.dispatcher.read().await.resolve(&route_name);
         let route = match route {
@@ -795,7 +804,6 @@ async fn dispatch_chunked_call(
                 cleanup_request(request);
                 let msg = format!("route not found: {route_name}");
                 write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
-                conn.flight_dec();
                 return;
             }
         };
@@ -822,8 +830,6 @@ async fn dispatch_chunked_call(
                 write_reply(writer, request_id, &ReplyControl::Error(s.into_bytes())).await;
             }
         }
-
-        conn.flight_dec();
     }
 }
 
@@ -1180,11 +1186,11 @@ mod tests {
         assert_eq!(ctrl.method_idx, 1);
     }
 
-    // -- chunked reassembly via connection --
+    // -- chunked reassembly via ChunkRegistry --
 
     #[test]
-    fn chunked_reassembly_via_connection() {
-        let conn = Connection::new(99);
+    fn chunked_reassembly_via_registry() {
+        use std::sync::{Arc, RwLock};
 
         let reassembly_cfg = c2_mem::config::PoolConfig {
             segment_size: 64 * 1024,
@@ -1195,35 +1201,37 @@ mod tests {
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_srv_chunk_test"),
         };
-        let mut pool = c2_mem::MemPool::new(reassembly_cfg);
+        let pool = Arc::new(RwLock::new(c2_mem::MemPool::new(reassembly_cfg)));
+        let registry = c2_chunk::ChunkRegistry::new(
+            pool.clone(),
+            c2_chunk::ChunkConfig::default(),
+        );
 
+        let conn_id = 99u64;
         let request_id = 42u64;
         let total_chunks = 3usize;
         let chunk_size = 8usize;
 
-        // Create assembler.
-        let mut asm =
-            c2_wire::assembler::ChunkAssembler::new(&mut pool, total_chunks, chunk_size, 512, 8 * (1 << 30)).unwrap();
-        asm.route_name = Some("grid".into());
-        asm.method_idx = Some(0);
-        conn.insert_assembler(request_id, asm);
+        registry.insert(conn_id, request_id, total_chunks, chunk_size).unwrap();
+        registry.set_route_info(conn_id, request_id, "grid".into(), 0);
 
         // Feed chunks.
-        assert!(!conn.feed_chunk(request_id, &pool, 0, b"aaaaaaaa").unwrap());
-        assert!(!conn.feed_chunk(request_id, &pool, 1, b"bbbbbbbb").unwrap());
-        assert!(conn.feed_chunk(request_id, &pool, 2, b"cc").unwrap());
+        assert!(!registry.feed(conn_id, request_id, 0, b"aaaaaaaa").unwrap());
+        assert!(!registry.feed(conn_id, request_id, 1, b"bbbbbbbb").unwrap());
+        assert!(registry.feed(conn_id, request_id, 2, b"cc").unwrap());
 
-        // Take and finish.
-        let asm = conn.take_assembler(request_id).unwrap();
-        assert_eq!(asm.route_name.as_deref(), Some("grid"));
-        assert_eq!(asm.method_idx, Some(0));
-        let handle = asm.finish().unwrap();
-        assert_eq!(handle.len(), 18); // 8+8+2
-        let slice = pool.handle_slice(&handle);
+        // Finish.
+        let finished = registry.finish(conn_id, request_id).unwrap();
+        assert_eq!(finished.route_name.as_deref(), Some("grid"));
+        assert_eq!(finished.method_idx, Some(0));
+        assert_eq!(finished.handle.len(), 18); // 8+8+2
+        let p = pool.read().unwrap();
+        let slice = p.handle_slice(&finished.handle);
         assert_eq!(&slice[0..8], b"aaaaaaaa");
         assert_eq!(&slice[8..16], b"bbbbbbbb");
         assert_eq!(&slice[16..18], b"cc");
-        pool.release_handle(handle);
+        drop(p);
+        pool.write().unwrap().release_handle(finished.handle);
     }
 
     // -- handshake extraction --

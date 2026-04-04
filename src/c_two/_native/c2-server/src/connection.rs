@@ -4,7 +4,6 @@
 //! `c_two.transport.server.connection` — tracks handshake status,
 //! SHM segments, activity timestamps, and in-flight request counting.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -14,7 +13,6 @@ use tracing::warn;
 
 use c2_mem::config::PoolConfig;
 use c2_mem::{FreeResult, MemPool};
-use c2_wire::assembler::ChunkAssembler;
 
 // ---------------------------------------------------------------------------
 // Peer SHM state (set once during handshake, read concurrently)
@@ -87,6 +85,25 @@ impl PeerShmState {
     }
 }
 
+/// RAII guard that increments flight count on creation and decrements on drop.
+/// Ensures [`Connection::wait_idle`] blocks until all guarded tasks complete.
+pub(crate) struct FlightGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> FlightGuard<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
+        conn.flight_inc();
+        Self { conn }
+    }
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.flight_dec();
+    }
+}
+
 /// Per-client connection state.
 pub struct Connection {
     conn_id: u64,
@@ -104,9 +121,6 @@ pub struct Connection {
 
     /// Notified whenever `inflight` drops to zero.
     idle_notify: Notify,
-
-    /// In-progress chunked reassembly state, keyed by request_id.
-    assemblers: Mutex<HashMap<u64, ChunkAssembler>>,
 }
 
 impl Connection {
@@ -123,7 +137,6 @@ impl Connection {
             last_activity: Mutex::new(Instant::now()),
             inflight: AtomicI32::new(0),
             idle_notify: Notify::new(),
-            assemblers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -332,36 +345,6 @@ impl Connection {
             let mut pool = pool_arc.write().unwrap();
             pool.gc_buddy();
         }
-    }
-
-    // -- chunk assembler management -----------------------------------------
-
-    /// Insert a new chunk assembler for the given `request_id`.
-    pub fn insert_assembler(&self, request_id: u64, asm: ChunkAssembler) {
-        self.assemblers.lock().unwrap().insert(request_id, asm);
-    }
-
-    /// Feed a chunk into the assembler for `request_id`.
-    ///
-    /// Returns `Ok(true)` when all chunks are received, `Ok(false)` otherwise.
-    /// Returns `Err` if no assembler exists for this request or on data error.
-    pub fn feed_chunk(
-        &self,
-        request_id: u64,
-        pool: &MemPool,
-        chunk_idx: usize,
-        data: &[u8],
-    ) -> Result<bool, String> {
-        let mut map = self.assemblers.lock().unwrap();
-        let asm = map
-            .get_mut(&request_id)
-            .ok_or_else(|| format!("no assembler for request {request_id}"))?;
-        asm.feed_chunk(pool, chunk_idx, data)
-    }
-
-    /// Remove and return the completed assembler for `request_id`.
-    pub fn take_assembler(&self, request_id: u64) -> Option<ChunkAssembler> {
-        self.assemblers.lock().unwrap().remove(&request_id)
     }
 
     /// Record activity — updates the last-activity timestamp to *now*.

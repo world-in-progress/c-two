@@ -27,6 +27,13 @@ pub struct GcStats {
     pub freed_bytes: u64,
 }
 
+/// Result of a successful [`ChunkRegistry::finish`] call.
+pub struct FinishedChunk {
+    pub handle: MemHandle,
+    pub route_name: Option<String>,
+    pub method_idx: Option<u16>,
+}
+
 /// Per-assembly tracking wrapper around [`ChunkAssembler`].
 struct TrackedAssembler {
     inner: ChunkAssembler,
@@ -165,7 +172,22 @@ impl ChunkRegistry {
         Ok(complete)
     }
 
-    /// Finish a completed assembly and return the reassembled [`MemHandle`].
+    /// Store route metadata on an in-flight assembly (server-side use).
+    pub fn set_route_info(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+        route_name: String,
+        method_idx: u16,
+    ) {
+        let mut shard = self.shard(conn_id).lock().unwrap();
+        if let Some(tracked) = shard.get_mut(&(conn_id, request_id)) {
+            tracked.inner.route_name = Some(route_name);
+            tracked.inner.method_idx = Some(method_idx);
+        }
+    }
+
+    /// Finish a completed assembly and return the reassembled data.
     ///
     /// The entry is removed from the registry regardless of success or failure.
     /// On any error path after `take_handle()`, the handle is released back to
@@ -174,7 +196,7 @@ impl ChunkRegistry {
         &self,
         conn_id: u64,
         request_id: u64,
-    ) -> Result<MemHandle, String> {
+    ) -> Result<FinishedChunk, String> {
         // Remove from shard and decrement counters first.
         let tracked = {
             let mut shard = self.shard(conn_id).lock().unwrap();
@@ -214,7 +236,11 @@ impl ChunkRegistry {
             }
         }
 
-        Ok(handle)
+        Ok(FinishedChunk {
+            handle,
+            route_name: inner.route_name,
+            method_idx: inner.method_idx,
+        })
     }
 
     /// Abort an in-flight assembly, releasing all resources.
@@ -322,11 +348,11 @@ mod tests {
         assert_eq!(reg.active_count(), 1);
         let complete = reg.feed(1, 100, 0, data).unwrap();
         assert!(complete);
-        let handle = reg.finish(1, 100).unwrap();
-        assert_eq!(handle.len(), data.len());
+        let finished = reg.finish(1, 100).unwrap();
+        assert_eq!(finished.handle.len(), data.len());
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
-        pool.write().unwrap().release_handle(handle);
+        pool.write().unwrap().release_handle(finished.handle);
     }
 
     #[test]
@@ -365,18 +391,18 @@ mod tests {
         assert!(!reg.feed(1, 400, 1, &[1u8; 128]).unwrap());
         assert!(!reg.feed(1, 400, 0, &[0u8; 128]).unwrap());
         assert!(reg.feed(1, 400, 2, &[2u8; 128]).unwrap());
-        let handle = reg.finish(1, 400).unwrap();
+        let finished = reg.finish(1, 400).unwrap();
         // Logical length must be trimmed to actual data (last chunk is 64, not 128).
-        assert_eq!(handle.len(), 128 * 3 + 64); // 448, not 512
+        assert_eq!(finished.handle.len(), 128 * 3 + 64); // 448, not 512
         // Verify data integrity
         let p = pool.read().unwrap();
-        let slice = p.handle_slice(&handle);
+        let slice = p.handle_slice(&finished.handle);
         assert_eq!(&slice[0..128], &[0u8; 128]);
         assert_eq!(&slice[128..256], &[1u8; 128]);
         assert_eq!(&slice[256..384], &[2u8; 128]);
         assert_eq!(&slice[384..384 + 64], &[3u8; 64]);
         drop(p);
-        pool.write().unwrap().release_handle(handle);
+        pool.write().unwrap().release_handle(finished.handle);
     }
 
     #[test]
@@ -468,8 +494,8 @@ mod tests {
         // Conn 2's assembly should survive.
         let complete = reg.feed(2, 100, 0, &[42u8; 1024]).unwrap();
         assert!(complete);
-        let handle = reg.finish(2, 100).unwrap();
-        pool.write().unwrap().release_handle(handle);
+        let finished = reg.finish(2, 100).unwrap();
+        pool.write().unwrap().release_handle(finished.handle);
         assert_eq!(reg.active_count(), 0);
     }
 
@@ -485,8 +511,8 @@ mod tests {
                 for req_id in 0u64..10 {
                     reg.insert(conn_id, req_id, 1, 64).unwrap();
                     reg.feed(conn_id, req_id, 0, &[conn_id as u8; 64]).unwrap();
-                    let handle = reg.finish(conn_id, req_id).unwrap();
-                    pool.write().unwrap().release_handle(handle);
+                    let finished = reg.finish(conn_id, req_id).unwrap();
+                    pool.write().unwrap().release_handle(finished.handle);
                 }
             });
             handles.push(h);
@@ -512,8 +538,8 @@ mod tests {
                     let req_id = thread_idx * 1000 + i;
                     reg.insert(conn_id, req_id, 1, 64).unwrap();
                     reg.feed(conn_id, req_id, 0, &[0u8; 64]).unwrap();
-                    let handle = reg.finish(conn_id, req_id).unwrap();
-                    pool.write().unwrap().release_handle(handle);
+                    let finished = reg.finish(conn_id, req_id).unwrap();
+                    pool.write().unwrap().release_handle(finished.handle);
                 }
             });
             handles.push(h);
