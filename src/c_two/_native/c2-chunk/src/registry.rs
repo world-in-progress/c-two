@@ -261,6 +261,30 @@ impl ChunkRegistry {
         }
         stats
     }
+
+    /// Remove all in-flight assemblies for a specific connection.
+    ///
+    /// Called when a connection disconnects to prevent orphaned assemblies.
+    /// Only accesses the single shard for `conn_id` (O(shard_size) scan).
+    pub fn cleanup_connection(&self, conn_id: u64) {
+        let mut shard = self.shard(conn_id).lock().unwrap();
+        let conn_keys: Vec<(u64, u64)> = shard
+            .keys()
+            .filter(|(cid, _)| *cid == conn_id)
+            .copied()
+            .collect();
+
+        for key in conn_keys {
+            if let Some(tracked) = shard.remove(&key) {
+                self.active_count.fetch_sub(1, Ordering::Relaxed);
+                self.total_bytes
+                    .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+                tracked
+                    .inner
+                    .abort(&mut self.pool.write().unwrap());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +292,7 @@ mod tests {
     use super::*;
     use c2_mem::config::PoolConfig;
     use std::sync::atomic::{AtomicU32, Ordering as TestOrdering};
+    use std::time::Duration;
 
     static TEST_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -367,5 +392,84 @@ mod tests {
         assert_eq!(reg.active_count(), 1);
         // Cleanup.
         reg.abort(1, 500);
+    }
+
+    #[test]
+    fn gc_sweep_expires_stale() {
+        let pool = test_pool();
+        let cfg = ChunkConfig {
+            assembler_timeout: Duration::from_millis(50),
+            ..ChunkConfig::default()
+        };
+        let reg = ChunkRegistry::new(pool.clone(), cfg);
+        reg.insert(1, 1, 1, 1024).unwrap();
+        assert_eq!(reg.active_count(), 1);
+        std::thread::sleep(Duration::from_millis(80));
+        let stats = reg.gc_sweep();
+        assert_eq!(stats.expired, 1);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+    }
+
+    #[test]
+    fn feed_updates_last_activity() {
+        let pool = test_pool();
+        let cfg = ChunkConfig {
+            assembler_timeout: Duration::from_millis(100),
+            ..ChunkConfig::default()
+        };
+        let reg = ChunkRegistry::new(pool.clone(), cfg);
+        reg.insert(1, 1, 3, 1024).unwrap();
+        // Wait 60ms, feed a chunk — resets timer.
+        std::thread::sleep(Duration::from_millis(60));
+        reg.feed(1, 1, 0, &[0u8; 1024]).unwrap();
+        // Wait another 60ms (120ms from insert, but only 60ms from last feed).
+        std::thread::sleep(Duration::from_millis(60));
+        let stats = reg.gc_sweep();
+        assert_eq!(stats.expired, 0);
+        assert_eq!(reg.active_count(), 1);
+        // Cleanup.
+        reg.abort(1, 1);
+    }
+
+    #[test]
+    fn soft_limit_triggers_gc() {
+        let pool = test_pool();
+        let cfg = ChunkConfig {
+            soft_limit: 2,
+            assembler_timeout: Duration::from_millis(10),
+            ..ChunkConfig::default()
+        };
+        let reg = ChunkRegistry::new(pool.clone(), cfg);
+        reg.insert(1, 1, 1, 64).unwrap();
+        reg.insert(1, 2, 1, 64).unwrap();
+        assert_eq!(reg.active_count(), 2);
+        // Let both expire.
+        std::thread::sleep(Duration::from_millis(30));
+        // This insert exceeds soft_limit (2) → triggers gc_sweep internally.
+        reg.insert(1, 3, 1, 64).unwrap();
+        // GC should have cleaned up the 2 expired ones; only the new one remains.
+        assert!(reg.active_count() <= 2);
+        // Cleanup remaining.
+        reg.abort(1, 3);
+    }
+
+    #[test]
+    fn cleanup_connection_removes_only_target() {
+        let pool = test_pool();
+        let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
+        reg.insert(1, 100, 1, 1024).unwrap();
+        reg.insert(1, 200, 1, 1024).unwrap();
+        reg.insert(2, 100, 1, 1024).unwrap();
+        assert_eq!(reg.active_count(), 3);
+        // Cleanup conn 1 — should remove (1,100) and (1,200).
+        reg.cleanup_connection(1);
+        assert_eq!(reg.active_count(), 1);
+        // Conn 2's assembly should survive.
+        let complete = reg.feed(2, 100, 0, &[42u8; 1024]).unwrap();
+        assert!(complete);
+        let handle = reg.finish(2, 100).unwrap();
+        pool.write().unwrap().release_handle(handle);
+        assert_eq!(reg.active_count(), 0);
     }
 }
