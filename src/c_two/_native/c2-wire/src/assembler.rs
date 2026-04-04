@@ -7,11 +7,6 @@
 use c2_mem::handle::MemHandle;
 use c2_mem::MemPool;
 
-/// Maximum number of chunks allowed per reassembly (512 × 128 MB = 64 GB max).
-const MAX_TOTAL_CHUNKS: usize = 512;
-/// Maximum total reassembly size (8 GB).
-const MAX_REASSEMBLY_BYTES: usize = 8 * (1 << 30);
-
 /// Reassembles chunked payloads into a contiguous [`MemHandle`].
 ///
 /// # Lifecycle
@@ -26,7 +21,7 @@ pub struct ChunkAssembler {
     received: usize,
     /// High-water mark: one past the last byte written.
     written_end: usize,
-    handle: MemHandle,
+    handle: Option<MemHandle>,
     received_flags: Vec<bool>,
     /// Route name extracted from the first chunk (server-side).
     pub route_name: Option<String>,
@@ -53,22 +48,22 @@ impl ChunkAssembler {
         pool: &mut MemPool,
         total_chunks: usize,
         chunk_size: usize,
+        max_total_chunks: usize,
+        max_reassembly_bytes: usize,
     ) -> Result<Self, String> {
         if total_chunks == 0 {
             return Err("total_chunks must be > 0".into());
         }
-        if chunk_size == 0 {
-            return Err("chunk_size must be > 0".into());
-        }
-        if total_chunks > MAX_TOTAL_CHUNKS {
+        if total_chunks > max_total_chunks {
             return Err(format!(
-                "total_chunks {total_chunks} exceeds limit {MAX_TOTAL_CHUNKS}"
+                "total_chunks {total_chunks} exceeds limit {max_total_chunks}"
             ));
         }
-        let alloc_size = total_chunks * chunk_size;
-        if alloc_size > MAX_REASSEMBLY_BYTES {
+        let alloc_size = total_chunks.checked_mul(chunk_size)
+            .ok_or_else(|| "chunk allocation overflow".to_string())?;
+        if alloc_size > max_reassembly_bytes {
             return Err(format!(
-                "reassembly size {alloc_size} exceeds limit {MAX_REASSEMBLY_BYTES}"
+                "reassembly size {alloc_size} exceeds limit {max_reassembly_bytes}"
             ));
         }
         let handle = pool.alloc_handle(alloc_size)?;
@@ -77,7 +72,7 @@ impl ChunkAssembler {
             chunk_size,
             received: 0,
             written_end: 0,
-            handle,
+            handle: Some(handle),
             received_flags: vec![false; total_chunks],
             route_name: None,
             method_idx: None,
@@ -109,8 +104,10 @@ impl ChunkAssembler {
                 data.len(), self.chunk_size
             ));
         }
+        let handle = self.handle.as_mut()
+            .ok_or("assembler handle already taken")?;
         let offset = chunk_idx * self.chunk_size;
-        let slice = pool.handle_slice_mut(&mut self.handle);
+        let slice = pool.handle_slice_mut(handle);
         slice[offset..offset + data.len()].copy_from_slice(data);
         self.received_flags[chunk_idx] = true;
         self.received += 1;
@@ -143,15 +140,28 @@ impl ChunkAssembler {
                 self.received, self.total_chunks
             ));
         }
-        self.handle.set_len(self.written_end);
-        Ok(self.handle)
+        let mut handle = self.handle.take()
+            .ok_or("assembler handle already taken")?;
+        handle.set_len(self.written_end);
+        Ok(handle)
     }
 
     /// Abort reassembly, releasing the underlying MemHandle.
     ///
     /// `pool` is needed to free buddy/dedicated handles.
-    pub fn abort(self, pool: &mut MemPool) {
-        pool.release_handle(self.handle);
+    pub fn abort(mut self, pool: &mut MemPool) {
+        if let Some(handle) = self.handle.take() {
+            pool.release_handle(handle);
+        }
+    }
+
+    /// Extract the underlying MemHandle without consuming self.
+    ///
+    /// Returns `None` if the handle was already taken (by a previous
+    /// `take_handle`, `finish`, or `abort` call).
+    /// Used by `ChunkRegistry` for safe error-path cleanup.
+    pub fn take_handle(&mut self) -> Option<MemHandle> {
+        self.handle.take()
     }
 }
 
@@ -175,7 +185,7 @@ mod tests {
     #[test]
     fn test_single_chunk() {
         let mut pool = test_pool();
-        let mut asm = ChunkAssembler::new(&mut pool, 1, 4096).unwrap();
+        let mut asm = ChunkAssembler::new(&mut pool, 1, 4096, 512, 8 * (1 << 30)).unwrap();
         let data = b"hello world";
         let complete = asm.feed_chunk(&pool, 0, data).unwrap();
         assert!(complete);
@@ -189,7 +199,7 @@ mod tests {
     #[test]
     fn test_multi_chunk_in_order() {
         let mut pool = test_pool();
-        let mut asm = ChunkAssembler::new(&mut pool, 3, 8).unwrap();
+        let mut asm = ChunkAssembler::new(&mut pool, 3, 8, 512, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(&pool, 0, b"aaaaaaaa").unwrap()); // full
         assert!(!asm.feed_chunk(&pool, 1, b"bbbbbbbb").unwrap()); // full
         assert!(asm.feed_chunk(&pool, 2, b"cc").unwrap());        // last, short
@@ -205,7 +215,7 @@ mod tests {
     #[test]
     fn test_out_of_order() {
         let mut pool = test_pool();
-        let mut asm = ChunkAssembler::new(&mut pool, 2, 8).unwrap();
+        let mut asm = ChunkAssembler::new(&mut pool, 2, 8, 512, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(&pool, 1, b"second").unwrap()); // last, short
         assert!(asm.feed_chunk(&pool, 0, b"firstttt").unwrap()); // full
         let handle = asm.finish().unwrap();
@@ -219,7 +229,7 @@ mod tests {
     #[test]
     fn test_duplicate_chunk_rejected() {
         let mut pool = test_pool();
-        let mut asm = ChunkAssembler::new(&mut pool, 2, 8).unwrap();
+        let mut asm = ChunkAssembler::new(&mut pool, 2, 8, 512, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(&pool, 0, b"data").unwrap();
         let err = asm.feed_chunk(&pool, 0, b"dup").unwrap_err();
         assert!(err.contains("duplicate"));
@@ -229,7 +239,7 @@ mod tests {
     #[test]
     fn test_abort_releases_handle() {
         let mut pool = test_pool();
-        let asm = ChunkAssembler::new(&mut pool, 4, 4096).unwrap();
+        let asm = ChunkAssembler::new(&mut pool, 4, 4096, 512, 8 * (1 << 30)).unwrap();
         asm.abort(&mut pool);
         // Pool should still work after abort.
         let h = pool.alloc_handle(4096).unwrap();
@@ -239,7 +249,7 @@ mod tests {
     #[test]
     fn test_finish_incomplete_fails() {
         let mut pool = test_pool();
-        let mut asm = ChunkAssembler::new(&mut pool, 3, 8).unwrap();
+        let mut asm = ChunkAssembler::new(&mut pool, 3, 8, 512, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(&pool, 0, b"data").unwrap();
         let err = asm.finish().unwrap_err();
         assert!(err.contains("incomplete"));
@@ -248,14 +258,14 @@ mod tests {
     #[test]
     fn test_zero_chunks_rejected() {
         let mut pool = test_pool();
-        let err = ChunkAssembler::new(&mut pool, 0, 4096).unwrap_err();
+        let err = ChunkAssembler::new(&mut pool, 0, 4096, 512, 8 * (1 << 30)).unwrap_err();
         assert!(err.contains("total_chunks must be > 0"));
     }
 
     #[test]
     fn test_oversized_chunk_data() {
         let mut pool = test_pool();
-        let mut asm = ChunkAssembler::new(&mut pool, 2, 8).unwrap();
+        let mut asm = ChunkAssembler::new(&mut pool, 2, 8, 512, 8 * (1 << 30)).unwrap();
         let err = asm.feed_chunk(&pool, 0, &[0u8; 16]).unwrap_err();
         assert!(err.contains("exceeds chunk_size"));
         asm.abort(&mut pool);
@@ -264,7 +274,18 @@ mod tests {
     #[test]
     fn test_zero_chunk_size_rejected() {
         let mut pool = test_pool();
-        let err = ChunkAssembler::new(&mut pool, 1, 0).unwrap_err();
-        assert!(err.contains("chunk_size must be > 0"));
+        let err = ChunkAssembler::new(&mut pool, 1, 0, 512, 8 * (1 << 30)).unwrap_err();
+        assert!(err.contains("allocate 0 bytes") || err.contains("chunk_size"));
+    }
+
+    #[test]
+    fn take_handle_extracts_and_clears() {
+        let mut pool = test_pool();
+        let mut asm = ChunkAssembler::new(&mut pool, 1, 4096, 512, 8 * (1 << 30)).unwrap();
+        let h = asm.take_handle();
+        assert!(h.is_some());
+        let h2 = asm.take_handle();
+        assert!(h2.is_none()); // second call returns None
+        pool.release_handle(h.unwrap());
     }
 }

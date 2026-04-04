@@ -959,7 +959,11 @@ async fn recv_loop(
                     total_size as usize
                 };
                 let mut pool = reassembly_pool.lock().unwrap();
-                match ChunkAssembler::new(&mut pool, total_chunks as usize, chunk_size) {
+                match ChunkAssembler::new(
+                    &mut pool, total_chunks as usize, chunk_size,
+                    512, // TODO: pass from config
+                    8 * (1 << 30), // TODO: pass from config
+                ) {
                     Ok(asm) => { assemblers.insert(rid, asm); }
                     Err(e) => {
                         eprintln!("Warning: reply chunk assembler creation failed: {e}");

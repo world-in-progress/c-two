@@ -723,6 +723,8 @@ async fn dispatch_chunked_call(
                 &mut pool,
                 total_chunks as usize,
                 chunk_size,
+                server.config.max_total_chunks as usize,
+                server.config.max_reassembly_bytes as usize,
             ) {
                 Ok(mut a) => {
                     a.route_name = Some(ctrl.route_name);
@@ -1201,7 +1203,7 @@ mod tests {
 
         // Create assembler.
         let mut asm =
-            c2_wire::assembler::ChunkAssembler::new(&mut pool, total_chunks, chunk_size).unwrap();
+            c2_wire::assembler::ChunkAssembler::new(&mut pool, total_chunks, chunk_size, 512, 8 * (1 << 30)).unwrap();
         asm.route_name = Some("grid".into());
         asm.method_idx = Some(0);
         conn.insert_assembler(request_id, asm);

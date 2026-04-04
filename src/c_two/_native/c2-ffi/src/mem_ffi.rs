@@ -637,7 +637,11 @@ impl PyChunkAssembler {
             let mut pool = pool_arc
                 .write()
                 .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
-            ChunkAssembler::new(&mut pool, total_chunks, chunk_size)
+            ChunkAssembler::new(
+                &mut pool, total_chunks, chunk_size,
+                512, // TODO: pass from config
+                8 * (1 << 30), // TODO: pass from config
+            )
                 .map_err(|e| PyRuntimeError::new_err(e))?
         };
         Ok(Self {
