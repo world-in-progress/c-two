@@ -1,1 +1,0 @@
-"""IPC transport subpackage."""
