@@ -1,1 +1,1 @@
-from .frame import IPCConfig
+"""IPC transport subpackage."""
