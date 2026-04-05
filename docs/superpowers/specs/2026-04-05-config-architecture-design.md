@@ -4,6 +4,27 @@
 **Status:** Draft
 **Scope:** IPC config unification — Python single source of truth, Rust mirror, FFI full-field pass-through
 
+## Breaking Changes (0.x.x)
+
+Since the project is pre-1.0, these are documented breaking changes with no backward-compat shims.
+
+### Environment Variables
+
+| Before | After | Reason |
+|--------|-------|--------|
+| `C2_IPC_SEGMENT_SIZE` | `C2_IPC_POOL_SEGMENT_SIZE` | Disambiguate pool vs reassembly segment size |
+| `C2_IPC_MAX_SEGMENTS` | `C2_IPC_MAX_POOL_SEGMENTS` | Disambiguate pool vs reassembly segment count |
+
+### Python API
+
+| Before | After | Reason |
+|--------|-------|--------|
+| `cc.set_server_ipc_config(segment_size=...)` | `cc.set_server(pool_segment_size=...)` | Shorter name; kwargs use field names directly |
+| `cc.set_client_ipc_config(segment_size=...)` | `cc.set_client(pool_segment_size=...)` | Shorter name; kwargs use field names directly |
+| `cc.set_shm_threshold(value)` | `cc.set_config(shm_threshold=value)` | Unified global config entry point |
+
+Parameter names also change: `segment_size` → `pool_segment_size`, `max_segments` → `max_pool_segments` (matching field names directly, no more remapping).
+
 ## Problem
 
 Configuration is scattered and drifting:
@@ -135,6 +156,12 @@ class BaseIPCConfig:
             raise ValueError("chunk_assembler_timeout must be positive")
 ```
 
+> **Note on clamping:** The current `IPCConfig.__post_init__` mutates
+> `pool_segment_size` to clamp it to `max_payload_size`. With `frozen=True`,
+> mutation is impossible. Clamping logic moves to `build_server_config()` /
+> `build_client_config()` — applied **before** constructing the frozen
+> dataclass. See "Config Priority Chain → Implementation" below.
+
 ### ServerIPCConfig
 
 ```python
@@ -166,11 +193,12 @@ class ServerIPCConfig(BaseIPCConfig):
 ```python
 @dataclass(frozen=True)
 class ClientIPCConfig(BaseIPCConfig):
-    """Client-side IPC configuration. Currently identical to BaseIPCConfig; reserved for future extension."""
-    pass
+    """Client-side IPC configuration. Overrides reassembly defaults for lower memory footprint."""
+    reassembly_segment_size: int = 67_108_864      # 64 MB (vs server 256 MB)
+    reassembly_max_segments: int = 4
 ```
 
-Client uses the same base fields. No additional fields needed today, but the class exists for future extension (e.g., retry policy, connection timeout).
+Client uses a smaller `reassembly_segment_size` default (64 MB vs server's 256 MB) because a single process may connect to many servers — 10 connections × 256 MB × 4 segments = 10 GB would be excessive. At 64 MB × 4 = 256 MB per connection, 10 connections = 2.5 GB, which is reasonable.
 
 ## Config Priority Chain
 
@@ -200,6 +228,14 @@ def build_server_config(settings: C2Settings, **kwargs) -> ServerIPCConfig:
         elif hasattr(settings, env_name) and getattr(settings, env_name) is not None:
             merged[name] = getattr(settings, env_name)
         # else: omit — dataclass default applies
+
+    # Clamping (formerly in IPCConfig.__post_init__ mutation):
+    # pool_segment_size must not exceed max_payload_size
+    seg = merged.get('pool_segment_size', ServerIPCConfig.pool_segment_size)
+    pay = merged.get('max_payload_size', ServerIPCConfig.max_payload_size)
+    if seg > pay:
+        merged['pool_segment_size'] = pay
+
     return ServerIPCConfig(**merged)
 
 
@@ -351,6 +387,7 @@ impl std::ops::Deref for ClientIpcConfig {
 - **`Deref` to `BaseIpcConfig`**: Allows `config.pool_segment_size` without `.base.` — ergonomic for downstream crates
 - **`Default` impl**: Retained for Rust-only testing. Values match Python defaults but are NOT authoritative in production
 - **Types**: `u64` for all sizes, `f64` for all durations, `u32` for all counts — no more `usize` ambiguity
+- **Client `reassembly_segment_size`**: Python `ClientIPCConfig` overrides to 64 MB; Rust `Default` for `ClientIpcConfig` should also use 64 MB. The `BaseIpcConfig::Default` uses 256 MB (server-oriented), but `ClientIpcConfig::Default` overrides `base.reassembly_segment_size` to 64 MB
 
 ### Downstream Crate Usage
 
@@ -358,7 +395,7 @@ impl std::ops::Deref for ClientIpcConfig {
 |-------|------|-------|
 | `c2-server` | `ServerIpcConfig` | Pool setup, heartbeat, frame limits |
 | `c2-ipc` | `ClientIpcConfig` | Pool setup, chunk config |
-| `c2-chunk` | `BaseIpcConfig` (via `ChunkConfig::from_base()`) | Chunk assembly params only |
+| `c2-chunk` | `BaseIpcConfig` (via `ChunkConfig::from_base()`) | Rename from current `from_ipc()` |
 | `c2-mem` | `PoolConfig` (unchanged) | Not affected by IPC split |
 | `c2-relay` | `RelayConfig` (unchanged) | Not affected |
 
@@ -496,6 +533,112 @@ def __init__(self, ...):
 
 **Key invariant:** Every field in `ServerIpcConfig` / `ClientIpcConfig` has a 1:1 mapping in the FFI signature. No field is omitted, no default is assumed.
 
+### RustClientPool FFI
+
+The current `RustClientPool.acquire()` and `set_default_config()` in `client_ffi.rs` also have hardcoded defaults and `..IpcConfig::default()` fallback. These must be converted to full-field pass-through.
+
+**Before (current — problematic):**
+```rust
+// set_default_config() — hardcoded defaults drift from Python
+#[pyo3(signature = (shm_threshold=4096, chunk_size=131072, pool_segment_size=None, ...))]
+fn set_default_config(&self, ...) {
+    let defaults = IpcConfig::default();
+    self.inner.set_default_config(IpcConfig {
+        shm_threshold,
+        chunk_size,
+        pool_segment_size: pool_segment_size.unwrap_or(defaults.pool_segment_size),
+        ..defaults    // ← fills unpassed fields with Rust defaults
+    });
+}
+
+// acquire() — optional overrides with IpcConfig::default() fallback
+#[pyo3(signature = (address, shm_threshold=None, chunk_size=None, ...))]
+fn acquire(&self, ...) -> PyResult<PyRustClient> {
+    let defaults = IpcConfig::default();
+    let config = Some(IpcConfig { ..defaults });  // ← Rust defaults, not Python
+    ...
+}
+```
+
+**After (this design):**
+
+`RustClientPool.set_default_config()` receives a frozen `ClientIPCConfig` worth of fields — all mandatory:
+
+```rust
+#[pyo3(signature = (
+    shm_threshold,
+    pool_enabled,
+    pool_segment_size,
+    max_pool_segments,
+    max_pool_memory,
+    reassembly_segment_size,
+    reassembly_max_segments,
+    max_total_chunks,
+    chunk_gc_interval,
+    chunk_threshold_ratio,
+    chunk_assembler_timeout,
+    max_reassembly_bytes,
+    chunk_size,
+))]
+fn set_default_config(
+    &self,
+    shm_threshold: u64,
+    pool_enabled: bool,
+    pool_segment_size: u64,
+    max_pool_segments: u32,
+    max_pool_memory: u64,
+    reassembly_segment_size: u64,
+    reassembly_max_segments: u32,
+    max_total_chunks: u32,
+    chunk_gc_interval: f64,
+    chunk_threshold_ratio: f64,
+    chunk_assembler_timeout: f64,
+    max_reassembly_bytes: u64,
+    chunk_size: u64,
+) {
+    let config = ClientIpcConfig {
+        base: BaseIpcConfig { /* all fields from params */ },
+        shm_threshold,
+    };
+    self.inner.set_default_config(config);
+}
+```
+
+`RustClientPool.acquire()` no longer accepts config overrides — it uses the pool's default config set via `set_default_config()`. Per-connection config overrides are eliminated (they were a source of inconsistency):
+
+```rust
+#[pyo3(signature = (address,))]
+fn acquire(&self, py: Python<'_>, address: &str) -> PyResult<PyRustClient> {
+    // Uses the default config set by set_default_config()
+    let client = py.allow_threads(move || self.inner.acquire(address, None))
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+    Ok(PyRustClient { inner: client })
+}
+```
+
+**Python-side caller:**
+```python
+# registry.py — during init or set_client()
+pool = RustClientPool(max_connections=...)
+cfg = registry._client_config    # frozen ClientIPCConfig
+shm = registry._global_config.shm_threshold
+pool.set_default_config(
+    shm_threshold=shm,
+    pool_enabled=cfg.pool_enabled,
+    pool_segment_size=cfg.pool_segment_size,
+    max_pool_segments=cfg.max_pool_segments,
+    max_pool_memory=cfg.max_pool_memory,
+    reassembly_segment_size=cfg.reassembly_segment_size,
+    reassembly_max_segments=cfg.reassembly_max_segments,
+    max_total_chunks=cfg.max_total_chunks,
+    chunk_gc_interval=cfg.chunk_gc_interval,
+    chunk_threshold_ratio=cfg.chunk_threshold_ratio,
+    chunk_assembler_timeout=cfg.chunk_assembler_timeout,
+    max_reassembly_bytes=cfg.max_reassembly_bytes,
+    chunk_size=cfg.chunk_size,
+)
+```
+
 ## Scope
 
 ### In Scope
@@ -505,7 +648,7 @@ def __init__(self, ...):
 - Update all Python import sites
 - Rust `c2-config/src/ipc.rs`: replace `IpcConfig` with `BaseIpcConfig` + `ServerIpcConfig` + `ClientIpcConfig`
 - Update all Rust crate consumers (`c2-server`, `c2-ipc`, `c2-chunk`, `c2-ffi`)
-- FFI: full-field mandatory signatures for `RustServer::new()` and `RustClient::new()`
+- FFI: full-field mandatory signatures for `RustServer::new()`, `RustClient::new()`, `RustClientPool.set_default_config()`, and simplified `RustClientPool.acquire()`
 - `cc.set_server()`, `cc.set_client()`, `cc.set_config()` API on `cc` namespace
 - `.env` support for all IPC config fields via `C2Settings`
 - Runtime protection (warning on post-start config changes)
@@ -525,9 +668,11 @@ def __init__(self, ...):
 1. **Config construction**: `BaseIPCConfig()`, `ServerIPCConfig()`, `ClientIPCConfig()` with defaults
 2. **Frozen enforcement**: Attempt attribute mutation → `FrozenInstanceError`
 3. **Validation**: Invalid values → `ValueError` (negative sizes, out-of-range ratios)
-4. **Priority chain**: kwargs override env, env override defaults
-5. **Runtime protection**: `cc.set_server()` after `cc.register()` → `UserWarning` emitted, config unchanged
-6. **Build functions**: `build_server_config()` / `build_client_config()` merge correctly
+4. **Clamping**: `build_server_config(pool_segment_size > max_payload_size)` → clamped to `max_payload_size`
+5. **Priority chain**: kwargs override env, env override defaults
+6. **Runtime protection**: `cc.set_server()` after `cc.register()` → `UserWarning` emitted, config unchanged
+7. **Build functions**: `build_server_config()` / `build_client_config()` merge correctly
+8. **Client defaults**: `ClientIPCConfig().reassembly_segment_size == 64 MB` (differs from Base's 256 MB)
 
 ### Rust Unit Tests
 
