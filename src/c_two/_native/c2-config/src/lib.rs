@@ -7,6 +7,6 @@ mod ipc;
 mod pool;
 mod relay;
 
-pub use ipc::IpcConfig;
+pub use ipc::{BaseIpcConfig, ClientIpcConfig, ServerIpcConfig};
 pub use pool::PoolConfig;
 pub use relay::RelayConfig;
