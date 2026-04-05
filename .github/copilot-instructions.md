@@ -27,10 +27,10 @@ uv run pytest tests/unit/test_encoding.py -q
 uv run pytest tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 
 # Rust type-check (no PyO3 link needed)
-cd src/c_two/_native && cargo check -p c2-mem -p c2-wire -p c2-ipc -p c2-server
+cd src/c_two/_native && cargo check -p c2-mem -p c2-wire -p c2-ipc -p c2-server -p c2-config -p c2-chunk
 
 # Rust unit tests (pure Rust, no Python linkage)
-cd src/c_two/_native && cargo test -p c2-mem -p c2-wire --no-default-features
+cd src/c_two/_native && cargo test -p c2-mem -p c2-wire -p c2-config -p c2-chunk --no-default-features
 
 # Note: c2-ffi tests need Python linkage — use `cargo check` not `cargo test`
 
@@ -64,7 +64,18 @@ Two-language design: Python owns domain logic (CRM/ICRM/Components); Rust owns t
 - **Script-based**: Use `cc.connect(ICRMClass, name='...', address='...')` to get a typed ICRM proxy.
 - **Function-based**: Decorate functions with `@cc.runtime.connect`. The first parameter must be typed as the ICRM class — the framework injects the connected instance automatically.
 
-### 3. Transport Layer (`src/c_two/transport/`)
+### 3. Config Layer (`src/c_two/config/`)
+
+Unified configuration with Python as the single source of truth, passed through to Rust via FFI.
+
+| File | Purpose |
+|------|---------|
+| `settings.py` | `C2Settings` pydantic model — env vars `C2_IPC_ADDRESS`, `C2_RELAY_ADDRESS`, `C2_IPC_POOL_SEGMENT_SIZE` etc. |
+| `ipc.py` | Frozen dataclasses: `BaseIPCConfig`, `ServerIPCConfig`, `ClientIPCConfig` + `build_server_config()` / `build_client_config()` |
+
+Config priority chain: explicit kwargs → environment variables → class defaults.
+
+### 4. Transport Layer (`src/c_two/transport/`)
 
 The transport layer is a thin Python orchestration shell around a Rust-native core. Python handles CRM registration, scheduling, and serialization; Rust handles IPC, wire framing, SHM, and HTTP relay.
 
@@ -72,11 +83,9 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 
 | File | Purpose |
 |------|---------|
-| `registry.py` | SOTA API surface: `cc.register()`, `cc.connect()`, `cc.close()`, `cc.shutdown()` etc. |
-| `config.py` | `C2Settings` pydantic model — env vars `C2_IPC_ADDRESS`, `C2_RELAY_ADDRESS` etc. |
+| `registry.py` | SOTA API surface: `cc.register()`, `cc.connect()`, `cc.close()`, `cc.shutdown()`, `cc.set_server()`, `cc.set_client()` etc. |
 | `protocol.py` | Re-export facade for Rust handshake codec — `Handshake`, `RouteInfo`, flag constants |
 | `wire.py` | `MethodTable` — maps ICRM method names to indices for wire dispatch; thin FFI wrappers |
-| `ipc/frame.py` | `IPCConfig` dataclass — transport tuning (SHM threshold, pool size, heartbeat, etc.) |
 | `server/native.py` | `NativeServerBridge` (exported as `Server`) — Python↔Rust server bridge |
 | `server/scheduler.py` | Read/write-aware CRM method execution scheduler |
 | `server/reply.py` | `unpack_icrm_result` + `wrap_error` — CRM reply handling |
@@ -90,14 +99,16 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 
 **Address priority:** `cc.set_address()` > `C2_IPC_ADDRESS` env var > auto-generated UUID path.
 
-### 4. Rust Native Layer (`src/c_two/_native/`)
+### 5. Rust Native Layer (`src/c_two/_native/`)
 
-A Cargo workspace of 7 crates, compiled into a single `c_two._native` Python extension module:
+A Cargo workspace of 9 crates, compiled into a single `c_two._native` Python extension module:
 
 | Crate | Purpose |
 |-------|---------|
+| `c2-config` | Unified IPC configuration structs (Base/Server/Client), shared by all Rust crates |
 | `c2-mem` | Buddy allocator, SHM regions, unified MemPool (buddy/dedicated/file-spill) |
 | `c2-wire` | Wire protocol codec, frame encoding, ChunkAssembler |
+| `c2-chunk` | ChunkRegistry — sharded lifecycle manager for chunked transfers |
 | `c2-ipc` | Async IPC client (UDS + SHM), chunked transfer |
 | `c2-server` | Tokio-based UDS server with per-connection state and peer SHM lazy-open |
 | `c2-http` | HTTP client for relay transport |
@@ -164,6 +175,7 @@ import c_two as cc
 
 # Server side
 cc.set_address('ipc://my_server')                       # optional: explicit address
+cc.set_server(pool_segment_size=2*1024*1024*1024)        # optional: tune IPC config
 cc.register(IGrid, grid_instance, name='grid')           # register CRM
 cc.register(INetwork, net_instance, name='network')      # multiple CRMs in one process
 
@@ -173,6 +185,7 @@ grid.some_method(arg)
 cc.close(grid)
 
 # Client side (remote process → IPC)
+cc.set_client(pool_segment_size=2*1024*1024*1024)        # optional: tune client config
 grid = cc.connect(IGrid, name='grid', address='ipc://my_server')
 grid.some_method(arg)
 cc.close(grid)
@@ -200,8 +213,14 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `C2_IPC_ADDRESS` | Override auto-generated IPC server address | auto UUID |
-| `C2_IPC_SEGMENT_SIZE` | Buddy pool segment size in bytes | 268435456 (256 MB) |
-| `C2_IPC_MAX_SEGMENTS` | Max buddy pool segments (1–255) | 4 |
+| `C2_IPC_POOL_SEGMENT_SIZE` | Buddy pool segment size in bytes | 268435456 (256 MB) |
+| `C2_IPC_MAX_POOL_SEGMENTS` | Max buddy pool segments (1–255) | 4 |
+| `C2_IPC_MAX_POOL_MEMORY` | Max total pool memory in bytes | segment_size × max_segments |
+| `C2_IPC_POOL_DECAY_SECONDS` | Idle segment decay time | 60.0 |
+| `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | 131072 (128 KB) |
+| `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | 2147483648 (2 GB) |
+| `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds (0 disables) | 30.0 |
+| `C2_SHM_THRESHOLD` | Payload size threshold for SHM vs inline | 4096 (4 KB) |
 | `C2_RELAY_ADDRESS` | HTTP relay server address | (none) |
 | `C2_ENV_FILE` | Path to `.env` file; empty string disables | `.env` |
 

@@ -245,10 +245,11 @@ cc.serve()
 
 **中继** (`relay.py`)：
 ```python
-from c_two.transport.relay import Relay
+from c_two.relay import NativeRelay
 
-relay = Relay(bind='127.0.0.1:8080')
-relay.start(blocking=True)
+relay = NativeRelay('127.0.0.1:8080')
+relay.start()
+relay.register_upstream('grid', 'ipc://grid_server')
 ```
 
 **客户端** (`client.py`)：
@@ -327,6 +328,7 @@ IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联
 性能关键组件使用 Rust 实现，通过 [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) 编译为 Python 扩展：
 
 - **伙伴分配器** — IPC 传输的零系统调用共享内存分配。跨进程，快速路径上无锁。
+- **分块注册表** — 分片式生命周期管理器，处理跨 buddy、dedicated 和文件溢出内存层的大载荷分块传输。
 - **HTTP 中继** — 基于 [axum](https://github.com/tokio-rs/axum) 的高吞吐网关，桥接 HTTP 到 IPC。处理连接池和请求多路复用。
 
 Rust 扩展在 `pip install c-two`（从预编译 wheel）或 `uv sync`（从源码）时自动编译。
@@ -371,6 +373,7 @@ uv run pytest    # 运行测试套件
 | 分块流式传输（载荷 > 256 MB） | ✅ 稳定 |
 | 心跳与连接管理 | ✅ 稳定 |
 | 读/写并发控制 | ✅ 稳定 |
+| 统一配置架构（Python 单一事实源） | ✅ 稳定 |
 | CI/CD 与多平台 PyPI 发布 | ✅ 稳定 |
 | 异步接口 | 🔜 规划中 |
 | 极端载荷磁盘溢出 | ✅ 稳定 |
