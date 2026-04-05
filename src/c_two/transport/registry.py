@@ -170,6 +170,23 @@ class _ProcessRegistry:
                 )
             self._shm_threshold = threshold
 
+    def set_config(self, *, shm_threshold: int | None = None) -> None:
+        """Set global config. Must be called before register()/connect()."""
+        with self._lock:
+            if self._server is not None or self._pool_config_applied:
+                import warnings
+                warnings.warn(
+                    'Active connections exist, set_config() ignored. '
+                    'Call set_config() before register()/connect().',
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return
+            if shm_threshold is not None:
+                if shm_threshold <= 0:
+                    raise ValueError(f'shm_threshold must be > 0, got {shm_threshold}')
+                self._shm_threshold = shm_threshold
+
     def set_server(self, **kwargs: object) -> None:
         """Configure IPC server. Must be called before register()."""
         with self._lock:
@@ -650,61 +667,35 @@ def set_address(address: str) -> None:
     _ProcessRegistry.get().set_address(address)
 
 
-def set_shm_threshold(threshold: int) -> None:
-    """Set the SHM threshold globally (applies to both server and client).
-
-    Payloads smaller than *threshold* are sent inline; larger use SHM.
-    Default: 4096 bytes.
-
-    See :meth:`_ProcessRegistry.set_shm_threshold`.
-    """
-    _ProcessRegistry.get().set_shm_threshold(threshold)
+def set_config(*, shm_threshold: int | None = None) -> None:
+    """Set global hardware config. Call before register()/connect()."""
+    _ProcessRegistry.get().set_config(shm_threshold=shm_threshold)
 
 
-def set_server_ipc_config(
-    *,
-    segment_size: int | None = None,
-    max_segments: int | None = None,
-    reassembly_segment_size: int | None = None,
-    reassembly_max_segments: int | None = None,
-) -> None:
-    """Configure IPC server memory pools before registering CRMs.
-
-    See :meth:`_ProcessRegistry.set_server`.
-    """
-    kwargs: dict[str, object] = {}
-    if segment_size is not None:
-        kwargs['pool_segment_size'] = segment_size
-    if max_segments is not None:
-        kwargs['max_pool_segments'] = max_segments
-    if reassembly_segment_size is not None:
-        kwargs['reassembly_segment_size'] = reassembly_segment_size
-    if reassembly_max_segments is not None:
-        kwargs['reassembly_max_segments'] = reassembly_max_segments
+def set_server(**kwargs: object) -> None:
+    """Configure IPC server. Call before register()."""
     _ProcessRegistry.get().set_server(**kwargs)
 
 
-def set_client_ipc_config(
-    *,
-    segment_size: int | None = None,
-    max_segments: int | None = None,
-    reassembly_segment_size: int | None = None,
-    reassembly_max_segments: int | None = None,
-) -> None:
-    """Configure IPC client memory pools before connecting.
-
-    See :meth:`_ProcessRegistry.set_client`.
-    """
-    kwargs: dict[str, object] = {}
-    if segment_size is not None:
-        kwargs['pool_segment_size'] = segment_size
-    if max_segments is not None:
-        kwargs['max_pool_segments'] = max_segments
-    if reassembly_segment_size is not None:
-        kwargs['reassembly_segment_size'] = reassembly_segment_size
-    if reassembly_max_segments is not None:
-        kwargs['reassembly_max_segments'] = reassembly_max_segments
+def set_client(**kwargs: object) -> None:
+    """Configure IPC client. Call before connect()."""
     _ProcessRegistry.get().set_client(**kwargs)
+
+
+# Deprecated aliases — remove in next version
+def set_shm_threshold(threshold: int) -> None:
+    """Deprecated: use set_config(shm_threshold=...) instead."""
+    set_config(shm_threshold=threshold)
+
+
+def set_server_ipc_config(**kw: object) -> None:
+    """Deprecated: use set_server() instead."""
+    set_server(**kw)
+
+
+def set_client_ipc_config(**kw: object) -> None:
+    """Deprecated: use set_client() instead."""
+    set_client(**kw)
 
 
 def register(
