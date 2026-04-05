@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 
 use c2_mem::{MemPool, PoolAllocation};
 
-use crate::client::{IpcClient, IpcConfig, IpcError, MethodTable, ServerPoolState};
+use crate::client::{IpcClient, ClientIpcConfig, IpcError, MethodTable, ServerPoolState};
 use crate::response::ResponseData;
 
 // ── Global shared runtime ────────────────────────────────────────────────
@@ -55,7 +55,7 @@ impl SyncClient {
     pub fn connect(
         address: &str,
         pool: Option<Arc<StdMutex<MemPool>>>,
-        config: IpcConfig,
+        config: ClientIpcConfig,
     ) -> Result<Self, IpcError> {
         let rt = get_or_create_runtime();
         let mut client = match pool {

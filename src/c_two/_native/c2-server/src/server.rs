@@ -37,7 +37,7 @@ use c2_wire::handshake::{
 };
 use c2_wire::msg_type::{MsgType, DISCONNECT_ACK_BYTES, PONG_BYTES, SHUTDOWN_ACK_BYTES};
 
-use crate::config::IpcConfig;
+use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request};
 use crate::heartbeat::run_heartbeat;
@@ -84,7 +84,7 @@ impl From<std::io::Error> for ServerError {
 /// the [`Dispatcher`].  Each connection runs in its own tokio task with a
 /// dedicated heartbeat probe.
 pub struct Server {
-    config: IpcConfig,
+    config: ServerIpcConfig,
     socket_path: PathBuf,
     dispatcher: RwLock<Dispatcher>,
     shutdown_tx: watch::Sender<bool>,
@@ -101,7 +101,7 @@ impl Server {
     ///
     /// Address format: `ipc://region_id`
     /// → socket at `/tmp/c_two_ipc/region_id.sock`
-    pub fn new(address: &str, config: IpcConfig) -> Result<Self, ServerError> {
+    pub fn new(address: &str, config: ServerIpcConfig) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
         let socket_path = parse_socket_path(address)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -120,7 +120,7 @@ impl Server {
             let prefix = format!("/cc3s{:08x}{:08x}", pid, ra_gen);
             MemPool::new_with_prefix(reassembly_cfg, prefix)
         };
-        let chunk_config = c2_chunk::ChunkConfig::from_ipc(&config);
+        let chunk_config = c2_chunk::ChunkConfig::from_base(&config);
         let chunk_registry = Arc::new(c2_chunk::ChunkRegistry::new(
             Arc::new(std::sync::RwLock::new(reassembly_pool)),
             chunk_config,
@@ -516,7 +516,7 @@ async fn dispatch_call(
     match result {
         Ok(meta) => send_response_meta(
             &server.response_pool, writer, request_id, meta,
-            server.config.shm_threshold, server.config.chunk_size,
+            server.config.shm_threshold, server.config.chunk_size as usize,
         ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -643,7 +643,7 @@ async fn dispatch_buddy_call(
     match result {
         Ok(meta) => send_response_meta(
             &server.response_pool, writer, request_id, meta,
-            server.config.shm_threshold, server.config.chunk_size,
+            server.config.shm_threshold, server.config.chunk_size as usize,
         ).await,
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -821,7 +821,7 @@ async fn dispatch_chunked_call(
         match result {
             Ok(meta) => send_response_meta(
                 &server.response_pool, writer, request_id, meta,
-                server.config.shm_threshold, server.config.chunk_size,
+                server.config.shm_threshold, server.config.chunk_size as usize,
             ).await,
             Err(CrmError::UserError(b)) => {
                 write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -1083,18 +1083,18 @@ mod tests {
 
     #[test]
     fn server_new_default_config() {
-        let s = Server::new("ipc://test_srv", IpcConfig::default()).unwrap();
+        let s = Server::new("ipc://test_srv", ServerIpcConfig::default()).unwrap();
         assert_eq!(s.socket_path(), Path::new("/tmp/c_two_ipc/test_srv.sock"));
     }
 
     #[test]
     fn server_new_bad_address() {
-        assert!(Server::new("http://bad", IpcConfig::default()).is_err());
+        assert!(Server::new("http://bad", ServerIpcConfig::default()).is_err());
     }
 
     #[test]
     fn server_new_bad_config() {
-        let cfg = IpcConfig { max_payload_size: 0, ..IpcConfig::default() };
+        let cfg = ServerIpcConfig { max_payload_size: 0, ..ServerIpcConfig::default() };
         assert!(Server::new("ipc://x", cfg).is_err());
     }
 
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_unregister_route() {
-        let s = Arc::new(Server::new("ipc://reg_test", IpcConfig::default()).unwrap());
+        let s = Arc::new(Server::new("ipc://reg_test", ServerIpcConfig::default()).unwrap());
 
         s.register_route(make_route("grid")).await;
         assert!(s.dispatcher.read().await.resolve("grid").is_some());
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_sets_signal() {
-        let s = Server::new("ipc://shut_test", IpcConfig::default()).unwrap();
+        let s = Server::new("ipc://shut_test", ServerIpcConfig::default()).unwrap();
         let mut rx = s.shutdown_rx.clone();
         s.shutdown();
         rx.changed().await.unwrap();

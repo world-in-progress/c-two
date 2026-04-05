@@ -19,7 +19,7 @@ use c2_mem::{MemPool, PoolConfig};
 /// (within POSIX 31-char limit on macOS).
 static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
-use crate::client::{IpcConfig, IpcError};
+use crate::client::{ClientIpcConfig, IpcError};
 use crate::sync_client::SyncClient;
 
 // ── Pool entry ───────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ struct PoolEntry {
 pub struct ClientPool {
     entries: StdMutex<HashMap<String, PoolEntry>>,
     grace_period: Duration,
-    default_config: StdMutex<Option<IpcConfig>>,
+    default_config: StdMutex<Option<ClientIpcConfig>>,
 }
 
 // Compile-time assertion: ClientPool must be Send + Sync.
@@ -65,7 +65,7 @@ impl ClientPool {
     }
 
     /// Set the default IPC config for newly created clients.
-    pub fn set_default_config(&self, config: IpcConfig) {
+    pub fn set_default_config(&self, config: ClientIpcConfig) {
         *self.default_config.lock().unwrap() = Some(config);
     }
 
@@ -74,7 +74,7 @@ impl ClientPool {
     pub fn acquire(
         &self,
         address: &str,
-        config: Option<&IpcConfig>,
+        config: Option<&ClientIpcConfig>,
     ) -> Result<Arc<SyncClient>, IpcError> {
         // Sweep stale entries before potentially creating a new one.
         self.sweep_expired();
@@ -389,10 +389,9 @@ mod tests {
     #[test]
     fn test_pool_set_default_config() {
         let pool = ClientPool::new(Duration::from_secs(30));
-        let cfg = IpcConfig {
+        let cfg = ClientIpcConfig {
+            base: c2_config::BaseIpcConfig { chunk_size: 65536, ..c2_config::BaseIpcConfig::default() },
             shm_threshold: 1024,
-            chunk_size: 65536,
-            ..IpcConfig::default()
         };
         pool.set_default_config(cfg);
         // Verify the config is stored (indirectly — acquire would use it).

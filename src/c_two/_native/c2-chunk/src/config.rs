@@ -4,7 +4,7 @@ use std::time::Duration;
 
 /// Configuration for the [`ChunkRegistry`](super::ChunkRegistry).
 ///
-/// Typically derived from [`c2_config::IpcConfig`] chunk-related fields.
+/// Typically derived from [`c2_config::BaseIpcConfig`] chunk-related fields.
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
     /// Timeout for incomplete assemblies (default 60s).
@@ -35,11 +35,11 @@ impl Default for ChunkConfig {
 }
 
 impl ChunkConfig {
-    /// Build a `ChunkConfig` from an [`IpcConfig`](c2_config::IpcConfig).
-    pub fn from_ipc(cfg: &c2_config::IpcConfig) -> Self {
+    /// Build a `ChunkConfig` from a [`BaseIpcConfig`](c2_config::BaseIpcConfig).
+    pub fn from_base(cfg: &c2_config::BaseIpcConfig) -> Self {
         Self {
-            assembler_timeout: Duration::from_secs_f64(cfg.chunk_assembler_timeout),
-            gc_interval: Duration::from_secs_f64(cfg.chunk_gc_interval),
+            assembler_timeout: Duration::from_secs_f64(cfg.chunk_assembler_timeout_secs),
+            gc_interval: Duration::from_secs_f64(cfg.chunk_gc_interval_secs),
             soft_limit: cfg.max_total_chunks,
             max_reassembly_bytes: cfg.max_reassembly_bytes,
             max_chunks_per_request: cfg.max_total_chunks as usize,
@@ -61,9 +61,9 @@ mod tests {
     }
 
     #[test]
-    fn from_ipc_config() {
-        let ipc = c2_config::IpcConfig::default();
-        let cfg = ChunkConfig::from_ipc(&ipc);
+    fn from_base_config() {
+        let base = c2_config::BaseIpcConfig::default();
+        let cfg = ChunkConfig::from_base(&base);
         assert_eq!(cfg.assembler_timeout, Duration::from_secs(60));
         assert_eq!(cfg.gc_interval, Duration::from_secs(5));
         assert_eq!(cfg.soft_limit, 512);

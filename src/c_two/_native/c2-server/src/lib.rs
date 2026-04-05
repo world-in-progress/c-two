@@ -5,7 +5,7 @@ pub mod heartbeat;
 pub mod scheduler;
 pub mod server;
 
-pub use config::IpcConfig;
+pub use config::ServerIpcConfig;
 pub use connection::Connection;
 pub use dispatcher::{CrmCallback, CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta};
 pub use heartbeat::{run_heartbeat, HeartbeatResult};

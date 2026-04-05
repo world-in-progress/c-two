@@ -16,7 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyTuple};
 
 use c2_mem::MemPool;
-use c2_config::IpcConfig;
+use c2_config::{BaseIpcConfig, ServerIpcConfig};
 use c2_server::dispatcher::{CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta};
 use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler};
 use c2_server::Server;
@@ -134,22 +134,25 @@ impl PyServer {
         reassembly_segment_size: u64,
         reassembly_max_segments: u32,
     ) -> PyResult<Self> {
-        let config = IpcConfig {
+        let config = ServerIpcConfig {
+            base: BaseIpcConfig {
+                pool_segment_size: segment_size,
+                max_pool_segments,
+                reassembly_segment_size,
+                reassembly_max_segments,
+                chunk_threshold_ratio: if max_payload_size > 0 {
+                    chunked_threshold as f64 / max_payload_size as f64
+                } else {
+                    0.9
+                },
+                ..BaseIpcConfig::default()
+            },
+            shm_threshold,
             max_frame_size,
             max_payload_size,
-            max_pool_segments,
-            pool_segment_size: segment_size,
-            heartbeat_interval,
-            heartbeat_timeout,
-            shm_threshold,
-            reassembly_segment_size,
-            reassembly_max_segments,
-            chunk_threshold_ratio: if max_payload_size > 0 {
-                chunked_threshold as f64 / max_payload_size as f64
-            } else {
-                0.9
-            },
-            ..IpcConfig::default()
+            heartbeat_interval_secs: heartbeat_interval,
+            heartbeat_timeout_secs: heartbeat_timeout,
+            ..ServerIpcConfig::default()
         };
         let server = Server::new(address, config)
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;

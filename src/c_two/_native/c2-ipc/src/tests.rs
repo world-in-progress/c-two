@@ -9,7 +9,7 @@ mod client_tests {
     use c2_wire::frame;
     use c2_wire::handshake::*;
 
-    use crate::client::IpcConfig;
+    use crate::client::ClientIpcConfig;
 
     #[test]
     fn encode_v2_inline_call() {
@@ -97,7 +97,7 @@ mod client_tests {
 
     #[test]
     fn test_ipc_config_defaults() {
-        let cfg = IpcConfig::default();
+        let cfg = ClientIpcConfig::default();
         assert_eq!(cfg.shm_threshold, 4096);
         assert_eq!(cfg.chunk_size, 131072);
     }
@@ -263,10 +263,9 @@ mod client_tests {
         // Verify IpcConfig thresholds determine the expected transport path.
         // We can't call call_full directly (no UDS connection), but we can
         // verify the selection logic by checking threshold boundaries.
-        let cfg = IpcConfig {
+        let cfg = ClientIpcConfig {
             shm_threshold: 100,
-            chunk_size: 500,
-            ..IpcConfig::default()
+            base: c2_config::BaseIpcConfig { chunk_size: 500, ..c2_config::BaseIpcConfig::default() },
         };
 
         // Below shm_threshold → inline
@@ -276,14 +275,15 @@ mod client_tests {
         // Between shm_threshold and chunk_size → buddy (if pool) or inline
         let medium = vec![0u8; 200];
         assert!(medium.len() > cfg.shm_threshold as usize);
-        assert!(medium.len() <= cfg.chunk_size);
+        assert!(medium.len() <= cfg.chunk_size as usize);
 
         // Above chunk_size → chunked (if no pool) or buddy first
         let large = vec![0u8; 600];
-        assert!(large.len() > cfg.chunk_size);
+        assert!(large.len() > cfg.chunk_size as usize);
 
         // Verify chunk count calculation.
-        let total_chunks = (large.len() + cfg.chunk_size - 1) / cfg.chunk_size;
+        let chunk_size = cfg.chunk_size as usize;
+        let total_chunks = (large.len() + chunk_size - 1) / chunk_size;
         assert_eq!(total_chunks, 2); // 600 / 500 = 1.2 → 2 chunks
     }
 
@@ -328,10 +328,9 @@ mod client_tests {
         // Verify custom config flows through to IpcClient via with_pool.
         // We can't actually connect (no server), but construction must succeed
         // and the config should influence transport path selection.
-        let cfg = IpcConfig {
+        let cfg = ClientIpcConfig {
             shm_threshold: 512,
-            chunk_size: 2048,
-            ..IpcConfig::default()
+            base: c2_config::BaseIpcConfig { chunk_size: 2048, ..c2_config::BaseIpcConfig::default() },
         };
 
         // IpcClient::new uses default config.

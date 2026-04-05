@@ -29,7 +29,7 @@ use c2_mem::{MemPool, PoolAllocation};
 
 use crate::response::ResponseData;
 
-pub use c2_config::IpcConfig;
+pub use c2_config::ClientIpcConfig;
 
 // ── Server pool state ────────────────────────────────────────────────────
 
@@ -214,7 +214,7 @@ pub struct IpcClient {
     recv_handle: Option<tokio::task::JoinHandle<()>>,
     connected: Arc<AtomicBool>,
     pub(crate) pool: Option<Arc<StdMutex<MemPool>>>,
-    pub(crate) config: IpcConfig,
+    pub(crate) config: ClientIpcConfig,
     /// Client-side chunk registry for reassembling chunked responses.
     pub(crate) chunk_registry: Arc<ChunkRegistry>,
     /// Unique connection identifier for the chunk registry.
@@ -242,7 +242,7 @@ static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl IpcClient {
-    fn make_chunk_registry(config: &IpcConfig) -> Arc<ChunkRegistry> {
+    fn make_chunk_registry(config: &ClientIpcConfig) -> Arc<ChunkRegistry> {
         let seg_size = config.reassembly_segment_size as usize;
         let max_segs = config.reassembly_max_segments as usize;
         let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
@@ -255,7 +255,7 @@ impl IpcClient {
             },
             prefix,
         )));
-        let chunk_config = ChunkConfig::from_ipc(config);
+        let chunk_config = ChunkConfig::from_base(config);
         Arc::new(ChunkRegistry::new(pool, chunk_config))
     }
 
@@ -280,8 +280,8 @@ impl IpcClient {
             recv_handle: None,
             connected: Arc::new(AtomicBool::new(false)),
             pool: None,
-            config: IpcConfig::default(),
-            chunk_registry: Self::make_chunk_registry(&IpcConfig::default()),
+            config: ClientIpcConfig::default(),
+            chunk_registry: Self::make_chunk_registry(&ClientIpcConfig::default()),
             conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -293,7 +293,7 @@ impl IpcClient {
     pub fn with_pool(
         address: &str,
         pool: Arc<StdMutex<MemPool>>,
-        config: IpcConfig,
+        config: ClientIpcConfig,
     ) -> Self {
         let name = address
             .strip_prefix("ipc://")
@@ -509,7 +509,7 @@ impl IpcClient {
         }
 
         // Use chunked transfer for data exceeding chunk size.
-        if data.len() > self.config.chunk_size {
+        if data.len() > self.config.chunk_size as usize {
             return self.call_chunked(route_name, method_idx, data).await;
         }
 
@@ -764,7 +764,7 @@ impl IpcClient {
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
-        let chunk_size = self.config.chunk_size;
+        let chunk_size = self.config.chunk_size as usize;
         let total_chunks = (data.len() + chunk_size - 1) / chunk_size;
 
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[test]
     fn reassembly_pool_unique_prefixes() {
-        let cfg = IpcConfig::default();
+        let cfg = ClientIpcConfig::default();
         let r1 = IpcClient::make_chunk_registry(&cfg);
         let r2 = IpcClient::make_chunk_registry(&cfg);
         let r3 = IpcClient::make_chunk_registry(&cfg);

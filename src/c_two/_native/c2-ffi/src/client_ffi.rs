@@ -15,7 +15,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use c2_config::IpcConfig;
+use c2_config::{BaseIpcConfig, ClientIpcConfig};
 use c2_ipc::{ClientPool, IpcError, ResponseData, ServerPoolState, SyncClient};
 use c2_mem::MemPool;
 
@@ -287,16 +287,18 @@ impl PyRustClient {
         reassembly_segment_size: Option<u64>,
         reassembly_max_segments: Option<u32>,
     ) -> PyResult<Self> {
-        let config = IpcConfig {
+        let config = ClientIpcConfig {
+            base: BaseIpcConfig {
+                chunk_size: chunk_size as u64,
+                pool_segment_size: pool_segment_size
+                    .unwrap_or(BaseIpcConfig::default().pool_segment_size),
+                reassembly_segment_size: reassembly_segment_size
+                    .unwrap_or(ClientIpcConfig::default().reassembly_segment_size),
+                reassembly_max_segments: reassembly_max_segments
+                    .unwrap_or(ClientIpcConfig::default().reassembly_max_segments),
+                ..BaseIpcConfig::default()
+            },
             shm_threshold,
-            chunk_size,
-            pool_segment_size: pool_segment_size
-                .unwrap_or(IpcConfig::default().pool_segment_size),
-            reassembly_segment_size: reassembly_segment_size
-                .unwrap_or(IpcConfig::default().reassembly_segment_size),
-            reassembly_max_segments: reassembly_max_segments
-                .unwrap_or(IpcConfig::default().reassembly_max_segments),
-            ..IpcConfig::default()
         };
         let seg_size = config.pool_segment_size as usize;
         let addr = address.to_string();
@@ -460,21 +462,24 @@ impl PyRustClientPool {
         reassembly_segment_size: Option<u64>,
         reassembly_max_segments: Option<u32>,
     ) -> PyResult<PyRustClient> {
-        let defaults = IpcConfig::default();
+        let base_defaults = BaseIpcConfig::default();
+        let client_defaults = ClientIpcConfig::default();
         let config = if shm_threshold.is_some() || chunk_size.is_some()
             || pool_segment_size.is_some() || reassembly_segment_size.is_some()
             || reassembly_max_segments.is_some()
         {
-            Some(IpcConfig {
-                shm_threshold: shm_threshold.unwrap_or(defaults.shm_threshold),
-                chunk_size: chunk_size.unwrap_or(defaults.chunk_size),
-                pool_segment_size: pool_segment_size
-                    .unwrap_or(defaults.pool_segment_size),
-                reassembly_segment_size: reassembly_segment_size
-                    .unwrap_or(defaults.reassembly_segment_size),
-                reassembly_max_segments: reassembly_max_segments
-                    .unwrap_or(defaults.reassembly_max_segments),
-                ..defaults
+            Some(ClientIpcConfig {
+                base: BaseIpcConfig {
+                    chunk_size: chunk_size.map(|v| v as u64).unwrap_or(base_defaults.chunk_size),
+                    pool_segment_size: pool_segment_size
+                        .unwrap_or(base_defaults.pool_segment_size),
+                    reassembly_segment_size: reassembly_segment_size
+                        .unwrap_or(client_defaults.reassembly_segment_size),
+                    reassembly_max_segments: reassembly_max_segments
+                        .unwrap_or(base_defaults.reassembly_max_segments),
+                    ..base_defaults
+                },
+                shm_threshold: shm_threshold.unwrap_or(client_defaults.shm_threshold),
             })
         } else {
             None
@@ -504,17 +509,20 @@ impl PyRustClientPool {
         reassembly_segment_size: Option<u64>,
         reassembly_max_segments: Option<u32>,
     ) {
-        let defaults = IpcConfig::default();
-        self.inner.set_default_config(IpcConfig {
+        let base_defaults = BaseIpcConfig::default();
+        let client_defaults = ClientIpcConfig::default();
+        self.inner.set_default_config(ClientIpcConfig {
+            base: BaseIpcConfig {
+                chunk_size: chunk_size as u64,
+                pool_segment_size: pool_segment_size
+                    .unwrap_or(base_defaults.pool_segment_size),
+                reassembly_segment_size: reassembly_segment_size
+                    .unwrap_or(client_defaults.reassembly_segment_size),
+                reassembly_max_segments: reassembly_max_segments
+                    .unwrap_or(base_defaults.reassembly_max_segments),
+                ..base_defaults
+            },
             shm_threshold,
-            chunk_size,
-            pool_segment_size: pool_segment_size
-                .unwrap_or(defaults.pool_segment_size),
-            reassembly_segment_size: reassembly_segment_size
-                .unwrap_or(defaults.reassembly_segment_size),
-            reassembly_max_segments: reassembly_max_segments
-                .unwrap_or(defaults.reassembly_max_segments),
-            ..defaults
         });
     }
 

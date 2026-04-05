@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 use tracing::warn;
 
-use crate::config::IpcConfig;
+use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 
 /// Outcome of the heartbeat task.
@@ -53,15 +53,15 @@ fn build_ping_frame() -> Vec<u8> {
 pub async fn run_heartbeat(
     conn: Arc<Connection>,
     writer: Arc<Mutex<OwnedWriteHalf>>,
-    config: &IpcConfig,
+    config: &ServerIpcConfig,
 ) -> HeartbeatResult {
-    if config.heartbeat_interval <= 0.0 {
+    if config.heartbeat_interval_secs <= 0.0 {
         // Heartbeat disabled — park forever.
         std::future::pending::<()>().await;
         return HeartbeatResult::Disabled;
     }
 
-    let check_interval = Duration::from_secs_f64(config.heartbeat_interval / 2.0);
+    let check_interval = Duration::from_secs_f64(config.heartbeat_interval_secs / 2.0);
     let mut ticker = interval(check_interval);
     // Skip the immediate first tick (fires instantly).
     ticker.tick().await;
@@ -72,7 +72,7 @@ pub async fn run_heartbeat(
         ticker.tick().await;
         let idle = conn.idle_seconds();
 
-        if idle >= config.heartbeat_timeout {
+        if idle >= config.heartbeat_timeout_secs {
             warn!(
                 conn_id = conn.conn_id(),
                 idle_secs = format!("{idle:.1}"),
@@ -81,7 +81,7 @@ pub async fn run_heartbeat(
             return HeartbeatResult::TimedOut;
         }
 
-        if idle >= config.heartbeat_interval {
+        if idle >= config.heartbeat_interval_secs {
             let mut w = writer.lock().await;
             if w.write_all(&ping_frame).await.is_err() {
                 warn!(conn_id = conn.conn_id(), "heartbeat write failed");
@@ -118,9 +118,9 @@ mod tests {
     #[tokio::test]
     async fn disabled_heartbeat() {
         let conn = Arc::new(Connection::new(1));
-        let config = IpcConfig {
-            heartbeat_interval: 0.0,
-            ..IpcConfig::default()
+        let config = ServerIpcConfig {
+            heartbeat_interval_secs: 0.0,
+            ..ServerIpcConfig::default()
         };
 
         // The run_heartbeat call with interval=0 should be disabled.
@@ -155,10 +155,10 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let conn = Arc::new(Connection::new(1));
-        let config = IpcConfig {
-            heartbeat_interval: 0.1,  // 100ms
-            heartbeat_timeout: 10.0,  // far away
-            ..IpcConfig::default()
+        let config = ServerIpcConfig {
+            heartbeat_interval_secs: 0.1,  // 100ms
+            heartbeat_timeout_secs: 10.0,  // far away
+            ..ServerIpcConfig::default()
         };
 
         let (sock_a, sock_b) = tokio::net::UnixStream::pair().unwrap();
@@ -194,10 +194,10 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_timeout_returns() {
         let conn = Arc::new(Connection::new(1));
-        let config = IpcConfig {
-            heartbeat_interval: 0.05,
-            heartbeat_timeout: 0.10,
-            ..IpcConfig::default()
+        let config = ServerIpcConfig {
+            heartbeat_interval_secs: 0.05,
+            heartbeat_timeout_secs: 0.10,
+            ..ServerIpcConfig::default()
         };
 
         let (sock_a, _sock_b) = tokio::net::UnixStream::pair().unwrap();

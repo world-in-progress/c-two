@@ -21,7 +21,7 @@ pub mod sync_client;
 #[cfg(test)]
 mod tests;
 
-pub use client::{IpcClient, IpcConfig, IpcError, MethodTable, ServerPoolState};
+pub use client::{IpcClient, ClientIpcConfig, IpcError, MethodTable, ServerPoolState};
 pub use pool::ClientPool;
 pub use response::ResponseData;
 pub use shm::{MappedSegment, SegmentCache, ShmError};
