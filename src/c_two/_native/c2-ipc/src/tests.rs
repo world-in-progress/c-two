@@ -260,7 +260,7 @@ mod client_tests {
 
     #[test]
     fn test_call_full_path_selection() {
-        // Verify IpcConfig thresholds determine the expected transport path.
+        // Verify ClientIpcConfig thresholds determine the expected transport path.
         // We can't call call_full directly (no UDS connection), but we can
         // verify the selection logic by checking threshold boundaries.
         let cfg = ClientIpcConfig {

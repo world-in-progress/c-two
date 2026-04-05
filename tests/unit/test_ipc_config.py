@@ -182,3 +182,58 @@ class TestBuildClientConfig:
         s = C2Settings()
         cfg = build_client_config(settings=s)
         assert cfg.reassembly_segment_size == 33_554_432
+
+
+class TestRuntimeProtection:
+    """Test that set_server/set_client warn when called too late."""
+
+    def test_set_server_after_register_warns(self):
+        import warnings
+        import c_two as cc
+        from tests.fixtures.ihello import IHello
+        from tests.fixtures.hello import Hello
+
+        registered = False
+        cc.set_address('ipc://test_runtime_prot_server')
+        try:
+            cc.register(IHello, Hello(), name='rp_hello')
+            registered = True
+
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter('always')
+                cc.set_server(pool_segment_size=1 << 30)
+                assert len(w) == 1
+                assert 'set_server()' in str(w[0].message)
+                assert issubclass(w[0].category, UserWarning)
+        finally:
+            if registered:
+                cc.unregister('rp_hello')
+            cc.shutdown()
+
+    def test_set_client_after_connect_warns(self):
+        import warnings
+        import c_two as cc
+        from tests.fixtures.ihello import IHello
+        from tests.fixtures.hello import Hello
+
+        registered = False
+        proxy = None
+        cc.set_address('ipc://test_runtime_prot_client')
+        try:
+            cc.register(IHello, Hello(), name='rp_hello2')
+            registered = True
+            proxy = cc.connect(IHello, name='rp_hello2',
+                               address='ipc://test_runtime_prot_client')
+
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter('always')
+                cc.set_client(pool_segment_size=1 << 30)
+                assert len(w) == 1
+                assert 'set_client()' in str(w[0].message)
+                assert issubclass(w[0].category, UserWarning)
+        finally:
+            if proxy is not None:
+                cc.close(proxy)
+            if registered:
+                cc.unregister('rp_hello2')
+            cc.shutdown()

@@ -92,7 +92,7 @@ impl ClientPool {
             entries.remove(address);
         }
 
-        // Resolve config: explicit > default > IpcConfig::default().
+        // Resolve config: explicit > default > ClientIpcConfig::default().
         let cfg = match config {
             Some(c) => c.clone(),
             None => self
