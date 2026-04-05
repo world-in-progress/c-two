@@ -109,50 +109,37 @@ impl PyServer {
     /// Create a new server targeting the given IPC address.
     #[new]
     #[pyo3(signature = (
-        address,
-        max_frame_size = 268_435_456,
-        max_payload_size = 134_217_728,
-        max_pool_segments = 4,
-        segment_size = 268_435_456,
-        chunked_threshold = 67_108_864,
-        heartbeat_interval = 10.0,
-        heartbeat_timeout = 30.0,
-        shm_threshold = 4096,
-        reassembly_segment_size = 67_108_864,
-        reassembly_max_segments = 4,
+        address, shm_threshold, pool_enabled, pool_segment_size,
+        max_pool_segments, max_pool_memory, reassembly_segment_size,
+        reassembly_max_segments, max_frame_size, max_payload_size,
+        max_pending_requests, pool_decay_seconds, heartbeat_interval,
+        heartbeat_timeout, max_total_chunks, chunk_gc_interval,
+        chunk_threshold_ratio, chunk_assembler_timeout,
+        max_reassembly_bytes, chunk_size,
     ))]
     fn new(
         address: &str,
-        max_frame_size: u64,
-        max_payload_size: u64,
-        max_pool_segments: u32,
-        segment_size: u64,
-        chunked_threshold: u64,
-        heartbeat_interval: f64,
-        heartbeat_timeout: f64,
-        shm_threshold: u64,
-        reassembly_segment_size: u64,
-        reassembly_max_segments: u32,
+        shm_threshold: u64, pool_enabled: bool,
+        pool_segment_size: u64, max_pool_segments: u32, max_pool_memory: u64,
+        reassembly_segment_size: u64, reassembly_max_segments: u32,
+        max_frame_size: u64, max_payload_size: u64, max_pending_requests: u32,
+        pool_decay_seconds: f64, heartbeat_interval: f64, heartbeat_timeout: f64,
+        max_total_chunks: u32, chunk_gc_interval: f64, chunk_threshold_ratio: f64,
+        chunk_assembler_timeout: f64, max_reassembly_bytes: u64, chunk_size: u64,
     ) -> PyResult<Self> {
         let config = ServerIpcConfig {
             base: BaseIpcConfig {
-                pool_segment_size: segment_size,
-                max_pool_segments,
-                reassembly_segment_size,
-                reassembly_max_segments,
-                chunk_threshold_ratio: if max_payload_size > 0 {
-                    chunked_threshold as f64 / max_payload_size as f64
-                } else {
-                    0.9
-                },
-                ..BaseIpcConfig::default()
+                pool_enabled, pool_segment_size, max_pool_segments, max_pool_memory,
+                reassembly_segment_size, reassembly_max_segments, max_total_chunks,
+                chunk_gc_interval_secs: chunk_gc_interval,
+                chunk_threshold_ratio,
+                chunk_assembler_timeout_secs: chunk_assembler_timeout,
+                max_reassembly_bytes, chunk_size,
             },
-            shm_threshold,
-            max_frame_size,
-            max_payload_size,
+            shm_threshold, max_frame_size, max_payload_size, max_pending_requests,
+            pool_decay_seconds,
             heartbeat_interval_secs: heartbeat_interval,
             heartbeat_timeout_secs: heartbeat_timeout,
-            ..ServerIpcConfig::default()
         };
         let server = Server::new(address, config)
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;

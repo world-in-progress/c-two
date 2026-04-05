@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
-from ..ipc.frame import IPCConfig
+from c_two.config.ipc import ServerIPCConfig
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_icrm_result
@@ -78,14 +78,16 @@ class NativeServerBridge:
         bind_address: str,
         icrm_class: type | None = None,
         crm_instance: object | None = None,
-        ipc_config: IPCConfig | None = None,
+        ipc_config: ServerIPCConfig | None = None,
         concurrency: ConcurrencyConfig | None = None,
         max_workers: int = 4,
         *,
         name: str | None = None,
+        shm_threshold: int = 4096,
     ) -> None:
-        self._config = ipc_config or IPCConfig()
+        self._config = ipc_config or ServerIPCConfig()
         self._address = bind_address
+        self._shm_threshold = shm_threshold
         self._default_concurrency = concurrency or ConcurrencyConfig(
             max_workers=max_workers,
         )
@@ -97,21 +99,27 @@ class NativeServerBridge:
 
         from c_two._native import RustServer
 
-        chunked_threshold = int(
-            self._config.max_payload_size * self._config.chunk_threshold_ratio,
-        )
         self._rust_server = RustServer(
             address=bind_address,
-            max_frame_size=self._config.max_frame_size,
-            max_payload_size=self._config.max_payload_size,
+            shm_threshold=shm_threshold,
+            pool_enabled=self._config.pool_enabled,
+            pool_segment_size=self._config.pool_segment_size,
             max_pool_segments=self._config.max_pool_segments,
-            segment_size=self._config.pool_segment_size,
-            chunked_threshold=chunked_threshold,
-            heartbeat_interval=self._config.heartbeat_interval,
-            heartbeat_timeout=self._config.heartbeat_timeout,
-            shm_threshold=self._config.shm_threshold,
+            max_pool_memory=self._config.max_pool_memory,
             reassembly_segment_size=self._config.reassembly_segment_size,
             reassembly_max_segments=self._config.reassembly_max_segments,
+            max_frame_size=self._config.max_frame_size,
+            max_payload_size=self._config.max_payload_size,
+            max_pending_requests=self._config.max_pending_requests,
+            pool_decay_seconds=self._config.pool_decay_seconds,
+            heartbeat_interval=self._config.heartbeat_interval,
+            heartbeat_timeout=self._config.heartbeat_timeout,
+            max_total_chunks=self._config.max_total_chunks,
+            chunk_gc_interval=self._config.chunk_gc_interval,
+            chunk_threshold_ratio=self._config.chunk_threshold_ratio,
+            chunk_assembler_timeout=self._config.chunk_assembler_timeout,
+            max_reassembly_bytes=self._config.max_reassembly_bytes,
+            chunk_size=self._config.chunk_size,
         )
 
         # Register initial CRM if provided (compat with old Server constructor).
@@ -309,7 +317,7 @@ class NativeServerBridge:
         """
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
-        shm_threshold = self._config.shm_threshold
+        shm_threshold = self._shm_threshold
 
         def dispatch(
             _route_name: str, method_idx: int,

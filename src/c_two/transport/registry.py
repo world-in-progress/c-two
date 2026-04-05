@@ -42,13 +42,13 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeVar
 
-from .config import settings
+from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
+from c_two.config.settings import settings
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
 from .server.native import NativeServerBridge as Server
 
 from ..crm.meta import MethodAccess
-from .ipc.frame import IPCConfig
 
 ICRM = TypeVar('ICRM')
 log = logging.getLogger(__name__)
@@ -112,7 +112,8 @@ class _ProcessRegistry:
         self._server: Server | None = None
         self._server_address: str | None = None
         self._explicit_address: str | None = None
-        self._explicit_ipc_config: IPCConfig | None = None
+        self._server_config: ServerIPCConfig | None = None
+        self._server_kwargs: dict[str, object] = {}
         self._shm_threshold: int | None = None
         self._client_ipc_overrides: dict[str, int] = {}
         from c_two._native import RustClientPool, RustHttpClientPool
@@ -167,46 +168,20 @@ class _ProcessRegistry:
                 )
             self._shm_threshold = threshold
 
-    def set_server_ipc_config(
-        self,
-        *,
-        segment_size: int | None = None,
-        max_segments: int | None = None,
-        reassembly_segment_size: int | None = None,
-        reassembly_max_segments: int | None = None,
-    ) -> None:
-        """Configure the IPC server's memory pools.
-
-        Must be called **before** any :func:`register` call.
-
-        Parameters
-        ----------
-        segment_size:
-            Server buddy pool segment size in bytes (default 256 MB).
-        max_segments:
-            Max buddy pool segments, 1–255 (default 4).
-        reassembly_segment_size:
-            Server reassembly pool segment size in bytes (default 64 MB).
-        reassembly_max_segments:
-            Max reassembly pool segments, 1–255 (default 4).
-        """
+    def set_server(self, **kwargs: object) -> None:
+        """Configure IPC server. Must be called before register()."""
         with self._lock:
             if self._server is not None:
-                raise RuntimeError(
-                    'Cannot set server IPC config after CRMs have been registered. '
-                    'Call set_server_ipc_config() before register().',
+                import warnings
+                warnings.warn(
+                    'Server already started, set_server() ignored. '
+                    'Call set_server() before register().',
+                    UserWarning,
+                    stacklevel=3,
                 )
-            overrides: dict[str, int] = {}
-            if segment_size is not None:
-                overrides['pool_segment_size'] = segment_size
-            if max_segments is not None:
-                overrides['max_pool_segments'] = max_segments
-            if reassembly_segment_size is not None:
-                overrides['reassembly_segment_size'] = reassembly_segment_size
-            if reassembly_max_segments is not None:
-                overrides['reassembly_max_segments'] = reassembly_max_segments
-            if overrides:
-                self._explicit_ipc_config = self._make_ipc_config(**overrides)
+                return
+            self._server_kwargs = kwargs
+            self._server_config = None  # rebuilt lazily
 
     def set_client_ipc_config(
         self,
@@ -286,8 +261,9 @@ class _ProcessRegistry:
                     or settings.ipc_address
                     or self._auto_address()
                 )
-                ipc_cfg = self._build_ipc_config()
-                self._server = Server(bind_address=addr, ipc_config=ipc_cfg)
+                server_cfg = self._build_server_config()
+                shm = self._shm_threshold or settings.shm_threshold or 4096
+                self._server = Server(bind_address=addr, ipc_config=server_cfg, shm_threshold=shm)
                 self._server_address = addr
                 # Rust pool uses its own defaults; skip Python IPCConfig.
 
@@ -440,7 +416,8 @@ class _ProcessRegistry:
             self._server = None
             self._server_address = None
             self._explicit_address = None
-            self._explicit_ipc_config = None
+            self._server_config = None
+            self._server_kwargs = {}
             self._shm_threshold = None
             self._client_ipc_overrides = {}
             self._registrations.clear()
@@ -638,64 +615,11 @@ class _ProcessRegistry:
     # Internals
     # ------------------------------------------------------------------
 
-    def _build_ipc_config(self) -> IPCConfig:
-        """Build an :class:`IPCConfig` from the three-level priority chain.
-
-        Priority: ``set_server_ipc_config()`` > env vars > defaults.
-        The ``shm_threshold`` from ``set_shm_threshold()`` is always
-        injected if set.
-        """
-        if self._explicit_ipc_config is not None:
-            cfg = self._explicit_ipc_config
-        else:
-            overrides: dict[str, int] = {}
-            if settings.ipc_segment_size is not None:
-                overrides['pool_segment_size'] = settings.ipc_segment_size
-            if settings.ipc_max_segments is not None:
-                overrides['max_pool_segments'] = settings.ipc_max_segments
-            cfg = self._make_ipc_config(**overrides) if overrides else IPCConfig()
-
-        if self._shm_threshold is not None:
-            from dataclasses import replace
-            cfg = replace(cfg, shm_threshold=self._shm_threshold)
-        return cfg
-
-    @staticmethod
-    def _make_ipc_config(**overrides: int) -> IPCConfig:
-        """Create IPCConfig with auto-derived ``max_pool_memory``.
-
-        Raises :class:`ValueError` if ``pool_segment_size`` exceeds
-        physical RAM (allocation would fail immediately).  Emits a
-        warning if the theoretical pool ceiling (``segment_size ×
-        max_segments``) exceeds 75 % of physical RAM.
-        """
-        seg = overrides.get('pool_segment_size', IPCConfig.pool_segment_size)
-        segs = overrides.get('max_pool_segments', IPCConfig.max_pool_segments)
-        pool_max = seg * segs
-        overrides.setdefault('max_pool_memory', pool_max)
-
-        phys = _physical_memory()
-        if phys is not None:
-            if seg > phys:
-                raise ValueError(
-                    f'pool_segment_size ({seg / (1 << 30):.1f} GB) exceeds '
-                    f'physical RAM ({phys / (1 << 30):.1f} GB) — '
-                    f'SHM allocation will fail'
-                )
-            if pool_max > int(phys * 0.75):
-                log.warning(
-                    'Theoretical pool ceiling %.1f GB '
-                    '(segment_size=%.1f GB × max_segments=%d) exceeds '
-                    '75%% of physical RAM (%.1f GB).  '
-                    'Segments are allocated lazily so this may be fine, '
-                    'but monitor memory usage under load.',
-                    pool_max / (1 << 30),
-                    seg / (1 << 30),
-                    segs,
-                    phys / (1 << 30),
-                )
-
-        return IPCConfig(**overrides)
+    def _build_server_config(self) -> ServerIPCConfig:
+        if self._server_config is not None:
+            return self._server_config
+        self._server_config = build_server_config(settings, **self._server_kwargs)
+        return self._server_config
 
     @staticmethod
     def _auto_address() -> str:
@@ -736,14 +660,18 @@ def set_server_ipc_config(
 ) -> None:
     """Configure IPC server memory pools before registering CRMs.
 
-    See :meth:`_ProcessRegistry.set_server_ipc_config`.
+    See :meth:`_ProcessRegistry.set_server`.
     """
-    _ProcessRegistry.get().set_server_ipc_config(
-        segment_size=segment_size,
-        max_segments=max_segments,
-        reassembly_segment_size=reassembly_segment_size,
-        reassembly_max_segments=reassembly_max_segments,
-    )
+    kwargs: dict[str, object] = {}
+    if segment_size is not None:
+        kwargs['pool_segment_size'] = segment_size
+    if max_segments is not None:
+        kwargs['max_pool_segments'] = max_segments
+    if reassembly_segment_size is not None:
+        kwargs['reassembly_segment_size'] = reassembly_segment_size
+    if reassembly_max_segments is not None:
+        kwargs['reassembly_max_segments'] = reassembly_max_segments
+    _ProcessRegistry.get().set_server(**kwargs)
 
 
 def set_client_ipc_config(
