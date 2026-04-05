@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import glob
 import math
@@ -29,6 +30,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 import c_two as cc
 from c_two._native import NativeRelay
 from c_two.transport.registry import _ProcessRegistry
+
+# Configurable via CLI --segment-size (bytes)
+_SEGMENT_SIZE: int = 2 * 1024 * 1024 * 1024  # default 2GB
+_MAX_SEGMENTS: int = 8
 
 # ---------------------------------------------------------------------------
 # Echo CRMs — bytes (identity fast path) vs dict (pickle path)
@@ -158,8 +163,8 @@ def bench_ipc(payload_size: int) -> float:
     _ProcessRegistry.reset()
     address = f'ipc://bench_3m_ipc_{_ipc_counter}'
 
-    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_address(address)
     cc.register(IEcho, Echo(), name='echo_ipc')
     _wait_sock(address)
@@ -187,8 +192,8 @@ def bench_relay(payload_size: int) -> float | None:
     address = f'ipc://bench_3m_relay_{_ipc_counter}'
     relay_addr = f'127.0.0.1:{_relay_port}'
 
-    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_address(address)
     cc.register(IEcho, Echo(), name='echo_relay')
     _wait_sock(address)
@@ -220,8 +225,9 @@ def bench_relay(payload_size: int) -> float | None:
 # IPC mode — dict payload (pickle path)
 # ---------------------------------------------------------------------------
 
-# dict sizes capped at 100MB — pickle is too slow beyond that
-_DICT_MAX_SIZE = 100 * 1024 * 1024
+# dict sizes were previously capped at 100MB due to dedicated segment bugs.
+# Now that ChunkRegistry + dedicated segments work correctly, test all sizes.
+_DICT_MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB — no practical limit
 
 def _make_dict_payload(size: int) -> dict:
     """Create a dict whose pickled size is approximately `size` bytes."""
@@ -236,8 +242,8 @@ def bench_ipc_dict(payload_size: int) -> float | None:
     _ProcessRegistry.reset()
     address = f'ipc://bench_3m_dict_{_ipc_counter}'
 
-    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_address(address)
     cc.register(IDictEcho, DictEcho(), name='echo_dict')
     _wait_sock(address)
@@ -257,6 +263,14 @@ def bench_ipc_dict(payload_size: int) -> float | None:
 # Runner
 # ---------------------------------------------------------------------------
 
+def _human_size(n: int) -> str:
+    if n >= 1024 * 1024 * 1024 and n % (1024 * 1024 * 1024) == 0:
+        return f'{n // (1024 * 1024 * 1024)}GB'
+    if n >= 1024 * 1024 and n % (1024 * 1024) == 0:
+        return f'{n // (1024 * 1024)}MB'
+    return f'{n}B'
+
+
 def _geomean(values: list[float]) -> float:
     valid = [v for v in values if v is not None and v > 0]
     if not valid:
@@ -275,12 +289,27 @@ def _fmt(v: float | None) -> str:
 
 
 def main():
+    global _SEGMENT_SIZE, _MAX_SEGMENTS
+
+    parser = argparse.ArgumentParser(description='Three-mode benchmark')
+    parser.add_argument('--segment-size', type=int, default=2 * 1024 * 1024 * 1024,
+                        help='Pool segment size in bytes (default: 2GB)')
+    parser.add_argument('--max-segments', type=int, default=8,
+                        help='Max pool segments (default: 8)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output TSV path (default: auto-named by segment size)')
+    args = parser.parse_args()
+    _SEGMENT_SIZE = args.segment_size
+    _MAX_SEGMENTS = args.max_segments
+
+    seg_label = _human_size(_SEGMENT_SIZE)
+
     _cleanup()
 
     print('=' * 120)
     print('Three-Mode Benchmark: Thread-local vs IPC vs Relay (HTTP)')
     print(f'Payload types: bytes (identity fast path) | dict (pickle serde)')
-    print(f'Warmup: {WARMUP}  |  Adaptive rounds (100/20/5)')
+    print(f'Warmup: {WARMUP}  |  Adaptive rounds (100/20/5)  |  Segment: {seg_label}×{_MAX_SEGMENTS}')
     print(f'Python: {sys.version}')
     print('=' * 120)
     header = (f'{"Size":>8s}  {"Rounds":>6s}  {"Thread (ms)":>12s}  '
@@ -324,7 +353,10 @@ def main():
     print('=' * 120)
 
     # Write TSV
-    tsv_path = os.path.join(os.path.dirname(__file__), '..', 'benchmark_results.tsv')
+    if args.output:
+        tsv_path = args.output
+    else:
+        tsv_path = os.path.join(os.path.dirname(__file__), '..', f'benchmark_results_{seg_label.lower()}.tsv')
     with open(tsv_path, 'w') as f:
         f.write('size\tsize_bytes\trounds\tthread_ms\tipc_bytes_ms\tipc_dict_ms\trelay_ms\n')
         for r in results:
