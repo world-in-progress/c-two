@@ -182,10 +182,10 @@ class ServerIPCConfig(BaseIPCConfig):
             raise ValueError("max_frame_size must be positive")
         if self.max_payload_size <= 0:
             raise ValueError("max_payload_size must be positive")
-        if self.heartbeat_interval <= 0:
-            raise ValueError("heartbeat_interval must be positive")
-        if self.heartbeat_timeout <= self.heartbeat_interval:
-            raise ValueError("heartbeat_timeout must exceed heartbeat_interval")
+        if self.heartbeat_interval < 0:
+            raise ValueError("heartbeat_interval must be >= 0 (0 disables heartbeat)")
+        if self.heartbeat_interval > 0 and self.heartbeat_timeout <= self.heartbeat_interval:
+            raise ValueError("heartbeat_timeout must exceed heartbeat_interval when heartbeat is enabled")
 ```
 
 ### ClientIPCConfig
@@ -639,7 +639,53 @@ pool.set_default_config(
 )
 ```
 
-## Scope
+### RustClient::new() FFI
+
+`RustClient::new()` currently has the same hardcoded defaults problem (`shm_threshold=4096`, `chunk_size=131072`, `..IpcConfig::default()`). It is converted to all-mandatory, matching the `ClientIpcConfig` field set:
+
+```rust
+#[pyo3(signature = (
+    address,
+    shm_threshold,
+    pool_enabled,
+    pool_segment_size,
+    max_pool_segments,
+    max_pool_memory,
+    reassembly_segment_size,
+    reassembly_max_segments,
+    max_total_chunks,
+    chunk_gc_interval,
+    chunk_threshold_ratio,
+    chunk_assembler_timeout,
+    max_reassembly_bytes,
+    chunk_size,
+))]
+fn new(
+    py: Python<'_>,
+    address: &str,
+    shm_threshold: u64,
+    pool_enabled: bool,
+    pool_segment_size: u64,
+    max_pool_segments: u32,
+    max_pool_memory: u64,
+    reassembly_segment_size: u64,
+    reassembly_max_segments: u32,
+    max_total_chunks: u32,
+    chunk_gc_interval: f64,
+    chunk_threshold_ratio: f64,
+    chunk_assembler_timeout: f64,
+    max_reassembly_bytes: u64,
+    chunk_size: u64,
+) -> PyResult<Self> {
+    let config = ClientIpcConfig {
+        base: BaseIpcConfig { /* all fields from params */ },
+        shm_threshold,
+    };
+    // ...
+}
+```
+
+`RustClient::new()` is still needed for standalone (non-pooled) connections. Both `RustClient::new()` and `RustClientPool.set_default_config()` receive the same `ClientIpcConfig` field set.
 
 ### In Scope
 
@@ -712,8 +758,18 @@ pool.set_default_config(
 | `max_payload_size` | `int` | `u64` | 17,179,869,184 (16 GB) | `C2_IPC_MAX_PAYLOAD_SIZE` |
 | `max_pending_requests` | `int` | `u32` | 1024 | `C2_IPC_MAX_PENDING_REQUESTS` |
 | `pool_decay_seconds` | `float` | `f64` | 60.0 | `C2_IPC_POOL_DECAY_SECONDS` |
-| `heartbeat_interval` | `float` | `f64` | 15.0 | `C2_IPC_HEARTBEAT_INTERVAL` |
+| `heartbeat_interval` | `float` | `f64` | 15.0 (0 = disabled) | `C2_IPC_HEARTBEAT_INTERVAL` |
 | `heartbeat_timeout` | `float` | `f64` | 30.0 | `C2_IPC_HEARTBEAT_TIMEOUT` |
+
+### ClientIPCConfig Overrides
+
+`ClientIPCConfig` inherits all `BaseIPCConfig` fields but overrides these defaults:
+
+| Field | Base Default | Client Default | Reason |
+|-------|-------------|---------------|--------|
+| `reassembly_segment_size` | 268,435,456 (256 MB) | 67,108,864 (64 MB) | Client may connect to many servers; 10 × 256 MB × 4 = 10 GB is excessive |
+
+All other fields use the `BaseIPCConfig` defaults.
 
 ### Global Settings (C2Settings)
 
