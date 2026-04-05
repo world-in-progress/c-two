@@ -9,7 +9,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport import Server
-from c_two.transport.ipc.frame import IPCConfig
+from c_two.config.ipc import ServerIPCConfig
 from c_two.transport.client.util import ping
 
 from tests.fixtures.hello import Hello
@@ -53,7 +53,7 @@ class TestHeartbeatIntegration:
 
     def test_active_connection_survives_heartbeat(self):
         """An active client is NOT disconnected by heartbeat probes."""
-        config = IPCConfig(heartbeat_interval=0.3, heartbeat_timeout=0.8)
+        config = ServerIPCConfig(heartbeat_interval=0.3, heartbeat_timeout=0.8)
         address = f'ipc://{_unique_region()}'
         server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
@@ -76,7 +76,7 @@ class TestHeartbeatIntegration:
 
     def test_idle_client_survives_heartbeat_with_pong(self):
         """An idle client that responds to PING survives heartbeat probes."""
-        config = IPCConfig(heartbeat_interval=0.2, heartbeat_timeout=0.6)
+        config = ServerIPCConfig(heartbeat_interval=0.2, heartbeat_timeout=0.6)
         address = f'ipc://{_unique_region()}'
         server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
@@ -104,7 +104,7 @@ class TestHeartbeatIntegration:
         and clean up dead connections without crashing.
         """
         import socket
-        config = IPCConfig(heartbeat_interval=0.1, heartbeat_timeout=0.3)
+        config = ServerIPCConfig(heartbeat_interval=0.1, heartbeat_timeout=0.3)
         address = f'ipc://{_unique_region()}'
         server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
@@ -133,7 +133,7 @@ class TestHeartbeatIntegration:
 
     def test_heartbeat_disabled(self):
         """When heartbeat_interval=0, no probes are sent."""
-        config = IPCConfig(heartbeat_interval=0, heartbeat_timeout=30)
+        config = ServerIPCConfig(heartbeat_interval=0, heartbeat_timeout=30)
         address = f'ipc://{_unique_region()}'
         server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
         server.start()
