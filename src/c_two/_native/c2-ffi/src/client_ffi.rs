@@ -277,26 +277,44 @@ pub struct PyRustClient {
 impl PyRustClient {
     /// Create and connect to the given IPC address.
     #[new]
-    #[pyo3(signature = (address, shm_threshold=4096, chunk_size=131072, pool_segment_size=None, reassembly_segment_size=None, reassembly_max_segments=None))]
+    #[pyo3(signature = (
+        address, shm_threshold, pool_enabled, pool_segment_size,
+        max_pool_segments, max_pool_memory, reassembly_segment_size,
+        reassembly_max_segments, max_total_chunks, chunk_gc_interval,
+        chunk_threshold_ratio, chunk_assembler_timeout,
+        max_reassembly_bytes, chunk_size,
+    ))]
     fn new(
         py: Python<'_>,
         address: &str,
         shm_threshold: u64,
-        chunk_size: usize,
-        pool_segment_size: Option<u64>,
-        reassembly_segment_size: Option<u64>,
-        reassembly_max_segments: Option<u32>,
+        pool_enabled: bool,
+        pool_segment_size: u64,
+        max_pool_segments: u32,
+        max_pool_memory: u64,
+        reassembly_segment_size: u64,
+        reassembly_max_segments: u32,
+        max_total_chunks: u32,
+        chunk_gc_interval: f64,
+        chunk_threshold_ratio: f64,
+        chunk_assembler_timeout: f64,
+        max_reassembly_bytes: u64,
+        chunk_size: u64,
     ) -> PyResult<Self> {
         let config = ClientIpcConfig {
             base: BaseIpcConfig {
-                chunk_size: chunk_size as u64,
-                pool_segment_size: pool_segment_size
-                    .unwrap_or(BaseIpcConfig::default().pool_segment_size),
-                reassembly_segment_size: reassembly_segment_size
-                    .unwrap_or(ClientIpcConfig::default().reassembly_segment_size),
-                reassembly_max_segments: reassembly_max_segments
-                    .unwrap_or(ClientIpcConfig::default().reassembly_max_segments),
-                ..BaseIpcConfig::default()
+                pool_enabled,
+                pool_segment_size,
+                max_pool_segments,
+                max_pool_memory,
+                reassembly_segment_size,
+                reassembly_max_segments,
+                max_total_chunks,
+                chunk_gc_interval_secs: chunk_gc_interval,
+                chunk_threshold_ratio,
+                chunk_assembler_timeout_secs: chunk_assembler_timeout,
+                max_reassembly_bytes,
+                chunk_size,
             },
             shm_threshold,
         };
@@ -311,9 +329,7 @@ impl PyRustClient {
             SyncClient::connect(&addr, Some(pool), config)
                 .map_err(|e| PyRuntimeError::new_err(format!("{e}")))
         })?;
-        Ok(Self {
-            inner: Arc::new(client),
-        })
+        Ok(Self { inner: Arc::new(client) })
     }
 
     /// Call a CRM method synchronously.
@@ -451,46 +467,13 @@ impl PyRustClientPool {
     ///
     /// Increments the internal reference count.  Call `release()` when
     /// the client is no longer needed.
-    #[pyo3(signature = (address, shm_threshold=None, chunk_size=None, pool_segment_size=None, reassembly_segment_size=None, reassembly_max_segments=None))]
-    fn acquire(
-        &self,
-        py: Python<'_>,
-        address: &str,
-        shm_threshold: Option<u64>,
-        chunk_size: Option<usize>,
-        pool_segment_size: Option<u64>,
-        reassembly_segment_size: Option<u64>,
-        reassembly_max_segments: Option<u32>,
-    ) -> PyResult<PyRustClient> {
-        let base_defaults = BaseIpcConfig::default();
-        let client_defaults = ClientIpcConfig::default();
-        let config = if shm_threshold.is_some() || chunk_size.is_some()
-            || pool_segment_size.is_some() || reassembly_segment_size.is_some()
-            || reassembly_max_segments.is_some()
-        {
-            Some(ClientIpcConfig {
-                base: BaseIpcConfig {
-                    chunk_size: chunk_size.map(|v| v as u64).unwrap_or(base_defaults.chunk_size),
-                    pool_segment_size: pool_segment_size
-                        .unwrap_or(base_defaults.pool_segment_size),
-                    reassembly_segment_size: reassembly_segment_size
-                        .unwrap_or(client_defaults.reassembly_segment_size),
-                    reassembly_max_segments: reassembly_max_segments
-                        .unwrap_or(base_defaults.reassembly_max_segments),
-                    ..base_defaults
-                },
-                shm_threshold: shm_threshold.unwrap_or(client_defaults.shm_threshold),
-            })
-        } else {
-            None
-        };
-
+    #[pyo3(signature = (address,))]
+    fn acquire(&self, py: Python<'_>, address: &str) -> PyResult<PyRustClient> {
         let addr = address.to_string();
         let pool = self.inner;
         let client = py
-            .allow_threads(move || pool.acquire(&addr, config.as_ref()))
+            .allow_threads(move || pool.acquire(&addr, None))
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
-
         Ok(PyRustClient { inner: client })
     }
 
@@ -500,30 +483,46 @@ impl PyRustClientPool {
     }
 
     /// Set the default IPC config for newly created clients.
-    #[pyo3(signature = (shm_threshold=4096, chunk_size=131072, pool_segment_size=None, reassembly_segment_size=None, reassembly_max_segments=None))]
+    #[pyo3(signature = (
+        shm_threshold, pool_enabled, pool_segment_size, max_pool_segments,
+        max_pool_memory, reassembly_segment_size, reassembly_max_segments,
+        max_total_chunks, chunk_gc_interval, chunk_threshold_ratio,
+        chunk_assembler_timeout, max_reassembly_bytes, chunk_size,
+    ))]
     fn set_default_config(
         &self,
         shm_threshold: u64,
-        chunk_size: usize,
-        pool_segment_size: Option<u64>,
-        reassembly_segment_size: Option<u64>,
-        reassembly_max_segments: Option<u32>,
+        pool_enabled: bool,
+        pool_segment_size: u64,
+        max_pool_segments: u32,
+        max_pool_memory: u64,
+        reassembly_segment_size: u64,
+        reassembly_max_segments: u32,
+        max_total_chunks: u32,
+        chunk_gc_interval: f64,
+        chunk_threshold_ratio: f64,
+        chunk_assembler_timeout: f64,
+        max_reassembly_bytes: u64,
+        chunk_size: u64,
     ) {
-        let base_defaults = BaseIpcConfig::default();
-        let client_defaults = ClientIpcConfig::default();
-        self.inner.set_default_config(ClientIpcConfig {
+        let config = ClientIpcConfig {
             base: BaseIpcConfig {
-                chunk_size: chunk_size as u64,
-                pool_segment_size: pool_segment_size
-                    .unwrap_or(base_defaults.pool_segment_size),
-                reassembly_segment_size: reassembly_segment_size
-                    .unwrap_or(client_defaults.reassembly_segment_size),
-                reassembly_max_segments: reassembly_max_segments
-                    .unwrap_or(base_defaults.reassembly_max_segments),
-                ..base_defaults
+                pool_enabled,
+                pool_segment_size,
+                max_pool_segments,
+                max_pool_memory,
+                reassembly_segment_size,
+                reassembly_max_segments,
+                max_total_chunks,
+                chunk_gc_interval_secs: chunk_gc_interval,
+                chunk_threshold_ratio,
+                chunk_assembler_timeout_secs: chunk_assembler_timeout,
+                max_reassembly_bytes,
+                chunk_size,
             },
             shm_threshold,
-        });
+        };
+        self.inner.set_default_config(config);
     }
 
     /// Sweep entries that have been unreferenced beyond the grace period.

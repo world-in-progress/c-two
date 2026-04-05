@@ -115,7 +115,9 @@ class _ProcessRegistry:
         self._server_config: ServerIPCConfig | None = None
         self._server_kwargs: dict[str, object] = {}
         self._shm_threshold: int | None = None
-        self._client_ipc_overrides: dict[str, int] = {}
+        self._client_config: ClientIPCConfig | None = None
+        self._client_kwargs: dict[str, object] = {}
+        self._pool_config_applied: bool = False
         from c_two._native import RustClientPool, RustHttpClientPool
         self._pool = RustClientPool.instance()
         self._http_pool = RustHttpClientPool.instance()
@@ -183,39 +185,20 @@ class _ProcessRegistry:
             self._server_kwargs = kwargs
             self._server_config = None  # rebuilt lazily
 
-    def set_client_ipc_config(
-        self,
-        *,
-        segment_size: int | None = None,
-        max_segments: int | None = None,
-        reassembly_segment_size: int | None = None,
-        reassembly_max_segments: int | None = None,
-    ) -> None:
-        """Configure the IPC client's memory pools.
-
-        Must be called **before** any :func:`connect` call.
-
-        Parameters
-        ----------
-        segment_size:
-            Client buddy pool segment size in bytes (default 256 MB).
-        max_segments:
-            Max buddy pool segments, 1–255 (default 4).
-        reassembly_segment_size:
-            Client reassembly pool segment size in bytes (default 256 MB).
-        reassembly_max_segments:
-            Max reassembly pool segments, 1–255 (default 4).
-        """
-        kwargs: dict[str, int] = {}
-        if segment_size is not None:
-            kwargs['pool_segment_size'] = segment_size
-        if reassembly_segment_size is not None:
-            kwargs['reassembly_segment_size'] = reassembly_segment_size
-        if reassembly_max_segments is not None:
-            kwargs['reassembly_max_segments'] = reassembly_max_segments
-        self._client_ipc_overrides = kwargs
-        # Apply to the pooled client factory.
-        self._pool.set_default_config(**kwargs)
+    def set_client(self, **kwargs: object) -> None:
+        """Configure IPC client. Must be called before connect()."""
+        with self._lock:
+            if self._pool_config_applied:
+                import warnings
+                warnings.warn(
+                    'Client connections already exist, set_client() ignored. '
+                    'Call set_client() before connect().',
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return
+            self._client_kwargs = kwargs
+            self._client_config = None  # rebuilt lazily
 
     def register(
         self,
@@ -340,6 +323,25 @@ class _ProcessRegistry:
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
+            if not self._pool_config_applied:
+                cfg = self._build_client_config()
+                shm = self._shm_threshold or settings.shm_threshold or 4096
+                self._pool.set_default_config(
+                    shm_threshold=shm,
+                    pool_enabled=cfg.pool_enabled,
+                    pool_segment_size=cfg.pool_segment_size,
+                    max_pool_segments=cfg.max_pool_segments,
+                    max_pool_memory=cfg.max_pool_memory,
+                    reassembly_segment_size=cfg.reassembly_segment_size,
+                    reassembly_max_segments=cfg.reassembly_max_segments,
+                    max_total_chunks=cfg.max_total_chunks,
+                    chunk_gc_interval=cfg.chunk_gc_interval,
+                    chunk_threshold_ratio=cfg.chunk_threshold_ratio,
+                    chunk_assembler_timeout=cfg.chunk_assembler_timeout,
+                    max_reassembly_bytes=cfg.max_reassembly_bytes,
+                    chunk_size=cfg.chunk_size,
+                )
+                self._pool_config_applied = True
             client = self._pool.acquire(address)
             proxy = ICRMProxy.ipc(
                 client,
@@ -419,7 +421,9 @@ class _ProcessRegistry:
             self._server_config = None
             self._server_kwargs = {}
             self._shm_threshold = None
-            self._client_ipc_overrides = {}
+            self._client_config = None
+            self._client_kwargs = {}
+            self._pool_config_applied = False
             self._registrations.clear()
 
         # Best-effort relay unregistration (ignore failures during shutdown).
@@ -621,6 +625,12 @@ class _ProcessRegistry:
         self._server_config = build_server_config(settings, **self._server_kwargs)
         return self._server_config
 
+    def _build_client_config(self) -> ClientIPCConfig:
+        if self._client_config is not None:
+            return self._client_config
+        self._client_config = build_client_config(settings, **self._client_kwargs)
+        return self._client_config
+
     @staticmethod
     def _auto_address() -> str:
         return f'ipc://cc_auto_{os.getpid()}_{uuid.uuid4().hex[:8]}'
@@ -683,14 +693,18 @@ def set_client_ipc_config(
 ) -> None:
     """Configure IPC client memory pools before connecting.
 
-    See :meth:`_ProcessRegistry.set_client_ipc_config`.
+    See :meth:`_ProcessRegistry.set_client`.
     """
-    _ProcessRegistry.get().set_client_ipc_config(
-        segment_size=segment_size,
-        max_segments=max_segments,
-        reassembly_segment_size=reassembly_segment_size,
-        reassembly_max_segments=reassembly_max_segments,
-    )
+    kwargs: dict[str, object] = {}
+    if segment_size is not None:
+        kwargs['pool_segment_size'] = segment_size
+    if max_segments is not None:
+        kwargs['max_pool_segments'] = max_segments
+    if reassembly_segment_size is not None:
+        kwargs['reassembly_segment_size'] = reassembly_segment_size
+    if reassembly_max_segments is not None:
+        kwargs['reassembly_max_segments'] = reassembly_max_segments
+    _ProcessRegistry.get().set_client(**kwargs)
 
 
 def register(
