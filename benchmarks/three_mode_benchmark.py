@@ -2,7 +2,7 @@
 
 Measures P50 round-trip latency for echo across three transport modes:
   - Thread-local: same process, zero serialization
-  - IPC: full serialize + SHM + UDS (2GB buddy segments)
+  - IPC: full serialize + SHM + UDS
   - Relay: HTTP → NativeRelay → IPC → CRM → reverse
 
 Two payload types compared:
@@ -11,8 +11,11 @@ Two payload types compared:
 
 Payload sizes: 64B, 256B, 1KB, 4KB, 64KB, 1MB, 10MB, 50MB, 100MB, 500MB, 1GB
 
+Results are written to benchmarks/results/ (git-ignored).
+
 Usage:
     C2_RELAY_ADDRESS= uv run python benchmarks/three_mode_benchmark.py
+    C2_RELAY_ADDRESS= uv run python benchmarks/three_mode_benchmark.py --segment-size 268435456
 """
 from __future__ import annotations
 
@@ -356,7 +359,9 @@ def main():
     if args.output:
         tsv_path = args.output
     else:
-        tsv_path = os.path.join(os.path.dirname(__file__), '..', f'benchmark_results_{seg_label.lower()}.tsv')
+        results_dir = os.path.join(os.path.dirname(__file__), 'results')
+        os.makedirs(results_dir, exist_ok=True)
+        tsv_path = os.path.join(results_dir, f'benchmark_{seg_label.lower()}.tsv')
     with open(tsv_path, 'w') as f:
         f.write('size\tsize_bytes\trounds\tthread_ms\tipc_bytes_ms\tipc_dict_ms\trelay_ms\n')
         for r in results:
