@@ -57,7 +57,7 @@ parking_lot = "0.12"
 parking_lot.workspace = true
 ```
 
-Affected crates: `c2-mem`, `c2-wire`, `c2-ipc`, `c2-server`, `c2-http`, `c2-ffi`
+Affected crates: `c2-wire`, `c2-ipc`, `c2-server`, `c2-http`, `c2-ffi` (5 crates; c2-mem has no std Mutex/RwLock usage)
 
 ### Code Transformation Pattern
 
@@ -79,24 +79,17 @@ let guard = self.pool.write();
 
 1. **`Arc<RwLock<MemPool>>` cross-crate boundary** — `MemPool` is wrapped in `Arc<RwLock<>>` and passed between c2-server, c2-ipc, c2-ffi, and c2-wire. All consumers must switch to `parking_lot::RwLock` simultaneously. Since we're doing a full migration, this is handled naturally.
 
-2. **Drop impls with `if let Ok(guard) = self.lock()`** — These defensive patterns (found in c2-ffi) exist specifically because of poisoning. With parking_lot, simplify to `let guard = self.lock()`:
+2. **Drop impls with `if let Ok(guard) = self.lock()`** — These defensive patterns (found in c2-ffi and c2-server/dispatcher.rs) exist specifically because of poisoning. With parking_lot, `lock()`/`write()` returns a guard directly — `if let Ok(...)` won't compile. Simplify to direct `let guard = self.lock()`:
    ```rust
-   // BEFORE (c2-ffi defensive pattern)
-   impl Drop for PyFoo {
-       fn drop(&mut self) {
-           if let Ok(guard) = self.inner.lock() {
-               guard.cleanup();
-           }
-       }
+   // BEFORE (c2-ffi + dispatcher.rs defensive pattern)
+   if let Ok(guard) = self.inner.lock() {
+       guard.cleanup();
    }
    // AFTER
-   impl Drop for PyFoo {
-       fn drop(&mut self) {
-           let guard = self.inner.lock();
-           guard.cleanup();
-       }
-   }
+   let guard = self.inner.lock();
+   guard.cleanup();
    ```
+   Affected locations (16 total): c2-ffi/client_ffi.rs (5), c2-ffi/shm_buffer.rs (5), c2-ffi/mem_ffi.rs (4), c2-server/dispatcher.rs (2).
 
 3. **PyO3 compatibility** — `parking_lot` guards implement `Send`/`Sync` the same way as std. `#[pyclass(frozen)]` types with interior `parking_lot::Mutex` work identically.
 
@@ -104,14 +97,14 @@ let guard = self.pool.write();
 
 ### Scope by Crate
 
-| Crate | Files | ~Unwrap Sites | Priority |
-|-------|-------|---------------|----------|
-| c2-ipc | client.rs, pool.rs, shm.rs | ~44 | Critical (async blocking) |
-| c2-ffi | mem_ffi.rs, client_ffi.rs, server_ffi.rs, shm_buffer.rs, relay_ffi.rs | ~50 | High (FFI boundary) |
-| c2-server | server.rs, connection.rs | ~20 | Critical (per-connection) |
-| c2-wire | chunk/registry.rs | ~21 | High (sharded locks) |
-| c2-mem | pool.rs, region.rs | ~15 | Medium |
-| c2-http | relay/router.rs, relay/server.rs | ~13 | Medium |
+| Crate | Files | `.unwrap()` | `if let Ok` | Priority |
+|-------|-------|-------------|-------------|----------|
+| c2-ipc | client.rs(30), pool.rs(14), response.rs(3), sync_client.rs(2) | 49 | 0 | Critical (async blocking) |
+| c2-ffi | mem_ffi.rs(17), client_ffi.rs(8), relay_ffi.rs(8), server_ffi.rs(5), shm_buffer.rs(5) | 43 | 14 | High (FFI boundary) |
+| c2-server | connection.rs(18), server.rs(8) + dispatcher.rs | 26 | 2 | Critical (per-connection) |
+| c2-http | relay/router.rs(12), relay/server.rs(6), client/pool.rs(5), relay/state.rs(1) | 24 | 0 | Medium |
+| c2-wire | chunk/registry.rs(21) | 21 | 0 | High (sharded locks) |
+| **Total** | **16 files** | **163** | **16** | |
 
 ---
 
