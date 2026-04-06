@@ -9,9 +9,6 @@
 //! `total_len` = 12 + payload_len (covers request_id + flags + payload).
 //! The 4-byte `total_len` prefix itself is **not** included in the value.
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use crate::flags;
 
 /// Size of the frame header in bytes: 4 (total_len) + 8 (rid) + 4 (flags).
@@ -113,7 +110,6 @@ pub enum DecodeError {
     Utf8Error,
 }
 
-#[cfg(feature = "std")]
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -131,7 +127,6 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
-#[cfg(feature = "std")]
 impl std::error::Error for DecodeError {}
 
 /// Decode the 4-byte `total_len` prefix from the start of a buffer.

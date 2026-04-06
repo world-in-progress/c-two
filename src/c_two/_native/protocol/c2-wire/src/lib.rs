@@ -13,14 +13,6 @@
 //!
 //! All integers are little-endian.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
-
 pub mod flags;
 pub mod frame;
 pub mod buddy;
@@ -29,7 +21,6 @@ pub mod chunk;
 pub mod ctrl;
 pub mod msg_type;
 pub mod handshake;
-#[cfg(feature = "std")]
 pub mod assembler;
 
 #[cfg(test)]

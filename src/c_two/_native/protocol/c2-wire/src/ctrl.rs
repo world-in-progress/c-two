@@ -15,9 +15,6 @@
 //! [1B ctrl=0x02][1B direction][1B index]
 //! ```
 
-#[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
-
 use crate::frame::DecodeError;
 
 /// Announce a new pool segment to peer.

@@ -248,6 +248,7 @@ dependencies = [
 name = "c2-wire"
 version = "0.1.0"
 dependencies = [
+ "c2-config",
  "c2-mem",
 ]
 

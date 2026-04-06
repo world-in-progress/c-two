@@ -23,9 +23,6 @@
 //! ]
 //! ```
 
-#[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
-
 use crate::frame::DecodeError;
 
 /// Handshake version number.

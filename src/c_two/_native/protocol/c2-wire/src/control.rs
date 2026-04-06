@@ -19,9 +19,6 @@
 //!     [4B error_len LE][error_bytes]
 //! ```
 
-#[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
-
 use crate::frame::DecodeError;
 
 /// Reply status: success — result data follows (inline or in buddy SHM).

@@ -4,9 +4,6 @@ edition.workspace = true
 version.workspace = true
 description = "Wire protocol codec for C-Two IPC frames"
 
-[features]
-default = ["std"]
-std = ["c2-mem"]
-
 [dependencies]
-c2-mem = { path = "../../foundation/c2-mem", optional = true }
+c2-config = { path = "../../foundation/c2-config" }
+c2-mem = { path = "../../foundation/c2-mem" }

@@ -80,9 +80,6 @@ pub fn decode_reply_chunk_meta(
 mod tests {
     use super::*;
 
-    #[cfg(not(feature = "std"))]
-    use alloc::vec;
-
     #[test]
     fn round_trip() {
         let encoded = encode_chunk_header(42, 100);
