@@ -104,7 +104,7 @@ let guard = self.pool.write();
 | c2-server | connection.rs(18), server.rs(8) + dispatcher.rs | 26 | 2 | Critical (per-connection) |
 | c2-http | relay/router.rs(12), relay/server.rs(6), client/pool.rs(5), relay/state.rs(1) | 24 | 0 | Medium |
 | c2-wire | chunk/registry.rs(21) | 21 | 0 | High (sharded locks) |
-| **Total** | **16 files** | **163** | **16** | |
+| **Total** | **17 files** | **163** | **16** | |
 
 ---
 
