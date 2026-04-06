@@ -34,26 +34,27 @@ _native/
 │   ├── c2-config/                # (381 LOC) config types
 │   └── c2-mem/                   # (3366 LOC) SHM + buddy allocator
 ├── protocol/
-│   └── c2-wire/                  # (2747 LOC) wire codec + chunk lifecycle
+│   └── c2-wire/                  # (1983 → 2747 LOC after merge)
 │       └── src/
-│           ├── chunk/            # ← merged from c2-chunk
-│           │   ├── mod.rs
-│           │   ├── config.rs
-│           │   ├── registry.rs
-│           │   └── promote.rs
+│           ├── chunk/            # wire chunk codec + lifecycle (merged)
+│           │   ├── mod.rs        # re-exports
+│           │   ├── header.rs     # ← renamed from original chunk.rs (codec)
+│           │   ├── config.rs     # ← from c2-chunk
+│           │   ├── registry.rs   # ← from c2-chunk
+│           │   └── promote.rs    # ← from c2-chunk
 │           ├── assembler.rs
 │           ├── frame.rs
 │           └── ...
 ├── transport/
 │   ├── c2-ipc/                   # (2385 LOC) UDS+SHM async client
 │   ├── c2-server/                # (2645 LOC) tokio UDS server
-│   └── c2-http/                  # (1327 LOC) HTTP transport layer
+│   └── c2-http/                  # (361 → 1327 LOC after merge)
 │       └── src/
-│           ├── client/           # ← original c2-http (reqwest)
+│           ├── client/           # ← original c2-http (reqwest) [default feature]
 │           │   ├── mod.rs
 │           │   ├── client.rs
 │           │   └── pool.rs
-│           ├── relay/            # ← merged from c2-relay
+│           ├── relay/            # ← merged from c2-relay [feature = "relay"]
 │           │   ├── mod.rs
 │           │   ├── server.rs
 │           │   ├── router.rs
@@ -85,15 +86,31 @@ No dependency cycles. Each layer only depends on layers below it.
 
 **Rationale**: ChunkRegistry manages wire-level chunk reassembly lifecycle. It's tightly coupled to wire framing concepts.
 
+**Naming conflict resolution**: c2-wire already has `src/chunk.rs` (chunk header codec: `encode_chunk_header`/`decode_chunk_header`). Rust does not allow both `chunk.rs` and `chunk/` at the same level. Solution: convert `chunk.rs` → `chunk/header.rs`, then place c2-chunk files alongside in the same `chunk/` directory.
+
 **File mapping**:
-| Source (c2-chunk) | Destination (c2-wire) |
-|---|---|
-| `src/config.rs` | `src/chunk/config.rs` |
-| `src/registry.rs` | `src/chunk/registry.rs` |
-| `src/promote.rs` | `src/chunk/promote.rs` |
-| `src/lib.rs` | `src/chunk/mod.rs` (re-exports) |
+| Source | Destination (c2-wire) | Notes |
+|---|---|---|
+| `c2-wire/src/chunk.rs` | `src/chunk/header.rs` | Renamed, existing wire chunk codec |
+| `c2-chunk/src/config.rs` | `src/chunk/config.rs` | From c2-chunk |
+| `c2-chunk/src/registry.rs` | `src/chunk/registry.rs` | From c2-chunk |
+| `c2-chunk/src/promote.rs` | `src/chunk/promote.rs` | From c2-chunk |
+| (new) | `src/chunk/mod.rs` | Re-exports all submodules |
+
+The new `chunk/mod.rs` re-exports header codec types at `c2_wire::chunk::` level for backward compat:
+```rust
+pub mod header;
+pub mod config;
+pub mod registry;
+pub mod promote;
+
+// Re-export header codec at chunk level (was previously chunk::encode_chunk_header)
+pub use header::*;
+```
 
 **Dependency change**: c2-wire gains `c2-config` dependency (inherited from c2-chunk).
+
+**no_std impact**: c2-wire currently has `features = { std = ["c2-mem"] }` for optional no_std support. However, `--no-default-features` already fails to compile (broken `vec!` macro in `control.rs`), and no consumer uses no_std mode. Merging c2-chunk makes c2-config and c2-mem hard dependencies, formally closing off no_std. **Decision: accept this trade-off.** The no_std path was already non-functional and has no planned use case.
 
 **Import updates**:
 - `c2-ipc`: `c2_chunk::` → `c2_wire::chunk::`
@@ -103,6 +120,39 @@ No dependency cycles. Each layer only depends on layers below it.
 ### 2. c2-relay → c2-http
 
 **Rationale**: Both are the HTTP transport layer — one is client-side (connecting TO relay), the other is server-side (the relay process itself). The combined crate represents "HTTP transport".
+
+**Feature gate design**: To avoid dependency bloat, the relay module is behind a feature gate. Pure HTTP client usage (reqwest only) does not pull in axum/tower/c2-ipc.
+
+```toml
+# c2-http/Cargo.toml
+[features]
+default = []
+relay = ["dep:axum", "dep:tower", "dep:c2-ipc", "dep:c2-wire", "dep:c2-config"]
+
+[dependencies]
+# Always available (client)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+
+# Relay-only deps (behind feature gate)
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+c2-config = { path = "../../foundation/c2-config", optional = true }
+c2-wire = { path = "../../protocol/c2-wire", optional = true }
+c2-ipc = { path = "../c2-ipc", optional = true }
+
+[[bin]]
+name = "c2-relay"
+required-features = ["relay"]
+```
+
+The `lib.rs` conditionally compiles the relay module:
+```rust
+pub mod client;
+
+#[cfg(feature = "relay")]
+pub mod relay;
+```
 
 **File mapping**:
 | Source (c2-relay) | Destination (c2-http) |
@@ -121,12 +171,10 @@ No dependency cycles. Each layer only depends on layers below it.
 | `src/pool.rs` | `src/client/pool.rs` |
 | `src/lib.rs` | `src/client/mod.rs` |
 
-**Dependency change**: c2-http gains c2-config, c2-wire, c2-ipc, axum, tower (from relay).
-
 **Import updates**:
 - `c2-ffi/relay_ffi.rs`: `c2_relay::` → `c2_http::relay::`
 - `c2-ffi/http_ffi.rs`: `c2_http::HttpClient` → `c2_http::client::HttpClient` (etc.)
-- `c2-ffi/Cargo.toml`: remove `c2-relay` dep, keep `c2-http`
+- `c2-ffi/Cargo.toml`: remove `c2-relay` dep, use `c2-http = { ..., features = ["relay"] }`
 
 ## Workspace Cargo.toml
 
