@@ -327,8 +327,10 @@ IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联
 
 性能关键组件使用 Rust 实现，通过 [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) 编译为 Python 扩展：
 
+Rust 工作空间包含 7 个 crate，按 4 层架构组织（基础层 → 协议层 → 传输层 → 桥接层）：
+
 - **伙伴分配器** — IPC 传输的零系统调用共享内存分配。跨进程，快速路径上无锁。
-- **分块注册表** — 分片式生命周期管理器，处理跨 buddy、dedicated 和文件溢出内存层的大载荷分块传输。
+- **线协议** — 帧编码、分块组装和分块注册表，管理大载荷的生命周期。
 - **HTTP 中继** — 基于 [axum](https://github.com/tokio-rs/axum) 的高吞吐网关，桥接 HTTP 到 IPC。处理连接池和请求多路复用。
 
 Rust 扩展在 `pip install c-two`（从预编译 wheel）或 `uv sync`（从源码）时自动编译。
