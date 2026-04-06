@@ -10,7 +10,8 @@
 //! `router::try_reconnect`).
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -42,8 +43,7 @@ enum Command {
 pub struct RelayServer {
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    #[allow(dead_code)]
-    pool: Arc<RwLock<UpstreamPool>>,
+    _pool: Arc<RwLock<UpstreamPool>>,
 }
 
 impl RelayServer {
@@ -85,7 +85,7 @@ impl RelayServer {
         Ok(Self {
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
-            pool,
+            _pool: pool,
         })
     }
 
@@ -199,7 +199,7 @@ impl RelayServer {
             interval.tick().await;
 
             let idle_names = {
-                let pool = state.pool.read().unwrap();
+                let pool = state.pool.read();
                 pool.idle_entries(idle_timeout_ms)
             };
 
@@ -207,7 +207,7 @@ impl RelayServer {
                 continue;
             }
 
-            let mut pool = state.pool.write().unwrap();
+            let mut pool = state.pool.write();
             for name in &idle_names {
                 if let Some(old_client) = pool.evict(name) {
                     let dead = !old_client.is_connected();
@@ -237,7 +237,7 @@ impl RelayServer {
                 Command::RegisterUpstream { name, address, reply } => {
                     // Check duplicate without holding lock
                     {
-                        let pool = state.pool.read().unwrap();
+                        let pool = state.pool.read();
                         if pool.contains(&name) {
                             let _ = reply.send(Err(format!("Route name already registered: '{name}'")));
                             continue;
@@ -247,7 +247,7 @@ impl RelayServer {
                     let mut client = IpcClient::new(&address);
                     let result = match client.connect().await {
                         Ok(()) => {
-                            let mut pool = state.pool.write().unwrap();
+                            let mut pool = state.pool.write();
                             pool.insert(name, address, Arc::new(client))
                         }
                         Err(e) => Err(format!("Failed to connect: {e}")),
@@ -256,7 +256,7 @@ impl RelayServer {
                 }
                 Command::UnregisterUpstream { name, reply } => {
                     let result = {
-                        let mut pool = state.pool.write().unwrap();
+                        let mut pool = state.pool.write();
                         pool.remove(&name)
                     };
                     match result {
@@ -278,7 +278,7 @@ impl RelayServer {
                     }
                 }
                 Command::ListRoutes { reply } => {
-                    let pool = state.pool.read().unwrap();
+                    let pool = state.pool.read();
                     let routes: Vec<(String, String)> = pool
                         .list_routes()
                         .into_iter()

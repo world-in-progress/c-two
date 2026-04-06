@@ -50,7 +50,7 @@ async fn handle_register(
 
     // Check for duplicate under read lock (brief)
     {
-        let pool = state.pool.read().unwrap();
+        let pool = state.pool.read();
         if pool.contains(&name) {
             return (
                 StatusCode::CONFLICT,
@@ -71,7 +71,7 @@ async fn handle_register(
     }
 
     // Insert under write lock (brief)
-    let mut pool = state.pool.write().unwrap();
+    let mut pool = state.pool.write();
     match pool.insert(name.clone(), address, Arc::new(client)) {
         Ok(()) => {
             pool.touch(&name);
@@ -107,7 +107,7 @@ async fn handle_unregister(
         None => return (StatusCode::BAD_REQUEST, "Missing \"name\"").into_response(),
     };
 
-    let mut pool = state.pool.write().unwrap();
+    let mut pool = state.pool.write();
     match pool.remove(&name) {
         Ok(old_client) => {
             // Close old client asynchronously if present.
@@ -136,7 +136,7 @@ async fn handle_unregister(
 
 /// `GET /_routes` — list all registered routes.
 async fn handle_routes(State(state): State<RelayState>) -> impl IntoResponse {
-    let routes: Vec<serde_json::Value> = state.pool.read().unwrap()
+    let routes: Vec<serde_json::Value> = state.pool.read()
         .list_routes()
         .into_iter()
         .map(|r| serde_json::json!({"name": r.name, "address": r.address}))
@@ -148,7 +148,7 @@ async fn handle_routes(State(state): State<RelayState>) -> impl IntoResponse {
 
 /// `GET /health` — liveness check.
 async fn health(State(state): State<RelayState>) -> impl IntoResponse {
-    let route_names = state.pool.read().unwrap().route_names();
+    let route_names = state.pool.read().route_names();
     Json(serde_json::json!({
         "status": "ok",
         "routes": route_names,
@@ -166,7 +166,7 @@ async fn call_handler(
 ) -> Response {
     // Acquire read lock briefly to clone the Arc<IpcClient>, then drop lock.
     let client = {
-        let pool = state.pool.read().unwrap();
+        let pool = state.pool.read();
         pool.get(&route_name)
     };
 
@@ -178,7 +178,7 @@ async fn call_handler(
                 Some(c) => c,
                 None => {
                     // Distinguish "never registered" from "registered but unreachable".
-                    let has = state.pool.read().unwrap().has_entry(&route_name);
+                    let has = state.pool.read().has_entry(&route_name);
                     if has {
                         return (
                             StatusCode::BAD_GATEWAY,
@@ -202,7 +202,7 @@ async fn call_handler(
 
     match client.call(&route_name, &method_name, &body).await {
         Ok(result) => {
-            { state.pool.read().unwrap().touch(&route_name); }
+            { state.pool.read().touch(&route_name); }
             let bytes = result.into_bytes_with_pool(
                 client.server_pool_arc(),
                 &client.reassembly_pool_arc(),
@@ -215,7 +215,7 @@ async fn call_handler(
                 .into_response()
         }
         Err(c2_ipc::IpcError::CrmError(err_bytes)) => {
-            { state.pool.read().unwrap().touch(&route_name); }
+            { state.pool.read().touch(&route_name); }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [("content-type", "application/octet-stream")],
@@ -226,7 +226,7 @@ async fn call_handler(
         Err(e) => {
             // Evict the dead client so next request triggers reconnect.
             {
-                let mut pool = state.pool.write().unwrap();
+                let mut pool = state.pool.write();
                 pool.evict(&route_name);
             }
             (
@@ -241,13 +241,13 @@ async fn call_handler(
 
 /// Attempt to reconnect an evicted upstream.
 async fn try_reconnect(state: &RelayState, route_name: &str) -> Option<Arc<IpcClient>> {
-    let address = { state.pool.read().unwrap().get_address(route_name)? };
+    let address = { state.pool.read().get_address(route_name)? };
 
     let mut client = IpcClient::new(&address);
     match client.connect().await {
         Ok(()) => {
             let client = Arc::new(client);
-            let mut pool = state.pool.write().unwrap();
+            let mut pool = state.pool.write();
             pool.reconnect(route_name, client.clone());
             Some(client)
         }

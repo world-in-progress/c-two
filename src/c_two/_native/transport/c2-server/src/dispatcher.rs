@@ -52,7 +52,7 @@ pub enum RequestData {
     /// SHM coordinates from peer (buddy or dedicated).
     /// ShmBuffer.release() frees via pool.free_at().
     Shm {
-        pool: Arc<std::sync::RwLock<MemPool>>,
+        pool: Arc<parking_lot::RwLock<MemPool>>,
         seg_idx: u16,
         offset: u32,
         data_size: u32,
@@ -64,7 +64,7 @@ pub enum RequestData {
     /// ShmBuffer.release() returns handle to pool.
     Handle {
         handle: MemHandle,
-        pool: Arc<std::sync::RwLock<MemPool>>,
+        pool: Arc<parking_lot::RwLock<MemPool>>,
     },
 }
 
@@ -73,14 +73,12 @@ pub enum RequestData {
 pub fn cleanup_request(request: RequestData) {
     match request {
         RequestData::Shm { pool, seg_idx, offset, data_size, is_dedicated } => {
-            if let Ok(mut p) = pool.write() {
-                let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
-            }
+            let mut p = pool.write();
+            let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
         }
         RequestData::Handle { handle, pool } => {
-            if let Ok(mut p) = pool.write() {
-                p.release_handle(handle);
-            }
+            let mut p = pool.write();
+            p.release_handle(handle);
         }
         RequestData::Inline(_) => {}
     }
@@ -112,7 +110,7 @@ pub trait CrmCallback: Send + Sync + 'static {
         route_name: &str,
         method_idx: u16,
         request: RequestData,
-        response_pool: Arc<std::sync::RwLock<MemPool>>,
+        response_pool: Arc<parking_lot::RwLock<MemPool>>,
     ) -> Result<ResponseMeta, CrmError>;
 }
 
@@ -209,7 +207,7 @@ mod tests {
             _route: &str,
             _method_idx: u16,
             _request: RequestData,
-            _response_pool: Arc<std::sync::RwLock<MemPool>>,
+            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"echo".to_vec()))
         }
@@ -234,7 +232,7 @@ mod tests {
         assert_eq!(route.method_names.len(), 2);
 
         // invoke the callback through the route
-        let pool = Arc::new(std::sync::RwLock::new(
+        let pool = Arc::new(parking_lot::RwLock::new(
             MemPool::new(PoolConfig::default())
         ));
         let result = route.callback.invoke(
@@ -330,13 +328,13 @@ mod tests {
                 _route: &str,
                 _method_idx: u16,
                 _request: RequestData,
-                _response_pool: Arc<std::sync::RwLock<MemPool>>,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
             ) -> Result<ResponseMeta, CrmError> {
                 Err(CrmError::InternalError("method not found".into()))
             }
         }
 
-        let pool = Arc::new(std::sync::RwLock::new(
+        let pool = Arc::new(parking_lot::RwLock::new(
             MemPool::new(PoolConfig::default())
         ));
         let cb: Arc<dyn CrmCallback> = Arc::new(FailCallback);

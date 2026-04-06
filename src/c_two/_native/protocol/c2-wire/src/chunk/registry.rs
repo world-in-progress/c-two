@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use std::time::Instant;
 
 use c2_mem::handle::MemHandle;
@@ -37,8 +38,7 @@ pub struct FinishedChunk {
 /// Per-assembly tracking wrapper around [`ChunkAssembler`].
 struct TrackedAssembler {
     inner: ChunkAssembler,
-    #[allow(dead_code)]
-    created_at: Instant,
+    _created_at: Instant,
     last_activity: Instant,
     total_bytes: u64,
 }
@@ -111,7 +111,7 @@ impl ChunkRegistry {
 
         // Allocate the reassembly buffer (needs write lock on pool).
         let assembler = {
-            let mut pool = self.pool.write().unwrap();
+            let mut pool = self.pool.write();
             ChunkAssembler::new(
                 &mut pool,
                 total_chunks,
@@ -125,18 +125,18 @@ impl ChunkRegistry {
         let now = Instant::now();
         let tracked = TrackedAssembler {
             inner: assembler,
-            created_at: now,
+            _created_at: now,
             last_activity: now,
             total_bytes: alloc_bytes,
         };
 
         // Lock shard and insert — reject duplicates to prevent silent leaks.
-        let mut shard = self.shard(conn_id).lock().unwrap();
+        let mut shard = self.shard(conn_id).lock();
         if shard.contains_key(&(conn_id, request_id)) {
             // Abort the newly allocated assembler before returning error.
             tracked
                 .inner
-                .abort(&mut self.pool.write().unwrap());
+                .abort(&mut self.pool.write());
             return Err(format!(
                 "duplicate assembly for ({conn_id}, {request_id})"
             ));
@@ -159,12 +159,12 @@ impl ChunkRegistry {
         chunk_idx: usize,
         data: &[u8],
     ) -> Result<bool, String> {
-        let mut shard = self.shard(conn_id).lock().unwrap();
+        let mut shard = self.shard(conn_id).lock();
         let tracked = shard
             .get_mut(&(conn_id, request_id))
             .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?;
 
-        let pool = self.pool.read().unwrap();
+        let pool = self.pool.read();
         let complete = tracked.inner.feed_chunk(&pool, chunk_idx, data)?;
         drop(pool);
 
@@ -180,7 +180,7 @@ impl ChunkRegistry {
         route_name: String,
         method_idx: u16,
     ) {
-        let mut shard = self.shard(conn_id).lock().unwrap();
+        let mut shard = self.shard(conn_id).lock();
         if let Some(tracked) = shard.get_mut(&(conn_id, request_id)) {
             tracked.inner.route_name = Some(route_name);
             tracked.inner.method_idx = Some(method_idx);
@@ -199,7 +199,7 @@ impl ChunkRegistry {
     ) -> Result<FinishedChunk, String> {
         // Remove from shard and decrement counters first.
         let tracked = {
-            let mut shard = self.shard(conn_id).lock().unwrap();
+            let mut shard = self.shard(conn_id).lock();
             let t = shard
                 .remove(&(conn_id, request_id))
                 .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?;
@@ -218,7 +218,7 @@ impl ChunkRegistry {
 
         if !inner.is_complete() {
             // Incomplete: release handle and report error.
-            self.pool.write().unwrap().release_handle(handle);
+            self.pool.write().release_handle(handle);
             return Err(format!(
                 "incomplete assembly for ({conn_id}, {request_id})"
             ));
@@ -229,7 +229,7 @@ impl ChunkRegistry {
 
         // Try SHM promotion if this is a FileSpill.
         if handle.is_file_spill() {
-            let mut pool = self.pool.write().unwrap();
+            let mut pool = self.pool.write();
             match promote_to_shm(&mut pool, handle) {
                 Ok(shm_handle) => handle = shm_handle,
                 Err(original) => handle = original,
@@ -245,7 +245,7 @@ impl ChunkRegistry {
 
     /// Abort an in-flight assembly, releasing all resources.
     pub fn abort(&self, conn_id: u64, request_id: u64) {
-        let mut shard = self.shard(conn_id).lock().unwrap();
+        let mut shard = self.shard(conn_id).lock();
         if let Some(tracked) = shard.remove(&(conn_id, request_id)) {
             drop(shard);
             self.active_count.fetch_sub(1, Ordering::Relaxed);
@@ -253,7 +253,7 @@ impl ChunkRegistry {
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
             tracked
                 .inner
-                .abort(&mut self.pool.write().unwrap());
+                .abort(&mut self.pool.write());
         }
     }
 
@@ -264,7 +264,7 @@ impl ChunkRegistry {
         let now = Instant::now();
 
         for shard_mutex in &self.shards {
-            let mut shard = shard_mutex.lock().unwrap();
+            let mut shard = shard_mutex.lock();
             let expired_keys: Vec<(u64, u64)> = shard
                 .iter()
                 .filter(|(_, t)| now.duration_since(t.last_activity) >= timeout)
@@ -280,7 +280,7 @@ impl ChunkRegistry {
                         .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
                     tracked
                         .inner
-                        .abort(&mut self.pool.write().unwrap());
+                        .abort(&mut self.pool.write());
                 }
             }
             stats.remaining += shard.len();
@@ -293,7 +293,7 @@ impl ChunkRegistry {
     /// Called when a connection disconnects to prevent orphaned assemblies.
     /// Only accesses the single shard for `conn_id` (O(shard_size) scan).
     pub fn cleanup_connection(&self, conn_id: u64) {
-        let mut shard = self.shard(conn_id).lock().unwrap();
+        let mut shard = self.shard(conn_id).lock();
         let conn_keys: Vec<(u64, u64)> = shard
             .keys()
             .filter(|(cid, _)| *cid == conn_id)
@@ -307,7 +307,7 @@ impl ChunkRegistry {
                     .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
                 tracked
                     .inner
-                    .abort(&mut self.pool.write().unwrap());
+                    .abort(&mut self.pool.write());
             }
         }
     }
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(finished.handle.len(), data.len());
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
-        pool.write().unwrap().release_handle(finished.handle);
+        pool.write().release_handle(finished.handle);
     }
 
     #[test]
@@ -395,14 +395,14 @@ mod tests {
         // Logical length must be trimmed to actual data (last chunk is 64, not 128).
         assert_eq!(finished.handle.len(), 128 * 3 + 64); // 448, not 512
         // Verify data integrity
-        let p = pool.read().unwrap();
+        let p = pool.read();
         let slice = p.handle_slice(&finished.handle);
         assert_eq!(&slice[0..128], &[0u8; 128]);
         assert_eq!(&slice[128..256], &[1u8; 128]);
         assert_eq!(&slice[256..384], &[2u8; 128]);
         assert_eq!(&slice[384..384 + 64], &[3u8; 64]);
         drop(p);
-        pool.write().unwrap().release_handle(finished.handle);
+        pool.write().release_handle(finished.handle);
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
         let complete = reg.feed(2, 100, 0, &[42u8; 1024]).unwrap();
         assert!(complete);
         let finished = reg.finish(2, 100).unwrap();
-        pool.write().unwrap().release_handle(finished.handle);
+        pool.write().release_handle(finished.handle);
         assert_eq!(reg.active_count(), 0);
     }
 
@@ -512,7 +512,7 @@ mod tests {
                     reg.insert(conn_id, req_id, 1, 64).unwrap();
                     reg.feed(conn_id, req_id, 0, &[conn_id as u8; 64]).unwrap();
                     let finished = reg.finish(conn_id, req_id).unwrap();
-                    pool.write().unwrap().release_handle(finished.handle);
+                    pool.write().release_handle(finished.handle);
                 }
             });
             handles.push(h);
@@ -539,7 +539,7 @@ mod tests {
                     reg.insert(conn_id, req_id, 1, 64).unwrap();
                     reg.feed(conn_id, req_id, 0, &[0u8; 64]).unwrap();
                     let finished = reg.finish(conn_id, req_id).unwrap();
-                    pool.write().unwrap().release_handle(finished.handle);
+                    pool.write().release_handle(finished.handle);
                 }
             });
             handles.push(h);

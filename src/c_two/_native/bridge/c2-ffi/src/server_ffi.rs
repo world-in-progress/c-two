@@ -9,7 +9,8 @@
 //! methods release the GIL via `py.allow_threads()`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -47,7 +48,7 @@ impl CrmCallback for PyCrmCallback {
         request: RequestData,
         // Unused: cached as self.response_pool_obj at registration time to avoid
         // re-creating PyMemPool on every call. Trait requires it for non-FFI impls.
-        _response_pool: Arc<std::sync::RwLock<MemPool>>,
+        _response_pool: Arc<parking_lot::RwLock<MemPool>>,
     ) -> Result<ResponseMeta, CrmError> {
         Python::with_gil(|py| {
             // Convert RequestData → PyShmBuffer
@@ -212,7 +213,7 @@ impl PyServer {
         // Register requires async; use a short-lived runtime if the main
         // one hasn't started, or block_on the existing runtime's handle.
         py.allow_threads(move || {
-            let rt_guard = self.rt.lock().unwrap();
+            let rt_guard = self.rt.lock();
             if let Some(rt) = rt_guard.as_ref() {
                 rt.block_on(server.register_route(route));
             } else {
@@ -244,7 +245,7 @@ impl PyServer {
                 .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
 
             {
-                let mut rt_guard = self.rt.lock().unwrap();
+                let mut rt_guard = self.rt.lock();
                 if rt_guard.is_some() {
                     return Err(PyRuntimeError::new_err("server is already running"));
                 }
@@ -274,7 +275,7 @@ impl PyServer {
             server.shutdown();
 
             let rt = {
-                let mut rt_guard = self.rt.lock().unwrap();
+                let mut rt_guard = self.rt.lock();
                 rt_guard.take()
             };
 
@@ -292,7 +293,7 @@ impl PyServer {
         let name = name.to_string();
 
         py.allow_threads(move || {
-            let rt_guard = self.rt.lock().unwrap();
+            let rt_guard = self.rt.lock();
             if let Some(rt) = rt_guard.as_ref() {
                 Ok(rt.block_on(server.unregister_route(&name)))
             } else {
@@ -308,7 +309,7 @@ impl PyServer {
     /// Whether the server is currently running.
     #[getter]
     fn is_running(&self) -> bool {
-        self.rt.lock().unwrap().is_some()
+        self.rt.lock().is_some()
     }
 
     /// The filesystem path of the UDS socket.

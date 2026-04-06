@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use c2_ipc::IpcClient;
@@ -216,7 +217,7 @@ mod tests {
     #[test]
     fn relay_state_new_has_empty_pool() {
         let state = RelayState::new();
-        let pool = state.pool.read().unwrap();
+        let pool = state.pool.read();
         assert!(pool.list_routes().is_empty());
     }
 

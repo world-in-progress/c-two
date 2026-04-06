@@ -13,7 +13,8 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 
 /// Python-visible pool configuration.
 #[pyclass(name = "PoolConfig", frozen)]
@@ -218,9 +219,7 @@ impl PyMemPool {
     /// ctypes.memmove or (ctypes.c_char * size).from_address(addr) to write
     /// directly into the SHM block — zero intermediate copies.
     fn alloc_ptr(&self, size: usize) -> PyResult<(PyPoolAlloc, usize)> {
-        let mut pool = self.pool.write().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let mut pool = self.pool.write();
         let alloc = pool.alloc(size)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         let ptr = pool.data_ptr(&alloc)
@@ -232,9 +231,7 @@ impl PyMemPool {
     ///
     /// Returns the usize pointer that Python can pass to ctypes.memmove.
     fn data_addr(&self, seg_idx: u32, offset: u32, is_dedicated: bool) -> PyResult<usize> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(ptr as usize)
@@ -243,9 +240,7 @@ impl PyMemPool {
     /// Allocate `size` bytes from the pool.
     /// Returns a PoolAlloc with segment index, offset, actual size, level, and dedicated flag.
     fn alloc(&self, size: usize) -> PyResult<PyPoolAlloc> {
-        let mut pool = self.pool.write().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let mut pool = self.pool.write();
         pool.alloc(size)
             .map(PyPoolAlloc::from)
             .map_err(|e| PyRuntimeError::new_err(e))
@@ -253,9 +248,7 @@ impl PyMemPool {
 
     /// Free a previously allocated block.
     fn free(&self, alloc: &PyPoolAlloc) -> PyResult<()> {
-        let mut pool = self.pool.write().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let mut pool = self.pool.write();
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             offset: alloc.offset,
@@ -270,9 +263,7 @@ impl PyMemPool {
 
     /// Write data into an allocated block.
     fn write(&self, alloc: &PyPoolAlloc, data: &[u8]) -> PyResult<()> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             offset: alloc.offset,
@@ -292,9 +283,7 @@ impl PyMemPool {
 
     /// Read data from an allocated block as bytes.
     fn read<'py>(&self, py: Python<'py>, alloc: &PyPoolAlloc, size: usize) -> PyResult<Bound<'py, PyBytes>> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             offset: alloc.offset,
@@ -313,9 +302,7 @@ impl PyMemPool {
     /// Write data from a Python buffer (bytes-like) into an allocated block.
     /// Uses buffer protocol for zero-copy from Python side.
     fn write_from_buffer(&self, py: Python<'_>, data: PyBuffer<u8>, alloc: &PyPoolAlloc) -> PyResult<()> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
             offset: alloc.offset,
@@ -347,9 +334,7 @@ impl PyMemPool {
         size: usize,
         is_dedicated: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         let slice = unsafe { std::slice::from_raw_parts(ptr, size) };
@@ -368,9 +353,7 @@ impl PyMemPool {
         data_size: u32,
         is_dedicated: bool,
     ) -> PyResult<()> {
-        let mut pool = self.pool.write().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let mut pool = self.pool.write();
         let _ = pool.free_at(seg_idx, offset, data_size, is_dedicated)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(())
@@ -378,9 +361,7 @@ impl PyMemPool {
 
     /// Get pool statistics.
     fn stats(&self) -> PyResult<PyPoolStats> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let s = pool.stats();
         Ok(PyPoolStats {
             total_segments: s.total_segments,
@@ -394,17 +375,13 @@ impl PyMemPool {
 
     /// Number of buddy segments currently alive.
     fn segment_count(&self) -> PyResult<usize> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         Ok(pool.segment_count())
     }
 
     /// Run garbage collection on freed dedicated segments and idle buddy segments.
     fn gc(&self) -> PyResult<()> {
-        let mut pool = self.pool.write().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let mut pool = self.pool.write();
         pool.gc_dedicated();
         pool.gc_buddy();
         Ok(())
@@ -412,17 +389,13 @@ impl PyMemPool {
 
     /// Get the SHM name for a buddy segment.
     fn segment_name(&self, idx: usize) -> PyResult<Option<String>> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         Ok(pool.segment_name(idx).map(|s| s.to_string()))
     }
 
     /// Get the pool name prefix (for handshake exchange / name derivation).
     fn prefix(&self) -> PyResult<String> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         Ok(pool.prefix().to_string())
     }
 
@@ -432,9 +405,7 @@ impl PyMemPool {
     /// Dedicated segments: `{prefix}_d{seg_idx:04x}`
     #[pyo3(signature = (seg_idx, is_dedicated = false))]
     fn derive_segment_name(&self, seg_idx: u32, is_dedicated: bool) -> PyResult<String> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let tag = if is_dedicated { "d" } else { "b" };
         Ok(format!("{}_{}{:04x}", pool.prefix(), tag, seg_idx))
     }
@@ -444,9 +415,7 @@ impl PyMemPool {
     /// Returns (data_base_addr, data_region_size).  Python creates a persistent
     /// memoryview from this instead of per-request ctypes arrays.
     fn seg_data_info(&self, seg_idx: u32) -> PyResult<(usize, usize)> {
-        let pool = self.pool.read().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let pool = self.pool.read();
         let (ptr, size) = pool.seg_data_info(seg_idx)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok((ptr as usize, size))
@@ -454,18 +423,14 @@ impl PyMemPool {
 
     /// Open a remote buddy segment (for the other side of a connection).
     fn open_segment(&self, name: &str, size: usize) -> PyResult<usize> {
-        let mut pool = self.pool.write().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let mut pool = self.pool.write();
         pool.open_segment(name, size)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     /// Destroy the pool and all its SHM segments.
     fn destroy(&self) -> PyResult<()> {
-        let mut pool = self.pool.write().map_err(|e| {
-            PyRuntimeError::new_err(format!("pool lock poisoned: {e}"))
-        })?;
+        let mut pool = self.pool.write();
         pool.destroy();
         Ok(())
     }
@@ -489,7 +454,7 @@ struct MemHandleInner {
 impl PyMemHandle {
     #[getter]
     fn len(&self) -> PyResult<usize> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state
             .handle
             .as_ref()
@@ -499,7 +464,7 @@ impl PyMemHandle {
 
     #[getter]
     fn is_file_spill(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state
             .handle
             .as_ref()
@@ -509,7 +474,7 @@ impl PyMemHandle {
 
     #[getter]
     fn is_buddy(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state
             .handle
             .as_ref()
@@ -519,7 +484,7 @@ impl PyMemHandle {
 
     #[getter]
     fn is_dedicated(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state
             .handle
             .as_ref()
@@ -530,7 +495,7 @@ impl PyMemHandle {
     /// Write `data` at byte `offset` within the handle.
     #[pyo3(signature = (data, offset = 0))]
     fn write_at(&self, data: &[u8], offset: usize) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let inner = &mut *state; // reborrow for split field access
         let h = inner
             .handle
@@ -541,8 +506,7 @@ impl PyMemHandle {
         }
         let pool = inner
             .pool
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+            .read();
         pool.handle_slice_mut(h)[offset..offset + data.len()].copy_from_slice(data);
         Ok(())
     }
@@ -550,27 +514,25 @@ impl PyMemHandle {
     /// Get raw pointer + length for memoryview construction.
     /// Returns (address, length) tuple.
     fn buffer_info(&self) -> PyResult<(usize, usize)> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let h = state
             .handle
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("handle released"))?;
         let pool = state
             .pool
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+            .read();
         let slice = pool.handle_slice(h);
         Ok((slice.as_ptr() as usize, slice.len()))
     }
 
     /// Release the underlying memory. Idempotent.
     fn release(&self) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(h) = state.handle.take() {
             let mut pool = state
                 .pool
-                .write()
-                .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+                .write();
             pool.release_handle(h);
         }
         Ok(())
@@ -581,7 +543,7 @@ impl PyMemHandle {
     }
 
     fn __repr__(&self) -> String {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         match &state.handle {
             Some(h) => format!(
                 "MemHandle(len={}, type={})",
@@ -601,12 +563,10 @@ impl PyMemHandle {
 
 impl Drop for PyMemHandle {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(h) = state.handle.take() {
-                if let Ok(mut pool) = state.pool.write() {
-                    pool.release_handle(h);
-                }
-            }
+        let mut state = self.state.lock();
+        if let Some(h) = state.handle.take() {
+            let mut pool = state.pool.write();
+            pool.release_handle(h);
         }
     }
 }
@@ -635,8 +595,7 @@ impl PyChunkAssembler {
         let pool_arc = pool_handle.pool_arc();
         let asm = {
             let mut pool = pool_arc
-                .write()
-                .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+                .write();
             ChunkAssembler::new(
                 &mut pool, total_chunks, chunk_size,
                 512, // TODO: pass from config
@@ -654,7 +613,7 @@ impl PyChunkAssembler {
 
     #[setter]
     fn set_route_name(&self, name: String) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state
             .inner
             .as_mut()
@@ -665,7 +624,7 @@ impl PyChunkAssembler {
 
     #[setter]
     fn set_method_idx(&self, idx: u16) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state
             .inner
             .as_mut()
@@ -676,19 +635,19 @@ impl PyChunkAssembler {
 
     #[getter]
     fn route_name(&self) -> Option<String> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state.inner.as_ref().and_then(|a| a.route_name.clone())
     }
 
     #[getter]
     fn method_idx(&self) -> Option<u16> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state.inner.as_ref().and_then(|a| a.method_idx)
     }
 
     /// Feed a chunk. Returns True when all chunks received.
     fn feed_chunk(&self, chunk_idx: usize, data: &[u8]) -> PyResult<bool> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let inner = &mut *state; // reborrow for split field access
         let asm = inner
             .inner
@@ -696,15 +655,14 @@ impl PyChunkAssembler {
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
         let pool = inner
             .pool
-            .read()
-            .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+            .read();
         asm.feed_chunk(&pool, chunk_idx, data)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
 
     #[getter]
     fn is_complete(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state
             .inner
             .as_ref()
@@ -714,13 +672,13 @@ impl PyChunkAssembler {
 
     #[getter]
     fn received(&self) -> usize {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         state.inner.as_ref().map(|a| a.received()).unwrap_or(0)
     }
 
     /// Finish reassembly → PyMemHandle.
     fn finish(&self) -> PyResult<PyMemHandle> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let asm = state
             .inner
             .take()
@@ -736,12 +694,11 @@ impl PyChunkAssembler {
 
     /// Abort reassembly, releasing buffer.
     fn abort(&self) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(asm) = state.inner.take() {
             let mut pool = state
                 .pool
-                .write()
-                .map_err(|e| PyRuntimeError::new_err(format!("lock: {e}")))?;
+                .write();
             asm.abort(&mut pool);
         }
         Ok(())
@@ -750,12 +707,10 @@ impl PyChunkAssembler {
 
 impl Drop for PyChunkAssembler {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(asm) = state.inner.take() {
-                if let Ok(mut pool) = state.pool.write() {
-                    asm.abort(&mut pool);
-                }
-            }
+        let mut state = self.state.lock();
+        if let Some(asm) = state.inner.take() {
+            let mut pool = state.pool.write();
+            asm.abort(&mut pool);
         }
     }
 }

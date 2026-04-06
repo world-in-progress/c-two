@@ -3,7 +3,8 @@
 //! Wraps [`IpcClient`] for blocking calls from Python (via PyO3).
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::{Mutex, RwLock};
 
 use c2_mem::{MemPool, PoolAllocation};
 
@@ -54,7 +55,7 @@ impl SyncClient {
     /// Connect to a server with optional pool for SHM transfers.
     pub fn connect(
         address: &str,
-        pool: Option<Arc<StdMutex<MemPool>>>,
+        pool: Option<Arc<Mutex<MemPool>>>,
         config: ClientIpcConfig,
     ) -> Result<Self, IpcError> {
         let rt = get_or_create_runtime();
@@ -92,7 +93,7 @@ impl SyncClient {
     pub fn pool_alloc_and_write(&self, data: &[u8]) -> Result<PoolAllocation, IpcError> {
         let pool_arc = self.inner.pool.as_ref()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
-        let mut pool = pool_arc.lock().unwrap();
+        let mut pool = pool_arc.lock();
         let alloc = pool.alloc(data.len())
             .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
         let ptr = pool.data_ptr(&alloc)
@@ -109,7 +110,7 @@ impl SyncClient {
     /// Free a pool allocation (used on send failure for cleanup).
     pub fn pool_free(&self, alloc: &PoolAllocation) {
         if let Some(ref pool_arc) = self.inner.pool {
-            let mut pool = pool_arc.lock().unwrap();
+            let mut pool = pool_arc.lock();
             let _ = pool.free(alloc);
         }
     }
@@ -134,7 +135,7 @@ impl SyncClient {
     }
 
     /// Get a reference to the server SHM pool (for FFI layer).
-    pub fn server_pool_arc(&self) -> Arc<StdMutex<Option<ServerPoolState>>> {
+    pub fn server_pool_arc(&self) -> Arc<Mutex<Option<ServerPoolState>>> {
         self.inner.server_pool.clone()
     }
 

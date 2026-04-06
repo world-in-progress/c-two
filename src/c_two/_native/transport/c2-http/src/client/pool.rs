@@ -1,7 +1,8 @@
 //! Reference-counted pool of [`HttpClient`] instances.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::client::{HttpClient, HttpError};
@@ -55,7 +56,7 @@ impl HttpClientPool {
     pub fn acquire(&self, base_url: &str) -> Result<Arc<HttpClient>, HttpError> {
         self.sweep_expired();
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
 
         if let Some(entry) = entries.get_mut(base_url) {
             entry.ref_count += 1;
@@ -84,7 +85,7 @@ impl HttpClientPool {
 
     /// Decrement reference count; mark for grace-period cleanup at 0.
     pub fn release(&self, base_url: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         if let Some(entry) = entries.get_mut(base_url) {
             if entry.ref_count == 0 {
                 eprintln!(
@@ -101,7 +102,7 @@ impl HttpClientPool {
 
     /// Sweep entries past the grace period.
     pub fn sweep_expired(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         let grace = self.grace_period;
         entries.retain(|_url, entry| {
             if entry.ref_count == 0 {
@@ -117,20 +118,19 @@ impl HttpClientPool {
 
     /// Destroy all clients immediately.
     pub fn shutdown_all(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         entries.clear();
     }
 
     /// Number of active entries.
     pub fn active_count(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().len()
     }
 
     /// Reference count for a specific URL.
     pub fn refcount(&self, base_url: &str) -> usize {
         self.entries
             .lock()
-            .unwrap()
             .get(base_url)
             .map_or(0, |e| e.ref_count)
     }
