@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use c2_mem::{MemPool, PoolConfig};
@@ -39,9 +40,9 @@ struct PoolEntry {
 /// `SyncClient`. When all references are released, the client is
 /// kept alive for a grace period before being destroyed.
 pub struct ClientPool {
-    entries: StdMutex<HashMap<String, PoolEntry>>,
+    entries: Mutex<HashMap<String, PoolEntry>>,
     grace_period: Duration,
-    default_config: StdMutex<Option<ClientIpcConfig>>,
+    default_config: Mutex<Option<ClientIpcConfig>>,
 }
 
 // Compile-time assertion: ClientPool must be Send + Sync.
@@ -58,15 +59,15 @@ impl ClientPool {
     /// Create a new pool with the given grace period.
     pub fn new(grace_period: Duration) -> Self {
         Self {
-            entries: StdMutex::new(HashMap::new()),
+            entries: Mutex::new(HashMap::new()),
             grace_period,
-            default_config: StdMutex::new(None),
+            default_config: Mutex::new(None),
         }
     }
 
     /// Set the default IPC config for newly created clients.
     pub fn set_default_config(&self, config: ClientIpcConfig) {
-        *self.default_config.lock().unwrap() = Some(config);
+        *self.default_config.lock() = Some(config);
     }
 
     /// Acquire a client for `address`. Creates and connects if needed.
@@ -79,7 +80,7 @@ impl ClientPool {
         // Sweep stale entries before potentially creating a new one.
         self.sweep_expired();
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
 
         // Fast path: existing connected client.
         if let Some(entry) = entries.get_mut(address) {
@@ -98,7 +99,6 @@ impl ClientPool {
             None => self
                 .default_config
                 .lock()
-                .unwrap()
                 .clone()
                 .unwrap_or_default(),
         };
@@ -108,7 +108,7 @@ impl ClientPool {
         pc.segment_size = cfg.pool_segment_size as usize;
         let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
-        let pool = Arc::new(StdMutex::new(MemPool::new_with_prefix(pc, prefix)));
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix(pc, prefix)));
 
         // Drop the entries lock before connecting (connect may block).
         drop(entries);
@@ -116,7 +116,7 @@ impl ClientPool {
         let client = SyncClient::connect(address, Some(pool), cfg)?;
         let client = Arc::new(client);
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
 
         // Another thread may have raced and inserted the same address.
         if let Some(entry) = entries.get_mut(address) {
@@ -143,7 +143,7 @@ impl ClientPool {
     /// Decrement reference count. When it reaches 0, mark for grace-period
     /// cleanup.
     pub fn release(&self, address: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         if let Some(entry) = entries.get_mut(address) {
             if entry.ref_count == 0 {
                 eprintln!("ClientPool::release: ref_count already 0 for {address}");
@@ -162,7 +162,7 @@ impl ClientPool {
     /// `grace_period`. Call this periodically (e.g., from Python on a
     /// timer or before acquire).
     pub fn sweep_expired(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         let grace = self.grace_period;
         entries.retain(|_addr, entry| {
             if entry.ref_count == 0 {
@@ -179,27 +179,26 @@ impl ClientPool {
 
     /// Destroy all clients immediately (for shutdown / testing).
     pub fn shutdown_all(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock();
         entries.clear(); // Arcs are dropped → connections close.
     }
 
     /// Number of active entries (for testing).
     pub fn active_count(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().len()
     }
 
     /// Reference count for an address (for testing).
     pub fn refcount(&self, address: &str) -> usize {
         self.entries
             .lock()
-            .unwrap()
             .get(address)
             .map_or(0, |e| e.ref_count)
     }
 
     /// Check if a client exists for the address (for testing).
     pub fn has_client(&self, address: &str) -> bool {
-        self.entries.lock().unwrap().contains_key(address)
+        self.entries.lock().contains_key(address)
     }
 }
 
@@ -248,7 +247,7 @@ mod tests {
         // Manually insert a fake entry with ref_count=0 and old release time.
         {
             let client = make_disconnected_client();
-            let mut entries = pool.entries.lock().unwrap();
+            let mut entries = pool.entries.lock();
             entries.insert(
                 "ipc://fake".to_owned(),
                 PoolEntry {
@@ -270,7 +269,7 @@ mod tests {
 
         {
             let client = make_disconnected_client();
-            let mut entries = pool.entries.lock().unwrap();
+            let mut entries = pool.entries.lock();
             entries.insert(
                 "ipc://recent".to_owned(),
                 PoolEntry {
@@ -294,7 +293,7 @@ mod tests {
         // Insert a fake connected-looking entry for refcount math.
         {
             let client = make_disconnected_client();
-            let mut entries = pool.entries.lock().unwrap();
+            let mut entries = pool.entries.lock();
             entries.insert(
                 addr.to_owned(),
                 PoolEntry {
@@ -331,7 +330,7 @@ mod tests {
 
         {
             let client = make_disconnected_client();
-            let mut entries = pool.entries.lock().unwrap();
+            let mut entries = pool.entries.lock();
             entries.insert(
                 addr.to_owned(),
                 PoolEntry {
@@ -354,7 +353,7 @@ mod tests {
         {
             let c1 = make_disconnected_client();
             let c2 = make_disconnected_client();
-            let mut entries = pool.entries.lock().unwrap();
+            let mut entries = pool.entries.lock();
             entries.insert(
                 "ipc://a".to_owned(),
                 PoolEntry {
@@ -395,7 +394,7 @@ mod tests {
         };
         pool.set_default_config(cfg);
         // Verify the config is stored (indirectly — acquire would use it).
-        let stored = pool.default_config.lock().unwrap();
+        let stored = pool.default_config.lock();
         assert!(stored.is_some());
         let c = stored.as_ref().unwrap();
         assert_eq!(c.shm_threshold, 1024);

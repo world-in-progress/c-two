@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex as StdMutex, RwLock};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -324,7 +325,7 @@ impl IpcClient {
 
         // Pre-allocate first SHM segment so handshake announces it.
         if let Some(ref pool_arc) = self.pool {
-            let mut pool = pool_arc.lock().unwrap();
+            let mut pool = pool_arc.lock();
             pool.ensure_ready()
                 .map_err(|e| IpcError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
@@ -357,7 +358,7 @@ impl IpcClient {
                     eprintln!("Warning: failed to open server SHM segment ({name}): {e}");
                 }
             }
-            *self.server_pool.lock().unwrap() = Some(ServerPoolState {
+            *self.server_pool.lock() = Some(ServerPoolState {
                 prefix: hs.prefix.clone(),
                 buddy_segment_size: buddy_seg_size,
                 pool,
@@ -383,7 +384,7 @@ impl IpcClient {
     ) -> Result<Handshake, IpcError> {
         // Build segment list and prefix from pool (if available).
         let (segments, prefix, cap_flags) = if let Some(ref pool_arc) = self.pool {
-            let pool = pool_arc.lock().unwrap();
+            let pool = pool_arc.lock();
             let count = pool.segment_count();
             let mut segs = Vec::with_capacity(count);
             for i in 0..count {
@@ -529,7 +530,7 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().unwrap().insert(rid, tx);
+            self.pending.lock().insert(rid, tx);
         }
 
         // Build and send the frame.
@@ -570,7 +571,7 @@ impl IpcClient {
         }.await;
 
         if let Err(e) = send_result {
-            self.pending.lock().unwrap().remove(&rid);
+            self.pending.lock().remove(&rid);
             return Err(e);
         }
 
@@ -594,7 +595,7 @@ impl IpcClient {
 
         // Allocate and write data to SHM.
         let alloc = {
-            let mut pool = pool_arc.lock().unwrap();
+            let mut pool = pool_arc.lock();
             pool.alloc(data.len()).map_err(|e| {
                 IpcError::Handshake(format!("buddy alloc failed: {e}"))
             })?
@@ -602,12 +603,12 @@ impl IpcClient {
 
         // Write data into the SHM region.
         {
-            let pool = pool_arc.lock().unwrap();
+            let pool = pool_arc.lock();
             let ptr = match pool.data_ptr(&alloc) {
                 Ok(p) => p,
                 Err(e) => {
                     drop(pool);
-                    let _ = pool_arc.lock().unwrap().free(&alloc);
+                    let _ = pool_arc.lock().free(&alloc);
                     return Err(IpcError::Handshake(format!("buddy data_ptr failed: {e}")));
                 }
             };
@@ -639,7 +640,7 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().unwrap().insert(rid, tx);
+            self.pending.lock().insert(rid, tx);
         }
 
         // Send frame — free buddy allocation if send fails.
@@ -650,14 +651,14 @@ impl IpcClient {
             let writer = match writer_guard.as_mut() {
                 Some(w) => w,
                 None => {
-                    let _ = pool_arc.lock().unwrap().free(&alloc);
-                    self.pending.lock().unwrap().remove(&rid);
+                    let _ = pool_arc.lock().free(&alloc);
+                    self.pending.lock().remove(&rid);
                     return Err(IpcError::Closed);
                 }
             };
             if let Err(e) = writer.write_all(&frame_bytes).await {
-                let _ = pool_arc.lock().unwrap().free(&alloc);
-                self.pending.lock().unwrap().remove(&rid);
+                let _ = pool_arc.lock().free(&alloc);
+                self.pending.lock().remove(&rid);
                 return Err(e.into());
             }
         }
@@ -670,7 +671,7 @@ impl IpcClient {
                 // freed by the server via cross-process SHM atomics; freeing
                 // them again here would corrupt the allocator.
                 if alloc.is_dedicated {
-                    let mut pool = pool_arc.lock().unwrap();
+                    let mut pool = pool_arc.lock();
                     let _ = pool.free(&alloc);
                 }
                 result
@@ -714,7 +715,7 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().unwrap().insert(rid, tx);
+            self.pending.lock().insert(rid, tx);
         }
 
         // Send buddy frame.
@@ -732,10 +733,10 @@ impl IpcClient {
             // Send failed — server never saw the allocation. Free it.
             // This matches call_buddy() behavior.
             if let Some(ref pool_arc) = self.pool {
-                let mut pool = pool_arc.lock().unwrap();
+                let mut pool = pool_arc.lock();
                 let _ = pool.free(alloc);
             }
-            self.pending.lock().unwrap().remove(&rid);
+            self.pending.lock().remove(&rid);
             return Err(e);
         }
 
@@ -747,7 +748,7 @@ impl IpcClient {
             Ok(result) => {
                 if alloc.is_dedicated {
                     if let Some(ref pool_arc) = self.pool {
-                        let mut pool = pool_arc.lock().unwrap();
+                        let mut pool = pool_arc.lock();
                         let _ = pool.free(alloc);
                     }
                 }
@@ -772,7 +773,7 @@ impl IpcClient {
         // Register pending call ONCE — reply comes after last chunk.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().unwrap().insert(rid, tx);
+            self.pending.lock().insert(rid, tx);
         }
 
         // Build call control (included only in chunk 0).
@@ -813,7 +814,7 @@ impl IpcClient {
         }.await;
 
         if let Err(e) = send_result {
-            self.pending.lock().unwrap().remove(&rid);
+            self.pending.lock().remove(&rid);
             return Err(e);
         }
 
@@ -869,7 +870,7 @@ impl IpcClient {
             handle.abort();
         }
         // Wake pending callers.
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending.lock();
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(IpcError::Closed));
         }
@@ -972,7 +973,7 @@ async fn recv_loop(
                     conn_id, rid as u64, total_chunks as usize, chunk_size,
                 ) {
                     eprintln!("Warning: reply chunk assembler creation failed: {e}");
-                    let tx = pending.lock().unwrap().remove(&rid);
+                    let tx = pending.lock().remove(&rid);
                     if let Some(tx) = tx {
                         let _ = tx.send(Err(IpcError::Handshake(
                             format!("chunked reply assembler failed: {e}"),
@@ -988,13 +989,13 @@ async fn recv_loop(
                     if complete {
                         match chunk_registry.finish(conn_id, rid as u64) {
                             Ok(finished) => {
-                                let tx = pending.lock().unwrap().remove(&rid);
+                                let tx = pending.lock().remove(&rid);
                                 if let Some(tx) = tx {
                                     let _ = tx.send(Ok(ResponseData::Handle(finished.handle)));
                                 }
                             }
                             Err(e) => {
-                                let tx = pending.lock().unwrap().remove(&rid);
+                                let tx = pending.lock().remove(&rid);
                                 if let Some(tx) = tx {
                                     let _ = tx.send(Err(IpcError::Handshake(
                                         format!("chunked reply finish error: {e}"),
@@ -1006,7 +1007,7 @@ async fn recv_loop(
                 }
                 Err(e) => {
                     eprintln!("Warning: reply chunk feed error: {e}");
-                    let tx = pending.lock().unwrap().remove(&rid);
+                    let tx = pending.lock().remove(&rid);
                     if let Some(tx) = tx {
                         let _ = tx.send(Err(IpcError::Handshake(
                             format!("chunked reply feed error: {e}"),
@@ -1022,7 +1023,7 @@ async fn recv_loop(
 
         // Dispatch to pending caller.
         let tx = {
-            pending.lock().unwrap().remove(&rid)
+            pending.lock().remove(&rid)
         };
         if let Some(tx) = tx {
             let _ = tx.send(result);
@@ -1033,7 +1034,7 @@ async fn recv_loop(
     chunk_registry.cleanup_connection(conn_id);
 
     // Connection lost — wake all pending callers.
-    let mut pending_guard = pending.lock().unwrap();
+    let mut pending_guard = pending.lock();
     for (_, tx) in pending_guard.drain() {
         let _ = tx.send(Err(IpcError::Closed));
     }
@@ -1091,9 +1092,9 @@ mod tests {
         let r1 = IpcClient::make_chunk_registry(&cfg);
         let r2 = IpcClient::make_chunk_registry(&cfg);
         let r3 = IpcClient::make_chunk_registry(&cfg);
-        let prefix1 = r1.pool().read().unwrap().prefix().to_string();
-        let prefix2 = r2.pool().read().unwrap().prefix().to_string();
-        let prefix3 = r3.pool().read().unwrap().prefix().to_string();
+        let prefix1 = r1.pool().read().prefix().to_string();
+        let prefix2 = r2.pool().read().prefix().to_string();
+        let prefix3 = r3.pool().read().prefix().to_string();
         assert_ne!(prefix1, prefix2);
         assert_ne!(prefix2, prefix3);
         assert_ne!(prefix1, prefix3);

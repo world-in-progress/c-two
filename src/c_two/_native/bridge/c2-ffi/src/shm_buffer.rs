@@ -5,7 +5,8 @@
 //! for `memoryview()` zero-copy access.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 
 use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::ffi;
@@ -106,7 +107,7 @@ impl PyShmBuffer {
 impl PyShmBuffer {
     /// Length of the buffer data in bytes.
     fn __len__(&self) -> PyResult<usize> {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock();
         match guard.as_ref() {
             Some(_) => Ok(self.data_len),
             None => Err(PyValueError::new_err("buffer already released")),
@@ -115,14 +116,14 @@ impl PyShmBuffer {
 
     /// True if the buffer has not been released and has non-zero length.
     fn __bool__(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock();
         guard.is_some() && self.data_len > 0
     }
 
     /// True if the buffer is inline (no SHM backing).
     #[getter]
     fn is_inline(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock();
         matches!(guard.as_ref(), Some(ShmBufferInner::Inline(_)))
     }
 
@@ -137,7 +138,7 @@ impl PyShmBuffer {
                 "cannot release: active memoryview exports",
             ));
         }
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         // Re-check under lock to close the TOCTOU window
         if self.exports.load(Ordering::Acquire) > 0 {
             return Err(PyBufferError::new_err(
@@ -148,15 +149,13 @@ impl PyShmBuffer {
             Some(ShmBufferInner::PeerShm {
                 pool, seg_idx, offset, data_size, is_dedicated,
             }) => {
-                if let Ok(mut p) = pool.write() {
-                    let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
-                }
+                let mut p = pool.write();
+                let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
                 Ok(())
             }
             Some(ShmBufferInner::Handle { handle, pool }) => {
-                if let Ok(mut p) = pool.write() {
-                    let _ = p.release_handle(handle);
-                }
+                let mut p = pool.write();
+                let _ = p.release_handle(handle);
                 Ok(())
             }
             Some(ShmBufferInner::Inline(_)) => Ok(()),
@@ -171,7 +170,7 @@ impl PyShmBuffer {
         flags: std::os::raw::c_int,
     ) -> PyResult<()> {
         let this = slf.borrow();
-        let guard = this.inner.lock().unwrap();
+        let guard = this.inner.lock();
         let inner = guard.as_ref().ok_or_else(|| {
             PyBufferError::new_err("buffer already released")
         })?;
@@ -181,16 +180,14 @@ impl PyShmBuffer {
             ShmBufferInner::PeerShm {
                 pool, seg_idx, offset, data_size, is_dedicated,
             } => {
-                let pool_guard = pool.read()
-                    .map_err(|_| PyBufferError::new_err("pool lock poisoned"))?;
+                let pool_guard = pool.read();
                 let raw_ptr = pool_guard
                     .data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
                     .map_err(|e| PyBufferError::new_err(format!("SHM access: {e}")))?;
                 (raw_ptr as *const u8, *data_size as usize)
             }
             ShmBufferInner::Handle { handle, pool } => {
-                let pool_guard = pool.read()
-                    .map_err(|_| PyBufferError::new_err("pool lock poisoned"))?;
+                let pool_guard = pool.read();
                 let slice = pool_guard.handle_slice(handle);
                 (slice.as_ptr(), slice.len())
             }
@@ -245,23 +242,20 @@ impl PyShmBuffer {
 
 impl Drop for PyShmBuffer {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(inner) = guard.take() {
-                match inner {
-                    ShmBufferInner::PeerShm {
-                        pool, seg_idx, offset, data_size, is_dedicated,
-                    } => {
-                        if let Ok(mut p) = pool.write() {
-                            let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
-                        }
-                    }
-                    ShmBufferInner::Handle { handle, pool } => {
-                        if let Ok(mut p) = pool.write() {
-                            let _ = p.release_handle(handle);
-                        }
-                    }
-                    ShmBufferInner::Inline(_) => {}
+        let mut guard = self.inner.lock();
+        if let Some(inner) = guard.take() {
+            match inner {
+                ShmBufferInner::PeerShm {
+                    pool, seg_idx, offset, data_size, is_dedicated,
+                } => {
+                    let mut p = pool.write();
+                    let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
                 }
+                ShmBufferInner::Handle { handle, pool } => {
+                    let mut p = pool.write();
+                    let _ = p.release_handle(handle);
+                }
+                ShmBufferInner::Inline(_) => {}
             }
         }
     }

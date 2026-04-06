@@ -5,7 +5,8 @@
 //! SHM segments, activity timestamps, and in-flight request counting.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use std::time::Instant;
 
 use tokio::sync::Notify;
@@ -55,13 +56,13 @@ impl PeerShmState {
         let pool_arc = self.pool.as_ref().ok_or("peer pool not initialised")?;
         // Fast path: check segment count under read lock
         {
-            let pool = pool_arc.read().unwrap();
+            let pool = pool_arc.read();
             if (seg_idx as usize) < pool.segment_count() {
                 return Ok(());
             }
         }
         // Slow path: open missing segments under write lock
-        let mut pool = pool_arc.write().unwrap();
+        let mut pool = pool_arc.write();
         // Re-check after upgrading (another thread may have opened it)
         let idx = seg_idx as usize;
         if idx < pool.segment_count() {
@@ -79,7 +80,7 @@ impl PeerShmState {
     // `has_dedicated(seg_idx)` predicate to avoid unconditional write-lock.
     fn ensure_dedicated_segment(&self, seg_idx: u32, min_size: usize) -> Result<(), String> {
         let pool_arc = self.pool.as_ref().ok_or("peer pool not initialised")?;
-        let mut pool = pool_arc.write().unwrap();
+        let mut pool = pool_arc.write();
         let name = Self::dedicated_segment_name(&self.prefix, seg_idx);
         pool.open_dedicated_at(seg_idx, &name, min_size)
     }
@@ -165,29 +166,29 @@ impl Connection {
     /// Get a shared reference to the peer's MemPool (for ShmBuffer construction).
     /// Returns None if handshake hasn't completed yet.
     pub fn peer_pool_arc(&self) -> Option<Arc<RwLock<MemPool>>> {
-        let state = self.peer_shm.lock().unwrap();
+        let state = self.peer_shm.lock();
         state.pool.clone()
     }
 
     /// Return the peer's SHM pool prefix (empty if handshake not done).
     pub fn peer_prefix(&self) -> String {
-        self.peer_shm.lock().unwrap().prefix.clone()
+        self.peer_shm.lock().prefix.clone()
     }
 
     /// Return cloned list of remote segment names.
     pub fn remote_segment_names(&self) -> Vec<String> {
-        self.peer_shm.lock().unwrap().segment_names.clone()
+        self.peer_shm.lock().segment_names.clone()
     }
 
     /// Return cloned list of remote segment sizes.
     /// Effective buddy segment size after clamping (test-only accessor).
     #[cfg(test)]
     pub fn buddy_segment_size(&self) -> usize {
-        self.peer_shm.lock().unwrap().buddy_segment_size
+        self.peer_shm.lock().buddy_segment_size
     }
 
     pub fn remote_segment_sizes(&self) -> Vec<u32> {
-        self.peer_shm.lock().unwrap().segment_sizes.clone()
+        self.peer_shm.lock().segment_sizes.clone()
     }
 
     /// Initialise peer SHM state from handshake data.
@@ -199,7 +200,7 @@ impl Connection {
     const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
 
     pub fn init_peer_shm(&self, prefix: String, segments: Vec<(String, u32)>) {
-        let mut state = self.peer_shm.lock().unwrap();
+        let mut state = self.peer_shm.lock();
         state.prefix = prefix;
         state.segment_names = segments.iter().map(|(n, _)| n.clone()).collect();
         state.segment_sizes = segments.iter().map(|(_, s)| *s).collect();
@@ -248,7 +249,7 @@ impl Connection {
     /// Ensure the peer's SHM segment at `seg_idx` is mapped (lazy-open).
     /// Does NOT read data — just ensures the segment is available for ShmBuffer access.
     pub fn ensure_peer_segment(&self, seg_idx: u16, data_size: u32, is_dedicated: bool) -> Result<(), String> {
-        let state = self.peer_shm.lock().unwrap();
+        let state = self.peer_shm.lock();
         if is_dedicated {
             state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)
         } else {
@@ -261,7 +262,7 @@ impl Connection {
     pub fn ensure_and_get_peer_pool(
         &self, seg_idx: u16, data_size: u32, is_dedicated: bool
     ) -> Result<Arc<RwLock<MemPool>>, String> {
-        let state = self.peer_shm.lock().unwrap();
+        let state = self.peer_shm.lock();
         if is_dedicated {
             state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)?;
         } else {
@@ -281,7 +282,7 @@ impl Connection {
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<Vec<u8>, String> {
-        let state = self.peer_shm.lock().unwrap();
+        let state = self.peer_shm.lock();
         // Lazy-open the segment if the pool hasn't mapped it yet.
         if is_dedicated {
             state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)?;
@@ -289,7 +290,7 @@ impl Connection {
             state.ensure_buddy_segment(seg_idx as u32)?;
         }
         let pool_arc = state.pool.as_ref().ok_or("peer pool not initialised")?;
-        let pool = pool_arc.read().unwrap();
+        let pool = pool_arc.read();
         let ptr = pool.data_ptr_at(seg_idx as u32, offset, is_dedicated)?;
         let slice = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) };
         Ok(slice.to_vec())
@@ -306,7 +307,7 @@ impl Connection {
         data_size: u32,
         is_dedicated: bool,
     ) -> FreeResult {
-        let state = self.peer_shm.lock().unwrap();
+        let state = self.peer_shm.lock();
         // Lazy-open the segment before freeing.
         let lazy_res = if is_dedicated {
             state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)
@@ -322,7 +323,7 @@ impl Connection {
             return FreeResult::Normal;
         }
         if let Some(pool_arc) = state.pool.as_ref() {
-            let mut pool = pool_arc.write().unwrap();
+            let mut pool = pool_arc.write();
             match pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
                 Ok(result) => return result,
                 Err(e) => {
@@ -340,23 +341,22 @@ impl Connection {
 
     /// Run buddy GC on the peer's SHM pool — reclaim idle trailing segments.
     pub fn gc_peer_buddy(&self) {
-        let state = self.peer_shm.lock().unwrap();
+        let state = self.peer_shm.lock();
         if let Some(pool_arc) = state.pool.as_ref() {
-            let mut pool = pool_arc.write().unwrap();
+            let mut pool = pool_arc.write();
             pool.gc_buddy();
         }
     }
 
     /// Record activity — updates the last-activity timestamp to *now*.
     pub fn touch(&self) {
-        *self.last_activity.lock().unwrap() = Instant::now();
+        *self.last_activity.lock() = Instant::now();
     }
 
     /// Seconds elapsed since the last `touch()`.
     pub fn idle_seconds(&self) -> f64 {
         self.last_activity
             .lock()
-            .unwrap()
             .elapsed()
             .as_secs_f64()
     }

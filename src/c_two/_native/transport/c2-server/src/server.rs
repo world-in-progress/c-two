@@ -93,7 +93,7 @@ pub struct Server {
     /// Sharded chunk reassembly lifecycle manager.
     chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
     /// Server-side MemPool for writing buddy SHM responses.
-    response_pool: Arc<std::sync::RwLock<MemPool>>,
+    response_pool: Arc<parking_lot::RwLock<MemPool>>,
 }
 
 impl Server {
@@ -122,7 +122,7 @@ impl Server {
         };
         let chunk_config = c2_wire::chunk::ChunkConfig::from_base(&config);
         let chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
-            Arc::new(std::sync::RwLock::new(reassembly_pool)),
+            Arc::new(parking_lot::RwLock::new(reassembly_pool)),
             chunk_config,
         ));
         let response_cfg = PoolConfig {
@@ -150,7 +150,7 @@ impl Server {
             shutdown_rx,
             conn_counter: AtomicU64::new(0),
             chunk_registry,
-            response_pool: Arc::new(std::sync::RwLock::new(response_pool)),
+            response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
         })
     }
 
@@ -170,7 +170,7 @@ impl Server {
     }
 
     /// Get a shared reference to the response pool (for zero-copy dispatch).
-    pub fn response_pool_arc(&self) -> Arc<std::sync::RwLock<MemPool>> {
+    pub fn response_pool_arc(&self) -> Arc<parking_lot::RwLock<MemPool>> {
         Arc::clone(&self.response_pool)
     }
 
@@ -397,7 +397,7 @@ async fn handle_handshake(
 
     // Collect response pool segment info for handshake.
     let (server_segments, server_prefix) = {
-        let pool = server.response_pool.read().unwrap();
+        let pool = server.response_pool.read();
         let count = pool.segment_count();
         let mut segs = Vec::with_capacity(count);
         for i in 0..count {
@@ -878,14 +878,14 @@ async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: 
 /// Write a success reply via buddy SHM: allocate from response pool, write
 /// data, send 11-byte pointer frame. Falls back to inline on alloc failure.
 async fn write_buddy_reply_with_data(
-    response_pool: &std::sync::RwLock<MemPool>,
+    response_pool: &parking_lot::RwLock<MemPool>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     data: &[u8],
 ) -> Result<(), String> {
     // 1. Allocate from response pool.
     let alloc = {
-        let mut pool = response_pool.write().unwrap();
+        let mut pool = response_pool.write();
         pool.alloc(data.len())
     };
     let alloc = match alloc {
@@ -897,7 +897,7 @@ async fn write_buddy_reply_with_data(
 
     // 2. Write data to SHM (single lock scope).
     let write_ok = {
-        let pool = response_pool.read().unwrap();
+        let pool = response_pool.read();
         match pool.data_ptr(&alloc) {
             Ok(ptr) => {
                 unsafe {
@@ -910,7 +910,7 @@ async fn write_buddy_reply_with_data(
     };
     if !write_ok {
         {
-            let mut pool = response_pool.write().unwrap();
+            let mut pool = response_pool.write();
             let _ = pool.free(&alloc);
         }
         return Err("data_ptr failed".into());
@@ -939,7 +939,7 @@ async fn write_buddy_reply_with_data(
     //    and read from SHM before gc_delay expires.  Buddy allocs use SHM
     //    atomics so the client's free_at is already cross-process visible.
     if alloc.is_dedicated {
-        let mut pool = response_pool.write().unwrap();
+        let mut pool = response_pool.write();
         let _ = pool.free(&alloc);
     }
 
@@ -982,7 +982,7 @@ async fn write_chunked_reply(
 
 /// Dispatch a `ResponseMeta` to the appropriate reply path.
 async fn send_response_meta(
-    response_pool: &std::sync::RwLock<MemPool>,
+    response_pool: &parking_lot::RwLock<MemPool>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     meta: ResponseMeta,
@@ -1012,7 +1012,7 @@ async fn send_response_meta(
 
             // Server-side free for dedicated segments (same as write_buddy_reply_with_data).
             if is_dedicated {
-                let mut pool = response_pool.write().unwrap();
+                let mut pool = response_pool.write();
                 let _ = pool.free_at(seg_idx as u32, offset, data_size, true);
             }
         }
@@ -1021,7 +1021,7 @@ async fn send_response_meta(
 
 /// Choose buddy SHM or inline reply based on data size and threshold.
 async fn smart_reply_with_data(
-    response_pool: &std::sync::RwLock<MemPool>,
+    response_pool: &parking_lot::RwLock<MemPool>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     data: &[u8],
@@ -1107,7 +1107,7 @@ mod tests {
             _: &str,
             _: u16,
             _request: RequestData,
-            _response_pool: Arc<std::sync::RwLock<MemPool>>,
+            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
         ) -> Result<ResponseMeta, CrmError> {
             Ok(ResponseMeta::Inline(b"echo".to_vec()))
         }
@@ -1190,7 +1190,8 @@ mod tests {
 
     #[test]
     fn chunked_reassembly_via_registry() {
-        use std::sync::{Arc, RwLock};
+        use std::sync::Arc;
+        use parking_lot::RwLock;
 
         let reassembly_cfg = c2_mem::config::PoolConfig {
             segment_size: 64 * 1024,
@@ -1225,13 +1226,13 @@ mod tests {
         assert_eq!(finished.route_name.as_deref(), Some("grid"));
         assert_eq!(finished.method_idx, Some(0));
         assert_eq!(finished.handle.len(), 18); // 8+8+2
-        let p = pool.read().unwrap();
+        let p = pool.read();
         let slice = p.handle_slice(&finished.handle);
         assert_eq!(&slice[0..8], b"aaaaaaaa");
         assert_eq!(&slice[8..16], b"bbbbbbbb");
         assert_eq!(&slice[16..18], b"cc");
         drop(p);
-        pool.write().unwrap().release_handle(finished.handle);
+        pool.write().release_handle(finished.handle);
     }
 
     // -- handshake extraction --

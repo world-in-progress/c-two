@@ -8,7 +8,7 @@
 //! release the Python GIL via `py.allow_threads()` so the Python ServerV2
 //! asyncio loop can continue processing connections during handshake.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -62,7 +62,7 @@ impl PyNativeRelay {
     /// Releases the GIL while waiting for the listener to bind.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         let (bind, idle_timeout_secs) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock();
             if state.server.is_some() {
                 return Err(PyRuntimeError::new_err("Relay is already running"));
             }
@@ -71,7 +71,7 @@ impl PyNativeRelay {
         let server = py
             .allow_threads(|| RelayServer::start(&bind, idle_timeout_secs))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to start relay: {e}")))?;
-        self.state.lock().unwrap().server = Some(server);
+        self.state.lock().server = Some(server);
         Ok(())
     }
 
@@ -80,7 +80,7 @@ impl PyNativeRelay {
     /// Releases the GIL while waiting for shutdown.
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
         let mut server = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state
                 .server
                 .take()
@@ -100,7 +100,7 @@ impl PyNativeRelay {
         let name = name.to_string();
         let address = address.to_string();
         py.allow_threads(|| {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock();
             let server = state
                 .server
                 .as_ref()
@@ -116,7 +116,7 @@ impl PyNativeRelay {
     fn unregister_upstream(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         let name = name.to_string();
         py.allow_threads(|| {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock();
             let server = state
                 .server
                 .as_ref()
@@ -132,7 +132,7 @@ impl PyNativeRelay {
     fn list_routes(&self, py: Python<'_>) -> PyResult<PyObject> {
         let routes = py
             .allow_threads(|| {
-                let state = self.state.lock().unwrap();
+                let state = self.state.lock();
                 let server = state
                     .server
                     .as_ref()
@@ -154,13 +154,13 @@ impl PyNativeRelay {
     /// Check if the relay is currently running.
     #[getter]
     fn is_running(&self) -> bool {
-        self.state.lock().unwrap().server.is_some()
+        self.state.lock().server.is_some()
     }
 
     /// The configured bind address.
     #[getter]
     fn bind_address(&self) -> String {
-        self.state.lock().unwrap().bind.clone()
+        self.state.lock().bind.clone()
     }
 }
 

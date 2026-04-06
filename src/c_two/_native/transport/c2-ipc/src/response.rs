@@ -51,23 +51,23 @@ impl ResponseData {
     /// Used by the relay which must copy data before forwarding over HTTP.
     pub fn into_bytes_with_pool(
         self,
-        server_pool: &std::sync::Arc<std::sync::Mutex<Option<super::client::ServerPoolState>>>,
-        reassembly_pool: &std::sync::Arc<std::sync::RwLock<c2_mem::MemPool>>,
+        server_pool: &std::sync::Arc<parking_lot::Mutex<Option<super::client::ServerPoolState>>>,
+        reassembly_pool: &std::sync::Arc<parking_lot::RwLock<c2_mem::MemPool>>,
     ) -> Result<Vec<u8>, String> {
         match self {
             ResponseData::Inline(v) => Ok(v),
             ResponseData::Shm { seg_idx, offset, data_size, is_dedicated } => {
-                let mut guard = server_pool.lock().unwrap();
+                let mut guard = server_pool.lock();
                 let state = guard.as_mut().ok_or("server pool not initialised")?;
                 let (data, _) = state.read_and_free(seg_idx, offset, data_size, is_dedicated)?;
                 Ok(data)
             }
             ResponseData::Handle(handle) => {
-                let pool = reassembly_pool.read().unwrap();
+                let pool = reassembly_pool.read();
                 let slice = pool.handle_slice(&handle);
                 let data = slice.to_vec();
                 drop(pool);
-                reassembly_pool.write().unwrap().release_handle(handle);
+                reassembly_pool.write().release_handle(handle);
                 Ok(data)
             }
         }

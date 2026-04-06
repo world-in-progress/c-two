@@ -338,7 +338,7 @@ mod client_tests {
         assert!(!c1.is_connected());
 
         // IpcClient::with_pool uses custom config.
-        let pool = std::sync::Arc::new(std::sync::Mutex::new(
+        let pool = std::sync::Arc::new(parking_lot::Mutex::new(
             c2_mem::MemPool::new(c2_mem::PoolConfig::default()),
         ));
         let c2 = crate::client::IpcClient::with_pool("ipc://test_prop_2", pool, cfg);
