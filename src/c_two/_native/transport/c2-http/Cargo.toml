@@ -2,9 +2,42 @@
 name = "c2-http"
 edition.workspace = true
 version.workspace = true
-description = "HTTP client for C-Two relay transport"
+description = "C-Two HTTP transport layer (client + relay server)"
+
+[features]
+default = []
+relay = [
+    "dep:axum",
+    "dep:tower-http",
+    "dep:c2-config",
+    "dep:c2-wire",
+    "dep:c2-ipc",
+    "dep:clap",
+    "dep:serde_json",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:anyhow",
+]
 
 [dependencies]
+# Always available (client)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["full"] }
 thiserror = "2"
+
+# Relay-only dependencies (behind feature gate)
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+c2-config = { path = "../../foundation/c2-config", optional = true }
+c2-wire = { path = "../../protocol/c2-wire", optional = true }
+c2-ipc = { path = "../c2-ipc", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+anyhow = { version = "1", optional = true }
+
+[[bin]]
+name = "c2-relay"
+path = "src/main.rs"
+required-features = ["relay"]

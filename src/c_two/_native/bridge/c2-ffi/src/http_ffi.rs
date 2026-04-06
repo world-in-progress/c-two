@@ -9,7 +9,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use c2_http::{HttpClient, HttpClientPool, HttpError};
+use c2_http::client::{HttpClient, HttpClientPool, HttpError};
 
 // ---------------------------------------------------------------------------
 // HttpCrmCallError — custom exception carrying serialised error bytes

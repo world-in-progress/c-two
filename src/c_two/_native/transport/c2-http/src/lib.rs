@@ -1,11 +1,9 @@
-//! HTTP client for C-Two relay transport.
+//! C-Two HTTP transport layer.
 //!
-//! Provides [`HttpClient`] for making CRM calls through an HTTP relay
-//! server, and [`HttpClientPool`] for reference-counted connection
-//! pooling.
+//! - `client`: HTTP client for connecting to relay servers (always available)
+//! - `relay`: HTTP relay server bridging HTTP→IPC (requires `relay` feature)
 
-mod client;
-mod pool;
+pub mod client;
 
-pub use client::{HttpClient, HttpError};
-pub use pool::HttpClientPool;
+#[cfg(feature = "relay")]
+pub mod relay;

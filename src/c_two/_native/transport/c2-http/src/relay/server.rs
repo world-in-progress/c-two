@@ -16,8 +16,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use c2_ipc::IpcClient;
-use crate::router;
-use crate::state::{RelayState, UpstreamPool};
+use crate::relay::router;
+use crate::relay::state::{RelayState, UpstreamPool};
 
 /// Commands sent from the sync API to the async runtime.
 enum Command {

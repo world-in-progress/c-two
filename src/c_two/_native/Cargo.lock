@@ -167,7 +167,6 @@ dependencies = [
  "c2-http",
  "c2-ipc",
  "c2-mem",
- "c2-relay",
  "c2-server",
  "c2-wire",
  "pyo3",
@@ -179,9 +178,19 @@ dependencies = [
 name = "c2-http"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "axum",
+ "c2-config",
+ "c2-ipc",
+ "c2-wire",
+ "clap",
  "reqwest",
+ "serde_json",
  "thiserror",
  "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -202,23 +211,6 @@ dependencies = [
  "c2-config",
  "libc",
  "memmap2",
-]
-
-[[package]]
-name = "c2-relay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "c2-config",
- "c2-ipc",
- "c2-wire",
- "clap",
- "serde_json",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

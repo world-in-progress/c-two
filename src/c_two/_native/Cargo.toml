@@ -7,7 +7,6 @@ members = [
     "transport/c2-ipc",
     "transport/c2-http",
     "transport/c2-server",
-    "transport/c2-relay",
     "bridge/c2-ffi",
 ]
 

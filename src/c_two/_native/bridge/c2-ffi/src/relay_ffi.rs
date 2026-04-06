@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use c2_relay::server::RelayServer;
+use c2_http::relay::server::RelayServer;
 
 struct RelayState {
     bind: String,

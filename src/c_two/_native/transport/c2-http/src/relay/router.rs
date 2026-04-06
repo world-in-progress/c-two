@@ -12,7 +12,7 @@ use axum::{
 };
 
 use c2_ipc::IpcClient;
-use crate::state::RelayState;
+use crate::relay::state::RelayState;
 
 /// Build the relay axum router with control-plane and data-plane endpoints.
 pub fn build_router(state: RelayState) -> Router {

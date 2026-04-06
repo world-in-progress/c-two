@@ -12,7 +12,7 @@
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use c2_relay::{router, RelayState};
+use c2_http::relay::{router, RelayState};
 
 #[derive(Parser, Debug)]
 #[command(name = "c2-relay", about = "C-Two HTTP relay server (multi-upstream)")]
