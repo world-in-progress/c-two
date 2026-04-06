@@ -37,8 +37,7 @@ pub struct FinishedChunk {
 /// Per-assembly tracking wrapper around [`ChunkAssembler`].
 struct TrackedAssembler {
     inner: ChunkAssembler,
-    #[allow(dead_code)]
-    created_at: Instant,
+    _created_at: Instant,
     last_activity: Instant,
     total_bytes: u64,
 }
@@ -125,7 +124,7 @@ impl ChunkRegistry {
         let now = Instant::now();
         let tracked = TrackedAssembler {
             inner: assembler,
-            created_at: now,
+            _created_at: now,
             last_activity: now,
             total_bytes: alloc_bytes,
         };

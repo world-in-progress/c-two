@@ -29,8 +29,7 @@ impl std::error::Error for ShmError {}
 pub struct MappedSegment {
     ptr: *mut u8,
     size: usize,
-    #[allow(dead_code)]
-    fd: RawFd,
+    _fd: RawFd,
 }
 
 // SAFETY: The mapped memory is shared between processes but we only read
@@ -76,7 +75,7 @@ impl MappedSegment {
         Ok(Self {
             ptr: ptr as *mut u8,
             size,
-            fd,
+            _fd: fd,
         })
     }
 
@@ -117,7 +116,7 @@ impl Drop for MappedSegment {
         if !self.ptr.is_null() {
             unsafe {
                 libc::munmap(self.ptr as *mut libc::c_void, self.size);
-                libc::close(self.fd);
+                libc::close(self._fd);
             }
         }
     }

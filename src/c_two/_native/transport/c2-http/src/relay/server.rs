@@ -42,8 +42,7 @@ enum Command {
 pub struct RelayServer {
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    #[allow(dead_code)]
-    pool: Arc<RwLock<UpstreamPool>>,
+    _pool: Arc<RwLock<UpstreamPool>>,
 }
 
 impl RelayServer {
@@ -85,7 +84,7 @@ impl RelayServer {
         Ok(Self {
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
-            pool,
+            _pool: pool,
         })
     }
 
