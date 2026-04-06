@@ -28,7 +28,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-manifest-path = "src/c_two/_native/c2-ffi/Cargo.toml"
+manifest-path = "src/c_two/_native/bridge/c2-ffi/Cargo.toml"
 module-name = "c_two._native"
 python-source = "src"
 features = ["pyo3/extension-module"]
