@@ -3,6 +3,12 @@
 //! Replaces the Python asyncio server (`transport/server/core.py`).
 //! CRM method execution is delegated to [`CrmCallback`] (implemented
 //! by PyO3 wrappers in c2-ffi).
+//!
+//! ## Lock conventions
+//!
+//! This module uses **two different RwLock types**:
+//! - `tokio::sync::RwLock` — async lock for `Dispatcher` (must `.await`)
+//! - `parking_lot::RwLock` — sync lock for `MemPool` (blocking, no `.await`)
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,13 +92,16 @@ impl From<std::io::Error> for ServerError {
 pub struct Server {
     config: ServerIpcConfig,
     socket_path: PathBuf,
+    /// **tokio async RwLock** — guards CRM dispatch table; requires `.read().await`
+    /// / `.write().await`.  Do NOT confuse with `parking_lot::RwLock` below.
     dispatcher: RwLock<Dispatcher>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     conn_counter: AtomicU64,
     /// Sharded chunk reassembly lifecycle manager.
     chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
-    /// Server-side MemPool for writing buddy SHM responses.
+    /// **parking_lot sync RwLock** — guards SHM memory pool; blocking `.read()`
+    /// / `.write()` (no `.await`).  Safe to hold briefly inside tokio tasks.
     response_pool: Arc<parking_lot::RwLock<MemPool>>,
 }
 
@@ -200,14 +209,19 @@ impl Server {
         // Spawn periodic GC sweep for expired chunk assemblies.
         let gc_registry = self.chunk_registry.clone();
         let gc_interval = self.chunk_registry.config().gc_interval;
+        let mut gc_shutdown_rx = self.shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(gc_interval);
             interval.tick().await; // skip first immediate tick
             loop {
-                interval.tick().await;
-                let stats = gc_registry.gc_sweep();
-                if stats.expired > 0 {
-                    info!(expired = stats.expired, freed = stats.freed_bytes, "chunk GC sweep");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let stats = gc_registry.gc_sweep();
+                        if stats.expired > 0 {
+                            info!(expired = stats.expired, freed = stats.freed_bytes, "chunk GC sweep");
+                        }
+                    }
+                    _ = gc_shutdown_rx.changed() => break,
                 }
             }
         });
