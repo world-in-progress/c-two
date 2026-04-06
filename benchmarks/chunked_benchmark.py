@@ -16,10 +16,8 @@ import sys
 import time
 
 import c_two as cc
-from c_two.transport.server import Server
-from c_two.transport.ipc.frame import IPCConfig
-from c_two.transport.client import SharedClient
-from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.client.util import ping
 
 
 # ---------------------------------------------------------------------------
@@ -41,21 +39,10 @@ class BenchChunk:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Constants
 # ---------------------------------------------------------------------------
 
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-
-
-def _wait_for_server(addr: str, timeout: float = 10.0) -> None:
-    region = addr.replace('ipc-v3://', '')
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region}.sock')
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
-            return
-        time.sleep(0.05)
-    raise TimeoutError(f'Server {addr} did not start within {timeout}s')
+SEGMENT_SIZE = 256 * 1024 * 1024  # 256 MB (default IPCConfig)
 
 
 def bench_one(
@@ -99,21 +86,17 @@ def main() -> None:
                         help='Maximum payload size in MB (default: 512)')
     args = parser.parse_args()
 
-    # Default config (256 MB segments) for realistic benchmarking.
-    cfg = IPCConfig()
+    _ProcessRegistry.reset()
+    address = f'ipc://bench_chunk_{os.getpid()}'
 
-    addr = f'ipc-v3://bench_chunk_{os.getpid()}'
-    server = Server(bind_address=addr, ipc_config=cfg)
-    server.register_crm(IBenchChunk, BenchChunk(), name='bench')
-    server.start()
-    _wait_for_server(addr)
+    cc.set_server_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
+    cc.set_client_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
+    cc.set_address(address)
+    cc.register(IBenchChunk, BenchChunk(), name='bench')
 
-    client = SharedClient(addr, ipc_config=cfg)
-    client.connect()
+    ping(address, timeout=10.0)
 
-    proxy = ICRMProxy.ipc(client, 'bench')
-    icrm = IBenchChunk()
-    icrm.client = proxy
+    icrm = cc.connect(IBenchChunk, name='bench', address=address)
 
     # Verify connectivity.
     assert icrm.add(1, 2) == 3, 'Basic connectivity check failed'
@@ -124,7 +107,7 @@ def main() -> None:
     sizes_kb = [s for s in sizes_kb if s <= max_kb]
 
     # Add boundary sizes around the chunk threshold.
-    seg_size = cfg.pool_segment_size
+    seg_size = SEGMENT_SIZE
     threshold = int(seg_size * 0.9)
     chunk_size = seg_size // 2
     boundary_kb = [
@@ -143,7 +126,6 @@ def main() -> None:
     print(f'  pool_segment_size : {seg_size:>12,} bytes ({seg_size // (1024*1024)} MB)')
     print(f'  chunk_threshold   : {threshold:>12,} bytes')
     print(f'  chunk_size        : {chunk_size:>12,} bytes ({chunk_size // (1024*1024)} MB)')
-    print(f'  chunked_capable   : {client._chunked_capable}')
     print()
     header = f'{"Payload":>12}  {"Mode":>8}  {"Min(ms)":>10}  {"Median(ms)":>10}  {"Max(ms)":>10}  {"Throughput":>14}'
     print(header)
@@ -180,8 +162,9 @@ def main() -> None:
     print()
 
     # Cleanup
-    client.terminate()
-    server.shutdown()
+    cc.close(icrm)
+    cc.unregister('bench')
+    cc.shutdown()
 
 
 if __name__ == '__main__':

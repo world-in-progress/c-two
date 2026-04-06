@@ -14,9 +14,8 @@ from c_two.transport.server import Server
 from c_two.transport.client.util import ping
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
-    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
-    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    FrameDecodeError,
+    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction,
+    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling,
 )
 from tests.fixtures.hello import Hello
 from tests.fixtures.ihello import IHello, HelloData
@@ -147,9 +146,8 @@ class TestCompoClientError:
 # Class 3 — Error serialization round-trips
 # ---------------------------------------------------------------------------
 ALL_SUBCLASSES = [
-    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction, CRMServerError,
-    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling, CompoClientError,
-    FrameDecodeError,
+    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction,
+    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling,
 ]
 
 

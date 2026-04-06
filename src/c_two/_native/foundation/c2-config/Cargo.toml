@@ -1,0 +1,8 @@
+[package]
+name = "c2-config"
+edition.workspace = true
+version.workspace = true
+description = "Shared configuration types for C-Two IPC transport, memory pool, and relay"
+
+[lib]
+name = "c2_config"

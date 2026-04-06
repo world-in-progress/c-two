@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytest
 
 import c_two as cc
-from c_two.transport.ipc.frame import IPCConfig
+from c_two.config.ipc import ServerIPCConfig
 from c_two.transport.client.util import ping
 from c_two.transport.server import Server
 
@@ -75,8 +75,8 @@ def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f'Server {addr} did not start within {timeout}s')
 
 
-def _pool_config(max_segs: int = 4) -> IPCConfig:
-    return IPCConfig(
+def _pool_config(max_segs: int = 4) -> ServerIPCConfig:
+    return ServerIPCConfig(
         pool_segment_size=_SEG_SIZE,
         max_pool_segments=max_segs,
         max_pool_memory=_SEG_SIZE * max_segs,
@@ -85,7 +85,7 @@ def _pool_config(max_segs: int = 4) -> IPCConfig:
 
 def _setup(
     addr: str | None = None,
-    cfg: IPCConfig | None = None,
+    cfg: ServerIPCConfig | None = None,
 ):
     """Spin up a Server + SOTA proxy for IPoolTest CRM.
 

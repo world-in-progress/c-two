@@ -281,25 +281,25 @@ class TestEmptyBytesHandling:
     """b'' is falsy in Python. Deserializers must use `is None` checks,
     not truthiness, otherwise b'' silently becomes None."""
 
-    # ---- bytes fast path (single bytes param) ----
+    # ---- pickle path (all types now use pickle) ----
 
-    def test_bytes_fast_path_input_empty_roundtrip(self):
-        """bytes fast-path input: b'' → serialize → deserialize → b'' (not None)."""
+    def test_pickle_input_bytes_roundtrip(self):
+        """bytes param: serialize → deserialize round-trips via pickle."""
         def fn(self, data: bytes) -> bytes: ...
         t = create_default_transferable(fn, is_input=True)
         raw = t.serialize(b'')
         result = t.deserialize(raw)
-        assert result is not None, 'b"" became None in bytes fast-path input'
-        assert bytes(result) == b''
+        assert result is not None, 'b"" became None in pickle input'
+        assert result == b''
 
-    def test_bytes_fast_path_output_empty_roundtrip(self):
-        """bytes fast-path output: b'' → serialize → deserialize → b'' (not None)."""
+    def test_pickle_output_bytes_roundtrip(self):
+        """bytes return: serialize → deserialize round-trips via pickle."""
         def fn(self, data: bytes) -> bytes: ...
         t = create_default_transferable(fn, is_input=False)
         raw = t.serialize(b'')
         result = t.deserialize(raw)
-        assert result is not None, 'b"" became None in bytes fast-path output'
-        assert bytes(result) == b''
+        assert result is not None, 'b"" became None in pickle output'
+        assert result == b''
 
     # ---- pickle path (non-bytes params) ----
 
@@ -353,7 +353,7 @@ class TestEmptyBytesHandling:
 
     # ---- None sentinel still works ----
 
-    def test_bytes_fast_path_none_stays_none(self):
+    def test_pickle_bytes_none_stays_none(self):
         def fn(self, data: bytes) -> bytes: ...
         t = create_default_transferable(fn, is_input=True)
         assert t.deserialize(None) is None
@@ -407,38 +407,38 @@ class TestSerializeDeserializeConsistency:
         # For a tuple, it hits the else branch and returns the tuple directly.
         assert result == (42, 'hello')
 
-    def test_bytes_fast_path_rejects_non_bytes_input(self):
-        """bytes fast-path serialize must reject non-bytes with TypeError."""
+    def test_pickle_bytes_rejects_non_serializable_input(self):
+        """pickle serialize must handle non-serializable types."""
         def fn(self, data: bytes) -> bytes: ...
         t = create_default_transferable(fn, is_input=True)
-        with pytest.raises(TypeError, match='bytes fast path'):
-            t.serialize('a string')
+        # pickle can serialize most things, but lambda cannot be pickled
+        with pytest.raises(Exception):
+            t.serialize(lambda: None)
 
-    def test_bytes_fast_path_rejects_non_bytes_output(self):
-        """bytes fast-path output serialize must reject non-bytes."""
+    def test_pickle_bytes_rejects_non_serializable_output(self):
+        """pickle output serialize must handle non-serializable types."""
         def fn(self, data: bytes) -> bytes: ...
         t = create_default_transferable(fn, is_input=False)
-        with pytest.raises(TypeError, match='bytes fast path'):
-            t.serialize(42)
+        with pytest.raises(Exception):
+            t.serialize(lambda: None)
 
-    def test_bytes_fast_path_accepts_memoryview(self):
-        """bytes fast-path must accept memoryview (zero-copy transport)."""
+    def test_pickle_bytes_roundtrip(self):
+        """bytes param type now uses pickle, verify round-trip."""
         def fn(self, data: bytes) -> bytes: ...
         t_in = create_default_transferable(fn, is_input=True)
         t_out = create_default_transferable(fn, is_input=False)
-        mv = memoryview(b'test data')
-        assert bytes(t_in.serialize(mv)) == b'test data'
-        assert bytes(t_out.serialize(mv)) == b'test data'
+        raw_in = t_in.serialize(b'test data')
+        assert t_in.deserialize(raw_in) == b'test data'
+        raw_out = t_out.serialize(b'test data')
+        assert t_out.deserialize(raw_out) == b'test data'
 
-    def test_output_bytes_fast_path_deserialize_accepts_both_formats(self):
-        """Output bytes fast-path deserialize handles both raw bytes and
-        pickle-encoded bytes (for version compatibility)."""
+    def test_output_pickle_deserialize_accepts_both_formats(self):
+        """Output pickle deserialize handles pickle-encoded bytes."""
         def fn(self, data: bytes) -> bytes: ...
         t = create_default_transferable(fn, is_input=False)
-        # Raw bytes (fast path)
-        assert t.deserialize(b'raw') == b'raw'
-        # Memoryview (zero-copy transport)
-        assert bytes(t.deserialize(memoryview(b'mv'))) == b'mv'
+        # Pickle-encoded bytes
+        raw = t.serialize(b'raw')
+        assert t.deserialize(raw) == b'raw'
 
 
 
@@ -470,4 +470,256 @@ class TestWireScatterWrite:
         from c_two.transport.wire import payload_total_size
         assert payload_total_size([b'a', b'bc', b'def']) == 6
 
+
+# ---------------------------------------------------------------------------
+# OPT-T5: buffer='copy|view|hold' parameter on @cc.transferable
+# ---------------------------------------------------------------------------
+
+class TestBufferMode:
+    """Tests for the buffer='copy|view|hold' parameter on @cc.transferable."""
+
+    def test_default_buffer_mode_is_copy(self):
+        """@cc.transferable without buffer= defaults to 'copy'."""
+        @cc.transferable
+        class CopyData:
+            x: int
+            def serialize(d: 'CopyData') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> 'CopyData':
+                return CopyData(x=pickle.loads(b))
+
+        assert CopyData._buffer_mode == 'copy'
+
+    def test_explicit_copy_mode(self):
+        """@cc.transferable(buffer='copy') sets _buffer_mode='copy'."""
+        @cc.transferable(buffer='copy')
+        class ExplicitCopy:
+            v: int
+            def serialize(d: 'ExplicitCopy') -> bytes:
+                return pickle.dumps(d.v)
+            def deserialize(b: bytes) -> 'ExplicitCopy':
+                return ExplicitCopy(v=pickle.loads(b))
+
+        assert ExplicitCopy._buffer_mode == 'copy'
+
+    def test_view_mode(self):
+        """@cc.transferable(buffer='view') sets _buffer_mode='view'."""
+        @cc.transferable(buffer='view')
+        class ViewData:
+            v: int
+            def serialize(d: 'ViewData') -> bytes:
+                return pickle.dumps(d.v)
+            def deserialize(data: memoryview) -> 'ViewData':
+                return ViewData(v=pickle.loads(data))
+
+        assert ViewData._buffer_mode == 'view'
+
+    def test_hold_mode(self):
+        """@cc.transferable(buffer='hold') sets _buffer_mode='hold'."""
+        @cc.transferable(buffer='hold')
+        class HoldData:
+            v: int
+            def serialize(d: 'HoldData') -> bytes:
+                return pickle.dumps(d.v)
+            def deserialize(data: memoryview) -> 'HoldData':
+                return HoldData(v=pickle.loads(data))
+
+        assert HoldData._buffer_mode == 'hold'
+
+    def test_invalid_buffer_mode_raises(self):
+        """Invalid buffer= value raises ValueError."""
+        with pytest.raises(ValueError, match='buffer'):
+            @cc.transferable(buffer='invalid')
+            class Bad:
+                x: int
+                def serialize(d: 'Bad') -> bytes:
+                    return b''
+                def deserialize(b: bytes) -> 'Bad':
+                    return Bad(x=0)
+
+    def test_existing_hello_data_has_copy_mode(self):
+        """Pre-existing @cc.transferable classes default to 'copy'."""
+        assert HelloData._buffer_mode == 'copy'
+
+    def test_default_transferable_has_view_mode(self):
+        """Default pickle transferable (auto-generated) uses 'view' mode."""
+        def fn(self, x: int) -> int: ...
+        t_in = create_default_transferable(fn, is_input=True)
+        t_out = create_default_transferable(fn, is_input=False)
+        assert t_in._buffer_mode == 'view'
+        assert t_out._buffer_mode == 'view'
+
+
+class TestCrmToComBufferModes:
+    """Test that crm_to_com handles _release_fn based on input buffer mode."""
+
+    def _setup(self, input_trans):
+        """Create a transfer-wrapped echo function with given input transferable."""
+        from c_two.crm.transferable import transfer
+        decorator = transfer(input=input_trans, output=None)
+        def echo(self, x):
+            return x
+        return decorator(echo)
+
+    def _make_icrm(self):
+        class MockCRM:
+            def echo(self, x):
+                return x
+        class MockICRM:
+            direction = '<-'
+            crm = MockCRM()
+        return MockICRM()
+
+    def test_copy_mode_calls_release(self):
+        """In copy mode, _release_fn is called (before deserialize)."""
+        released = []
+
+        @cc.transferable(buffer='copy')
+        class CopyIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data: bytes) -> int:
+                return pickle.loads(data)
+
+        wrapped = self._setup(CopyIn)
+        icrm = self._make_icrm()
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert released, '_release_fn was not called in copy mode'
+
+    def test_view_mode_calls_release(self):
+        """In view mode, _release_fn is called (after deserialize)."""
+        released = []
+        def fn(self, x: int) -> int: ...
+        input_trans = create_default_transferable(fn, is_input=True)
+        assert input_trans._buffer_mode == 'view'
+
+        wrapped = self._setup(input_trans)
+        icrm = self._make_icrm()
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert released, '_release_fn was not called in view mode'
+
+    def test_hold_mode_skips_release(self):
+        """In hold mode, _release_fn is NOT called (RAII)."""
+        released = []
+
+        @cc.transferable(buffer='hold')
+        class HoldIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data) -> int:
+                return pickle.loads(data) if isinstance(data, (bytes, memoryview)) else data
+
+        wrapped = self._setup(HoldIn)
+        icrm = self._make_icrm()
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert not released, '_release_fn should NOT be called in hold mode'
+
+    def test_no_release_fn_works(self):
+        """When _release_fn is None (thread-local), all modes work fine."""
+        def fn(self, x: int) -> int: ...
+        input_trans = create_default_transferable(fn, is_input=True)
+        wrapped = self._setup(input_trans)
+        icrm = self._make_icrm()
+        # No _release_fn — must not crash
+        result = wrapped(icrm, pickle.dumps(42))
+        # result is (error_bytes, result_bytes) tuple
+        assert isinstance(result, tuple)
+
+    def test_release_called_on_exception(self):
+        """_release_fn must be called even if deserialize raises."""
+        released = []
+
+        @cc.transferable(buffer='copy')
+        class BadDeser:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data: bytes) -> int:
+                raise RuntimeError('boom')
+
+        wrapped = self._setup(BadDeser)
+        icrm = self._make_icrm()
+        # Should not raise — crm_to_com catches exceptions
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert released, '_release_fn must be called even on error'
+
+    def test_transfer_wrapper_has_buffer_mode_attrs(self):
+        """transfer_wrapper should expose _input_buffer_mode and _output_buffer_mode."""
+        @cc.transferable(buffer='view')
+        class ViewIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data) -> int:
+                return pickle.loads(data)
+
+        wrapped = self._setup(ViewIn)
+        assert hasattr(wrapped, '_input_buffer_mode')
+        assert wrapped._input_buffer_mode == 'view'
+
+
+class TestComToCrmBufferModes:
+    """Test that com_to_crm handles response based on output buffer mode."""
+
+    def _make_mock_response(self, data: bytes):
+        """Create a mock PyShmBuffer-like response."""
+        class MockResponse:
+            def __init__(self, data):
+                self._data = data
+                self.released = False
+            def release(self):
+                self.released = True
+            def __buffer__(self, flags):
+                return memoryview(self._data)
+        return MockResponse(data)
+
+    def _make_icrm(self, response_data):
+        mock_resp = self._make_mock_response(response_data)
+        class MockClient:
+            supports_direct_call = False
+            def __init__(self, resp):
+                self.response = resp
+            def call(self, method, data):
+                return self.response
+        class MockICRM:
+            direction = '->'
+            def __init__(self, client):
+                self.client = client
+        client = MockClient(mock_resp)
+        return MockICRM(client), mock_resp
+
+    def test_copy_mode_releases_response(self):
+        """copy mode: response is materialized and released."""
+        @cc.transferable(buffer='copy')
+        class CopyOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data: bytes) -> int:
+                assert isinstance(data, bytes)
+                return pickle.loads(data)
+
+        from c_two.crm.transferable import transfer
+        icrm, mock_resp = self._make_icrm(pickle.dumps(42))
+        decorator = transfer(input=None, output=CopyOut)
+        def fn(self) -> int: ...
+        wrapped = decorator(fn)
+        result = wrapped(icrm)
+        assert result == 42
+        assert mock_resp.released
+
+    def test_hold_mode_skips_release(self):
+        """hold mode: response is NOT released (RAII)."""
+        @cc.transferable(buffer='hold')
+        class HoldOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data) -> int:
+                return pickle.loads(bytes(data)) if isinstance(data, memoryview) else pickle.loads(data)
+
+        from c_two.crm.transferable import transfer
+        icrm, mock_resp = self._make_icrm(pickle.dumps(42))
+        decorator = transfer(input=None, output=HoldOut)
+        def fn(self) -> int: ...
+        wrapped = decorator(fn)
+        result = wrapped(icrm)
+        assert result == 42
+        assert not mock_resp.released
 

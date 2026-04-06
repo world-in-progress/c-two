@@ -86,6 +86,8 @@ class Transferable(metaclass=TransferableMeta):
 
     """
 
+    _buffer_mode: str = 'copy'  # 'copy' | 'view' | 'hold'
+
     def serialize(*args: any) -> bytes:
         """
         serialize is a static method, and the decorator @staticmethod is added in the metaclass.  
@@ -123,19 +125,6 @@ def _default_deserialize_func(data: memoryview | None):
         return None
     return pickle.loads(data)
 
-def _is_single_bytes_param(func, filtered_params, type_hints) -> bool:
-    """Check if a function takes exactly one parameter of type bytes."""
-    if len(filtered_params) != 1:
-        return False
-    param_type = type_hints.get(filtered_params[0])
-    return param_type is bytes
-
-
-def _is_bytes_return(func) -> bool:
-    """Check if a function has return type bytes."""
-    type_hints = get_type_hints(func)
-    return type_hints.get('return') is bytes
-
 
 def create_default_transferable(func, is_input: bool):
     """
@@ -167,50 +156,31 @@ def create_default_transferable(func, is_input: bool):
                 continue
             filtered_params.append(name)
 
-        # Fast path: single bytes parameter — skip pickle entirely.
-        # The deserializer returns the data as-is (including memoryview) to
-        # enable zero-copy reads when the transport provides memoryview.
-        if _is_single_bytes_param(func, filtered_params, type_hints):
-            class DynamicInputTransferable(Transferable):
-                __module__ = 'Default'
+        # All input types use pickle-based serialization.
+        # pickle.loads() accepts memoryview since Python 3.8, so the
+        # deserializer is memoryview-aware for zero-copy transport.
+        class DynamicInputTransferable(Transferable):
+            __module__ = 'Default'
 
-                def serialize(data) -> bytes:
-                    if isinstance(data, (bytes, memoryview)):
-                        return data
-                    raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(data).__name__}")
+            def serialize(*args) -> bytes:
+                """Default serialization: pickle args directly as tuple."""
+                try:
+                    if len(args) == 1:
+                        return pickle.dumps(args[0])
+                    return pickle.dumps(args)
+                except Exception as e:
+                    logger.error(f'Failed to serialize input data: {e}')
+                    raise
 
-                def deserialize(data: memoryview | bytes):
-                    if data is None:
+            def deserialize(data: memoryview | bytes):
+                """Default deserialization: unpickle and return value or tuple."""
+                try:
+                    if data is None or len(data) == 0:
                         return None
-                    return data
-
-        else:
-            # Define the dynamic transferable class for input.
-            # pickle.loads() accepts memoryview since Python 3.8, so we
-            # can safely mark the default pickle-based class as
-            # memoryview-aware to avoid unnecessary bytes() conversion.
-            class DynamicInputTransferable(Transferable):
-                __module__ = 'Default'  # mark as default
-                
-                def serialize(*args) -> bytes:
-                    """Default serialization: pickle args directly as tuple."""
-                    try:
-                        if len(args) == 1:
-                            return pickle.dumps(args[0])
-                        return pickle.dumps(args)
-                    except Exception as e:
-                        logger.error(f'Failed to serialize input data: {e}')
-                        raise
-                
-                def deserialize(data: memoryview | bytes):
-                    """Default deserialization: unpickle and return value or tuple."""
-                    try:
-                        if data is None or len(data) == 0:
-                            return None
-                        unpickled = pickle.loads(data)
-                        return unpickled
-                    except Exception as e:
-                        raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
+                    unpickled = pickle.loads(data)
+                    return unpickled
+                except Exception as e:
+                    raise ValueError(f"Failed to deserialize input data for {func.__name__}: {e}")
         
         # Set the dynamic class properties
         DynamicInputTransferable._is_input = True
@@ -219,6 +189,7 @@ def create_default_transferable(func, is_input: bool):
         DynamicInputTransferable._type_hints = type_hints
         DynamicInputTransferable.__qualname__ = class_name
         DynamicInputTransferable._param_names = filtered_params
+        DynamicInputTransferable._buffer_mode = 'view'
         
         return DynamicInputTransferable
     
@@ -230,19 +201,8 @@ def create_default_transferable(func, is_input: bool):
         type_hints = get_type_hints(func)
         return_type = type_hints.get('return')
 
-        # Fast path: bytes return type — skip pickle entirely.
-        # The serializer passes memoryview through to enable zero-copy
-        # SHM→SHM writes in transports that support it (ipc buddy).
-        if return_type is bytes:
-            def _bytes_output_serialize(val):
-                if isinstance(val, (bytes, memoryview)):
-                    return val
-                raise TypeError(f"bytes fast path: expected bytes or memoryview, got {type(val).__name__}")
-            serialize_func = staticmethod(_bytes_output_serialize)
-            deserialize_func = staticmethod(lambda data: data if isinstance(data, (bytes, memoryview)) else pickle.loads(data) if data is not None else None)
-        else:
-            serialize_func = staticmethod(_default_serialize_func)
-            deserialize_func = staticmethod(_default_deserialize_func)
+        serialize_func = staticmethod(_default_serialize_func)
+        deserialize_func = staticmethod(_default_deserialize_func)
 
         # Define the dynamic transferable class for output
         attrs = {
@@ -264,6 +224,7 @@ def create_default_transferable(func, is_input: bool):
         DynamicOutputTransferable._original_func = func
         DynamicOutputTransferable.__qualname__ = class_name
         DynamicOutputTransferable._return_type = return_type
+        DynamicOutputTransferable._buffer_mode = 'view'
         
         return DynamicOutputTransferable
 
@@ -281,15 +242,30 @@ def get_transferable(full_name: str) -> Transferable | None:
 
 # Transferable-related decorators #################################################
 
-def transferable(cls: Type[T]) -> Type[T]:
+_VALID_BUFFER_MODES = frozenset(('copy', 'view', 'hold'))
+
+def transferable(cls=None, *, buffer: str = 'copy'):
+    """Decorator to make a class inherit from Transferable.
+
+    Supports both ``@cc.transferable`` and ``@cc.transferable(buffer='view')``.
     """
-    A decorator to make a class automatically inherit from Transferable.
-    """
-    # Dynamically create a new class that inherits from both the original class and Transferable
-    new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
-    new_cls.__module__ = cls.__module__  # preserve the original module
-    new_cls.__qualname__ = cls.__qualname__  # preserve the original qualified name
-    return new_cls
+    if buffer not in _VALID_BUFFER_MODES:
+        raise ValueError(
+            f"buffer must be one of {sorted(_VALID_BUFFER_MODES)}, got {buffer!r}"
+        )
+
+    def wrap(cls):
+        new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
+        new_cls.__module__ = cls.__module__
+        new_cls.__qualname__ = cls.__qualname__
+        new_cls._buffer_mode = buffer
+        return new_cls
+
+    if cls is not None:
+        # Called as @cc.transferable (no parentheses)
+        return wrap(cls)
+    # Called as @cc.transferable(buffer='view')
+    return wrap
 
 def transfer(input: Transferable | None = None, output: Transferable | None = None) -> callable:
 
@@ -300,6 +276,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             # Get transferable
             input_transferable = input.serialize if input else None
             output_transferable = output.deserialize if output else None
+            output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
 
             try:
                 if len(args) < 1:
@@ -320,13 +297,36 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 
                 # Call CRM
                 stage = 'call_crm'
-                result_bytes = client.call(method_name, serialized_args)
+                response = client.call(method_name, serialized_args)
                 
                 # Deserialize output
                 stage = 'deserialize_output'
                 if not output_transferable:
+                    if hasattr(response, 'release'):
+                        response.release()
                     return None
-                return output_transferable(result_bytes)
+                if hasattr(response, 'release'):
+                    mv = memoryview(response)
+                    if output_buffer_mode == 'copy':
+                        try:
+                            data = bytes(mv)
+                        finally:
+                            mv.release()
+                            response.release()
+                        result = output_transferable(data)
+                    elif output_buffer_mode == 'view':
+                        try:
+                            result = output_transferable(mv)
+                            if isinstance(result, memoryview):
+                                result = bytes(result)
+                        finally:
+                            mv.release()
+                            response.release()
+                    else:  # hold — RAII, no explicit release
+                        result = output_transferable(mv)
+                else:
+                    result = output_transferable(response)
+                return result
             
             except error.CCBaseError:
                 raise
@@ -338,10 +338,10 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 else:
                     raise error.CompoDeserializeOutput(str(e)) from e
         
-        def crm_to_com(*args: any) -> tuple[any, any]:
-            # Get transferable
+        def crm_to_com(*args: any, _release_fn=None) -> tuple[any, any]:
             input_transferable = input.deserialize if input else None
             output_transferable = output.serialize if output else None
+            input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
 
             err = None
             result = None
@@ -350,22 +350,34 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             try:
                 if len(args) < 1:
                     raise ValueError('Instance method requires self, but only get one argument.')
-                
-                # Parse input args
+
                 iicrm = args[0]
                 crm = iicrm.crm
                 request = args[1] if len(args) > 1 else None
-                
-                # Deserialize input args if input_transferable is provided
-                # And if deserialized_args is not a tuple, convert it to a tuple
+
                 if request is not None and input_transferable is not None:
-                    deserialized_args = input_transferable(request)
+                    if input_buffer_mode == 'copy':
+                        request_copy = bytes(request) if not isinstance(request, bytes) else request
+                        if _release_fn is not None:
+                            _release_fn()
+                            _release_fn = None
+                        deserialized_args = input_transferable(request_copy)
+                    elif input_buffer_mode == 'view':
+                        deserialized_args = input_transferable(request)
+                        if _release_fn is not None:
+                            _release_fn()
+                            _release_fn = None
+                    else:  # hold
+                        deserialized_args = input_transferable(request)
                 else:
                     deserialized_args = tuple()
+                    if _release_fn is not None:
+                        _release_fn()
+                        _release_fn = None
+
                 if not isinstance(deserialized_args, tuple):
                     deserialized_args = (deserialized_args,)
 
-                # Call CRM method with the same name
                 crm_method = getattr(crm, method_name, None)
                 if crm_method is None:
                     raise ValueError(f'Method "{method_name}" not found on CRM class.')
@@ -373,9 +385,14 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
                 stage = 'execute_function'
                 result = crm_method(*deserialized_args)
                 err = None
-                
+
             except Exception as e:
                 result = None
+                if _release_fn is not None:
+                    try:
+                        _release_fn()
+                    except Exception:
+                        pass
                 if stage == 'deserialize_input':
                     err = error.CRMDeserializeInput(str(e))
                 elif stage == 'execute_function':
@@ -395,7 +412,7 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             return (serialized_error, serialized_result)
         
         @wraps(func)
-        def transfer_wrapper(*args: any) -> any:
+        def transfer_wrapper(*args: any, **kwargs: any) -> any:
             if not args:
                 raise ValueError('No arguments provided to determine direction.')
             
@@ -406,10 +423,14 @@ def transfer(input: Transferable | None = None, output: Transferable | None = No
             if icrm.direction == '->':
                 return com_to_crm(*args)
             elif icrm.direction == '<-':
-                return crm_to_com(*args)
+                return crm_to_com(*args, **kwargs)
             else:
                 raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
         
+        # Expose buffer mode attributes for dispatch table introspection
+        transfer_wrapper._input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
+        transfer_wrapper._output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
+
         return transfer_wrapper
     
     return decorator

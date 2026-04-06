@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
-from ..ipc.frame import IPCConfig
+from c_two.config.ipc import ServerIPCConfig
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_icrm_result
@@ -48,7 +50,7 @@ class CRMSlot:
     scheduler: Scheduler
     methods: list[str]
     shutdown_method: str | None = None
-    _dispatch_table: dict[str, tuple[Any, MethodAccess]] = field(
+    _dispatch_table: dict[str, tuple[Any, MethodAccess, str]] = field(
         default_factory=dict, repr=False,
     )
 
@@ -58,7 +60,9 @@ class CRMSlot:
                 continue
             method = getattr(self.icrm, name, None)
             if method is not None:
-                self._dispatch_table[name] = (method, get_method_access(method))
+                access = get_method_access(method)
+                buffer_mode = getattr(method, '_input_buffer_mode', 'copy')
+                self._dispatch_table[name] = (method, access, buffer_mode)
 
 
 class NativeServerBridge:
@@ -74,14 +78,16 @@ class NativeServerBridge:
         bind_address: str,
         icrm_class: type | None = None,
         crm_instance: object | None = None,
-        ipc_config: IPCConfig | None = None,
+        ipc_config: ServerIPCConfig | None = None,
         concurrency: ConcurrencyConfig | None = None,
         max_workers: int = 4,
         *,
         name: str | None = None,
+        shm_threshold: int = 4096,
     ) -> None:
-        self._config = ipc_config or IPCConfig()
+        self._config = ipc_config or ServerIPCConfig()
         self._address = bind_address
+        self._shm_threshold = shm_threshold
         self._default_concurrency = concurrency or ConcurrencyConfig(
             max_workers=max_workers,
         )
@@ -93,18 +99,27 @@ class NativeServerBridge:
 
         from c_two._native import RustServer
 
-        chunked_threshold = int(
-            self._config.max_payload_size * self._config.chunk_threshold_ratio,
-        )
         self._rust_server = RustServer(
             address=bind_address,
+            shm_threshold=shm_threshold,
+            pool_enabled=self._config.pool_enabled,
+            pool_segment_size=self._config.pool_segment_size,
+            max_pool_segments=self._config.max_pool_segments,
+            max_pool_memory=self._config.max_pool_memory,
+            reassembly_segment_size=self._config.reassembly_segment_size,
+            reassembly_max_segments=self._config.reassembly_max_segments,
             max_frame_size=self._config.max_frame_size,
             max_payload_size=self._config.max_payload_size,
-            max_pool_segments=self._config.max_pool_segments,
-            segment_size=self._config.pool_segment_size,
-            chunked_threshold=chunked_threshold,
+            max_pending_requests=self._config.max_pending_requests,
+            pool_decay_seconds=self._config.pool_decay_seconds,
             heartbeat_interval=self._config.heartbeat_interval,
             heartbeat_timeout=self._config.heartbeat_timeout,
+            max_total_chunks=self._config.max_total_chunks,
+            chunk_gc_interval=self._config.chunk_gc_interval,
+            chunk_threshold_ratio=self._config.chunk_threshold_ratio,
+            chunk_assembler_timeout=self._config.chunk_assembler_timeout,
+            max_reassembly_bytes=self._config.max_reassembly_bytes,
+            chunk_size=self._config.chunk_size,
         )
 
         # Register initial CRM if provided (compat with old Server constructor).
@@ -153,7 +168,7 @@ class NativeServerBridge:
         for idx, mname in enumerate(methods):
             entry = slot._dispatch_table.get(mname)
             if entry is not None:
-                _, access = entry
+                _, access, _bm = entry
                 access_map[idx] = (
                     'read' if access is MethodAccess.READ else 'write'
                 )
@@ -193,7 +208,7 @@ class NativeServerBridge:
             raise KeyError(f'Name not registered: {name!r}')
         access_map = {
             mname: access
-            for mname, (_, access) in slot._dispatch_table.items()
+            for mname, (_, access, _bm) in slot._dispatch_table.items()
         }
         return slot.scheduler, access_map
 
@@ -212,9 +227,6 @@ class NativeServerBridge:
     def start(self, timeout: float = 5.0) -> None:
         self._rust_server.start()
         # Wait for the UDS socket to be created by the Rust server.
-        import os
-        import time
-
         socket_path = self._rust_server.socket_path
         deadline = time.monotonic() + timeout
         while not os.path.exists(socket_path):
@@ -238,9 +250,8 @@ class NativeServerBridge:
                 logger.warning('Error shutting down RustServer', exc_info=True)
             self._started = False
 
-        with self._slots_lock:
-            for slot in self._slots.values():
-                slot.scheduler.shutdown()
+        for slot in slots_snapshot:
+            slot.scheduler.shutdown()
 
     # ------------------------------------------------------------------
     # ICRM helpers
@@ -293,20 +304,26 @@ class NativeServerBridge:
 
     def _make_dispatcher(
         self, route_name: str, slot: CRMSlot,
-    ) -> Callable[[str, int, bytes], bytes]:
+    ) -> Callable[[str, int, object, object], object]:
         """Build the Python callable passed to ``RustServer.register_route()``.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
-        held.  It resolves the method, calls the ICRM, and returns result
-        bytes.  For errors, it raises :class:`CrmCallError` whose
-        ``error_bytes`` attribute is picked up by ``PyCrmCallback``.
+        held.  Signature: ``(route_name, method_idx, shm_buffer, response_pool)``.
+        It reads the request via ``memoryview(shm_buffer)``, resolves the
+        method, calls the ICRM, and returns result bytes (or *None* for empty
+        responses).  For large responses (> shm_threshold), allocates from
+        ``response_pool`` SHM and returns a ``(seg_idx, offset, data_size,
+        is_dedicated)`` tuple — Rust sends the buddy frame directly.
         """
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
+        shm_threshold = self._shm_threshold
 
         def dispatch(
-            _route_name: str, method_idx: int, payload: bytes,
-        ) -> bytes:
+            _route_name: str, method_idx: int,
+            request_buf: object, response_pool: object,
+        ) -> object:
+            # 1. Resolve method
             method_name = idx_to_name.get(method_idx)
             if method_name is None:
                 raise RuntimeError(
@@ -315,11 +332,64 @@ class NativeServerBridge:
             entry = dispatch_table.get(method_name)
             if entry is None:
                 raise RuntimeError(f'Method not found: {method_name}')
-            method, _access = entry
-            result = method(payload)
+            method, _access, buffer_mode = entry
+
+            # 2. Buffer-mode-aware request handling
+            if buffer_mode == 'copy':
+                # Materialize to bytes, release SHM immediately
+                try:
+                    mv = memoryview(request_buf)
+                    payload = bytes(mv)
+                    mv.release()
+                finally:
+                    try:
+                        request_buf.release()
+                    except Exception:
+                        pass
+                result = method(payload)
+            elif buffer_mode == 'view':
+                # Pass memoryview; _release_fn frees SHM after deserialize
+                mv = memoryview(request_buf)
+                released = False
+                def release_fn():
+                    nonlocal released
+                    if not released:
+                        released = True
+                        mv.release()
+                        try:
+                            request_buf.release()
+                        except Exception:
+                            pass
+                try:
+                    result = method(mv, _release_fn=release_fn)
+                finally:
+                    if not released:
+                        release_fn()
+            else:  # hold
+                # Pass memoryview directly; RAII handles lifetime
+                mv = memoryview(request_buf)
+                result = method(mv)
+
+            # 3. Unpack result
             res_part, err_part = unpack_icrm_result(result)
             if err_part:
                 raise CrmCallError(err_part)
-            return res_part if res_part else b''
+            if not res_part:
+                return None
+
+            # 4. For large responses, write to response pool SHM
+            if response_pool is not None and len(res_part) > shm_threshold:
+                try:
+                    alloc = response_pool.alloc(len(res_part))
+                    response_pool.write_from_buffer(res_part, alloc)
+                    seg_idx = int(alloc.seg_idx) & 0xFFFF
+                    return (seg_idx, alloc.offset, len(res_part), alloc.is_dedicated)
+                except Exception:
+                    pass
+
+            # Inline path — must be bytes for wire encoding.
+            if isinstance(res_part, memoryview):
+                res_part = bytes(res_part)
+            return res_part
 
         return dispatch

@@ -15,7 +15,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport.server import Server
-from c_two.transport.ipc.frame import IPCConfig
+from c_two.config.ipc import ServerIPCConfig
 from c_two.transport.client.util import ping
 
 
@@ -63,7 +63,7 @@ class TestConcurrentCallSafety:
     def test_32_threads_concurrent_echo(self):
         """32 threads making concurrent echo calls via a shared proxy."""
         addr = _next_addr()
-        cfg = IPCConfig(
+        cfg = ServerIPCConfig(
             pool_segment_size=1 << 20,  # 1MB
             max_pool_segments=2,
             max_pool_memory=2 << 20,
@@ -108,7 +108,7 @@ class TestConcurrentCallSafety:
     def test_concurrent_calls_different_sizes(self):
         """Concurrent calls with varied payload sizes (inline + buddy paths)."""
         addr = _next_addr()
-        cfg = IPCConfig(
+        cfg = ServerIPCConfig(
             pool_segment_size=1 << 20,
             max_pool_segments=2,
             max_pool_memory=2 << 20,
@@ -175,7 +175,7 @@ class TestDoubleShutdown:
 
     def test_server_double_shutdown(self):
         addr = _next_addr()
-        cfg = IPCConfig(
+        cfg = ServerIPCConfig(
             pool_segment_size=65536,
             max_pool_segments=1,
             max_pool_memory=65536,
@@ -197,7 +197,7 @@ class TestSOTAAPIConcurrency:
         """Multiple threads rapidly connect/use/close the same CRM."""
         addr = _next_addr()
         cc.set_address(addr)
-        cc.set_ipc_config(segment_size=1 << 20, max_segments=2)
+        cc.set_server(pool_segment_size=1 << 20, max_pool_segments=2)
         cc.register(IEcho, EchoImpl(), name='echo_conc')
 
         try:

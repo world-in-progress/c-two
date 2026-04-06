@@ -1,0 +1,13 @@
+[package]
+name = "c2-server"
+edition.workspace = true
+version.workspace = true
+description = "Tokio-based UDS server for C-Two IPC transport"
+
+[dependencies]
+c2-config = { path = "../../foundation/c2-config" }
+c2-wire = { path = "../../protocol/c2-wire" }
+c2-mem = { path = "../../foundation/c2-mem" }
+parking_lot = { workspace = true }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
+tracing = "0.1"

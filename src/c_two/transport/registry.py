@@ -42,13 +42,13 @@ import uuid
 from dataclasses import dataclass
 from typing import TypeVar
 
-from .config import settings
+from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
+from c_two.config.settings import settings
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
 from .server.native import NativeServerBridge as Server
 
 from ..crm.meta import MethodAccess
-from .ipc.frame import IPCConfig
 
 ICRM = TypeVar('ICRM')
 log = logging.getLogger(__name__)
@@ -112,7 +112,12 @@ class _ProcessRegistry:
         self._server: Server | None = None
         self._server_address: str | None = None
         self._explicit_address: str | None = None
-        self._explicit_ipc_config: IPCConfig | None = None
+        self._server_config: ServerIPCConfig | None = None
+        self._server_kwargs: dict[str, object] = {}
+        self._shm_threshold: int | None = None
+        self._client_config: ClientIPCConfig | None = None
+        self._client_kwargs: dict[str, object] = {}
+        self._pool_config_applied: bool = False
         from c_two._native import RustClientPool, RustHttpClientPool
         self._pool = RustClientPool.instance()
         self._http_pool = RustHttpClientPool.instance()
@@ -142,40 +147,75 @@ class _ProcessRegistry:
                 )
             self._explicit_address = address
 
-    def set_ipc_config(
-        self,
-        *,
-        segment_size: int | None = None,
-        max_segments: int | None = None,
-    ) -> None:
-        """Set IPC transport parameters programmatically.
+    def set_shm_threshold(self, threshold: int) -> None:
+        """Set the SHM threshold globally (server + client).
 
-        Priority: ``set_ipc_config()`` > ``C2_IPC_SEGMENT_SIZE`` /
-        ``C2_IPC_MAX_SEGMENTS`` env vars > defaults.
+        Payloads smaller than *threshold* bytes are sent inline;
+        larger payloads use shared memory.  Default: 4096 bytes.
 
-        Must be called **before** any :func:`register` call.
+        Must be called **before** any :func:`register` or :func:`connect`.
 
         Parameters
         ----------
-        segment_size:
-            Buddy pool segment size in bytes.  Determines the maximum
-            single-call payload size.  Default: 256 MB.
-        max_segments:
-            Maximum number of buddy pool segments (1–255).  Default: 4.
+        threshold:
+            Size in bytes.  Must be > 0.
         """
+        if threshold <= 0:
+            raise ValueError(f'shm_threshold must be > 0, got {threshold}')
         with self._lock:
             if self._server is not None:
                 raise RuntimeError(
-                    'Cannot set IPC config after CRMs have been registered. '
-                    'Call set_ipc_config() before register().',
+                    'Cannot set shm_threshold after CRMs have been registered. '
+                    'Call set_shm_threshold() before register().',
                 )
-            overrides: dict[str, int] = {}
-            if segment_size is not None:
-                overrides['pool_segment_size'] = segment_size
-            if max_segments is not None:
-                overrides['max_pool_segments'] = max_segments
-            if overrides:
-                self._explicit_ipc_config = self._make_ipc_config(**overrides)
+            self._shm_threshold = threshold
+
+    def set_config(self, *, shm_threshold: int | None = None) -> None:
+        """Set global config. Must be called before register()/connect()."""
+        with self._lock:
+            if self._server is not None or self._pool_config_applied:
+                import warnings
+                warnings.warn(
+                    'Active connections exist, set_config() ignored. '
+                    'Call set_config() before register()/connect().',
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return
+            if shm_threshold is not None:
+                if shm_threshold <= 0:
+                    raise ValueError(f'shm_threshold must be > 0, got {shm_threshold}')
+                self._shm_threshold = shm_threshold
+
+    def set_server(self, **kwargs: object) -> None:
+        """Configure IPC server. Must be called before register()."""
+        with self._lock:
+            if self._server is not None:
+                import warnings
+                warnings.warn(
+                    'Server already started, set_server() ignored. '
+                    'Call set_server() before register().',
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return
+            self._server_kwargs = kwargs
+            self._server_config = None  # rebuilt lazily
+
+    def set_client(self, **kwargs: object) -> None:
+        """Configure IPC client. Must be called before connect()."""
+        with self._lock:
+            if self._pool_config_applied:
+                import warnings
+                warnings.warn(
+                    'Client connections already exist, set_client() ignored. '
+                    'Call set_client() before connect().',
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return
+            self._client_kwargs = kwargs
+            self._client_config = None  # rebuilt lazily
 
     def register(
         self,
@@ -221,8 +261,9 @@ class _ProcessRegistry:
                     or settings.ipc_address
                     or self._auto_address()
                 )
-                ipc_cfg = self._build_ipc_config()
-                self._server = Server(bind_address=addr, ipc_config=ipc_cfg)
+                server_cfg = self._build_server_config()
+                shm = self._shm_threshold or settings.shm_threshold or 4096
+                self._server = Server(bind_address=addr, ipc_config=server_cfg, shm_threshold=shm)
                 self._server_address = addr
                 # Rust pool uses its own defaults; skip Python IPCConfig.
 
@@ -299,6 +340,25 @@ class _ProcessRegistry:
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
+            if not self._pool_config_applied:
+                cfg = self._build_client_config()
+                shm = self._shm_threshold or settings.shm_threshold or 4096
+                self._pool.set_default_config(
+                    shm_threshold=shm,
+                    pool_enabled=cfg.pool_enabled,
+                    pool_segment_size=cfg.pool_segment_size,
+                    max_pool_segments=cfg.max_pool_segments,
+                    max_pool_memory=cfg.max_pool_memory,
+                    reassembly_segment_size=cfg.reassembly_segment_size,
+                    reassembly_max_segments=cfg.reassembly_max_segments,
+                    max_total_chunks=cfg.max_total_chunks,
+                    chunk_gc_interval=cfg.chunk_gc_interval,
+                    chunk_threshold_ratio=cfg.chunk_threshold_ratio,
+                    chunk_assembler_timeout=cfg.chunk_assembler_timeout,
+                    max_reassembly_bytes=cfg.max_reassembly_bytes,
+                    chunk_size=cfg.chunk_size,
+                )
+                self._pool_config_applied = True
             client = self._pool.acquire(address)
             proxy = ICRMProxy.ipc(
                 client,
@@ -375,7 +435,12 @@ class _ProcessRegistry:
             self._server = None
             self._server_address = None
             self._explicit_address = None
-            self._explicit_ipc_config = None
+            self._server_config = None
+            self._server_kwargs = {}
+            self._shm_threshold = None
+            self._client_config = None
+            self._client_kwargs = {}
+            self._pool_config_applied = False
             self._registrations.clear()
 
         # Best-effort relay unregistration (ignore failures during shutdown).
@@ -571,60 +636,17 @@ class _ProcessRegistry:
     # Internals
     # ------------------------------------------------------------------
 
-    def _build_ipc_config(self) -> IPCConfig:
-        """Build an :class:`IPCConfig` from the three-level priority chain.
+    def _build_server_config(self) -> ServerIPCConfig:
+        if self._server_config is not None:
+            return self._server_config
+        self._server_config = build_server_config(settings, **self._server_kwargs)
+        return self._server_config
 
-        Priority: ``set_ipc_config()`` > env vars > defaults.
-        """
-        if self._explicit_ipc_config is not None:
-            return self._explicit_ipc_config
-
-        overrides: dict[str, int] = {}
-        if settings.ipc_segment_size is not None:
-            overrides['pool_segment_size'] = settings.ipc_segment_size
-        if settings.ipc_max_segments is not None:
-            overrides['max_pool_segments'] = settings.ipc_max_segments
-
-        if overrides:
-            return self._make_ipc_config(**overrides)
-        return IPCConfig()
-
-    @staticmethod
-    def _make_ipc_config(**overrides: int) -> IPCConfig:
-        """Create IPCConfig with auto-derived ``max_pool_memory``.
-
-        Raises :class:`ValueError` if ``pool_segment_size`` exceeds
-        physical RAM (allocation would fail immediately).  Emits a
-        warning if the theoretical pool ceiling (``segment_size ×
-        max_segments``) exceeds 75 % of physical RAM.
-        """
-        seg = overrides.get('pool_segment_size', IPCConfig.pool_segment_size)
-        segs = overrides.get('max_pool_segments', IPCConfig.max_pool_segments)
-        pool_max = seg * segs
-        overrides.setdefault('max_pool_memory', pool_max)
-
-        phys = _physical_memory()
-        if phys is not None:
-            if seg > phys:
-                raise ValueError(
-                    f'pool_segment_size ({seg / (1 << 30):.1f} GB) exceeds '
-                    f'physical RAM ({phys / (1 << 30):.1f} GB) — '
-                    f'SHM allocation will fail'
-                )
-            if pool_max > int(phys * 0.75):
-                log.warning(
-                    'Theoretical pool ceiling %.1f GB '
-                    '(segment_size=%.1f GB × max_segments=%d) exceeds '
-                    '75%% of physical RAM (%.1f GB).  '
-                    'Segments are allocated lazily so this may be fine, '
-                    'but monitor memory usage under load.',
-                    pool_max / (1 << 30),
-                    seg / (1 << 30),
-                    segs,
-                    phys / (1 << 30),
-                )
-
-        return IPCConfig(**overrides)
+    def _build_client_config(self) -> ClientIPCConfig:
+        if self._client_config is not None:
+            return self._client_config
+        self._client_config = build_client_config(settings, **self._client_kwargs)
+        return self._client_config
 
     @staticmethod
     def _auto_address() -> str:
@@ -645,22 +667,35 @@ def set_address(address: str) -> None:
     _ProcessRegistry.get().set_address(address)
 
 
-def set_ipc_config(
-    *,
-    segment_size: int | None = None,
-    max_segments: int | None = None,
-) -> None:
-    """Set IPC transport parameters before registering any CRM.
+def set_config(*, shm_threshold: int | None = None) -> None:
+    """Set global hardware config. Call before register()/connect()."""
+    _ProcessRegistry.get().set_config(shm_threshold=shm_threshold)
 
-    Priority: ``set_ipc_config()`` > ``C2_IPC_SEGMENT_SIZE`` /
-    ``C2_IPC_MAX_SEGMENTS`` env vars > defaults (256 MB / 4 segments).
 
-    See :meth:`_ProcessRegistry.set_ipc_config`.
-    """
-    _ProcessRegistry.get().set_ipc_config(
-        segment_size=segment_size,
-        max_segments=max_segments,
-    )
+def set_server(**kwargs: object) -> None:
+    """Configure IPC server. Call before register()."""
+    _ProcessRegistry.get().set_server(**kwargs)
+
+
+def set_client(**kwargs: object) -> None:
+    """Configure IPC client. Call before connect()."""
+    _ProcessRegistry.get().set_client(**kwargs)
+
+
+# Deprecated aliases — remove in next version
+def set_shm_threshold(threshold: int) -> None:
+    """Deprecated: use set_config(shm_threshold=...) instead."""
+    set_config(shm_threshold=threshold)
+
+
+def set_server_ipc_config(**kw: object) -> None:
+    """Deprecated: use set_server() instead."""
+    set_server(**kw)
+
+
+def set_client_ipc_config(**kw: object) -> None:
+    """Deprecated: use set_client() instead."""
+    set_client(**kw)
 
 
 def register(

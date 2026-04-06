@@ -11,7 +11,6 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.transport.ipc.frame import IPCConfig
 from c_two.transport import Server
 from c_two.transport.client.util import ping, shutdown
 
@@ -71,13 +70,12 @@ def server_addr():
 def server_small_shm():
     """Server with small SHM threshold (forces inline path more often)."""
     addr = f'ipc://{_unique_region("small")}'
-    config = IPCConfig(shm_threshold=16)
     server = Server(
         bind_address=addr,
         icrm_class=IHello,
         crm_instance=Hello(),
-        ipc_config=config,
         name='hello',
+        shm_threshold=16,
     )
     server.start()
     _wait_for_server(addr)

@@ -30,7 +30,7 @@ TOTAL_REQUESTS = 3000
 CONCURRENCY = 32
 
 IPC_NAME = f'relay_bench_{os.getpid()}'
-IPC_ADDR = f'ipc-v3://{IPC_NAME}'
+IPC_ADDR = f'ipc://{IPC_NAME}'
 PAYLOAD_FILE = '/tmp/c2_bench_payload.bin'
 
 

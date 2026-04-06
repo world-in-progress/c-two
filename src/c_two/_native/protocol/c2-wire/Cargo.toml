@@ -1,0 +1,11 @@
+[package]
+name = "c2-wire"
+edition.workspace = true
+version.workspace = true
+description = "Wire protocol codec for C-Two IPC frames"
+
+[dependencies]
+c2-config = { path = "../../foundation/c2-config" }
+c2-mem = { path = "../../foundation/c2-mem" }
+parking_lot = { workspace = true }
+tracing = "0.1"
