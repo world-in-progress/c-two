@@ -169,6 +169,7 @@ dependencies = [
  "c2-mem",
  "c2-server",
  "c2-wire",
+ "parking_lot",
  "pyo3",
  "serde_json",
  "tokio",
@@ -184,6 +185,7 @@ dependencies = [
  "c2-ipc",
  "c2-wire",
  "clap",
+ "parking_lot",
  "reqwest",
  "serde_json",
  "thiserror",
@@ -201,6 +203,7 @@ dependencies = [
  "c2-mem",
  "c2-wire",
  "libc",
+ "parking_lot",
  "tokio",
 ]
 
@@ -220,6 +223,7 @@ dependencies = [
  "c2-config",
  "c2-mem",
  "c2-wire",
+ "parking_lot",
  "tokio",
  "tracing",
 ]
@@ -230,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "c2-config",
  "c2-mem",
+ "parking_lot",
  "tracing",
 ]
 

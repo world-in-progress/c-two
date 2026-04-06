@@ -23,6 +23,7 @@ relay = [
 # Always available (client)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
+parking_lot = { workspace = true }
 thiserror = "2"
 
 # Relay-only dependencies (behind feature gate)
