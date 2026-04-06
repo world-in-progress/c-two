@@ -156,16 +156,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
-name = "c2-chunk"
-version = "0.1.0"
-dependencies = [
- "c2-config",
- "c2-mem",
- "c2-wire",
- "tracing",
-]
-
-[[package]]
 name = "c2-config"
 version = "0.1.0"
 
@@ -177,7 +167,6 @@ dependencies = [
  "c2-http",
  "c2-ipc",
  "c2-mem",
- "c2-relay",
  "c2-server",
  "c2-wire",
  "pyo3",
@@ -189,16 +178,25 @@ dependencies = [
 name = "c2-http"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "axum",
+ "c2-config",
+ "c2-ipc",
+ "c2-wire",
+ "clap",
  "reqwest",
+ "serde_json",
  "thiserror",
  "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "c2-ipc"
 version = "0.1.0"
 dependencies = [
- "c2-chunk",
  "c2-config",
  "c2-mem",
  "c2-wire",
@@ -216,27 +214,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "c2-relay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "c2-config",
- "c2-ipc",
- "c2-wire",
- "clap",
- "serde_json",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "c2-server"
 version = "0.1.0"
 dependencies = [
- "c2-chunk",
  "c2-config",
  "c2-mem",
  "c2-wire",
@@ -248,7 +228,9 @@ dependencies = [
 name = "c2-wire"
 version = "0.1.0"
 dependencies = [
+ "c2-config",
  "c2-mem",
+ "tracing",
 ]
 
 [[package]]

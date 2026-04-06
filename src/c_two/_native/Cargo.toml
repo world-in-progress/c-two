@@ -1,15 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "c2-config",
-    "c2-mem",
-    "c2-wire",
-    "c2-chunk",
-    "c2-ipc",
-    "c2-http",
-    "c2-relay",
-    "c2-server",
-    "c2-ffi",
+    "foundation/c2-config",
+    "foundation/c2-mem",
+    "protocol/c2-wire",
+    "transport/c2-ipc",
+    "transport/c2-http",
+    "transport/c2-server",
+    "bridge/c2-ffi",
 ]
 
 [workspace.package]

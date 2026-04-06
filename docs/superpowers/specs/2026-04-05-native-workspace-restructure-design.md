@@ -1,7 +1,7 @@
 # Native Workspace Restructure Design
 
 **Date**: 2026-04-05  
-**Status**: Draft  
+**Status**: Implemented  
 **Scope**: Reorganize `src/c_two/_native/` Cargo workspace — directory grouping + crate merges
 
 ## Problem

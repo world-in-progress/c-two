@@ -327,8 +327,10 @@ The IPC transport uses a **control-plane / data-plane separation**: method routi
 
 Performance-critical components are implemented in Rust and compiled as a Python extension via [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
 
+The Rust workspace contains 7 crates organized in 4 layers (foundation → protocol → transport → bridge):
+
 - **Buddy Allocator** — Zero-syscall shared memory allocation for the IPC transport. Cross-process, lock-free on the fast path.
-- **Chunk Registry** — Sharded lifecycle manager for chunked large-payload transfers across buddy, dedicated, and file-spill memory tiers.
+- **Wire Protocol** — Frame encoding, chunk assembly, and chunk registry for large-payload lifecycle management.
 - **HTTP Relay** — High-throughput [axum](https://github.com/tokio-rs/axum)-based gateway bridging HTTP to IPC. Handles connection pooling and request multiplexing.
 
 The Rust extension is compiled automatically during `pip install c-two` (from pre-built wheels) or `uv sync` (from source).

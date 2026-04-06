@@ -1,0 +1,29 @@
+[package]
+name = "c2-ffi"
+edition.workspace = true
+version.workspace = true
+description = "PyO3 bindings for C-Two native extensions (memory pool + HTTP relay)"
+
+[lib]
+name = "c2_ffi"
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+
+[dependencies]
+c2-config = { path = "../../foundation/c2-config" }
+c2-mem = { path = "../../foundation/c2-mem" }
+c2-wire = { path = "../../protocol/c2-wire" }
+c2-http = { path = "../../transport/c2-http", features = ["relay"] }
+c2-ipc = { path = "../../transport/c2-ipc" }
+c2-server = { path = "../../transport/c2-server" }
+pyo3 = { version = "0.25", features = ["extension-module"], optional = true }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
