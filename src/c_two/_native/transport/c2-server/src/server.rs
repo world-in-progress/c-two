@@ -91,7 +91,7 @@ pub struct Server {
     shutdown_rx: watch::Receiver<bool>,
     conn_counter: AtomicU64,
     /// Sharded chunk reassembly lifecycle manager.
-    chunk_registry: Arc<c2_chunk::ChunkRegistry>,
+    chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
     /// Server-side MemPool for writing buddy SHM responses.
     response_pool: Arc<std::sync::RwLock<MemPool>>,
 }
@@ -120,8 +120,8 @@ impl Server {
             let prefix = format!("/cc3s{:08x}{:08x}", pid, ra_gen);
             MemPool::new_with_prefix(reassembly_cfg, prefix)
         };
-        let chunk_config = c2_chunk::ChunkConfig::from_base(&config);
-        let chunk_registry = Arc::new(c2_chunk::ChunkRegistry::new(
+        let chunk_config = c2_wire::chunk::ChunkConfig::from_base(&config);
+        let chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
             Arc::new(std::sync::RwLock::new(reassembly_pool)),
             chunk_config,
         ));
@@ -175,7 +175,7 @@ impl Server {
     }
 
     /// Get the chunk registry (for FFI or external use).
-    pub fn chunk_registry(&self) -> &Arc<c2_chunk::ChunkRegistry> {
+    pub fn chunk_registry(&self) -> &Arc<c2_wire::chunk::ChunkRegistry> {
         &self.chunk_registry
     }
 
@@ -1202,9 +1202,9 @@ mod tests {
             spill_dir: std::env::temp_dir().join("c2_srv_chunk_test"),
         };
         let pool = Arc::new(RwLock::new(c2_mem::MemPool::new(reassembly_cfg)));
-        let registry = c2_chunk::ChunkRegistry::new(
+        let registry = c2_wire::chunk::ChunkRegistry::new(
             pool.clone(),
-            c2_chunk::ChunkConfig::default(),
+            c2_wire::chunk::ChunkConfig::default(),
         );
 
         let conn_id = 99u64;

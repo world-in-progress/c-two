@@ -4,7 +4,6 @@ members = [
     "foundation/c2-config",
     "foundation/c2-mem",
     "protocol/c2-wire",
-    "protocol/c2-chunk",
     "transport/c2-ipc",
     "transport/c2-http",
     "transport/c2-server",

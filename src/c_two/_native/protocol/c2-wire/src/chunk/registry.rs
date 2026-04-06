@@ -11,11 +11,11 @@ use std::time::Instant;
 
 use c2_mem::handle::MemHandle;
 use c2_mem::MemPool;
-use c2_wire::assembler::ChunkAssembler;
+use crate::assembler::ChunkAssembler;
 use tracing::warn;
 
-use crate::config::ChunkConfig;
-use crate::promote::promote_to_shm;
+use crate::chunk::config::ChunkConfig;
+use crate::chunk::promote::promote_to_shm;
 
 const SHARD_COUNT: usize = 16;
 

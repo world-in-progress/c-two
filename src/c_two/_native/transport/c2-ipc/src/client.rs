@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex};
 
-use c2_chunk::{ChunkConfig, ChunkRegistry};
+use c2_wire::chunk::{ChunkConfig, ChunkRegistry};
 use c2_mem::FreeResult;
 use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
 use c2_wire::chunk::encode_chunk_header;

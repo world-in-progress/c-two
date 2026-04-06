@@ -6,7 +6,6 @@ description = "Async IPC client for C-Two relay"
 
 [dependencies]
 c2-config = { path = "../../foundation/c2-config" }
-c2-chunk = { path = "../../protocol/c2-chunk" }
 c2-wire = { path = "../../protocol/c2-wire" }
 c2-mem = { path = "../../foundation/c2-mem" }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
