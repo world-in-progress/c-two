@@ -435,8 +435,16 @@ This ensures `cc.hold()` works uniformly across all three transports.
 | Transport | `cc.hold()` Behavior |
 |-----------|---------------------|
 | IPC (SHM) | Full hold — SHM stays allocated until `.release()` |
-| HTTP | Graceful no-op — `HeldResult` wraps value, `.release()` is no-op |
-| Thread-local | Graceful no-op — no serialization at all, value is direct |
+| HTTP | Graceful degradation — `HeldResult` wraps value, `.release()` clears reference (no SHM to free) |
+| Thread-local | Graceful degradation — `HeldResult` wraps value, `.release()` clears reference (no serialization occurred) |
+
+Note: "graceful degradation" means no SHM operation occurs, but `HeldResult` still enforces consistent lifecycle semantics — after `.release()`, `.value` raises regardless of transport. This ensures user code does not accidentally depend on transport-specific behavior.
+
+#### Implementation Notes
+
+- **`_c2_buffer` is framework-internal**: It is reserved by the framework and must never appear in user signatures. ICRM methods remain positional-args-only for user parameters; kwargs are not forwarded to user code. `_c2_buffer` is popped by `transfer_wrapper` before reaching the RPC layer.
+- **`ParamSpec` typing caveat**: `cc.hold()` is typed as `Callable[P, R] -> Callable[P, HeldResult[R]]`, but the internal `_c2_buffer` injection means static type checkers may flag a spurious error. Implementation should use `typing.cast` or `@overload` to satisfy type checkers.
+- **`HeldResult.__del__` robustness**: Implementation must bind `sys` and `warnings` as local default arguments or closure variables to survive late interpreter teardown where module globals may already be `None`.
 
 ### 7. Transport-Level Codec Selection (Out of Scope — Future Work)
 
