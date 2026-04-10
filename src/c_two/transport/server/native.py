@@ -61,7 +61,7 @@ class CRMSlot:
             method = getattr(self.icrm, name, None)
             if method is not None:
                 access = get_method_access(method)
-                buffer_mode = getattr(method, '_input_buffer_mode', 'copy')
+                buffer_mode = getattr(method, '_input_buffer_mode', 'view')
                 self._dispatch_table[name] = (method, access, buffer_mode)
 
 
@@ -335,19 +335,7 @@ class NativeServerBridge:
             method, _access, buffer_mode = entry
 
             # 2. Buffer-mode-aware request handling
-            if buffer_mode == 'copy':
-                # Materialize to bytes, release SHM immediately
-                try:
-                    mv = memoryview(request_buf)
-                    payload = bytes(mv)
-                    mv.release()
-                finally:
-                    try:
-                        request_buf.release()
-                    except Exception:
-                        pass
-                result = method(payload)
-            elif buffer_mode == 'view':
+            if buffer_mode == 'view':
                 # Pass memoryview; _release_fn frees SHM after deserialize
                 mv = memoryview(request_buf)
                 released = False

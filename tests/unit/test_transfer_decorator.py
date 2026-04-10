@@ -206,3 +206,44 @@ class TestIcrmTransferIntegration:
         from c_two.error import CCError
         assert CCError.deserialize(memoryview(err_bytes)) is None
         assert pickle.loads(result_bytes) == 'Hi World'
+
+
+class TestMethodLevelBufferBehavior:
+    """Buffer lifecycle is controlled at method level, not type level."""
+
+    def test_view_buffer_releases_after_deserialize(self):
+        """With buffer='view' (default), _release_fn is invoked after CRM method returns."""
+        @cc.transferable
+        class ViewIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+            def deserialize(data) -> int:
+                return pickle.loads(data)
+
+        def echo(self, x):
+            return x
+
+        wrapped = _build_transfer_wrapper(echo, input=ViewIn, output=None, buffer='view')
+
+        class MockCRM:
+            def echo(self, x):
+                return x
+        class MockICRM:
+            direction = '<-'
+            crm = MockCRM()
+        icrm = MockICRM()
+
+        released = []
+        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        assert released, '_release_fn should be called in view mode'
+
+    def test_hold_buffer_declared_at_method(self):
+        """buffer='hold' is set via @cc.transfer, not on the type."""
+        @cc.icrm(namespace='test.buf.hold', version='0.1.0')
+        class IBufHold:
+            @transfer(buffer='hold')
+            def process(self, data: bytes) -> str:
+                ...
+
+        method = getattr(IBufHold, 'process')
+        assert getattr(method, '_input_buffer_mode', None) == 'hold'
