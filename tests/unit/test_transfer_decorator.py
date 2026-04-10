@@ -247,3 +247,102 @@ class TestMethodLevelBufferBehavior:
 
         method = getattr(IBufHold, 'process')
         assert getattr(method, '_input_buffer_mode', None) == 'hold'
+
+
+class TestExports:
+    def test_cc_transfer_importable(self):
+        import c_two as cc
+        assert hasattr(cc, 'transfer')
+        assert callable(cc.transfer)
+
+    def test_cc_hold_importable(self):
+        import c_two as cc
+        assert hasattr(cc, 'hold')
+        assert callable(cc.hold)
+
+    def test_cc_held_result_importable(self):
+        import c_two as cc
+        assert hasattr(cc, 'HeldResult')
+
+
+class TestEndToEnd:
+    """Full round-trip: ICRM with @cc.transfer, proxy call, hold mode."""
+
+    def test_auto_bundle_round_trip(self):
+        """Methods without @cc.transfer auto-bundle via pickle."""
+        import pickle
+        import c_two as cc
+        from c_two.error import CCError
+
+        @cc.icrm(namespace='test.e2e.autobundle', version='0.1.0')
+        class IE2E:
+            def greeting(self, name: str) -> str:
+                ...
+
+        class CRM:
+            def greeting(self, name: str) -> str:
+                return f'Hello, {name}!'
+
+        server_icrm = IE2E()
+        server_icrm.crm = CRM()
+        server_icrm.direction = '<-'
+
+        greet = getattr(server_icrm, 'greeting')
+        serialized_input = pickle.dumps('World')
+        err_bytes, result_bytes = greet(serialized_input)
+
+        assert CCError.deserialize(memoryview(err_bytes)) is None
+        assert pickle.loads(result_bytes) == 'Hello, World!'
+
+    def test_hold_mode_thread_local(self):
+        """cc.hold() on thread-local proxy returns HeldResult."""
+        import c_two as cc
+        from c_two.crm.transferable import HeldResult
+        from c_two.transport.client.proxy import ICRMProxy
+
+        @cc.icrm(namespace='test.hold.threadlocal', version='0.1.0')
+        class IHoldTest:
+            def compute(self, x: int) -> int:
+                ...
+
+        class FakeCRM:
+            def compute(self, x: int) -> int:
+                return x * 2
+
+        proxy = ICRMProxy.thread_local(FakeCRM())
+
+        client_icrm = IHoldTest()
+        client_icrm.client = proxy
+        client_icrm.direction = '->'
+
+        result = client_icrm.compute(5)
+        assert result == 10
+
+        held = cc.hold(client_icrm.compute)(5)
+        assert isinstance(held, HeldResult)
+        assert held.value == 10
+        held.release()
+
+    def test_c2_buffer_not_leaked_to_crm(self):
+        """_c2_buffer is popped by transfer_wrapper, never reaches user CRM methods."""
+        import pickle
+        import c_two as cc
+
+        received_kwargs = {}
+
+        @cc.icrm(namespace='test.noleak', version='0.1.0')
+        class INoLeak:
+            def process(self, x: int) -> int:
+                ...
+
+        class CRM:
+            def process(self, x, **kwargs):
+                received_kwargs.update(kwargs)
+                return x
+
+        server = INoLeak()
+        server.crm = CRM()
+        server.direction = '<-'
+
+        err, result = server.process(pickle.dumps(42))
+        assert '_c2_buffer' not in received_kwargs
