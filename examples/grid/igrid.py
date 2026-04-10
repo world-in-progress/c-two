@@ -1,13 +1,6 @@
 import c_two as cc
-import pyarrow as pa
 
-from grid.transferables import (
-    GridInfo,
-    GridInfos,
-    GridSchema,
-    PeerGridInfos,
-    GridAttribute,
-)
+from grid.transferables import GridSchema, GridAttribute
 
 @cc.icrm(namespace='icrm', version='0.1.0')
 class IGrid:

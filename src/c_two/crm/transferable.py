@@ -9,7 +9,7 @@ from abc import ABCMeta
 from functools import wraps
 from pydantic import BaseModel, create_model
 from dataclasses import dataclass, is_dataclass
-from typing import get_type_hints, get_args, get_origin, Any, Callable, TypeVar, Type
+from typing import get_type_hints, Any, Callable, TypeVar, Type
 
 import struct as _struct
 
@@ -113,7 +113,6 @@ logger = logging.getLogger(__name__)
 # Global Caches ###################################################################
 
 _TRANSFERABLE_MAP: dict[str, Transferable] = {}
-_TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
 _TRANSFERABLE_LOCK = threading.Lock()
 
 # Definition of Transferable ######################################################
@@ -146,19 +145,6 @@ class TransferableMeta(ABCMeta):
             if cls.__module__ != 'Default':
                 # Register the class in the global transferable map
                 full_name = register_transferable(cls)
-                
-                # Register the class in the global transferable information list
-                serialize_func = attrs['serialize']
-                serialize_sig = list(inspect.signature(serialize_func).parameters.values())
-                serialize_param_map = {}
-                for param in serialize_sig:
-                    serialize_param_map[param.name] = param.annotation
-                with _TRANSFERABLE_LOCK:
-                    _TRANSFERABLE_INFOS.append({
-                        'name': full_name,
-                        'module': cls.__module__,
-                        'param_map': serialize_param_map
-                    })
 
                 logger.debug(f'Registered transferable: {full_name}')
         return cls
@@ -569,28 +555,6 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
                         full_name = f'{param_module}.{param_name}' if param_module else param_name
                         input_transferable = get_transferable(full_name)
 
-                    # Priority 2: Field name+type comparison (legacy path).
-                    if input_transferable is None:
-                        with _TRANSFERABLE_LOCK:
-                            infos_snapshot = list(_TRANSFERABLE_INFOS)
-                        for info in infos_snapshot:
-                            if info.get('module') != func.__module__:
-                                continue
-                            registered_param_map = info.get('param_map', {})
-                            is_empty_registered = not bool(registered_param_map)
-                            if not is_empty_input and not is_empty_registered:
-                                if set(input_model_fields.keys()) == set(registered_param_map.keys()):
-                                    match = True
-                                    for name, fi in input_model_fields.items():
-                                        pydantic_type = fi.annotation
-                                        registered_type = registered_param_map.get(name)
-                                        if pydantic_type != registered_type:
-                                            match = False
-                                            break
-                                    if match:
-                                        input_transferable = get_transferable(info['name'])
-                                        break
-
             # If no matching transferable found, create a default one
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
@@ -611,26 +575,6 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
                     return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
 
                     output_transferable = get_transferable(return_type_full_name)
-                    if output_transferable is None:
-                        origin = get_origin(return_type)
-                        args = get_args(return_type)
-                        expected_output_types = []
-                        if origin is tuple:
-                            expected_output_types = list(args)
-                        elif return_type is not None and return_type is not type(None):
-                            expected_output_types = [return_type]
-
-                        if expected_output_types:
-                            with _TRANSFERABLE_LOCK:
-                                infos_snapshot = list(_TRANSFERABLE_INFOS)
-                            for info in infos_snapshot:
-                                if info.get('module') != func.__module__:
-                                    continue
-                                registered_param_map = info.get('param_map', {})
-                                registered_output_types = list(registered_param_map.values())
-                                if expected_output_types == registered_output_types:
-                                    output_transferable = get_transferable(info['name'])
-                                    break
 
                     # If no matching transferable found, create a default one
                     if output_transferable is None and not (return_type is None or return_type is type(None)):

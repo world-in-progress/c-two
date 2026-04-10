@@ -223,13 +223,10 @@ class TestAutoTransfer:
         assert callable(wrapped)
 
     def test_direct_lookup_prefers_over_field_matching(self):
-        """Direct Transferable lookup (Priority 1) should be preferred over
-        field name+type comparison (Priority 2)."""
-        # Create a function whose param type IS a registered Transferable
+        """Direct Transferable lookup (Priority 1) works even with different module."""
         def echo(self, item: HelloData) -> HelloData: ...
-        echo.__module__ = 'some.other.module'  # different module
+        echo.__module__ = 'some.other.module'
         wrapped = auto_transfer(echo)
-        # Should still work — Priority 1 doesn't check module
         assert callable(wrapped)
 
 
