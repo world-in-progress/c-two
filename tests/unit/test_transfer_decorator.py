@@ -127,3 +127,82 @@ class TestAutoTransferWithConfig:
         def my_method(self, x: int) -> str: ...
         wrapped = auto_transfer(my_method, input=_FakeInput, output=_FakeOutput, buffer='hold')
         assert wrapped._input_buffer_mode == 'hold'
+
+
+class TestIcrmTransferIntegration:
+    """@cc.transfer metadata is consumed by icrm() via auto_transfer."""
+
+    def test_icrm_picks_up_transfer_metadata(self):
+        @cc.icrm(namespace='test.transfer', version='0.1.0')
+        class ITest:
+            @transfer(input=_FakeInput, buffer='hold')
+            def process(self, x: int) -> str:
+                ...
+
+            def plain(self, y: str) -> int:
+                ...
+
+        process_method = getattr(ITest, 'process', None)
+        assert process_method is not None
+        assert getattr(process_method, '_input_buffer_mode', None) == 'hold'
+
+        plain_method = getattr(ITest, 'plain', None)
+        assert plain_method is not None
+        assert getattr(plain_method, '_input_buffer_mode', None) == 'view'
+
+    def test_transfer_metadata_round_trip(self):
+        """Round-trip: explicit @transfer(input=...) uses the custom codec, not pickle fallback."""
+        serialize_calls = []
+        deserialize_calls = []
+
+        @cc.transferable
+        class TrackedInput(Transferable):
+            val: int
+            def serialize(d: 'TrackedInput') -> bytes:
+                serialize_calls.append(d.val)
+                return pickle.dumps(d.val)
+            def deserialize(b: bytes) -> 'TrackedInput':
+                v = pickle.loads(b)
+                deserialize_calls.append(v)
+                return TrackedInput(val=v)
+
+        @cc.icrm(namespace='test.roundtrip', version='0.1.0')
+        class IRoundTrip:
+            @transfer(input=TrackedInput)
+            def process(self, data: TrackedInput) -> int:
+                ...
+
+        class CRM:
+            def process(self, data):
+                return data.val * 2
+
+        server = IRoundTrip()
+        server.crm = CRM()
+        server.direction = '<-'
+
+        serialized = TrackedInput.serialize(TrackedInput(val=7))
+        err_bytes, result_bytes = server.process(serialized)
+
+        from c_two.error import CCError
+        assert CCError.deserialize(memoryview(err_bytes)) is None
+        assert 7 in deserialize_calls
+
+    def test_plain_method_still_works(self):
+        """Methods without @transfer still auto-bundle via pickle."""
+        @cc.icrm(namespace='test.plain', version='0.1.0')
+        class IPlain:
+            def greet(self, name: str) -> str:
+                ...
+
+        class CRM:
+            def greet(self, name):
+                return f'Hi {name}'
+
+        server = IPlain()
+        server.crm = CRM()
+        server.direction = '<-'
+
+        err_bytes, result_bytes = server.greet(pickle.dumps('World'))
+        from c_two.error import CCError
+        assert CCError.deserialize(memoryview(err_bytes)) is None
+        assert pickle.loads(result_bytes) == 'Hi World'
