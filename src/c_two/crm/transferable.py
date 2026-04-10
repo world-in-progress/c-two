@@ -2,7 +2,9 @@ from __future__ import annotations
 import pickle
 import inspect
 import logging
+import sys
 import threading
+import warnings
 from abc import ABCMeta
 from functools import wraps
 from pydantic import BaseModel, create_model
@@ -12,6 +14,66 @@ from typing import get_type_hints, get_args, get_origin, Any, Callable, TypeVar,
 import struct as _struct
 
 from .. import error
+
+
+R = TypeVar('R')
+
+
+class HeldResult:
+    """Wraps a method return value with explicit SHM lifecycle control.
+
+    Three-layer safety net:
+    1. Explicit .release() — preferred
+    2. Context manager (__enter__/__exit__) — recommended
+    3. __del__ fallback — last resort with warning
+    """
+
+    __slots__ = ('_value', '_release_cb', '_released')
+
+    def __init__(self, value, release_cb=None):
+        self._value = value
+        self._release_cb = release_cb
+        self._released = False
+
+    @property
+    def value(self):
+        if self._released:
+            raise RuntimeError("SHM released — value no longer accessible")
+        return self._value
+
+    def release(self):
+        if not self._released:
+            self._released = True
+            cb = self._release_cb
+            self._release_cb = None
+            self._value = None
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+    def __del__(self, _is_finalizing=sys.is_finalizing, _warn=warnings.warn):
+        # NOTE: _is_finalizing and _warn are bound as default args at class
+        # definition time so they survive late interpreter teardown.
+        if getattr(self, '_released', True):
+            return
+        if _is_finalizing():
+            self.release()
+            return
+        _warn(
+            "HeldResult was garbage-collected without release() — "
+            "potential SHM leak. Use 'with cc.hold(...)' or call .release().",
+            ResourceWarning,
+            stacklevel=2,
+        )
+        self.release()
 
 
 def _add_length_prefix(message_bytes):
