@@ -1067,7 +1067,7 @@ Part of transferable redesign (spec: 2026-07-15)."
 
 ---
 
-### Task 8: Delete Priority 2 matching + grid example cleanup (atomic)
+### Task 7: Delete Priority 2 matching + grid example cleanup (atomic)
 
 **Files:**
 - Modify: `src/c_two/crm/transferable.py` (delete Priority 2 block in `auto_transfer`)
@@ -1169,7 +1169,7 @@ Part of transferable redesign (spec: 2026-07-15)."
 
 ---
 
-### Task 9: Wire up exports + end-to-end tests
+### Task 8: Wire up exports + end-to-end tests
 
 **Files:**
 - Modify: `src/c_two/crm/__init__.py`
