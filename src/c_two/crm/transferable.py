@@ -355,173 +355,201 @@ def transferable(cls=None, *, buffer: str = 'copy'):
     # Called as @cc.transferable(buffer='view')
     return wrap
 
-def transfer(input: Transferable | None = None, output: Transferable | None = None) -> callable:
+_VALID_TRANSFER_BUFFERS = frozenset(('view', 'hold'))
 
-    def decorator(func: callable) -> callable:
-        method_name = func.__name__
-        
-        def com_to_crm(*args: any) -> any:
-            # Get transferable
-            input_transferable = input.serialize if input else None
-            output_transferable = output.deserialize if output else None
-            output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
+def transfer(*, input=None, output=None, buffer='view'):
+    """Metadata-only decorator for ICRM methods.
 
-            try:
-                if len(args) < 1:
-                    raise ValueError('Instance method requires self, but only get one argument.')
-                
-                # Parse input args
-                icrm = args[0]
-                client = icrm.client
-                request = args[1:] if len(args) > 1 else None
+    Attaches ``__cc_transfer__`` dict to the function. Does NOT wrap it.
+    Consumed by ``icrm()`` → ``auto_transfer()`` at class decoration time.
 
-                # Thread fast path — skip all serialization/deserialization
-                if getattr(client, 'supports_direct_call', False):
-                    return client.call_direct(method_name, request or ())
-                
-                # Standard cross-process path
-                stage = 'serialize_input'
-                serialized_args = input_transferable(*request) if (request is not None and input_transferable is not None) else None
-                
-                # Call CRM
-                stage = 'call_crm'
-                response = client.call(method_name, serialized_args)
-                
-                # Deserialize output
-                stage = 'deserialize_output'
-                if not output_transferable:
-                    if hasattr(response, 'release'):
-                        response.release()
-                    return None
-                if hasattr(response, 'release'):
-                    mv = memoryview(response)
-                    if output_buffer_mode == 'copy':
-                        try:
-                            data = bytes(mv)
-                        finally:
-                            mv.release()
-                            response.release()
-                        result = output_transferable(data)
-                    elif output_buffer_mode == 'view':
-                        try:
-                            result = output_transferable(mv)
-                            if isinstance(result, memoryview):
-                                result = bytes(result)
-                        finally:
-                            mv.release()
-                            response.release()
-                    else:  # hold — RAII, no explicit release
-                        result = output_transferable(mv)
-                else:
-                    result = output_transferable(response)
+    Parameters
+    ----------
+    input : type[Transferable] | None
+        Custom input transferable. None = auto-bundle via pickle.
+    output : type[Transferable] | None
+        Custom output transferable. None = auto-bundle via pickle.
+    buffer : 'view' | 'hold'
+        Input buffer mode (CRM-side). Default 'view'.
+    """
+    if buffer not in _VALID_TRANSFER_BUFFERS:
+        raise ValueError(
+            f"buffer must be one of {sorted(_VALID_TRANSFER_BUFFERS)}, got {buffer!r}"
+        )
+
+    def decorator(func):
+        func.__cc_transfer__ = {
+            'input': input,
+            'output': output,
+            'buffer': buffer,
+        }
+        return func  # NO wrapping
+    return decorator
+
+
+def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
+    """Build the com_to_crm / crm_to_com / transfer_wrapper closure.
+
+    This is the internal implementation that was previously inside transfer().
+    Called by auto_transfer() after resolving input/output transferables.
+    """
+    method_name = func.__name__
+
+    def com_to_crm(*args, _c2_buffer=None):
+        input_transferable = input.serialize if input else None
+        output_transferable = output.deserialize if output else None
+
+        try:
+            if len(args) < 1:
+                raise ValueError('Instance method requires self, but only get one argument.')
+
+            icrm = args[0]
+            client = icrm.client
+            request = args[1:] if len(args) > 1 else None
+
+            # Thread fast path — skip all serialization/deserialization
+            if getattr(client, 'supports_direct_call', False):
+                result = client.call_direct(method_name, request or ())
+                if _c2_buffer == 'hold':
+                    return HeldResult(result, None)
                 return result
-            
-            except error.CCBaseError:
-                raise
-            except Exception as e:
-                if stage == 'serialize_input':
-                    raise error.CompoSerializeInput(str(e)) from e
-                elif stage == 'call_crm':
-                    raise error.CompoCRMCalling(str(e)) from e
+
+            # Standard cross-process path
+            stage = 'serialize_input'
+            serialized_args = input_transferable(*request) if (request is not None and input_transferable is not None) else None
+
+            stage = 'call_crm'
+            response = client.call(method_name, serialized_args)
+
+            stage = 'deserialize_output'
+            if not output_transferable:
+                if hasattr(response, 'release'):
+                    response.release()
+                if _c2_buffer == 'hold':
+                    return HeldResult(None, None)
+                return None
+
+            if hasattr(response, 'release'):
+                mv = memoryview(response)
+                if _c2_buffer == 'hold':
+                    result = output_transferable(mv)
+                    def release_cb():
+                        mv.release()
+                        try:
+                            response.release()
+                        except Exception:
+                            pass
+                    return HeldResult(result, release_cb)
                 else:
-                    raise error.CompoDeserializeOutput(str(e)) from e
-        
-        def crm_to_com(*args: any, _release_fn=None) -> tuple[any, any]:
-            input_transferable = input.deserialize if input else None
-            output_transferable = output.serialize if output else None
-            input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
+                    # view (default)
+                    try:
+                        result = output_transferable(mv)
+                        if isinstance(result, memoryview):
+                            result = bytes(result)
+                    finally:
+                        mv.release()
+                        response.release()
+                    return result
+            else:
+                result = output_transferable(response)
+                if _c2_buffer == 'hold':
+                    return HeldResult(result, None)
+                return result
 
-            err = None
-            result = None
-            stage = 'deserialize_input'
+        except error.CCBaseError:
+            raise
+        except Exception as e:
+            if stage == 'serialize_input':
+                raise error.CompoSerializeInput(str(e)) from e
+            elif stage == 'call_crm':
+                raise error.CompoCRMCalling(str(e)) from e
+            else:
+                raise error.CompoDeserializeOutput(str(e)) from e
 
-            try:
-                if len(args) < 1:
-                    raise ValueError('Instance method requires self, but only get one argument.')
+    def crm_to_com(*args, _release_fn=None):
+        input_transferable = input.deserialize if input else None
+        output_transferable = output.serialize if output else None
+        input_buffer_mode = buffer
 
-                iicrm = args[0]
-                crm = iicrm.crm
-                request = args[1] if len(args) > 1 else None
+        err = None
+        result = None
+        stage = 'deserialize_input'
 
-                if request is not None and input_transferable is not None:
-                    if input_buffer_mode == 'copy':
-                        request_copy = bytes(request) if not isinstance(request, bytes) else request
-                        if _release_fn is not None:
-                            _release_fn()
-                            _release_fn = None
-                        deserialized_args = input_transferable(request_copy)
-                    elif input_buffer_mode == 'view':
-                        deserialized_args = input_transferable(request)
-                        if _release_fn is not None:
-                            _release_fn()
-                            _release_fn = None
-                    else:  # hold
-                        deserialized_args = input_transferable(request)
-                else:
-                    deserialized_args = tuple()
+        try:
+            if len(args) < 1:
+                raise ValueError('Instance method requires self, but only get one argument.')
+
+            iicrm = args[0]
+            crm = iicrm.crm
+            request = args[1] if len(args) > 1 else None
+
+            if request is not None and input_transferable is not None:
+                if input_buffer_mode == 'view':
+                    deserialized_args = input_transferable(request)
                     if _release_fn is not None:
                         _release_fn()
                         _release_fn = None
-
-                if not isinstance(deserialized_args, tuple):
-                    deserialized_args = (deserialized_args,)
-
-                crm_method = getattr(crm, method_name, None)
-                if crm_method is None:
-                    raise ValueError(f'Method "{method_name}" not found on CRM class.')
-
-                stage = 'execute_function'
-                result = crm_method(*deserialized_args)
-                err = None
-
-            except Exception as e:
-                result = None
-                if _release_fn is not None:
-                    try:
-                        _release_fn()
-                    except Exception:
-                        pass
-                if stage == 'deserialize_input':
-                    err = error.CRMDeserializeInput(str(e))
-                elif stage == 'execute_function':
-                    err = error.CRMExecuteFunction(str(e))
-                else:
-                    err = error.CRMSerializeOutput(str(e))
-
-            # Create a serialized response based on the serialized_error and serialized_result
-            serialized_error: bytes = error.CCError.serialize(err)
-            serialized_result = b''
-            if output_transferable is not None and result is not None:
-                # Unpack tuple arguments or pass single argument based on result type
-                serialized_result = (
-                    output_transferable(*result) if isinstance(result, tuple)
-                    else output_transferable(result)
-                )
-            return (serialized_error, serialized_result)
-        
-        @wraps(func)
-        def transfer_wrapper(*args: any, **kwargs: any) -> any:
-            if not args:
-                raise ValueError('No arguments provided to determine direction.')
-            
-            icrm = args[0]
-            if not hasattr(icrm, 'direction'):
-                raise AttributeError('The ICRM instance does not have a "direction" attribute.')
-            
-            if icrm.direction == '->':
-                return com_to_crm(*args)
-            elif icrm.direction == '<-':
-                return crm_to_com(*args, **kwargs)
+                else:  # hold
+                    deserialized_args = input_transferable(request)
             else:
-                raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
-        
-        # Expose buffer mode attributes for dispatch table introspection
-        transfer_wrapper._input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
-        transfer_wrapper._output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
+                deserialized_args = tuple()
+                if _release_fn is not None:
+                    _release_fn()
+                    _release_fn = None
 
-        return transfer_wrapper
-    
-    return decorator
+            if not isinstance(deserialized_args, tuple):
+                deserialized_args = (deserialized_args,)
+
+            crm_method = getattr(crm, method_name, None)
+            if crm_method is None:
+                raise ValueError(f'Method "{method_name}" not found on CRM class.')
+
+            stage = 'execute_function'
+            result = crm_method(*deserialized_args)
+            err = None
+
+        except Exception as e:
+            result = None
+            if _release_fn is not None:
+                try:
+                    _release_fn()
+                except Exception:
+                    pass
+            if stage == 'deserialize_input':
+                err = error.CRMDeserializeInput(str(e))
+            elif stage == 'execute_function':
+                err = error.CRMExecuteFunction(str(e))
+            else:
+                err = error.CRMSerializeOutput(str(e))
+
+        serialized_error = error.CCError.serialize(err)
+        serialized_result = b''
+        if output_transferable is not None and result is not None:
+            serialized_result = (
+                output_transferable(*result) if isinstance(result, tuple)
+                else output_transferable(result)
+            )
+        return (serialized_error, serialized_result)
+
+    @wraps(func)
+    def transfer_wrapper(*args, **kwargs):
+        if not args:
+            raise ValueError('No arguments provided to determine direction.')
+
+        icrm = args[0]
+        if not hasattr(icrm, 'direction'):
+            raise AttributeError('The ICRM instance does not have a "direction" attribute.')
+
+        if icrm.direction == '->':
+            _c2_buffer = kwargs.pop('_c2_buffer', None)
+            return com_to_crm(*args, _c2_buffer=_c2_buffer)
+        elif icrm.direction == '<-':
+            return crm_to_com(*args, **kwargs)
+        else:
+            raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
+
+    transfer_wrapper._input_buffer_mode = buffer
+    return transfer_wrapper
 
 def auto_transfer(func: callable | None = None) -> callable:
     def create_wrapper(func: callable) -> callable:
@@ -614,8 +642,7 @@ def auto_transfer(func: callable | None = None) -> callable:
                     output_transferable = create_default_transferable(func, is_input=False)
 
         # --- Wrapping ---
-        transfer_decorator = transfer(input=input_transferable, output=output_transferable)
-        wrapped_func = transfer_decorator(func)
+        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable)
         return wrapped_func
 
     if func is None:

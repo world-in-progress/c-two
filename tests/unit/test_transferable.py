@@ -553,13 +553,12 @@ class TestBufferMode:
 class TestCrmToComBufferModes:
     """Test that crm_to_com handles _release_fn based on input buffer mode."""
 
-    def _setup(self, input_trans):
+    def _setup(self, input_trans, buffer='view'):
         """Create a transfer-wrapped echo function with given input transferable."""
-        from c_two.crm.transferable import transfer
-        decorator = transfer(input=input_trans, output=None)
+        from c_two.crm.transferable import _build_transfer_wrapper
         def echo(self, x):
             return x
-        return decorator(echo)
+        return _build_transfer_wrapper(echo, input=input_trans, output=None, buffer=buffer)
 
     def _make_icrm(self):
         class MockCRM:
@@ -609,12 +608,10 @@ class TestCrmToComBufferModes:
             def deserialize(data) -> int:
                 return pickle.loads(data) if isinstance(data, (bytes, memoryview)) else data
 
-        wrapped = self._setup(HoldIn)
+        wrapped = self._setup(HoldIn, buffer='hold')
         icrm = self._make_icrm()
         result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert not released, '_release_fn should NOT be called in hold mode'
-
-    def test_no_release_fn_works(self):
         """When _release_fn is None (thread-local), all modes work fine."""
         def fn(self, x: int) -> int: ...
         input_trans = create_default_transferable(fn, is_input=True)
@@ -643,7 +640,7 @@ class TestCrmToComBufferModes:
         assert released, '_release_fn must be called even on error'
 
     def test_transfer_wrapper_has_buffer_mode_attrs(self):
-        """transfer_wrapper should expose _input_buffer_mode and _output_buffer_mode."""
+        """transfer_wrapper should expose _input_buffer_mode."""
         @cc.transferable(buffer='view')
         class ViewIn:
             def serialize(val: int) -> bytes:
@@ -686,40 +683,43 @@ class TestComToCrmBufferModes:
         client = MockClient(mock_resp)
         return MockICRM(client), mock_resp
 
-    def test_copy_mode_releases_response(self):
-        """copy mode: response is materialized and released."""
-        @cc.transferable(buffer='copy')
-        class CopyOut:
+    def test_view_mode_releases_response(self):
+        """view mode: response is deserialized and released."""
+        @cc.transferable
+        class ViewOut:
             def serialize(val: int) -> bytes:
                 return pickle.dumps(val)
-            def deserialize(data: bytes) -> int:
-                assert isinstance(data, bytes)
+            def deserialize(data) -> int:
+                if isinstance(data, memoryview):
+                    return pickle.loads(bytes(data))
                 return pickle.loads(data)
 
-        from c_two.crm.transferable import transfer
+        from c_two.crm.transferable import _build_transfer_wrapper
         icrm, mock_resp = self._make_icrm(pickle.dumps(42))
-        decorator = transfer(input=None, output=CopyOut)
         def fn(self) -> int: ...
-        wrapped = decorator(fn)
+        wrapped = _build_transfer_wrapper(fn, input=None, output=ViewOut)
         result = wrapped(icrm)
         assert result == 42
         assert mock_resp.released
 
-    def test_hold_mode_skips_release(self):
-        """hold mode: response is NOT released (RAII)."""
-        @cc.transferable(buffer='hold')
+    def test_hold_mode_returns_held_result(self):
+        """hold mode via _c2_buffer: returns HeldResult wrapping SHM."""
+        from c_two.crm.transferable import _build_transfer_wrapper, HeldResult
+
+        @cc.transferable
         class HoldOut:
             def serialize(val: int) -> bytes:
                 return pickle.dumps(val)
             def deserialize(data) -> int:
                 return pickle.loads(bytes(data)) if isinstance(data, memoryview) else pickle.loads(data)
 
-        from c_two.crm.transferable import transfer
         icrm, mock_resp = self._make_icrm(pickle.dumps(42))
-        decorator = transfer(input=None, output=HoldOut)
         def fn(self) -> int: ...
-        wrapped = decorator(fn)
-        result = wrapped(icrm)
-        assert result == 42
-        assert not mock_resp.released
+        wrapped = _build_transfer_wrapper(fn, input=None, output=HoldOut)
+        result = wrapped(icrm, _c2_buffer='hold')
+        assert isinstance(result, HeldResult)
+        assert result.value == 42
+        assert not mock_resp.released  # SHM held until explicit release
+        result.release()
+        assert mock_resp.released
 
