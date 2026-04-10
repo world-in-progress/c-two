@@ -346,3 +346,38 @@ class TestEndToEnd:
 
         err, result = server.process(pickle.dumps(42))
         assert '_c2_buffer' not in received_kwargs
+
+
+class TestHoldVsViewSmoke:
+    """Smoke test that hold vs view both produce correct results."""
+
+    def test_view_and_hold_produce_same_value(self):
+        """Both modes return the same data; hold wraps in HeldResult."""
+        import c_two as cc
+        from c_two.crm.transferable import HeldResult
+        from c_two.transport.client.proxy import ICRMProxy
+
+        @cc.icrm(namespace='test.holdview.smoke', version='0.1.0')
+        class ISmoke:
+            def echo(self, data: bytes) -> bytes: ...
+
+        class SmokeEcho:
+            def echo(self, data: bytes) -> bytes:
+                return data
+
+        proxy = ICRMProxy.thread_local(SmokeEcho())
+        icrm = ISmoke()
+        icrm.client = proxy
+        icrm.direction = '->'
+
+        payload = b'x' * 1024
+
+        # View mode
+        view_result = icrm.echo(payload)
+        assert view_result == payload
+
+        # Hold mode
+        held = cc.hold(icrm.echo)(payload)
+        assert isinstance(held, HeldResult)
+        assert held.value == payload
+        held.release()
