@@ -76,6 +76,32 @@ class HeldResult:
         self.release()
 
 
+def hold(method):
+    """Wrap an ICRM bound method to hold SHM on the response.
+
+    Usage: ``cc.hold(proxy.method)(args)`` — single-shot pattern.
+    Returns a callable that injects ``_c2_buffer='hold'`` into kwargs.
+    """
+    if not callable(method):
+        raise TypeError(
+            f"cc.hold() requires a callable, got {type(method).__name__}"
+        )
+    self_obj = getattr(method, '__self__', None)
+    name = getattr(method, '__name__', None)
+    if self_obj is None or name is None:
+        raise TypeError(
+            "cc.hold() requires a bound ICRM method, "
+            "e.g. cc.hold(grid.compute)"
+        )
+
+    @wraps(method)
+    def wrapper(*args, **kwargs):
+        kwargs['_c2_buffer'] = 'hold'
+        return getattr(self_obj, name)(*args, **kwargs)
+
+    return wrapper
+
+
 def _add_length_prefix(message_bytes):
     length = len(message_bytes)
     prefix = _struct.pack('>Q', length)

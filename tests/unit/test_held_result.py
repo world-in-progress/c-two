@@ -71,3 +71,46 @@ class TestHeldResultBasic:
         hr.release()  # should not raise
         with pytest.raises(Exception):
             _ = hr.value
+
+
+class TestHoldFunction:
+    """cc.hold() wraps a bound ICRM method to inject _c2_buffer='hold'."""
+
+    def test_hold_injects_c2_buffer(self):
+        from c_two.crm.transferable import hold
+
+        class FakeProxy:
+            def compute(self, x, **kwargs):
+                return kwargs
+
+        proxy = FakeProxy()
+        wrapped = hold(proxy.compute)
+        result = wrapped(42)
+        assert result['_c2_buffer'] == 'hold'
+
+    def test_hold_rejects_unbound_function(self):
+        from c_two.crm.transferable import hold
+
+        def standalone(x):
+            return x
+
+        with pytest.raises(TypeError, match='bound'):
+            hold(standalone)
+
+    def test_hold_rejects_non_callable(self):
+        from c_two.crm.transferable import hold
+
+        with pytest.raises(TypeError):
+            hold(42)
+
+    def test_hold_preserves_args(self):
+        from c_two.crm.transferable import hold
+
+        class FakeProxy:
+            def compute(self, a, b, **kwargs):
+                return (a, b, kwargs.get('_c2_buffer'))
+
+        proxy = FakeProxy()
+        wrapped = hold(proxy.compute)
+        result = wrapped(1, 2)
+        assert result == (1, 2, 'hold')
