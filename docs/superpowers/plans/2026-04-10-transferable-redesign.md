@@ -172,11 +172,11 @@ class HeldResult:
     def __exit__(self, *args):
         self.release()
 
-    def __del__(self):
+    def __del__(self, _is_finalizing=sys.is_finalizing, _warn=warnings.warn):
+        # NOTE: _is_finalizing and _warn are bound as default args at class
+        # definition time so they survive late interpreter teardown.
         if getattr(self, '_released', True):
             return
-        _is_finalizing = sys.is_finalizing
-        _warn = warnings.warn
         if _is_finalizing():
             self.release()
             return
@@ -336,8 +336,10 @@ The current `transfer()` function (L270–436) is overloaded — it both stores 
 # tests/unit/test_transfer_decorator.py
 import pickle
 import pytest
+from c_two.crm.transferable import (
+    Transferable, transfer, _build_transfer_wrapper, auto_transfer,
+)
 import c_two as cc
-from c_two.crm.transferable import Transferable
 
 
 @cc.transferable
@@ -362,7 +364,7 @@ class TestTransferDecorator:
     """@cc.transfer attaches __cc_transfer__ metadata without wrapping."""
 
     def test_attaches_metadata(self):
-        @cc.transfer(input=_FakeInput, output=_FakeOutput)
+        @transfer(input=_FakeInput, output=_FakeOutput)
         def my_method(self, x: int) -> str:
             ...
 
@@ -373,7 +375,7 @@ class TestTransferDecorator:
         assert meta['buffer'] == 'view'
 
     def test_buffer_hold(self):
-        @cc.transfer(buffer='hold')
+        @transfer(buffer='hold')
         def my_method(self, data: bytes) -> bytes:
             ...
 
@@ -387,13 +389,13 @@ class TestTransferDecorator:
         def original(self, x: int) -> int:
             return x
 
-        decorated = cc.transfer(input=_FakeInput)(original)
+        decorated = transfer(input=_FakeInput)(original)
         # The function itself is unchanged (no __wrapped__, same object)
         assert decorated is original
 
     def test_invalid_buffer_raises(self):
         with pytest.raises(ValueError, match='buffer'):
-            @cc.transfer(buffer='copy')
+            @transfer(buffer='copy')
             def bad(self) -> None:
                 ...
 ```
@@ -614,15 +616,31 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py tests/unit/test_held_result.py -v`
 Expected: All PASS
 
-- [ ] **Step 5: Verify no regressions**
+- [ ] **Step 5: Update `auto_transfer` to call `_build_transfer_wrapper()` instead of old `transfer()`**
+
+The current `auto_transfer` at L529 calls `transfer(input=..., output=...)` which now only attaches metadata. It must call `_build_transfer_wrapper()` instead:
+
+```python
+        # --- Wrapping --- (L528-531)
+        # Before: transfer_decorator = transfer(input=input_transferable, output=output_transferable)
+        # Before: wrapped_func = transfer_decorator(func)
+        # After:
+        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable)
+        return wrapped_func
+```
+
+Also update any direct `transfer()` callsites in tests:
+- `tests/unit/test_transferable.py` lines that call `transfer(input=..., output=...)(func)` must now call `_build_transfer_wrapper(func, input=..., output=...)` or use `auto_transfer` instead.
+
+- [ ] **Step 6: Verify no regressions**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
-Expected: 553+ passed (existing tests still pass because `auto_transfer` still calls the build function internally)
+Expected: 553+ passed (auto_transfer now calls _build_transfer_wrapper, existing behavior preserved)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/c_two/crm/transferable.py tests/unit/test_transfer_decorator.py
+git add src/c_two/crm/transferable.py tests/unit/test_transfer_decorator.py tests/unit/test_transferable.py
 git commit -m "refactor(transferable): split transfer() into metadata + _build_transfer_wrapper
 
 @cc.transfer is now metadata-only (attaches __cc_transfer__).
@@ -636,13 +654,15 @@ Part of transferable redesign (spec: 2026-07-15)."
 
 ---
 
-### Task 4: Simplify `auto_transfer` — delete Priority 2, accept config kwargs
+### Task 4: Add kwargs support to `auto_transfer` (keep Priority 2 for now)
 
 **Files:**
 - Modify: `src/c_two/crm/transferable.py:438-538` (`auto_transfer`)
-- Modify: `tests/unit/test_transferable.py` (update expectations)
+- Modify: `tests/unit/test_transfer_decorator.py` (add config tests)
 
-- [ ] **Step 1: Write tests for the new `auto_transfer` behavior**
+Priority 2 matching is NOT deleted yet — that happens atomically with grid example cleanup in Task 7. This task only adds `input`/`output`/`buffer` kwargs so `icrm()` can pass `@cc.transfer` config through.
+
+- [ ] **Step 1: Write tests for the new `auto_transfer` kwargs behavior**
 
 Add to `tests/unit/test_transfer_decorator.py`:
 
@@ -651,7 +671,6 @@ class TestAutoTransferWithConfig:
     """auto_transfer accepts input/output/buffer kwargs from @cc.transfer."""
 
     def test_explicit_input_override(self):
-        from c_two.crm.transferable import auto_transfer
         wrapped = auto_transfer(
             lambda self, x: ...,
             input=_FakeInput,
@@ -661,13 +680,11 @@ class TestAutoTransferWithConfig:
         assert wrapped._input_buffer_mode == 'view'
 
     def test_explicit_buffer_hold(self):
-        from c_two.crm.transferable import auto_transfer
         def my_method(self, x: int) -> int: ...
         wrapped = auto_transfer(my_method, buffer='hold')
         assert wrapped._input_buffer_mode == 'hold'
 
     def test_explicit_output_override(self):
-        from c_two.crm.transferable import auto_transfer
         def my_method(self, x: int) -> str: ...
         wrapped = auto_transfer(my_method, output=_FakeOutput)
         assert callable(wrapped)
@@ -678,7 +695,7 @@ class TestAutoTransferWithConfig:
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py::TestAutoTransferWithConfig -v`
 Expected: FAIL — `auto_transfer` doesn't accept kwargs yet
 
-- [ ] **Step 3: Rewrite `auto_transfer` to accept kwargs and delete Priority 2**
+- [ ] **Step 3: Rewrite `auto_transfer` to accept kwargs (keep Priority 2 for now)**
 
 Replace `auto_transfer` (L438–538) with:
 
@@ -688,6 +705,7 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
 
     When called without kwargs, performs auto-matching:
     - Single-param direct match → registered @transferable
+    - Multi-param field-name match (Priority 2) → registered @transferable
     - Return type direct match → registered @transferable
     - Fallback → DynamicInput/OutputTransferable (pickle)
 
@@ -714,7 +732,16 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
                         full_name = f'{param_module}.{param_name}' if param_module else param_name
                         input_transferable = get_transferable(full_name)
 
-                    # Priority 2 (field-name matching) — DELETED
+                    # Priority 2: field-name matching (kept for backward compat;
+                    # will be removed with grid example migration in Task 7)
+                    if input_transferable is None and len(input_model_fields) > 1:
+                        for info in _get_all_transferable_info():
+                            registered_fields = info.get('fields', {})
+                            if registered_fields and set(input_model_fields.keys()) == set(registered_fields.keys()):
+                                expected_input_types = {k: v.annotation for k, v in input_model_fields.items()}
+                                if expected_input_types == registered_fields:
+                                    input_transferable = get_transferable(info['name'])
+                                    break
 
                     if input_transferable is None and not is_empty_input:
                         input_transferable = create_default_transferable(func, is_input=True)
@@ -746,41 +773,24 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
         return create_wrapper(func)
 ```
 
-Key changes:
-- Accepts `input`, `output`, `buffer` kwargs
-- Deletes Priority 2 field-name matching block (L463–483)
-- Deletes output Priority 2 matching (L512–522)
+Key changes from the old version:
+- Accepts `input`, `output`, `buffer` kwargs (explicit overrides)
+- Priority 2 field-name matching is KEPT for now (removed in Task 7 with grid migration)
 - Calls `_build_transfer_wrapper()` instead of old `transfer()`
 
-- [ ] **Step 4: Update existing tests in `test_transferable.py`**
-
-The `test_matching_transferable_uses_existing` test relied on Priority 2 field-name matching. Update it:
-
-```python
-# In TestAutoTransfer class, update test_matching_transferable_uses_existing:
-def test_matching_transferable_uses_existing(self):
-    """When a function has a single param typed as a registered Transferable,
-    auto_transfer should use it (Priority 1 direct lookup)."""
-    def process(self, data: HelloData) -> HelloData: ...
-    process.__module__ = HelloData.__module__
-    wrapped = auto_transfer(process)
-    assert callable(wrapped)
-```
-
-- [ ] **Step 5: Run all tests**
+- [ ] **Step 4: Run all tests**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
-Expected: All pass
+Expected: All pass (Priority 2 still works, kwargs are additive)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add src/c_two/crm/transferable.py tests/unit/test_transfer_decorator.py tests/unit/test_transferable.py
-git commit -m "refactor(transferable): simplify auto_transfer, delete Priority 2 matching
+git add src/c_two/crm/transferable.py tests/unit/test_transfer_decorator.py
+git commit -m "refactor(transferable): add kwargs to auto_transfer for @cc.transfer config
 
 auto_transfer now accepts input/output/buffer kwargs from @cc.transfer.
-Priority 2 field-name matching (L464-483) deleted — replaced by explicit
-@cc.transfer override. Output Priority 2 also deleted.
+Priority 2 field-name matching preserved for backward compatibility.
 
 Part of transferable redesign (spec: 2026-07-15)."
 ```
@@ -804,7 +814,7 @@ class TestIcrmTransferIntegration:
     def test_icrm_picks_up_transfer_metadata(self):
         @cc.icrm(namespace='test.transfer', version='0.1.0')
         class ITest:
-            @cc.transfer(input=_FakeInput, buffer='hold')
+            @transfer(input=_FakeInput, buffer='hold')
             def process(self, x: int) -> str:
                 ...
 
@@ -820,6 +830,48 @@ class TestIcrmTransferIntegration:
         plain_method = getattr(ITest, 'plain', None)
         assert plain_method is not None
         assert getattr(plain_method, '_input_buffer_mode', None) == 'view'
+
+    def test_explicit_transferable_actually_runs(self):
+        """Round-trip: explicit @transfer(input=..., output=...) uses the custom codec."""
+        import pickle
+
+        serialize_calls = []
+        deserialize_calls = []
+
+        @cc.transferable
+        class TrackedInput(Transferable):
+            val: int
+            def serialize(d: 'TrackedInput') -> bytes:
+                serialize_calls.append(d.val)
+                return pickle.dumps(d.val)
+            def deserialize(b: bytes) -> 'TrackedInput':
+                v = pickle.loads(b)
+                deserialize_calls.append(v)
+                return TrackedInput(val=v)
+
+        @cc.icrm(namespace='test.roundtrip', version='0.1.0')
+        class IRoundTrip:
+            @transfer(input=TrackedInput)
+            def process(self, data: TrackedInput) -> int:
+                ...
+
+        # Simulate server-side call
+        class CRM:
+            def process(self, data):
+                return data.val * 2
+
+        server = IRoundTrip()
+        server.crm = CRM()
+        server.direction = '<-'
+
+        # Call with serialized TrackedInput
+        serialized = TrackedInput.serialize(TrackedInput(val=7))
+        err_bytes, result_bytes = server.process(serialized)
+
+        from c_two.error import CCError
+        assert CCError.deserialize(memoryview(err_bytes)) is None
+        # Verify custom deserializer was called (not pickle fallback)
+        assert 7 in deserialize_calls
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -863,21 +915,65 @@ Part of transferable redesign (spec: 2026-07-15)."
 
 ---
 
-### Task 6: Remove `_buffer_mode` from `Transferable` class and `@transferable` decorator
+### Task 6: Remove `_buffer_mode` from `Transferable` + update server dispatch (atomic)
 
 **Files:**
 - Modify: `src/c_two/crm/transferable.py:78-104` (`Transferable` class)
 - Modify: `src/c_two/crm/transferable.py:245-268` (`transferable()` decorator)
-- Modify: `tests/unit/test_transferable.py` (update any `_buffer_mode` references)
+- Modify: `src/c_two/transport/server/native.py:57-65` (`build_dispatch_table`)
+- Modify: `src/c_two/transport/server/native.py:322-395` (dispatch function)
+- Modify: `tests/unit/test_transferable.py` (replace type-level buffer tests with method-level tests)
 
-- [ ] **Step 1: Remove `_buffer_mode` from `Transferable` class**
+This task is atomic: remove `_buffer_mode` from the type system AND update server dispatch default from `copy` to `view` in the same commit. Before deleting old buffer tests, write replacement tests for method-level `@cc.transfer(buffer=...)`.
+
+- [ ] **Step 1: Write replacement buffer tests using method-level `@cc.transfer(buffer=...)`**
+
+Add to `tests/unit/test_transfer_decorator.py`:
+
+```python
+class TestMethodLevelBufferBehavior:
+    """Buffer lifecycle is controlled at method level, not type level."""
+
+    def test_view_buffer_releases_after_deserialize(self):
+        """With buffer='view' (default), input memoryview is released after CRM method returns."""
+        @cc.icrm(namespace='test.buf.view', version='0.1.0')
+        class IBufView:
+            def process(self, data: bytes) -> str:
+                ...
+
+        class CRM:
+            def process(self, data):
+                return 'ok'
+
+        server = IBufView()
+        server.crm = CRM()
+        server.direction = '<-'
+
+        import pickle
+        err, result = server.process(pickle.dumps(b'hello'))
+        from c_two.error import CCError
+        assert CCError.deserialize(memoryview(err)) is None
+
+    def test_hold_buffer_declared_at_method(self):
+        """buffer='hold' is set via @cc.transfer, not on the type."""
+        @cc.icrm(namespace='test.buf.hold', version='0.1.0')
+        class IBufHold:
+            @transfer(buffer='hold')
+            def process(self, data: bytes) -> str:
+                ...
+
+        method = getattr(IBufHold, 'process')
+        assert getattr(method, '_input_buffer_mode', None) == 'hold'
+```
+
+- [ ] **Step 2: Remove `_buffer_mode` from `Transferable` class**
 
 In `Transferable` class (L89), remove:
 ```python
     _buffer_mode: str = 'copy'  # 'copy' | 'view' | 'hold'
 ```
 
-- [ ] **Step 2: Remove `buffer` param from `@transferable` decorator**
+- [ ] **Step 3: Remove `buffer` param from `@transferable` decorator**
 
 Simplify the `transferable()` decorator — remove `buffer` parameter:
 ```python
@@ -899,7 +995,7 @@ def transferable(cls=None):
     return wrap
 ```
 
-- [ ] **Step 3: Remove `_buffer_mode` assignments in `create_default_transferable`**
+- [ ] **Step 4: Remove `_buffer_mode` assignments in `create_default_transferable`**
 
 In `create_default_transferable` (L192 and L227), delete:
 ```python
@@ -907,34 +1003,9 @@ DynamicInputTransferable._buffer_mode = 'view'   # L192 — delete
 DynamicOutputTransferable._buffer_mode = 'view'   # L227 — delete
 ```
 
-- [ ] **Step 4: Run all tests**
+- [ ] **Step 5: Update `build_dispatch_table` default**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
-Expected: All pass
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/c_two/crm/transferable.py
-git commit -m "refactor(transferable): remove _buffer_mode from Transferable class
-
-Buffer lifecycle is now controlled at method level (@cc.transfer) and
-call site (cc.hold()), not on the data type.
-
-Part of transferable redesign (spec: 2026-07-15)."
-```
-
----
-
-### Task 7: Update server dispatch — remove `copy` branch, default to `view`
-
-**Files:**
-- Modify: `src/c_two/transport/server/native.py:57-65` (`build_dispatch_table`)
-- Modify: `src/c_two/transport/server/native.py:322-395` (dispatch function)
-
-- [ ] **Step 1: Update `build_dispatch_table` default**
-
-Change L64:
+Change L64 in `src/c_two/transport/server/native.py`:
 ```python
 # Before:
 buffer_mode = getattr(method, '_input_buffer_mode', 'copy')
@@ -942,7 +1013,7 @@ buffer_mode = getattr(method, '_input_buffer_mode', 'copy')
 buffer_mode = getattr(method, '_input_buffer_mode', 'view')
 ```
 
-- [ ] **Step 2: Remove `copy` branch in dispatch**
+- [ ] **Step 6: Remove `copy` branch in dispatch**
 
 In the dispatch function (L338–349), remove the `copy` block and make `view` the first branch:
 
@@ -972,94 +1043,62 @@ In the dispatch function (L338–349), remove the `copy` block and make `view` t
                 result = method(mv)
 ```
 
-- [ ] **Step 3: Run all tests**
+- [ ] **Step 7: Update old buffer tests in `test_transferable.py`**
+
+Remove or update tests that reference `_buffer_mode` on the type or `@cc.transferable(buffer=...)`.
+
+- [ ] **Step 8: Run all tests**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add src/c_two/transport/server/native.py
-git commit -m "refactor(server): remove copy buffer branch, default to view
+git add src/c_two/crm/transferable.py src/c_two/transport/server/native.py tests/unit/test_transferable.py tests/unit/test_transfer_decorator.py
+git commit -m "refactor: remove _buffer_mode from types, update server dispatch to view default
 
-Server dispatch now only handles 'view' and 'hold' buffer modes.
-Default changed from 'copy' to 'view'.
+Buffer lifecycle is now controlled at method level (@cc.transfer) and call
+site (cc.hold()), not on the data type. Server dispatch removes copy branch,
+defaults to view.
 
 Part of transferable redesign (spec: 2026-07-15)."
 ```
 
 ---
 
-### Task 8: Wire up exports — `cc.transfer`, `cc.hold`, `cc.HeldResult`
+### Task 8: Delete Priority 2 matching + grid example cleanup (atomic)
 
 **Files:**
-- Modify: `src/c_two/crm/__init__.py`
-- Modify: `src/c_two/__init__.py`
+- Modify: `src/c_two/crm/transferable.py` (delete Priority 2 block in `auto_transfer`)
+- Modify: `examples/grid/transferables.py` (delete bundle classes)
+- Modify: `examples/grid/igrid.py` (remove bundle imports)
+- Modify: `tests/unit/test_transferable.py` (update Priority 2-dependent tests)
 
-- [ ] **Step 1: Update `crm/__init__.py`**
+Priority 2 deletion and grid cleanup happen atomically — the grid example is the only consumer of Priority 2 matching.
 
+- [ ] **Step 1: Delete Priority 2 matching block in `auto_transfer`**
+
+In `auto_transfer`, remove the Priority 2 block:
 ```python
-from .meta import ICRMMeta, MethodAccess, get_method_access, read, write
-from .template import generate_crm_template
-from .transferable import transfer, hold, HeldResult
+                    # Priority 2: field-name matching — DELETE THIS BLOCK
+                    if input_transferable is None and len(input_model_fields) > 1:
+                        for info in _get_all_transferable_info():
+                            registered_fields = info.get('fields', {})
+                            if registered_fields and set(input_model_fields.keys()) == set(registered_fields.keys()):
+                                expected_input_types = {k: v.annotation for k, v in input_model_fields.items()}
+                                if expected_input_types == registered_fields:
+                                    input_transferable = get_transferable(info['name'])
+                                    break
 ```
 
-- [ ] **Step 2: Update `src/c_two/__init__.py`**
+Also delete output Priority 2 matching (the similar block in the output section).
 
-Add imports:
-```python
-from .crm.transferable import transfer, hold, HeldResult
-```
-
-- [ ] **Step 3: Write import verification test**
-
-Add to `tests/unit/test_transfer_decorator.py`:
-
-```python
-class TestExports:
-    def test_cc_transfer_importable(self):
-        assert hasattr(cc, 'transfer')
-        assert callable(cc.transfer)
-
-    def test_cc_hold_importable(self):
-        assert hasattr(cc, 'hold')
-        assert callable(cc.hold)
-
-    def test_cc_held_result_importable(self):
-        assert hasattr(cc, 'HeldResult')
-```
-
-- [ ] **Step 4: Run all tests**
-
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
-Expected: All pass
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/c_two/crm/__init__.py src/c_two/__init__.py tests/unit/test_transfer_decorator.py
-git commit -m "feat: export cc.transfer, cc.hold, cc.HeldResult
-
-Makes the new transferable redesign API accessible from the top-level
-cc namespace.
-
-Part of transferable redesign (spec: 2026-07-15)."
-```
-
----
-
-### Task 9: Update grid example — delete parameter bundles
-
-**Files:**
-- Modify: `examples/grid/transferables.py`
-- Modify: `examples/grid/igrid.py`
-
-- [ ] **Step 1: Simplify `transferables.py`**
+- [ ] **Step 2: Simplify `transferables.py`**
 
 Keep only `GridSchema`, `GridAttribute`, and the helper functions. Delete `GridInfo`, `PeerGridInfos`, `GridInfos`, `GridAttributes`, `GridKeys`.
 
-- [ ] **Step 2: Simplify `igrid.py`**
+- [ ] **Step 3: Simplify `igrid.py`**
 
 Remove unused imports (`GridInfo`, `GridInfos`, `PeerGridInfos`). The ICRM methods that previously relied on Priority 2 matching now auto-bundle via pickle by default:
 
@@ -1096,28 +1135,81 @@ class IGrid:
         ...
 ```
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Update Priority 2-dependent tests in `test_transferable.py`**
+
+Update `test_matching_transferable_uses_existing` and any other tests that relied on Priority 2 field-name matching:
+
+```python
+def test_matching_transferable_uses_existing(self):
+    """When a function has a single param typed as a registered Transferable,
+    auto_transfer should use it (Priority 1 direct lookup)."""
+    def process(self, data: HelloData) -> HelloData: ...
+    process.__module__ = HelloData.__module__
+    wrapped = auto_transfer(process)
+    assert callable(wrapped)
+```
+
+- [ ] **Step 5: Run all tests**
+
+Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Expected: All pass
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add examples/grid/transferables.py examples/grid/igrid.py
-git commit -m "refactor(examples): delete parameter bundle transferables from grid
+git add src/c_two/crm/transferable.py examples/grid/transferables.py examples/grid/igrid.py tests/unit/test_transferable.py
+git commit -m "refactor: delete Priority 2 matching + grid parameter bundles
 
-Only domain types (GridSchema, GridAttribute) remain. All other
-methods auto-bundle via pickle.
+Priority 2 field-name matching removed from auto_transfer.
+Grid example simplified: only domain types (GridSchema, GridAttribute)
+remain. All other methods auto-bundle via pickle.
 
 Part of transferable redesign (spec: 2026-07-15)."
 ```
 
 ---
 
-### Task 10: End-to-end integration test
+### Task 9: Wire up exports + end-to-end tests
 
 **Files:**
-- Modify: `tests/unit/test_transfer_decorator.py` (add e2e test)
+- Modify: `src/c_two/crm/__init__.py`
+- Modify: `src/c_two/__init__.py`
+- Modify: `tests/unit/test_transfer_decorator.py` (add export + e2e tests)
+- Create: `tests/integration/test_transfer_hold.py` (IPC integration)
 
-- [ ] **Step 1: Write an end-to-end test verifying the full flow**
+- [ ] **Step 1: Update `crm/__init__.py`**
 
 ```python
+from .meta import ICRMMeta, MethodAccess, get_method_access, read, write
+from .template import generate_crm_template
+from .transferable import transfer, hold, HeldResult
+```
+
+- [ ] **Step 2: Update `src/c_two/__init__.py`**
+
+Add imports:
+```python
+from .crm.transferable import transfer, hold, HeldResult
+```
+
+- [ ] **Step 3: Write import verification + unit e2e tests**
+
+Add to `tests/unit/test_transfer_decorator.py`:
+
+```python
+class TestExports:
+    def test_cc_transfer_importable(self):
+        assert hasattr(cc, 'transfer')
+        assert callable(cc.transfer)
+
+    def test_cc_hold_importable(self):
+        assert hasattr(cc, 'hold')
+        assert callable(cc.hold)
+
+    def test_cc_held_result_importable(self):
+        assert hasattr(cc, 'HeldResult')
+
+
 class TestEndToEnd:
     """Full round-trip: ICRM with @cc.transfer, proxy call, hold mode."""
 
@@ -1131,17 +1223,14 @@ class TestEndToEnd:
         from tests.fixtures.hello import Hello
         crm = Hello()
 
-        # Server-side ICRM
         server_icrm = IE2E()
         server_icrm.crm = crm
         server_icrm.direction = '<-'
 
-        # Simulate crm_to_com: serialize input, call CRM, serialize output
         greet = getattr(server_icrm, 'greet')
         serialized_input = pickle.dumps('World')
         err_bytes, result_bytes = greet(serialized_input)
 
-        # Verify no error
         from c_two.error import CCError
         assert CCError.deserialize(memoryview(err_bytes)) is None
         assert pickle.loads(result_bytes) == 'Hello, World!'
@@ -1155,7 +1244,6 @@ class TestEndToEnd:
             def compute(self, x: int) -> int:
                 ...
 
-        # Create thread-local proxy
         class FakeCRM:
             def compute(self, x: int) -> int:
                 return x * 2
@@ -1167,29 +1255,130 @@ class TestEndToEnd:
         client_icrm.client = proxy
         client_icrm.direction = '->'
 
-        # Normal call
         result = client_icrm.compute(5)
         assert result == 10
 
-        # Hold call
         held = cc.hold(client_icrm.compute)(5)
         assert isinstance(held, HeldResult)
         assert held.value == 10
         held.release()
+
+    def test_c2_buffer_not_leaked_to_crm(self):
+        """_c2_buffer is popped by transfer_wrapper, never reaches user CRM methods."""
+        received_kwargs = {}
+
+        @cc.icrm(namespace='test.noleak', version='0.1.0')
+        class INoLeak:
+            def process(self, x: int) -> int:
+                ...
+
+        class CRM:
+            def process(self, x, **kwargs):
+                received_kwargs.update(kwargs)
+                return x
+
+        server = INoLeak()
+        server.crm = CRM()
+        server.direction = '<-'
+
+        import pickle
+        err, result = server.process(pickle.dumps(42))
+        assert '_c2_buffer' not in received_kwargs
 ```
 
-- [ ] **Step 2: Run all tests**
+- [ ] **Step 4: Write IPC integration test for `cc.hold()`**
+
+Create `tests/integration/test_transfer_hold.py` following the pattern from existing `tests/integration/test_icrm_proxy.py`:
+
+```python
+# tests/integration/test_transfer_hold.py
+"""IPC integration tests for buffer hold mode and HeldResult lifecycle."""
+import pytest
+import c_two as cc
+from c_two.crm.transferable import HeldResult, transfer
+
+from tests.fixtures.ihello import IHello
+from tests.fixtures.hello import Hello
+
+
+class TestIPCHoldMode:
+    """Test cc.hold() through real IPC transport."""
+
+    def test_hold_returns_held_result_ipc(self):
+        """cc.hold() on IPC proxy returns HeldResult with valid data."""
+        crm = Hello()
+        cc.register(IHello, crm, name='hold_test')
+
+        try:
+            proxy = cc.connect(IHello, name='hold_test')
+            try:
+                # Normal call
+                result = proxy.hello('World')
+                assert result == 'Hello, World!'
+
+                # Hold call
+                held = cc.hold(proxy.hello)('World')
+                assert isinstance(held, HeldResult)
+                assert held.value == 'Hello, World!'
+                held.release()
+
+                # After release, value is inaccessible
+                with pytest.raises(RuntimeError):
+                    _ = held.value
+            finally:
+                cc.close(proxy)
+        finally:
+            cc.unregister('hold_test')
+
+    def test_hold_context_manager_ipc(self):
+        """HeldResult works as context manager through IPC."""
+        crm = Hello()
+        cc.register(IHello, crm, name='hold_ctx')
+
+        try:
+            proxy = cc.connect(IHello, name='hold_ctx')
+            try:
+                with cc.hold(proxy.hello)('World') as held:
+                    assert held.value == 'Hello, World!'
+                # After context exit, released
+                with pytest.raises(RuntimeError):
+                    _ = held.value
+            finally:
+                cc.close(proxy)
+        finally:
+            cc.unregister('hold_ctx')
+
+    def test_view_default_releases_after_call(self):
+        """Default view mode: data is accessible as normal return, no HeldResult."""
+        crm = Hello()
+        cc.register(IHello, crm, name='view_test')
+
+        try:
+            proxy = cc.connect(IHello, name='view_test')
+            try:
+                result = proxy.hello('World')
+                assert result == 'Hello, World!'
+                assert not isinstance(result, HeldResult)
+            finally:
+                cc.close(proxy)
+        finally:
+            cc.unregister('view_test')
+```
+
+- [ ] **Step 5: Run all tests**
 
 Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add tests/unit/test_transfer_decorator.py
-git commit -m "test: add end-to-end integration tests for transferable redesign
+git add src/c_two/crm/__init__.py src/c_two/__init__.py tests/unit/test_transfer_decorator.py tests/integration/test_transfer_hold.py
+git commit -m "feat: wire exports + e2e tests for transferable redesign
 
-Tests auto-bundle round-trip and cc.hold() on thread-local proxy.
+Exports cc.transfer, cc.hold, cc.HeldResult to top-level namespace.
+Unit e2e: auto-bundle round-trip, thread-local hold, _c2_buffer isolation.
+IPC integration: hold/release lifecycle through real transport.
 
 Part of transferable redesign (spec: 2026-07-15)."
 ```
@@ -1198,7 +1387,10 @@ Part of transferable redesign (spec: 2026-07-15)."
 
 ## Notes
 
+- **Task ordering rationale**: Tasks 3+4 merged to avoid breaking auto_transfer when transfer() becomes metadata-only. Tasks 6+7 merged so _buffer_mode removal and server default change happen atomically. Priority 2 deletion and grid cleanup happen together in Task 8 since grid is the only Priority 2 consumer.
 - **Backward compatibility**: The grid example is the only consumer of Priority 2 matching and `_buffer_mode` on transferables. No external users are affected.
 - **Thread safety**: All new code (HeldResult, hold()) is stateless per-instance. No new global state introduced.
 - **`copy` mode removal**: The `copy` branch in both `_build_transfer_wrapper` and `native.py` dispatch is deleted. `view` becomes the universal default.
-- **Testing strategy**: Each task includes its own tests. Task 10 provides end-to-end verification. The full suite (553+ tests) is re-run after each task.
+- **`HeldResult.__del__` safety**: `sys.is_finalizing` and `warnings.warn` are bound as default args at class definition time to survive late interpreter teardown.
+- **Testing strategy**: Each task includes its own tests. Task 9 provides both unit e2e and real IPC integration tests. The full suite (553+ tests) is re-run after each task.
+- **Early tests import `transfer` from `c_two.crm.transferable` directly** — the `cc.transfer` export is only wired in Task 9 (exports).
