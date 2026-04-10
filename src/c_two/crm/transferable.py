@@ -551,105 +551,116 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
     transfer_wrapper._input_buffer_mode = buffer
     return transfer_wrapper
 
-def auto_transfer(func: callable | None = None) -> callable:
-    def create_wrapper(func: callable) -> callable:
+def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
+    """Auto-wrap a function with transfer logic.
+
+    When called without kwargs, performs auto-matching:
+    - Single-param direct match → registered @transferable
+    - Multi-param field-name match (Priority 2) → registered @transferable
+    - Return type direct match → registered @transferable
+    - Fallback → DynamicInput/OutputTransferable (pickle)
+
+    When called with kwargs (from @cc.transfer metadata), uses provided
+    input/output transferables and fills gaps with auto-matching.
+    """
+    def create_wrapper(func):
         # --- Input Matching ---
-        # Priority 1: Direct Transferable lookup — if the method has exactly
-        # one non-self parameter whose type is a registered Transferable,
-        # use it directly (same strategy as the output matcher).
-        input_model = _create_pydantic_model_from_func_sig(func)
-        input_transferable: Transferable | None = None
+        input_transferable = input  # explicit override
 
-        if input_model is not None:
-            input_model_fields = getattr(input_model, 'model_fields', {})
-            is_empty_input = not bool(input_model_fields)
+        if input_transferable is None:
+            input_model = _create_pydantic_model_from_func_sig(func)
+            is_empty_input = True
 
-            if not is_empty_input:
-                # Direct lookup: single-param whose type is a registered
-                # Transferable gets matched without fragile name/type
-                # comparison against serialize() signatures.
-                if len(input_model_fields) == 1:
-                    field_info = next(iter(input_model_fields.values()))
-                    param_type = field_info.annotation
-                    param_module = getattr(param_type, '__module__', None)
-                    param_name = getattr(param_type, '__name__', str(param_type))
-                    full_name = f'{param_module}.{param_name}' if param_module else param_name
-                    input_transferable = get_transferable(full_name)
+            if input_model is not None:
+                input_model_fields = getattr(input_model, 'model_fields', {})
+                is_empty_input = not bool(input_model_fields)
 
-                # Priority 2: Field name+type comparison (legacy path).
-                if input_transferable is None:
-                    with _TRANSFERABLE_LOCK:
-                        infos_snapshot = list(_TRANSFERABLE_INFOS)
-                    for info in infos_snapshot:
-                        if info.get('module') != func.__module__:
-                            continue
-                        registered_param_map = info.get('param_map', {})
-                        is_empty_registered = not bool(registered_param_map)
-                        if not is_empty_input and not is_empty_registered:
-                            if set(input_model_fields.keys()) == set(registered_param_map.keys()):
-                                match = True
-                                for name, fi in input_model_fields.items():
-                                    pydantic_type = fi.annotation
-                                    registered_type = registered_param_map.get(name)
-                                    if pydantic_type != registered_type:
-                                        match = False
-                                        break
-                                if match:
-                                    input_transferable = get_transferable(info['name'])
-                                    break
+                if not is_empty_input:
+                    # Priority 1: single param whose type is a registered Transferable
+                    if len(input_model_fields) == 1:
+                        field_info = next(iter(input_model_fields.values()))
+                        param_type = field_info.annotation
+                        param_module = getattr(param_type, '__module__', None)
+                        param_name = getattr(param_type, '__name__', str(param_type))
+                        full_name = f'{param_module}.{param_name}' if param_module else param_name
+                        input_transferable = get_transferable(full_name)
 
-            # If no matching transferable found, create a default one (not registered and only used in this function)
-            if input_transferable is None and not is_empty_input:
-                input_transferable = create_default_transferable(func, is_input=True)
-
-        # --- Output Matching (compares types directly) ---
-        type_hints = get_type_hints(func)
-        output_transferable: Transferable | None = None
-        
-        if 'return' in type_hints:
-            return_type = type_hints['return']
-            if return_type is None or return_type is type(None):
-                 output_transferable = None
-            else:
-                return_type_name = getattr(return_type, '__name__', str(return_type))
-                return_type_module = getattr(return_type, '__module__', None)
-                return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
-                
-                output_transferable = get_transferable(return_type_full_name)
-                if output_transferable is None:
-                    origin = get_origin(return_type)
-                    args = get_args(return_type)
-                    expected_output_types = []
-                    if origin is tuple:
-                        expected_output_types = list(args)
-                    elif return_type is not None and return_type is not type(None):
-                        expected_output_types = [return_type]
-
-                    if expected_output_types:
+                    # Priority 2: Field name+type comparison (legacy path).
+                    if input_transferable is None:
                         with _TRANSFERABLE_LOCK:
                             infos_snapshot = list(_TRANSFERABLE_INFOS)
                         for info in infos_snapshot:
                             if info.get('module') != func.__module__:
                                 continue
                             registered_param_map = info.get('param_map', {})
-                            registered_output_types = list(registered_param_map.values())
-                            if expected_output_types == registered_output_types:
-                                output_transferable = get_transferable(info['name'])
-                                break
-                
-                # If no matching transferable found, create a default one (not registered and only used in this function)
-                if output_transferable is None and not (return_type is None or return_type is type(None)):
-                    output_transferable = create_default_transferable(func, is_input=False)
+                            is_empty_registered = not bool(registered_param_map)
+                            if not is_empty_input and not is_empty_registered:
+                                if set(input_model_fields.keys()) == set(registered_param_map.keys()):
+                                    match = True
+                                    for name, fi in input_model_fields.items():
+                                        pydantic_type = fi.annotation
+                                        registered_type = registered_param_map.get(name)
+                                        if pydantic_type != registered_type:
+                                            match = False
+                                            break
+                                    if match:
+                                        input_transferable = get_transferable(info['name'])
+                                        break
+
+            # If no matching transferable found, create a default one
+            if input_transferable is None and not is_empty_input:
+                input_transferable = create_default_transferable(func, is_input=True)
+
+        # --- Output Matching ---
+        output_transferable = output  # explicit override
+
+        if output_transferable is None:
+            type_hints = get_type_hints(func)
+
+            if 'return' in type_hints:
+                return_type = type_hints['return']
+                if return_type is None or return_type is type(None):
+                    output_transferable = None
+                else:
+                    return_type_name = getattr(return_type, '__name__', str(return_type))
+                    return_type_module = getattr(return_type, '__module__', None)
+                    return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
+
+                    output_transferable = get_transferable(return_type_full_name)
+                    if output_transferable is None:
+                        origin = get_origin(return_type)
+                        args = get_args(return_type)
+                        expected_output_types = []
+                        if origin is tuple:
+                            expected_output_types = list(args)
+                        elif return_type is not None and return_type is not type(None):
+                            expected_output_types = [return_type]
+
+                        if expected_output_types:
+                            with _TRANSFERABLE_LOCK:
+                                infos_snapshot = list(_TRANSFERABLE_INFOS)
+                            for info in infos_snapshot:
+                                if info.get('module') != func.__module__:
+                                    continue
+                                registered_param_map = info.get('param_map', {})
+                                registered_output_types = list(registered_param_map.values())
+                                if expected_output_types == registered_output_types:
+                                    output_transferable = get_transferable(info['name'])
+                                    break
+
+                    # If no matching transferable found, create a default one
+                    if output_transferable is None and not (return_type is None or return_type is type(None)):
+                        output_transferable = create_default_transferable(func, is_input=False)
 
         # --- Wrapping ---
-        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable)
+        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable, buffer=buffer)
         return wrapped_func
 
     if func is None:
         return create_wrapper
     else:
         if not callable(func):
-             raise TypeError("@auto_transfer requires a callable function or parentheses.")
+            raise TypeError("@auto_transfer requires a callable function or parentheses.")
         return create_wrapper(func)
 
 # Helpers #########################################################################

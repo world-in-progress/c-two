@@ -95,3 +95,35 @@ class TestBuildTransferWrapper:
         assert CCError.deserialize(memoryview(err_bytes)) is None
         out = _FakeOutput.deserialize(result_bytes)
         assert out.y == 'Hi 42'
+
+
+class TestAutoTransferWithConfig:
+    """auto_transfer accepts input/output/buffer kwargs from @cc.transfer."""
+
+    def test_explicit_input_override(self):
+        wrapped = auto_transfer(
+            lambda self, x: ...,
+            input=_FakeInput,
+        )
+        assert callable(wrapped)
+
+    def test_explicit_buffer_hold(self):
+        def my_method(self, x: int) -> int: ...
+        wrapped = auto_transfer(my_method, buffer='hold')
+        assert wrapped._input_buffer_mode == 'hold'
+
+    def test_explicit_output_override(self):
+        def my_method(self, x: int) -> str: ...
+        wrapped = auto_transfer(my_method, output=_FakeOutput)
+        assert callable(wrapped)
+
+    def test_default_buffer_is_view(self):
+        def my_method(self, x: int) -> int: ...
+        wrapped = auto_transfer(my_method)
+        assert wrapped._input_buffer_mode == 'view'
+
+    def test_kwargs_forwarded_to_build(self):
+        """Explicit input/output skip auto-matching."""
+        def my_method(self, x: int) -> str: ...
+        wrapped = auto_transfer(my_method, input=_FakeInput, output=_FakeOutput, buffer='hold')
+        assert wrapped._input_buffer_mode == 'hold'
