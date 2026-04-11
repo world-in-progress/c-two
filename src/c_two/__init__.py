@@ -22,6 +22,7 @@ from .transport.registry import (
     server_address,
     shutdown,
     serve,
+    hold_stats,
 )
 
 def _load_banner(name: str) -> str:
