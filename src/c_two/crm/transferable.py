@@ -329,7 +329,7 @@ def transferable(cls=None):
 
 _VALID_TRANSFER_BUFFERS = frozenset(('view', 'hold'))
 
-def transfer(*, input=None, output=None, buffer='view'):
+def transfer(*, input=None, output=None, buffer=None):
     """Metadata-only decorator for ICRM methods.
 
     Attaches ``__cc_transfer__`` dict to the function. Does NOT wrap it.
@@ -341,12 +341,13 @@ def transfer(*, input=None, output=None, buffer='view'):
         Custom input transferable. None = auto-bundle via pickle.
     output : type[Transferable] | None
         Custom output transferable. None = auto-bundle via pickle.
-    buffer : 'view' | 'hold'
-        Input buffer mode (CRM-side). Default 'view'.
+    buffer : 'view' | 'hold' | None
+        Input buffer mode (CRM-side). None = auto-detect from input
+        transferable's ``from_buffer`` availability. Default None.
     """
-    if buffer not in _VALID_TRANSFER_BUFFERS:
+    if buffer is not None and buffer not in _VALID_TRANSFER_BUFFERS:
         raise ValueError(
-            f"buffer must be one of {sorted(_VALID_TRANSFER_BUFFERS)}, got {buffer!r}"
+            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, got {buffer!r}"
         )
 
     def decorator(func):
@@ -523,21 +524,21 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
     transfer_wrapper._input_buffer_mode = buffer
     return transfer_wrapper
 
-def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
+def auto_transfer(func=None, *, input=None, output=None, buffer=None):
     """Auto-wrap a function with transfer logic.
 
     When called without kwargs, performs auto-matching:
     - Single-param direct match → registered @transferable
-    - Multi-param field-name match (Priority 2) → registered @transferable
     - Return type direct match → registered @transferable
     - Fallback → DynamicInput/OutputTransferable (pickle)
 
-    When called with kwargs (from @cc.transfer metadata), uses provided
-    input/output transferables and fills gaps with auto-matching.
+    Buffer mode auto-detection:
+    - buffer=None (default): 'hold' if input transferable has from_buffer, else 'view'
+    - buffer='view'/'hold': explicit override
     """
     def create_wrapper(func):
-        # --- Input Matching ---
-        input_transferable = input  # explicit override
+        # --- Input Matching --- (KEEP EXISTING CODE EXACTLY AS-IS)
+        input_transferable = input
 
         if input_transferable is None:
             input_model = _create_pydantic_model_from_func_sig(func)
@@ -548,7 +549,6 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
                 is_empty_input = not bool(input_model_fields)
 
                 if not is_empty_input:
-                    # Priority 1: single param whose type is a registered Transferable
                     if len(input_model_fields) == 1:
                         field_info = next(iter(input_model_fields.values()))
                         param_type = field_info.annotation
@@ -557,12 +557,11 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
                         full_name = f'{param_module}.{param_name}' if param_module else param_name
                         input_transferable = get_transferable(full_name)
 
-            # If no matching transferable found, create a default one
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
 
-        # --- Output Matching ---
-        output_transferable = output  # explicit override
+        # --- Output Matching --- (KEEP EXISTING CODE EXACTLY AS-IS)
+        output_transferable = output
 
         if output_transferable is None:
             type_hints = get_type_hints(func)
@@ -575,15 +574,43 @@ def auto_transfer(func=None, *, input=None, output=None, buffer='view'):
                     return_type_name = getattr(return_type, '__name__', str(return_type))
                     return_type_module = getattr(return_type, '__module__', None)
                     return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
-
                     output_transferable = get_transferable(return_type_full_name)
-
-                    # If no matching transferable found, create a default one
                     if output_transferable is None and not (return_type is None or return_type is type(None)):
                         output_transferable = create_default_transferable(func, is_input=False)
 
+        # --- Buffer Mode Resolution (NEW) ---
+        effective_buffer = buffer
+        if effective_buffer is None:
+            # Auto-detect: hold if input transferable has from_buffer
+            has_from_buffer = (
+                input_transferable is not None
+                and hasattr(input_transferable, 'from_buffer')
+                and callable(input_transferable.from_buffer)
+            )
+            effective_buffer = 'hold' if has_from_buffer else 'view'
+            
+            # Log auto-detection
+            if effective_buffer == 'hold':
+                logger.debug(
+                    'Auto-detected hold mode for %s (input type has from_buffer)',
+                    func.__name__,
+                )
+
+        # Validate: hold requires from_buffer on input transferable
+        if effective_buffer == 'hold' and input_transferable is not None:
+            has_fb = (
+                hasattr(input_transferable, 'from_buffer')
+                and callable(input_transferable.from_buffer)
+            )
+            if not has_fb:
+                raise TypeError(
+                    f"buffer='hold' on {func.__name__} requires "
+                    f"{getattr(input_transferable, '__name__', input_transferable)} "
+                    f"to implement from_buffer()"
+                )
+
         # --- Wrapping ---
-        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable, buffer=buffer)
+        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable, buffer=effective_buffer)
         return wrapped_func
 
     if func is None:

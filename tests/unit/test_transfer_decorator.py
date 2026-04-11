@@ -25,6 +25,17 @@ class _FakeOutput(Transferable):
         return _FakeOutput(y=pickle.loads(b))
 
 
+@cc.transferable
+class _FakeInputWithFromBuffer(Transferable):
+    x: int
+    def serialize(d: '_FakeInputWithFromBuffer') -> bytes:
+        return pickle.dumps(d.x)
+    def deserialize(b: bytes) -> '_FakeInputWithFromBuffer':
+        return _FakeInputWithFromBuffer(x=pickle.loads(b))
+    def from_buffer(b: bytes) -> '_FakeInputWithFromBuffer':
+        return _FakeInputWithFromBuffer(x=pickle.loads(b))
+
+
 class TestTransferDecorator:
     """@cc.transfer attaches __cc_transfer__ metadata without wrapping."""
 
@@ -37,7 +48,7 @@ class TestTransferDecorator:
         assert meta is not None
         assert meta['input'] is _FakeInput
         assert meta['output'] is _FakeOutput
-        assert meta['buffer'] == 'view'
+        assert meta['buffer'] is None
 
     def test_buffer_hold(self):
         @transfer(buffer='hold')
@@ -108,7 +119,7 @@ class TestAutoTransferWithConfig:
         assert callable(wrapped)
 
     def test_explicit_buffer_hold(self):
-        def my_method(self, x: int) -> int: ...
+        def my_method(self, data: _FakeInputWithFromBuffer) -> int: ...
         wrapped = auto_transfer(my_method, buffer='hold')
         assert wrapped._input_buffer_mode == 'hold'
 
@@ -125,7 +136,7 @@ class TestAutoTransferWithConfig:
     def test_kwargs_forwarded_to_build(self):
         """Explicit input/output skip auto-matching."""
         def my_method(self, x: int) -> str: ...
-        wrapped = auto_transfer(my_method, input=_FakeInput, output=_FakeOutput, buffer='hold')
+        wrapped = auto_transfer(my_method, input=_FakeInputWithFromBuffer, output=_FakeOutput, buffer='hold')
         assert wrapped._input_buffer_mode == 'hold'
 
 
@@ -135,7 +146,7 @@ class TestIcrmTransferIntegration:
     def test_icrm_picks_up_transfer_metadata(self):
         @cc.icrm(namespace='test.transfer', version='0.1.0')
         class ITest:
-            @transfer(input=_FakeInput, buffer='hold')
+            @transfer(input=_FakeInputWithFromBuffer, buffer='hold')
             def process(self, x: int) -> str:
                 ...
 
@@ -242,7 +253,7 @@ class TestMethodLevelBufferBehavior:
         @cc.icrm(namespace='test.buf.hold', version='0.1.0')
         class IBufHold:
             @transfer(buffer='hold')
-            def process(self, data: bytes) -> str:
+            def process(self, data: _FakeInputWithFromBuffer) -> str:
                 ...
 
         method = getattr(IBufHold, 'process')

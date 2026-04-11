@@ -744,3 +744,101 @@ class TestFromBufferMeta:
 
         assert hasattr(HasBuf, 'from_buffer')
         assert callable(HasBuf.from_buffer)
+
+
+class TestAutoDetectBufferMode:
+    """auto_transfer auto-detects hold mode when from_buffer exists."""
+
+    def _make_type_with_from_buffer(self, name='AutoDetType'):
+        """Helper: create a transferable with from_buffer."""
+        @cc.transferable
+        class _T:
+            x: int
+            def serialize(d: '_T') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> '_T':
+                return _T(x=pickle.loads(b))
+            def from_buffer(b: bytes) -> '_T':
+                return _T(x=pickle.loads(b))
+        
+        # Update the names
+        _T.__name__ = name
+        _T.__qualname__ = name
+        
+        # Re-register with the new name
+        from c_two.crm.transferable import register_transferable
+        register_transferable(_T)
+        
+        return _T
+
+    def _make_type_without_from_buffer(self, name='NoFBType'):
+        """Helper: create a transferable without from_buffer."""
+        @cc.transferable
+        class _T:
+            x: int
+            def serialize(d: '_T') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> '_T':
+                return _T(x=pickle.loads(b))
+        
+        # Update the names
+        _T.__name__ = name
+        _T.__qualname__ = name
+        
+        # Re-register with the new name
+        from c_two.crm.transferable import register_transferable
+        register_transferable(_T)
+        
+        return _T
+
+    def test_auto_hold_when_from_buffer_exists(self):
+        """With from_buffer on input type, auto_transfer defaults to hold."""
+        T = self._make_type_with_from_buffer('AH1')
+        def fn(self, data: T) -> int: ...
+        fn.__module__ = T.__module__
+        wrapped = auto_transfer(fn)
+        assert wrapped._input_buffer_mode == 'hold'
+
+    def test_auto_view_when_no_from_buffer(self):
+        """Without from_buffer, auto_transfer defaults to view."""
+        T = self._make_type_without_from_buffer('AV1')
+        def fn(self, data: T) -> int: ...
+        fn.__module__ = T.__module__
+        wrapped = auto_transfer(fn)
+        assert wrapped._input_buffer_mode == 'view'
+
+    def test_explicit_view_overrides_auto_hold(self):
+        """@cc.transfer(buffer='view') forces view even with from_buffer."""
+        T = self._make_type_with_from_buffer('OV1')
+        def fn(self, data: T) -> int: ...
+        fn.__module__ = T.__module__
+        wrapped = auto_transfer(fn, buffer='view')
+        assert wrapped._input_buffer_mode == 'view'
+
+    def test_explicit_hold_with_from_buffer(self):
+        """@cc.transfer(buffer='hold') works when from_buffer exists."""
+        T = self._make_type_with_from_buffer('EH1')
+        def fn(self, data: T) -> int: ...
+        fn.__module__ = T.__module__
+        wrapped = auto_transfer(fn, buffer='hold')
+        assert wrapped._input_buffer_mode == 'hold'
+
+    def test_explicit_hold_without_from_buffer_raises(self):
+        """@cc.transfer(buffer='hold') without from_buffer raises TypeError."""
+        T = self._make_type_without_from_buffer('EHF1')
+        def fn(self, data: T) -> int: ...
+        fn.__module__ = T.__module__
+        with pytest.raises(TypeError, match='from_buffer'):
+            auto_transfer(fn, buffer='hold')
+
+    def test_default_transferable_always_view(self):
+        """When no registered transferable matches (pickle fallback), always view."""
+        def fn(self, x: int, y: str) -> int: ...
+        wrapped = auto_transfer(fn)
+        assert wrapped._input_buffer_mode == 'view'
+
+    def test_transfer_decorator_accepts_none_buffer(self):
+        """@cc.transfer(buffer=None) is valid (auto-detect)."""
+        @cc.transfer(buffer=None)
+        def fn(self): ...
+        assert fn.__cc_transfer__['buffer'] is None
