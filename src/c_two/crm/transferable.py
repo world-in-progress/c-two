@@ -680,8 +680,10 @@ def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str 
         return create_model(model_name, **fields)
 
     except ValueError: # Handle functions without signatures (like some built-ins)
-        logger.error(f'Could not get signature for {func.__qualname__}')
+        logger.debug(f'Could not get signature for {func.__qualname__}')
         return None
     except Exception as e:
-        logger.error(f'Error creating Pydantic model for {func.__qualname__}: {e}')
+        # Expected for plain classes that Pydantic cannot schema —
+        # auto_transfer falls back to pickle-based serialization.
+        logger.debug(f'Pydantic model skipped for {func.__qualname__}, will use pickle fallback: {e}')
         return None
