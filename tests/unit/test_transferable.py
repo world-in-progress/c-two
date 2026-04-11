@@ -961,3 +961,76 @@ class TestFromBufferDispatch:
         # Should use from_buffer for output when _c2_buffer='hold'
         assert 'from_buffer' in call_log
         assert isinstance(result, cc.HeldResult)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end from_buffer auto-detection via ICRM decorator
+# ---------------------------------------------------------------------------
+
+class TestFromBufferEndToEnd:
+    """End-to-end test: ICRM with from_buffer auto-detects hold mode."""
+
+    def test_icrm_auto_detects_hold_from_from_buffer(self):
+        """An ICRM method whose input type has from_buffer gets hold mode."""
+        import numpy as np
+
+        @cc.transferable
+        class NpData:
+            arr: object  # np.ndarray
+
+            def serialize(d: 'NpData') -> bytes:
+                return d.arr.tobytes()
+
+            def deserialize(b: bytes) -> 'NpData':
+                return NpData(arr=np.frombuffer(b, dtype=np.float64).copy())
+
+            def from_buffer(b: bytes) -> 'NpData':
+                return NpData(arr=np.frombuffer(b, dtype=np.float64))
+
+        @cc.icrm(namespace='test.fb_e2e', version='0.1.0')
+        class ICompute:
+            def process(self, data: NpData) -> int:
+                ...
+
+        # Verify auto-detection set hold mode
+        method = getattr(ICompute, 'process')
+        assert method._input_buffer_mode == 'hold'
+
+    def test_icrm_explicit_view_override(self):
+        """@cc.transfer(buffer='view') overrides auto-detection."""
+        @cc.transferable
+        class BufData:
+            x: int
+            def serialize(d: 'BufData') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> 'BufData':
+                return BufData(x=pickle.loads(b))
+            def from_buffer(b: bytes) -> 'BufData':
+                return BufData(x=pickle.loads(b))
+
+        @cc.icrm(namespace='test.fb_override', version='0.1.0')
+        class IOverride:
+            @cc.transfer(buffer='view')
+            def process(self, data: BufData) -> int:
+                ...
+
+        method = getattr(IOverride, 'process')
+        assert method._input_buffer_mode == 'view'
+
+    def test_icrm_no_from_buffer_stays_view(self):
+        """Without from_buffer, method stays in view mode."""
+        @cc.transferable
+        class PlainData:
+            x: int
+            def serialize(d: 'PlainData') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> 'PlainData':
+                return PlainData(x=pickle.loads(b))
+
+        @cc.icrm(namespace='test.fb_plain', version='0.1.0')
+        class IPlain:
+            def process(self, data: PlainData) -> int:
+                ...
+
+        method = getattr(IPlain, 'process')
+        assert method._input_buffer_mode == 'view'
