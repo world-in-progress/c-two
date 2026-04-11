@@ -681,3 +681,66 @@ class TestComToCrmBufferModes:
         result.release()
         assert mock_resp.released
 
+
+
+class TestFromBufferMeta:
+    """TransferableMeta recognizes from_buffer and converts to staticmethod."""
+
+    def test_from_buffer_converted_to_staticmethod(self):
+        """from_buffer is auto-converted to @staticmethod by TransferableMeta."""
+        @cc.transferable
+        class BufType:
+            value: int
+            def serialize(d: 'BufType') -> bytes:
+                return pickle.dumps(d.value)
+            def deserialize(b: bytes) -> 'BufType':
+                return BufType(value=pickle.loads(b))
+            def from_buffer(b: bytes) -> 'BufType':
+                return BufType(value=int.from_bytes(b[:4], 'little'))
+
+        assert isinstance(
+            inspect.getattr_static(BufType, 'from_buffer'), staticmethod
+        )
+
+    def test_from_buffer_callable(self):
+        """from_buffer works as a static method after decoration."""
+        @cc.transferable
+        class BufType2:
+            value: int
+            def serialize(d: 'BufType2') -> bytes:
+                return d.value.to_bytes(4, 'little')
+            def deserialize(b: bytes) -> 'BufType2':
+                return BufType2(value=int.from_bytes(b[:4], 'little'))
+            def from_buffer(b: bytes) -> 'BufType2':
+                return BufType2(value=int.from_bytes(b[:4], 'little'))
+
+        result = BufType2.from_buffer(b'\x2a\x00\x00\x00')
+        assert result.value == 42
+
+    def test_registered_without_from_buffer(self):
+        """Types with only serialize+deserialize still register fine."""
+        @cc.transferable
+        class NoBuffer:
+            x: int
+            def serialize(d: 'NoBuffer') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> 'NoBuffer':
+                return NoBuffer(x=pickle.loads(b))
+
+        full_name = f'{NoBuffer.__module__}.{NoBuffer.__name__}'
+        assert get_transferable(full_name) is NoBuffer
+
+    def test_has_from_buffer_attribute(self):
+        """Types with from_buffer have it accessible as class attribute."""
+        @cc.transferable
+        class HasBuf:
+            x: int
+            def serialize(d: 'HasBuf') -> bytes:
+                return pickle.dumps(d.x)
+            def deserialize(b: bytes) -> 'HasBuf':
+                return HasBuf(x=pickle.loads(b))
+            def from_buffer(b: bytes) -> 'HasBuf':
+                return HasBuf(x=pickle.loads(b))
+
+        assert hasattr(HasBuf, 'from_buffer')
+        assert callable(HasBuf.from_buffer)

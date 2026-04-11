@@ -122,7 +122,7 @@ class TransferableMeta(ABCMeta):
     TransferableMeta
     --
     A metaclass for Transferable that:
-    1. Automatically converts 'serialize' and 'deserialize' methods to static methods
+    1. Automatically converts 'serialize', 'deserialize', and 'from_buffer' methods to static methods
     2. Ensures all subclasses of Transferable are dataclasses
     3. Registers the transferable class in the global transferable map and transferable information list
     """
@@ -132,6 +132,8 @@ class TransferableMeta(ABCMeta):
             attrs['serialize'] = staticmethod(attrs['serialize'])
         if 'deserialize' in attrs and not isinstance(attrs['deserialize'], staticmethod):
             attrs['deserialize'] = staticmethod(attrs['deserialize'])
+        if 'from_buffer' in attrs and not isinstance(attrs['from_buffer'], staticmethod):
+            attrs['from_buffer'] = staticmethod(attrs['from_buffer'])
         
         # Create the class
         cls = super().__new__(mcs, name, bases, attrs, **kwargs)
