@@ -23,6 +23,7 @@ from c_two.config.ipc import ServerIPCConfig
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_icrm_result
+from .hold_registry import HoldRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,10 @@ class NativeServerBridge:
         self._slots_lock = threading.Lock()
         self._default_name: str | None = None
         self._started = False
+
+        hold_warn = float(os.environ.get('C2_HOLD_WARN_SECONDS', '60'))
+        self._hold_registry = HoldRegistry(warn_threshold=hold_warn)
+        self._hold_sweep_interval = 10
 
         from c_two._native import RustServer
 
@@ -298,6 +303,10 @@ class NativeServerBridge:
                 'Error invoking @on_shutdown for %s', slot.name, exc_info=True,
             )
 
+    def hold_stats(self) -> dict:
+        """Return hold-mode SHM tracking statistics."""
+        return self._hold_registry.stats()
+
     # ------------------------------------------------------------------
     # Dispatch callable factory
     # ------------------------------------------------------------------
@@ -318,6 +327,10 @@ class NativeServerBridge:
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
         shm_threshold = self._shm_threshold
+
+        hold_registry = self._hold_registry
+        hold_sweep_interval = self._hold_sweep_interval
+        hold_dispatch_count = 0
 
         def dispatch(
             _route_name: str, method_idx: int,
@@ -354,9 +367,25 @@ class NativeServerBridge:
                     if not released:
                         release_fn()
             else:  # hold
-                # Pass memoryview directly; RAII handles lifetime
                 mv = memoryview(request_buf)
-                result = method(mv)
+                try:
+                    result = method(mv)
+                finally:
+                    if not getattr(request_buf, 'is_inline', False):
+                        hold_registry.track(request_buf, method_name, route_name)
+
+                nonlocal hold_dispatch_count
+                hold_dispatch_count += 1
+                if hold_dispatch_count % hold_sweep_interval == 0:
+                    for stale in hold_registry.sweep():
+                        age = time.monotonic() - stale.created_at
+                        logger.warning(
+                            "Hold-mode SHM buffer pinned for %.1fs — "
+                            "route=%s method=%s size=%d bytes. "
+                            "CRM may be storing buffer-backed views.",
+                            age, stale.route_name, stale.method_name,
+                            stale.data_len,
+                        )
 
             # 3. Unpack result
             res_part, err_part = unpack_icrm_result(result)
