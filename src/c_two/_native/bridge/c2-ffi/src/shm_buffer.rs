@@ -45,7 +45,7 @@ enum ShmBufferInner {
 /// For SHM-backed buffers, `memoryview(buf)` returns a direct view
 /// into shared memory — zero copies. Call `buf.release()` when done
 /// to free the SHM allocation.
-#[pyclass(name = "ShmBuffer", frozen)]
+#[pyclass(name = "ShmBuffer", frozen, weakref)]
 pub struct PyShmBuffer {
     inner: Mutex<Option<ShmBufferInner>>,
     data_len: usize,
@@ -126,6 +126,13 @@ impl PyShmBuffer {
         let guard = self.inner.lock();
         matches!(guard.as_ref(), Some(ShmBufferInner::Inline(_)))
     }
+
+    /// Number of active buffer protocol exports (memoryviews).
+    #[getter]
+    fn exports(&self) -> u32 {
+        self.exports.load(Ordering::Acquire)
+    }
+
 
     /// Free the underlying SHM block.
     ///
