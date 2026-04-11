@@ -42,7 +42,7 @@ class HoldRegistry:
         self._entries: dict[int, HoldEntry] = {}
         self._counter: int = 0
         self._warn_threshold = warn_threshold
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def track(self, request_buf: object, method_name: str, route_name: str) -> None:
         """Register a hold-mode buffer for tracking.

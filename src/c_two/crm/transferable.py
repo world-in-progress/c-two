@@ -372,7 +372,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
         input_transferable = input.serialize if input else None
         # Output deserializer: from_buffer when hold mode and available
         if output is not None:
-            if _c2_buffer == 'hold' and hasattr(output, 'from_buffer'):
+            if _c2_buffer == 'hold' and hasattr(output, 'from_buffer') and callable(output.from_buffer):
                 output_fn = output.from_buffer
             else:
                 output_fn = output.deserialize
@@ -449,7 +449,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
     def crm_to_com(*args, _release_fn=None):
         # Select input deserializer based on buffer mode
         if input is not None:
-            if buffer == 'hold' and hasattr(input, 'from_buffer'):
+            if buffer == 'hold' and hasattr(input, 'from_buffer') and callable(input.from_buffer):
                 input_fn = input.from_buffer
             else:
                 input_fn = input.deserialize
