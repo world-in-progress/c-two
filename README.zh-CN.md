@@ -205,7 +205,11 @@ class ICompute:
 
 ### cc.hold() — 客户端零拷贝
 
-在客户端，`cc.hold()` 请求响应的共享内存缓冲区保持存活，实现结果的零拷贝读取。返回的 `HeldResult` 包装了值，必须显式释放：
+在客户端，`cc.hold()` 请求响应的共享内存缓冲区保持存活，实现结果的零拷贝读取。返回的 `HeldResult` 包装了值，并提供三层共享内存生命周期安全网：
+
+1. **显式 `.release()`** — 推荐用于同时持有多个缓冲区的复杂工作流
+2. **上下文管理器（`with`）** — 推荐用于单缓冲区作用域
+3. **`__del__` 兜底** — 最后手段，若忘记释放会触发 `ResourceWarning`
 
 ```python
 grid = cc.connect(ICompute, name='compute', address='ipc://server')
@@ -213,11 +217,21 @@ grid = cc.connect(ICompute, name='compute', address='ipc://server')
 # Normal call — buffer released immediately after deserialize
 result = grid.transform(matrix)
 
-# Hold call — SHM buffer stays alive, result is a zero-copy view
+# Option 1: Context manager — clean for single holds
 with cc.hold(grid.transform)(matrix) as held:
     data = held.value          # zero-copy NumPy array backed by SHM
     process(data)              # read directly from shared memory
 # SHM buffer released on context exit
+
+# Option 2: Explicit release — better for multiple concurrent holds
+a = cc.hold(grid.transform)(matrix_a)
+b = cc.hold(grid.transform)(matrix_b)
+try:
+    combined = np.concatenate([a.value.data, b.value.data])
+    process(combined)
+finally:
+    a.release()
+    b.release()
 ```
 
 > **何时使用持有模式：** 适用于反序列化开销占主导的大型数组/列式数据。对于小载荷（< 1 MB），跟踪共享内存生命周期的开销超过拷贝成本。

@@ -168,11 +168,21 @@ class IMyResource:
 ```
 
 ### Hold Mode Pattern
-`cc.hold()` wraps an ICRM bound method for client-side SHM retention. Returns `HeldResult` with `.value` and `.release()`:
+`cc.hold()` wraps an ICRM bound method for client-side SHM retention. Returns `HeldResult` with `.value` and `.release()`. Three-layer safety: explicit `.release()`, context manager, `__del__` fallback:
 ```python
+# Context manager (single hold)
 with cc.hold(proxy.method)(args) as held:
     data = held.value  # zero-copy view backed by SHM
 # SHM released on context exit
+
+# Explicit release (multiple holds)
+a = cc.hold(proxy.method)(args_a)
+b = cc.hold(proxy.method)(args_b)
+try:
+    process(a.value, b.value)
+finally:
+    a.release()
+    b.release()
 ```
 
 Buffer mode auto-detection: when `@cc.transfer(buffer=None)` (default), the framework checks if the input transferable has `from_buffer` → hold, else → view.

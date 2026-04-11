@@ -205,7 +205,11 @@ Without `@cc.transfer`, the framework automatically matches registered `@transfe
 
 ### cc.hold() — Client-Side Zero-Copy
 
-On the client side, `cc.hold()` requests that the response SHM buffer remain alive, enabling zero-copy reads of the result. The returned `HeldResult` wraps the value and must be explicitly released:
+On the client side, `cc.hold()` requests that the response SHM buffer remain alive, enabling zero-copy reads of the result. The returned `HeldResult` wraps the value and provides a three-layer safety net for SHM lifecycle:
+
+1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
+2. **Context manager (`with`)** — recommended for single-buffer scopes
+3. **`__del__` fallback** — last resort, emits `ResourceWarning` if you forget to release
 
 ```python
 grid = cc.connect(ICompute, name='compute', address='ipc://server')
@@ -213,11 +217,21 @@ grid = cc.connect(ICompute, name='compute', address='ipc://server')
 # Normal call — buffer released immediately after deserialize
 result = grid.transform(matrix)
 
-# Hold call — SHM buffer stays alive, result is a zero-copy view
+# Option 1: Context manager — clean for single holds
 with cc.hold(grid.transform)(matrix) as held:
     data = held.value          # zero-copy NumPy array backed by SHM
     process(data)              # read directly from shared memory
 # SHM buffer released on context exit
+
+# Option 2: Explicit release — better for multiple concurrent holds
+a = cc.hold(grid.transform)(matrix_a)
+b = cc.hold(grid.transform)(matrix_b)
+try:
+    combined = np.concatenate([a.value.data, b.value.data])
+    process(combined)
+finally:
+    a.release()
+    b.release()
 ```
 
 > **When to use hold mode:** Large array/columnar data where deserialization dominates cost. For small payloads (< 1 MB), the overhead of tracking SHM lifecycle exceeds the copy cost.
