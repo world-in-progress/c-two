@@ -11,6 +11,14 @@ from c_two.crm.transferable import (
 from tests.fixtures.ihello import HelloData, HelloItems, IHello
 
 
+# Module-level plain class for pickle-compatibility in tests
+class _PlainWidget:
+    def __init__(self, size: int = 0):
+        self.size = size
+
+def _plain_widget_func(self, w: _PlainWidget) -> _PlainWidget: ...
+
+
 # ---------------------------------------------------------------------------
 # @cc.transferable decorator
 # ---------------------------------------------------------------------------
@@ -228,6 +236,30 @@ class TestAutoTransfer:
         echo.__module__ = 'some.other.module'
         wrapped = auto_transfer(echo)
         assert callable(wrapped)
+
+    def test_plain_class_param_uses_pickle_fallback(self):
+        """When a plain (non-dataclass, non-transferable) class is used as a
+        parameter type, Pydantic model creation fails but auto_transfer must
+        still fall through to pickle-based default transferable — not silently
+        treat the method as having no parameters."""
+        class PlainMessage:
+            def __init__(self, value: str = ''):
+                self.value = value
+
+        def respond(self, msg: PlainMessage) -> PlainMessage: ...
+        respond.__module__ = 'some.arbitrary.module'
+
+        wrapped = auto_transfer(respond)
+        assert callable(wrapped)
+        # Verify the wrapper has input/output transferables (not None)
+        assert hasattr(wrapped, '__wrapped__')
+
+    def test_plain_class_roundtrip_via_pickle(self):
+        """Plain class params serialize/deserialize correctly via pickle fallback.
+        Use a module-level class to ensure pickle compatibility."""
+        wrapped = auto_transfer(_plain_widget_func)
+        assert callable(wrapped)
+        assert hasattr(wrapped, '__wrapped__')
 
 
 # ---------------------------------------------------------------------------

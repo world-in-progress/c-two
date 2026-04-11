@@ -570,6 +570,13 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                         param_name = getattr(param_type, '__name__', str(param_type))
                         full_name = f'{param_module}.{param_name}' if param_module else param_name
                         input_transferable = get_transferable(full_name)
+            else:
+                # Pydantic model creation failed (e.g. arbitrary type) —
+                # check actual signature to decide if params exist.
+                sig = inspect.signature(func)
+                params = [n for i, n in enumerate(sig.parameters)
+                          if not (i == 0 and n in ('self', 'cls'))]
+                is_empty_input = len(params) == 0
 
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
