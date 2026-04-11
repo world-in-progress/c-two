@@ -6,7 +6,7 @@ from c_two.crm.transferable import (
     Transferable, TransferableMeta,
     register_transferable, get_transferable,
     create_default_transferable, auto_transfer,
-    _create_pydantic_model_from_func_sig, _TRANSFERABLE_MAP,
+    _extract_func_params, _TRANSFERABLE_MAP,
 )
 from tests.fixtures.ihello import HelloData, HelloItems, IHello
 
@@ -263,43 +263,51 @@ class TestAutoTransfer:
 
 
 # ---------------------------------------------------------------------------
-# _create_pydantic_model_from_func_sig
+# _extract_func_params
 # ---------------------------------------------------------------------------
 
-class TestPydanticModelFromSig:
+class TestExtractFuncParams:
     def test_basic_fields(self):
         def fn(a: int, b: str) -> bool: ...
-        model = _create_pydantic_model_from_func_sig(fn)
-        fields = model.model_fields
-        assert 'a' in fields
-        assert 'b' in fields
-        assert fields['a'].annotation is int
-        assert fields['b'].annotation is str
+        params = _extract_func_params(fn)
+        assert len(params) == 2
+        assert params[0] == ('a', int, ...)
+        assert params[1] == ('b', str, ...)
 
     def test_skips_self(self):
         def fn(self, x: float) -> None: ...
-        model = _create_pydantic_model_from_func_sig(fn)
-        fields = model.model_fields
-        assert 'self' not in fields
-        assert 'x' in fields
-        assert fields['x'].annotation is float
+        params = _extract_func_params(fn)
+        assert len(params) == 1
+        assert params[0][0] == 'x'
+        assert params[0][1] is float
 
     def test_skips_cls(self):
         def fn(cls, y: int) -> None: ...
-        model = _create_pydantic_model_from_func_sig(fn)
-        fields = model.model_fields
-        assert 'cls' not in fields
-        assert 'y' in fields
+        params = _extract_func_params(fn)
+        assert len(params) == 1
+        assert params[0][0] == 'y'
 
     def test_empty_after_self(self):
         def fn(self) -> None: ...
-        model = _create_pydantic_model_from_func_sig(fn)
-        assert model.model_fields == {}
+        params = _extract_func_params(fn)
+        assert params == []
 
     def test_preserves_defaults(self):
         def fn(a: int, b: str = 'hi') -> None: ...
-        model = _create_pydantic_model_from_func_sig(fn)
-        assert model.model_fields['b'].default == 'hi'
+        params = _extract_func_params(fn)
+        assert params[1][2] == 'hi'
+
+    def test_plain_class_param(self):
+        """Plain classes that would fail Pydantic are handled fine."""
+        class Arbitrary:
+            def __init__(self, x: int = 0):
+                self.x = x
+
+        def fn(self, msg: Arbitrary) -> None: ...
+        params = _extract_func_params(fn)
+        assert len(params) == 1
+        assert params[0][0] == 'msg'
+        assert params[0][1] is Arbitrary
 
 
 # ---------------------------------------------------------------------------

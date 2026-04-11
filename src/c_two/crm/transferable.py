@@ -7,7 +7,6 @@ import threading
 import warnings
 from abc import ABCMeta
 from functools import wraps
-from pydantic import BaseModel, create_model
 from dataclasses import dataclass, is_dataclass
 from typing import get_type_hints, Any, Callable, TypeVar, Type
 
@@ -551,37 +550,24 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
     - buffer='view'/'hold': explicit override
     """
     def create_wrapper(func):
-        # --- Input Matching --- (KEEP EXISTING CODE EXACTLY AS-IS)
+        # --- Input Matching ---
         input_transferable = input
 
         if input_transferable is None:
-            input_model = _create_pydantic_model_from_func_sig(func)
-            is_empty_input = True
+            func_params = _extract_func_params(func)
+            is_empty_input = len(func_params) == 0
 
-            if input_model is not None:
-                input_model_fields = getattr(input_model, 'model_fields', {})
-                is_empty_input = not bool(input_model_fields)
-
-                if not is_empty_input:
-                    if len(input_model_fields) == 1:
-                        field_info = next(iter(input_model_fields.values()))
-                        param_type = field_info.annotation
-                        param_module = getattr(param_type, '__module__', None)
-                        param_name = getattr(param_type, '__name__', str(param_type))
-                        full_name = f'{param_module}.{param_name}' if param_module else param_name
-                        input_transferable = get_transferable(full_name)
-            else:
-                # Pydantic model creation failed (e.g. arbitrary type) —
-                # check actual signature to decide if params exist.
-                sig = inspect.signature(func)
-                params = [n for i, n in enumerate(sig.parameters)
-                          if not (i == 0 and n in ('self', 'cls'))]
-                is_empty_input = len(params) == 0
+            if not is_empty_input and len(func_params) == 1:
+                _, param_type, _ = func_params[0]
+                param_module = getattr(param_type, '__module__', None)
+                param_name = getattr(param_type, '__name__', str(param_type))
+                full_name = f'{param_module}.{param_name}' if param_module else param_name
+                input_transferable = get_transferable(full_name)
 
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
 
-        # --- Output Matching --- (KEEP EXISTING CODE EXACTLY AS-IS)
+        # --- Output Matching ---
         output_transferable = output
 
         if output_transferable is None:
@@ -643,47 +629,27 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
 
 # Helpers #########################################################################
 
-def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str = "InputModel") -> type[BaseModel] | None:
+def _extract_func_params(func: Callable) -> list[tuple[str, type, Any]]:
     """
-    Creates a Pydantic model representing the input signature of a function,
-    skipping the first parameter if it's 'self' or 'cls'.
-    Returns None if signature cannot be determined or on error.
+    Extract input parameters from a function signature using pure inspect.
+
+    Returns a list of (name, annotation, default) tuples, skipping 'self'/'cls'.
+    Returns an empty list if the function has no parameters (beyond self/cls)
+    or if the signature cannot be determined.
     """
     try:
-        signature = inspect.signature(func)
+        sig = inspect.signature(func)
         type_hints = get_type_hints(func)
+    except (ValueError, TypeError):
+        return []
 
-        fields = {}
-        param_names = list(signature.parameters.keys())
-
-        for i, name in enumerate(param_names):
-            param = signature.parameters[name]
-            # Skip 'self' or 'cls' only if it's the *first* parameter
-            if i == 0 and name in ('self', 'cls'):
-                continue
-            
-            annotation = type_hints.get(name, param.annotation)
-            # Pydantic needs Ellipsis (...) for required fields without defaults
-            default = ... if param.default is inspect.Parameter.empty else param.default
-            # Use Any if no annotation found, Pydantic handles Any
-            actual_annotation = annotation if annotation is not inspect.Parameter.empty else Any
-
-            fields[name] = (actual_annotation, default)
-
-        # Create the dynamic model
-        model_name = f"{func.__qualname__.replace('.', '_')}_{model_name_suffix}"
-        # Handle functions with no relevant parameters (e.g., only self)
-        if not fields:
-             # Return an empty model definition
-             return create_model(model_name)
-
-        return create_model(model_name, **fields)
-
-    except ValueError: # Handle functions without signatures (like some built-ins)
-        logger.debug(f'Could not get signature for {func.__qualname__}')
-        return None
-    except Exception as e:
-        # Expected for plain classes that Pydantic cannot schema —
-        # auto_transfer falls back to pickle-based serialization.
-        logger.debug(f'Pydantic model skipped for {func.__qualname__}, will use pickle fallback: {e}')
-        return None
+    params = []
+    for i, (name, param) in enumerate(sig.parameters.items()):
+        if i == 0 and name in ('self', 'cls'):
+            continue
+        annotation = type_hints.get(name, param.annotation)
+        if annotation is inspect.Parameter.empty:
+            annotation = Any
+        default = param.default if param.default is not inspect.Parameter.empty else ...
+        params.append((name, annotation, default))
+    return params
