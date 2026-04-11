@@ -842,3 +842,122 @@ class TestAutoDetectBufferMode:
         @cc.transfer(buffer=None)
         def fn(self): ...
         assert fn.__cc_transfer__['buffer'] is None
+
+
+class TestFromBufferDispatch:
+    """_build_transfer_wrapper uses from_buffer in hold mode, deserialize in view."""
+
+    def test_crm_to_com_hold_uses_from_buffer(self):
+        """In hold mode, crm_to_com should call from_buffer instead of deserialize."""
+        call_log = []
+
+        @cc.transferable
+        class FBDispatch1:
+            x: int
+            def serialize(d: 'FBDispatch1') -> bytes:
+                return d.x.to_bytes(4, 'little')
+            def deserialize(b: bytes) -> 'FBDispatch1':
+                call_log.append('deserialize')
+                return FBDispatch1(x=int.from_bytes(b[:4], 'little'))
+            def from_buffer(b: bytes) -> 'FBDispatch1':
+                call_log.append('from_buffer')
+                return FBDispatch1(x=int.from_bytes(b[:4], 'little'))
+
+        from c_two.crm.transferable import _build_transfer_wrapper
+
+        def my_method(self, data: 'FBDispatch1') -> int: ...
+        wrapper = _build_transfer_wrapper(my_method, input=FBDispatch1, buffer='hold')
+
+        # Simulate server-side call (direction='<-')
+        class FakeICRM:
+            direction = '<-'
+            class crm:
+                @staticmethod
+                def my_method(data):
+                    return data.x
+        icrm = FakeICRM()
+
+        call_log.clear()
+        payload = FBDispatch1.serialize(FBDispatch1(x=7))
+        result = wrapper(icrm, memoryview(payload))
+
+        assert 'from_buffer' in call_log
+        assert 'deserialize' not in call_log
+
+    def test_crm_to_com_view_uses_deserialize(self):
+        """In view mode, crm_to_com should call deserialize, not from_buffer."""
+        call_log = []
+
+        @cc.transferable
+        class FBDispatch2:
+            x: int
+            def serialize(d: 'FBDispatch2') -> bytes:
+                return d.x.to_bytes(4, 'little')
+            def deserialize(b: bytes) -> 'FBDispatch2':
+                call_log.append('deserialize')
+                return FBDispatch2(x=int.from_bytes(b[:4], 'little'))
+            def from_buffer(b: bytes) -> 'FBDispatch2':
+                call_log.append('from_buffer')
+                return FBDispatch2(x=int.from_bytes(b[:4], 'little'))
+
+        from c_two.crm.transferable import _build_transfer_wrapper
+
+        def my_method(self, data: 'FBDispatch2') -> int: ...
+        wrapper = _build_transfer_wrapper(my_method, input=FBDispatch2, buffer='view')
+
+        class FakeICRM:
+            direction = '<-'
+            class crm:
+                @staticmethod
+                def my_method(data):
+                    return data.x
+        icrm = FakeICRM()
+
+        call_log.clear()
+        payload = FBDispatch2.serialize(FBDispatch2(x=7))
+        released = False
+        def release_fn():
+            nonlocal released
+            released = True
+        result = wrapper(icrm, memoryview(payload), _release_fn=release_fn)
+
+        assert 'deserialize' in call_log
+        assert 'from_buffer' not in call_log
+        assert released
+
+    def test_com_to_crm_hold_prefers_from_buffer(self):
+        """Client-side hold mode uses from_buffer for output when available."""
+        call_log = []
+
+        @cc.transferable
+        class FBDispatch3:
+            x: int
+            def serialize(d: 'FBDispatch3') -> bytes:
+                return d.x.to_bytes(4, 'little')
+            def deserialize(b: bytes) -> 'FBDispatch3':
+                call_log.append('deserialize')
+                return FBDispatch3(x=int.from_bytes(b[:4], 'little'))
+            def from_buffer(b: bytes) -> 'FBDispatch3':
+                call_log.append('from_buffer')
+                return FBDispatch3(x=int.from_bytes(b[:4], 'little'))
+
+        from c_two.crm.transferable import _build_transfer_wrapper
+
+        def my_method(self) -> 'FBDispatch3': ...
+        wrapper = _build_transfer_wrapper(my_method, output=FBDispatch3, buffer='view')
+
+        class FakeClient:
+            supports_direct_call = False
+            def call(self, method_name, args):
+                return b'\x07\x00\x00\x00'
+
+        class FakeICRM:
+            direction = '->'
+            client = FakeClient()
+
+        icrm = FakeICRM()
+        call_log.clear()
+        result = wrapper(icrm, _c2_buffer='hold')
+        # Should use from_buffer for output when _c2_buffer='hold'
+        assert 'from_buffer' in call_log
+        assert isinstance(result, cc.HeldResult)

@@ -370,7 +370,14 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
 
     def com_to_crm(*args, _c2_buffer=None):
         input_transferable = input.serialize if input else None
-        output_transferable = output.deserialize if output else None
+        # Output deserializer: from_buffer when hold mode and available
+        if output is not None:
+            if _c2_buffer == 'hold' and hasattr(output, 'from_buffer'):
+                output_fn = output.from_buffer
+            else:
+                output_fn = output.deserialize
+        else:
+            output_fn = None
 
         try:
             if len(args) < 1:
@@ -395,7 +402,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             response = client.call(method_name, serialized_args)
 
             stage = 'deserialize_output'
-            if not output_transferable:
+            if not output_fn:
                 if hasattr(response, 'release'):
                     response.release()
                 if _c2_buffer == 'hold':
@@ -405,7 +412,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             if hasattr(response, 'release'):
                 mv = memoryview(response)
                 if _c2_buffer == 'hold':
-                    result = output_transferable(mv)
+                    result = output_fn(mv)
                     def release_cb():
                         mv.release()
                         try:
@@ -416,7 +423,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 else:
                     # view (default)
                     try:
-                        result = output_transferable(mv)
+                        result = output_fn(mv)
                         if isinstance(result, memoryview):
                             result = bytes(result)
                     finally:
@@ -424,7 +431,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                         response.release()
                     return result
             else:
-                result = output_transferable(response)
+                result = output_fn(response)
                 if _c2_buffer == 'hold':
                     return HeldResult(result, None)
                 return result
@@ -440,7 +447,14 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 raise error.CompoDeserializeOutput(str(e)) from e
 
     def crm_to_com(*args, _release_fn=None):
-        input_transferable = input.deserialize if input else None
+        # Select input deserializer based on buffer mode
+        if input is not None:
+            if buffer == 'hold' and hasattr(input, 'from_buffer'):
+                input_fn = input.from_buffer
+            else:
+                input_fn = input.deserialize
+        else:
+            input_fn = None
         output_transferable = output.serialize if output else None
         input_buffer_mode = buffer
 
@@ -456,14 +470,14 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             crm = iicrm.crm
             request = args[1] if len(args) > 1 else None
 
-            if request is not None and input_transferable is not None:
+            if request is not None and input_fn is not None:
                 if input_buffer_mode == 'view':
-                    deserialized_args = input_transferable(request)
+                    deserialized_args = input_fn(request)
                     if _release_fn is not None:
                         _release_fn()
                         _release_fn = None
                 else:  # hold
-                    deserialized_args = input_transferable(request)
+                    deserialized_args = input_fn(request)
             else:
                 deserialized_args = tuple()
                 if _release_fn is not None:
