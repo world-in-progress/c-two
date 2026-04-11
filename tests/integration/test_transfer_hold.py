@@ -2,9 +2,17 @@
 import pytest
 import c_two as cc
 from c_two.crm.transferable import HeldResult
+from c_two.transport.registry import _ProcessRegistry
 
 from tests.fixtures.ihello import IHello
 from tests.fixtures.hello import Hello
+
+
+@pytest.fixture(autouse=True)
+def _cleanup():
+    yield
+    cc.shutdown()
+    _ProcessRegistry._instance = None
 
 
 class TestIPCHoldMode:
