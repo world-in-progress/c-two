@@ -6,10 +6,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 from grid.transferables import (
-    GridInfo,
-    GridInfos,
     GridSchema,
-    PeerGridInfos,
     GridAttribute,
 )
 

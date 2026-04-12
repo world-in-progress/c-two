@@ -100,7 +100,7 @@ def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
     cc.set_client_ipc_config(segment_size=seg_size, max_segments=8,
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IEcho, Echo(), name='echo_b')
     _wait_sock(address)
 
@@ -144,7 +144,7 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
     cc.set_client_ipc_config(segment_size=seg_size, max_segments=8,
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IDictEcho, DictEcho(), name='echo_d')
     _wait_sock(address)
 

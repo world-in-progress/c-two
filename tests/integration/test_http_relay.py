@@ -86,7 +86,7 @@ def relay_stack():
     http_port = 19000 + _next_id()
 
     # Register CRMs via SOTA API.
-    cc.set_address(ipc_addr)
+    cc.set_ipc_address(ipc_addr)
     cc.register(IHello, Hello(), name='hello')
     cc.register(ICounter, Counter(), name='counter')
 
@@ -285,7 +285,7 @@ class TestRelayControlPlane:
         ipc_addr = f'ipc://ctrl_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
-        cc.set_address(ipc_addr)
+        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
@@ -326,7 +326,7 @@ class TestRelayControlPlane:
         ipc_addr = f'ipc://dup_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
-        cc.set_address(ipc_addr)
+        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
@@ -357,7 +357,7 @@ class TestRelayControlPlane:
         ipc_addr = f'ipc://unreg_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
-        cc.set_address(ipc_addr)
+        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
@@ -418,7 +418,7 @@ class TestRelayControlPlane:
         ipc_addr = f'ipc://health_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
-        cc.set_address(ipc_addr)
+        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
         cc.register(ICounter, Counter(), name='counter')
 

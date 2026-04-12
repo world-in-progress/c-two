@@ -2,16 +2,103 @@ from __future__ import annotations
 import pickle
 import inspect
 import logging
+import sys
 import threading
+import warnings
 from abc import ABCMeta
 from functools import wraps
-from pydantic import BaseModel, create_model
 from dataclasses import dataclass, is_dataclass
-from typing import get_type_hints, get_args, get_origin, Any, Callable, TypeVar, Type
+from typing import get_type_hints, Any, Callable, TypeVar, Type
 
 import struct as _struct
 
 from .. import error
+
+
+R = TypeVar('R')
+
+
+class HeldResult:
+    """Wraps a method return value with explicit SHM lifecycle control.
+
+    Three-layer safety net:
+    1. Explicit .release() — preferred
+    2. Context manager (__enter__/__exit__) — recommended
+    3. __del__ fallback — last resort with warning
+    """
+
+    __slots__ = ('_value', '_release_cb', '_released')
+
+    def __init__(self, value, release_cb=None):
+        self._value = value
+        self._release_cb = release_cb
+        self._released = False
+
+    @property
+    def value(self):
+        if self._released:
+            raise RuntimeError("SHM released — value no longer accessible")
+        return self._value
+
+    def release(self):
+        if not self._released:
+            self._released = True
+            cb = self._release_cb
+            self._release_cb = None
+            self._value = None
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+    def __del__(self, _is_finalizing=sys.is_finalizing, _warn=warnings.warn):
+        # NOTE: _is_finalizing and _warn are bound as default args at class
+        # definition time so they survive late interpreter teardown.
+        if getattr(self, '_released', True):
+            return
+        if _is_finalizing():
+            self.release()
+            return
+        _warn(
+            "HeldResult was garbage-collected without release() — "
+            "potential SHM leak. Use 'with cc.hold(...)' or call .release().",
+            ResourceWarning,
+            stacklevel=2,
+        )
+        self.release()
+
+
+def hold(method):
+    """Wrap an ICRM bound method to hold SHM on the response.
+
+    Usage: ``cc.hold(proxy.method)(args)`` — single-shot pattern.
+    Returns a callable that injects ``_c2_buffer='hold'`` into kwargs.
+    """
+    if not callable(method):
+        raise TypeError(
+            f"cc.hold() requires a callable, got {type(method).__name__}"
+        )
+    self_obj = getattr(method, '__self__', None)
+    name = getattr(method, '__name__', None)
+    if self_obj is None or name is None:
+        raise TypeError(
+            "cc.hold() requires a bound ICRM method, "
+            "e.g. cc.hold(grid.compute)"
+        )
+
+    @wraps(method)
+    def wrapper(*args, **kwargs):
+        kwargs['_c2_buffer'] = 'hold'
+        return getattr(self_obj, name)(*args, **kwargs)
+
+    return wrapper
 
 
 def _add_length_prefix(message_bytes):
@@ -25,7 +112,6 @@ logger = logging.getLogger(__name__)
 # Global Caches ###################################################################
 
 _TRANSFERABLE_MAP: dict[str, Transferable] = {}
-_TRANSFERABLE_INFOS: list[dict[str, dict[str, type] | str]] = []
 _TRANSFERABLE_LOCK = threading.Lock()
 
 # Definition of Transferable ######################################################
@@ -35,7 +121,7 @@ class TransferableMeta(ABCMeta):
     TransferableMeta
     --
     A metaclass for Transferable that:
-    1. Automatically converts 'serialize' and 'deserialize' methods to static methods
+    1. Automatically converts 'serialize', 'deserialize', and 'from_buffer' methods to static methods
     2. Ensures all subclasses of Transferable are dataclasses
     3. Registers the transferable class in the global transferable map and transferable information list
     """
@@ -45,6 +131,8 @@ class TransferableMeta(ABCMeta):
             attrs['serialize'] = staticmethod(attrs['serialize'])
         if 'deserialize' in attrs and not isinstance(attrs['deserialize'], staticmethod):
             attrs['deserialize'] = staticmethod(attrs['deserialize'])
+        if 'from_buffer' in attrs and not isinstance(attrs['from_buffer'], staticmethod):
+            attrs['from_buffer'] = staticmethod(attrs['from_buffer'])
         
         # Create the class
         cls = super().__new__(mcs, name, bases, attrs, **kwargs)
@@ -58,19 +146,6 @@ class TransferableMeta(ABCMeta):
             if cls.__module__ != 'Default':
                 # Register the class in the global transferable map
                 full_name = register_transferable(cls)
-                
-                # Register the class in the global transferable information list
-                serialize_func = attrs['serialize']
-                serialize_sig = list(inspect.signature(serialize_func).parameters.values())
-                serialize_param_map = {}
-                for param in serialize_sig:
-                    serialize_param_map[param.name] = param.annotation
-                with _TRANSFERABLE_LOCK:
-                    _TRANSFERABLE_INFOS.append({
-                        'name': full_name,
-                        'module': cls.__module__,
-                        'param_map': serialize_param_map
-                    })
 
                 logger.debug(f'Registered transferable: {full_name}')
         return cls
@@ -85,8 +160,6 @@ class Transferable(metaclass=TransferableMeta):
     - deserialize: convert `bytes` message to runtime `args`
 
     """
-
-    _buffer_mode: str = 'copy'  # 'copy' | 'view' | 'hold'
 
     def serialize(*args: any) -> bytes:
         """
@@ -189,8 +262,6 @@ def create_default_transferable(func, is_input: bool):
         DynamicInputTransferable._type_hints = type_hints
         DynamicInputTransferable.__qualname__ = class_name
         DynamicInputTransferable._param_names = filtered_params
-        DynamicInputTransferable._buffer_mode = 'view'
-        
         return DynamicInputTransferable
     
     else:
@@ -224,8 +295,6 @@ def create_default_transferable(func, is_input: bool):
         DynamicOutputTransferable._original_func = func
         DynamicOutputTransferable.__qualname__ = class_name
         DynamicOutputTransferable._return_type = return_type
-        DynamicOutputTransferable._buffer_mode = 'view'
-        
         return DynamicOutputTransferable
 
 # Transferable-related interfaces #################################################
@@ -242,342 +311,345 @@ def get_transferable(full_name: str) -> Transferable | None:
 
 # Transferable-related decorators #################################################
 
-_VALID_BUFFER_MODES = frozenset(('copy', 'view', 'hold'))
-
-def transferable(cls=None, *, buffer: str = 'copy'):
+def transferable(cls=None):
     """Decorator to make a class inherit from Transferable.
 
-    Supports both ``@cc.transferable`` and ``@cc.transferable(buffer='view')``.
+    Supports both ``@cc.transferable`` and ``@cc.transferable()``.
     """
-    if buffer not in _VALID_BUFFER_MODES:
-        raise ValueError(
-            f"buffer must be one of {sorted(_VALID_BUFFER_MODES)}, got {buffer!r}"
-        )
-
     def wrap(cls):
         new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
         new_cls.__module__ = cls.__module__
         new_cls.__qualname__ = cls.__qualname__
-        new_cls._buffer_mode = buffer
         return new_cls
 
     if cls is not None:
-        # Called as @cc.transferable (no parentheses)
         return wrap(cls)
-    # Called as @cc.transferable(buffer='view')
     return wrap
 
-def transfer(input: Transferable | None = None, output: Transferable | None = None) -> callable:
+_VALID_TRANSFER_BUFFERS = frozenset(('view', 'hold'))
 
-    def decorator(func: callable) -> callable:
-        method_name = func.__name__
-        
-        def com_to_crm(*args: any) -> any:
-            # Get transferable
-            input_transferable = input.serialize if input else None
-            output_transferable = output.deserialize if output else None
-            output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
+def transfer(*, input=None, output=None, buffer=None):
+    """Metadata-only decorator for ICRM methods.
 
-            try:
-                if len(args) < 1:
-                    raise ValueError('Instance method requires self, but only get one argument.')
-                
-                # Parse input args
-                icrm = args[0]
-                client = icrm.client
-                request = args[1:] if len(args) > 1 else None
+    Attaches ``__cc_transfer__`` dict to the function. Does NOT wrap it.
+    Consumed by ``icrm()`` → ``auto_transfer()`` at class decoration time.
 
-                # Thread fast path — skip all serialization/deserialization
-                if getattr(client, 'supports_direct_call', False):
-                    return client.call_direct(method_name, request or ())
-                
-                # Standard cross-process path
-                stage = 'serialize_input'
-                serialized_args = input_transferable(*request) if (request is not None and input_transferable is not None) else None
-                
-                # Call CRM
-                stage = 'call_crm'
-                response = client.call(method_name, serialized_args)
-                
-                # Deserialize output
-                stage = 'deserialize_output'
-                if not output_transferable:
-                    if hasattr(response, 'release'):
-                        response.release()
-                    return None
-                if hasattr(response, 'release'):
-                    mv = memoryview(response)
-                    if output_buffer_mode == 'copy':
-                        try:
-                            data = bytes(mv)
-                        finally:
-                            mv.release()
-                            response.release()
-                        result = output_transferable(data)
-                    elif output_buffer_mode == 'view':
-                        try:
-                            result = output_transferable(mv)
-                            if isinstance(result, memoryview):
-                                result = bytes(result)
-                        finally:
-                            mv.release()
-                            response.release()
-                    else:  # hold — RAII, no explicit release
-                        result = output_transferable(mv)
-                else:
-                    result = output_transferable(response)
+    Parameters
+    ----------
+    input : type[Transferable] | None
+        Custom input transferable. None = auto-bundle via pickle.
+    output : type[Transferable] | None
+        Custom output transferable. None = auto-bundle via pickle.
+    buffer : 'view' | 'hold' | None
+        Input buffer mode (CRM-side). None = auto-detect from input
+        transferable's ``from_buffer`` availability. Default None.
+    """
+    if buffer is not None and buffer not in _VALID_TRANSFER_BUFFERS:
+        raise ValueError(
+            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, got {buffer!r}"
+        )
+
+    def decorator(func):
+        func.__cc_transfer__ = {
+            'input': input,
+            'output': output,
+            'buffer': buffer,
+        }
+        return func  # NO wrapping
+    return decorator
+
+
+def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
+    """Build the com_to_crm / crm_to_com / transfer_wrapper closure.
+
+    This is the internal implementation that was previously inside transfer().
+    Called by auto_transfer() after resolving input/output transferables.
+    """
+    method_name = func.__name__
+
+    def com_to_crm(*args, _c2_buffer=None):
+        input_transferable = input.serialize if input else None
+        # Output deserializer: from_buffer when hold mode and available
+        if output is not None:
+            if _c2_buffer == 'hold' and hasattr(output, 'from_buffer') and callable(output.from_buffer):
+                output_fn = output.from_buffer
+            else:
+                output_fn = output.deserialize
+        else:
+            output_fn = None
+
+        try:
+            if len(args) < 1:
+                raise ValueError('Instance method requires self, but only get one argument.')
+
+            icrm = args[0]
+            client = icrm.client
+            request = args[1:] if len(args) > 1 else None
+
+            # Thread fast path — skip all serialization/deserialization
+            if getattr(client, 'supports_direct_call', False):
+                result = client.call_direct(method_name, request or ())
+                if _c2_buffer == 'hold':
+                    return HeldResult(result, None)
                 return result
-            
-            except error.CCBaseError:
-                raise
-            except Exception as e:
-                if stage == 'serialize_input':
-                    raise error.CompoSerializeInput(str(e)) from e
-                elif stage == 'call_crm':
-                    raise error.CompoCRMCalling(str(e)) from e
+
+            # Standard cross-process path
+            stage = 'serialize_input'
+            serialized_args = input_transferable(*request) if (request is not None and input_transferable is not None) else None
+
+            stage = 'call_crm'
+            response = client.call(method_name, serialized_args)
+
+            stage = 'deserialize_output'
+            if not output_fn:
+                if hasattr(response, 'release'):
+                    response.release()
+                if _c2_buffer == 'hold':
+                    return HeldResult(None, None)
+                return None
+
+            if hasattr(response, 'release'):
+                mv = memoryview(response)
+                if _c2_buffer == 'hold':
+                    result = output_fn(mv)
+                    def release_cb():
+                        mv.release()
+                        try:
+                            response.release()
+                        except Exception:
+                            pass
+                    return HeldResult(result, release_cb)
                 else:
-                    raise error.CompoDeserializeOutput(str(e)) from e
-        
-        def crm_to_com(*args: any, _release_fn=None) -> tuple[any, any]:
-            input_transferable = input.deserialize if input else None
-            output_transferable = output.serialize if output else None
-            input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
+                    # view (default)
+                    try:
+                        result = output_fn(mv)
+                        if isinstance(result, memoryview):
+                            result = bytes(result)
+                    finally:
+                        mv.release()
+                        response.release()
+                    return result
+            else:
+                result = output_fn(response)
+                if _c2_buffer == 'hold':
+                    return HeldResult(result, None)
+                return result
 
-            err = None
-            result = None
-            stage = 'deserialize_input'
+        except error.CCBaseError:
+            raise
+        except Exception as e:
+            if stage == 'serialize_input':
+                raise error.CompoSerializeInput(str(e)) from e
+            elif stage == 'call_crm':
+                raise error.CompoCRMCalling(str(e)) from e
+            else:
+                raise error.CompoDeserializeOutput(str(e)) from e
 
-            try:
-                if len(args) < 1:
-                    raise ValueError('Instance method requires self, but only get one argument.')
+    def crm_to_com(*args, _release_fn=None):
+        # Select input deserializer based on buffer mode
+        if input is not None:
+            if buffer == 'hold' and hasattr(input, 'from_buffer') and callable(input.from_buffer):
+                input_fn = input.from_buffer
+            else:
+                input_fn = input.deserialize
+        else:
+            input_fn = None
+        output_transferable = output.serialize if output else None
+        input_buffer_mode = buffer
 
-                iicrm = args[0]
-                crm = iicrm.crm
-                request = args[1] if len(args) > 1 else None
+        err = None
+        result = None
+        stage = 'deserialize_input'
 
-                if request is not None and input_transferable is not None:
-                    if input_buffer_mode == 'copy':
-                        request_copy = bytes(request) if not isinstance(request, bytes) else request
-                        if _release_fn is not None:
-                            _release_fn()
-                            _release_fn = None
-                        deserialized_args = input_transferable(request_copy)
-                    elif input_buffer_mode == 'view':
-                        deserialized_args = input_transferable(request)
-                        if _release_fn is not None:
-                            _release_fn()
-                            _release_fn = None
-                    else:  # hold
-                        deserialized_args = input_transferable(request)
-                else:
-                    deserialized_args = tuple()
+        try:
+            if len(args) < 1:
+                raise ValueError('Instance method requires self, but only get one argument.')
+
+            iicrm = args[0]
+            crm = iicrm.crm
+            request = args[1] if len(args) > 1 else None
+
+            if request is not None and input_fn is not None:
+                if input_buffer_mode == 'view':
+                    deserialized_args = input_fn(request)
                     if _release_fn is not None:
                         _release_fn()
                         _release_fn = None
-
-                if not isinstance(deserialized_args, tuple):
-                    deserialized_args = (deserialized_args,)
-
-                crm_method = getattr(crm, method_name, None)
-                if crm_method is None:
-                    raise ValueError(f'Method "{method_name}" not found on CRM class.')
-
-                stage = 'execute_function'
-                result = crm_method(*deserialized_args)
-                err = None
-
-            except Exception as e:
-                result = None
-                if _release_fn is not None:
-                    try:
-                        _release_fn()
-                    except Exception:
-                        pass
-                if stage == 'deserialize_input':
-                    err = error.CRMDeserializeInput(str(e))
-                elif stage == 'execute_function':
-                    err = error.CRMExecuteFunction(str(e))
-                else:
-                    err = error.CRMSerializeOutput(str(e))
-
-            # Create a serialized response based on the serialized_error and serialized_result
-            serialized_error: bytes = error.CCError.serialize(err)
-            serialized_result = b''
-            if output_transferable is not None and result is not None:
-                # Unpack tuple arguments or pass single argument based on result type
-                serialized_result = (
-                    output_transferable(*result) if isinstance(result, tuple)
-                    else output_transferable(result)
-                )
-            return (serialized_error, serialized_result)
-        
-        @wraps(func)
-        def transfer_wrapper(*args: any, **kwargs: any) -> any:
-            if not args:
-                raise ValueError('No arguments provided to determine direction.')
-            
-            icrm = args[0]
-            if not hasattr(icrm, 'direction'):
-                raise AttributeError('The ICRM instance does not have a "direction" attribute.')
-            
-            if icrm.direction == '->':
-                return com_to_crm(*args)
-            elif icrm.direction == '<-':
-                return crm_to_com(*args, **kwargs)
+                else:  # hold
+                    deserialized_args = input_fn(request)
             else:
-                raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
-        
-        # Expose buffer mode attributes for dispatch table introspection
-        transfer_wrapper._input_buffer_mode = getattr(input, '_buffer_mode', 'copy') if input else 'copy'
-        transfer_wrapper._output_buffer_mode = getattr(output, '_buffer_mode', 'copy') if output else 'copy'
+                deserialized_args = tuple()
+                if _release_fn is not None:
+                    _release_fn()
+                    _release_fn = None
 
-        return transfer_wrapper
-    
-    return decorator
+            if not isinstance(deserialized_args, tuple):
+                deserialized_args = (deserialized_args,)
 
-def auto_transfer(func: callable | None = None) -> callable:
-    def create_wrapper(func: callable) -> callable:
+            crm_method = getattr(crm, method_name, None)
+            if crm_method is None:
+                raise ValueError(f'Method "{method_name}" not found on CRM class.')
+
+            stage = 'execute_function'
+            result = crm_method(*deserialized_args)
+            err = None
+
+        except Exception as e:
+            result = None
+            if _release_fn is not None:
+                try:
+                    _release_fn()
+                except Exception:
+                    pass
+            if stage == 'deserialize_input':
+                err = error.CRMDeserializeInput(str(e))
+            elif stage == 'execute_function':
+                err = error.CRMExecuteFunction(str(e))
+            else:
+                err = error.CRMSerializeOutput(str(e))
+
+        serialized_error = error.CCError.serialize(err)
+        serialized_result = b''
+        if output_transferable is not None and result is not None:
+            serialized_result = (
+                output_transferable(*result) if isinstance(result, tuple)
+                else output_transferable(result)
+            )
+        return (serialized_error, serialized_result)
+
+    @wraps(func)
+    def transfer_wrapper(*args, **kwargs):
+        if not args:
+            raise ValueError('No arguments provided to determine direction.')
+
+        icrm = args[0]
+        if not hasattr(icrm, 'direction'):
+            raise AttributeError('The ICRM instance does not have a "direction" attribute.')
+
+        if icrm.direction == '->':
+            _c2_buffer = kwargs.pop('_c2_buffer', None)
+            return com_to_crm(*args, _c2_buffer=_c2_buffer)
+        elif icrm.direction == '<-':
+            return crm_to_com(*args, **kwargs)
+        else:
+            raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
+
+    transfer_wrapper._input_buffer_mode = buffer
+    return transfer_wrapper
+
+def auto_transfer(func=None, *, input=None, output=None, buffer=None):
+    """Auto-wrap a function with transfer logic.
+
+    When called without kwargs, performs auto-matching:
+    - Single-param direct match → registered @transferable
+    - Return type direct match → registered @transferable
+    - Fallback → DynamicInput/OutputTransferable (pickle)
+
+    Buffer mode auto-detection:
+    - buffer=None (default): 'hold' if input transferable has from_buffer, else 'view'
+    - buffer='view'/'hold': explicit override
+    """
+    def create_wrapper(func):
         # --- Input Matching ---
-        # Priority 1: Direct Transferable lookup — if the method has exactly
-        # one non-self parameter whose type is a registered Transferable,
-        # use it directly (same strategy as the output matcher).
-        input_model = _create_pydantic_model_from_func_sig(func)
-        input_transferable: Transferable | None = None
+        input_transferable = input
 
-        if input_model is not None:
-            input_model_fields = getattr(input_model, 'model_fields', {})
-            is_empty_input = not bool(input_model_fields)
+        if input_transferable is None:
+            func_params = _extract_func_params(func)
+            is_empty_input = len(func_params) == 0
 
-            if not is_empty_input:
-                # Direct lookup: single-param whose type is a registered
-                # Transferable gets matched without fragile name/type
-                # comparison against serialize() signatures.
-                if len(input_model_fields) == 1:
-                    field_info = next(iter(input_model_fields.values()))
-                    param_type = field_info.annotation
-                    param_module = getattr(param_type, '__module__', None)
-                    param_name = getattr(param_type, '__name__', str(param_type))
-                    full_name = f'{param_module}.{param_name}' if param_module else param_name
-                    input_transferable = get_transferable(full_name)
+            if not is_empty_input and len(func_params) == 1:
+                _, param_type, _ = func_params[0]
+                param_module = getattr(param_type, '__module__', None)
+                param_name = getattr(param_type, '__name__', str(param_type))
+                full_name = f'{param_module}.{param_name}' if param_module else param_name
+                input_transferable = get_transferable(full_name)
 
-                # Priority 2: Field name+type comparison (legacy path).
-                if input_transferable is None:
-                    with _TRANSFERABLE_LOCK:
-                        infos_snapshot = list(_TRANSFERABLE_INFOS)
-                    for info in infos_snapshot:
-                        if info.get('module') != func.__module__:
-                            continue
-                        registered_param_map = info.get('param_map', {})
-                        is_empty_registered = not bool(registered_param_map)
-                        if not is_empty_input and not is_empty_registered:
-                            if set(input_model_fields.keys()) == set(registered_param_map.keys()):
-                                match = True
-                                for name, fi in input_model_fields.items():
-                                    pydantic_type = fi.annotation
-                                    registered_type = registered_param_map.get(name)
-                                    if pydantic_type != registered_type:
-                                        match = False
-                                        break
-                                if match:
-                                    input_transferable = get_transferable(info['name'])
-                                    break
-
-            # If no matching transferable found, create a default one (not registered and only used in this function)
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
 
-        # --- Output Matching (compares types directly) ---
-        type_hints = get_type_hints(func)
-        output_transferable: Transferable | None = None
-        
-        if 'return' in type_hints:
-            return_type = type_hints['return']
-            if return_type is None or return_type is type(None):
-                 output_transferable = None
-            else:
-                return_type_name = getattr(return_type, '__name__', str(return_type))
-                return_type_module = getattr(return_type, '__module__', None)
-                return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
-                
-                output_transferable = get_transferable(return_type_full_name)
-                if output_transferable is None:
-                    origin = get_origin(return_type)
-                    args = get_args(return_type)
-                    expected_output_types = []
-                    if origin is tuple:
-                        expected_output_types = list(args)
-                    elif return_type is not None and return_type is not type(None):
-                        expected_output_types = [return_type]
+        # --- Output Matching ---
+        output_transferable = output
 
-                    if expected_output_types:
-                        with _TRANSFERABLE_LOCK:
-                            infos_snapshot = list(_TRANSFERABLE_INFOS)
-                        for info in infos_snapshot:
-                            if info.get('module') != func.__module__:
-                                continue
-                            registered_param_map = info.get('param_map', {})
-                            registered_output_types = list(registered_param_map.values())
-                            if expected_output_types == registered_output_types:
-                                output_transferable = get_transferable(info['name'])
-                                break
-                
-                # If no matching transferable found, create a default one (not registered and only used in this function)
-                if output_transferable is None and not (return_type is None or return_type is type(None)):
-                    output_transferable = create_default_transferable(func, is_input=False)
+        if output_transferable is None:
+            type_hints = get_type_hints(func)
+
+            if 'return' in type_hints:
+                return_type = type_hints['return']
+                if return_type is None or return_type is type(None):
+                    output_transferable = None
+                else:
+                    return_type_name = getattr(return_type, '__name__', str(return_type))
+                    return_type_module = getattr(return_type, '__module__', None)
+                    return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
+                    output_transferable = get_transferable(return_type_full_name)
+                    if output_transferable is None and not (return_type is None or return_type is type(None)):
+                        output_transferable = create_default_transferable(func, is_input=False)
+
+        # --- Buffer Mode Resolution (NEW) ---
+        effective_buffer = buffer
+        if effective_buffer is None:
+            # Auto-detect: hold if input transferable has from_buffer
+            has_from_buffer = (
+                input_transferable is not None
+                and hasattr(input_transferable, 'from_buffer')
+                and callable(input_transferable.from_buffer)
+            )
+            effective_buffer = 'hold' if has_from_buffer else 'view'
+            
+            # Log auto-detection
+            if effective_buffer == 'hold':
+                logger.debug(
+                    'Auto-detected hold mode for %s (input type has from_buffer)',
+                    func.__name__,
+                )
+
+        # Validate: hold requires from_buffer on input transferable
+        if effective_buffer == 'hold' and input_transferable is not None:
+            has_fb = (
+                hasattr(input_transferable, 'from_buffer')
+                and callable(input_transferable.from_buffer)
+            )
+            if not has_fb:
+                raise TypeError(
+                    f"buffer='hold' on {func.__name__} requires "
+                    f"{getattr(input_transferable, '__name__', input_transferable)} "
+                    f"to implement from_buffer()"
+                )
 
         # --- Wrapping ---
-        transfer_decorator = transfer(input=input_transferable, output=output_transferable)
-        wrapped_func = transfer_decorator(func)
+        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable, buffer=effective_buffer)
         return wrapped_func
 
     if func is None:
         return create_wrapper
     else:
         if not callable(func):
-             raise TypeError("@auto_transfer requires a callable function or parentheses.")
+            raise TypeError("@auto_transfer requires a callable function or parentheses.")
         return create_wrapper(func)
 
 # Helpers #########################################################################
 
-def _create_pydantic_model_from_func_sig(func: Callable, model_name_suffix: str = "InputModel") -> type[BaseModel] | None:
+def _extract_func_params(func: Callable) -> list[tuple[str, type, Any]]:
     """
-    Creates a Pydantic model representing the input signature of a function,
-    skipping the first parameter if it's 'self' or 'cls'.
-    Returns None if signature cannot be determined or on error.
+    Extract input parameters from a function signature using pure inspect.
+
+    Returns a list of (name, annotation, default) tuples, skipping 'self'/'cls'.
+    Returns an empty list if the function has no parameters (beyond self/cls)
+    or if the signature cannot be determined.
     """
     try:
-        signature = inspect.signature(func)
+        sig = inspect.signature(func)
         type_hints = get_type_hints(func)
+    except (ValueError, TypeError):
+        return []
 
-        fields = {}
-        param_names = list(signature.parameters.keys())
-
-        for i, name in enumerate(param_names):
-            param = signature.parameters[name]
-            # Skip 'self' or 'cls' only if it's the *first* parameter
-            if i == 0 and name in ('self', 'cls'):
-                continue
-            
-            annotation = type_hints.get(name, param.annotation)
-            # Pydantic needs Ellipsis (...) for required fields without defaults
-            default = ... if param.default is inspect.Parameter.empty else param.default
-            # Use Any if no annotation found, Pydantic handles Any
-            actual_annotation = annotation if annotation is not inspect.Parameter.empty else Any
-
-            fields[name] = (actual_annotation, default)
-
-        # Create the dynamic model
-        model_name = f"{func.__qualname__.replace('.', '_')}_{model_name_suffix}"
-        # Handle functions with no relevant parameters (e.g., only self)
-        if not fields:
-             # Return an empty model definition
-             return create_model(model_name)
-
-        return create_model(model_name, **fields)
-
-    except ValueError: # Handle functions without signatures (like some built-ins)
-        logger.error(f'Could not get signature for {func.__qualname__}')
-        return None
-    except Exception as e:
-        logger.error(f'Error creating Pydantic model for {func.__qualname__}: {e}')
-        return None
+    params = []
+    for i, (name, param) in enumerate(sig.parameters.items()):
+        if i == 0 and name in ('self', 'cls'):
+            continue
+        annotation = type_hints.get(name, param.annotation)
+        if annotation is inspect.Parameter.empty:
+            annotation = Any
+        default = param.default if param.default is not inspect.Parameter.empty else ...
+        params.append((name, annotation, default))
+    return params

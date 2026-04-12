@@ -24,7 +24,7 @@
 
 - **Resources, not services** — C-Two doesn't expose RPC endpoints. It makes Python classes remotely accessible while preserving their stateful, object-oriented nature.
 
-- **Zero-copy when local, transparent when remote** — Same-process calls skip serialization entirely. Cross-process calls use shared memory. Cross-machine calls go over HTTP. Your code doesn't change.
+- **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting you read columnar data (NumPy, Arrow, …) directly from SHM — no deserialization, no copies.
 
 - **Built for scientific Python** — Native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
 
@@ -152,22 +152,89 @@ cc.close(greeter)
 
 For custom data types that need to cross the wire, use `@cc.transferable`. Without it, pickle is used as fallback.
 
+A transferable class defines up to three static methods (written without `@staticmethod` — the framework adds it automatically):
+
+| Method | Required | Purpose |
+|--------|----------|---------|
+| `serialize(data) → bytes` | ✅ Yes | Encode data for wire transfer (outbound) |
+| `deserialize(raw) → T` | ✅ Yes | Decode wire bytes into an owned Python object (inbound) |
+| `from_buffer(buf) → T` | ❌ Optional | Build a zero-copy view over the raw buffer (inbound, hold mode) |
+
 ```python
+import numpy as np
+
 @cc.transferable
-class GridAttribute:
-    level: int
-    global_id: int
-    elevation: float
+class Matrix:
+    rows: int
+    cols: int
+    data: np.ndarray
 
-    def serialize(data: 'GridAttribute') -> bytes:
-        # Custom serialization (e.g., Apache Arrow)
-        ...
+    def serialize(mat: 'Matrix') -> bytes:
+        header = struct.pack('>II', mat.rows, mat.cols)
+        return header + mat.data.tobytes()
 
-    def deserialize(raw: bytes) -> 'GridAttribute':
-        ...
+    def deserialize(raw: bytes) -> 'Matrix':
+        rows, cols = struct.unpack_from('>II', raw)
+        arr = np.frombuffer(raw, dtype=np.float64, offset=8).reshape(rows, cols)
+        return Matrix(rows=rows, cols=cols, data=arr.copy())  # owned copy
+
+    def from_buffer(buf: memoryview) -> 'Matrix':
+        header = bytes(buf[:8])
+        rows, cols = struct.unpack('>II', header)
+        arr = np.frombuffer(buf[8:], dtype=np.float64).reshape(rows, cols)
+        return Matrix(rows=rows, cols=cols, data=arr)  # zero-copy view into SHM
 ```
 
-> `serialize` and `deserialize` are written as instance-style methods but are automatically converted to `@staticmethod` by the framework.
+When `from_buffer` is present, the server automatically uses **hold mode** — the SHM buffer stays alive so `from_buffer` can return a zero-copy view. Without `from_buffer`, the server uses **view mode** — the buffer is released immediately after `deserialize`.
+
+### @cc.transfer — Per-Method Control
+
+Use `@cc.transfer()` on ICRM methods to explicitly specify which transferable type handles serialization, or to override the buffer mode:
+
+```python
+@cc.icrm(namespace='demo.compute', version='0.1.0')
+class ICompute:
+    @cc.transfer(input=Matrix, output=Matrix, buffer='hold')
+    def transform(self, mat: Matrix) -> Matrix: ...
+
+    @cc.transfer(input=Matrix, buffer='view')  # force copy even if from_buffer exists
+    def ingest(self, mat: Matrix) -> None: ...
+```
+
+Without `@cc.transfer`, the framework automatically matches registered `@transferable` types by function signature and resolves the buffer mode from the input type's capabilities.
+
+### cc.hold() — Client-Side Zero-Copy
+
+On the client side, `cc.hold()` requests that the response SHM buffer remain alive, enabling zero-copy reads of the result. The returned `HeldResult` wraps the value and provides a three-layer safety net for SHM lifecycle:
+
+1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
+2. **Context manager (`with`)** — recommended for single-buffer scopes
+3. **`__del__` fallback** — last resort, emits `ResourceWarning` if you forget to release
+
+```python
+grid = cc.connect(ICompute, name='compute', address='ipc://server')
+
+# Normal call — buffer released immediately after deserialize
+result = grid.transform(matrix)
+
+# Option 1: Context manager — clean for single holds
+with cc.hold(grid.transform)(matrix) as held:
+    data = held.value          # zero-copy NumPy array backed by SHM
+    process(data)              # read directly from shared memory
+# SHM buffer released on context exit
+
+# Option 2: Explicit release — better for multiple concurrent holds
+a = cc.hold(grid.transform)(matrix_a)
+b = cc.hold(grid.transform)(matrix_b)
+try:
+    combined = np.concatenate([a.value.data, b.value.data])
+    process(combined)
+finally:
+    a.release()
+    b.release()
+```
+
+> **When to use hold mode:** Large array/columnar data where deserialization dominates cost. For small payloads (< 1 MB), the overhead of tracking SHM lifecycle exceeds the copy cost.
 
 ---
 
@@ -180,11 +247,9 @@ When `cc.connect()` targets a CRM registered in the same process, the proxy call
 ```python
 import c_two as cc
 
-# Register two CRMs in the same process
 cc.register(IGreeter, Greeter(lang='en'), name='greeter')
 cc.register(ICounter, Counter(initial=100), name='counter')
 
-# Connect — zero-serde thread-local proxies
 greeter = cc.connect(IGreeter, name='greeter')
 counter = cc.connect(ICounter, name='counter')
 
@@ -192,7 +257,6 @@ print(greeter.greet('World'))    # → Hello, World!
 print(counter.value())           # → 100
 counter.increment(10)
 
-# Cleanup
 cc.close(greeter)
 cc.close(counter)
 cc.shutdown()
@@ -200,31 +264,91 @@ cc.shutdown()
 
 > **Best for:** local prototyping, testing, single-machine computation.
 
-### Multi-Process — IPC
+### Multi-Process IPC — with Custom Transferable
 
 Separate server and client processes communicating over Unix domain sockets with shared memory.
+
+**Shared types** (`types.py`):
+```python
+import c_two as cc
+import numpy as np, struct
+
+@cc.transferable
+class Mesh:
+    n_vertices: int
+    positions: np.ndarray   # (N, 3) float64
+
+    def serialize(mesh: 'Mesh') -> bytes:
+        header = struct.pack('>I', mesh.n_vertices)
+        return header + mesh.positions.tobytes()
+
+    def deserialize(raw: bytes) -> 'Mesh':
+        (n,) = struct.unpack_from('>I', raw)
+        arr = np.frombuffer(raw, dtype=np.float64, offset=4).reshape(n, 3).copy()
+        return Mesh(n_vertices=n, positions=arr)
+
+    def from_buffer(buf: memoryview) -> 'Mesh':
+        header = bytes(buf[:4])
+        (n,) = struct.unpack('>I', header)
+        arr = np.frombuffer(buf[4:], dtype=np.float64).reshape(n, 3)
+        return Mesh(n_vertices=n, positions=arr)  # zero-copy view
+
+@cc.icrm(namespace='demo.mesh', version='0.1.0')
+class IMeshStore:
+    @cc.read
+    def get_mesh(self) -> Mesh: ...
+
+    def update_positions(self, mesh: Mesh) -> int: ...
+
+    @cc.on_shutdown
+    def cleanup(self) -> None: ...
+```
 
 **Server** (`server.py`):
 ```python
 import c_two as cc
+from types import IMeshStore, Mesh
 
-cc.set_address('ipc://my_server')
-cc.register(IGrid, grid_instance, name='grid')
-print(f'Listening at {cc.server_address()}')
+class MeshStore:
+    def __init__(self):
+        self._mesh = Mesh(n_vertices=0, positions=np.empty((0, 3)))
 
+    def get_mesh(self) -> Mesh:
+        return self._mesh
+
+    def update_positions(self, mesh: Mesh) -> int:
+        self._mesh = mesh
+        return mesh.n_vertices
+
+    def cleanup(self):
+        print('MeshStore shutting down')
+
+cc.set_address('ipc://mesh_server')
+cc.register(IMeshStore, MeshStore(), name='mesh')
 cc.serve()  # blocks until interrupted
 ```
 
 **Client** (`client.py`):
 ```python
 import c_two as cc
+from types import IMeshStore, Mesh
+import numpy as np
 
-grid = cc.connect(IGrid, name='grid', address='ipc://my_server')
-infos = grid.get_grid_infos(1, [0, 1, 2])
-keys = grid.subdivide_grids([1], [0])
+mesh_store = cc.connect(IMeshStore, name='mesh', address='ipc://mesh_server')
 
-cc.close(grid)
-cc.shutdown()
+# Upload data
+big_mesh = Mesh(n_vertices=1_000_000,
+                positions=np.random.randn(1_000_000, 3))
+mesh_store.update_positions(big_mesh)
+
+# Read with hold — zero-copy SHM access
+with cc.hold(mesh_store.get_mesh)() as held:
+    positions = held.value.positions  # np.ndarray backed by SHM, no copy
+    centroid = positions.mean(axis=0)
+    print(f'Centroid: {centroid}')
+# SHM released here
+
+cc.close(mesh_store)
 ```
 
 > **Best for:** multi-process on same host, worker isolation, high-throughput local IPC.
@@ -233,37 +357,45 @@ cc.shutdown()
 
 An HTTP relay bridges network requests to CRM processes running on IPC.
 
-**CRM Server** (`resource.py`):
 ```python
-import c_two as cc
-
-cc.set_address('ipc://grid_server')
-cc.register(IGrid, grid_instance, name='grid')
-# Auto-registers with relay when C2_RELAY_ADDRESS is set
+# CRM Server (resource.py)
+cc.set_address('ipc://mesh_server')
+cc.register(IMeshStore, MeshStore(), name='mesh')
 cc.serve()
-```
 
-**Relay** (`relay.py`):
-```python
-from c_two.relay import NativeRelay
+# Relay (start via CLI)
+# c3 relay --upstream ipc://mesh_server --bind 0.0.0.0:8080
 
-relay = NativeRelay('127.0.0.1:8080')
-relay.start()
-relay.register_upstream('grid', 'ipc://grid_server')
-```
-
-**Client** (`client.py`):
-```python
-import c_two as cc
-
-# Same API — just change the address
-grid = cc.connect(IGrid, name='grid', address='http://127.0.0.1:8080')
-grid.get_grid_infos(1, [0])
-
-cc.close(grid)
+# Client — same API, just change the address
+mesh = cc.connect(IMeshStore, name='mesh', address='http://relay-host:8080')
+mesh.get_mesh()
+cc.close(mesh)
 ```
 
 > **Best for:** network-accessible services, web integration, cross-machine deployment.
+
+### Function-Based Components
+
+For scripting-style code, `@cc.runtime.connect` injects the ICRM proxy as the first parameter:
+
+```python
+@cc.runtime.connect
+def compute_centroid(store: IMeshStore) -> np.ndarray:
+    mesh = store.get_mesh()
+    return mesh.positions.mean(axis=0)
+
+# Framework injects the proxy — caller only passes non-ICRM args
+result = compute_centroid(crm_address='ipc://mesh_server')
+```
+
+### Server-Side Monitoring
+
+Use `cc.hold_stats()` to monitor SHM buffers held by CRM methods in hold mode:
+
+```python
+stats = cc.hold_stats()
+# {'active_holds': 3, 'total_held_bytes': 52428800, 'oldest_hold_seconds': 12.5}
+```
 
 ---
 
@@ -308,8 +440,10 @@ Server-side stateful resources exposed through standardized ICRM interfaces.
 
 - **CRM**: Plain Python class — state + domain logic. Not decorated.
 - **ICRM**: Interface class decorated with `@cc.icrm()`. Only methods declared here are remotely accessible.
-- **`@transferable`**: Custom serialization for domain data types (e.g., Apache Arrow for scientific data).
+- **`@transferable`**: Custom serialization for domain data types. Optionally provides `from_buffer` for zero-copy SHM views.
+- **`@cc.transfer`**: Per-method control over input/output transferable types and buffer mode.
 - **`@cc.read` / `@cc.write`**: Concurrency annotations — parallel reads, exclusive writes.
+- **`@cc.on_shutdown`**: Lifecycle callback invoked when a CRM is unregistered (not exposed via RPC).
 
 ### Transport Layer
 
@@ -321,7 +455,7 @@ Protocol-agnostic communication with automatic protocol detection based on addre
 | `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
 | `http://host:port` | HTTP relay | Cross-machine, web-compatible |
 
-The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory — zero-copy on the data path.
+The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory — zero-copy on the data path. When `from_buffer` is available, **hold mode** keeps the SHM buffer alive across the CRM method call, enabling the CRM to operate directly on shared memory without deserialization.
 
 ### Rust Native Layer
 
@@ -377,9 +511,11 @@ uv run pytest    # run the test suite
 | Read/write concurrency control | ✅ Stable |
 | Unified config architecture (Python SSOT) | ✅ Stable |
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
-| Async interfaces | 🔜 Planned |
 | Disk spill for extreme payloads | ✅ Stable |
-| Cross-language clients (Rust/C++) | 🔮 Future |
+| Hold mode with `from_buffer` zero-copy | ✅ Stable |
+| SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
+| Async interfaces | 🔜 Planned |
+| Cross-language clients (TypeScript/Rust) | 🔮 Future |
 
 See the [full roadmap](docs/plans/c-two-rpc-v2-roadmap.md) for details.
 

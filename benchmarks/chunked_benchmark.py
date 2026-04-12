@@ -91,7 +91,7 @@ def main() -> None:
 
     cc.set_server_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
     cc.set_client_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IBenchChunk, BenchChunk(), name='bench')
 
     ping(address, timeout=10.0)

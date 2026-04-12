@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.4.1"
+version = "0.4.2"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
 license-files = ["LICENSE"]
@@ -12,11 +12,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "anthropic>=0.49.0",
     "httpx>=0.28.1",
     "numpy>=2.2.4",
-    "openai>=1.76.0",
-    "pandas>=2.2.3",
     "pillow>=12.1.1",
     "pyarrow>=23.0.1",
     "pytest>=8.0.0",

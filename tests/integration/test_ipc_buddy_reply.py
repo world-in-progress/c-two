@@ -32,7 +32,7 @@ class TestBuddyReply:
     """Verify large responses transit via buddy SHM (not inline UDS)."""
 
     def _setup_ipc(self, address: str) -> cc.ICRMProxy:
-        cc.set_address(address)
+        cc.set_ipc_address(address)
         cc.register(IEcho, Echo(), name='echo')
         time.sleep(0.3)
         return cc.connect(IEcho, name='echo', address=address)
@@ -115,7 +115,7 @@ class TestBuddyReply:
         import threading
 
         addr = 'ipc://test_buddy_reply_concurrent'
-        cc.set_address(addr)
+        cc.set_ipc_address(addr)
         cc.register(IEcho, Echo(), name='echo')
         time.sleep(0.3)
 

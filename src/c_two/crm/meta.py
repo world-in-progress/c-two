@@ -115,7 +115,11 @@ def icrm(*, namespace: str = 'cc', version: str = '0.1.0'):
             if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__', '__tag__'):
                 if getattr(value, _SHUTDOWN_ATTR, False):
                     continue  # @cc.on_shutdown methods are not RPC-callable
-                decorated_methods[name] = auto_transfer(value)
+                transfer_config = getattr(value, '__cc_transfer__', None)
+                if transfer_config:
+                    decorated_methods[name] = auto_transfer(value, **transfer_config)
+                else:
+                    decorated_methods[name] = auto_transfer(value)
         
         # Define a new class with ICRMMeta metaclass that inherits from the original class
         class_name = cls.__name__

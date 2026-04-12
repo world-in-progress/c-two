@@ -56,7 +56,7 @@ def main():
         f.write(pickle.dumps(('Benchmark',)))
 
     try:
-        cc.set_address(IPC_ADDR)
+        cc.set_ipc_address(IPC_ADDR)
         cc.register(IHello, Hello(), name='hello')
 
         relay = NativeRelay(f'127.0.0.1:{RELAY_PORT}')

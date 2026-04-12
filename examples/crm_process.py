@@ -4,12 +4,12 @@ Registers CRMs and keeps the process alive so remote clients can connect
 via IPC.  Press Ctrl-C to shut down.
 
 Run:
-    uv run python examples/server.py
+    uv run python examples/crm_process.py
 
 Then in another terminal:
-    uv run python examples/client.py
+    uv run python examples/compo.py
 """
-import os, sys, signal, threading
+import os, sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 def main():
     # Set address before registering any CRM.
-    cc.set_address(BIND_ADDRESS)
+    cc.set_ipc_address(BIND_ADDRESS)
 
     # Init the Grid CRM (same as old server.py)
     epsg = 2326
@@ -39,17 +39,9 @@ def main():
     # Register — one line replaces ServerConfig + Server + start()
     cc.register(IGrid, grid, name='grid')
     print(f'Grid CRM registered at {cc.server_address()}')
-    print('Waiting for clients… (Ctrl-C to stop)\n')
 
-    # Block until interrupted
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    stop.wait()
-
-    # Cleanup
-    cc.unregister('grid')
-    cc.shutdown()
-    print('\nServer shut down.')
+    # Block until SIGINT/SIGTERM, then auto-shutdown via atexit.
+    cc.serve()
 
 
 if __name__ == '__main__':

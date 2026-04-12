@@ -12,7 +12,7 @@ port = int(sys.argv[1]) if len(sys.argv) > 1 else 19985
 ipc_addr = f'ipc://bench_full_{os.getpid()}'
 
 _ProcessRegistry.reset()
-cc.set_address(ipc_addr)
+cc.set_ipc_address(ipc_addr)
 cc.register(IHello, Hello(), name='hello')
 
 relay = NativeRelay(f'127.0.0.1:{port}')

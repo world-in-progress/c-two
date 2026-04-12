@@ -6,8 +6,9 @@ from . import error
 from .compo import runtime
 from .crm.meta import icrm, read, write, on_shutdown
 from .crm.transferable import transferable
+from .crm.transferable import transfer, hold, HeldResult
 from .transport.registry import (
-    set_address,
+    set_ipc_address,
     set_config,
     set_server,
     set_client,
@@ -21,6 +22,7 @@ from .transport.registry import (
     server_address,
     shutdown,
     serve,
+    hold_stats,
 )
 
 def _load_banner(name: str) -> str:

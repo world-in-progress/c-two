@@ -55,8 +55,10 @@ Two-language design: Python owns domain logic (CRM/ICRM/Components); Rust owns t
 ### 1. CRM Layer (`src/c_two/crm/`)
 - **CRM**: A plain Python class holding state and implementing domain logic. Not decorated.
 - **ICRM**: An interface class decorated with `@cc.icrm(namespace='...', version='...')` that declares which CRM methods are remotely accessible. Only methods in the ICRM are exposed. Method bodies are `...` (ellipsis).
-- **`@transferable`**: Decorator for custom data types that need to cross the wire. Automatically makes classes into dataclasses and registers `serialize`/`deserialize` as static methods. Without `@transferable`, pickle is used as fallback.
+- **`@transferable`**: Decorator for custom data types that need to cross the wire. Automatically makes classes into dataclasses and registers `serialize`/`deserialize`/`from_buffer` as static methods. Without `@transferable`, pickle is used as fallback.
+- **`from_buffer`**: Optional third method on transferable types. Provides zero-copy buffer views (e.g., `np.frombuffer`). When present, server-side auto-detects hold mode.
 - **Method access**: ICRM methods can be annotated with `@cc.read` or `@cc.write` (default: write) to control concurrency — the scheduler allows parallel reads but exclusive writes.
+- **`@cc.transfer()`**: Per-method metadata decorator for ICRM methods. Allows explicit `input`, `output` transferable and `buffer` mode ('view'|'hold'|None). Does NOT wrap the function — consumed by `icrm()` at class decoration time.
 - **`@on_shutdown`**: Marks a single public method as shutdown callback (called when CRM is unregistered; not exposed via RPC).
 
 ### 2. Component Layer (`src/c_two/compo/`)
@@ -89,6 +91,7 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 | `server/native.py` | `NativeServerBridge` (exported as `Server`) — Python↔Rust server bridge |
 | `server/scheduler.py` | Read/write-aware CRM method execution scheduler |
 | `server/reply.py` | `unpack_icrm_result` + `wrap_error` — CRM reply handling |
+| `server/hold_registry.py` | `HoldRegistry` — weakref-based tracking of hold-mode SHM buffers |
 | `client/proxy.py` | `ICRMProxy` — unified proxy supporting both thread-local and IPC modes |
 | `client/util.py` | Standalone `ping()` and `shutdown()` — lightweight server probes via raw UDS |
 
@@ -141,7 +144,7 @@ class IGrid:
 ```
 
 ### Transferable Pattern
-`serialize` and `deserialize` are written as regular methods but the `TransferableMeta` metaclass converts them to `@staticmethod` automatically — do **not** add `@staticmethod` yourself:
+`serialize`, `deserialize`, and `from_buffer` are written as regular methods but the `TransferableMeta` metaclass converts them to `@staticmethod` automatically — do **not** add `@staticmethod` yourself:
 ```python
 @cc.transferable
 class MyData:
@@ -151,7 +154,38 @@ class MyData:
         ...
     def deserialize(arrow_bytes: bytes) -> 'MyData':
         ...
+    def from_buffer(buf: memoryview) -> 'MyData':
+        ...  # optional: zero-copy view for hold mode
 ```
+
+### Transfer Decorator Pattern
+`@cc.transfer()` is a metadata-only decorator applied to ICRM methods. It attaches `__cc_transfer__` but does NOT wrap the function:
+```python
+@cc.icrm(namespace='ns', version='0.1.0')
+class IMyResource:
+    @cc.transfer(input=MyData, output=MyData, buffer='hold')
+    def process(self, data: MyData) -> MyData: ...
+```
+
+### Hold Mode Pattern
+`cc.hold()` wraps an ICRM bound method for client-side SHM retention. Returns `HeldResult` with `.value` and `.release()`. Three-layer safety: explicit `.release()`, context manager, `__del__` fallback:
+```python
+# Context manager (single hold)
+with cc.hold(proxy.method)(args) as held:
+    data = held.value  # zero-copy view backed by SHM
+# SHM released on context exit
+
+# Explicit release (multiple holds)
+a = cc.hold(proxy.method)(args_a)
+b = cc.hold(proxy.method)(args_b)
+try:
+    process(a.value, b.value)
+finally:
+    a.release()
+    b.release()
+```
+
+Buffer mode auto-detection: when `@cc.transfer(buffer=None)` (default), the framework checks if the input transferable has `from_buffer` → hold, else → view.
 
 ### Component Function Pattern
 The first parameter is always the ICRM type (injected by the framework). Callers never pass it:
@@ -194,6 +228,13 @@ cc.shutdown()
 ```
 
 The `name` parameter in `cc.register()` is a user-chosen routing key — it is **not** the ICRM namespace. Multiple CRMs using different ICRM classes (or even the same ICRM class with different instances) can coexist under distinct names.
+
+### Hold Stats API
+```python
+# Server-side monitoring of hold-mode SHM buffers
+stats = cc.hold_stats()
+# {'active_holds': N, 'total_held_bytes': M, 'oldest_hold_seconds': T}
+```
 
 ### Error Handling
 Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Errors serialize to/from bytes for wire transfer. Error classes are named by location: `CRMDeserializeInput`, `CompoSerializeInput`, `CRMExecuteFunction`, etc.

@@ -657,7 +657,7 @@ class _ProcessRegistry:
 # Module-level API (delegates to singleton)
 # ------------------------------------------------------------------
 
-def set_address(address: str) -> None:
+def set_ipc_address(address: str) -> None:
     """Set the IPC server address before registering any CRM.
 
     Priority: ``set_address()`` > ``C2_IPC_ADDRESS`` env var > auto.
@@ -769,6 +769,21 @@ def serve(blocking: bool = True) -> None:
     See :meth:`_ProcessRegistry.serve`.
     """
     _ProcessRegistry.get().serve(blocking=blocking)
+
+
+def hold_stats() -> dict:
+    """Return hold-mode SHM tracking statistics.
+
+    Returns dict with:
+    - active_holds: number of currently held SHM buffers
+    - total_held_bytes: total bytes pinned in SHM
+    - oldest_hold_seconds: age of oldest active hold
+    """
+    inst = _ProcessRegistry._instance
+    server = inst._server if inst else None
+    if server is None:
+        return {'active_holds': 0, 'total_held_bytes': 0, 'oldest_hold_seconds': 0}
+    return server.hold_stats()
 
 
 # Auto-cleanup on process exit.
