@@ -194,7 +194,7 @@ class TestRuntimeProtection:
         from tests.fixtures.hello import Hello
 
         registered = False
-        cc.set_address('ipc://test_runtime_prot_server')
+        cc.set_ipc_address('ipc://test_runtime_prot_server')
         try:
             cc.register(IHello, Hello(), name='rp_hello')
             registered = True
@@ -218,7 +218,7 @@ class TestRuntimeProtection:
 
         registered = False
         proxy = None
-        cc.set_address('ipc://test_runtime_prot_client')
+        cc.set_ipc_address('ipc://test_runtime_prot_client')
         try:
             cc.register(IHello, Hello(), name='rp_hello2')
             registered = True

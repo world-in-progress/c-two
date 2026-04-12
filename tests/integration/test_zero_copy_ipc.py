@@ -28,7 +28,7 @@ def _cleanup():
 
 
 def _setup(address: str):
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IEchoZC, EchoZC(), name='echo_zc')
     time.sleep(0.3)
     return cc.connect(IEchoZC, name='echo_zc', address=address)

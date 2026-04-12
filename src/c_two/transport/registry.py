@@ -657,7 +657,7 @@ class _ProcessRegistry:
 # Module-level API (delegates to singleton)
 # ------------------------------------------------------------------
 
-def set_address(address: str) -> None:
+def set_ipc_address(address: str) -> None:
     """Set the IPC server address before registering any CRM.
 
     Priority: ``set_address()`` > ``C2_IPC_ADDRESS`` env var > auto.

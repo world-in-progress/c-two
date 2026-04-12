@@ -8,7 +8,7 @@ from .crm.meta import icrm, read, write, on_shutdown
 from .crm.transferable import transferable
 from .crm.transferable import transfer, hold, HeldResult
 from .transport.registry import (
-    set_address,
+    set_ipc_address,
     set_config,
     set_server,
     set_client,

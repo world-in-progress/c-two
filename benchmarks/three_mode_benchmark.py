@@ -168,7 +168,7 @@ def bench_ipc(payload_size: int) -> float:
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IEcho, Echo(), name='echo_ipc')
     _wait_sock(address)
 
@@ -197,7 +197,7 @@ def bench_relay(payload_size: int) -> float | None:
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IEcho, Echo(), name='echo_relay')
     _wait_sock(address)
 
@@ -247,7 +247,7 @@ def bench_ipc_dict(payload_size: int) -> float | None:
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IDictEcho, DictEcho(), name='echo_dict')
     _wait_sock(address)
 

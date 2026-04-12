@@ -128,7 +128,7 @@ def bench_ipc(payload_size: int) -> float:
     # 2 GB buddy segments to handle up to 1 GB payloads.
     cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
     cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.set_address(address)
+    cc.set_ipc_address(address)
     cc.register(IEcho, Echo(), name='echo_ipc')
 
     # Wait for server socket.

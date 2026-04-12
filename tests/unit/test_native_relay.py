@@ -97,7 +97,7 @@ class TestNativeRelayWithServer:
         ipc_addr = f'ipc://nrelay_test_{os.getpid()}'
 
         try:
-            cc.set_address(ipc_addr)
+            cc.set_ipc_address(ipc_addr)
             cc.register(IHello, Hello(), name='hello')
 
             relay = NativeRelay('127.0.0.1:19905')
@@ -133,7 +133,7 @@ class TestNativeRelayWithServer:
         ipc_addr = f'ipc://nrelay_data_{os.getpid()}'
 
         try:
-            cc.set_address(ipc_addr)
+            cc.set_ipc_address(ipc_addr)
             cc.register(IHello, Hello(), name='hello')
 
             relay = NativeRelay('127.0.0.1:19906')
