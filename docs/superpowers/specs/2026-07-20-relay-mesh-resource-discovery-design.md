@@ -264,7 +264,7 @@ All peer communication uses HTTP endpoints on the relay (new `/_peer/*` routes),
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/_peer/join` | POST | New relay announces itself to a seed |
-| `/_peer/sync` | GET | Request full route table + peer list + sequence number |
+| `/_peer/sync` | GET | Request full route table + peer list |
 | `/_peer/announce` | POST | Broadcast a route or relay state change |
 | `/_peer/heartbeat` | POST | Periodic liveness signal |
 | `/_peer/leave` | POST | Graceful shutdown notification |
