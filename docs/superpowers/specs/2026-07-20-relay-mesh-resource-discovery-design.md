@@ -77,10 +77,11 @@ struct RouteEntry {
     name: String,           // CRM routing name
     relay_id: String,       // Which relay hosts it
     relay_url: String,      // HTTP URL of the hosting relay
+    ipc_address: Option<String>, // IPC address (Some for Local, None for Peer)
     icrm_ns: String,        // ICRM namespace (e.g., "cc.demo")
     icrm_ver: String,       // ICRM version (e.g., "0.1.0")
     locality: Locality,     // Local or Peer
-    registered_at: f64,     // Unix timestamp
+    registered_at: f64,     // Unix timestamp (monotonic-adjusted, see §1.3)
 }
 
 enum Locality { Local, Peer }
@@ -96,12 +97,28 @@ struct PeerInfo {
 
 enum PeerStatus { Alive, Suspect, Dead }
 
-/// Resolution result returned to clients.
+/// Resolution result returned to clients via /_resolve.
 struct RouteInfo {
     name: String,
     relay_url: String,      // Where to connect
+    ipc_address: Option<String>, // IPC address (present for LOCAL routes)
     icrm_ns: String,
     icrm_ver: String,
+}
+```
+
+#### RouteTable vs UpstreamPool
+
+`RouteTable` **replaces** `UpstreamPool`. The current `UpstreamPool` stores `(name, ipc_address, Option<IpcClient>, last_activity)` — this is a subset of what `RouteTable` tracks. After the migration:
+
+- `RouteTable` owns route discovery (LOCAL + PEER entries), peer tracking, and gossip state.
+- Connection pooling (lazy `IpcClient` creation, idle eviction) moves into a separate `ConnectionPool` that `RouteTable` references. This keeps route metadata cleanly separated from connection lifecycle.
+
+```rust
+struct RelayState {
+    route_table: RwLock<RouteTable>,     // Route discovery + peer state
+    conn_pool: RwLock<ConnectionPool>,   // IPC/HTTP connection lifecycle
+    disseminator: Box<dyn Disseminator>, // Gossip broadcast strategy
 }
 ```
 
@@ -109,7 +126,7 @@ struct RouteInfo {
 
 ```rust
 impl RouteTable {
-    fn resolve(&self, name: &str) -> Option<RouteInfo>;
+    fn resolve(&self, name: &str) -> Vec<RouteInfo>;  // Returns all matches, ordered
     fn list_routes(&self) -> Vec<RouteEntry>;
     fn list_peers(&self) -> Vec<PeerInfo>;
     fn register_route(&mut self, entry: RouteEntry);
@@ -118,16 +135,17 @@ impl RouteTable {
     fn unregister_peer(&mut self, relay_id: &str);
     fn full_snapshot(&self) -> FullSync;       // For /_peer/sync
     fn merge_snapshot(&mut self, sync: FullSync); // On join
+    fn route_digest(&self) -> HashMap<String, u64>; // {name → hash} for anti-entropy
 }
 ```
 
-Resolution priority: LOCAL entries first, then PEER (local = IPC direct, no network hop).
+Resolution priority: LOCAL entries first, then PEER entries sorted by `(registered_at, relay_id)` for deterministic ordering (see §1.3).
 
 #### Control-Plane HTTP Endpoints (for Python clients)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/_resolve/{name}` | GET | Resolve a CRM name → `RouteInfo` (JSON) |
+| `/_resolve/{name}` | GET | Resolve a CRM name → `Vec<RouteInfo>` (JSON array, ordered: LOCAL first, then PEER by deterministic sort). Client takes first entry; can fallback to subsequent entries on failure. |
 | `/_routes` | GET | List all known routes (already exists, extended) |
 | `/_peers` | GET | List all known peer relays |
 
@@ -136,7 +154,7 @@ Resolution priority: LOCAL entries first, then PEER (local = IPC direct, no netw
 The RouteTable is backed by local SQLite (path: `{C2_DATA_DIR}/registry.db`) for persistence across relay restarts, or in-memory for single-node/ephemeral deployments.
 
 Tables:
-- `routes(name TEXT, relay_id TEXT, relay_url TEXT, icrm_ns TEXT, icrm_ver TEXT, registered_at REAL, PRIMARY KEY (name, relay_id))`
+- `routes(name TEXT, relay_id TEXT, relay_url TEXT, ipc_address TEXT, icrm_ns TEXT, icrm_ver TEXT, registered_at REAL, PRIMARY KEY (name, relay_id))`
 - `relays(relay_id TEXT PRIMARY KEY, url TEXT, last_heartbeat REAL, status TEXT)`
 
 #### Crash Resilience
@@ -154,7 +172,15 @@ Combined effect: after a crash and restart, the relay begins with a clean local 
 ### 1.3 Duplicate Name Policy
 
 - **Same node:** Rejected (409 Conflict). A single machine gains nothing from running duplicate CRM instances of the same resource — the existing `READ_PARALLEL` scheduler already handles concurrent reads via thread pool, and duplicate processes waste CPU/GPU/memory.
-- **Cross node:** Allowed. Multiple relays can register the same `name`. The route table stores all entries. Resolution returns the LOCAL entry first (if available), otherwise picks the nearest peer (Phase 1: first registered; Phase 2: version-aware selection).
+- **Cross node:** Allowed. Multiple relays can register the same `name`. The route table stores all entries.
+
+#### Deterministic Resolution Ordering
+
+When multiple PEER entries exist for the same name, all relays must resolve to the same target to avoid inconsistency. Gossip has no global clock, so arrival order varies across relays.
+
+Resolution uses a **deterministic sort key**: `(registered_at, relay_id)`. Among PEER entries with the same name, the entry with the smallest `registered_at` wins; ties are broken by lexicographic `relay_id` (smallest first). Every relay applies the same comparator, so the resolved order is consistent regardless of gossip arrival sequence.
+
+`/_resolve/{name}` returns all matching entries sorted by: LOCAL first, then PEERs by `(registered_at, relay_id)`. The client defaults to the first entry and can fallback to subsequent ones on failure.
 
 ### 1.4 Peer Discovery (Seed Bootstrap)
 
@@ -188,16 +214,24 @@ Relay-C starts up (late join):
   4. Seed responds with FULL_SYNC:
      - Complete route table (all names across all peers)
      - Complete peer list (all known relays + their URLs)
+     - Logical sequence number (seq: u64) representing the seed's latest gossip state
      This is a point-in-time snapshot of the seed's registry.
-  5. Relay-C replaces all PEER routes in local registry with FULL_SYNC data
-  6. Relay-C announces itself to ALL peers learned from sync
+  5. Relay-C acquires RouteTable write lock:
+     a. Replaces all PEER routes in local registry with FULL_SYNC data
+     b. Sets local gossip sequence = received seq
+     c. Queues any incoming gossip received during steps 3–5 for replay
+  6. Relay-C replays queued gossip (only messages with seq > FULL_SYNC seq)
+  7. Relay-C releases write lock
+  8. Relay-C announces itself to ALL peers learned from sync
      POST /_peer/announce to each peer
      → Each peer adds Relay-C to their peer list
-  7. Relay-C registers its own local CRMs as routes
+  9. Relay-C registers its own local CRMs as routes
      → Each triggers gossip (ROUTE_ANNOUNCE) to all peers
 ```
 
-The FULL_SYNC in step 4 ensures the late-joining relay receives ALL previously announced routes, not just incremental changes broadcast after it joined. The seed relay's `/_peer/sync` endpoint simply serializes the full RouteTable state as JSON.
+**TOCTOU protection (steps 5–7):** Between receiving FULL_SYNC and completing local registration, a race window exists where incoming gossip could be lost. The write lock on `RouteTable` during steps 5–7 prevents concurrent modification. Any gossip arriving during this window is queued in a `Vec<PeerMessage>` and replayed after the snapshot is applied. The `seq` field ensures replayed messages that predate the snapshot are idempotent (route upsert by `(name, relay_id)` primary key).
+
+The FULL_SYNC in step 4 ensures the late-joining relay receives ALL previously announced routes, not just incremental changes broadcast after it joined. The seed relay's `/_peer/sync` endpoint serializes the full RouteTable state as JSON plus a logical sequence number that the joiner uses to deduplicate gossip received during the join window.
 
 If all seeds are unreachable (e.g., this relay starts first):
 - Relay operates in standalone mode (empty registry, only local CRMs)
@@ -213,27 +247,41 @@ All peer communication uses HTTP endpoints on the relay (new `/_peer/*` routes),
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/_peer/join` | POST | New relay announces itself to a seed |
-| `/_peer/sync` | GET | Request full route table + peer list |
+| `/_peer/sync` | GET | Request full route table + peer list + sequence number |
 | `/_peer/announce` | POST | Broadcast a route or relay state change |
 | `/_peer/heartbeat` | POST | Periodic liveness signal |
 | `/_peer/leave` | POST | Graceful shutdown notification |
+| `/_peer/digest` | POST | Anti-entropy route digest exchange (§1.5.1) |
 
 #### Message Types
 
+All peer messages are wrapped in an envelope with a protocol version field. This ensures forward compatibility: Phase 1 relays receiving an unknown message variant from a Phase 2+ relay log a warning and ignore it, rather than crashing on deserialization failure.
+
 ```rust
+struct PeerEnvelope {
+    protocol_version: u32,  // Currently 1; bump on breaking changes
+    message: PeerMessage,
+}
+
 enum PeerMessage {
     RouteAnnounce { name: String, relay_id: String, relay_url: String,
-                    icrm_ns: String, icrm_ver: String },
+                    ipc_address: Option<String>,  // Some for LOCAL, None for PEER relay
+                    icrm_ns: String, icrm_ver: String,
+                    registered_at: f64 },
     RouteWithdraw { name: String, relay_id: String },
     RelayJoin    { relay_id: String, url: String },
     RelayLeave   { relay_id: String },
     Heartbeat    { relay_id: String, route_count: u32 },
+    DigestExchange { digest: HashMap<String, u64> }, // Anti-entropy (§1.5.1)
+    DigestDiff     { missing: Vec<RouteEntry>, extra: Vec<(String, String)> },
     // Phase 2 (reserved):
     // StaleNotify  { name: String, version: u64 },
     // WriteIntent  { name: String, writer_relay_id: String },
     // WriteComplete { name: String, version: u64 },
 }
 ```
+
+Receivers ignore `PeerEnvelope` with `protocol_version > SUPPORTED_VERSION` and log `warn!("ignoring peer message with unsupported protocol version {}", v)`.
 
 #### Dissemination Strategy
 
@@ -253,6 +301,33 @@ struct FullBroadcast;  // Phase 1: send to all
 ```
 
 This allows swapping to probabilistic gossip (SWIM-style) if C-Two is deployed on 1000+ node clusters, without changing the rest of the architecture.
+
+### 1.5.1 Anti-Entropy (Periodic Digest Sync)
+
+Gossip is fire-and-forget (HTTP POST with no ACK). During network partitions, messages are silently lost. When the partition heals, each side may have deleted the other's routes (heartbeat timeout) with no automatic recovery mechanism.
+
+**Periodic digest exchange** provides convergence after partition recovery:
+
+```
+Every 60 seconds, each relay pair exchanges route digests:
+
+  Relay-A → Relay-B: DigestExchange { digest: {name → hash(relay_id, registered_at)} }
+  Relay-B compares with its own table:
+    - Names in A's digest but not in B → request from A (missing routes)
+    - Names in B's table from A but not in A's digest → stale, delete
+    - Names with different hashes → conflict, request full entry from A
+  Relay-B → Relay-A: DigestDiff { missing: [...], extra: [...] }
+  Relay-A sends missing entries; Relay-B deletes extras.
+  Then B sends its own digest to A (symmetric).
+```
+
+**Key properties:**
+- The digest is a compact `{name → u64}` map where the hash encodes `(relay_id, registered_at)`. This keeps digest size proportional to route count, not entry size.
+- Digest exchange is **bidirectional**: both sides detect what they're missing.
+- The exchange is idempotent: running it multiple times converges to the same state.
+- The 60-second interval is configurable via `C2_RELAY_ANTI_ENTROPY_INTERVAL` (0 disables).
+- During normal operation (no partitions), digests match and no data is transferred — overhead is one small HTTP round-trip per peer per interval.
+- After a partition heals, full convergence occurs within one interval (60s worst case).
 
 ### 1.6 Failure Detection
 
@@ -289,14 +364,17 @@ For same-node scenarios where only IPC is needed (no relay), name resolution fal
 
 ### 1.8 IPC Address Simplification
 
-With relay mesh handling all name resolution, clients never see IPC addresses. The existing `set_ipc_address()` API and `C2_IPC_ADDRESS` environment variable are **removed**:
+With relay mesh handling all name resolution, clients normally don't need to know IPC addresses. The existing `set_ipc_address()` API and `C2_IPC_ADDRESS` environment variable are **removed**:
 
 - **IPC addresses are always auto-generated UUIDs.** The server generates `ipc://cc_auto_{pid}_{uuid8}` automatically on first `cc.register()`. This is an internal transport detail, invisible to users.
 - **`cc.set_ipc_address()` is removed.** No longer needed — address is auto-assigned.
 - **`C2_IPC_ADDRESS` env var is removed.** Same reason.
-- **`cc.connect(address=...)` parameter is removed.** Name-based resolution via registry replaces explicit addressing. For direct IPC debugging, the auto-generated address can be discovered via `c3 registry list-routes`.
+- **`cc.connect(address=...)` parameter is RETAINED as an escape hatch.** When `address=` is provided, relay resolution is bypassed entirely and the client connects directly to the specified address. This is essential for:
+  - Debugging individual CRM processes without a relay running.
+  - Integration tests that don't want to spin up a relay.
+  - Gradual migration from explicit addressing to name-based resolution.
 
-This is a breaking change. Since C-Two is at 0.x.x, backward compatibility is not required.
+This is a breaking change for `set_ipc_address()` and `C2_IPC_ADDRESS`. Since C-Two is at 0.x.x, backward compatibility is not required.
 
 ### 1.9 Registry Integration with `cc.register()` and `cc.connect()`
 
@@ -318,30 +396,61 @@ def register(icrm_class, crm_instance, name, ...):
         # Relay updates its RouteTable and gossips to all peers
 ```
 
-The `_notify_relay_register` function calls the existing `POST /_register` endpoint (already implemented), extended to trigger gossip.
+**Relay notification resilience (M5):** `_notify_relay_register` uses retry-then-background semantics:
+
+1. Try up to 3 times (1s interval) to POST to `/_register`.
+2. If all 3 fail, **local registration succeeds anyway** — the CRM is usable for same-process connections.
+3. A background task continues retrying (exponential backoff, max 60s) until the relay becomes reachable or `cc.unregister()` is called.
+4. Once the relay accepts the registration, normal gossip propagation occurs.
+
+This prevents a temporarily unavailable relay from blocking CRM startup. The CRM is always available locally; remote visibility is eventually consistent.
 
 #### Client side (`cc.connect`)
 
 ```python
-def connect(icrm_class, name):
+# Route cache: TTL-based, invalidated on connection failure
+_route_cache: dict[str, tuple[list[RouteInfo], float]] = {}
+_ROUTE_CACHE_TTL = 30.0  # seconds
+
+def connect(icrm_class, name, address=None):
+    # Escape hatch: explicit address bypasses all resolution
+    if address:
+        return _connect_direct(icrm_class, name, address)
+
     # Priority 1: same-process
     if name in _registrations:
         return ICRMProxy.thread_local(...)
 
-    # Priority 2: resolve via relay HTTP endpoint
+    # Priority 2: resolve via relay HTTP endpoint (with cache)
     relay_address = _get_relay_address()
     if relay_address:
-        route_info = _http_get(f'{relay_address}/_resolve/{name}')
-        if route_info:
-            if route_info['relay_url'] == relay_address:
-                # Local relay → IPC direct
-                return _connect_ipc(icrm_class, name, route_info)
-            else:
-                # Remote relay → HTTP direct to target relay
-                return _connect_http(icrm_class, name, route_info['relay_url'])
+        routes = _resolve_with_cache(relay_address, name)
+        for route_info in routes:
+            try:
+                if route_info['relay_url'] == relay_address:
+                    # Local relay → IPC direct (use ipc_address from route)
+                    return _connect_ipc(icrm_class, name, route_info)
+                else:
+                    # Remote relay → HTTP direct to target relay
+                    return _connect_http(icrm_class, name, route_info['relay_url'])
+            except ConnectionError:
+                continue  # Try next route entry (fallback)
+        # All routes failed → clear cache and raise
+        _route_cache.pop(name, None)
 
     raise ResourceNotFound(f"CRM '{name}' not found")
+
+def _resolve_with_cache(relay_address, name):
+    cached = _route_cache.get(name)
+    if cached and time.monotonic() - cached[1] < _ROUTE_CACHE_TTL:
+        return cached[0]
+    routes = _http_get(f'{relay_address}/_resolve/{name}')  # Returns list
+    if routes:
+        _route_cache[name] = (routes, time.monotonic())
+    return routes or []
 ```
+
+The cache avoids redundant HTTP round-trips for repeated `cc.connect()` calls. Cache entries are evicted on TTL expiry or connection failure (whichever comes first).
 
 ### 1.10 Relay CLI Changes
 
@@ -515,13 +624,18 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 |---------|-------------|
 | `cc.set_ipc_address(address)` | Removed. IPC address is always auto-generated UUID. |
 | `C2_IPC_ADDRESS` env var | Removed. Same reason. |
-| `cc.connect(..., address='ipc://...')` | `cc.connect(IGrid, name='grid')` — relay resolves address. |
+
+### Changed APIs
+
+| API | Change |
+|-----|--------|
+| `cc.connect(..., address=...)` | Retained as escape hatch. When provided, bypasses relay resolution. Normal usage: `cc.connect(IGrid, name='grid')` — relay resolves address. |
 
 ### Unchanged APIs
 
 - `C2_RELAY_ADDRESS` — points to local relay (now also the name resolution endpoint).
 - `cc.register()` — no new required parameters. New optional: `consistency`, `stale_policy`, `refresh_strategy`.
-- `cc.connect()` — `name` parameter is now the sole locator (no `address`).
+- `cc.connect()` — `name` parameter is the primary locator. `address=` is retained as escape hatch (bypasses relay resolution when provided).
 - Single-node deployments without relay continue to work (local-only resolution).
 
 ---
@@ -554,8 +668,8 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 
 | Component | Crate | Changes |
 |-----------|-------|---------|
-| Peer protocol endpoints | `c2-http` (relay module) | New `/_peer/*` routes in `router.rs` |
-| Route table state | `c2-http` (relay module) | New `RouteTable` struct (extends `UpstreamPool`) |
+| Peer protocol endpoints | `c2-http` (relay module) | New `/_peer/*` routes in `router.rs` (including `/_peer/digest` for anti-entropy) |
+| Route table state | `c2-http` (relay module) | New `RouteTable` struct (replaces `UpstreamPool`); `ConnectionPool` for connection lifecycle |
 | Gossip dissemination | `c2-http` (relay module) | `Disseminator` trait + `FullBroadcast` impl |
 | Heartbeat sweeper | `c2-http` (relay module) | Extend existing idle sweeper |
 | Peer message types | `c2-wire` | New message enum (or JSON via serde) |
@@ -564,10 +678,10 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 
 | Component | File | Changes |
 |-----------|------|---------|
-| Name resolution | `transport/registry.py` | Extend `connect()` with relay-based resolution; remove `address` param |
+| Name resolution | `transport/registry.py` | Extend `connect()` with relay-based resolution + TTL route cache; `address=` retained as escape hatch |
 | Address removal | `transport/registry.py` | Remove `set_ipc_address()`, `_explicit_address`, `C2_IPC_ADDRESS` fallback; always auto-UUID |
 | Registry notification | `transport/registry.py` | Extend `register()` / `unregister()` to notify relay |
-| Relay configuration | `config/settings.py` | New `C2_RELAY_SEEDS` setting; remove `C2_IPC_ADDRESS` |
+| Relay configuration | `config/settings.py` | New `C2_RELAY_SEEDS`, `C2_RELAY_ANTI_ENTROPY_INTERVAL` settings; remove `C2_IPC_ADDRESS` |
 | CLI extensions | `cli.py` | New `c3 relay --seeds` flag; `c3 registry` subcommand |
 | Error types | `errors.py` | New error classes |
 
