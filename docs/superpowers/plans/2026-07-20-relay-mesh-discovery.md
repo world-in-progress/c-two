@@ -375,6 +375,11 @@ impl RouteTable {
         names
     }
 
+    /// Count of LOCAL routes only (for heartbeat reporting).
+    pub fn local_route_count(&self) -> u32 {
+        self.routes.values().filter(|e| e.locality == Locality::Local).count() as u32
+    }
+
     /// Remove all routes from a specific relay.
     pub fn remove_routes_by_relay(&mut self, relay_id: &str) -> Vec<RouteEntry> {
         let keys: Vec<_> = self.routes
@@ -925,15 +930,21 @@ pub struct RelayState {
     route_table: RwLock<RouteTable>,
     conn_pool: RwLock<ConnectionPool>,
     config: Arc<RelayConfig>,
+    disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
 }
 
 impl RelayState {
-    pub fn new(config: Arc<RelayConfig>) -> Self {
+    pub fn new(config: Arc<RelayConfig>, disseminator: Arc<dyn crate::relay::disseminator::Disseminator>) -> Self {
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: RwLock::new(ConnectionPool::new()),
+            disseminator,
             config,
         }
+    }
+
+    pub fn disseminator(&self) -> &Arc<dyn crate::relay::disseminator::Disseminator> {
+        &self.disseminator
     }
 
     pub fn config(&self) -> &RelayConfig { &self.config }
@@ -1047,9 +1058,17 @@ impl RelayState {
         }).collect()
     }
 
+    pub fn local_route_count(&self) -> u32 {
+        self.route_table.read().local_route_count()
+    }
+
     // -- Snapshot operations --
 
     pub fn full_snapshot(&self) -> FullSync { self.route_table.read().full_snapshot() }
+    /// Merge a full snapshot from a peer. Uses write lock which serializes
+    /// with concurrent register operations (accepted TOCTOU risk for Phase 1;
+    /// upsert idempotency makes lost concurrent updates recoverable via
+    /// anti-entropy within one interval).
     pub fn merge_snapshot(&self, sync: FullSync) { self.route_table.write().merge_snapshot(sync); }
 
     pub fn route_digest(&self) -> std::collections::HashMap<(String, String), u64> {
@@ -1080,6 +1099,12 @@ fn now_secs() -> f64 {
 mod tests {
     use super::*;
 
+    /// No-op disseminator for unit tests.
+    struct NullDisseminator;
+    impl crate::relay::disseminator::Disseminator for NullDisseminator {
+        fn broadcast(&self, _envelope: PeerEnvelope, _peers: &[PeerInfo]) {}
+    }
+
     fn test_config() -> Arc<RelayConfig> {
         Arc::new(RelayConfig {
             relay_id: "test-relay".into(),
@@ -1088,9 +1113,13 @@ mod tests {
         })
     }
 
+    fn null_disseminator() -> Arc<dyn crate::relay::disseminator::Disseminator> {
+        Arc::new(NullDisseminator)
+    }
+
     #[test]
     fn register_and_resolve_upstream() {
-        let state = RelayState::new(test_config());
+        let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(IpcClient::new("ipc://grid"));
         state.register_upstream("grid".into(), "ipc://grid".into(),
             "test.ns".into(), "0.1.0".into(), client);
@@ -1101,7 +1130,7 @@ mod tests {
 
     #[test]
     fn unregister_upstream() {
-        let state = RelayState::new(test_config());
+        let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(IpcClient::new("ipc://grid"));
         state.register_upstream("grid".into(), "ipc://grid".into(),
             "test.ns".into(), "0.1.0".into(), client);
@@ -1111,7 +1140,7 @@ mod tests {
 
     #[test]
     fn peer_route_operations() {
-        let state = RelayState::new(test_config());
+        let state = RelayState::new(test_config(), null_disseminator());
         state.register_peer_route(RouteEntry {
             name: "remote".into(), relay_id: "peer-1".into(),
             relay_url: "http://peer-1:8080".into(), ipc_address: None,
@@ -1159,7 +1188,21 @@ Rewrite all existing HTTP handlers to use the new `RelayState` API. Add `/_resol
 
 Key changes:
 - `handle_register`: Use `state.register_upstream()` (now requires `icrm_ns`, `icrm_ver` params, defaulting to empty strings for backward compat).
-- `handle_unregister`: Use `state.unregister_upstream()`.
+- `handle_unregister`: Use `state.unregister_upstream()`. After removing, broadcast `RouteWithdraw` to all peers:
+    ```rust
+    // In handle_unregister, after state.unregister_upstream(name):
+    if let Some((entry, _client)) = result {
+        let envelope = PeerEnvelope::new(
+            state.relay_id(),
+            PeerMessage::RouteWithdraw {
+                name: entry.name.clone(),
+                relay_id: entry.relay_id.clone(),
+            },
+        );
+        let peers = state.list_peers();
+        state.disseminator().broadcast(envelope, &peers);
+    }
+    ```
 - `call_handler`: Use `state.get_client()` + `state.touch_connection()`.
 - `try_reconnect`: Use `state.get_address()` + `state.reconnect()`.
 - `list_routes`: Use `state.route_names()`.
@@ -1229,7 +1272,12 @@ async fn call_handler(
     // Forward — existing logic unchanged.
     match client.send_raw(&body).await {
         Ok(response) => (StatusCode::OK, response).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("IPC error: {e}")).into_response(),
+        Err(e) => {
+            // Mark connection as failed for potential cleanup.
+            // Note: In single-hop design, this only applies to local upstream failures,
+            // not peer relay failures. Peer failure detection is handled by heartbeat.
+            (StatusCode::BAD_GATEWAY, format!("IPC error: {e}")).into_response()
+        }
     }
 }
 ```
@@ -1295,7 +1343,9 @@ pub struct RelayServer {
 impl RelayServer {
     pub fn start(config: RelayConfig) -> Result<Self, String> {
         let config = Arc::new(config);
-        let state = Arc::new(RelayState::new(config.clone()));
+        let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> =
+            Arc::new(crate::relay::disseminator::FullBroadcast::new());
+        let state = Arc::new(RelayState::new(config.clone(), disseminator));
         let (tx, rx) = mpsc::channel(32);
         let server_state = state.clone();
         let bind_addr = config.bind.clone();
@@ -1429,7 +1479,12 @@ pub enum PeerMessage {
     /// Anti-entropy diff: entries the sender has that recipient was missing.
     DigestDiff {
         entries: Vec<DigestDiffEntry>,
+        /// Routes the sender doesn't have but recipient does — should be deleted.
+        extra: Vec<(String, String)>,  // (name, relay_id) pairs to delete
     },
+    /// Unknown message type from a newer protocol version.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One entry in a digest map.
@@ -1622,16 +1677,23 @@ use crate::relay::peer::{PeerEnvelope, PeerMessage, PROTOCOL_VERSION};
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
 
-/// POST /_peer/announce — receive RouteAnnounce or RouteWithdraw
-pub async fn handle_peer_announce(
-    State(state): State<Arc<RelayState>>,
-    Json(envelope): Json<PeerEnvelope>,
-) -> impl IntoResponse {
+fn check_protocol_version(envelope: &PeerEnvelope) -> bool {
     if envelope.protocol_version > PROTOCOL_VERSION {
         tracing::warn!(
             "Ignoring message from {} with protocol_version {}",
             envelope.sender_relay_id, envelope.protocol_version
         );
+        return false;
+    }
+    true
+}
+
+/// POST /_peer/announce — receive RouteAnnounce or RouteWithdraw
+pub async fn handle_peer_announce(
+    State(state): State<Arc<RelayState>>,
+    Json(envelope): Json<PeerEnvelope>,
+) -> impl IntoResponse {
+    if !check_protocol_version(&envelope) {
         return StatusCode::OK;
     }
     match envelope.message {
@@ -1652,7 +1714,11 @@ pub async fn handle_peer_announce(
         PeerMessage::RouteWithdraw { name, relay_id } => {
             state.unregister_peer_route(&name, &relay_id);
         }
-        _ => {} // Wrong endpoint, ignore.
+        _ => {
+            if matches!(envelope.message, PeerMessage::Unknown) {
+                tracing::warn!("Ignoring unknown message type from {}", envelope.sender_relay_id);
+            }
+        } // Wrong endpoint, ignore.
     }
     StatusCode::OK
 }
@@ -1662,6 +1728,9 @@ pub async fn handle_peer_join(
     State(state): State<Arc<RelayState>>,
     Json(envelope): Json<PeerEnvelope>,
 ) -> impl IntoResponse {
+    if !check_protocol_version(&envelope) {
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ignored"}))).into_response();
+    }
     if let PeerMessage::RelayJoin { relay_id, url } = envelope.message {
         if relay_id == state.relay_id() {
             return (StatusCode::OK, Json(serde_json::json!({"status": "self"}))).into_response();
@@ -1694,6 +1763,9 @@ pub async fn handle_peer_heartbeat(
     State(state): State<Arc<RelayState>>,
     Json(envelope): Json<PeerEnvelope>,
 ) -> impl IntoResponse {
+    if !check_protocol_version(&envelope) {
+        return StatusCode::OK;
+    }
     if let PeerMessage::Heartbeat { relay_id, route_count } = envelope.message {
         state.with_route_table_mut(|rt| {
             if let Some(peer) = rt.get_peer_mut(&relay_id) {
@@ -1714,6 +1786,9 @@ pub async fn handle_peer_leave(
     State(state): State<Arc<RelayState>>,
     Json(envelope): Json<PeerEnvelope>,
 ) -> impl IntoResponse {
+    if !check_protocol_version(&envelope) {
+        return StatusCode::OK;
+    }
     if let PeerMessage::RelayLeave { relay_id } = envelope.message {
         state.remove_routes_by_relay(&relay_id);
         state.unregister_peer(&relay_id);
@@ -1726,6 +1801,9 @@ pub async fn handle_peer_digest(
     State(state): State<Arc<RelayState>>,
     Json(envelope): Json<PeerEnvelope>,
 ) -> impl IntoResponse {
+    if !check_protocol_version(&envelope) {
+        return StatusCode::OK.into_response();
+    }
     match envelope.message {
         PeerMessage::DigestExchange { digest } => {
             // Compare incoming digest with our own.
@@ -1763,11 +1841,12 @@ pub async fn handle_peer_digest(
                 }
             }
 
-            // Find entries in peer's digest that we don't have → mark for deletion.
+            // Find entries in peer's digest that we don't have → tell peer to delete them.
+            let mut extra = Vec::new();
             for d in &digest {
                 let key = (d.name.clone(), d.relay_id.clone());
                 if !our_digest.contains_key(&key) {
-                    missing_from_us.push(key);
+                    extra.push(key);
                 }
             }
 
@@ -1776,11 +1855,11 @@ pub async fn handle_peer_digest(
 
             let response = PeerEnvelope::new(
                 state.relay_id(),
-                PeerMessage::DigestDiff { entries: diff_entries },
+                PeerMessage::DigestDiff { entries: diff_entries, extra },
             );
             Json(response).into_response()
         }
-        PeerMessage::DigestDiff { entries } => {
+        PeerMessage::DigestDiff { entries, extra } => {
             // Apply diff entries from peer.
             for diff in entries {
                 state.register_peer_route(RouteEntry {
@@ -1793,6 +1872,10 @@ pub async fn handle_peer_digest(
                     locality: Locality::Peer,
                     registered_at: diff.registered_at,
                 });
+            }
+            // Process deletion convergence.
+            for (name, relay_id) in extra {
+                state.unregister_peer_route(&name, &relay_id);
             }
             StatusCode::OK.into_response()
         }
@@ -1874,11 +1957,11 @@ use crate::relay::types::PeerStatus;
 /// Spawn all background tasks. Returns handles for monitoring.
 pub fn spawn_background_tasks(
     state: Arc<RelayState>,
-    disseminator: Arc<dyn Disseminator>,
     cancel: CancellationToken,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
     let config = state.config().clone();
+    let disseminator = state.disseminator().clone();
 
     // 1. Heartbeat sender
     if config.heartbeat_interval > Duration::ZERO {
@@ -1947,7 +2030,7 @@ async fn heartbeat_loop(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                let route_count = state.route_names().len() as u32;
+                let route_count = state.local_route_count();
                 let envelope = PeerEnvelope::new(
                     state.relay_id(),
                     PeerMessage::Heartbeat {
@@ -2157,6 +2240,16 @@ async fn seed_retry_loop(
                     if let Ok(resp) = client.post(&join_url).json(&envelope).send().await {
                         if let Ok(snapshot) = resp.json::<crate::relay::types::FullSync>().await {
                             state.merge_snapshot(snapshot);
+                            // Announce ourselves to all newly learned peers.
+                            let peers = state.list_peers();
+                            let announce = PeerEnvelope::new(
+                                state.relay_id(),
+                                PeerMessage::RelayJoin {
+                                    relay_id: state.relay_id().to_string(),
+                                    url: state.config().effective_advertise_url(),
+                                },
+                            );
+                            state.disseminator().broadcast(announce, &peers);
                             break; // One successful seed is enough.
                         }
                     }
@@ -2174,14 +2267,20 @@ In `RelayServer::start()`, after binding the HTTP server:
 ```rust
 use tokio_util::sync::CancellationToken;
 use crate::relay::background::spawn_background_tasks;
-use crate::relay::disseminator::FullBroadcast;
 
 // Inside the tokio runtime block:
 let cancel = CancellationToken::new();
-let disseminator: Arc<dyn Disseminator> = Arc::new(FullBroadcast::new());
-let bg_handles = spawn_background_tasks(state.clone(), disseminator, cancel.clone());
+let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
 
-// On shutdown, cancel all background tasks:
+// On shutdown — announce graceful departure before cancelling tasks.
+let leave = PeerEnvelope::new(
+    state.relay_id(),
+    PeerMessage::RelayLeave { relay_id: state.relay_id().to_string() },
+);
+let peers = state.list_peers();
+state.disseminator().broadcast(leave, &peers);
+// Small delay to let the broadcast send.
+tokio::time::sleep(Duration::from_millis(100)).await;
 cancel.cancel();
 for handle in bg_handles {
     let _ = handle.await;
@@ -2215,6 +2314,16 @@ if !config.seeds.is_empty() {
             if let Ok(resp) = client.post(&join_url).json(&envelope).send().await {
                 if let Ok(snapshot) = resp.json::<FullSync>().await {
                     state.merge_snapshot(snapshot);
+                    // Announce ourselves to all newly learned peers.
+                    let peers = state.list_peers();
+                    let announce = PeerEnvelope::new(
+                        state.relay_id(),
+                        PeerMessage::RelayJoin {
+                            relay_id: state.relay_id().to_string(),
+                            url: state.config().effective_advertise_url(),
+                        },
+                    );
+                    state.disseminator().broadcast(announce, &peers);
                     break;
                 }
             }
@@ -2306,7 +2415,20 @@ async fn handle_register(
     );
 
     // Gossip announce to peers.
-    // (Disseminator broadcast will be wired in Task 12 integration.)
+    let envelope = PeerEnvelope::new(
+        state.relay_id(),
+        PeerMessage::RouteAnnounce {
+            name: name.clone(),
+            relay_id: entry.relay_id.clone(),
+            relay_url: entry.relay_url.clone(),
+            ipc_address: entry.ipc_address.clone(),
+            icrm_ns: entry.icrm_ns.clone(),
+            icrm_ver: entry.icrm_ver.clone(),
+            registered_at: entry.registered_at,
+        },
+    );
+    let peers = state.list_peers();
+    state.disseminator().broadcast(envelope, &peers);
 
     (StatusCode::OK, Json(serde_json::json!({"status": "registered"}))).into_response()
 }
@@ -2397,6 +2519,7 @@ Expected: 4 tests pass.
 class C2Settings(BaseSettings):
     # ... existing fields ...
     relay_seeds: str = ""  # Comma-separated seed relay URLs
+    relay_anti_entropy_interval: float = 60.0  # seconds (env: C2_RELAY_ANTI_ENTROPY_INTERVAL)
 
     @property
     def relay_seed_list(self) -> list[str]:
@@ -2434,7 +2557,21 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 **Files:**
 - Modify: `src/c_two/transport/registry.py`
 
-Update `cc.connect()` to resolve names via relay when no `address=` is given. Implement thread-safe route cache with 30s TTL.
+Update `cc.connect()` to resolve names via relay when no `address=` is given. Implement thread-safe route cache with 30s TTL. Add `set_relay()` convenience API.
+
+- [ ] **Step 0: Add set_relay() to registry.py and __init__.py**
+
+In `registry.py`, add to `_ProcessRegistry`:
+```python
+def set_relay(self, address: str):
+    """Set the relay address for name resolution."""
+    self._settings.relay_address = address
+```
+
+In `__init__.py`, export:
+```python
+set_relay = _registry.set_relay
+```
 
 - [ ] **Step 1: Add route cache to _ProcessRegistry**
 
@@ -2525,16 +2662,19 @@ def connect(self, icrm_cls, *, name=None, address=None, **kwargs):
     if not routes:
         raise ResourceNotFound(f"No routes for '{name}'")
 
-    # Use first route (LOCAL preferred, then PEER by ordering).
-    route = routes[0]
-    relay_url = route["relay_url"]
-
-    # If LOCAL route → use IPC address directly.
-    if route.get("ipc_address"):
-        return self._make_remote_proxy(icrm_cls, name, route["ipc_address"])
-
-    # PEER route → connect via that relay's HTTP endpoint.
-    return self._make_remote_proxy(icrm_cls, name, f"{relay_url}/{name}")
+    # Try each route in order (LOCAL first, then PEER by ordering).
+    last_error = None
+    for route in routes:
+        try:
+            if route.get("ipc_address"):
+                return self._make_remote_proxy(icrm_cls, name, route["ipc_address"])
+            relay_url = route["relay_url"]
+            return self._make_remote_proxy(icrm_cls, name, f"{relay_url}/{name}")
+        except Exception as e:
+            last_error = e
+            self._route_cache.invalidate(name)
+            continue
+    raise ResourceUnavailable(f"All routes for '{name}' unreachable: {last_error}")
 ```
 
 - [ ] **Step 4: Verify existing tests still pass**
@@ -2565,9 +2705,16 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - Modify: `src/c_two/transport/registry.py`
 - Modify: `src/c_two/__init__.py`
 
-Add retry logic to relay notification in `cc.register()`. Remove `set_ipc_address()` and auto-generate UUID addresses.
+Add retry logic to relay notification in `cc.register()`. Add `_relay_unregister()` for relay notification on `cc.unregister()`. Remove `set_ipc_address()` and auto-generate UUID addresses.
 
 - [ ] **Step 1: Add retry logic to _relay_register**
+
+In `_ProcessRegistry.__init__()`, add:
+```python
+self._bg_cancel = threading.Event()
+```
+
+In `unregister()`, add `self._bg_cancel.set()` to cancel any pending background retries.
 
 ```python
 def _relay_register(self, name: str, ipc_address: str,
@@ -2615,8 +2762,12 @@ def _schedule_background_relay_register(self, name, ipc_address, icrm_ns, icrm_v
             "name": name, "address": ipc_address,
             "icrm_ns": icrm_ns, "icrm_ver": icrm_ver,
         }).encode()
-        for _ in range(60):  # Try for ~5 minutes.
-            time.sleep(5)
+        delay = 1.0
+        max_delay = 60.0
+        while not self._bg_cancel.is_set():
+            self._bg_cancel.wait(delay)
+            if self._bg_cancel.is_set():
+                return
             try:
                 req = urllib.request.Request(
                     f"{self._settings.relay_address}/_register",
@@ -2627,15 +2778,46 @@ def _schedule_background_relay_register(self, name, ipc_address, icrm_ns, icrm_v
                 with urllib.request.urlopen(req, timeout=5):
                     return
             except Exception:
-                continue
+                delay = min(delay * 2, max_delay)
 
     t = threading.Thread(target=retry_loop, daemon=True)
     t.start()
 ```
 
+- [ ] **Step 1b: Add _relay_unregister for cc.unregister() relay notification**
+
+The existing `unregister()` method must call `self._relay_unregister(name)` after removing the CRM locally.
+
+```python
+def _relay_unregister(self, name: str):
+    """Notify relay about CRM unregistration."""
+    relay_addr = self._settings.relay_address
+    if not relay_addr:
+        return
+    import urllib.request, json
+    payload = json.dumps({"name": name}).encode()
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"{relay_addr}/_unregister",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                return
+        except Exception:
+            if attempt < 2:
+                time.sleep(1)
+    # Background retry not needed for unregister — route will be cleaned
+    # by anti-entropy and failure detection.
+```
+
+In `unregister()`, add `self._relay_unregister(name)` after the local CRM removal.
+
 - [ ] **Step 2: Remove set_ipc_address from registry.py and __init__.py**
 
-In `registry.py`, delete the `set_ipc_address()` method and all references to `_ipc_address_override`.
+In `registry.py`, delete the `set_ipc_address()` method and all references to `_explicit_address`.
 
 In `__init__.py`, remove `set_ipc_address` from the exports.
 
@@ -2643,9 +2825,9 @@ Replace the auto-address logic to always use UUID:
 
 ```python
 def _auto_address(self) -> str:
-    """Generate a unique IPC address using UUID."""
-    import uuid
-    return f"ipc://cc_auto_{uuid.uuid4().hex[:16]}"
+    """Generate a unique IPC address using PID + UUID."""
+    import uuid, os
+    return f"ipc://cc_auto_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 ```
 
 - [ ] **Step 3: Update tests that used set_ipc_address**
@@ -2690,7 +2872,7 @@ Add `--seeds` flag to `c3 relay` and a new `c3 registry` subcommand.
 
 ```python
 @relay.command()
-@click.option("--upstream", "-u", required=True, help="Upstream IPC address")
+@click.option("--upstream", "-u", required=False, default=None, help="Upstream IPC address")
 @click.option("--bind", "-b", default="0.0.0.0:8080", help="HTTP bind address")
 @click.option("--seeds", "-s", default="", help="Comma-separated seed relay URLs")
 @click.option("--relay-id", default=None, help="Stable relay identifier")
@@ -2706,7 +2888,8 @@ def start(upstream, bind, seeds, relay_id, advertise_url):
         seeds=seed_list,
     )
     relay.start()
-    relay.register_upstream(upstream)
+    if upstream:
+        relay.register_upstream(upstream)
     # ... signal handling ...
 ```
 
@@ -2785,6 +2968,12 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - Create: `tests/integration/test_relay_mesh.py`
 
 End-to-end tests for the relay mesh: two relays, gossip sync, name resolution, and failure detection.
+
+> **Note (H-8):** The register tests POST fake `ipc://` addresses, but Task 10's `handle_register`
+> opens a real `IpcClient::connect()` and returns 502 on failure. To avoid needing real IPC servers
+> in integration tests, add a `skip_ipc_validation: bool` field to `RelayConfig` (default `false`).
+> Set it to `true` when constructing `NativeRelay` in tests. In `handle_register`, skip the
+> `IpcClient::connect` call when `config.skip_ipc_validation` is set.
 
 - [ ] **Step 1: Create integration test file**
 
