@@ -16,11 +16,11 @@ C-Two currently requires clients to know the exact IPC or HTTP address of the CR
 
 A **decentralized Relay Mesh** where every node runs a Relay that:
 
-1. Maintains a **Registry CRM** — a fully-replicated route table stored as a regular CRM resource.
+1. Maintains an internal **RouteTable** — a fully-replicated route table managed as Rust-native state inside the relay.
 2. Synchronizes route state with peer relays via **gossip** (HTTP-based, reusing the existing axum stack).
 3. Enables `cc.connect(IGrid, name='grid')` to resolve the target relay automatically and connect directly (single hop).
 
-The architecture is **self-bootstrapping**: the registry is itself a CRM, consuming C-Two's own transport, concurrency, and serialization infrastructure.
+The route table is **relay-internal state**, not an externally-accessible CRM resource. It is managed entirely in Rust and exposed to Python clients via lightweight HTTP control-plane endpoints (`/_resolve`, `/_routes`).
 
 ## Architecture Overview
 
@@ -29,8 +29,8 @@ The architecture is **self-bootstrapping**: the registry is itself a CRM, consum
 │ Relay-A  │◄────────────► │ Relay-B  │◄────────────► │ Relay-C  │
 │ Node-1   │               │ Node-2   │               │ Node-3   │
 │          │               │          │               │          │
-│ Registry │  full replica  │ Registry │  full replica  │ Registry │
-│ CRM      │◄────────────► │ CRM      │◄────────────► │ CRM      │
+│ Route    │  full replica  │ Route    │  full replica  │ Route    │
+│ Table    │◄────────────► │ Table    │◄────────────► │ Table    │
 │          │               │          │               │          │
 │ app CRMs │               │ app CRMs │               │ app CRMs │
 └──────────┘               └──────────┘               └──────────┘
@@ -44,7 +44,7 @@ The architecture is **self-bootstrapping**: the registry is itself a CRM, consum
 - **No single point of failure.** Every relay holds a full copy of the route table.
 - **Zero extra hops for local resources.** Same-node CRM → IPC direct.
 - **Single hop for remote resources.** Resolve locally → HTTP direct to target relay.
-- **Self-bootstrapping.** Registry CRM is a standard CRM, validated by C-Two's own test suite.
+- **Pure Rust internals.** Route table is relay-internal state — no CRM/ICRM/scheduler overhead.
 
 ## Phase 1: Naming + Discovery
 
@@ -63,87 +63,77 @@ Resolution chain (evaluated in order, first match wins):
 | 3 | Local relay has `name` as PEER route | HTTP direct to owning relay | ~1-5ms |
 | — | None found | raise `ResourceNotFound` | — |
 
-For priority 3 (cross-node), the client resolves the target relay URL from the local Registry CRM, then establishes a direct HTTP connection to that relay. Subsequent RPC calls go directly to the target relay — the resolution happens once at `cc.connect()` time.
+For priority 3 (cross-node), the client queries the local relay's `/_resolve/{name}` endpoint, which looks up the RouteTable and returns the target relay URL. The client then establishes a direct HTTP connection to that relay. Subsequent RPC calls go directly to the target relay — the resolution happens once at `cc.connect()` time.
 
-### 1.2 Registry CRM
+### 1.2 RouteTable (Relay-Internal State)
 
-Each relay embeds a Registry CRM with the following ICRM interface:
+Each relay maintains a `RouteTable` — a Rust struct inside `RelayState` that tracks all known CRM routes and peer relays. It is **not** a CRM; it does not use ICRM, scheduler, or serialization. It is purely relay-internal state managed by Rust, exposed via HTTP control-plane endpoints.
 
-```python
-@cc.icrm(namespace='cc.internal', version='0.1.0')
-class IRelayRegistry:
-    @cc.read
-    def resolve(self, name: str) -> RouteInfo | None:
-        """Resolve a CRM name to its hosting relay's URL.
+#### Rust Data Model
 
-        Returns None if the name is not registered anywhere.
-        """
-        ...
+```rust
+/// A single CRM route entry.
+struct RouteEntry {
+    name: String,           // CRM routing name
+    relay_id: String,       // Which relay hosts it
+    relay_url: String,      // HTTP URL of the hosting relay
+    icrm_ns: String,        // ICRM namespace (e.g., "cc.demo")
+    icrm_ver: String,       // ICRM version (e.g., "0.1.0")
+    locality: Locality,     // Local or Peer
+    registered_at: f64,     // Unix timestamp
+}
 
-    @cc.read
-    def list_routes(self) -> list[RouteEntry]:
-        """List all known routes across the mesh."""
-        ...
+enum Locality { Local, Peer }
 
-    @cc.read
-    def list_relays(self) -> list[RelayInfo]:
-        """List all known peer relays."""
-        ...
+/// Information about a peer relay.
+struct PeerInfo {
+    relay_id: String,       // Unique relay identifier
+    url: String,            // HTTP URL
+    route_count: u32,       // Number of CRMs on this relay
+    last_heartbeat: Instant,
+    status: PeerStatus,     // Alive | Suspect | Dead
+}
 
-    @cc.write
-    def register_route(self, name: str, relay_id: str, address: str,
-                       icrm_namespace: str, icrm_version: str) -> None:
-        """Register a CRM route (called by local relay on cc.register)."""
-        ...
+enum PeerStatus { Alive, Suspect, Dead }
 
-    @cc.write
-    def unregister_route(self, name: str, relay_id: str) -> None:
-        """Unregister a CRM route (called by local relay on cc.unregister)."""
-        ...
-
-    @cc.write
-    def register_relay(self, relay_id: str, url: str) -> None:
-        """Register a peer relay (called during peer join)."""
-        ...
-
-    @cc.write
-    def unregister_relay(self, relay_id: str) -> None:
-        """Unregister a peer relay (called during peer leave or failure)."""
-        ...
+/// Resolution result returned to clients.
+struct RouteInfo {
+    name: String,
+    relay_url: String,      // Where to connect
+    icrm_ns: String,
+    icrm_ver: String,
+}
 ```
 
-#### Data Model
+#### RouteTable API (internal, not RPC)
 
-```python
-@dataclass
-class RouteEntry:
-    name: str                # CRM routing name
-    relay_id: str            # Which relay hosts it
-    relay_url: str           # HTTP URL of the hosting relay
-    icrm_namespace: str      # ICRM namespace (e.g., 'cc.demo')
-    icrm_version: str        # ICRM version (e.g., '0.1.0')
-    locality: str            # 'local' or 'peer'
-    registered_at: float     # Unix timestamp
-
-@dataclass
-class RelayInfo:
-    relay_id: str            # Unique relay identifier
-    url: str                 # HTTP URL
-    route_count: int         # Number of CRMs on this relay
-    last_heartbeat: float    # Unix timestamp of last heartbeat
-    status: str              # 'alive' | 'suspect' | 'dead'
-
-@dataclass
-class RouteInfo:
-    name: str
-    relay_url: str           # Where to connect
-    icrm_namespace: str
-    icrm_version: str
+```rust
+impl RouteTable {
+    fn resolve(&self, name: &str) -> Option<RouteInfo>;
+    fn list_routes(&self) -> Vec<RouteEntry>;
+    fn list_peers(&self) -> Vec<PeerInfo>;
+    fn register_route(&mut self, entry: RouteEntry);
+    fn unregister_route(&mut self, name: &str, relay_id: &str);
+    fn register_peer(&mut self, info: PeerInfo);
+    fn unregister_peer(&mut self, relay_id: &str);
+    fn full_snapshot(&self) -> FullSync;       // For /_peer/sync
+    fn merge_snapshot(&mut self, sync: FullSync); // On join
+}
 ```
+
+Resolution priority: LOCAL entries first, then PEER (local = IPC direct, no network hop).
+
+#### Control-Plane HTTP Endpoints (for Python clients)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/_resolve/{name}` | GET | Resolve a CRM name → `RouteInfo` (JSON) |
+| `/_routes` | GET | List all known routes (already exists, extended) |
+| `/_peers` | GET | List all known peer relays |
 
 #### Storage
 
-Each Registry CRM persists its state to local SQLite (path: `{C2_DATA_DIR}/registry.db` or in-memory for single-node).
+The RouteTable is backed by local SQLite (path: `{C2_DATA_DIR}/registry.db`) for persistence across relay restarts, or in-memory for single-node/ephemeral deployments.
 
 Tables:
 - `routes(name TEXT, relay_id TEXT, relay_url TEXT, icrm_ns TEXT, icrm_ver TEXT, registered_at REAL, PRIMARY KEY (name, relay_id))`
@@ -153,9 +143,9 @@ Tables:
 
 SQLite is persistent — if a relay crashes, a stale `registry.db` survives on disk and may contain routes to now-dead CRMs. Two safeguards prevent dirty reads on restart:
 
-1. **Startup purge of local routes.** On relay startup, all routes where `relay_id == self.relay_id` are deleted from the local SQLite before any CRM registration. Local routes are only valid for the current process; stale entries from a previous incarnation are always wrong.
+1. **Startup purge of local routes.** On relay startup, all routes where `relay_id == self.relay_id` are deleted from SQLite before any CRM registration. Local routes are only valid for the current process; stale entries from a previous incarnation are always wrong.
 
-2. **Full sync overwrite for peer routes.** During the join protocol (step 3–4), the full route table received from the seed peer replaces all PEER entries in local SQLite. This ensures peer routes reflect the current mesh state, not a stale snapshot from before the crash.
+2. **Full sync overwrite for peer routes.** During the join protocol (step 4–5), the full route table received from the seed peer replaces all PEER entries in SQLite. This ensures peer routes reflect the current mesh state, not a stale snapshot from before the crash.
 
 3. **WAL mode.** SQLite is opened with `PRAGMA journal_mode=WAL` for crash-safe writes. Even if the relay crashes mid-write, the database remains consistent.
 
@@ -207,7 +197,7 @@ Relay-C starts up (late join):
      → Each triggers gossip (ROUTE_ANNOUNCE) to all peers
 ```
 
-The FULL_SYNC in step 4 ensures the late-joining relay receives ALL previously announced routes, not just incremental changes broadcast after it joined. The seed relay's `/_peer/sync` endpoint simply serializes the full Registry CRM state.
+The FULL_SYNC in step 4 ensures the late-joining relay receives ALL previously announced routes, not just incremental changes broadcast after it joined. The seed relay's `/_peer/sync` endpoint simply serializes the full RouteTable state as JSON.
 
 If all seeds are unreachable (e.g., this relay starts first):
 - Relay operates in standalone mode (empty registry, only local CRMs)
@@ -255,7 +245,7 @@ The dissemination layer is abstracted behind a `Disseminator` trait:
 
 ```rust
 trait Disseminator: Send + Sync {
-    async fn broadcast(&self, msg: PeerMessage, peers: &[RelayInfo]);
+    async fn broadcast(&self, msg: PeerMessage, peers: &[PeerInfo]);
 }
 
 struct FullBroadcast;  // Phase 1: send to all
@@ -275,7 +265,7 @@ This allows swapping to probabilistic gossip (SWIM-style) if C-Two is deployed o
 
 When a peer is marked dead:
 
-1. Set peer status to `dead` in Registry CRM.
+1. Set peer status to `Dead` in RouteTable.
 2. Remove all routes from that peer.
 3. If a removed route has replicas on other peers, traffic auto-routes to surviving replicas.
 4. Log warning: `[relay] Peer relay-b marked dead; removed N routes`.
@@ -316,18 +306,19 @@ This is a breaking change. Since C-Two is at 0.x.x, backward compatibility is no
 def register(icrm_class, crm_instance, name, ...):
     # ... existing logic (create server, register CRM) ...
 
-    # NEW: if relay is configured, notify registry
+    # NEW: if relay is configured, notify relay's route table via HTTP
     if relay_address:
-        registry = _get_or_connect_registry(relay_address)
-        registry.register_route(
+        _notify_relay_register(
+            relay_address=relay_address,
             name=name,
-            relay_id=_local_relay_id(),
-            address=server_address,
+            ipc_address=server_address,
             icrm_namespace=icrm_class.__cc_namespace__,
             icrm_version=icrm_class.__cc_version__,
         )
-        # Relay's gossip will propagate to all peers
+        # Relay updates its RouteTable and gossips to all peers
 ```
+
+The `_notify_relay_register` function calls the existing `POST /_register` endpoint (already implemented), extended to trigger gossip.
 
 #### Client side (`cc.connect`)
 
@@ -337,22 +328,22 @@ def connect(icrm_class, name):
     if name in _registrations:
         return ICRMProxy.thread_local(...)
 
-    # Priority 2: resolve via relay
+    # Priority 2: resolve via relay HTTP endpoint
     relay_address = _get_relay_address()
     if relay_address:
-        route_info = _resolve_via_relay(relay_address, name)
+        route_info = _http_get(f'{relay_address}/_resolve/{name}')
         if route_info:
-            if route_info.relay_url == relay_address:
+            if route_info['relay_url'] == relay_address:
                 # Local relay → IPC direct
                 return _connect_ipc(icrm_class, name, route_info)
             else:
                 # Remote relay → HTTP direct to target relay
-                return _connect_http(icrm_class, name, route_info.relay_url)
+                return _connect_http(icrm_class, name, route_info['relay_url'])
 
     raise ResourceNotFound(f"CRM '{name}' not found")
 ```
 
-### 1.9 Relay CLI Changes
+### 1.10 Relay CLI Changes
 
 ```bash
 # Start relay with peer discovery
@@ -539,7 +530,7 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 
 ### C-Two Owns
 
-- Name registration and resolution (Registry CRM)
+- Name registration and resolution (RouteTable + `/_resolve` endpoint)
 - Relay mesh gossip protocol (peer discovery, route sync, failure detection)
 - Write detection and version tracking (`@cc.read`/`@cc.write` awareness)
 - Stale notification gossip (`STALE_NOTIFY`)
@@ -564,7 +555,7 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 | Component | Crate | Changes |
 |-----------|-------|---------|
 | Peer protocol endpoints | `c2-http` (relay module) | New `/_peer/*` routes in `router.rs` |
-| Route table state | `c2-http` (relay module) | Extend `UpstreamPool` or new `RegistryState` |
+| Route table state | `c2-http` (relay module) | New `RouteTable` struct (extends `UpstreamPool`) |
 | Gossip dissemination | `c2-http` (relay module) | `Disseminator` trait + `FullBroadcast` impl |
 | Heartbeat sweeper | `c2-http` (relay module) | Extend existing idle sweeper |
 | Peer message types | `c2-wire` | New message enum (or JSON via serde) |
@@ -586,7 +577,7 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 
 ### Phase 1
 
-- **Unit tests:** Registry CRM CRUD operations; route resolution priority chain; peer message serialization.
+- **Unit tests:** RouteTable CRUD operations; route resolution priority chain; peer message serialization.
 - **Integration tests:** Two-relay mesh with CRM registration and cross-relay resolution; seed bootstrap with delayed startup; failure detection and route cleanup.
 - **Single-node regression:** Existing tests pass unchanged (no relay configured → local-only behavior).
 
@@ -599,7 +590,7 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 
 ## Open Questions (for implementation planning)
 
-1. **Registry CRM storage:** In-memory dict vs. SQLite for persistence across relay restarts. Recommendation: in-memory for Phase 1 (simplicity); SQLite for production (persistence after restart).
+1. **RouteTable storage:** In-memory dict vs. SQLite for persistence across relay restarts. Recommendation: in-memory for Phase 1 (simplicity); SQLite for production (persistence after restart).
 2. **Relay ID generation:** UUID vs. hostname-based. Recommendation: `{hostname}_{pid}_{short_uuid}` for debuggability.
 3. **Heartbeat protocol:** Full broadcast vs. SWIM-style probabilistic probing. Recommendation: full broadcast for Phase 1 (< 100 nodes); abstract `Disseminator` trait for future optimization.
 4. **Peer message format:** JSON (simple, human-readable) vs. binary (efficient). Recommendation: JSON for Phase 1 (peer messages are infrequent and small); binary optimization later if needed.
