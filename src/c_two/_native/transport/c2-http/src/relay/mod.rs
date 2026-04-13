@@ -7,6 +7,8 @@
 
 pub mod config;
 pub mod conn_pool;
+pub mod disseminator;
+pub mod peer;
 pub mod route_table;
 pub mod router;
 pub mod server;
