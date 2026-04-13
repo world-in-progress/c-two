@@ -14,10 +14,10 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use c2_http::relay::server::RelayServer;
+use c2_config::RelayConfig;
 
-struct RelayState {
-    bind: String,
-    idle_timeout_secs: u64,
+struct ServerState {
+    config: RelayConfig,
     server: Option<RelayServer>,
 }
 
@@ -36,24 +36,34 @@ struct RelayState {
 /// ```
 #[pyclass(name = "NativeRelay", frozen)]
 pub struct PyNativeRelay {
-    state: Mutex<RelayState>,
+    state: Mutex<ServerState>,
 }
 
 #[pymethods]
 impl PyNativeRelay {
     /// Create a new relay targeting the given bind address.
     ///
-    /// `idle_timeout_secs` controls how long an upstream can be idle
+    /// `idle_timeout` controls how long an upstream can be idle
     /// before its connection is evicted. Set to `0` to disable (default).
     #[new]
-    #[pyo3(signature = (bind = "0.0.0.0:8080", idle_timeout_secs = 0))]
-    fn new(bind: &str, idle_timeout_secs: u64) -> Self {
+    #[pyo3(signature = (bind = "0.0.0.0:8080", relay_id=None, advertise_url=None, seeds=None, idle_timeout=0))]
+    fn new(
+        bind: &str,
+        relay_id: Option<String>,
+        advertise_url: Option<String>,
+        seeds: Option<Vec<String>>,
+        idle_timeout: u64,
+    ) -> Self {
+        let config = RelayConfig {
+            bind: bind.to_string(),
+            relay_id: relay_id.unwrap_or_else(|| RelayConfig::generate_relay_id()),
+            advertise_url: advertise_url.unwrap_or_default(),
+            seeds: seeds.unwrap_or_default(),
+            idle_timeout_secs: idle_timeout,
+            ..Default::default()
+        };
         Self {
-            state: Mutex::new(RelayState {
-                bind: bind.to_string(),
-                idle_timeout_secs,
-                server: None,
-            }),
+            state: Mutex::new(ServerState { config, server: None }),
         }
     }
 
@@ -61,15 +71,15 @@ impl PyNativeRelay {
     ///
     /// Releases the GIL while waiting for the listener to bind.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
-        let (bind, idle_timeout_secs) = {
+        let config = {
             let state = self.state.lock();
             if state.server.is_some() {
                 return Err(PyRuntimeError::new_err("Relay is already running"));
             }
-            (state.bind.clone(), state.idle_timeout_secs)
+            state.config.clone()
         }; // lock dropped before allow_threads
         let server = py
-            .allow_threads(|| RelayServer::start(&bind, idle_timeout_secs))
+            .allow_threads(|| RelayServer::start(config))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to start relay: {e}")))?;
         self.state.lock().server = Some(server);
         Ok(())
@@ -160,7 +170,7 @@ impl PyNativeRelay {
     /// The configured bind address.
     #[getter]
     fn bind_address(&self) -> String {
-        self.state.lock().bind.clone()
+        self.state.lock().config.bind.clone()
     }
 }
 
