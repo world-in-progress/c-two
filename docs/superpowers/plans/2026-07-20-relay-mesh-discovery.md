@@ -98,6 +98,8 @@ pub struct RelayConfig {
     pub dead_peer_probe_interval: Duration,
     /// Seed retry interval when no peers available.
     pub seed_retry_interval: Duration,
+    /// Skip IPC validation in `/_register`. For testing only.
+    pub skip_ipc_validation: bool,
 }
 
 impl Default for RelayConfig {
@@ -113,6 +115,7 @@ impl Default for RelayConfig {
             heartbeat_miss_threshold: 3,
             dead_peer_probe_interval: Duration::from_secs(30),
             seed_retry_interval: Duration::from_secs(10),
+            skip_ipc_validation: false,
         }
     }
 }
@@ -2407,8 +2410,14 @@ async fn handle_register(
     // Register (upsert semantics).
     let icrm_ns = payload.icrm_ns.unwrap_or_default();
     let icrm_ver = payload.icrm_ver.unwrap_or_default();
-    let client = Arc::new(IpcClient::connect(&payload.address).await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("IPC connect failed: {e}")))?);
+
+    // IPC validation: skip when configured for testing (H-8).
+    let client = if state.config().skip_ipc_validation {
+        None
+    } else {
+        Some(Arc::new(IpcClient::connect(&payload.address).await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("IPC connect failed: {e}")))?))
+    };
 
     let entry = state.register_upstream(
         name.clone(), address.clone(), icrm_ns, icrm_ver, client,
@@ -2969,11 +2978,8 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 
 End-to-end tests for the relay mesh: two relays, gossip sync, name resolution, and failure detection.
 
-> **Note (H-8):** The register tests POST fake `ipc://` addresses, but Task 10's `handle_register`
-> opens a real `IpcClient::connect()` and returns 502 on failure. To avoid needing real IPC servers
-> in integration tests, add a `skip_ipc_validation: bool` field to `RelayConfig` (default `false`).
-> Set it to `true` when constructing `NativeRelay` in tests. In `handle_register`, skip the
-> `IpcClient::connect` call when `config.skip_ipc_validation` is set.
+Tests use `skip_ipc_validation: true` in `RelayConfig` to avoid needing real IPC servers.
+The flag is defined in Task 1 (`RelayConfig`) and checked in Task 10 (`handle_register`).
 
 - [ ] **Step 1: Create integration test file**
 
@@ -3189,7 +3195,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - [x] §1.6 Failure Detection → Task 9 (heartbeat + failure_detection_loop + dead_peer_probe)
 - [x] §1.7 Config → Tasks 1, 11 (RelayConfig, C2_RELAY_SEEDS)
 - [x] §1.8 Address Auto-UUID → Task 13 (remove set_ipc_address)
-- [x] §1.9 Registry Integration → Tasks 12-13 (cc.connect + cc.register updates)
+- [x] §1.9 Registry Integration → Tasks 12-13 (cc.connect + cc.register updates). H-8 IPC validation skip wired into Task 1 `RelayConfig` + Task 10 `handle_register`.
 - [x] §1.10 CLI → Task 14 (--seeds, c3 registry)
 
 ### Type Consistency
