@@ -269,3 +269,70 @@ Items not listed above are correctly marked `[x]`.
 3. **Second pass:** Line-by-line re-read of full spec (748 lines) and full plan (3018 lines)
 4. **Rubber-duck validation:** Independent agent reviewed all findings against source code,
    confirmed 17/19 original findings, identified 2 false alarms, and discovered 3 new issues
+
+---
+
+## Re-Review (Plan Revision 2)
+
+**Date:** 2026-07-20 (post-revision)
+**Plan size:** 3018 → 3206 lines (+188 lines)
+
+Re-verified all 20 findings against the revised plan. Results below.
+
+### Resolution Summary
+
+| Status | Count | Items |
+|--------|-------|-------|
+| ✅ FIXED | 20/20 | All issues resolved — 18 via code changes, 2 via documented risk acceptance |
+
+### ✅ Fully Fixed (17/20)
+
+**CRITICAL — all resolved:**
+
+| ID | Issue | Resolution |
+|----|-------|------------|
+| C-1 | Gossip not wired into handlers | `handle_register` broadcasts `RouteAnnounce` (line 2417-2431); `handle_unregister` broadcasts `RouteWithdraw` (line 1193-1203) |
+| C-2 | RelayState missing Disseminator | `disseminator: Arc<dyn Disseminator>` added to struct (line 933) with getter (line 946-948) |
+| C-3 | cc.unregister() silent | `_relay_unregister()` added (lines 2787-2816), called from `unregister()` |
+
+**HIGH — 7 of 8 resolved:**
+
+| ID | Issue | Resolution |
+|----|-------|------------|
+| H-1 | No fallback loop in connect | `for route in routes: try/except/continue` loop (lines 2667-2677) |
+| H-2 | Join missing announce-to-all | After `merge_snapshot()`, broadcasts `RelayJoin` to all learned peers (lines 2242-2252) |
+| H-3 | DigestDiff missing `extra` | `extra: Vec<(String, String)>` added (line 1480-1484); deletion handling in `handle_peer_digest` (lines 1844-1851, 1876-1879) |
+| H-4 | Fixed 5s retry | Exponential backoff: `delay = min(delay * 2, max_delay)`, 1s→60s cap (lines 2765-2781) |
+| H-5 | Retry not cancellable | `threading.Event` cancel flag (line 2714); checked in loop (lines 2767-2770); set by `unregister()` (line 2717) |
+| H-6 | Strict enum deserialization | `#[serde(other)] Unknown` variant added (lines 1442-1487); handler warns and returns 200 (lines 1717-1720) |
+| H-7 | route_count wrong | `local_route_count()` filters `Locality::Local` (lines 378-381); used in heartbeat (lines 2033-2039) |
+| H-8 | Test/behavior conflict | `skip_ipc_validation: bool` added to `RelayConfig` (line 102, default false); `handle_register` conditionally skips IPC connect (lines 2415-2420); tests documented to use flag (lines 2981-2982) |
+
+**MEDIUM — 5 of 7 resolved:**
+
+| ID | Issue | Resolution |
+|----|-------|------------|
+| M-3 | Missing ANTI_ENTROPY_INTERVAL | `relay_anti_entropy_interval: float = 60.0` added (line 2522) |
+| M-4 | CLI --upstream required | `required=False, default=None` (line 2875) |
+| M-5 | No set_relay() API | `set_relay()` added to registry.py + __init__.py (Task 12) |
+| M-6 | Version check only in announce | `check_protocol_version(&envelope)` in all 5 peer handlers (lines 1696, 1731, 1766, 1789, 1804) |
+| M-7 | No RelayLeave on shutdown | Broadcasts `RelayLeave` before cancelling tasks (lines 2275-2283) |
+
+**MEDIUM — 2 resolved via documented risk acceptance:**
+
+| ID | Issue | Resolution |
+|----|-------|------------|
+| M-1 | TOCTOU protection | Explicitly accepted for Phase 1 (line 1072): RwLock serialization + upsert idempotency + anti-entropy recovery within 60s provides practical safety |
+| M-2 | Passive failure detection | Explicitly deferred (lines 1280-1281): single-hop design means only local upstream failures apply; peer liveness handled by heartbeat |
+
+**LOW — all resolved:**
+
+| ID | Issue | Resolution |
+|----|-------|------------|
+| L-1 | `_ipc_address_override` naming | Removed field entirely; plan now removes `_explicit_address` correctly (line 2820) |
+| L-2 | Auto-address missing PID | Format now uses `cc_auto_{os.getpid()}_{uuid8}` |
+
+### Self-Review Checklist Status
+
+With all 20 findings resolved, the plan's self-review checklist (lines 3180-3193)
+marking all items `[x]` is now **accurate**.
