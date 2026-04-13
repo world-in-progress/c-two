@@ -188,7 +188,7 @@ Combined effect: after a crash and restart, the relay begins with a clean local 
 ### 1.3 Duplicate Name Policy
 
 - **Same node (same relay_id):** **Upsert semantics.** If a route with the same `(name, relay_id)` already exists, the `ipc_address` and `registered_at` are updated (INSERT OR REPLACE). This handles the common case of a CRM process crashing and restarting with a new auto-UUID address — the relay simply updates the route entry instead of rejecting it. A gossip `RouteAnnounce` is broadcast with the updated entry.
-- **Same node (different process, same name):** If a different CRM process attempts to register a name that is already registered by a still-alive CRM process on the same relay, the relay detects this by checking if the existing IPC address is still responsive (a quick health check). If the old process is alive → 409 Conflict. If the old process is dead (health check fails) → upsert as above.
+- **Same node (different process, same name):** If a different CRM process attempts to register a name that is already registered by a still-alive CRM process on the same relay, the relay detects this by sending a **Ping** to the existing IPC address (using the wire protocol's `MsgType::Ping`, timeout 500ms). If the old process responds with Pong → 409 Conflict. If the connection fails (`ECONNREFUSED`) or times out → the old process is considered dead → upsert as above. Note: on Linux, crashed processes leave behind UDS socket files that return `ECONNREFUSED` on connect — this is correctly treated as dead.
 - **Cross node:** Allowed. Multiple relays can register the same `name`. The route table stores all entries.
 
 #### Deterministic Resolution Ordering
@@ -233,13 +233,11 @@ Relay-C starts up (late join):
   4. Seed responds with FULL_SYNC:
      - Complete route table (all names across all peers)
      - Complete peer list (all known relays + their URLs)
-     - Logical sequence number (seq: u64) representing the seed's latest gossip state
      This is a point-in-time snapshot of the seed's registry.
   5. Relay-C acquires RouteTable write lock:
      a. Replaces all PEER routes in local registry with FULL_SYNC data
-     b. Sets local gossip sequence = received seq
-     c. Queues any incoming gossip received during steps 3–5 for replay
-  6. Relay-C replays queued gossip (only messages with seq > FULL_SYNC seq)
+     b. Queues any incoming gossip received during steps 3–5 for replay
+  6. Relay-C replays ALL queued gossip messages (upsert semantics — no filtering needed)
   7. Relay-C releases write lock
   8. Relay-C announces itself to ALL peers learned from sync
      POST /_peer/announce to each peer
@@ -248,9 +246,9 @@ Relay-C starts up (late join):
      → Each triggers gossip (ROUTE_ANNOUNCE) to all peers
 ```
 
-**TOCTOU protection (steps 5–7):** Between receiving FULL_SYNC and completing local registration, a race window exists where incoming gossip could be lost. The write lock on `RouteTable` during steps 5–7 prevents concurrent modification. Any gossip arriving during this window is queued in a `Vec<PeerMessage>` and replayed after the snapshot is applied. The `seq` field ensures replayed messages that predate the snapshot are idempotent (route upsert by `(name, relay_id)` primary key).
+**TOCTOU protection (steps 5–7):** Between receiving FULL_SYNC and completing local registration, a race window exists where incoming gossip could be lost. The write lock on `RouteTable` during steps 5–7 prevents concurrent modification. Any gossip arriving during this window is queued in a `Vec<PeerMessage>` and replayed after the snapshot is applied. No sequence numbers are needed — all gossip operations (RouteAnnounce, RouteWithdraw) are idempotent via upsert on the `(name, relay_id)` primary key, so replaying a message that was already included in the snapshot is harmless.
 
-The FULL_SYNC in step 4 ensures the late-joining relay receives ALL previously announced routes, not just incremental changes broadcast after it joined. The seed relay's `/_peer/sync` endpoint serializes the full RouteTable state as JSON plus a logical sequence number that the joiner uses to deduplicate gossip received during the join window.
+The FULL_SYNC in step 4 ensures the late-joining relay receives ALL previously announced routes, not just incremental changes broadcast after it joined. The seed relay's `/_peer/sync` endpoint serializes the full RouteTable state as JSON.
 
 If all seeds are unreachable (e.g., this relay starts first):
 - Relay operates in standalone mode (empty registry, only local CRMs)
@@ -328,7 +326,8 @@ Gossip is fire-and-forget (HTTP POST with no ACK). During network partitions, me
 **Periodic digest exchange** provides convergence after partition recovery:
 
 ```
-Every 60 seconds, each relay pair exchanges route digests:
+Every 60 seconds, each relay selects ONE peer (round-robin from peer list)
+and exchanges route digests:
 
   Relay-A → Relay-B: DigestExchange {
     digest: { (name, relay_id) → hash(registered_at, ipc_address) }
@@ -345,13 +344,15 @@ Every 60 seconds, each relay pair exchanges route digests:
   Then B sends its own digest to A (symmetric).
 ```
 
+**Peer selection strategy:** Each relay maintains a round-robin index into its Alive peer list. Every interval, it advances the index and exchanges with the next peer. This produces **O(N) exchanges per interval** across the cluster (one per relay), compared to O(N²) if every relay contacted every peer. Full-mesh convergence time is `interval × peer_count` in the worst case (e.g., 60s × 10 peers = 10 minutes for a 10-node cluster), which is acceptable since anti-entropy is a background consistency repair, not the primary sync mechanism.
+
 **Key properties:**
 - The digest key is `(name, relay_id)` — this uniquely identifies each route entry and avoids ambiguity when multiple relays register the same name. The hash covers `(registered_at, ipc_address)` — the mutable fields of a route entry.
 - Digest exchange is **bidirectional**: both sides detect what they're missing.
 - The exchange is idempotent: running it multiple times converges to the same state.
 - The 60-second interval is configurable via `C2_RELAY_ANTI_ENTROPY_INTERVAL` (0 disables).
-- During normal operation (no partitions), digests match and no data is transferred — overhead is one small HTTP round-trip per peer per interval.
-- After a partition heals, full convergence occurs within one interval (60s worst case).
+- During normal operation (no partitions), digests match and no data is transferred — overhead is one small HTTP round-trip per relay per interval.
+- After a partition heals, convergence depends on round-robin selection. Worst case: `interval × peer_count` (e.g., 600s for 10 peers at 60s interval). Dead-peer recovery (§1.6) triggers an immediate digest exchange to accelerate this.
 
 ### 1.6 Failure Detection
 
@@ -370,7 +371,7 @@ When a peer is marked dead:
 4. Log warning: `[relay] Peer relay-b marked dead; removed N routes`.
 5. **Dead-peer probe** (background task): every 30s, attempt `GET /health` on each Dead peer. If it responds:
    - Transition status `Dead → Alive`.
-   - Trigger bidirectional FULL_SYNC to reconcile route tables.
+   - Trigger an immediate bidirectional digest exchange (§1.5.1) to reconcile route tables — reuses the existing anti-entropy mechanism rather than introducing a separate sync protocol.
    - Log: `[relay] Peer relay-b recovered; synced N routes`.
 6. Peers are only **permanently removed** from the peer list upon receiving an explicit `RelayLeave` message (graceful shutdown). Crash + recovery is handled by the probe, not by re-join via seeds.
 
@@ -705,7 +706,7 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 | Component | Crate | Changes |
 |-----------|-------|---------|
 | Peer protocol endpoints | `c2-http` (relay module) | New `/_peer/*` routes in `router.rs` (including `/_peer/digest` for anti-entropy) |
-| Route table state | `c2-http` (relay module) | New `RouteTable` struct (replaces `UpstreamPool`); `ConnectionPool` for connection lifecycle |
+| Route table state | `c2-http` (relay module) | New `RouteTable` struct (replaces `UpstreamPool`); `ConnectionPool` for connection lifecycle. **Feature flag note:** `UpstreamPool` is currently used in both mesh-relay and plain-relay (single upstream `c3 relay --upstream ipc://...`) modes. `RouteTable` replaces it behind the `relay` feature. For plain-relay mode (no mesh), `RouteTable` operates in standalone mode: no peers, no gossip, just LOCAL routes — functionally equivalent to the current `UpstreamPool`. The `relay` feature flag continues to gate all mesh-specific code (gossip, peers, anti-entropy). |
 | Gossip dissemination | `c2-http` (relay module) | `Disseminator` trait + `FullBroadcast` impl |
 | Heartbeat sweeper | `c2-http` (relay module) | Extend existing idle sweeper |
 | Peer message types | `c2-wire` | New message enum (or JSON via serde) |
