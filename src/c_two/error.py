@@ -104,6 +104,30 @@ class CompoCRMCalling(CCError):
         message = 'Error occurred when calling CRM from Compo' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_COMPO_CRM_CALLING, message=message)
 
+class ResourceNotFound(CCError):
+    """Raised when a named resource cannot be resolved by any relay."""
+    ERROR_CODE = 701
+
+    def __init__(self, message: str | None = None):
+        super().__init__(code=ERROR_Code.ERROR_UNKNOWN, message=message or 'Resource not found')
+
+class ResourceUnavailable(CCError):
+    """Raised when a resource exists but is not reachable."""
+    ERROR_CODE = 702
+
+    def __init__(self, message: str | None = None, detail: str | None = None):
+        msg = message or 'Resource unavailable'
+        if detail:
+            msg = f'{msg}: {detail}'
+        super().__init__(code=ERROR_Code.ERROR_UNKNOWN, message=msg)
+
+class RegistryUnavailable(CCError):
+    """Raised when no relay is available for name resolution."""
+    ERROR_CODE = 705
+
+    def __init__(self, message: str | None = None):
+        super().__init__(code=ERROR_Code.ERROR_UNKNOWN, message=message or 'Registry unavailable')
+
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING:    CRMDeserializeInput,
     ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING:     CRMSerializeOutput,
