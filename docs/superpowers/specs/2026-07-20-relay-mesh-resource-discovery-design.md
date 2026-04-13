@@ -61,11 +61,9 @@ Resolution chain (evaluated in order, first match wins):
 | 1 | Same process (`_registrations[name]`) | thread-local proxy | ~0 |
 | 2 | Local relay has `name` as LOCAL route | IPC direct to CRM | ~0.3ms |
 | 3 | Local relay has `name` as PEER route | HTTP direct to owning relay | ~1-5ms |
-| 4 | None found | raise `ResourceNotFound` | — |
+| — | None found | raise `ResourceNotFound` | — |
 
 For priority 3 (cross-node), the client resolves the target relay URL from the local Registry CRM, then establishes a direct HTTP connection to that relay. Subsequent RPC calls go directly to the target relay — the resolution happens once at `cc.connect()` time.
-
-Explicit `address=` parameter is still supported and bypasses the resolution chain entirely (backward compatible).
 
 ### 1.2 Registry CRM
 
@@ -151,6 +149,18 @@ Tables:
 - `routes(name TEXT, relay_id TEXT, relay_url TEXT, icrm_ns TEXT, icrm_ver TEXT, registered_at REAL, PRIMARY KEY (name, relay_id))`
 - `relays(relay_id TEXT PRIMARY KEY, url TEXT, last_heartbeat REAL, status TEXT)`
 
+#### Crash Resilience
+
+SQLite is persistent — if a relay crashes, a stale `registry.db` survives on disk and may contain routes to now-dead CRMs. Two safeguards prevent dirty reads on restart:
+
+1. **Startup purge of local routes.** On relay startup, all routes where `relay_id == self.relay_id` are deleted from the local SQLite before any CRM registration. Local routes are only valid for the current process; stale entries from a previous incarnation are always wrong.
+
+2. **Full sync overwrite for peer routes.** During the join protocol (step 3–4), the full route table received from the seed peer replaces all PEER entries in local SQLite. This ensures peer routes reflect the current mesh state, not a stale snapshot from before the crash.
+
+3. **WAL mode.** SQLite is opened with `PRAGMA journal_mode=WAL` for crash-safe writes. Even if the relay crashes mid-write, the database remains consistent.
+
+Combined effect: after a crash and restart, the relay begins with a clean local slate and a fresh peer snapshot — no stale data can leak.
+
 ### 1.3 Duplicate Name Policy
 
 - **Same node:** Rejected (409 Conflict). A single machine gains nothing from running duplicate CRM instances of the same resource — the existing `READ_PARALLEL` scheduler already handles concurrent reads via thread pool, and duplicate processes waste CPU/GPU/memory.
@@ -177,23 +187,32 @@ No designated "head node." Any relay can be a seed. Seeds are only used for init
 
 #### Join Protocol
 
+A relay that starts after the mesh is already running (late join) receives the full current state via FULL_SYNC:
+
 ```
-Relay-C starts up:
-  1. Read C2_RELAY_SEEDS → [http://node1:8080, http://node2:8080]
-  2. Try POST /_peer/join to each seed (first success wins)
+Relay-C starts up (late join):
+  1. Startup purge: DELETE all local routes from registry.db (crash recovery)
+  2. Read C2_RELAY_SEEDS → [http://node1:8080, http://node2:8080]
+  3. Try POST /_peer/join to each seed (first success wins)
      Body: {"relay_id": "relay-c", "url": "http://node3:8080"}
-  3. Seed responds with full route table + peer list (FULL_SYNC)
-  4. Relay-C merges into local Registry CRM
-  5. Relay-C announces itself to ALL peers learned from sync
+  4. Seed responds with FULL_SYNC:
+     - Complete route table (all names across all peers)
+     - Complete peer list (all known relays + their URLs)
+     This is a point-in-time snapshot of the seed's registry.
+  5. Relay-C replaces all PEER routes in local registry with FULL_SYNC data
+  6. Relay-C announces itself to ALL peers learned from sync
      POST /_peer/announce to each peer
-  6. Relay-C registers its local CRMs as routes
-     → Each triggers gossip to all peers
+     → Each peer adds Relay-C to their peer list
+  7. Relay-C registers its own local CRMs as routes
+     → Each triggers gossip (ROUTE_ANNOUNCE) to all peers
 ```
 
+The FULL_SYNC in step 4 ensures the late-joining relay receives ALL previously announced routes, not just incremental changes broadcast after it joined. The seed relay's `/_peer/sync` endpoint simply serializes the full Registry CRM state.
+
 If all seeds are unreachable (e.g., this relay starts first):
-- Relay operates in standalone mode
+- Relay operates in standalone mode (empty registry, only local CRMs)
 - Retries seed connection periodically (every 10s)
-- Once a seed becomes reachable, completes the join protocol
+- Once a seed becomes reachable, completes the join protocol above
 
 ### 1.5 Gossip Protocol (HTTP-based)
 
@@ -278,7 +297,18 @@ cc.set_relay('http://localhost:8080')
 
 For same-node scenarios where only IPC is needed (no relay), name resolution falls back to local-only (priorities 1–2 in the resolution chain). The relay is only needed for cross-node discovery.
 
-### 1.8 Registry Integration with `cc.register()` and `cc.connect()`
+### 1.8 IPC Address Simplification
+
+With relay mesh handling all name resolution, clients never see IPC addresses. The existing `set_ipc_address()` API and `C2_IPC_ADDRESS` environment variable are **removed**:
+
+- **IPC addresses are always auto-generated UUIDs.** The server generates `ipc://cc_auto_{pid}_{uuid8}` automatically on first `cc.register()`. This is an internal transport detail, invisible to users.
+- **`cc.set_ipc_address()` is removed.** No longer needed — address is auto-assigned.
+- **`C2_IPC_ADDRESS` env var is removed.** Same reason.
+- **`cc.connect(address=...)` parameter is removed.** Name-based resolution via registry replaces explicit addressing. For direct IPC debugging, the auto-generated address can be discovered via `c3 registry list-routes`.
+
+This is a breaking change. Since C-Two is at 0.x.x, backward compatibility is not required.
+
+### 1.9 Registry Integration with `cc.register()` and `cc.connect()`
 
 #### Server side (`cc.register`)
 
@@ -302,16 +332,12 @@ def register(icrm_class, crm_instance, name, ...):
 #### Client side (`cc.connect`)
 
 ```python
-def connect(icrm_class, name, address=None):
-    # Priority 1: explicit address (backward compatible)
-    if address:
-        return _connect_explicit(icrm_class, name, address)
-
-    # Priority 2: same-process
+def connect(icrm_class, name):
+    # Priority 1: same-process
     if name in _registrations:
         return ICRMProxy.thread_local(...)
 
-    # Priority 3: resolve via relay
+    # Priority 2: resolve via relay
     relay_address = _get_relay_address()
     if relay_address:
         route_info = _resolve_via_relay(relay_address, name)
@@ -488,12 +514,24 @@ All errors follow fast-fail semantics (no automatic retry at the C-Two level). C
 
 ---
 
-## Backward Compatibility
+## Breaking Changes (0.x.x)
 
-- `cc.connect(IGrid, name='grid', address='ipc://...')` continues to work unchanged. Explicit `address` bypasses the registry entirely.
-- `C2_RELAY_ADDRESS` continues to work. The relay it points to now also serves as the name resolution endpoint.
-- Existing single-node deployments (no relay) are unaffected. Name resolution falls back to local-only.
-- `cc.register()` gains no new required parameters. All new parameters (`consistency`, `stale_policy`, `refresh_strategy`) have backward-compatible defaults.
+C-Two is at 0.x.x — no backward compatibility guarantees.
+
+### Removed APIs
+
+| Removed | Replacement |
+|---------|-------------|
+| `cc.set_ipc_address(address)` | Removed. IPC address is always auto-generated UUID. |
+| `C2_IPC_ADDRESS` env var | Removed. Same reason. |
+| `cc.connect(..., address='ipc://...')` | `cc.connect(IGrid, name='grid')` — relay resolves address. |
+
+### Unchanged APIs
+
+- `C2_RELAY_ADDRESS` — points to local relay (now also the name resolution endpoint).
+- `cc.register()` — no new required parameters. New optional: `consistency`, `stale_policy`, `refresh_strategy`.
+- `cc.connect()` — `name` parameter is now the sole locator (no `address`).
+- Single-node deployments without relay continue to work (local-only resolution).
 
 ---
 
@@ -535,9 +573,10 @@ All errors follow fast-fail semantics (no automatic retry at the C-Two level). C
 
 | Component | File | Changes |
 |-----------|------|---------|
-| Name resolution | `transport/registry.py` | Extend `connect()` with relay-based resolution |
+| Name resolution | `transport/registry.py` | Extend `connect()` with relay-based resolution; remove `address` param |
+| Address removal | `transport/registry.py` | Remove `set_ipc_address()`, `_explicit_address`, `C2_IPC_ADDRESS` fallback; always auto-UUID |
 | Registry notification | `transport/registry.py` | Extend `register()` / `unregister()` to notify relay |
-| Relay configuration | `config/settings.py` | New `C2_RELAY_SEEDS` setting |
+| Relay configuration | `config/settings.py` | New `C2_RELAY_SEEDS` setting; remove `C2_IPC_ADDRESS` |
 | CLI extensions | `cli.py` | New `c3 relay --seeds` flag; `c3 registry` subcommand |
 | Error types | `errors.py` | New error classes |
 
