@@ -81,7 +81,7 @@ struct RouteEntry {
     icrm_ns: String,        // ICRM namespace (e.g., "cc.demo")
     icrm_ver: String,       // ICRM version (e.g., "0.1.0")
     locality: Locality,     // Local or Peer
-    registered_at: f64,     // Unix timestamp (monotonic-adjusted, see §1.3)
+    registered_at: f64,     // Unix wall-clock timestamp (see §1.3 clock skew caveat)
 }
 
 enum Locality { Local, Peer }
@@ -122,6 +122,22 @@ struct RelayState {
 }
 ```
 
+**Lock ordering rule:** When both locks are needed (e.g., removing a route and its connection), always acquire `route_table` **before** `conn_pool`. To prevent accidental inversion, `RelayState` provides transactional methods that encapsulate multi-lock operations:
+
+```rust
+impl RelayState {
+    /// Remove a route and close its connection atomically.
+    fn remove_route_and_connection(&self, name: &str, relay_id: &str) {
+        let mut rt = self.route_table.write();
+        rt.unregister_route(name, relay_id);
+        let mut cp = self.conn_pool.write();
+        cp.evict(name);
+    }
+}
+```
+
+Callers should use these transactional methods instead of acquiring locks individually.
+
 #### RouteTable API (internal, not RPC)
 
 ```rust
@@ -135,7 +151,7 @@ impl RouteTable {
     fn unregister_peer(&mut self, relay_id: &str);
     fn full_snapshot(&self) -> FullSync;       // For /_peer/sync
     fn merge_snapshot(&mut self, sync: FullSync); // On join
-    fn route_digest(&self) -> HashMap<String, u64>; // {name → hash} for anti-entropy
+    fn route_digest(&self) -> HashMap<(String, String), u64>; // (name, relay_id) → hash for anti-entropy
 }
 ```
 
@@ -171,7 +187,8 @@ Combined effect: after a crash and restart, the relay begins with a clean local 
 
 ### 1.3 Duplicate Name Policy
 
-- **Same node:** Rejected (409 Conflict). A single machine gains nothing from running duplicate CRM instances of the same resource — the existing `READ_PARALLEL` scheduler already handles concurrent reads via thread pool, and duplicate processes waste CPU/GPU/memory.
+- **Same node (same relay_id):** **Upsert semantics.** If a route with the same `(name, relay_id)` already exists, the `ipc_address` and `registered_at` are updated (INSERT OR REPLACE). This handles the common case of a CRM process crashing and restarting with a new auto-UUID address — the relay simply updates the route entry instead of rejecting it. A gossip `RouteAnnounce` is broadcast with the updated entry.
+- **Same node (different process, same name):** If a different CRM process attempts to register a name that is already registered by a still-alive CRM process on the same relay, the relay detects this by checking if the existing IPC address is still responsive (a quick health check). If the old process is alive → 409 Conflict. If the old process is dead (health check fails) → upsert as above.
 - **Cross node:** Allowed. Multiple relays can register the same `name`. The route table stores all entries.
 
 #### Deterministic Resolution Ordering
@@ -179,6 +196,8 @@ Combined effect: after a crash and restart, the relay begins with a clean local 
 When multiple PEER entries exist for the same name, all relays must resolve to the same target to avoid inconsistency. Gossip has no global clock, so arrival order varies across relays.
 
 Resolution uses a **deterministic sort key**: `(registered_at, relay_id)`. Among PEER entries with the same name, the entry with the smallest `registered_at` wins; ties are broken by lexicographic `relay_id` (smallest first). Every relay applies the same comparator, so the resolved order is consistent regardless of gossip arrival sequence.
+
+> **Clock skew caveat:** `registered_at` is a wall-clock Unix timestamp (`SystemTime`), not a monotonic clock (which is process-local and cross-machine-incomparable). Deterministic ordering is therefore subject to clock skew across nodes. For clusters with significant clock drift (>1s), the ordering may not reflect true registration order. NTP synchronization across cluster nodes is recommended. This is an accepted limitation in Phase 1 — a Lamport/hybrid logical clock could replace wall-clock ordering in a future phase if needed.
 
 `/_resolve/{name}` returns all matching entries sorted by: LOCAL first, then PEERs by `(registered_at, relay_id)`. The client defaults to the first entry and can fallback to subsequent ones on failure.
 
@@ -272,8 +291,8 @@ enum PeerMessage {
     RelayJoin    { relay_id: String, url: String },
     RelayLeave   { relay_id: String },
     Heartbeat    { relay_id: String, route_count: u32 },
-    DigestExchange { digest: HashMap<String, u64> }, // Anti-entropy (§1.5.1)
-    DigestDiff     { missing: Vec<RouteEntry>, extra: Vec<(String, String)> },
+    DigestExchange { digest: HashMap<(String, String), u64> }, // Anti-entropy (§1.5.1), key=(name, relay_id)
+    DigestDiff     { missing: Vec<RouteEntry>, extra: Vec<(String, String)> }, // extra = (name, relay_id) to delete
     // Phase 2 (reserved):
     // StaleNotify  { name: String, version: u64 },
     // WriteIntent  { name: String, writer_relay_id: String },
@@ -311,18 +330,23 @@ Gossip is fire-and-forget (HTTP POST with no ACK). During network partitions, me
 ```
 Every 60 seconds, each relay pair exchanges route digests:
 
-  Relay-A → Relay-B: DigestExchange { digest: {name → hash(relay_id, registered_at)} }
+  Relay-A → Relay-B: DigestExchange {
+    digest: { (name, relay_id) → hash(registered_at, ipc_address) }
+  }
+  // Key is (name, relay_id) to handle cross-node same-name routes unambiguously.
+  // Each entry is individually hashable; no aggregation ambiguity.
+
   Relay-B compares with its own table:
-    - Names in A's digest but not in B → request from A (missing routes)
-    - Names in B's table from A but not in A's digest → stale, delete
-    - Names with different hashes → conflict, request full entry from A
+    - (name, relay_id) in A's digest but not in B → request from A (missing route)
+    - (name, relay_id) in B's table from A but not in A's digest → stale, delete
+    - Same key, different hash → conflict, request full entry from A
   Relay-B → Relay-A: DigestDiff { missing: [...], extra: [...] }
   Relay-A sends missing entries; Relay-B deletes extras.
   Then B sends its own digest to A (symmetric).
 ```
 
 **Key properties:**
-- The digest is a compact `{name → u64}` map where the hash encodes `(relay_id, registered_at)`. This keeps digest size proportional to route count, not entry size.
+- The digest key is `(name, relay_id)` — this uniquely identifies each route entry and avoids ambiguity when multiple relays register the same name. The hash covers `(registered_at, ipc_address)` — the mutable fields of a route entry.
 - Digest exchange is **bidirectional**: both sides detect what they're missing.
 - The exchange is idempotent: running it multiple times converges to the same state.
 - The 60-second interval is configurable via `C2_RELAY_ANTI_ENTROPY_INTERVAL` (0 disables).
@@ -340,11 +364,17 @@ Every 60 seconds, each relay pair exchanges route digests:
 
 When a peer is marked dead:
 
-1. Set peer status to `Dead` in RouteTable.
-2. Remove all routes from that peer.
+1. Set peer status to `Dead` in RouteTable. **The peer remains in the peer list** (not removed).
+2. Remove all routes from that peer (no longer routable).
 3. If a removed route has replicas on other peers, traffic auto-routes to surviving replicas.
 4. Log warning: `[relay] Peer relay-b marked dead; removed N routes`.
-5. If the dead peer recovers, it re-joins via seed protocol and FULL_SYNC restores its routes.
+5. **Dead-peer probe** (background task): every 30s, attempt `GET /health` on each Dead peer. If it responds:
+   - Transition status `Dead → Alive`.
+   - Trigger bidirectional FULL_SYNC to reconcile route tables.
+   - Log: `[relay] Peer relay-b recovered; synced N routes`.
+6. Peers are only **permanently removed** from the peer list upon receiving an explicit `RelayLeave` message (graceful shutdown). Crash + recovery is handled by the probe, not by re-join via seeds.
+
+This ensures partition healing is automatic: after a network split resolves, dead-peer probes re-establish connectivity within 30s without requiring seed reachability.
 
 ### 1.7 Client Configuration
 
@@ -408,7 +438,9 @@ This prevents a temporarily unavailable relay from blocking CRM startup. The CRM
 #### Client side (`cc.connect`)
 
 ```python
-# Route cache: TTL-based, invalidated on connection failure
+# Route cache: TTL-based, invalidated on connection failure.
+# Thread-safe for free-threading (Python 3.14t target).
+_route_cache_lock = threading.Lock()
 _route_cache: dict[str, tuple[list[RouteInfo], float]] = {}
 _ROUTE_CACHE_TTL = 30.0  # seconds
 
@@ -436,21 +468,25 @@ def connect(icrm_class, name, address=None):
             except ConnectionError:
                 continue  # Try next route entry (fallback)
         # All routes failed → clear cache and raise
-        _route_cache.pop(name, None)
+        with _route_cache_lock:
+            _route_cache.pop(name, None)
 
     raise ResourceNotFound(f"CRM '{name}' not found")
 
 def _resolve_with_cache(relay_address, name):
-    cached = _route_cache.get(name)
-    if cached and time.monotonic() - cached[1] < _ROUTE_CACHE_TTL:
-        return cached[0]
+    with _route_cache_lock:
+        cached = _route_cache.get(name)
+        if cached and time.monotonic() - cached[1] < _ROUTE_CACHE_TTL:
+            return cached[0]
+    # Cache miss or expired — HTTP fetch outside lock to avoid blocking
     routes = _http_get(f'{relay_address}/_resolve/{name}')  # Returns list
     if routes:
-        _route_cache[name] = (routes, time.monotonic())
+        with _route_cache_lock:
+            _route_cache[name] = (routes, time.monotonic())
     return routes or []
 ```
 
-The cache avoids redundant HTTP round-trips for repeated `cc.connect()` calls. Cache entries are evicted on TTL expiry or connection failure (whichever comes first).
+The cache uses a `threading.Lock` to protect the check-then-update pattern. The lock is held briefly (dict lookup only); the HTTP fetch happens outside the lock to avoid blocking concurrent callers. Under free-threading (no GIL), this prevents TOCTOU races where concurrent `cc.connect()` calls could issue duplicate HTTP requests or corrupt the cache dict.
 
 ### 1.10 Relay CLI Changes
 
