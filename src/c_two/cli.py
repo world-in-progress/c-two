@@ -89,7 +89,7 @@ _RELAY_BANNER = """\
    POST /_register      Register upstream CRM
    POST /_unregister    Unregister upstream CRM
    GET  /_routes        List registered routes
-   GET  /_resolve/{name} Resolve resource name
+   GET  /_resolve/{{name}} Resolve resource name
    GET  /_peers          List known peers
    GET  /health         Health check
 
@@ -103,9 +103,8 @@ _RELAY_BANNER = """\
 @cli.command()
 @click.option(
     '--bind', '-b',
-    default='0.0.0.0:8080',
-    show_default=True,
-    help='HTTP listen address (host:port).',
+    default=None,
+    help='HTTP listen address (host:port).  [env: C2_RELAY_BIND; default: 0.0.0.0:8080]',
 )
 @click.option(
     '--upstream', '-u',
@@ -125,35 +124,34 @@ _RELAY_BANNER = """\
 )
 @click.option(
     '--idle-timeout',
-    default=300,
-    show_default=True,
+    default=None,
     type=int,
     metavar='SECONDS',
-    help='Disconnect idle upstream IPC connections after this many seconds (0=disabled).',
+    help='Disconnect idle upstream IPC connections after this many seconds (0=disabled).  [env: C2_RELAY_IDLE_TIMEOUT; default: 300]',
 )
 @click.option(
     '--seeds', '-s',
-    default='',
-    help='Comma-separated seed relay URLs for mesh mode.',
+    default=None,
+    help='Comma-separated seed relay URLs for mesh mode.  [env: C2_RELAY_SEEDS]',
 )
 @click.option(
     '--relay-id',
-    default='',
-    help='Stable relay identifier for mesh protocol.',
+    default=None,
+    help='Stable relay identifier for mesh protocol.  [env: C2_RELAY_ID]',
 )
 @click.option(
     '--advertise-url',
-    default='',
-    help='Publicly reachable URL for this relay (announced to peers).',
+    default=None,
+    help='Publicly reachable URL for this relay (announced to peers).  [env: C2_RELAY_ADVERTISE_URL]',
 )
 def relay(
-    bind: str,
+    bind: str | None,
     upstream: tuple[str, ...],
     log_level: str,
-    idle_timeout: int,
-    seeds: str,
-    relay_id: str,
-    advertise_url: str,
+    idle_timeout: int | None,
+    seeds: str | None,
+    relay_id: str | None,
+    advertise_url: str | None,
 ):
     """Start the C-Two HTTP relay server.
 
@@ -161,6 +159,14 @@ def relay(
     CRM processes auto-register via C2_RELAY_ADDRESS, or use --upstream
     to pre-register at startup.
     """
+    from .config.settings import settings
+
+    # Resolve: CLI flag > env/.env (via settings) > hardcoded default
+    bind = bind or settings.relay_bind or '0.0.0.0:8080'
+    idle_timeout = idle_timeout if idle_timeout is not None else (settings.relay_idle_timeout or 300)
+    seeds_str = seeds if seeds is not None else (settings.relay_seeds or '')
+    relay_id = relay_id or settings.relay_id or ''
+    advertise_url = advertise_url or settings.relay_advertise_url or ''
     logging.getLogger().setLevel(getattr(logging, log_level.upper()))
 
     # Parse upstream entries early to fail fast on bad format.
@@ -179,7 +185,7 @@ def relay(
         )
         sys.exit(1)
 
-    seed_list = [s.strip() for s in seeds.split(",") if s.strip()] if seeds else []
+    seed_list = [s.strip() for s in seeds_str.split(",") if s.strip()] if seeds_str else []
     relay_instance = NativeRelay(
         bind,
         relay_id=relay_id or None,

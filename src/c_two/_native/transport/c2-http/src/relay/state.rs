@@ -187,7 +187,9 @@ mod tests {
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
-        fn broadcast(&self, _envelope: crate::relay::peer::PeerEnvelope, _peers: &[PeerSnapshot]) {}
+        fn broadcast(&self, _envelope: crate::relay::peer::PeerEnvelope, _peers: &[PeerSnapshot]) -> Option<tokio::task::JoinHandle<()>> {
+            None
+        }
     }
 
     fn test_config() -> Arc<RelayConfig> {

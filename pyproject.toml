@@ -19,6 +19,11 @@ dev = [
     "pytest>=8.0.0",
     "pytest-timeout>=2.0.0",
 ]
+examples = [
+    "numpy>=2.2.4",
+    "pandas>=2.2.0",
+    "pyarrow>=23.0.1",
+]
 
 [build-system]
 requires = ["maturin>=1.7,<2.0"]
