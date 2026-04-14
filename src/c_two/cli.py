@@ -89,6 +89,8 @@ _RELAY_BANNER = """\
    POST /_register      Register upstream CRM
    POST /_unregister    Unregister upstream CRM
    GET  /_routes        List registered routes
+   GET  /_resolve/{name} Resolve resource name
+   GET  /_peers          List known peers
    GET  /health         Health check
 
  Data plane:
@@ -129,11 +131,29 @@ _RELAY_BANNER = """\
     metavar='SECONDS',
     help='Disconnect idle upstream IPC connections after this many seconds (0=disabled).',
 )
+@click.option(
+    '--seeds', '-s',
+    default='',
+    help='Comma-separated seed relay URLs for mesh mode.',
+)
+@click.option(
+    '--relay-id',
+    default='',
+    help='Stable relay identifier for mesh protocol.',
+)
+@click.option(
+    '--advertise-url',
+    default='',
+    help='Publicly reachable URL for this relay (announced to peers).',
+)
 def relay(
     bind: str,
     upstream: tuple[str, ...],
     log_level: str,
     idle_timeout: int,
+    seeds: str,
+    relay_id: str,
+    advertise_url: str,
 ):
     """Start the C-Two HTTP relay server.
 
@@ -159,7 +179,14 @@ def relay(
         )
         sys.exit(1)
 
-    relay_instance = NativeRelay(bind, idle_timeout_secs=idle_timeout)
+    seed_list = [s.strip() for s in seeds.split(",") if s.strip()] if seeds else []
+    relay_instance = NativeRelay(
+        bind,
+        relay_id=relay_id or None,
+        advertise_url=advertise_url or None,
+        seeds=seed_list if seed_list else None,
+        idle_timeout=idle_timeout,
+    )
     relay_instance.start()
 
     for name, address in parsed_upstreams:
@@ -179,6 +206,14 @@ def relay(
         workers='-',
         idle_timeout=idle_str,
     ))
+
+    # Show mesh info in banner if configured
+    if seed_list:
+        click.echo(f'  Mesh mode: {len(seed_list)} seed(s)')
+        for s in seed_list:
+            click.echo(f'    → {s}')
+    if relay_id:
+        click.echo(f'  Relay ID: {relay_id}')
 
     # Block until signal.
     stop = threading.Event()
@@ -206,6 +241,86 @@ def _relay_url(bind: str) -> str:
     if host in ('0.0.0.0', '::'):
         host = '127.0.0.1'
     return f'http://{host}:{port}'
+
+
+# ---------------------------------------------------------------------------
+# c3 registry  (resource registry commands)
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def registry():
+    """Resource registry commands — query relay for routes and peers."""
+
+
+@registry.command('list-routes')
+@click.option('--relay', '-r', required=True, help='Relay HTTP address (e.g. http://localhost:8080)')
+def registry_list_routes(relay):
+    """List all registered routes on a relay."""
+    import json
+    import urllib.request
+
+    url = f'{relay.rstrip("/")}/_routes'
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            routes = json.loads(resp.read())
+            if not routes:
+                click.echo('No routes registered.')
+                return
+            for name in routes:
+                click.echo(name)
+    except Exception as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+
+
+@registry.command('resolve')
+@click.option('--relay', '-r', required=True, help='Relay HTTP address')
+@click.argument('name')
+def registry_resolve(relay, name):
+    """Resolve a resource name to route info."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    url = f'{relay.rstrip("/")}/_resolve/{name}'
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            routes = json.loads(resp.read())
+            for route in routes:
+                click.echo(json.dumps(route, indent=2))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            click.echo(f"Resource '{name}' not found", err=True)
+        else:
+            click.echo(f'Error: HTTP {e.code}', err=True)
+        sys.exit(1)
+    except Exception as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
+
+
+@registry.command('peers')
+@click.option('--relay', '-r', required=True, help='Relay HTTP address')
+def registry_peers(relay):
+    """List known peer relays."""
+    import json
+    import urllib.request
+
+    url = f'{relay.rstrip("/")}/_peers'
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            peer_list = json.loads(resp.read())
+            if not peer_list:
+                click.echo('No peers known.')
+                return
+            for peer in peer_list:
+                status = peer.get('status', 'unknown')
+                peer_id = peer.get('relay_id', '?')
+                peer_url = peer.get('url', '?')
+                click.echo(f'{peer_id} ({peer_url}) - {status}')
+    except Exception as e:
+        click.echo(f'Error: {e}', err=True)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
