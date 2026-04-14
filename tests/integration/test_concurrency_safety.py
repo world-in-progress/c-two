@@ -195,8 +195,6 @@ class TestSOTAAPIConcurrency:
 
     def test_concurrent_connect_close_cycles(self):
         """Multiple threads rapidly connect/use/close the same CRM."""
-        addr = _next_addr()
-        cc.set_ipc_address(addr)
         cc.set_server(pool_segment_size=1 << 20, max_pool_segments=2)
         cc.register(IEcho, EchoImpl(), name='echo_conc')
 
@@ -227,8 +225,6 @@ class TestSOTAAPIConcurrency:
 
     def test_connect_unknown_name_raises(self):
         """cc.connect with unknown name raises LookupError."""
-        addr = _next_addr()
-        cc.set_ipc_address(addr)
         cc.register(IEcho, EchoImpl(), name='echo_lookup')
 
         try:
@@ -239,8 +235,6 @@ class TestSOTAAPIConcurrency:
 
     def test_double_register_same_name_raises(self):
         """Registering the same name twice raises ValueError."""
-        addr = _next_addr()
-        cc.set_ipc_address(addr)
         cc.register(IEcho, EchoImpl(), name='echo_dup')
 
         try:

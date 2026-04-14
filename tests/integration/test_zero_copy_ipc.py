@@ -27,10 +27,10 @@ def _cleanup():
     _ProcessRegistry._instance = None
 
 
-def _setup(address: str):
-    cc.set_ipc_address(address)
+def _setup():
     cc.register(IEchoZC, EchoZC(), name='echo_zc')
     time.sleep(0.3)
+    address = cc.server_address()
     return cc.connect(IEchoZC, name='echo_zc', address=address)
 
 
@@ -40,7 +40,7 @@ class TestZeroCopyIPC:
 
     def test_inline_small(self):
         """Payloads below SHM threshold use inline path (64B, 512B)."""
-        proxy = _setup('ipc://test_zc_inline')
+        proxy = _setup()
         for size in [64, 512]:
             data = os.urandom(size)
             result = proxy.echo(data)
@@ -49,7 +49,7 @@ class TestZeroCopyIPC:
 
     def test_buddy_medium(self):
         """Medium payloads (1KB-1MB) use buddy SHM zero-copy path."""
-        proxy = _setup('ipc://test_zc_buddy')
+        proxy = _setup()
         for size in [1024, 64 * 1024, 1024 * 1024]:
             data = os.urandom(size)
             result = proxy.echo(data)
@@ -58,7 +58,7 @@ class TestZeroCopyIPC:
 
     def test_large_payload(self):
         """Large payloads (10MB) use buddy/dedicated SHM."""
-        proxy = _setup('ipc://test_zc_large')
+        proxy = _setup()
         data = os.urandom(10 * 1024 * 1024)
         result = proxy.echo(data)
         assert result == data
@@ -66,7 +66,7 @@ class TestZeroCopyIPC:
 
     def test_data_integrity_pattern(self):
         """Verify specific byte patterns survive the zero-copy path."""
-        proxy = _setup('ipc://test_zc_integrity')
+        proxy = _setup()
         # All zeros
         data = b'\x00' * 65536
         assert proxy.echo(data) == data
@@ -80,7 +80,7 @@ class TestZeroCopyIPC:
 
     def test_sequential_calls_no_leak(self):
         """Multiple sequential calls don't leak SHM blocks."""
-        proxy = _setup('ipc://test_zc_no_leak')
+        proxy = _setup()
         for _ in range(20):
             data = os.urandom(1024 * 1024)
             result = proxy.echo(data)
@@ -89,14 +89,14 @@ class TestZeroCopyIPC:
 
     def test_empty_payload(self):
         """Empty payload works correctly."""
-        proxy = _setup('ipc://test_zc_empty')
+        proxy = _setup()
         result = proxy.echo(b'')
         assert result == b''
         cc.close(proxy)
 
     def test_mixed_sizes(self):
         """Alternating small and large payloads work correctly."""
-        proxy = _setup('ipc://test_zc_mixed')
+        proxy = _setup()
         sizes = [64, 1024 * 1024, 128, 512 * 1024, 32, 2 * 1024 * 1024]
         for size in sizes:
             data = os.urandom(size)

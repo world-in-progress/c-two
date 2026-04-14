@@ -94,11 +94,10 @@ class TestNativeRelayWithServer:
         from tests.fixtures.ihello import IHello
 
         _ProcessRegistry.reset()
-        ipc_addr = f'ipc://nrelay_test_{os.getpid()}'
 
         try:
-            cc.set_ipc_address(ipc_addr)
             cc.register(IHello, Hello(), name='hello')
+            ipc_addr = cc.server_address()
 
             relay = NativeRelay('127.0.0.1:19905')
             relay.start()
@@ -130,11 +129,10 @@ class TestNativeRelayWithServer:
         from tests.fixtures.ihello import IHello
 
         _ProcessRegistry.reset()
-        ipc_addr = f'ipc://nrelay_data_{os.getpid()}'
 
         try:
-            cc.set_ipc_address(ipc_addr)
             cc.register(IHello, Hello(), name='hello')
+            ipc_addr = cc.server_address()
 
             relay = NativeRelay('127.0.0.1:19906')
             relay.start()

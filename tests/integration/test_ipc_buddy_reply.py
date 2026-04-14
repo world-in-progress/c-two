@@ -31,15 +31,15 @@ def _cleanup():
 class TestBuddyReply:
     """Verify large responses transit via buddy SHM (not inline UDS)."""
 
-    def _setup_ipc(self, address: str) -> cc.ICRMProxy:
-        cc.set_ipc_address(address)
+    def _setup_ipc(self) -> cc.ICRMProxy:
         cc.register(IEcho, Echo(), name='echo')
         time.sleep(0.3)
+        address = cc.server_address()
         return cc.connect(IEcho, name='echo', address=address)
 
     def test_small_payload_roundtrip(self):
         """Small payloads still work (inline path)."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_small')
+        proxy = self._setup_ipc()
         data = b'hello'
         result = proxy.echo(data)
         assert result == data
@@ -47,7 +47,7 @@ class TestBuddyReply:
 
     def test_large_payload_roundtrip(self):
         """Large payload (1MB) goes through buddy SHM response path."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_large')
+        proxy = self._setup_ipc()
         data = os.urandom(1024 * 1024)  # 1 MB — above 4KB shm_threshold
         result = proxy.echo(data)
         assert result == data
@@ -55,7 +55,7 @@ class TestBuddyReply:
 
     def test_very_large_payload_roundtrip(self):
         """Very large payload (50MB) round-trips correctly."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_vlarge')
+        proxy = self._setup_ipc()
         data = os.urandom(50 * 1024 * 1024)  # 50 MB
         result = proxy.echo(data)
         assert len(result) == len(data)
@@ -64,7 +64,7 @@ class TestBuddyReply:
 
     def test_multiple_large_calls(self):
         """Multiple sequential large calls don't leak memory."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_multi')
+        proxy = self._setup_ipc()
         for _ in range(10):
             data = os.urandom(1024 * 1024)  # 1 MB each
             result = proxy.echo(data)
@@ -73,7 +73,7 @@ class TestBuddyReply:
 
     def test_gc_idle_segment_reclaim(self):
         """GC reclaims idle segments after bursty allocation."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_gc')
+        proxy = self._setup_ipc()
         # Force multiple segment usage with large payloads
         for _ in range(5):
             data = os.urandom(10 * 1024 * 1024)  # 10 MB each
@@ -86,7 +86,7 @@ class TestBuddyReply:
 
     def test_stress_mixed_payload_sizes(self):
         """Mixed payload sizes stress-test both inline and SHM paths."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_stress')
+        proxy = self._setup_ipc()
         sizes = [64, 512, 4096, 32768, 1024 * 1024, 64, 512, 4096]
         for size in sizes:
             data = os.urandom(size)
@@ -96,7 +96,7 @@ class TestBuddyReply:
 
     def test_view_mode_large_payload(self):
         """View mode (default pickle) works for large payloads through IPC."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_view')
+        proxy = self._setup_ipc()
         data = b'V' * (2 * 1024 * 1024)  # 2MB
         result = proxy.echo(data)
         assert result == data
@@ -104,7 +104,7 @@ class TestBuddyReply:
 
     def test_copy_mode_custom_transferable(self):
         """Custom @cc.transferable (copy mode default) works through IPC."""
-        proxy = self._setup_ipc('ipc://test_buddy_reply_copy_compat')
+        proxy = self._setup_ipc()
         data = b'C' * (1024 * 1024)  # 1MB
         result = proxy.echo(data)
         assert result == data
@@ -114,10 +114,9 @@ class TestBuddyReply:
         """Multiple concurrent large calls work correctly."""
         import threading
 
-        addr = 'ipc://test_buddy_reply_concurrent'
-        cc.set_ipc_address(addr)
         cc.register(IEcho, Echo(), name='echo')
         time.sleep(0.3)
+        addr = cc.server_address()
 
         errors = []
 
@@ -143,7 +142,7 @@ class TestBuddyReply:
     def test_response_buffer_memoryview(self):
         """ResponseBuffer supports zero-copy memoryview access."""
         import pickle
-        proxy = self._setup_ipc('ipc://test_buddy_reply_mv')
+        proxy = self._setup_ipc()
         rust_client = proxy.client._client
         route_name = proxy.client._name
         data = os.urandom(1024 * 1024)  # 1 MB — above SHM threshold
@@ -158,7 +157,7 @@ class TestBuddyReply:
     def test_response_buffer_auto_release(self):
         """ResponseBuffer auto-releases SHM on garbage collection."""
         import pickle
-        proxy = self._setup_ipc('ipc://test_buddy_reply_autorel')
+        proxy = self._setup_ipc()
         rust_client = proxy.client._client
         route_name = proxy.client._name
         import gc
