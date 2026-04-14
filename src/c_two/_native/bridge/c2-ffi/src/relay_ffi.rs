@@ -46,13 +46,14 @@ impl PyNativeRelay {
     /// `idle_timeout` controls how long an upstream can be idle
     /// before its connection is evicted. Set to `0` to disable (default).
     #[new]
-    #[pyo3(signature = (bind = "0.0.0.0:8080", relay_id=None, advertise_url=None, seeds=None, idle_timeout=0))]
+    #[pyo3(signature = (bind = "0.0.0.0:8080", relay_id=None, advertise_url=None, seeds=None, idle_timeout=0, skip_ipc_validation=false))]
     fn new(
         bind: &str,
         relay_id: Option<String>,
         advertise_url: Option<String>,
         seeds: Option<Vec<String>>,
         idle_timeout: u64,
+        skip_ipc_validation: bool,
     ) -> Self {
         let config = RelayConfig {
             bind: bind.to_string(),
@@ -60,6 +61,7 @@ impl PyNativeRelay {
             advertise_url: advertise_url.unwrap_or_default(),
             seeds: seeds.unwrap_or_default(),
             idle_timeout_secs: idle_timeout,
+            skip_ipc_validation,
             ..Default::default()
         };
         Self {

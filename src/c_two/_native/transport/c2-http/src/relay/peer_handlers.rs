@@ -73,7 +73,14 @@ pub async fn handle_peer_join(
             last_heartbeat: std::time::Instant::now(),
             status: PeerStatus::Alive,
         });
-        let snapshot = state.full_snapshot();
+        let mut snapshot = state.full_snapshot();
+        // Include ourselves so the joiner can add us as a peer.
+        snapshot.peers.push(PeerSnapshot {
+            relay_id: state.relay_id().to_string(),
+            url: state.config().effective_advertise_url(),
+            route_count: state.local_route_count(),
+            status: PeerStatus::Alive,
+        });
         Json(snapshot).into_response()
     } else {
         StatusCode::BAD_REQUEST.into_response()

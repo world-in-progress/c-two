@@ -134,16 +134,7 @@ impl RelayServer {
 
     /// Gracefully stop the relay server.
     pub fn stop(&mut self) -> Result<(), String> {
-        // Broadcast leave before stopping
-        let leave = PeerEnvelope::new(
-            self.state.relay_id(),
-            PeerMessage::RelayLeave {
-                relay_id: self.state.relay_id().to_string(),
-            },
-        );
-        let peers = self.state.list_peers();
-        self.state.disseminator().broadcast(leave, &peers);
-
+        // Leave broadcast happens inside the tokio runtime (in `run()`'s shutdown block).
         self.cancel.cancel();
 
         if let Some(tx) = self.cmd_tx.take() {
