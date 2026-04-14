@@ -15,6 +15,7 @@ from .transport.registry import (
     set_shm_threshold,
     set_server_ipc_config,
     set_client_ipc_config,
+    set_relay,
     register,
     connect,
     close,

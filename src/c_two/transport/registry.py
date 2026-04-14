@@ -38,12 +38,14 @@ import os
 import signal
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import TypeVar
 
 from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
 from c_two.config.settings import settings
+from c_two.error import ResourceNotFound, ResourceUnavailable, RegistryUnavailable
 from .client.proxy import ICRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
 from .server.native import NativeServerBridge as Server
@@ -76,6 +78,36 @@ class _Registration:
     concurrency: ConcurrencyConfig | None
     scheduler: Scheduler | None = None
     access_map: dict[str, MethodAccess] | None = None
+
+
+_ROUTE_CACHE_TTL = 30.0  # seconds
+
+
+class _RouteCache:
+    """Thread-safe TTL cache for resolved routes."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache: dict[str, tuple[list[dict], float]] = {}
+
+    def get(self, name: str) -> list[dict] | None:
+        with self._lock:
+            entry = self._cache.get(name)
+            if entry and time.monotonic() - entry[1] < _ROUTE_CACHE_TTL:
+                return entry[0]
+            return None
+
+    def put(self, name: str, routes: list[dict]):
+        with self._lock:
+            self._cache[name] = (routes, time.monotonic())
+
+    def invalidate(self, name: str):
+        with self._lock:
+            self._cache.pop(name, None)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
 
 
 class _ProcessRegistry:
@@ -121,6 +153,7 @@ class _ProcessRegistry:
         from c_two._native import RustClientPool, RustHttpClientPool
         self._pool = RustClientPool.instance()
         self._http_pool = RustHttpClientPool.instance()
+        self._route_cache = _RouteCache()
 
     # ------------------------------------------------------------------
     # Public API
@@ -146,6 +179,13 @@ class _ProcessRegistry:
                     'Call set_address() before register().',
                 )
             self._explicit_address = address
+
+    def set_relay(self, address: str) -> None:
+        """Set the relay address for name resolution.
+
+        Convenience wrapper — equivalent to setting ``C2_RELAY_ADDRESS``.
+        """
+        settings.relay_address = address
 
     def set_shm_threshold(self, threshold: int) -> None:
         """Set the SHM threshold globally (server + client).
@@ -366,9 +406,80 @@ class _ProcessRegistry:
                 on_terminate=lambda addr=address: self._pool.release(addr),
             )
         else:
-            raise LookupError(
-                f'Name {name!r} is not registered locally '
-                f'and no address was provided',
+            # 3. Relay resolution — no local CRM and no explicit address.
+            try:
+                routes = self._resolve_via_relay(name)
+            except RegistryUnavailable:
+                raise LookupError(
+                    f'Name {name!r} is not registered locally '
+                    f'and no address was provided',
+                )
+            except (ResourceNotFound, ResourceUnavailable):
+                raise
+            except Exception:
+                raise LookupError(
+                    f'Name {name!r} is not registered locally '
+                    f'and relay resolution failed',
+                )
+
+            if not routes:
+                raise ResourceNotFound(f"No routes for '{name}'")
+
+            # Try each route in priority order (LOCAL first, then PEER).
+            last_error = None
+            for route in routes:
+                try:
+                    ipc_addr = route.get("ipc_address")
+                    if ipc_addr:
+                        address = ipc_addr
+                    else:
+                        relay_url = route.get("relay_url", "")
+                        address = f"{relay_url}/{name}"
+
+                    if address.startswith(('http://', 'https://')):
+                        client = self._http_pool.acquire(address)
+                        proxy = ICRMProxy.http(
+                            client,
+                            name,
+                            on_terminate=lambda addr=address: self._http_pool.release(addr),
+                        )
+                    else:
+                        if not self._pool_config_applied:
+                            cfg = self._build_client_config()
+                            shm = self._shm_threshold or settings.shm_threshold or 4096
+                            self._pool.set_default_config(
+                                shm_threshold=shm,
+                                pool_enabled=cfg.pool_enabled,
+                                pool_segment_size=cfg.pool_segment_size,
+                                max_pool_segments=cfg.max_pool_segments,
+                                max_pool_memory=cfg.max_pool_memory,
+                                reassembly_segment_size=cfg.reassembly_segment_size,
+                                reassembly_max_segments=cfg.reassembly_max_segments,
+                                max_total_chunks=cfg.max_total_chunks,
+                                chunk_gc_interval=cfg.chunk_gc_interval,
+                                chunk_threshold_ratio=cfg.chunk_threshold_ratio,
+                                chunk_assembler_timeout=cfg.chunk_assembler_timeout,
+                                max_reassembly_bytes=cfg.max_reassembly_bytes,
+                                chunk_size=cfg.chunk_size,
+                            )
+                            self._pool_config_applied = True
+                        client = self._pool.acquire(address)
+                        proxy = ICRMProxy.ipc(
+                            client,
+                            name,
+                            on_terminate=lambda addr=address: self._pool.release(addr),
+                        )
+
+                    icrm = icrm_class()
+                    icrm.client = proxy
+                    return icrm
+                except Exception as e:
+                    last_error = e
+                    self._route_cache.invalidate(name)
+                    continue
+
+            raise ResourceUnavailable(
+                f"All routes for '{name}' unreachable: {last_error}",
             )
 
         icrm = icrm_class()
@@ -442,6 +553,8 @@ class _ProcessRegistry:
             self._client_kwargs = {}
             self._pool_config_applied = False
             self._registrations.clear()
+
+        self._route_cache.clear()
 
         # Best-effort relay unregistration (ignore failures during shutdown).
         for name in names_to_unregister:
@@ -632,6 +745,34 @@ class _ProcessRegistry:
 
         log.info('Unregistered CRM %s from relay at %s', name, relay_addr)
 
+    def _resolve_via_relay(self, name: str) -> list[dict]:
+        """Resolve a resource name via the relay's /_resolve endpoint."""
+        cached = self._route_cache.get(name)
+        if cached is not None:
+            return cached
+
+        relay_addr = settings.relay_address
+        if not relay_addr:
+            raise RegistryUnavailable("No relay configured (set C2_RELAY_ADDRESS or call cc.set_relay())")
+
+        import json
+        import urllib.request
+
+        url = f'{relay_addr.rstrip("/")}/_resolve/{name}'
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                routes = json.loads(resp.read())
+                self._route_cache.put(name, routes)
+                return routes
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ResourceNotFound(f"Resource '{name}' not found") from e
+            raise ResourceUnavailable(f"Relay error: {e.code}") from e
+        except Exception as e:
+            self._route_cache.invalidate(name)
+            raise RegistryUnavailable(f"Relay unreachable: {e}") from e
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -680,6 +821,11 @@ def set_server(**kwargs: object) -> None:
 def set_client(**kwargs: object) -> None:
     """Configure IPC client. Call before connect()."""
     _ProcessRegistry.get().set_client(**kwargs)
+
+
+def set_relay(address: str) -> None:
+    """Set the relay address for name resolution."""
+    _ProcessRegistry.get().set_relay(address)
 
 
 # Deprecated aliases — remove in next version
