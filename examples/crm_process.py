@@ -19,13 +19,11 @@ import logging
 from grid.grid import Grid
 from grid.igrid import IGrid
 
-BIND_ADDRESS = 'ipc://grid'
 logging.basicConfig(level=logging.DEBUG)
 
 
 def main():
-    # Set address before registering any CRM.
-    cc.set_ipc_address(BIND_ADDRESS)
+    # Init the Grid CRM (same as old server.py)
 
     # Init the Grid CRM (same as old server.py)
     epsg = 2326

@@ -1,10 +1,14 @@
+use tokio::task::JoinHandle;
+
 use crate::relay::peer::PeerEnvelope;
 use crate::relay::types::PeerSnapshot;
 
 /// Trait for broadcasting gossip messages to peers.
 pub trait Disseminator: Send + Sync {
     /// Broadcast a message to all relevant peers.
-    fn broadcast(&self, envelope: PeerEnvelope, peers: &[PeerSnapshot]);
+    /// Returns a handle that can be awaited when delivery matters
+    /// (e.g. shutdown leave). Callers may ignore it for fire-and-forget.
+    fn broadcast(&self, envelope: PeerEnvelope, peers: &[PeerSnapshot]) -> Option<JoinHandle<()>>;
 }
 
 /// Full broadcast — sends to every Alive peer.
@@ -40,7 +44,7 @@ impl FullBroadcast {
 }
 
 impl Disseminator for FullBroadcast {
-    fn broadcast(&self, envelope: PeerEnvelope, peers: &[PeerSnapshot]) {
+    fn broadcast(&self, envelope: PeerEnvelope, peers: &[PeerSnapshot]) -> Option<JoinHandle<()>> {
         use crate::relay::types::PeerStatus;
         let alive: Vec<String> = peers
             .iter()
@@ -49,16 +53,16 @@ impl Disseminator for FullBroadcast {
             .collect();
 
         if alive.is_empty() {
-            return;
+            return None;
         }
 
         let client = self.http_client.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let futs: Vec<_> = alive
                 .iter()
                 .map(|url| Self::send_to_peer(&client, url, &envelope))
                 .collect();
             futures::future::join_all(futs).await;
-        });
+        }))
     }
 }

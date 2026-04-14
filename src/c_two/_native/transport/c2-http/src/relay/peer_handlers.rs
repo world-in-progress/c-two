@@ -155,9 +155,9 @@ pub async fn handle_peer_digest(
             let all_routes = state.with_route_table(|rt| rt.list_routes());
 
             let mut diff_entries = Vec::new();
-            for (key, _our_hash) in &our_digest {
+            for (key, our_hash) in &our_digest {
                 match peer_map.get(key) {
-                    Some(peer_hash) if peer_hash == _our_hash => {}
+                    Some(peer_hash) if peer_hash == our_hash => {}
                     _ => {
                         // We have this route and peer doesn't, or hashes differ.
                         if let Some(entry) = all_routes.iter()

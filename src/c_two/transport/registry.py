@@ -357,25 +357,7 @@ class _ProcessRegistry:
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
-            if not self._pool_config_applied:
-                cfg = self._build_client_config()
-                shm = self._shm_threshold or settings.shm_threshold or 4096
-                self._pool.set_default_config(
-                    shm_threshold=shm,
-                    pool_enabled=cfg.pool_enabled,
-                    pool_segment_size=cfg.pool_segment_size,
-                    max_pool_segments=cfg.max_pool_segments,
-                    max_pool_memory=cfg.max_pool_memory,
-                    reassembly_segment_size=cfg.reassembly_segment_size,
-                    reassembly_max_segments=cfg.reassembly_max_segments,
-                    max_total_chunks=cfg.max_total_chunks,
-                    chunk_gc_interval=cfg.chunk_gc_interval,
-                    chunk_threshold_ratio=cfg.chunk_threshold_ratio,
-                    chunk_assembler_timeout=cfg.chunk_assembler_timeout,
-                    max_reassembly_bytes=cfg.max_reassembly_bytes,
-                    chunk_size=cfg.chunk_size,
-                )
-                self._pool_config_applied = True
+            self._ensure_pool_config()
             client = self._pool.acquire(address)
             proxy = ICRMProxy.ipc(
                 client,
@@ -421,25 +403,7 @@ class _ProcessRegistry:
                             on_terminate=lambda addr=address: self._http_pool.release(addr),
                         )
                     else:
-                        if not self._pool_config_applied:
-                            cfg = self._build_client_config()
-                            shm = self._shm_threshold or settings.shm_threshold or 4096
-                            self._pool.set_default_config(
-                                shm_threshold=shm,
-                                pool_enabled=cfg.pool_enabled,
-                                pool_segment_size=cfg.pool_segment_size,
-                                max_pool_segments=cfg.max_pool_segments,
-                                max_pool_memory=cfg.max_pool_memory,
-                                reassembly_segment_size=cfg.reassembly_segment_size,
-                                reassembly_max_segments=cfg.reassembly_max_segments,
-                                max_total_chunks=cfg.max_total_chunks,
-                                chunk_gc_interval=cfg.chunk_gc_interval,
-                                chunk_threshold_ratio=cfg.chunk_threshold_ratio,
-                                chunk_assembler_timeout=cfg.chunk_assembler_timeout,
-                                max_reassembly_bytes=cfg.max_reassembly_bytes,
-                                chunk_size=cfg.chunk_size,
-                            )
-                            self._pool_config_applied = True
+                        self._ensure_pool_config()
                         client = self._pool.acquire(address)
                         proxy = ICRMProxy.ipc(
                             client,
@@ -800,6 +764,30 @@ class _ProcessRegistry:
             return self._client_config
         self._client_config = build_client_config(settings, **self._client_kwargs)
         return self._client_config
+
+    def _ensure_pool_config(self) -> None:
+        """Apply pool default config exactly once (thread-safe)."""
+        with self._lock:
+            if self._pool_config_applied:
+                return
+            cfg = self._build_client_config()
+            shm = self._shm_threshold or settings.shm_threshold or 4096
+            self._pool.set_default_config(
+                shm_threshold=shm,
+                pool_enabled=cfg.pool_enabled,
+                pool_segment_size=cfg.pool_segment_size,
+                max_pool_segments=cfg.max_pool_segments,
+                max_pool_memory=cfg.max_pool_memory,
+                reassembly_segment_size=cfg.reassembly_segment_size,
+                reassembly_max_segments=cfg.reassembly_max_segments,
+                max_total_chunks=cfg.max_total_chunks,
+                chunk_gc_interval=cfg.chunk_gc_interval,
+                chunk_threshold_ratio=cfg.chunk_threshold_ratio,
+                chunk_assembler_timeout=cfg.chunk_assembler_timeout,
+                max_reassembly_bytes=cfg.max_reassembly_bytes,
+                chunk_size=cfg.chunk_size,
+            )
+            self._pool_config_applied = True
 
     @staticmethod
     def _auto_address() -> str:

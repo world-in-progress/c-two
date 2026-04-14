@@ -87,12 +87,11 @@ def main() -> None:
     args = parser.parse_args()
 
     _ProcessRegistry.reset()
-    address = f'ipc://bench_chunk_{os.getpid()}'
 
     cc.set_server_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
     cc.set_client_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
-    cc.set_ipc_address(address)
     cc.register(IBenchChunk, BenchChunk(), name='bench')
+    address = cc.server_address()
 
     ping(address, timeout=10.0)
 

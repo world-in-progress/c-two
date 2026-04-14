@@ -47,11 +47,6 @@ impl RouteTable {
         self.routes.contains_key(&(name.to_string(), self.relay_id.clone()))
     }
 
-    /// Get the LOCAL route entry for a name (if any).
-    pub fn get_local_route(&self, name: &str) -> Option<&RouteEntry> {
-        self.routes.get(&(name.to_string(), self.relay_id.clone()))
-    }
-
     /// Resolve a name → ordered list of RouteInfo.
     /// LOCAL first, then PEER sorted by (registered_at, relay_id).
     pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
@@ -204,15 +199,20 @@ impl RouteTable {
             if ps.relay_id == self.relay_id {
                 continue; // Don't add ourselves.
             }
-            self.peers.entry(ps.relay_id.clone()).or_insert_with(|| {
-                PeerInfo {
-                    relay_id: ps.relay_id,
-                    url: ps.url,
-                    route_count: ps.route_count,
-                    last_heartbeat: Instant::now(),
-                    status: PeerStatus::Alive,
-                }
-            });
+            self.peers.entry(ps.relay_id.clone())
+                .and_modify(|existing| {
+                    existing.url = ps.url.clone();
+                    existing.route_count = ps.route_count;
+                })
+                .or_insert_with(|| {
+                    PeerInfo {
+                        relay_id: ps.relay_id,
+                        url: ps.url,
+                        route_count: ps.route_count,
+                        last_heartbeat: Instant::now(),
+                        status: PeerStatus::Alive,
+                    }
+                });
         }
     }
 

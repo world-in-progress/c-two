@@ -233,8 +233,10 @@ impl RelayServer {
             PeerMessage::RelayLeave { relay_id: state.relay_id().to_string() },
         );
         let peers = state.list_peers();
-        state.disseminator().broadcast(leave, &peers);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let leave_handle = state.disseminator().broadcast(leave, &peers);
+        if let Some(h) = leave_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
         cancel.cancel();
         for handle in bg_handles {
             let _ = handle.await;

@@ -336,3 +336,187 @@ Re-verified all 20 findings against the revised plan. Results below.
 
 With all 20 findings resolved, the plan's self-review checklist (lines 3180-3193)
 marking all items `[x]` is now **accurate**.
+
+---
+
+## Part 2: Code Implementation Review
+
+**Date:** 2026-07-20
+**Scope:** Full implementation audit — bugs, logic issues, zombie code, plan coverage
+**Branch:** `feat/relay-mesh-discovery` (HEAD: f077559, 34 files changed, ~3036 additions)
+**Baseline:** 628 Python tests passed ✅ | 27 Rust relay tests passed ✅ | `cargo check` clean ✅
+
+### Review Method
+
+4 parallel code-review agents covering:
+1. **Rust core** — types.rs, route_table.rs, conn_pool.rs, state.rs, relay config
+2. **Rust gossip** — peer.rs, disseminator.rs, peer_handlers.rs, background.rs, router.rs, server.rs
+3. **Python** — registry.py, settings.py, error.py, cli.py, __init__.py, relay_ffi.rs
+4. **Tests + plan coverage** — all test files + 15-task plan coverage verification
+
+All findings validated manually and cross-checked by rubber-duck agent.
+
+### Plan Coverage
+
+**All 15 tasks fully implemented ✅** — no missing or partially-implemented tasks detected.
+
+| Task | Description | Status |
+|------|-------------|--------|
+| 1 | RelayConfig + Core Types | ✅ types.rs, relay.rs |
+| 2 | RouteTable | ✅ route_table.rs (394 lines) |
+| 3 | ConnectionPool | ✅ conn_pool.rs |
+| 4 | RelayState | ✅ state.rs (421 lines) |
+| 5 | Router rewrite | ✅ router.rs modified |
+| 7 | PeerMessage + Disseminator | ✅ peer.rs, disseminator.rs |
+| 8 | Peer handlers | ✅ peer_handlers.rs (6 endpoints) |
+| 9 | Background tasks | ✅ background.rs (5 loops) |
+| 10 | Register/unregister wiring | ✅ router.rs handlers |
+| 11 | Error types + settings | ✅ error.py (3 new errors), settings.py |
+| 12 | cc.connect() relay resolution | ✅ registry.py (route cache + TTL) |
+| 13 | cc.register() relay notification | ✅ registry.py (retry + backoff) |
+| 14 | CLI changes | ✅ cli.py (--seeds, registry cmd) |
+| 15 | Integration tests | ✅ test_relay_mesh.py (6), test_mesh_errors.py (4) |
+
+### Findings Summary
+
+| Severity | Count | Description |
+|----------|-------|-------------|
+| HIGH | 2 | Shutdown broadcast, pool config race |
+| MEDIUM | 2 | Stale peer metadata, zombie API calls |
+| LOW | 3 | Dead code, naming, design notes |
+| **Total** | **7** | |
+
+### HIGH Findings
+
+#### H-1: Shutdown RelayLeave broadcast is fire-and-forget
+
+**Files:** `server.rs:230-237`, `disseminator.rs:56`
+**Impact:** Peers may not receive leave notification → stale routes until next anti-entropy cycle
+
+`FullBroadcast::broadcast()` uses `tokio::spawn` (fire-and-forget) — no `JoinHandle` is
+tracked or awaited. The server then sleeps 100ms and calls `cancel.cancel()`, but the
+spawned broadcast task is NOT in `bg_handles` and may be dropped when the tokio runtime
+owned by the relay thread (`server.rs:73-83`) shuts down.
+
+```rust
+// server.rs:230-241 — broadcast handle is lost
+state.disseminator().broadcast(leave, &peers); // tokio::spawn, no handle
+tokio::time::sleep(Duration::from_millis(100)).await;
+cancel.cancel(); // runtime may drop the broadcast task
+```
+
+**Recommendation:** Either (a) make `broadcast()` return a `JoinHandle` and await it with
+a timeout before cancelling, or (b) use `disseminator.broadcast_and_wait(leave, &peers,
+Duration::from_secs(2)).await` pattern. Best-effort is fine, but the current implementation
+doesn't even try to ensure delivery.
+
+---
+
+#### H-2: `_pool_config_applied` race condition (Python free-threading)
+
+**File:** `registry.py:360-378, 424-442`
+**Impact:** Under 3.14t free-threading, multiple threads may call `set_default_config()` concurrently
+
+The `_pool_config_applied` flag is checked and set OUTSIDE `self._lock`:
+
+```python
+# Line 360 — no lock held here
+if not self._pool_config_applied:
+    cfg = self._build_client_config()
+    self._pool.set_default_config(...)  # called by multiple threads
+    self._pool_config_applied = True    # line 378
+```
+
+The same pattern appears in the relay resolution path (lines 424-442). Under CPython with
+GIL this is mostly safe (due to GIL atomicity), but c-two explicitly targets Python 3.14t
+free-threading where this becomes a real data race.
+
+**Recommendation:** Move the `_pool_config_applied` check+set inside a `with self._lock:`
+block, or use a dedicated `threading.Lock` for pool initialization (double-checked locking).
+
+### MEDIUM Findings
+
+#### M-1: `merge_snapshot` never updates existing peer metadata
+
+**File:** `route_table.rs:207`
+**Impact:** If a peer's advertise URL changes, the stale URL persists until the peer is removed and re-added
+
+```rust
+// or_insert_with only fires for NEW entries — existing peers are never refreshed
+self.peers.entry(ps.relay_id.clone()).or_insert_with(|| {
+    PeerInfo { relay_id: ps.relay_id, url: ps.url, ... }
+});
+```
+
+After initial discovery, `merge_snapshot` can't update a peer's `url` or `status`. While
+`route_count` is refreshed by heartbeat (`peer_handlers.rs:105-114`), the `url` field is not
+updated through any path except full peer removal + re-addition.
+
+**Recommendation:** Use `.and_modify(|existing| { existing.url = ps.url; ... }).or_insert_with(...)` to refresh mutable metadata while preserving locally-managed fields like `last_heartbeat`.
+
+---
+
+#### M-2: Zombie `set_ipc_address()` calls in benchmarks/examples
+
+**Files:** 7 files still reference the removed API
+**Impact:** These scripts crash with `AttributeError` when executed
+
+```
+benchmarks/_relay_full_server.py
+benchmarks/three_mode_benchmark.py
+benchmarks/segment_size_benchmark.py
+benchmarks/thread_vs_ipc_benchmark.py
+benchmarks/relay_qps_benchmark.py
+benchmarks/chunked_benchmark.py
+examples/crm_process.py
+```
+
+`set_ipc_address` was removed from `cc.__init__` exports in this branch. These files
+were not updated to use `cc.set_address()` or the new auto-address mechanism.
+
+**Recommendation:** Update all 7 files to replace `cc.set_ipc_address(...)` with `cc.set_address(...)`.
+
+### LOW Findings
+
+#### L-1: `get_local_route` is dead code
+
+**File:** `route_table.rs:51`
+
+`pub fn get_local_route()` is defined but never called. `has_local_route()` (existence check)
+and `resolve()` (full resolution) are used instead. Consider removing or marking `#[cfg(test)]`.
+
+#### L-2: `_our_hash` underscore-prefix naming
+
+**File:** `peer_handlers.rs:159`
+
+Variable `_our_hash` has underscore prefix (Rust convention for unused), but IS used in
+comparison `peer_hash == _our_hash`. Should be `our_hash`.
+
+#### L-3: Protocol version rejects newer peers (design note)
+
+**File:** `peer_handlers.rs:11-18`
+
+`check_protocol_version()` rejects messages from peers with higher `protocol_version`,
+preventing forward compatibility. The `#[serde(other)] Unknown` variant handles unknown
+message types within compatible versions. This is a deliberate design tradeoff — stricter
+version gating vs forward-compat. Acceptable for Phase 1 but worth revisiting if mixed-version
+deployments become a requirement.
+
+### Rejected Findings (False Positives)
+
+The following issues were raised by review agents but determined to be false positives:
+
+1. **"Anti-entropy is asymmetric"** — By design. Both relays run independent anti-entropy
+   loops. Initiator learns from responder's DigestDiff. Convergence guaranteed across 2 rounds.
+
+2. **"Idle sweeper ignores cancellation"** — Runs inside `tokio::select!` (server.rs:224-228).
+   When select exits, the sweeper future is dropped. Safe.
+
+3. **"Seed retry duplicate broadcast"** — Different code paths: startup bootstrap (one-shot)
+   vs recovery loop (periodic when all peers are dead). Not duplicate.
+
+4. **"ERROR_CODE class attributes unused"** — Used by `tests/unit/test_mesh_errors.py`
+   (lines 7, 11, 15). Not dead code.
+
+5. **"Background loops don't respect cancellation"** — `tokio::select!` already cancels
+   the tick future when the cancel token fires. Correct pattern.
