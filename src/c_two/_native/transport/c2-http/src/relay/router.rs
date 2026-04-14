@@ -13,16 +13,24 @@ use axum::{
 
 use c2_ipc::IpcClient;
 use crate::relay::state::RelayState;
+use crate::relay::peer::{PeerEnvelope, PeerMessage};
+use crate::relay::peer_handlers;
 
 /// Build the relay axum router with control-plane and data-plane endpoints.
-pub fn build_router(state: RelayState) -> Router {
+pub fn build_router(state: Arc<RelayState>) -> Router {
     Router::new()
-        // Control-plane endpoints (underscore prefix avoids CRM name collisions)
         .route("/_register", post(handle_register))
         .route("/_unregister", post(handle_unregister))
-        .route("/_routes", get(handle_routes))
-        // Data-plane endpoints
-        .route("/health", get(health))
+        .route("/_routes", get(handle_list_routes))
+        .route("/_resolve/{name}", get(handle_resolve))
+        .route("/_peers", get(handle_peers))
+        .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
+        .route("/_peer/join", post(peer_handlers::handle_peer_join))
+        .route("/_peer/sync", get(peer_handlers::handle_peer_sync))
+        .route("/_peer/heartbeat", post(peer_handlers::handle_peer_heartbeat))
+        .route("/_peer/leave", post(peer_handlers::handle_peer_leave))
+        .route("/_peer/digest", post(peer_handlers::handle_peer_digest))
+        .route("/health", get(handle_health))
         .route("/_echo", post(echo_handler))
         .route("/{route_name}/{method_name}", post(call_handler))
         .with_state(state)
@@ -33,10 +41,10 @@ pub fn build_router(state: RelayState) -> Router {
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "address": "ipc://..."}`
+/// Body: `{"name": "grid", "address": "ipc://...", "icrm_ns": "...", "icrm_ver": "..."}`
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
-    State(state): State<RelayState>,
+    State(state): State<Arc<RelayState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let name = match body.get("name").and_then(|v| v.as_str()) {
@@ -47,51 +55,68 @@ async fn handle_register(
         Some(a) => a.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"address\"").into_response(),
     };
+    let icrm_ns = body.get("icrm_ns").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let icrm_ver = body.get("icrm_ver").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // Check for duplicate under read lock (brief)
-    {
-        let pool = state.pool.read();
-        if pool.contains(&name) {
+    // Check for duplicate LOCAL route.
+    if state.has_local_route(&name) {
+        let existing_addr = state.get_address(&name);
+        if let Some(ref old_addr) = existing_addr {
+            if old_addr != &address {
+                // Different address → might be a new process after crash.
+                // Check if old IPC connection is still alive.
+                if let Some(old_client) = state.get_client(&name) {
+                    if old_client.is_connected() {
+                        // Old process still alive → reject.
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({
+                                "error": "DuplicateRoute",
+                                "name": name,
+                                "existing_address": old_addr,
+                            })),
+                        ).into_response();
+                    }
+                    // Not connected → fall through to upsert.
+                }
+            }
+            // Same address or old process dead → fall through to upsert.
+        }
+    }
+
+    // Connect IPC client (or skip if configured for testing)
+    let client = if state.config().skip_ipc_validation {
+        Arc::new(IpcClient::new(&address))
+    } else {
+        let mut c = IpcClient::new(&address);
+        if let Err(e) = c.connect().await {
             return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": format!("Route name already registered: '{name}'")})),
-            )
-                .into_response();
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
+            ).into_response();
         }
-    }
+        Arc::new(c)
+    };
 
-    // Connect IPC client without holding any lock
-    let mut client = IpcClient::new(&address);
-    if let Err(e) = client.connect().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
-        )
-            .into_response();
-    }
+    let entry = state.register_upstream(name.clone(), address, icrm_ns, icrm_ver, client);
 
-    // Insert under write lock (brief)
-    let mut pool = state.pool.write();
-    match pool.insert(name.clone(), address, Arc::new(client)) {
-        Ok(()) => {
-            pool.touch(&name);
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"registered": name})),
-            )
-                .into_response()
-        }
-        Err(e) if e.contains("already registered") => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
-    }
+    // Gossip announce to peers
+    let envelope = PeerEnvelope::new(
+        state.relay_id(),
+        PeerMessage::RouteAnnounce {
+            name: entry.name.clone(),
+            relay_id: entry.relay_id.clone(),
+            relay_url: entry.relay_url.clone(),
+            ipc_address: entry.ipc_address.clone(),
+            icrm_ns: entry.icrm_ns.clone(),
+            icrm_ver: entry.icrm_ver.clone(),
+            registered_at: entry.registered_at,
+        },
+    );
+    let peers = state.list_peers();
+    state.disseminator().broadcast(envelope, &peers);
+
+    (StatusCode::CREATED, Json(serde_json::json!({"registered": name}))).into_response()
 }
 
 /// `POST /_unregister` — remove a CRM upstream.
@@ -99,7 +124,7 @@ async fn handle_register(
 /// Body: `{"name": "grid"}`
 /// Returns: 200 on success, 404 on missing.
 async fn handle_unregister(
-    State(state): State<RelayState>,
+    State(state): State<Arc<RelayState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let name = match body.get("name").and_then(|v| v.as_str()) {
@@ -107,10 +132,9 @@ async fn handle_unregister(
         None => return (StatusCode::BAD_REQUEST, "Missing \"name\"").into_response(),
     };
 
-    let mut pool = state.pool.write();
-    match pool.remove(&name) {
-        Ok(old_client) => {
-            // Close old client asynchronously if present.
+    match state.unregister_upstream(&name) {
+        Some((entry, old_client)) => {
+            // Close old client asynchronously
             if let Some(arc_client) = old_client {
                 tokio::spawn(async move {
                     let mut client = match Arc::try_unwrap(arc_client) {
@@ -120,26 +144,32 @@ async fn handle_unregister(
                     client.close().await;
                 });
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"unregistered": name})),
-            )
-                .into_response()
+
+            // Gossip withdraw to peers
+            let envelope = PeerEnvelope::new(
+                state.relay_id(),
+                PeerMessage::RouteWithdraw {
+                    name: entry.name.clone(),
+                    relay_id: entry.relay_id.clone(),
+                },
+            );
+            let peers = state.list_peers();
+            state.disseminator().broadcast(envelope, &peers);
+
+            (StatusCode::OK, Json(serde_json::json!({"unregistered": name}))).into_response()
         }
-        Err(e) => (
+        None => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
+            Json(serde_json::json!({"error": format!("Route name not registered: '{name}'")})),
+        ).into_response(),
     }
 }
 
 /// `GET /_routes` — list all registered routes.
-async fn handle_routes(State(state): State<RelayState>) -> impl IntoResponse {
-    let routes: Vec<serde_json::Value> = state.pool.read()
-        .list_routes()
+async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
+    let routes: Vec<serde_json::Value> = state.list_routes()
         .into_iter()
-        .map(|r| serde_json::json!({"name": r.name, "address": r.address}))
+        .map(|r| serde_json::json!({"name": r.name, "address": r.ipc_address.unwrap_or_default()}))
         .collect();
     Json(serde_json::json!({"routes": routes}))
 }
@@ -147,12 +177,33 @@ async fn handle_routes(State(state): State<RelayState>) -> impl IntoResponse {
 // -- Data-plane handlers --------------------------------------------------
 
 /// `GET /health` — liveness check.
-async fn health(State(state): State<RelayState>) -> impl IntoResponse {
-    let route_names = state.pool.read().route_names();
+async fn handle_health(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
+    let route_names = state.route_names();
     Json(serde_json::json!({
         "status": "ok",
         "routes": route_names,
     }))
+}
+
+/// `GET /_resolve/{name}` — resolve a CRM name to available routes.
+async fn handle_resolve(
+    Path(name): Path<String>,
+    State(state): State<Arc<RelayState>>,
+) -> impl IntoResponse {
+    let routes = state.resolve(&name);
+    if routes.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "ResourceNotFound", "name": name,
+        }))).into_response();
+    }
+    Json(routes).into_response()
+}
+
+/// `GET /_peers` — list known peer relays.
+async fn handle_peers(
+    State(state): State<Arc<RelayState>>,
+) -> impl IntoResponse {
+    Json(state.list_peers()).into_response()
 }
 
 /// `POST /{route_name}/{method_name}` — relay CRM call to upstream.
@@ -160,49 +211,39 @@ async fn health(State(state): State<RelayState>) -> impl IntoResponse {
 /// If the upstream was evicted by the idle sweeper, attempts a lazy
 /// reconnect before returning 502.
 async fn call_handler(
-    State(state): State<RelayState>,
+    State(state): State<Arc<RelayState>>,
     Path((route_name, method_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    // Acquire read lock briefly to clone the Arc<IpcClient>, then drop lock.
-    let client = {
-        let pool = state.pool.read();
-        pool.get(&route_name)
-    };
+    let client = state.get_client(&route_name);
 
     let client = match client {
         Some(c) => c,
-        None => {
-            // Entry might exist but client is None (evicted). Try reconnect.
-            match try_reconnect(&state, &route_name).await {
-                Some(c) => c,
-                None => {
-                    // Distinguish "never registered" from "registered but unreachable".
-                    let has = state.pool.read().has_entry(&route_name);
-                    if has {
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "error": format!("Upstream '{route_name}' is registered but unreachable")
-                            })),
-                        )
-                            .into_response();
-                    }
+        None => match try_reconnect(&state, &route_name).await {
+            Some(c) => c,
+            None => {
+                let has = state.has_connection(&route_name);
+                if has {
                     return (
-                        StatusCode::NOT_FOUND,
+                        StatusCode::BAD_GATEWAY,
                         Json(serde_json::json!({
-                            "error": format!("No upstream registered for route: '{route_name}'")
+                            "error": format!("Upstream '{route_name}' is registered but unreachable")
                         })),
-                    )
-                        .into_response();
+                    ).into_response();
                 }
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("No upstream registered for route: '{route_name}'")
+                    })),
+                ).into_response();
             }
-        }
+        },
     };
 
     match client.call(&route_name, &method_name, &body).await {
         Ok(result) => {
-            { state.pool.read().touch(&route_name); }
+            state.touch_connection(&route_name);
             let bytes = result.into_bytes_with_pool(
                 client.server_pool_arc(),
                 &client.reassembly_pool_arc(),
@@ -211,44 +252,37 @@ async fn call_handler(
                 StatusCode::OK,
                 [("content-type", "application/octet-stream")],
                 bytes,
-            )
-                .into_response()
+            ).into_response()
         }
         Err(c2_ipc::IpcError::CrmError(err_bytes)) => {
-            { state.pool.read().touch(&route_name); }
+            state.touch_connection(&route_name);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [("content-type", "application/octet-stream")],
                 err_bytes,
-            )
-                .into_response()
+            ).into_response()
         }
         Err(e) => {
-            // Evict the dead client so next request triggers reconnect.
-            {
-                let mut pool = state.pool.write();
-                pool.evict(&route_name);
-            }
+            // Evict dead client so next request triggers reconnect.
+            state.evict_connection(&route_name);
             (
                 StatusCode::BAD_GATEWAY,
                 [("content-type", "text/plain")],
                 format!("relay error: {e}"),
-            )
-                .into_response()
+            ).into_response()
         }
     }
 }
 
 /// Attempt to reconnect an evicted upstream.
 async fn try_reconnect(state: &RelayState, route_name: &str) -> Option<Arc<IpcClient>> {
-    let address = { state.pool.read().get_address(route_name)? };
+    let address = state.get_address(route_name)?;
 
     let mut client = IpcClient::new(&address);
     match client.connect().await {
         Ok(()) => {
             let client = Arc::new(client);
-            let mut pool = state.pool.write();
-            pool.reconnect(route_name, client.clone());
+            state.reconnect(route_name, client.clone());
             Some(client)
         }
         Err(e) => {

@@ -5,11 +5,20 @@
 //! c2-http = { path = "...", features = ["relay"] }
 //! ```
 
+pub mod background;
 pub mod config;
+pub mod conn_pool;
+pub mod disseminator;
+pub mod peer;
+pub mod peer_handlers;
+pub mod route_table;
 pub mod router;
 pub mod server;
 pub mod state;
+pub mod types;
 
 pub use config::RelayConfig;
+pub use route_table::RouteTable;
 pub use server::RelayServer;
 pub use state::RelayState;
+pub use types::*;

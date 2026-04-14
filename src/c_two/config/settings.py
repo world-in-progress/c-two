@@ -15,11 +15,25 @@ class C2Settings(BaseSettings):
         env_file=_env_file,
         env_prefix='C2_',
         env_file_encoding='utf-8',
+        extra='ignore',
     )
 
     # Transport addresses
     ipc_address: str | None = None
     relay_address: str | None = None
+    relay_seeds: str = ""                       # C2_RELAY_SEEDS (comma-separated URLs)
+    relay_bind: str | None = None                # C2_RELAY_BIND (c3 relay --bind)
+    relay_id: str | None = None                  # C2_RELAY_ID (c3 relay --relay-id)
+    relay_advertise_url: str | None = None       # C2_RELAY_ADVERTISE_URL
+    relay_idle_timeout: int | None = None        # C2_RELAY_IDLE_TIMEOUT
+    relay_anti_entropy_interval: float = 60.0    # C2_RELAY_ANTI_ENTROPY_INTERVAL
+
+    @property
+    def relay_seed_list(self) -> list[str]:
+        """Parse comma-separated relay seeds into a list."""
+        if not self.relay_seeds:
+            return []
+        return [s.strip() for s in self.relay_seeds.split(",") if s.strip()]
 
     # Global hardware param
     shm_threshold: int | None = None            # C2_SHM_THRESHOLD

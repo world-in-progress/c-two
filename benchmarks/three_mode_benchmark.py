@@ -164,12 +164,11 @@ def bench_ipc(payload_size: int) -> float:
     global _ipc_counter
     _ipc_counter += 1
     _ProcessRegistry.reset()
-    address = f'ipc://bench_3m_ipc_{_ipc_counter}'
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_ipc_address(address)
     cc.register(IEcho, Echo(), name='echo_ipc')
+    address = cc.server_address()
     _wait_sock(address)
 
     payload = b'\xAB' * payload_size
@@ -192,13 +191,12 @@ def bench_relay(payload_size: int) -> float | None:
     _ipc_counter += 1
     _relay_port += 1
     _ProcessRegistry.reset()
-    address = f'ipc://bench_3m_relay_{_ipc_counter}'
     relay_addr = f'127.0.0.1:{_relay_port}'
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_ipc_address(address)
     cc.register(IEcho, Echo(), name='echo_relay')
+    address = cc.server_address()
     _wait_sock(address)
 
     relay = NativeRelay(relay_addr)
@@ -243,12 +241,11 @@ def bench_ipc_dict(payload_size: int) -> float | None:
     global _ipc_counter
     _ipc_counter += 1
     _ProcessRegistry.reset()
-    address = f'ipc://bench_3m_dict_{_ipc_counter}'
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_ipc_address(address)
     cc.register(IDictEcho, DictEcho(), name='echo_dict')
+    address = cc.server_address()
     _wait_sock(address)
 
     payload = _make_dict_payload(payload_size)

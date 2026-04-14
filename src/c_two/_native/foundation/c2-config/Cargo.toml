@@ -6,3 +6,7 @@ description = "Shared configuration types for C-Two IPC transport, memory pool, 
 
 [lib]
 name = "c2_config"
+
+[dependencies]
+gethostname = "0.2"
+uuid = { version = "1", features = ["v4"] }

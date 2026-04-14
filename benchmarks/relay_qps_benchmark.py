@@ -56,15 +56,15 @@ def main():
         f.write(pickle.dumps(('Benchmark',)))
 
     try:
-        cc.set_ipc_address(IPC_ADDR)
         cc.register(IHello, Hello(), name='hello')
+        ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'127.0.0.1:{RELAY_PORT}')
         relay.start()
         time.sleep(0.1)
 
         try:
-            relay.register_upstream('hello', IPC_ADDR)
+            relay.register_upstream('hello', ipc_addr)
 
             # Warmup with hey
             subprocess.run(

@@ -11,14 +11,17 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use c2_ipc::IpcClient;
+use c2_config::RelayConfig;
+use crate::relay::background::spawn_background_tasks;
+use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
-use crate::relay::state::{RelayState, UpstreamPool};
+use crate::relay::state::RelayState;
 
 /// Commands sent from the sync API to the async runtime.
 enum Command {
@@ -40,27 +43,32 @@ enum Command {
 }
 
 /// Embeddable relay server with a synchronous control API.
+#[allow(dead_code)]
 pub struct RelayServer {
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    _pool: Arc<RwLock<UpstreamPool>>,
+    state: Arc<RelayState>,
+    cancel: CancellationToken,
 }
 
 impl RelayServer {
     /// Start the relay server on a background thread.
-    ///
-    /// `idle_timeout_secs` controls how long an upstream can be idle
-    /// before the sweeper evicts its connection. Set to `0` to disable.
-    pub fn start(bind: &str, idle_timeout_secs: u64) -> Result<Self, String> {
-        let addr: SocketAddr = bind
-            .parse()
-            .map_err(|e| format!("Invalid bind address '{bind}': {e}"))?;
+    pub fn start(config: RelayConfig) -> Result<Self, String> {
+        let addr: SocketAddr = config.bind.parse()
+            .map_err(|e| format!("Invalid bind address '{}': {e}", config.bind))?;
 
-        let pool = Arc::new(RwLock::new(UpstreamPool::new()));
-        let state = RelayState { pool: pool.clone() };
+        let config = Arc::new(config);
+        let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> =
+            Arc::new(crate::relay::disseminator::FullBroadcast::new());
+        let state = Arc::new(RelayState::new(config.clone(), disseminator));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+
+        let idle_timeout_secs = config.idle_timeout_secs;
+        let server_state = state.clone();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
 
         let thread = std::thread::Builder::new()
             .name("c2-relay".into())
@@ -71,7 +79,7 @@ impl RelayServer {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    Self::run(addr, state, cmd_rx, ready_tx, idle_timeout_secs).await;
+                    Self::run(addr, server_state, cmd_rx, ready_tx, idle_timeout_secs, cancel_clone).await;
                 });
             })
             .map_err(|e| format!("Failed to spawn relay thread: {e}"))?;
@@ -85,7 +93,8 @@ impl RelayServer {
         Ok(Self {
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
-            _pool: pool,
+            state,
+            cancel,
         })
     }
 
@@ -125,6 +134,9 @@ impl RelayServer {
 
     /// Gracefully stop the relay server.
     pub fn stop(&mut self) -> Result<(), String> {
+        // Leave broadcast happens inside the tokio runtime (in `run()`'s shutdown block).
+        self.cancel.cancel();
+
         if let Some(tx) = self.cmd_tx.take() {
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = tx.blocking_send(Command::Stop { reply: reply_tx });
@@ -148,10 +160,11 @@ impl RelayServer {
 
     async fn run(
         addr: SocketAddr,
-        state: RelayState,
+        state: Arc<RelayState>,
         mut cmd_rx: mpsc::Receiver<Command>,
         ready_tx: oneshot::Sender<Result<(), String>>,
         idle_timeout_secs: u64,
+        cancel: CancellationToken,
     ) {
         let app = router::build_router(state.clone());
 
@@ -166,20 +179,73 @@ impl RelayServer {
             }
         };
 
+        // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
+        let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
+
+        // Seed bootstrap (one-shot, non-blocking)
+        if !state.config().seeds.is_empty() {
+            let s = state.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                for seed_url in &s.config().seeds {
+                    let join_url = format!("{seed_url}/_peer/join");
+                    let envelope = PeerEnvelope::new(
+                        s.relay_id(),
+                        PeerMessage::RelayJoin {
+                            relay_id: s.relay_id().to_string(),
+                            url: s.config().effective_advertise_url(),
+                        },
+                    );
+                    if let Ok(resp) = client.post(&join_url).json(&envelope).send().await {
+                        if let Ok(snapshot) = resp.json::<crate::relay::types::FullSync>().await {
+                            s.merge_snapshot(snapshot);
+                            let peers = s.list_peers();
+                            let announce = PeerEnvelope::new(
+                                s.relay_id(),
+                                PeerMessage::RelayJoin {
+                                    relay_id: s.relay_id().to_string(),
+                                    url: s.config().effective_advertise_url(),
+                                },
+                            );
+                            s.disseminator().broadcast(announce, &peers);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         let server = axum::serve(listener, app);
         let sweeper = Self::idle_sweeper(state.clone(), idle_timeout_secs);
 
-        // Run the HTTP server, command loop, and idle sweeper concurrently.
         tokio::select! {
             _ = server => {},
-            _ = Self::command_loop(state, &mut cmd_rx) => {},
+            _ = Self::command_loop(state.clone(), &mut cmd_rx) => {},
             _ = sweeper => {},
+        }
+
+        // Shutdown: broadcast leave, cancel background tasks
+        let leave = PeerEnvelope::new(
+            state.relay_id(),
+            PeerMessage::RelayLeave { relay_id: state.relay_id().to_string() },
+        );
+        let peers = state.list_peers();
+        let leave_handle = state.disseminator().broadcast(leave, &peers);
+        if let Some(h) = leave_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+        cancel.cancel();
+        for handle in bg_handles {
+            let _ = handle.await;
         }
     }
 
     /// Periodically evict upstream connections that have been idle
     /// longer than `idle_timeout_secs`.
-    async fn idle_sweeper(state: RelayState, idle_timeout_secs: u64) {
+    async fn idle_sweeper(state: Arc<RelayState>, idle_timeout_secs: u64) {
         // When idle_timeout is 0, still sweep for dead connections every 30s.
         let check_interval = if idle_timeout_secs == 0 {
             30
@@ -198,23 +264,14 @@ impl RelayServer {
         loop {
             interval.tick().await;
 
-            let idle_names = {
-                let pool = state.pool.read();
-                pool.idle_entries(idle_timeout_ms)
-            };
-
-            if idle_names.is_empty() {
-                continue;
-            }
-
-            let mut pool = state.pool.write();
-            for name in &idle_names {
-                if let Some(old_client) = pool.evict(name) {
-                    let dead = !old_client.is_connected();
+            let evicted = state.evict_idle(idle_timeout_ms);
+            for (name, old_client) in evicted {
+                if let Some(arc_client) = old_client {
+                    let dead = !arc_client.is_connected();
                     tokio::spawn(async move {
-                        let mut client = match Arc::try_unwrap(old_client) {
+                        let mut client = match Arc::try_unwrap(arc_client) {
                             Ok(c) => c,
-                            Err(_arc) => return, // still referenced elsewhere
+                            Err(_arc) => return,
                         };
                         client.close().await;
                     });
@@ -229,38 +286,29 @@ impl RelayServer {
     }
 
     async fn command_loop(
-        state: RelayState,
+        state: Arc<RelayState>,
         cmd_rx: &mut mpsc::Receiver<Command>,
     ) {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 Command::RegisterUpstream { name, address, reply } => {
-                    // Check duplicate without holding lock
-                    {
-                        let pool = state.pool.read();
-                        if pool.contains(&name) {
-                            let _ = reply.send(Err(format!("Route name already registered: '{name}'")));
-                            continue;
-                        }
+                    if state.has_local_route(&name) {
+                        let _ = reply.send(Err(format!("Route name already registered: '{name}'")));
+                        continue;
                     }
-                    // Connect without holding lock
                     let mut client = IpcClient::new(&address);
                     let result = match client.connect().await {
                         Ok(()) => {
-                            let mut pool = state.pool.write();
-                            pool.insert(name, address, Arc::new(client))
+                            state.register_upstream(name, address, String::new(), String::new(), Arc::new(client));
+                            Ok(())
                         }
                         Err(e) => Err(format!("Failed to connect: {e}")),
                     };
                     let _ = reply.send(result);
                 }
                 Command::UnregisterUpstream { name, reply } => {
-                    let result = {
-                        let mut pool = state.pool.write();
-                        pool.remove(&name)
-                    };
-                    match result {
-                        Ok(old_client) => {
+                    match state.unregister_upstream(&name) {
+                        Some((_entry, old_client)) => {
                             if let Some(arc_client) = old_client {
                                 tokio::spawn(async move {
                                     let mut client = match Arc::try_unwrap(arc_client) {
@@ -272,17 +320,15 @@ impl RelayServer {
                             }
                             let _ = reply.send(Ok(()));
                         }
-                        Err(e) => {
-                            let _ = reply.send(Err(e));
+                        None => {
+                            let _ = reply.send(Err(format!("Route name not registered: '{name}'")));
                         }
                     }
                 }
                 Command::ListRoutes { reply } => {
-                    let pool = state.pool.read();
-                    let routes: Vec<(String, String)> = pool
-                        .list_routes()
+                    let routes: Vec<(String, String)> = state.list_routes()
                         .into_iter()
-                        .map(|r| (r.name, r.address))
+                        .map(|r| (r.name, r.ipc_address.unwrap_or_default()))
                         .collect();
                     let _ = reply.send(routes);
                 }

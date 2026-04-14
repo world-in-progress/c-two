@@ -13,16 +13,19 @@ relay = [
     "dep:c2-wire",
     "dep:c2-ipc",
     "dep:clap",
+    "dep:serde",
     "dep:serde_json",
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:anyhow",
+    "dep:futures",
 ]
 
 [dependencies]
 # Always available (client)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 parking_lot = { workspace = true }
 thiserror = "2"
 
@@ -33,10 +36,12 @@ c2-config = { path = "../../foundation/c2-config", optional = true }
 c2-wire = { path = "../../protocol/c2-wire", optional = true }
 c2-ipc = { path = "../c2-ipc", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 anyhow = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
 
 [[bin]]
 name = "c2-relay"

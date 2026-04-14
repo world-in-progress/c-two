@@ -82,13 +82,12 @@ def relay_stack():
     'counter'.  The relay starts empty; upstreams are added
     programmatically via ``register_upstream()``.
     """
-    ipc_addr = f'ipc://relay_test_{os.getpid()}_{_next_id()}'
     http_port = 19000 + _next_id()
 
     # Register CRMs via SOTA API.
-    cc.set_ipc_address(ipc_addr)
     cc.register(IHello, Hello(), name='hello')
     cc.register(ICounter, Counter(), name='counter')
+    ipc_addr = cc.server_address()
 
     # Start relay (empty — no upstream param).
     relay = NativeRelay(f'0.0.0.0:{http_port}')
@@ -282,11 +281,10 @@ class TestRelayControlPlane:
 
     def test_register_via_http_control(self):
         """POST /_register adds an upstream and allows calls."""
-        ipc_addr = f'ipc://ctrl_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
-        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
+        ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
         relay.start()
@@ -321,13 +319,12 @@ class TestRelayControlPlane:
         finally:
             relay.stop()
 
-    def test_register_duplicate_409(self):
-        """POST /_register with duplicate name returns 409."""
-        ipc_addr = f'ipc://dup_test_{os.getpid()}_{_next_id()}'
+    def test_register_duplicate_upsert(self):
+        """POST /_register with same name upserts (returns 201)."""
         http_port = 19000 + _next_id()
 
-        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
+        ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
         relay.start()
@@ -343,22 +340,21 @@ class TestRelayControlPlane:
                 )
                 assert resp.status_code == 201
 
-                # Duplicate registration.
+                # Same-relay duplicate registration uses upsert semantics.
                 resp = http.post(
                     f'{relay_url}/_register',
                     json={'name': 'hello', 'address': ipc_addr},
                 )
-                assert resp.status_code == 409
+                assert resp.status_code == 201
         finally:
             relay.stop()
 
     def test_unregister_removes_route(self):
         """POST /_unregister removes the route; calls return 404."""
-        ipc_addr = f'ipc://unreg_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
-        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
+        ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
         relay.start()
@@ -415,12 +411,11 @@ class TestRelayControlPlane:
 
     def test_health_shows_registered_routes(self):
         """GET /health lists all registered route names."""
-        ipc_addr = f'ipc://health_test_{os.getpid()}_{_next_id()}'
         http_port = 19000 + _next_id()
 
-        cc.set_ipc_address(ipc_addr)
         cc.register(IHello, Hello(), name='hello')
         cc.register(ICounter, Counter(), name='counter')
+        ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
         relay.start()
