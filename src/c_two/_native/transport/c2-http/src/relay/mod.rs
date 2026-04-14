@@ -5,6 +5,7 @@
 //! c2-http = { path = "...", features = ["relay"] }
 //! ```
 
+pub mod background;
 pub mod config;
 pub mod conn_pool;
 pub mod disseminator;

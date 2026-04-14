@@ -25,6 +25,7 @@ relay = [
 # Always available (client)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 parking_lot = { workspace = true }
 thiserror = "2"
 

@@ -14,9 +14,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use c2_ipc::IpcClient;
 use c2_config::RelayConfig;
+use crate::relay::background::spawn_background_tasks;
+use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::RelayState;
 
@@ -45,6 +48,7 @@ pub struct RelayServer {
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
     state: Arc<RelayState>,
+    cancel: CancellationToken,
 }
 
 impl RelayServer {
@@ -63,6 +67,8 @@ impl RelayServer {
 
         let idle_timeout_secs = config.idle_timeout_secs;
         let server_state = state.clone();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
 
         let thread = std::thread::Builder::new()
             .name("c2-relay".into())
@@ -73,7 +79,7 @@ impl RelayServer {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    Self::run(addr, server_state, cmd_rx, ready_tx, idle_timeout_secs).await;
+                    Self::run(addr, server_state, cmd_rx, ready_tx, idle_timeout_secs, cancel_clone).await;
                 });
             })
             .map_err(|e| format!("Failed to spawn relay thread: {e}"))?;
@@ -88,6 +94,7 @@ impl RelayServer {
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
             state,
+            cancel,
         })
     }
 
@@ -127,6 +134,18 @@ impl RelayServer {
 
     /// Gracefully stop the relay server.
     pub fn stop(&mut self) -> Result<(), String> {
+        // Broadcast leave before stopping
+        let leave = PeerEnvelope::new(
+            self.state.relay_id(),
+            PeerMessage::RelayLeave {
+                relay_id: self.state.relay_id().to_string(),
+            },
+        );
+        let peers = self.state.list_peers();
+        self.state.disseminator().broadcast(leave, &peers);
+
+        self.cancel.cancel();
+
         if let Some(tx) = self.cmd_tx.take() {
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = tx.blocking_send(Command::Stop { reply: reply_tx });
@@ -154,6 +173,7 @@ impl RelayServer {
         mut cmd_rx: mpsc::Receiver<Command>,
         ready_tx: oneshot::Sender<Result<(), String>>,
         idle_timeout_secs: u64,
+        cancel: CancellationToken,
     ) {
         let app = router::build_router(state.clone());
 
@@ -168,14 +188,65 @@ impl RelayServer {
             }
         };
 
+        // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
+        let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
+
+        // Seed bootstrap (one-shot, non-blocking)
+        if !state.config().seeds.is_empty() {
+            let s = state.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                for seed_url in &s.config().seeds {
+                    let join_url = format!("{seed_url}/_peer/join");
+                    let envelope = PeerEnvelope::new(
+                        s.relay_id(),
+                        PeerMessage::RelayJoin {
+                            relay_id: s.relay_id().to_string(),
+                            url: s.config().effective_advertise_url(),
+                        },
+                    );
+                    if let Ok(resp) = client.post(&join_url).json(&envelope).send().await {
+                        if let Ok(snapshot) = resp.json::<crate::relay::types::FullSync>().await {
+                            s.merge_snapshot(snapshot);
+                            let peers = s.list_peers();
+                            let announce = PeerEnvelope::new(
+                                s.relay_id(),
+                                PeerMessage::RelayJoin {
+                                    relay_id: s.relay_id().to_string(),
+                                    url: s.config().effective_advertise_url(),
+                                },
+                            );
+                            s.disseminator().broadcast(announce, &peers);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         let server = axum::serve(listener, app);
         let sweeper = Self::idle_sweeper(state.clone(), idle_timeout_secs);
 
-        // Run the HTTP server, command loop, and idle sweeper concurrently.
         tokio::select! {
             _ = server => {},
-            _ = Self::command_loop(state, &mut cmd_rx) => {},
+            _ = Self::command_loop(state.clone(), &mut cmd_rx) => {},
             _ = sweeper => {},
+        }
+
+        // Shutdown: broadcast leave, cancel background tasks
+        let leave = PeerEnvelope::new(
+            state.relay_id(),
+            PeerMessage::RelayLeave { relay_id: state.relay_id().to_string() },
+        );
+        let peers = state.list_peers();
+        state.disseminator().broadcast(leave, &peers);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        for handle in bg_handles {
+            let _ = handle.await;
         }
     }
 

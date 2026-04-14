@@ -58,24 +58,47 @@ async fn handle_register(
     let icrm_ns = body.get("icrm_ns").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let icrm_ver = body.get("icrm_ver").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // Check for duplicate local route
+    // Check for duplicate LOCAL route.
     if state.has_local_route(&name) {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": format!("Route name already registered: '{name}'")})),
-        ).into_response();
+        let existing_addr = state.get_address(&name);
+        if let Some(ref old_addr) = existing_addr {
+            if old_addr != &address {
+                // Different address → might be a new process after crash.
+                // Check if old IPC connection is still alive.
+                if let Some(old_client) = state.get_client(&name) {
+                    if old_client.is_connected() {
+                        // Old process still alive → reject.
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({
+                                "error": "DuplicateRoute",
+                                "name": name,
+                                "existing_address": old_addr,
+                            })),
+                        ).into_response();
+                    }
+                    // Not connected → fall through to upsert.
+                }
+            }
+            // Same address or old process dead → fall through to upsert.
+        }
     }
 
-    // Connect IPC client without holding any lock
-    let mut client = IpcClient::new(&address);
-    if let Err(e) = client.connect().await {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
-        ).into_response();
-    }
+    // Connect IPC client (or skip if configured for testing)
+    let client = if state.config().skip_ipc_validation {
+        Arc::new(IpcClient::new(&address))
+    } else {
+        let mut c = IpcClient::new(&address);
+        if let Err(e) = c.connect().await {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
+            ).into_response();
+        }
+        Arc::new(c)
+    };
 
-    let entry = state.register_upstream(name.clone(), address, icrm_ns, icrm_ver, Arc::new(client));
+    let entry = state.register_upstream(name.clone(), address, icrm_ns, icrm_ver, client);
 
     // Gossip announce to peers
     let envelope = PeerEnvelope::new(
