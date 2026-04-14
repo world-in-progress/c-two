@@ -319,8 +319,8 @@ class TestRelayControlPlane:
         finally:
             relay.stop()
 
-    def test_register_duplicate_409(self):
-        """POST /_register with duplicate name returns 409."""
+    def test_register_duplicate_upsert(self):
+        """POST /_register with same name upserts (returns 201)."""
         http_port = 19000 + _next_id()
 
         cc.register(IHello, Hello(), name='hello')
@@ -340,12 +340,12 @@ class TestRelayControlPlane:
                 )
                 assert resp.status_code == 201
 
-                # Duplicate registration.
+                # Same-relay duplicate registration uses upsert semantics.
                 resp = http.post(
                     f'{relay_url}/_register',
                     json={'name': 'hello', 'address': ipc_addr},
                 )
-                assert resp.status_code == 409
+                assert resp.status_code == 201
         finally:
             relay.stop()
 
