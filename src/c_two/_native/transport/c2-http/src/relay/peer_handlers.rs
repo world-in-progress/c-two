@@ -190,16 +190,7 @@ pub async fn handle_peer_digest(
         }
         PeerMessage::DigestDiff { entries, extra } => {
             for diff in entries {
-                state.register_peer_route(RouteEntry {
-                    name: diff.name,
-                    relay_id: diff.relay_id,
-                    relay_url: diff.relay_url,
-                    ipc_address: diff.ipc_address,
-                    icrm_ns: diff.icrm_ns,
-                    icrm_ver: diff.icrm_ver,
-                    locality: Locality::Peer,
-                    registered_at: diff.registered_at,
-                });
+                state.register_peer_route(diff.into());
             }
             for (name, relay_id) in extra {
                 state.unregister_peer_route(&name, &relay_id);

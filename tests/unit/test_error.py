@@ -17,8 +17,8 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING == 6
         assert ERROR_Code.ERROR_AT_COMPO_CRM_CALLING == 7
 
-    def test_has_exactly_7_members(self):
-        assert len(ERROR_Code) == 7
+    def test_has_exactly_10_members(self):
+        assert len(ERROR_Code) == 10
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]

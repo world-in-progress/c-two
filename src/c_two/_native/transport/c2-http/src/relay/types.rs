@@ -76,3 +76,14 @@ pub struct PeerSnapshot {
     pub route_count: u32,
     pub status: PeerStatus,
 }
+
+/// Convert a DigestDiffEntry into a PEER RouteEntry.
+impl From<crate::relay::peer::DigestDiffEntry> for RouteEntry {
+    fn from(d: crate::relay::peer::DigestDiffEntry) -> Self {
+        Self {
+            name: d.name, relay_id: d.relay_id, relay_url: d.relay_url,
+            ipc_address: d.ipc_address, icrm_ns: d.icrm_ns, icrm_ver: d.icrm_ver,
+            locality: Locality::Peer, registered_at: d.registered_at,
+        }
+    }
+}

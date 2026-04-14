@@ -169,17 +169,7 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
             if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
                 if let PeerMessage::DigestDiff { entries, extra: _ } = resp_env.message {
                     for diff_entry in entries {
-                        let route = RouteEntry {
-                            name: diff_entry.name,
-                            relay_id: diff_entry.relay_id,
-                            relay_url: diff_entry.relay_url,
-                            ipc_address: diff_entry.ipc_address,
-                            icrm_ns: diff_entry.icrm_ns,
-                            icrm_ver: diff_entry.icrm_ver,
-                            locality: Locality::Peer,
-                            registered_at: diff_entry.registered_at,
-                        };
-                        state.register_peer_route(route);
+                        state.register_peer_route(diff_entry.into());
                     }
                 }
             }
@@ -226,7 +216,11 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
 
         for (relay_id, url) in dead {
             let health_url = format!("{url}/health");
-            if client.get(&health_url).send().await.is_ok() {
+            let probe_ok = match client.get(&health_url).send().await {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            };
+            if probe_ok {
                 // Peer is back — mark alive
                 state.with_route_table_mut(|rt| {
                     if let Some(p) = rt.get_peer_mut(&relay_id) {
@@ -246,17 +240,7 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                     if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
                         if let PeerMessage::DigestDiff { entries, extra: _ } = resp_env.message {
                             for diff_entry in entries {
-                                let route = RouteEntry {
-                                    name: diff_entry.name,
-                                    relay_id: diff_entry.relay_id,
-                                    relay_url: diff_entry.relay_url,
-                                    ipc_address: diff_entry.ipc_address,
-                                    icrm_ns: diff_entry.icrm_ns,
-                                    icrm_ver: diff_entry.icrm_ver,
-                                    locality: Locality::Peer,
-                                    registered_at: diff_entry.registered_at,
-                                };
-                                state.register_peer_route(route);
+                                state.register_peer_route(diff_entry.into());
                             }
                         }
                     }
