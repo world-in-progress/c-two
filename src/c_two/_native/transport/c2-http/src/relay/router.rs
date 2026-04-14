@@ -14,6 +14,7 @@ use axum::{
 use c2_ipc::IpcClient;
 use crate::relay::state::RelayState;
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
+use crate::relay::peer_handlers;
 
 /// Build the relay axum router with control-plane and data-plane endpoints.
 pub fn build_router(state: Arc<RelayState>) -> Router {
@@ -23,6 +24,12 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .route("/_routes", get(handle_list_routes))
         .route("/_resolve/{name}", get(handle_resolve))
         .route("/_peers", get(handle_peers))
+        .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
+        .route("/_peer/join", post(peer_handlers::handle_peer_join))
+        .route("/_peer/sync", get(peer_handlers::handle_peer_sync))
+        .route("/_peer/heartbeat", post(peer_handlers::handle_peer_heartbeat))
+        .route("/_peer/leave", post(peer_handlers::handle_peer_leave))
+        .route("/_peer/digest", post(peer_handlers::handle_peer_digest))
         .route("/health", get(handle_health))
         .route("/_echo", post(echo_handler))
         .route("/{route_name}/{method_name}", post(call_handler))
