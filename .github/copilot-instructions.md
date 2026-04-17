@@ -4,7 +4,10 @@
 
 C-Two is a **resource-oriented RPC framework** for Python that enables remote invocation of stateful resource classes across processes and machines. It is designed for distributed scientific computation — not traditional microservices.
 
-The core abstraction is **not services, but resources**: CRMs (Core Resource Models) encapsulate persistent state and domain logic; Components consume them through ICRM interfaces with full location transparency.
+The core abstraction is **not services, but resources**. Terminology:
+- **CRM** (Core Resource Model) = the *contract* class decorated with `@cc.crm(...)`. Declares which methods are remotely callable. Method bodies are `...`.
+- **Resource** = the *runtime instance* implementing a CRM contract. A plain Python class, not decorated. Named by domain semantics (`NestedGrid` implements `Grid`).
+- **Client** = any code that calls `cc.connect(...)` to consume a resource. There is no separate "Component" abstraction.
 
 ## Build, Test & Run
 
@@ -39,32 +42,40 @@ uv run python examples/local.py
 
 # Run IPC example (two terminals)
 uv run python examples/crm_process.py    # terminal 1: server
-uv run python examples/compo.py          # terminal 2: client
+uv run python examples/client.py         # terminal 2: client
+
+# Run relay mesh example (three terminals)
+c3 relay -b 0.0.0.0:8300                          # terminal 1: relay
+uv run python examples/relay_mesh/resource.py      # terminal 2: CRM server
+uv run python examples/relay_mesh/client.py        # terminal 3: client
+
+# Install examples dependencies (pandas, pyarrow — needed for grid example)
+uv sync --group examples
 
 # CLI tool
 c3 --version
 c3 relay --upstream ipc://my_server --bind 0.0.0.0:8080
 ```
 
-Tests use **pytest** with a 30-second per-test timeout. Tests live under `tests/unit/` and `tests/integration/`, with shared fixtures in `tests/fixtures/` (see `IHello` ICRM and `Hello` CRM).
+Tests use **pytest** with a 30-second per-test timeout. Tests live under `tests/unit/` and `tests/integration/`, with shared fixtures in `tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource).
 
 ## Architecture
 
-Two-language design: Python owns domain logic (CRM/ICRM/Components); Rust owns transport, memory, and wire codec. PyO3/maturin bridges them as `c_two._native`.
+Two-language design: Python owns domain logic (CRM + Resource + client code); Rust owns transport, memory, and wire codec. PyO3/maturin bridges them as `c_two._native`.
 
 ### 1. CRM Layer (`src/c_two/crm/`)
-- **CRM**: A plain Python class holding state and implementing domain logic. Not decorated.
-- **ICRM**: An interface class decorated with `@cc.icrm(namespace='...', version='...')` that declares which CRM methods are remotely accessible. Only methods in the ICRM are exposed. Method bodies are `...` (ellipsis).
+- **CRM contract**: An interface class decorated with `@cc.crm(namespace='...', version='...')` that declares which methods are remotely accessible. Only methods in the contract are exposed. Method bodies are `...` (ellipsis).
+- **Resource**: A plain Python class implementing a CRM contract — holds state and domain logic. Not decorated. Name it by domain semantics (`NestedGrid`, `PostgresVectorLayer`), never by the contract name.
 - **`@transferable`**: Decorator for custom data types that need to cross the wire. Automatically makes classes into dataclasses and registers `serialize`/`deserialize`/`from_buffer` as static methods. Without `@transferable`, pickle is used as fallback.
 - **`from_buffer`**: Optional third method on transferable types. Provides zero-copy buffer views (e.g., `np.frombuffer`). When present, server-side auto-detects hold mode.
-- **Method access**: ICRM methods can be annotated with `@cc.read` or `@cc.write` (default: write) to control concurrency — the scheduler allows parallel reads but exclusive writes.
-- **`@cc.transfer()`**: Per-method metadata decorator for ICRM methods. Allows explicit `input`, `output` transferable and `buffer` mode ('view'|'hold'|None). Does NOT wrap the function — consumed by `icrm()` at class decoration time.
-- **`@on_shutdown`**: Marks a single public method as shutdown callback (called when CRM is unregistered; not exposed via RPC).
+- **Method access**: CRM contract methods can be annotated with `@cc.read` or `@cc.write` (default: write) to control concurrency — the scheduler allows parallel reads but exclusive writes.
+- **`@cc.transfer()`**: Per-method metadata decorator for CRM contract methods. Allows explicit `input`, `output` transferable and `buffer` mode ('view'|'hold'|None). Does NOT wrap the function — consumed by `@cc.crm` at class decoration time.
+- **`@on_shutdown`**: Marks a single public method as shutdown callback (called when a resource is unregistered; not exposed via RPC).
 
-### 2. Component Layer (`src/c_two/compo/`)
-- Components are client-side consumers of CRM resources.
-- **Script-based**: Use `cc.connect(ICRMClass, name='...', address='...')` to get a typed ICRM proxy.
-- **Function-based**: Decorate functions with `@cc.runtime.connect`. The first parameter must be typed as the ICRM class — the framework injects the connected instance automatically.
+### 2. Client Layer
+- Any code that calls `cc.connect(CRMClass, name='...', address='...')` is a **client**. The returned proxy is a typed object matching the CRM contract.
+- The proxy supports `with`: `with cc.connect(Grid, name='grid') as g: ...` auto-closes on exit.
+- There is no separate `compo/` module, no `@cc.runtime.connect` decorator, and no "Component" type.
 
 ### 3. Config Layer (`src/c_two/config/`)
 
@@ -72,10 +83,10 @@ Unified configuration with Python as the single source of truth, passed through 
 
 | File | Purpose |
 |------|---------|
-| `settings.py` | `C2Settings` pydantic model — env vars `C2_IPC_ADDRESS`, `C2_RELAY_ADDRESS`, `C2_IPC_POOL_SEGMENT_SIZE` etc. |
+| `settings.py` | `C2Settings` pydantic model — all `C2_*` env vars, `.env` loading (`extra='ignore'`), relay server config |
 | `ipc.py` | Frozen dataclasses: `BaseIPCConfig`, `ServerIPCConfig`, `ClientIPCConfig` + `build_server_config()` / `build_client_config()` |
 
-Config priority chain: explicit kwargs → environment variables → class defaults.
+Config priority chain: explicit kwargs (`cc.set_*()`) → environment variables / `.env` → class defaults.
 
 ### 4. Transport Layer (`src/c_two/transport/`)
 
@@ -87,20 +98,22 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 |------|---------|
 | `registry.py` | SOTA API surface: `cc.register()`, `cc.connect()`, `cc.close()`, `cc.shutdown()`, `cc.set_server()`, `cc.set_client()` etc. |
 | `protocol.py` | Re-export facade for Rust handshake codec — `Handshake`, `RouteInfo`, flag constants |
-| `wire.py` | `MethodTable` — maps ICRM method names to indices for wire dispatch; thin FFI wrappers |
+| `wire.py` | `MethodTable` — maps CRM contract method names to indices for wire dispatch; thin FFI wrappers |
 | `server/native.py` | `NativeServerBridge` (exported as `Server`) — Python↔Rust server bridge |
-| `server/scheduler.py` | Read/write-aware CRM method execution scheduler |
-| `server/reply.py` | `unpack_icrm_result` + `wrap_error` — CRM reply handling |
+| `server/scheduler.py` | Read/write-aware resource method execution scheduler |
+| `server/reply.py` | `unpack_icrm_result` + `wrap_error` — resource reply handling |
 | `server/hold_registry.py` | `HoldRegistry` — weakref-based tracking of hold-mode SHM buffers |
-| `client/proxy.py` | `ICRMProxy` — unified proxy supporting both thread-local and IPC modes |
+| `client/proxy.py` | `CRMProxy` — unified proxy supporting both thread-local and IPC modes |
 | `client/util.py` | Standalone `ping()` and `shutdown()` — lightweight server probes via raw UDS |
 
 **Transport modes:**
-- **Thread-local** (same process): `cc.connect()` returns a zero-serialization proxy that calls CRM methods directly.
+- **Thread-local** (same process): `cc.connect()` returns a zero-serialization proxy that calls resource methods directly.
 - **IPC** (`ipc://`): UDS control channel + POSIX SHM data plane via Rust (`c2-ipc`, `c2-server`).
 - **HTTP** (`http://`): HTTP relay for cross-machine transport via Rust (`c2-http`).
 
 **Address priority:** `cc.set_address()` > `C2_IPC_ADDRESS` env var > auto-generated UUID path.
+
+**Relay priority:** `cc.set_relay()` > `C2_RELAY_ADDRESS` env var > none (standalone mode).
 
 ### 5. Rust Native Layer (`src/c_two/_native/`)
 
@@ -126,6 +139,18 @@ A Cargo workspace of 7 crates organized in 4 layers, compiled into a single `c_t
 ### CLI (`src/c_two/cli.py`)
 The `c3` CLI provides `relay` (HTTP relay server) and `dev` (developer tools) commands.
 
+**`c3 relay`** options (all support env vars via `C2Settings` / `.env`):
+
+| Option | Env var | Default | Purpose |
+|--------|---------|---------|---------|
+| `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address |
+| `--seeds` | `C2_RELAY_SEEDS` | `""` | Comma-separated seed relay URLs for mesh |
+| `--relay-id` | `C2_RELAY_ID` | auto UUID | Stable relay identifier |
+| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | `""` | Publicly reachable URL for peers |
+| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `300` | IPC idle disconnect timeout (seconds) |
+
+Priority: CLI flag → env var / `.env` → hardcoded default.
+
 ## Key Conventions
 
 ### Import Style
@@ -134,11 +159,11 @@ The package is imported as `c_two` but aliased as `cc`:
 import c_two as cc
 ```
 
-### ICRM Definition Pattern
-ICRM classes are interfaces — method bodies are `...` (ellipsis). The `@cc.icrm()` decorator requires `namespace` and `version` (semver string):
+### CRM Contract Definition Pattern
+CRM contract classes are interfaces — method bodies are `...` (ellipsis). The `@cc.crm()` decorator requires `namespace` and `version` (semver string). Do **not** use an `I`-prefix on the contract class name:
 ```python
-@cc.icrm(namespace='cc.demo', version='0.1.0')
-class IGrid:
+@cc.crm(namespace='cc.demo', version='0.1.0')
+class Grid:
     def some_method(self, arg: int) -> str:
         ...
 ```
@@ -159,16 +184,16 @@ class MyData:
 ```
 
 ### Transfer Decorator Pattern
-`@cc.transfer()` is a metadata-only decorator applied to ICRM methods. It attaches `__cc_transfer__` but does NOT wrap the function:
+`@cc.transfer()` is a metadata-only decorator applied to CRM contract methods. It attaches `__cc_transfer__` but does NOT wrap the function:
 ```python
-@cc.icrm(namespace='ns', version='0.1.0')
-class IMyResource:
+@cc.crm(namespace='ns', version='0.1.0')
+class MyResource:
     @cc.transfer(input=MyData, output=MyData, buffer='hold')
     def process(self, data: MyData) -> MyData: ...
 ```
 
 ### Hold Mode Pattern
-`cc.hold()` wraps an ICRM bound method for client-side SHM retention. Returns `HeldResult` with `.value` and `.release()`. Three-layer safety: explicit `.release()`, context manager, `__del__` fallback:
+`cc.hold()` wraps a CRM-proxy bound method for client-side SHM retention. Returns `HeldResult` with `.value` and `.release()`. Three-layer safety: explicit `.release()`, context manager, `__del__` fallback:
 ```python
 # Context manager (single hold)
 with cc.hold(proxy.method)(args) as held:
@@ -187,15 +212,12 @@ finally:
 
 Buffer mode auto-detection: when `@cc.transfer(buffer=None)` (default), the framework checks if the input transferable has `from_buffer` → hold, else → view.
 
-### Component Function Pattern
-The first parameter is always the ICRM type (injected by the framework). Callers never pass it:
+### Client Usage Pattern
+Any code that calls `cc.connect(...)` is a client. The returned proxy is typed to the CRM contract and supports `with` for auto-close:
 ```python
-@cc.runtime.connect
-def process(crm: IGrid, level: int) -> list[str]:
-    return crm.subdivide_grids([level], [0])
-
-# Called without the crm parameter:
-result = process(1, crm_address='ipc://server')
+with cc.connect(Grid, name='grid', address='ipc://server') as grid:
+    result = grid.subdivide_grids([1], [0])
+# proxy auto-closed on exit
 ```
 
 ### SOTA API Pattern
@@ -207,18 +229,26 @@ import c_two as cc
 
 # Server side
 cc.set_address('ipc://my_server')                       # optional: explicit address
+cc.set_relay('http://relay-host:8080')                   # optional: relay for name resolution
 cc.set_server(pool_segment_size=2*1024*1024*1024)        # optional: tune IPC config
-cc.register(IGrid, grid_instance, name='grid')           # register CRM
-cc.register(INetwork, net_instance, name='network')      # multiple CRMs in one process
+cc.register(Grid, grid_instance, name='grid')           # register a Grid resource
+cc.register(Network, net_instance, name='network')      # multiple resources in one process
+cc.serve()                                               # block until Ctrl-C
 
 # Client side (same process → thread preference, zero serde)
-grid = cc.connect(IGrid, name='grid')
+grid = cc.connect(Grid, name='grid')
 grid.some_method(arg)
 cc.close(grid)
 
-# Client side (remote process → IPC)
+# Client side (remote process → IPC, direct address)
 cc.set_client(pool_segment_size=2*1024*1024*1024)        # optional: tune client config
-grid = cc.connect(IGrid, name='grid', address='ipc://my_server')
+grid = cc.connect(Grid, name='grid', address='ipc://my_server')
+grid.some_method(arg)
+cc.close(grid)
+
+# Client side (relay-based name resolution)
+cc.set_relay('http://relay-host:8080')
+grid = cc.connect(Grid, name='grid')                    # relay resolves name → IPC address
 grid.some_method(arg)
 cc.close(grid)
 
@@ -227,7 +257,7 @@ cc.unregister('grid')
 cc.shutdown()
 ```
 
-The `name` parameter in `cc.register()` is a user-chosen routing key — it is **not** the ICRM namespace. Multiple CRMs using different ICRM classes (or even the same ICRM class with different instances) can coexist under distinct names.
+The `name` parameter in `cc.register()` is a user-chosen routing key — it is **not** the CRM namespace. Multiple resources using different CRM contracts (or even the same CRM contract with different instances) can coexist under distinct names.
 
 ### Hold Stats API
 ```python
@@ -237,13 +267,13 @@ stats = cc.hold_stats()
 ```
 
 ### Error Handling
-Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Errors serialize to/from bytes for wire transfer. Error classes are named by location: `CRMDeserializeInput`, `CompoSerializeInput`, `CRMExecuteFunction`, etc.
+Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Errors serialize to/from bytes for wire transfer. Error classes are named by location: `ResourceDeserializeInput`, `ClientSerializeInput`, `ResourceExecuteFunction`, `ClientCallResource`, etc. Enum values live under `ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`.
 
 ### Naming
-- ICRM classes: prefixed with `I` (e.g., `IGrid`)
-- CRM classes: plain names matching the resource (e.g., `Grid`)
+- CRM contract classes: plain names, **no `I` prefix** (e.g., `Grid`, not `IGrid`)
+- Resource (implementation) classes: named by domain semantics — `NestedGrid`, `PostgresVectorLayer`, or the fallback `{ContractName}Impl` pattern used by the generator
 - Transferable classes: descriptive data names (e.g., `GridAttribute`, `GridSchema`)
-- CRM routing names: user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)` — distinct from ICRM namespace
+- Routing names: user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)` — distinct from the CRM `namespace`
 
 ### Performance-Sensitive Code
 Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize zero-copy and single-allocation patterns. The Python `wire.py` retains `MethodTable` (method-name → index mapping) used by `NativeServerBridge` for dispatch, `payload_total_size` (scatter-write aware), and thin wrappers for `decode_call_control`/`encode_reply_control`/`decode_reply_control` that preserve Python default arguments (`offset=0`, `error_data=None`). The `thread://` transport skips serialization entirely. SHM segments use deterministic naming for lazy peer-side opening — no explicit segment announcement protocol is needed. The buddy allocator's `alloc()`/`free_at()` are thread-safe.
@@ -252,6 +282,14 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `C2_IPC_ADDRESS` | Override auto-generated IPC server address | auto UUID |
+| `C2_RELAY_ADDRESS` | HTTP relay URL for CRM registration and client name resolution | (none) |
+| `C2_RELAY_BIND` | Relay HTTP listen address (`c3 relay --bind`) | `0.0.0.0:8080` |
+| `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
+| `C2_RELAY_ADVERTISE_URL` | Publicly reachable URL announced to mesh peers | (none) |
+| `C2_RELAY_SEEDS` | Comma-separated seed relay URLs for mesh mode | (none) |
+| `C2_RELAY_IDLE_TIMEOUT` | Upstream IPC idle disconnect timeout in seconds | `300` |
+| `C2_RELAY_ANTI_ENTROPY_INTERVAL` | Anti-entropy digest exchange interval in seconds | `60.0` |
+| `C2_SHM_THRESHOLD` | Payload size threshold for SHM vs inline | 4096 (4 KB) |
 | `C2_IPC_POOL_SEGMENT_SIZE` | Buddy pool segment size in bytes | 268435456 (256 MB) |
 | `C2_IPC_MAX_POOL_SEGMENTS` | Max buddy pool segments (1–255) | 4 |
 | `C2_IPC_MAX_POOL_MEMORY` | Max total pool memory in bytes | segment_size × max_segments |
@@ -259,9 +297,9 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | 131072 (128 KB) |
 | `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | 2147483648 (2 GB) |
 | `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds (0 disables) | 30.0 |
-| `C2_SHM_THRESHOLD` | Payload size threshold for SHM vs inline | 4096 (4 KB) |
-| `C2_RELAY_ADDRESS` | HTTP relay server address | (none) |
 | `C2_ENV_FILE` | Path to `.env` file; empty string disables | `.env` |
+
+All `C2_*` variables can be set in `.env` (loaded via pydantic-settings). See `.env.example` for the full reference.
 
 ## Python Version
 

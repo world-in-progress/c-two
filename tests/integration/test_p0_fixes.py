@@ -25,11 +25,11 @@ def _cleanup():
 
 
 # ---------------------------------------------------------------------------
-# ICRM + CRM definitions
+# CRM + CRM definitions
 # ---------------------------------------------------------------------------
 
-@cc.icrm(namespace='test.p0', version='0.1.0')
-class ICounter:
+@cc.crm(namespace='test.p0', version='0.1.0')
+class Counter:
     @cc.read
     def get_value(self) -> int: ...
 
@@ -40,7 +40,7 @@ class ICounter:
     def cleanup(self): ...
 
 
-class Counter:
+class CounterImpl:
     def __init__(self):
         self.value = 0
         self.cleaned_up = False
@@ -56,13 +56,13 @@ class Counter:
         self.cleaned_up = True
 
 
-@cc.icrm(namespace='test.p0.noclean', version='0.1.0')
-class ISimple:
+@cc.crm(namespace='test.p0.noclean', version='0.1.0')
+class Simple:
     @cc.read
     def read_data(self) -> str: ...
 
 
-class Simple:
+class SimpleImpl:
     def read_data(self) -> str:
         return 'data'
 
@@ -75,33 +75,33 @@ class TestThreadLocalConcurrency:
 
     def test_connect_returns_guarded_proxy(self):
         """cc.connect() thread-local path should return a proxy with scheduler."""
-        crm = Counter()
-        cc.register(ICounter, crm, name='ctr')
-        icrm = cc.connect(ICounter, name='ctr')
+        crm = CounterImpl()
+        cc.register(Counter, crm, name='ctr')
+        crm = cc.connect(Counter, name='ctr')
 
         # The proxy should have scheduler set
-        assert icrm.client._scheduler is not None
-        assert icrm.client._access_map is not None
-        assert 'get_value' in icrm.client._access_map
-        assert 'increment' in icrm.client._access_map
+        assert crm.client._scheduler is not None
+        assert crm.client._access_map is not None
+        assert 'get_value' in crm.client._access_map
+        assert 'increment' in crm.client._access_map
 
-        cc.close(icrm)
+        cc.close(crm)
 
     def test_thread_local_rw_isolation(self):
         """Concurrent reads and writes should be properly isolated."""
-        crm = Counter()
+        crm = CounterImpl()
         cc.register(
-            ICounter, crm, name='ctr_iso',
+            Counter, crm, name='ctr_iso',
             concurrency=ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE),
         )
 
         errors = []
         def do_increments(n):
             try:
-                icrm = cc.connect(ICounter, name='ctr_iso')
+                crm = cc.connect(Counter, name='ctr_iso')
                 for _ in range(n):
-                    icrm.increment()
-                cc.close(icrm)
+                    crm.increment()
+                cc.close(crm)
             except Exception as e:
                 errors.append(e)
 
@@ -117,7 +117,7 @@ class TestThreadLocalConcurrency:
 
     def test_read_parallel_allows_concurrent_reads(self):
         """READ_PARALLEL mode allows concurrent reads."""
-        @cc.icrm(namespace='test.p0.slow', version='0.1.0')
+        @cc.crm(namespace='test.p0.slow', version='0.1.0')
         class ISlowReader:
             @cc.read
             def slow_read(self) -> float: ...
@@ -136,9 +136,9 @@ class TestThreadLocalConcurrency:
 
         results = [None, None]
         def do_read(idx):
-            icrm = cc.connect(ISlowReader, name='slow')
-            results[idx] = icrm.slow_read()
-            cc.close(icrm)
+            crm = cc.connect(ISlowReader, name='slow')
+            results[idx] = crm.slow_read()
+            cc.close(crm)
 
         t1 = threading.Thread(target=do_read, args=(0,))
         t2 = threading.Thread(target=do_read, args=(1,))
@@ -162,8 +162,8 @@ class TestOnShutdownLifecycle:
 
     def test_unregister_invokes_shutdown(self):
         """cc.unregister() should call @cc.on_shutdown method."""
-        crm = Counter()
-        cc.register(ICounter, crm, name='ctr_sd')
+        crm = CounterImpl()
+        cc.register(Counter, crm, name='ctr_sd')
 
         assert not crm.cleaned_up
         cc.unregister('ctr_sd')
@@ -171,10 +171,10 @@ class TestOnShutdownLifecycle:
 
     def test_shutdown_invokes_all(self):
         """cc.shutdown() should call @cc.on_shutdown on all CRMs."""
-        crm1 = Counter()
-        crm2 = Counter()
-        cc.register(ICounter, crm1, name='ctr1')
-        cc.register(ICounter, crm2, name='ctr2')
+        crm1 = CounterImpl()
+        crm2 = CounterImpl()
+        cc.register(Counter, crm1, name='ctr1')
+        cc.register(Counter, crm2, name='ctr2')
 
         assert not crm1.cleaned_up
         assert not crm2.cleaned_up
@@ -184,13 +184,13 @@ class TestOnShutdownLifecycle:
 
     def test_no_shutdown_method_still_works(self):
         """CRM without @cc.on_shutdown should register/unregister fine."""
-        crm = Simple()
-        cc.register(ISimple, crm, name='simple')
+        crm = SimpleImpl()
+        cc.register(Simple, crm, name='simple')
         cc.unregister('simple')
 
     def test_shutdown_exception_does_not_crash(self):
         """Exception in @cc.on_shutdown should be caught."""
-        @cc.icrm(namespace='test.p0.err', version='0.1.0')
+        @cc.crm(namespace='test.p0.err', version='0.1.0')
         class IFailing:
             @cc.on_shutdown
             def cleanup(self): ...
@@ -206,8 +206,8 @@ class TestOnShutdownLifecycle:
 
     def test_shutdown_method_not_rpc_callable(self):
         """@cc.on_shutdown methods should not appear in dispatch table."""
-        crm = Counter()
-        cc.register(ICounter, crm, name='ctr_rpc')
+        crm = CounterImpl()
+        cc.register(Counter, crm, name='ctr_rpc')
 
         from c_two.transport.registry import _ProcessRegistry
         reg = _ProcessRegistry._instance

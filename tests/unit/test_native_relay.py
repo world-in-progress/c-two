@@ -90,13 +90,13 @@ class TestNativeRelayWithServer:
         import os
         import c_two as cc
         from c_two.transport.registry import _ProcessRegistry
-        from tests.fixtures.hello import Hello
-        from tests.fixtures.ihello import IHello
+        from tests.fixtures.hello import HelloImpl
+        from tests.fixtures.ihello import Hello
 
         _ProcessRegistry.reset()
 
         try:
-            cc.register(IHello, Hello(), name='hello')
+            cc.register(Hello, HelloImpl(), name='hello')
             ipc_addr = cc.server_address()
 
             relay = NativeRelay('127.0.0.1:19905')
@@ -124,14 +124,14 @@ class TestNativeRelayWithServer:
         import c_two as cc
         from c_two._native import RustHttpClientPool
         from c_two.transport.registry import _ProcessRegistry
-        from c_two.transport.client.proxy import ICRMProxy
-        from tests.fixtures.hello import Hello
-        from tests.fixtures.ihello import IHello
+        from c_two.transport.client.proxy import CRMProxy
+        from tests.fixtures.hello import HelloImpl
+        from tests.fixtures.ihello import Hello
 
         _ProcessRegistry.reset()
 
         try:
-            cc.register(IHello, Hello(), name='hello')
+            cc.register(Hello, HelloImpl(), name='hello')
             ipc_addr = cc.server_address()
 
             relay = NativeRelay('127.0.0.1:19906')
@@ -144,9 +144,9 @@ class TestNativeRelayWithServer:
                 url = 'http://127.0.0.1:19906'
                 client = pool.acquire(url)
                 try:
-                    icrm = IHello()
-                    icrm.client = ICRMProxy.http(client, 'hello')
-                    result = icrm.greeting('NativeRelay')
+                    crm = Hello()
+                    crm.client = CRMProxy.http(client, 'hello')
+                    result = crm.greeting('NativeRelay')
                     assert result == 'Hello, NativeRelay!'
                 finally:
                     pool.release(url)

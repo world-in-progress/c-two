@@ -16,12 +16,12 @@ import httpx
 
 import c_two as cc
 from c_two._native import NativeRelay, RustHttpClientPool
-from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.client.proxy import CRMProxy
 from c_two.transport.registry import _ProcessRegistry
 
-from tests.fixtures.hello import Hello
-from tests.fixtures.ihello import IHello
-from tests.fixtures.counter import ICounter, Counter
+from tests.fixtures.hello import HelloImpl
+from tests.fixtures.ihello import Hello
+from tests.fixtures.counter import Counter, CounterImpl
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +85,8 @@ def relay_stack():
     http_port = 19000 + _next_id()
 
     # Register CRMs via SOTA API.
-    cc.register(IHello, Hello(), name='hello')
-    cc.register(ICounter, Counter(), name='counter')
+    cc.register(Hello, HelloImpl(), name='hello')
+    cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
 
     # Start relay (empty — no upstream param).
@@ -116,9 +116,9 @@ class TestHttpRelayFullChain:
         relay_url, _ = relay_stack
         client = _acquire_http(relay_url)
         try:
-            icrm = IHello()
-            icrm.client = ICRMProxy.http(client, 'hello')
-            result = icrm.greeting('HTTP')
+            crm = Hello()
+            crm.client = CRMProxy.http(client, 'hello')
+            result = crm.greeting('HTTP')
             assert result == 'Hello, HTTP!'
         finally:
             _release_http(relay_url)
@@ -128,9 +128,9 @@ class TestHttpRelayFullChain:
         relay_url, _ = relay_stack
         client = _acquire_http(relay_url)
         try:
-            icrm = IHello()
-            icrm.client = ICRMProxy.http(client, 'hello')
-            result = icrm.add(42, 58)
+            crm = Hello()
+            crm.client = CRMProxy.http(client, 'hello')
+            result = crm.add(42, 58)
             assert result == 100
         finally:
             _release_http(relay_url)
@@ -140,9 +140,9 @@ class TestHttpRelayFullChain:
         relay_url, _ = relay_stack
         client = _acquire_http(relay_url)
         try:
-            icrm = IHello()
-            icrm.client = ICRMProxy.http(client, 'hello')
-            result = icrm.get_items([10, 20, 30])
+            crm = Hello()
+            crm.client = CRMProxy.http(client, 'hello')
+            result = crm.get_items([10, 20, 30])
             assert result == ['item-10', 'item-20', 'item-30']
         finally:
             _release_http(relay_url)
@@ -152,9 +152,9 @@ class TestHttpRelayFullChain:
         relay_url, _ = relay_stack
         client = _acquire_http(relay_url)
         try:
-            icrm = IHello()
-            icrm.client = ICRMProxy.http(client, 'hello')
-            result = icrm.get_data(5)
+            crm = Hello()
+            crm.client = CRMProxy.http(client, 'hello')
+            result = crm.get_data(5)
             assert result.name == 'data-5'
             assert result.value == 50
         finally:
@@ -166,13 +166,13 @@ class TestHttpRelayFullChain:
         client = _acquire_http(relay_url)
         try:
             # Hello CRM
-            hello = IHello()
-            hello.client = ICRMProxy.http(client, 'hello')
+            hello = HelloImpl()
+            hello.client = CRMProxy.http(client, 'hello')
             assert hello.greeting('Route') == 'Hello, Route!'
 
             # Counter CRM
-            counter = ICounter()
-            counter.client = ICRMProxy.http(client, 'counter')
+            counter = CounterImpl()
+            counter.client = CRMProxy.http(client, 'counter')
             counter.increment(1)
             counter.increment(1)
             assert counter.get() == 2
@@ -199,10 +199,10 @@ class TestHttpRelayFullChain:
 
         def worker(tid: int) -> None:
             try:
-                icrm = IHello()
-                icrm.client = ICRMProxy.http(client, 'hello')
+                crm = Hello()
+                crm.client = CRMProxy.http(client, 'hello')
                 for i in range(n_calls):
-                    result = icrm.add(tid, i)
+                    result = crm.add(tid, i)
                     if result != tid + i:
                         errors.append(f'T{tid}[{i}]: {result} != {tid + i}')
             except Exception as e:
@@ -229,29 +229,29 @@ class TestCcConnectHttp:
     def test_connect_http_mode(self, relay_stack):
         """cc.connect with HTTP address returns http-mode proxy."""
         relay_url, _ = relay_stack
-        icrm = cc.connect(IHello, name='hello', address=relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
-            assert icrm.client._mode == 'http'
-            assert icrm.client.supports_direct_call is False
+            assert crm.client._mode == 'http'
+            assert crm.client.supports_direct_call is False
         finally:
-            cc.close(icrm)
+            cc.close(crm)
 
     def test_connect_http_call(self, relay_stack):
         """cc.connect with HTTP address can make real CRM calls."""
         relay_url, _ = relay_stack
-        icrm = cc.connect(IHello, name='hello', address=relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
-            result = icrm.greeting('SOTA')
+            result = crm.greeting('SOTA')
             assert result == 'Hello, SOTA!'
         finally:
-            cc.close(icrm)
+            cc.close(crm)
 
     def test_connect_http_multi_crm(self, relay_stack):
         """cc.connect to different CRMs via HTTP."""
         relay_url, _ = relay_stack
 
-        hello = cc.connect(IHello, name='hello', address=relay_url)
-        counter = cc.connect(ICounter, name='counter', address=relay_url)
+        hello = cc.connect(Hello, name='hello', address=relay_url)
+        counter = cc.connect(Counter, name='counter', address=relay_url)
         try:
             assert hello.greeting('Multi') == 'Hello, Multi!'
             counter.increment(1)
@@ -265,10 +265,10 @@ class TestCcConnectHttp:
         relay_url, _ = relay_stack
         registry = _ProcessRegistry.get()
 
-        icrm = cc.connect(IHello, name='hello', address=relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         assert registry._http_pool.refcount(relay_url) == 1
 
-        cc.close(icrm)
+        cc.close(crm)
         assert registry._http_pool.refcount(relay_url) == 0
 
 
@@ -283,7 +283,7 @@ class TestRelayControlPlane:
         """POST /_register adds an upstream and allows calls."""
         http_port = 19000 + _next_id()
 
-        cc.register(IHello, Hello(), name='hello')
+        cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
@@ -311,9 +311,9 @@ class TestRelayControlPlane:
             # Verify data-plane call works.
             client = _acquire_http(relay_url)
             try:
-                icrm = IHello()
-                icrm.client = ICRMProxy.http(client, 'hello')
-                assert icrm.greeting('Control') == 'Hello, Control!'
+                crm = Hello()
+                crm.client = CRMProxy.http(client, 'hello')
+                assert crm.greeting('Control') == 'Hello, Control!'
             finally:
                 _release_http(relay_url)
         finally:
@@ -323,7 +323,7 @@ class TestRelayControlPlane:
         """POST /_register with same name upserts (returns 201)."""
         http_port = 19000 + _next_id()
 
-        cc.register(IHello, Hello(), name='hello')
+        cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
@@ -353,7 +353,7 @@ class TestRelayControlPlane:
         """POST /_unregister removes the route; calls return 404."""
         http_port = 19000 + _next_id()
 
-        cc.register(IHello, Hello(), name='hello')
+        cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')
@@ -413,8 +413,8 @@ class TestRelayControlPlane:
         """GET /health lists all registered route names."""
         http_port = 19000 + _next_id()
 
-        cc.register(IHello, Hello(), name='hello')
-        cc.register(ICounter, Counter(), name='counter')
+        cc.register(Hello, HelloImpl(), name='hello')
+        cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
 
         relay = NativeRelay(f'0.0.0.0:{http_port}')

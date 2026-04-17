@@ -31,6 +31,8 @@ pub struct PyPoolConfig {
     #[pyo3(get)]
     pub dedicated_crash_timeout_secs: f64,
     #[pyo3(get)]
+    pub buddy_idle_decay_secs: f64,
+    #[pyo3(get)]
     pub spill_threshold: f64,
     #[pyo3(get)]
     pub spill_dir: String,
@@ -45,6 +47,7 @@ impl PyPoolConfig {
         max_segments = 8,
         max_dedicated_segments = 4,
         dedicated_crash_timeout_secs = 60.0,
+        buddy_idle_decay_secs = 60.0,
         spill_threshold = 0.8,
         spill_dir = String::from("/tmp/c_two_spill/"),
     ))]
@@ -54,6 +57,7 @@ impl PyPoolConfig {
         max_segments: usize,
         max_dedicated_segments: usize,
         dedicated_crash_timeout_secs: f64,
+        buddy_idle_decay_secs: f64,
         spill_threshold: f64,
         spill_dir: String,
     ) -> PyResult<Self> {
@@ -71,6 +75,9 @@ impl PyPoolConfig {
         if dedicated_crash_timeout_secs.is_nan() {
             return Err(PyValueError::new_err("dedicated_crash_timeout_secs must not be NaN"));
         }
+        if buddy_idle_decay_secs.is_nan() {
+            return Err(PyValueError::new_err("buddy_idle_decay_secs must not be NaN"));
+        }
         if spill_threshold < 0.0 || spill_threshold > 1.0 || spill_threshold.is_nan() {
             return Err(PyValueError::new_err("spill_threshold must be in [0.0, 1.0]"));
         }
@@ -80,6 +87,7 @@ impl PyPoolConfig {
             max_segments,
             max_dedicated_segments,
             dedicated_crash_timeout_secs,
+            buddy_idle_decay_secs,
             spill_threshold,
             spill_dir,
         })
@@ -102,6 +110,7 @@ impl From<&PyPoolConfig> for PoolConfig {
             max_segments: py.max_segments,
             max_dedicated_segments: py.max_dedicated_segments,
             dedicated_crash_timeout_secs: py.dedicated_crash_timeout_secs,
+            buddy_idle_decay_secs: py.buddy_idle_decay_secs,
             spill_threshold: py.spill_threshold,
             spill_dir: std::path::PathBuf::from(&py.spill_dir),
         }

@@ -9,55 +9,55 @@ T = TypeVar('T')
 
 logger = logging.getLogger(__name__)
 
-def generate_crm_template(icrm_class: Type[T], output_path: str | Path) -> None:
+def generate_crm_template(crm_class: Type[T], output_path: str | Path) -> None:
     """
-    Generate a CRM template based on an ICRM class.
+    Generate a resource impl template based on a CRM contract class.
 
     Args:
-        icrm_class (Type[T]): The ICRM class to generate a template from
+        crm_class (Type[T]): The CRM contract class to generate a template from
         output_path (str | Path): Path where the template file will be saved
     """
     
-    # Validate that the class is an ICRM
-    if not hasattr(icrm_class, 'direction') or icrm_class.direction != '->':
-        raise ValueError(f'{icrm_class.__name__} is not a valid ICRM class (decorated with @icrm)')
+    # Validate that the class is a CRM contract
+    if not hasattr(crm_class, 'direction') or crm_class.direction != '->':
+        raise ValueError(f'{crm_class.__name__} is not a valid CRM contract class (decorated with @cc.crm)')
     
     # Get source file path
-    source_file = inspect.getsourcefile(icrm_class)
+    source_file = inspect.getsourcefile(crm_class)
     if not source_file:
-        raise ValueError(f'Could not retrieve source file for {icrm_class.__name__}')
+        raise ValueError(f'Could not retrieve source file for {crm_class.__name__}')
     
     # Parse source code using AST
     with open(source_file, 'r') as f:
         source_code = f.read()
     tree = ast.parse(source_code)
     
-    # Find the ICRM class definition
-    icrm_class_node: ast.ClassDef | None = None
+    # Find the CRM class definition
+    crm_class_node: ast.ClassDef | None = None
     for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == icrm_class.__name__:
-            icrm_class_node = node
+        if isinstance(node, ast.ClassDef) and node.name == crm_class.__name__:
+            crm_class_node = node
             break
     
-    if not icrm_class_node:
-        raise ValueError(f'Could not find class {icrm_class.__name__} in source file {source_file}')
+    if not crm_class_node:
+        raise ValueError(f'Could not find class {crm_class.__name__} in source file {source_file}')
     
     # Extract method information using AST
-    methods = _extract_method_from_ast(icrm_class_node)
+    methods = _extract_method_from_ast(crm_class_node)
     
     # Extract transferable dependencies
-    transferable_deps = _extract_transferable_dependencies(icrm_class, methods)
+    transferable_deps = _extract_transferable_dependencies(crm_class, methods)
     
     # Generate class name
-    class_name = icrm_class.__name__
-    crm_class_name = class_name[1:] if class_name.startswith('I') else f'{class_name}Impl'
+    class_name = crm_class.__name__
+    crm_class_name = f'{class_name}Impl'
     
     # Generate template content
     template_content = _generate_template_content_ast(
-        icrm_class.__name__,
+        crm_class.__name__,
         crm_class_name,
         methods,
-        icrm_class.__module__,
+        crm_class.__module__,
         transferable_deps
     )
     
@@ -197,7 +197,7 @@ def _extract_types_from_ast_node(node: ast.FunctionDef) -> set[str]:
     
     return types
 
-def _extract_transferable_dependencies(icrm_class: Type[T], methods: list[dict]) -> set[str]:
+def _extract_transferable_dependencies(crm_class: Type[T], methods: list[dict]) -> set[str]:
     """Extract all transferable types used in method signatures."""
     transferable_deps = set()
     
@@ -206,8 +206,8 @@ def _extract_transferable_dependencies(icrm_class: Type[T], methods: list[dict])
         method_name = method['name']
         
         # Get method from class
-        if hasattr(icrm_class, method_name):
-            method_func = getattr(icrm_class, method_name)
+        if hasattr(crm_class, method_name):
+            method_func = getattr(crm_class, method_name)
             try:
                 method_hints = get_type_hints(method_func)
                 for hint_name, hint_type in method_hints.items():
@@ -218,14 +218,14 @@ def _extract_transferable_dependencies(icrm_class: Type[T], methods: list[dict])
                 transferable_deps.update(_extract_types_from_ast_node(ast_node))
     
     # Filter to only include types that are likely transferables
-    # (type that are defined in the same module as the ICRM)
-    icrm_module = sys.modules[icrm_class.__module__]
+    # (types defined in the same module as the CRM contract)
+    crm_module = sys.modules[crm_class.__module__]
     filtered_deps = set()
     
     for dep in transferable_deps:
-        if hasattr(icrm_module, dep):
+        if hasattr(crm_module, dep):
             # Check if it's a transferable class
-            dep_class = getattr(icrm_module, dep)
+            dep_class = getattr(crm_module, dep)
             if hasattr(dep_class, '__dict__') and hasattr(dep_class, 'serialize') and hasattr(dep_class, 'deserialize'):
                 filtered_deps.add(dep)
     
@@ -263,27 +263,27 @@ def _generate_method_template_ast(method_info: dict) -> list[str]:
     
     return method_lines
 
-def _generate_template_content_ast(icrm_name: str, crm_name: str, methods: list, icrm_module: str, transferable_deps: set[str]) -> str:
+def _generate_template_content_ast(crm_contract_name: str, crm_name: str, methods: list, crm_module: str, transferable_deps: set[str]) -> str:
     """Generate the template file content using AST-extracted information."""
     
     # Build import statements
     import_lines = ['import c_two as cc']
     
-    # Import ICRM
-    icrm_import = f'from {icrm_module} import {icrm_name}'
+    # Import CRM contract
+    crm_import = f'from {crm_module} import {crm_contract_name}'
     
     # Import transferable dependencies
     if transferable_deps:
-        transferable_import = f'from {icrm_module} import {", ".join(sorted(transferable_deps))}'
-        import_lines.extend([icrm_import, transferable_import])
+        transferable_import = f'from {crm_module} import {", ".join(sorted(transferable_deps))}'
+        import_lines.extend([crm_import, transferable_import])
     else:
-        import_lines.append(icrm_import)
+        import_lines.append(crm_import)
         
     # Start building the template
     lines = import_lines + [
         '',
-        '@cc.crm',
-        f'class {crm_name}({icrm_name}):',
+        '@cc.crm(namespace=\'cc\', version=\'0.1.0\')',
+        f'class {crm_name}({crm_contract_name}):',
         '    """',
         '    This is an auto-generated template. Please implement the methods below.',
         '    """',

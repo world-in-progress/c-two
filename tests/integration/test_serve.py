@@ -19,7 +19,7 @@ _SERVE_SCRIPT = textwrap.dedent("""\
     import c_two as cc
     import os, sys
 
-    @cc.icrm(namespace='cc.test.serve_integ', version='0.1.0')
+    @cc.crm(namespace='cc.test.serve_integ', version='0.1.0')
     class IPing:
         def ping(self) -> str:
             ...

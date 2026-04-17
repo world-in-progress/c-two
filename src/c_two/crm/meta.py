@@ -4,7 +4,7 @@ from typing import TypeVar, Type, Callable
 from .transferable import auto_transfer
 
 _F = TypeVar('_F', bound=Callable)
-ICRM = TypeVar('ICRM')
+CRM = TypeVar('CRM')
 _METHOD_ACCESS_ATTR = '__cc_method_access__'
 _SHUTDOWN_ATTR = '__cc_on_shutdown__'
 
@@ -34,10 +34,10 @@ def get_method_access(func: Callable) -> MethodAccess:
 
 
 def on_shutdown(func: _F) -> _F:
-    """Mark an ICRM method as the shutdown callback.
+    """Mark a CRM method as the shutdown callback.
 
-    The decorated method is called (with no arguments) when the CRM is
-    unregistered or the process exits.  At most one method per ICRM may
+    The decorated method is called (with no arguments) when the resource
+    is unregistered or the process exits.  At most one method per CRM may
     carry this decorator.  It is **not** added to the RPC dispatch table.
     """
     if not callable(func):
@@ -65,51 +65,63 @@ def get_shutdown_method(cls: type) -> str | None:
             )
         if found is not None:
             raise ValueError(
-                f'ICRM {cls.__name__} has multiple @on_shutdown methods: '
+                f'CRM {cls.__name__} has multiple @on_shutdown methods: '
                 f'{found!r} and {name!r}',
             )
         found = name
     return found
 
-class ICRMMeta(type):
-    """
-    ICRMMeta
-    --
-    A metaclass for ICRM (Interface of Core Resource Model) classes that automatically sets a 'direction' attribute on new classes.
-    Direction rules: 
-    - An ICRM class (decorated with @icrm) has direction '->' as default, indicating its instance can transfer data from Component to CRM through a Client instance.
-    - When an ICRM class is used at CRM server side, it is significant to set the direction of its instance to '<-', indicating its instance can transfer data from CRM to Component.
+class CRMMeta(type):
+    """Metaclass for CRM (Core Resource Model) contract classes.
+
+    Sets a ``direction`` attribute on every CRM class.  Direction rules:
+      - ``'->'`` default: the CRM instance transfers data *from* client
+        *to* the resource server via ``auto_transfer``.
+      - ``'<-'``: server-side instance, flipped by the resource runtime
+        to indicate the reverse transfer direction.
     """
     def __new__(mcs, name, bases, attrs, **kwargs):
         attrs['direction'] = '->'
-        
+
         cls = super().__new__(mcs, name, bases, attrs, **kwargs)
         return cls
 
-def icrm(*, namespace: str = 'cc', version: str = '0.1.0'):
+
+def _crm_enter(self):
+    """Context-manager entry — returns the CRM instance itself."""
+    return self
+
+
+def _crm_exit(self, exc_type, exc_val, exc_tb):
+    """Context-manager exit — closes the underlying proxy via the registry.
+
+    Imports ``close`` lazily to avoid a circular import between the CRM
+    layer and the transport layer.
     """
-    Interface of Core Resource Model (ICRM) decorator
-    --
-    Convert a regular class to an ICRM class.
-    
-    This function transforms the given class by applying the ICRMMeta metaclass,
-    making it a proper ICRM that Server and Client can follow and interact with.
-    Additionally, it decorates all member functions of the class with @auto_transfer,
-    so that their input parameters and return values can be automatically transferred between Component and CRM.
-    
-    Returns:
-        A class that has all the attributes of the original class plus a static
-        'connect' method that creates and returns instances connected to a remote service.
+    from ..transport.registry import close as _close
+    _close(self)
+    return False
+
+
+def crm(*, namespace: str = 'cc', version: str = '0.1.0'):
+    """CRM (Core Resource Model) decorator.
+
+    Declares a CRM contract — the interface that resource implementations
+    expose to clients over RPC.  Apply to a plain class whose method
+    bodies are typically ``...``; the decorator wires up auto-transfer on
+    every public method, tags the class with ``namespace/ClassName/version``,
+    and adds context-manager support so ``cc.connect`` can be used with a
+    ``with`` statement.
     """
-    def icrm_wrapper(cls: Type[ICRM]) -> Type[ICRM]:
+    def crm_wrapper(cls: Type[CRM]) -> Type[CRM]:
         # Validate namespace and version
         if not namespace:
-            raise ValueError('Namespace of ICRM cannot be empty.')
+            raise ValueError('Namespace of CRM cannot be empty.')
         if not version:
-            raise ValueError('Version of ICRM cannot be empty (version example: "1.0.0").')
+            raise ValueError('Version of CRM cannot be empty (version example: "1.0.0").')
         if not isinstance(version, str) or not version.count('.') == 2:
             raise ValueError('Version must be a string in the format "major.minor.patch".')
-        
+
         decorated_methods = {}
         for name, value in cls.__dict__.items():
             if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__', '__tag__'):
@@ -120,33 +132,37 @@ def icrm(*, namespace: str = 'cc', version: str = '0.1.0'):
                     decorated_methods[name] = auto_transfer(value, **transfer_config)
                 else:
                     decorated_methods[name] = auto_transfer(value)
-        
-        # Define a new class with ICRMMeta metaclass that inherits from the original class
+
+        # Define a new class with CRMMeta metaclass that inherits from the original class
         class_name = cls.__name__
         bases = (cls,)
-        
-        # Create the new class
-        new_cls = ICRMMeta(class_name, bases, {
-            **{k: v for k, v in cls.__dict__.items() 
+
+        # Create the new class with injected context-manager methods.
+        new_cls = CRMMeta(class_name, bases, {
+            **{k: v for k, v in cls.__dict__.items()
             if k not in decorated_methods and k not in ('__dict__', '__weakref__')},
-            **decorated_methods
+            **decorated_methods,
+            '__enter__': _crm_enter,
+            '__exit__': _crm_exit,
         })
-        
+
         # Copy over type hints explicitly to help type checkers
         try:
             new_cls.__annotations__ = getattr(cls, '__annotations__', {})
         except (AttributeError, TypeError):
             pass
-        
+
         # Copy docstring, module name etc.
         for attr in ['__doc__', '__module__', '__qualname__']:
             try:
                 setattr(new_cls, attr, getattr(cls, attr))
             except (AttributeError, TypeError):
                 pass
-        
+
         # Add static tag attributes
         setattr(new_cls, '__tag__', f'{namespace}/{class_name}/{version}')
+        setattr(new_cls, '__cc_namespace__', namespace)
+        setattr(new_cls, '__cc_version__', version)
 
         return new_cls
-    return icrm_wrapper
+    return crm_wrapper

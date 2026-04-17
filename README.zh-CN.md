@@ -38,14 +38,14 @@
 pip install c-two
 ```
 
-### 定义资源接口及其实现
+### 定义资源契约及其实现
 
 ```python
 import c_two as cc
 
-# 接口 — 声明哪些方法可被远程访问
-@cc.icrm(namespace='demo.counter', version='0.1.0')
-class ICounter:
+# CRM 契约 — 声明哪些方法可被远程访问
+@cc.crm(namespace='demo.counter', version='0.1.0')
+class Counter:
     def increment(self, amount: int) -> int: ...
 
     @cc.read
@@ -54,8 +54,8 @@ class ICounter:
     def reset(self) -> int: ...
 
 
-# 实现 — 一个持有状态的普通 Python 类
-class Counter:
+# Resource — 一个实现契约的普通 Python 类
+class CounterImpl:
     def __init__(self, initial: int = 0):
         self._value = initial
 
@@ -75,8 +75,8 @@ class Counter:
 ### 本地使用（零序列化）
 
 ```python
-cc.register(ICounter, Counter(initial=100), name='counter')
-counter = cc.connect(ICounter, name='counter')
+cc.register(Counter, CounterImpl(initial=100), name='counter')
+counter = cc.connect(Counter, name='counter')
 
 counter.increment(10)    # → 110
 counter.value()          # → 110
@@ -91,10 +91,10 @@ cc.close(counter)
 ```python
 # 服务端进程
 cc.set_address('ipc:///tmp/my_server')
-cc.register(ICounter, Counter(), name='counter')
+cc.register(Counter, CounterImpl(), name='counter')
 
 # 客户端进程（另一个终端）
-counter = cc.connect(ICounter, name='counter', address='ipc:///tmp/my_server')
+counter = cc.connect(Counter, name='counter', address='ipc:///tmp/my_server')
 counter.increment(5)     # 用法完全一致
 cc.close(counter)
 ```
@@ -105,13 +105,13 @@ cc.close(counter)
 
 ## 核心概念
 
-### ICRM — 接口
+### CRM — 契约
 
-ICRM（Interface of Core Resource Model）声明了哪些 CRM 方法可被远程访问。使用 `@cc.icrm()` 装饰，方法体为 `...`（纯接口，无实现）。
+**CRM**（Core Resource Model）声明远程资源暴露*哪些*方法。使用 `@cc.crm()` 装饰，方法体为 `...`（纯接口，无实现）。
 
 ```python
-@cc.icrm(namespace='demo.greeter', version='0.1.0')
-class IGreeter:
+@cc.crm(namespace='demo.greeter', version='0.1.0')
+class Greeter:
     @cc.read    # 允许并发读取
     def greet(self, name: str) -> str: ...
 
@@ -121,12 +121,12 @@ class IGreeter:
 
 方法可标注 `@cc.read`（允许并发访问）或保持默认的 write（独占访问）。
 
-### CRM — 核心资源模型
+### Resource — 运行时实例
 
-CRM 是一个普通的 Python 类，持有状态并实现领域逻辑。它**不需要**任何装饰器 — 框架通过 ICRM 接口发现其方法。
+**Resource** 是实现 CRM 契约的普通 Python 类，持有状态和领域逻辑。它**不需要**任何装饰器 — 框架通过所注册的 CRM 契约发现其方法。命名应体现 *它是什么*（`GreeterImpl`、`PostgresGreeter`、`MultilingualGreeter`），而非接口本身。
 
 ```python
-class Greeter:
+class GreeterImpl:
     def __init__(self, lang: str = 'en'):
         self._lang = lang
         self._templates = {'en': 'Hello, {}!', 'zh': '你好, {}!'}
@@ -138,15 +138,60 @@ class Greeter:
         return self._lang
 ```
 
-### Component — 消费者
+### Client — 消费者
 
-Component 通过 ICRM 代理消费 CRM 资源。代理是位置透明的 — 无论 CRM 运行在同进程还是远程机器，用法完全相同。
+任何调用 `cc.connect(...)` 的代码都是 **client**（即 consumer / 应用代码）。返回的代理是位置透明的 — 无论资源运行在同进程还是远程机器，用法完全相同。
 
 ```python
-greeter = cc.connect(IGreeter, name='greeter')
+greeter = cc.connect(Greeter, name='greeter')
 greeter.greet('World')     # → '你好, World!'
 cc.close(greeter)
+
+# 或使用上下文管理器：
+with cc.connect(Greeter, name='greeter') as greeter:
+    greeter.greet('World')
 ```
+
+### Server — 资源宿主
+
+**Server** 是调用 `cc.register(...)` 托管一个或多个资源、并通常调用 `cc.serve()` 进入请求循环的进程。单个 server 进程可以托管任意多的资源（每个使用唯一的 `name`），并在首次注册时自动绑定一个 IPC 端点。
+
+```python
+import c_two as cc
+
+cc.set_address('ipc://my_server')              # 可选 — 默认是自动生成的 UUID 路径
+cc.register(Greeter, GreeterImpl(), name='greeter')
+cc.register(Counter, CounterImpl(), name='counter')
+cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关闭
+```
+
+- **地址**（`ipc://...`）是本地传输端点。*同进程*内的客户端完全跳过它（零序列化）；*同主机上的其他进程*通过此地址直接连接。
+- **`cc.serve()` 是可选的** — 如果宿主进程已有自己的事件循环（Web 服务、GUI、模拟器），你可以只注册资源，让它们在后台服务，同时你的主循环照常运行。
+- 一个进程可以**同时**是 server 和 client（注册一些资源，同时连接另一些）。
+
+### Relay — 分布式发现
+
+**HTTP 中继**（`c3 relay`）是一个轻量级代理，让客户端可以**按名称**跨机器访问服务端。服务端在注册时把自己的 IPC 地址通告给中继；客户端只需查询中继即可被透明路由到目标。
+
+```bash
+# 在网络可达的任意节点启动中继
+c3 relay --bind 0.0.0.0:8080
+```
+
+```python
+# 服务端 — 将资源通告给中继
+cc.set_relay('http://relay-host:8080')
+cc.register(MeshStore, MeshStoreImpl(), name='mesh')
+cc.serve()
+
+# 客户端 — 按名称解析，无需显式地址
+cc.set_relay('http://relay-host:8080')
+mesh = cc.connect(MeshStore, name='mesh')
+```
+
+多个中继可以通过 gossip 协议组成**网格集群** — 网格中任意中继都能解析整个集群内注册的任何资源。详见下方的 [中继网格示例](#中继网格--多中继集群)。
+
+> **何时需要中继？** 仅用于跨机器或按名称发现的场景。同进程和同主机（IPC）用法完全不需要中继。
 
 ### @transferable — 自定义序列化
 
@@ -189,11 +234,11 @@ class Matrix:
 
 ### @cc.transfer — 逐方法控制
 
-在 ICRM 方法上使用 `@cc.transfer()` 可显式指定由哪个 transferable 类型处理序列化，或覆盖缓冲区模式：
+在 CRM 契约方法上使用 `@cc.transfer()` 可显式指定由哪个 transferable 类型处理序列化，或覆盖缓冲区模式：
 
 ```python
-@cc.icrm(namespace='demo.compute', version='0.1.0')
-class ICompute:
+@cc.crm(namespace='demo.compute', version='0.1.0')
+class Compute:
     @cc.transfer(input=Matrix, output=Matrix, buffer='hold')
     def transform(self, mat: Matrix) -> Matrix: ...
 
@@ -212,7 +257,7 @@ class ICompute:
 3. **`__del__` 兜底** — 最后手段，若忘记释放会触发 `ResourceWarning`
 
 ```python
-grid = cc.connect(ICompute, name='compute', address='ipc://server')
+grid = cc.connect(Compute, name='compute', address='ipc://server')
 
 # Normal call — buffer released immediately after deserialize
 result = grid.transform(matrix)
@@ -247,11 +292,11 @@ finally:
 ```python
 import c_two as cc
 
-cc.register(IGreeter, Greeter(lang='en'), name='greeter')
-cc.register(ICounter, Counter(initial=100), name='counter')
+cc.register(Greeter, Greeter(lang='en'), name='greeter')
+cc.register(Counter, Counter(initial=100), name='counter')
 
-greeter = cc.connect(IGreeter, name='greeter')
-counter = cc.connect(ICounter, name='counter')
+greeter = cc.connect(Greeter, name='greeter')
+counter = cc.connect(Counter, name='counter')
 
 print(greeter.greet('World'))    # → Hello, World!
 print(counter.value())           # → 100
@@ -293,8 +338,8 @@ class Mesh:
         arr = np.frombuffer(buf[4:], dtype=np.float64).reshape(n, 3)
         return Mesh(n_vertices=n, positions=arr)  # zero-copy view
 
-@cc.icrm(namespace='demo.mesh', version='0.1.0')
-class IMeshStore:
+@cc.crm(namespace='demo.mesh', version='0.1.0')
+class MeshStore:
     @cc.read
     def get_mesh(self) -> Mesh: ...
 
@@ -307,7 +352,7 @@ class IMeshStore:
 **服务端** (`server.py`)：
 ```python
 import c_two as cc
-from types import IMeshStore, Mesh
+from types import MeshStore, Mesh
 
 class MeshStore:
     def __init__(self):
@@ -324,17 +369,17 @@ class MeshStore:
         print('MeshStore shutting down')
 
 cc.set_address('ipc://mesh_server')
-cc.register(IMeshStore, MeshStore(), name='mesh')
+cc.register(MeshStore, MeshStore(), name='mesh')
 cc.serve()  # blocks until interrupted
 ```
 
 **客户端** (`client.py`)：
 ```python
 import c_two as cc
-from types import IMeshStore, Mesh
+from types import MeshStore, Mesh
 import numpy as np
 
-mesh_store = cc.connect(IMeshStore, name='mesh', address='ipc://mesh_server')
+mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://mesh_server')
 
 # Upload data
 big_mesh = Mesh(n_vertices=1_000_000,
@@ -355,42 +400,59 @@ cc.close(mesh_store)
 
 ### 跨机器 — HTTP 中继
 
-HTTP 中继将网络请求桥接到运行在 IPC 上的 CRM 进程。
+HTTP 中继将网络请求桥接到运行在 IPC 上的 CRM 进程。CRM 进程向中继注册，客户端通过**名称**发现资源。
 
+**CRM 服务端** (`resource.py`)：
 ```python
-# CRM Server (resource.py)
+import c_two as cc
+
+cc.set_relay('http://relay-host:8080')
 cc.set_address('ipc://mesh_server')
-cc.register(IMeshStore, MeshStore(), name='mesh')
-cc.serve()
+cc.register(MeshStore, MeshStore(), name='mesh')
+cc.serve()  # 阻塞，直到 Ctrl-C
+```
 
-# Relay (start via CLI)
-# c3 relay --upstream ipc://mesh_server --bind 0.0.0.0:8080
+**中继** — 通过 `c3` CLI 启动：
+```bash
+# 绑定地址可通过 CLI 参数、环境变量 C2_RELAY_BIND 或 .env 文件配置
+c3 relay --bind 0.0.0.0:8080
+```
 
-# Client — same API, just change the address
-mesh = cc.connect(IMeshStore, name='mesh', address='http://relay-host:8080')
+**客户端** (`client.py`)：
+```python
+import c_two as cc
+
+cc.set_relay('http://relay-host:8080')
+mesh = cc.connect(MeshStore, name='mesh')  # 中继解析名称
 mesh.get_mesh()
 cc.close(mesh)
 ```
 
 > **适用场景：** 网络可访问的服务、Web 集成、跨机器部署。
 
-### 函数式组件
+### 中继网格 — 多中继集群
 
-对于脚本风格的代码，`@cc.runtime.connect` 自动注入 ICRM 代理作为第一个参数：
+多个中继组成**网格网络**，通过 gossip 协议自动传播路由。CRM 向本地中继注册，客户端可跨整个集群发现资源。
 
-```python
-@cc.runtime.connect
-def compute_centroid(store: IMeshStore) -> np.ndarray:
-    mesh = store.get_mesh()
-    return mesh.positions.mean(axis=0)
+```bash
+# 启动中继 A（seeds 指向对等中继实现自动加入）
+c3 relay --bind 0.0.0.0:8080 --relay-id relay-a \
+    --advertise-url http://relay-a:8080 --seeds http://relay-b:8080
 
-# Framework injects the proxy — caller only passes non-ICRM args
-result = compute_centroid(crm_address='ipc://mesh_server')
+# 启动中继 B
+c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
+    --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
+
+CRM 进程向本地中继注册，网格自动传播路由。客户端可通过网格中的**任意**中继连接。
+
+> **适用场景：** 多节点集群、高可用、地理分布部署。
+
+> **完整可运行的网格示例请参阅 [`examples/relay_mesh/`](examples/relay_mesh/) 目录。**
 
 ### 服务端监控
 
-使用 `cc.hold_stats()` 监控持有模式下 CRM 方法所持有的共享内存缓冲区：
+使用 `cc.hold_stats()` 监控持有模式下资源方法所持有的共享内存缓冲区：
 
 ```python
 stats = cc.hold_stats()
@@ -403,13 +465,13 @@ stats = cc.hold_stats()
 
 **C-Two 的设计哲学不是定义服务，而是赋能资源。**
 
-在科学计算中，封装复杂状态和领域特定操作的资源需要被组织为内聚的单元。我们称这些为 **核心资源模型（CRM）**。应用程序更关心的是 *如何与资源交互*，而非 *资源在哪里*。我们称资源消费者为 **组件（Component）**。C-Two 提供位置透明和统一的资源访问，使组件能够像访问本地对象一样与 CRM 交互。
+在科学计算中，封装复杂状态和领域特定操作的资源需要被组织为内聚的单元。我们称描述这些资源的契约为 **核心资源模型（CRM）**。应用程序更关心的是 *如何与资源交互*，而非 *资源在哪里*。C-Two 提供位置透明和统一的资源访问，使任何 **client** 都能像访问本地对象一样与资源交互。
 
 ```mermaid
 graph LR
-    subgraph 组件层
-        C1[Component] -->|cc.connect| P1[ICRM 代理]
-        C2[Component] -->|cc.connect| P2[ICRM 代理]
+    subgraph 客户端层
+        C1[Client] -->|cc.connect| P1[CRM 代理]
+        C2[Client] -->|cc.connect| P2[CRM 代理]
     end
 
     subgraph 传输层
@@ -420,30 +482,30 @@ graph LR
         T -->|http://| HTTP[HTTP<br/>中继]
     end
 
-    subgraph CRM 层
-        TH --> CRM1[CRM 实例]
+    subgraph 资源层
+        TH --> CRM1[Resource 实例]
         IPC --> CRM1
         HTTP --> CRM1
     end
 ```
 
-### 组件层
+### 客户端层
 
-客户端消费者通过 ICRM 代理访问远程资源。代理提供完整的类型安全和位置透明性 — 组件不需要知道（也不关心）CRM 运行在哪里。
+调用 `cc.connect(...)` 消费资源的任何代码。返回的代理提供完整的类型安全和位置透明性 — 客户端不需要知道（也不关心）资源运行在哪里。
 
-- **脚本式**：`cc.connect(ICRMClass, name='...', address='...')` 返回类型化的 ICRM 代理
-- **函数式**：`@cc.runtime.connect` 装饰器自动注入 ICRM 代理作为第一个参数
+- `cc.connect(CRMClass, name='...', address='...')` 返回类型化的 CRM 代理
+- 代理支持上下文管理：`with cc.connect(...) as x:` 自动关闭
 
-### CRM 层
+### 资源层
 
-服务端有状态资源，通过标准化的 ICRM 接口暴露。
+服务端有状态的实例，通过标准化的 CRM 契约暴露。
 
-- **CRM**：普通 Python 类 — 状态 + 领域逻辑，无需装饰器。
-- **ICRM**：使用 `@cc.icrm()` 装饰的接口类。只有在此声明的方法才可被远程访问。
+- **CRM 契约**：使用 `@cc.crm()` 装饰的接口类。只有在此声明的方法才可被远程访问。
+- **Resource**：实现契约的普通 Python 类 — 状态 + 领域逻辑，无需装饰器。
 - **`@transferable`**：领域数据类型的自定义序列化。可选提供 `from_buffer` 实现零拷贝共享内存视图。
 - **`@cc.transfer`**：逐方法控制输入/输出 transferable 类型和缓冲区模式。
 - **`@cc.read` / `@cc.write`**：并发注解 — 并行读取，独占写入。
-- **`@cc.on_shutdown`**：生命周期回调，在 CRM 被注销时调用（不通过 RPC 暴露）。
+- **`@cc.on_shutdown`**：生命周期回调，在资源被注销时调用（不通过 RPC 暴露）。
 
 ### 传输层
 
@@ -491,8 +553,10 @@ pip install c-two
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
-uv sync          # 安装依赖 + 编译 Rust 扩展
-uv run pytest    # 运行测试套件
+cp .env.example .env               # 配置环境变量（可选）
+uv sync                            # 安装依赖 + 编译 Rust 扩展
+uv sync --group examples           # 安装示例依赖（pandas、pyarrow）
+uv run pytest                      # 运行测试套件
 ```
 
 > 需要 [uv](https://github.com/astral-sh/uv) 和 Rust 工具链。
@@ -503,9 +567,10 @@ uv run pytest    # 运行测试套件
 
 | 功能 | 状态 |
 |------|------|
-| 核心 RPC 框架（CRM / ICRM / Component） | ✅ 稳定 |
+| 核心 RPC 框架（CRM + Resource + Client） | ✅ 稳定 |
 | IPC 传输 + SHM 伙伴分配器 | ✅ 稳定 |
 | HTTP 中继（Rust 驱动） | ✅ 稳定 |
+| 中继网格与 gossip 路由发现 | ✅ 稳定 |
 | 分块流式传输（载荷 > 256 MB） | ✅ 稳定 |
 | 心跳与连接管理 | ✅ 稳定 |
 | 读/写并发控制 | ✅ 稳定 |

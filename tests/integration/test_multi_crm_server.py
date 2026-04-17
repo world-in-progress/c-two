@@ -15,9 +15,9 @@ import c_two as cc
 from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
 from c_two.transport.client.util import ping
 
-from tests.fixtures.ihello import IHello
-from tests.fixtures.hello import Hello
-from tests.fixtures.counter import ICounter, Counter
+from tests.fixtures.ihello import Hello
+from tests.fixtures.hello import HelloImpl
+from tests.fixtures.counter import Counter, CounterImpl
 
 
 def _unique_region() -> str:
@@ -42,8 +42,8 @@ def multi_crm_addr():
     """Start a Server hosting Hello + Counter CRMs."""
     addr = f'ipc://{_unique_region()}'
     server = Server(bind_address=addr)
-    server.register_crm(IHello, Hello(), name='hello')
-    server.register_crm(ICounter, Counter(initial=100), name='counter')
+    server.register_crm(Hello, HelloImpl(), name='hello')
+    server.register_crm(Counter, CounterImpl(initial=100), name='counter')
     server.start()
     _wait_for_server(addr)
     yield addr, server
@@ -56,8 +56,8 @@ def single_then_add_addr():
     addr = f'ipc://{_unique_region()}'
     server = Server(
         bind_address=addr,
-        icrm_class=IHello,
-        crm_instance=Hello(),
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
         name='hello',
     )
     server.start()
@@ -75,31 +75,31 @@ class TestRegistrationAPI:
     def test_register_returns_name(self):
         addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
-        result = server.register_crm(IHello, Hello(), name='hello')
+        result = server.register_crm(Hello, HelloImpl(), name='hello')
         assert result == 'hello'
         server.shutdown()
 
     def test_duplicate_name_raises(self):
         addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
-        server.register_crm(IHello, Hello(), name='hello')
+        server.register_crm(Hello, HelloImpl(), name='hello')
         with pytest.raises(ValueError, match='already registered'):
-            server.register_crm(IHello, Hello(), name='hello')
+            server.register_crm(Hello, HelloImpl(), name='hello')
         server.shutdown()
 
     def test_names_property(self):
         addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
-        server.register_crm(IHello, Hello(), name='hello')
-        server.register_crm(ICounter, Counter(), name='counter')
+        server.register_crm(Hello, HelloImpl(), name='hello')
+        server.register_crm(Counter, CounterImpl(), name='counter')
         assert set(server.names) == {'hello', 'counter'}
         server.shutdown()
 
     def test_unregister(self):
         addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
-        server.register_crm(IHello, Hello(), name='hello')
-        server.register_crm(ICounter, Counter(), name='counter')
+        server.register_crm(Hello, HelloImpl(), name='hello')
+        server.register_crm(Counter, CounterImpl(), name='counter')
         server.unregister_crm('counter')
         assert server.names == ['hello']
         server.shutdown()
@@ -127,7 +127,7 @@ class TestMultiCRMRouting:
 
     def test_hello_greeting(self, multi_crm_addr):
         addr, _server = multi_crm_addr
-        proxy = cc.connect(IHello, name='hello', address=addr)
+        proxy = cc.connect(Hello, name='hello', address=addr)
         try:
             assert proxy.greeting('World') == 'Hello, World!'
         finally:
@@ -135,7 +135,7 @@ class TestMultiCRMRouting:
 
     def test_counter_get(self, multi_crm_addr):
         addr, _server = multi_crm_addr
-        proxy = cc.connect(ICounter, name='counter', address=addr)
+        proxy = cc.connect(Counter, name='counter', address=addr)
         try:
             assert proxy.get() == 100  # initial=100 in fixture
         finally:
@@ -144,8 +144,8 @@ class TestMultiCRMRouting:
     def test_both_names_same_server(self, multi_crm_addr):
         """A single server can serve calls to both CRMs."""
         addr, _server = multi_crm_addr
-        hello = cc.connect(IHello, name='hello', address=addr)
-        counter = cc.connect(ICounter, name='counter', address=addr)
+        hello = cc.connect(Hello, name='hello', address=addr)
+        counter = cc.connect(Counter, name='counter', address=addr)
         try:
             assert hello.greeting('Multi') == 'Hello, Multi!'
             assert counter.get() == 100
@@ -156,7 +156,7 @@ class TestMultiCRMRouting:
     def test_counter_increment(self, multi_crm_addr):
         """Stateful CRM — increment counter and read back."""
         addr, _server = multi_crm_addr
-        proxy = cc.connect(ICounter, name='counter', address=addr)
+        proxy = cc.connect(Counter, name='counter', address=addr)
         try:
             assert proxy.increment(5) == 105  # 100 + 5
             assert proxy.get() == 105
@@ -167,7 +167,7 @@ class TestMultiCRMRouting:
         """Connecting to a non-existent route name raises an error."""
         addr, _server = multi_crm_addr
         with pytest.raises(Exception):
-            proxy = cc.connect(IHello, name='nonexistent', address=addr)
+            proxy = cc.connect(Hello, name='nonexistent', address=addr)
             try:
                 proxy.greeting('x')
             finally:
@@ -186,11 +186,11 @@ class TestDynamicRegistration:
         assert server.names == ['hello']
 
         # Add counter CRM dynamically.
-        server.register_crm(ICounter, Counter(initial=42), name='counter')
+        server.register_crm(Counter, CounterImpl(initial=42), name='counter')
         assert set(server.names) == {'hello', 'counter'}
 
         # Connect and call the new CRM.
-        proxy = cc.connect(ICounter, name='counter', address=addr)
+        proxy = cc.connect(Counter, name='counter', address=addr)
         try:
             assert proxy.get() == 42
         finally:
@@ -200,8 +200,8 @@ class TestDynamicRegistration:
         """Unregistering the default route shifts to the next one."""
         addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
-        server.register_crm(IHello, Hello(), name='hello')
-        server.register_crm(ICounter, Counter(), name='counter')
+        server.register_crm(Hello, HelloImpl(), name='hello')
+        server.register_crm(Counter, CounterImpl(), name='counter')
 
         server.unregister_crm('hello')
         # Default should shift to counter.

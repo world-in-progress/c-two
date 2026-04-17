@@ -1,6 +1,6 @@
-"""ICRM result unpacking helpers.
+"""resource result unpacking helpers.
 
-Used by NativeServerBridge to convert raw ICRM return values
+Used by NativeServerBridge to convert raw resource return values
 into (result_bytes, error_bytes) tuples.
 """
 from __future__ import annotations
@@ -10,8 +10,8 @@ from typing import Any
 from ... import error
 
 
-def unpack_icrm_result(result: Any) -> tuple[bytes | memoryview, bytes]:
-    """Unpack ICRM ``'<-'`` result into ``(result_data, error_bytes)``.
+def unpack_resource_result(result: Any) -> tuple[bytes | memoryview, bytes]:
+    """Unpack resource ``'<-'`` result into ``(result_data, error_bytes)``.
 
     ``result_data`` may be ``bytes`` or ``memoryview`` — the caller
     decides whether to materialise.  Error bytes are always ``bytes``.

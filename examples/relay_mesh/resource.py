@@ -1,6 +1,6 @@
 """Grid CRM process — auto-registers with the relay.
 
-Reuses the existing ``IGrid`` ICRM, ``Grid`` CRM, and transferable
+Reuses the existing ``Grid`` contract, ``NestedGrid`` resource, and transferable
 types from ``examples/grid/``.
 
 Run (after starting relay.py):
@@ -16,8 +16,8 @@ sys.path.insert(0, _examples_dir)
 import c_two as cc
 import logging
 
-from grid.igrid import IGrid
-from grid.grid import Grid
+from grid.grid_contract import Grid
+from grid.nested_grid import Grid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,14 +28,14 @@ logging.basicConfig(
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
-    grid = Grid(
+    grid = NestedGrid(
         epsg=2326,
         bounds=[808357.5, 824117.5, 838949.5, 843957.5],
         first_size=[64.0, 64.0],
         subdivide_rules=[[4, 3], [2, 2], [2, 2], [2, 2]],
     )
 
-    cc.register(IGrid, grid, name='grid')
+    cc.register(Grid, grid, name='grid')
     print(f'Grid CRM registered (IPC: {cc.server_address()})')
     print('Press Ctrl-C to stop.\n')
 

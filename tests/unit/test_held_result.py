@@ -74,7 +74,7 @@ class TestHeldResultBasic:
 
 
 class TestHoldFunction:
-    """cc.hold() wraps a bound ICRM method to inject _c2_buffer='hold'."""
+    """cc.hold() wraps a bound CRM method to inject _c2_buffer='hold'."""
 
     def test_hold_injects_c2_buffer(self):
         from c_two.crm.transferable import hold

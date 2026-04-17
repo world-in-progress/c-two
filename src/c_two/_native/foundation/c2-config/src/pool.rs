@@ -14,6 +14,11 @@ pub struct PoolConfig {
     /// Crash-recovery timeout for dedicated segments (seconds).
     /// Normal GC uses SHM read_done flag; this is a safety net for peer crashes.
     pub dedicated_crash_timeout_secs: f64,
+    /// Idle decay window for buddy segments (seconds). A buddy segment whose
+    /// `alloc_count` has been zero for at least this duration becomes eligible
+    /// for reclamation by `gc_buddy()`. Only trailing idle segments are popped
+    /// (at least one segment is always retained).
+    pub buddy_idle_decay_secs: f64,
     /// Spill threshold ratio: when `requested > available_ram * threshold`,
     /// use file-backed mmap.  Default 0.8 (80%).
     pub spill_threshold: f64,
@@ -29,6 +34,7 @@ impl Default for PoolConfig {
             max_segments: 8,
             max_dedicated_segments: 4,
             dedicated_crash_timeout_secs: 60.0,
+            buddy_idle_decay_secs: 60.0,
             spill_threshold: 0.8,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_spill/"),
         }

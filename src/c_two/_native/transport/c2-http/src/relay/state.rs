@@ -44,7 +44,7 @@ impl RelayState {
     /// Register a LOCAL upstream CRM.
     pub fn register_upstream(
         &self, name: String, address: String,
-        icrm_ns: String, icrm_ver: String,
+        crm_ns: String, crm_ver: String,
         client: Arc<IpcClient>,
     ) -> RouteEntry {
         let entry = RouteEntry {
@@ -52,7 +52,7 @@ impl RelayState {
             relay_id: self.config.relay_id.clone(),
             relay_url: self.config.effective_advertise_url(),
             ipc_address: Some(address.clone()),
-            icrm_ns, icrm_ver,
+            crm_ns, crm_ver,
             locality: Locality::Local,
             registered_at: now_secs(),
         };
@@ -231,7 +231,7 @@ mod tests {
         state.register_peer_route(RouteEntry {
             name: "remote".into(), relay_id: "peer-1".into(),
             relay_url: "http://peer-1:8080".into(), ipc_address: None,
-            icrm_ns: "ns".into(), icrm_ver: "0.1.0".into(),
+            crm_ns: "ns".into(), crm_ver: "0.1.0".into(),
             locality: Locality::Peer, registered_at: 1000.0,
         });
         assert_eq!(state.resolve("remote").len(), 1);

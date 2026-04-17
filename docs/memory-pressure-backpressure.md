@@ -132,8 +132,8 @@ except MemoryPressureError:
     time.sleep(0.1)
     result = icrm.process_large_data(big_payload)
     # 策略 3: 增大池配置
-    cc.set_server_ipc_config(segment_size=512 * 1024 * 1024)
-    cc.set_client_ipc_config(segment_size=512 * 1024 * 1024)
+    cc.set_server(segment_size=512 * 1024 * 1024)
+    cc.set_client(segment_size=512 * 1024 * 1024)
 ```
 
 ---
@@ -291,11 +291,11 @@ IPCConfig(
 import c_two as cc
 
 # 注册 CRM 之前设置
-cc.set_server_ipc_config(
+cc.set_server(
     segment_size=512 * 1024 * 1024,  # 512 MB per segment
     max_segments=2,                   # 最多 2 个 segment
 )
-cc.set_client_ipc_config(
+cc.set_client(
     segment_size=512 * 1024 * 1024,
     max_segments=2,
 )

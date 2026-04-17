@@ -42,20 +42,20 @@ _MAX_SEGMENTS: int = 8
 # Echo CRMs — bytes (identity fast path) vs dict (pickle path)
 # ---------------------------------------------------------------------------
 
-@cc.icrm(namespace='bench.three_mode', version='0.1.0')
-class IEcho:
+@cc.crm(namespace='bench.three_mode', version='0.1.0')
+class Echo:
     def echo(self, data: bytes) -> bytes: ...
 
-class Echo:
+class EchoImpl:
     def echo(self, data: bytes) -> bytes:
         return data
 
 
-@cc.icrm(namespace='bench.three_mode_dict', version='0.1.0')
-class IDictEcho:
+@cc.crm(namespace='bench.three_mode_dict', version='0.1.0')
+class DictEcho:
     def echo(self, data: dict) -> dict: ...
 
-class DictEcho:
+class DictEchoImpl:
     def echo(self, data: dict) -> dict:
         return data
 
@@ -144,12 +144,12 @@ def _measure(proxy, payload, rounds: int, validate_len: bool = True) -> float:
 
 def bench_thread(payload_size: int) -> float:
     _ProcessRegistry.reset()
-    cc.register(IEcho, Echo(), name='echo_thread')
+    cc.register(Echo, EchoImpl(), name='echo_thread')
     try:
-        icrm = cc.connect(IEcho, name='echo_thread')
+        crm = cc.connect(Echo, name='echo_thread')
         payload = b'\xAB' * payload_size
-        result_ms = _measure(icrm, payload, _rounds(payload_size))
-        cc.close(icrm)
+        result_ms = _measure(crm, payload, _rounds(payload_size))
+        cc.close(crm)
     finally:
         cc.unregister('echo_thread')
         cc.shutdown()
@@ -167,15 +167,15 @@ def bench_ipc(payload_size: int) -> float:
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.register(IEcho, Echo(), name='echo_ipc')
+    cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
     _wait_sock(address)
 
     payload = b'\xAB' * payload_size
     try:
-        icrm = cc.connect(IEcho, name='echo_ipc', address=address)
-        result_ms = _measure(icrm, payload, _rounds(payload_size))
-        cc.close(icrm)
+        crm = cc.connect(Echo, name='echo_ipc', address=address)
+        result_ms = _measure(crm, payload, _rounds(payload_size))
+        cc.close(crm)
     finally:
         cc.unregister('echo_ipc')
         cc.shutdown()
@@ -195,7 +195,7 @@ def bench_relay(payload_size: int) -> float | None:
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.register(IEcho, Echo(), name='echo_relay')
+    cc.register(Echo, EchoImpl(), name='echo_relay')
     address = cc.server_address()
     _wait_sock(address)
 
@@ -206,9 +206,9 @@ def bench_relay(payload_size: int) -> float | None:
 
     payload = b'\xAB' * payload_size
     try:
-        icrm = cc.connect(IEcho, name='echo_relay', address=f'http://{relay_addr}')
-        result_ms = _measure(icrm, payload, _rounds(payload_size))
-        cc.close(icrm)
+        crm = cc.connect(Echo, name='echo_relay', address=f'http://{relay_addr}')
+        result_ms = _measure(crm, payload, _rounds(payload_size))
+        cc.close(crm)
         return result_ms
     except Exception as exc:
         print(f'  [relay FAILED: {exc}]', file=sys.stderr)
@@ -244,15 +244,15 @@ def bench_ipc_dict(payload_size: int) -> float | None:
 
     cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
     cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.register(IDictEcho, DictEcho(), name='echo_dict')
+    cc.register(DictEcho, DictEchoImpl(), name='echo_dict')
     address = cc.server_address()
     _wait_sock(address)
 
     payload = _make_dict_payload(payload_size)
     try:
-        icrm = cc.connect(IDictEcho, name='echo_dict', address=address)
-        result_ms = _measure(icrm, payload, _rounds(payload_size), validate_len=False)
-        cc.close(icrm)
+        crm = cc.connect(DictEcho, name='echo_dict', address=address)
+        result_ms = _measure(crm, payload, _rounds(payload_size), validate_len=False)
+        cc.close(crm)
     finally:
         cc.unregister('echo_dict')
         cc.shutdown()

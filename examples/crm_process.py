@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../e
 
 import c_two as cc
 import logging
-from grid.grid import Grid
-from grid.igrid import IGrid
+from grid.nested_grid import NestedGrid
+from grid.grid_contract import Grid
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -32,10 +32,10 @@ def main():
     subdivide_rules = [
         [478, 310], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [1, 1]
     ]
-    grid = Grid(epsg, bounds, first_size, subdivide_rules)
+    grid = NestedGrid(epsg, bounds, first_size, subdivide_rules)
 
     # Register — one line replaces ServerConfig + Server + start()
-    cc.register(IGrid, grid, name='grid')
+    cc.register(Grid, grid, name='grid')
     print(f'Grid CRM registered at {cc.server_address()}')
 
     # Block until SIGINT/SIGTERM, then auto-shutdown via atexit.

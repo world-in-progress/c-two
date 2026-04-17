@@ -21,16 +21,16 @@ from c_two.transport.client.util import ping
 
 
 # ---------------------------------------------------------------------------
-# Inline ICRM / CRM
+# Inline CRM contract + resource
 # ---------------------------------------------------------------------------
 
-@cc.icrm(namespace='bench.chunk', version='0.1.0')
-class IBenchChunk:
+@cc.crm(namespace='bench.chunk', version='0.1.0')
+class BenchChunk:
     def echo(self, data: str) -> str: ...
     def add(self, a: int, b: int) -> int: ...
 
 
-class BenchChunk:
+class BenchChunkImpl:
     def echo(self, data: str) -> str:
         return data
 
@@ -46,7 +46,7 @@ SEGMENT_SIZE = 256 * 1024 * 1024  # 256 MB (default IPCConfig)
 
 
 def bench_one(
-    icrm: IBenchChunk,
+    crm: BenchChunk,
     payload_size: int,
     warmup: int = 2,
     repeats: int = 5,
@@ -56,12 +56,12 @@ def bench_one(
 
     # Warmup
     for _ in range(warmup):
-        icrm.echo(payload)
+        crm.echo(payload)
 
     latencies = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        result = icrm.echo(payload)
+        result = crm.echo(payload)
         t1 = time.perf_counter()
         assert len(result) == payload_size, f'Data integrity error: {len(result)} != {payload_size}'
         latencies.append(t1 - t0)
@@ -88,17 +88,17 @@ def main() -> None:
 
     _ProcessRegistry.reset()
 
-    cc.set_server_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
-    cc.set_client_ipc_config(segment_size=SEGMENT_SIZE, max_segments=4)
-    cc.register(IBenchChunk, BenchChunk(), name='bench')
+    cc.set_server(segment_size=SEGMENT_SIZE, max_segments=4)
+    cc.set_client(segment_size=SEGMENT_SIZE, max_segments=4)
+    cc.register(BenchChunk, BenchChunkImpl(), name='bench')
     address = cc.server_address()
 
     ping(address, timeout=10.0)
 
-    icrm = cc.connect(IBenchChunk, name='bench', address=address)
+    crm = cc.connect(BenchChunk, name='bench', address=address)
 
     # Verify connectivity.
-    assert icrm.add(1, 2) == 3, 'Basic connectivity check failed'
+    assert crm.add(1, 2) == 3, 'Basic connectivity check failed'
 
     # Build payload schedule.
     sizes_kb = [4, 64, 256, 1024, 4096, 16384, 65536]
@@ -141,7 +141,7 @@ def main() -> None:
         warmup = 1 if payload_bytes >= 64 * 1024 * 1024 else 2
 
         try:
-            stats = bench_one(icrm, payload_bytes, warmup=warmup, repeats=repeats)
+            stats = bench_one(crm, payload_bytes, warmup=warmup, repeats=repeats)
         except Exception as e:
             print(f'{size_kb:>9} KB  {"ERROR":>8}  {str(e)[:60]}')
             continue
@@ -161,7 +161,7 @@ def main() -> None:
     print()
 
     # Cleanup
-    cc.close(icrm)
+    cc.close(crm)
     cc.unregister('bench')
     cc.shutdown()
 

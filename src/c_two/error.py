@@ -4,12 +4,12 @@ from enum import IntEnum, unique
 @unique
 class ERROR_Code(IntEnum):
     ERROR_UNKNOWN                           = 0
-    ERROR_AT_CRM_INPUT_DESERIALIZING        = 1
-    ERROR_AT_CRM_OUTPUT_SERIALIZING         = 2
-    ERROR_AT_CRM_FUNCTION_EXECUTING         = 3
-    ERROR_AT_COMPO_INPUT_SERIALIZING        = 5
-    ERROR_AT_COMPO_OUTPUT_DESERIALIZING     = 6
-    ERROR_AT_COMPO_CRM_CALLING              = 7
+    ERROR_AT_RESOURCE_INPUT_DESERIALIZING   = 1
+    ERROR_AT_RESOURCE_OUTPUT_SERIALIZING    = 2
+    ERROR_AT_RESOURCE_FUNCTION_EXECUTING    = 3
+    ERROR_AT_CLIENT_INPUT_SERIALIZING       = 5
+    ERROR_AT_CLIENT_OUTPUT_DESERIALIZING    = 6
+    ERROR_AT_CLIENT_CALLING_RESOURCE        = 7
     ERROR_RESOURCE_NOT_FOUND                = 701
     ERROR_RESOURCE_UNAVAILABLE              = 702
     ERROR_REGISTRY_UNAVAILABLE              = 705
@@ -77,35 +77,35 @@ class CCError(CCBaseError):
         obj.message = message or 'Error occurred when using C-Two.'
         return obj
 
-class CRMDeserializeInput(CCError):
+class ResourceDeserializeInput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when deserializing input at CRM' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING, message=message)
+        message = 'Error occurred when deserializing input at resource' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING, message=message)
 
-class CRMSerializeOutput(CCError):
+class ResourceSerializeOutput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when serializing output at CRM' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING, message=message)
+        message = 'Error occurred when serializing output at resource' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING, message=message)
 
-class CRMExecuteFunction(CCError):
+class ResourceExecuteFunction(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when executing function at CRM' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING, message=message)
+        message = 'Error occurred when executing function at resource' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message=message)
 
-class CompoSerializeInput(CCError):
+class ClientSerializeInput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when serializing input at Compo' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_COMPO_INPUT_SERIALIZING, message=message)
-        
-class CompoDeserializeOutput(CCError):
+        message = 'Error occurred when serializing input at client' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING, message=message)
+
+class ClientDeserializeOutput(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when deserializing output at Compo' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING, message=message)
-        
-class CompoCRMCalling(CCError):
+        message = 'Error occurred when deserializing output at client' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING, message=message)
+
+class ClientCallResource(CCError):
     def __init__(self, message: str | None = None):
-        message = 'Error occurred when calling CRM from Compo' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_COMPO_CRM_CALLING, message=message)
+        message = 'Error occurred when calling resource from client' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE, message=message)
 
 class ResourceNotFound(CCError):
     """Raised when a named resource cannot be resolved by any relay."""
@@ -132,13 +132,13 @@ class RegistryUnavailable(CCError):
         super().__init__(code=ERROR_Code.ERROR_REGISTRY_UNAVAILABLE, message=message or 'Registry unavailable')
 
 _CODE_TO_CLASS: dict[int, type] = {
-    ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING:    CRMDeserializeInput,
-    ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING:     CRMSerializeOutput,
-    ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING:     CRMExecuteFunction,
-    ERROR_Code.ERROR_AT_COMPO_INPUT_SERIALIZING:    CompoSerializeInput,
-    ERROR_Code.ERROR_AT_COMPO_OUTPUT_DESERIALIZING: CompoDeserializeOutput,
-    ERROR_Code.ERROR_AT_COMPO_CRM_CALLING:          CompoCRMCalling,
-    ERROR_Code.ERROR_RESOURCE_NOT_FOUND:            ResourceNotFound,
-    ERROR_Code.ERROR_RESOURCE_UNAVAILABLE:          ResourceUnavailable,
-    ERROR_Code.ERROR_REGISTRY_UNAVAILABLE:          RegistryUnavailable,
+    ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
+    ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING:  ResourceSerializeOutput,
+    ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING:  ResourceExecuteFunction,
+    ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING:     ClientSerializeInput,
+    ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING:  ClientDeserializeOutput,
+    ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE:      ClientCallResource,
+    ERROR_Code.ERROR_RESOURCE_NOT_FOUND:               ResourceNotFound,
+    ERROR_Code.ERROR_RESOURCE_UNAVAILABLE:             ResourceUnavailable,
+    ERROR_Code.ERROR_REGISTRY_UNAVAILABLE:             RegistryUnavailable,
 }

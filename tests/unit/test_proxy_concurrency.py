@@ -7,7 +7,7 @@ import time
 import pytest
 
 from c_two.crm.meta import MethodAccess
-from c_two.transport.client.proxy import ICRMProxy
+from c_two.transport.client.proxy import CRMProxy
 from c_two.transport.server.scheduler import Scheduler, ConcurrencyConfig, ConcurrencyMode
 
 
@@ -59,12 +59,12 @@ class TestThreadLocalNoScheduler:
     def test_call_direct_no_scheduler(self):
         """Without scheduler, call_direct works as before (no locking)."""
         crm = _SlowCRM()
-        proxy = ICRMProxy.thread_local(crm)
+        proxy = CRMProxy.thread_local(crm)
         assert proxy.call_direct('read_op', ()) == 'read_result'
         assert proxy.call_direct('write_op', ('hello',)) == 'write_result'
 
     def test_supports_direct_call(self):
-        proxy = ICRMProxy.thread_local(_SlowCRM())
+        proxy = CRMProxy.thread_local(_SlowCRM())
         assert proxy.supports_direct_call is True
 
 
@@ -78,7 +78,7 @@ class TestExclusiveMode:
         """Two concurrent writes should not overlap in EXCLUSIVE mode."""
         crm = _SlowCRM()
         sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE))
-        proxy = ICRMProxy.thread_local(
+        proxy = CRMProxy.thread_local(
             crm, scheduler=sched, access_map=_READ_WRITE_MAP,
         )
 
@@ -101,7 +101,7 @@ class TestExclusiveMode:
         """Read and write should not overlap in EXCLUSIVE mode."""
         crm = _SlowCRM()
         sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE))
-        proxy = ICRMProxy.thread_local(
+        proxy = CRMProxy.thread_local(
             crm, scheduler=sched, access_map=_READ_WRITE_MAP,
         )
 
@@ -131,7 +131,7 @@ class TestReadParallelMode:
         """Two reads should overlap in READ_PARALLEL mode."""
         crm = _SlowCRM()
         sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL))
-        proxy = ICRMProxy.thread_local(
+        proxy = CRMProxy.thread_local(
             crm, scheduler=sched, access_map=_READ_WRITE_MAP,
         )
 
@@ -151,7 +151,7 @@ class TestReadParallelMode:
         """Write blocks reads in READ_PARALLEL mode."""
         crm = _SlowCRM()
         sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL))
-        proxy = ICRMProxy.thread_local(
+        proxy = CRMProxy.thread_local(
             crm, scheduler=sched, access_map=_READ_WRITE_MAP,
         )
 
@@ -178,7 +178,7 @@ class TestParallelMode:
         """All calls should overlap in PARALLEL mode."""
         crm = _SlowCRM()
         sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.PARALLEL))
-        proxy = ICRMProxy.thread_local(
+        proxy = CRMProxy.thread_local(
             crm, scheduler=sched, access_map=_READ_WRITE_MAP,
         )
 
@@ -206,7 +206,7 @@ class TestDefaultAccess:
         crm = _SlowCRM()
         sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE))
         # Empty access_map — all methods default to WRITE
-        proxy = ICRMProxy.thread_local(crm, scheduler=sched, access_map={})
+        proxy = CRMProxy.thread_local(crm, scheduler=sched, access_map={})
 
         results = []
         def do_write(idx):

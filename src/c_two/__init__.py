@@ -1,19 +1,14 @@
 from importlib.metadata import version
 __version__ = version('c-two')
 
-from . import compo
 from . import error
-from .compo import runtime
-from .crm.meta import icrm, read, write, on_shutdown
+from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import transferable
 from .crm.transferable import transfer, hold, HeldResult
 from .transport.registry import (
     set_config,
     set_server,
     set_client,
-    set_shm_threshold,
-    set_server_ipc_config,
-    set_client_ipc_config,
     set_relay,
     register,
     connect,

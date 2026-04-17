@@ -41,7 +41,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "address": "ipc://...", "icrm_ns": "...", "icrm_ver": "..."}`
+/// Body: `{"name": "grid", "address": "ipc://...", "crm_ns": "...", "crm_ver": "..."}`
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
     State(state): State<Arc<RelayState>>,
@@ -55,8 +55,8 @@ async fn handle_register(
         Some(a) => a.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"address\"").into_response(),
     };
-    let icrm_ns = body.get("icrm_ns").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let icrm_ver = body.get("icrm_ver").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let crm_ns = body.get("crm_ns").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let crm_ver = body.get("crm_ver").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     // Check for duplicate LOCAL route.
     if state.has_local_route(&name) {
@@ -98,7 +98,7 @@ async fn handle_register(
         Arc::new(c)
     };
 
-    let entry = state.register_upstream(name.clone(), address, icrm_ns, icrm_ver, client);
+    let entry = state.register_upstream(name.clone(), address, crm_ns, crm_ver, client);
 
     // Gossip announce to peers
     let envelope = PeerEnvelope::new(
@@ -108,8 +108,8 @@ async fn handle_register(
             relay_id: entry.relay_id.clone(),
             relay_url: entry.relay_url.clone(),
             ipc_address: entry.ipc_address.clone(),
-            icrm_ns: entry.icrm_ns.clone(),
-            icrm_ver: entry.icrm_ver.clone(),
+            crm_ns: entry.crm_ns.clone(),
+            crm_ver: entry.crm_ver.clone(),
             registered_at: entry.registered_at,
         },
     );

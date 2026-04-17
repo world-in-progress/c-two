@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
-/// Method access level (from ICRM `@cc.read` / `@cc.write`).
+/// Method access level (from CRM contract `@cc.read` / `@cc.write`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessLevel {
     Read,

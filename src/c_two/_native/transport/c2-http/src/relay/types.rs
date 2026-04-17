@@ -15,8 +15,8 @@ pub struct RouteEntry {
     pub relay_id: String,
     pub relay_url: String,
     pub ipc_address: Option<String>,
-    pub icrm_ns: String,
-    pub icrm_ver: String,
+    pub crm_ns: String,
+    pub crm_ver: String,
     pub locality: Locality,
     pub registered_at: f64,
 }
@@ -27,8 +27,8 @@ pub struct RouteInfo {
     pub name: String,
     pub relay_url: String,
     pub ipc_address: Option<String>,
-    pub icrm_ns: String,
-    pub icrm_ver: String,
+    pub crm_ns: String,
+    pub crm_ver: String,
 }
 
 impl RouteEntry {
@@ -37,8 +37,8 @@ impl RouteEntry {
             name: self.name.clone(),
             relay_url: self.relay_url.clone(),
             ipc_address: self.ipc_address.clone(),
-            icrm_ns: self.icrm_ns.clone(),
-            icrm_ver: self.icrm_ver.clone(),
+            crm_ns: self.crm_ns.clone(),
+            crm_ver: self.crm_ver.clone(),
         }
     }
 }
@@ -82,7 +82,7 @@ impl From<crate::relay::peer::DigestDiffEntry> for RouteEntry {
     fn from(d: crate::relay::peer::DigestDiffEntry) -> Self {
         Self {
             name: d.name, relay_id: d.relay_id, relay_url: d.relay_url,
-            ipc_address: d.ipc_address, icrm_ns: d.icrm_ns, icrm_ver: d.icrm_ver,
+            ipc_address: d.ipc_address, crm_ns: d.crm_ns, crm_ver: d.crm_ver,
             locality: Locality::Peer, registered_at: d.registered_at,
         }
     }

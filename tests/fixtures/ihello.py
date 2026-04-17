@@ -26,9 +26,9 @@ class HelloItems:
         return pickle.loads(data_bytes)
 
 
-@cc.icrm(namespace='test.hello', version='0.1.0')
-class IHello:
-    """Lightweight ICRM interface for unit testing."""
+@cc.crm(namespace='test.hello', version='0.1.0')
+class Hello:
+    """Lightweight CRM contract for unit testing."""
 
     def greeting(self, name: str) -> str:
         """Simple string in, string out."""

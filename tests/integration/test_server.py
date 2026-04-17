@@ -1,6 +1,6 @@
 """Integration tests for Server via SOTA API.
 
-Tests Server functionality through the cc.connect ICRM proxy.
+Tests Server functionality through the cc.connect CRM proxy.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ import c_two as cc
 from c_two.transport import Server
 from c_two.transport.client.util import ping, shutdown
 
-from tests.fixtures.hello import Hello
-from tests.fixtures.ihello import IHello
+from tests.fixtures.hello import HelloImpl
+from tests.fixtures.ihello import Hello
 
 
 # ---------------------------------------------------------------------------
@@ -52,12 +52,12 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 
 @pytest.fixture
 def server_addr():
-    """Start a Server hosting the Hello CRM + IHello ICRM."""
+    """Start a Server hosting the Hello CRM + Hello CRM."""
     addr = f'ipc://{_unique_region()}'
     server = Server(
         bind_address=addr,
-        icrm_class=IHello,
-        crm_instance=Hello(),
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
         name='hello',
     )
     server.start()
@@ -72,8 +72,8 @@ def server_small_shm():
     addr = f'ipc://{_unique_region("small")}'
     server = Server(
         bind_address=addr,
-        icrm_class=IHello,
-        crm_instance=Hello(),
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
         name='hello',
         shm_threshold=16,
     )
@@ -91,7 +91,7 @@ class TestServerBasic:
     """Server must handle standard RPC calls via SOTA API."""
 
     def test_greeting(self, server_addr):
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         try:
             result = proxy.greeting('World')
             assert result == 'Hello, World!'
@@ -99,7 +99,7 @@ class TestServerBasic:
             cc.close(proxy)
 
     def test_add(self, server_addr):
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         try:
             result = proxy.add(7, 8)
             assert result == 15
@@ -107,7 +107,7 @@ class TestServerBasic:
             cc.close(proxy)
 
     def test_list(self, server_addr):
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         try:
             result = proxy.get_items([1, 2, 3])
             assert result == ['item-1', 'item-2', 'item-3']
@@ -121,8 +121,8 @@ class TestServerBasic:
         addr = f'ipc://{_unique_region("shut")}'
         server = Server(
             bind_address=addr,
-            icrm_class=IHello,
-            crm_instance=Hello(),
+            crm_class=Hello,
+            crm_instance=HelloImpl(),
             name='hello',
         )
         server.start()
@@ -133,14 +133,14 @@ class TestServerBasic:
 
 
 # ---------------------------------------------------------------------------
-# ICRM method routing
+# CRM method routing
 # ---------------------------------------------------------------------------
 
 class TestServerRouting:
-    """Server routes ICRM method calls correctly."""
+    """Server routes CRM method calls correctly."""
 
     def test_greeting_routed(self, server_addr):
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         try:
             result = proxy.greeting('V2')
             assert result == 'Hello, V2!'
@@ -148,7 +148,7 @@ class TestServerRouting:
             cc.close(proxy)
 
     def test_add_routed(self, server_addr):
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         try:
             result = proxy.add(100, 200)
             assert result == 300
@@ -156,7 +156,7 @@ class TestServerRouting:
             cc.close(proxy)
 
     def test_list_routed(self, server_addr):
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         try:
             result = proxy.get_items([5, 10])
             assert result == ['item-5', 'item-10']
@@ -165,7 +165,7 @@ class TestServerRouting:
 
     def test_custom_type_routed(self, server_addr):
         """Test transferable type round-trip via SOTA API."""
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         try:
             from tests.fixtures.ihello import HelloData
             result = proxy.get_data(42)
@@ -183,7 +183,7 @@ class TestServerInlinePath:
     """Force the inline path by using a very small SHM threshold."""
 
     def test_greeting_inline(self, server_small_shm):
-        proxy = cc.connect(IHello, name='hello', address=server_small_shm)
+        proxy = cc.connect(Hello, name='hello', address=server_small_shm)
         try:
             result = proxy.greeting('Inline')
             assert result == 'Hello, Inline!'
@@ -199,7 +199,7 @@ class TestServerConcurrent:
     """Multiple concurrent calls to Server."""
 
     def test_concurrent_calls(self, server_addr):
-        proxy = cc.connect(IHello, name='hello', address=server_addr)
+        proxy = cc.connect(Hello, name='hello', address=server_addr)
         errors: list[str] = []
 
         def worker(tid: int) -> None:

@@ -11,8 +11,8 @@ import c_two as cc
 from c_two.transport.server import Server
 from c_two.transport.client.util import ping
 
-from tests.fixtures.hello import Hello
-from tests.fixtures.ihello import IHello
+from tests.fixtures.hello import HelloImpl
+from tests.fixtures.ihello import Hello
 
 # Disable proxy for localhost to avoid HTTP test failures
 os.environ.setdefault('NO_PROXY', '127.0.0.1,localhost')
@@ -47,7 +47,7 @@ def protocol_address(request, unique_ipc_address):
 @pytest.fixture
 def hello_crm():
     """Create a Hello CRM instance."""
-    return Hello()
+    return HelloImpl()
 
 
 def _wait_for_server(address: str, timeout: float = 5.0) -> None:
@@ -68,7 +68,7 @@ def hello_server(protocol_address, hello_crm):
     """Start a Hello CRM server on the given protocol, yield the address, then shut down."""
     server = Server(
         bind_address=protocol_address,
-        icrm_class=IHello,
+        crm_class=Hello,
         crm_instance=hello_crm,
     )
     server.start()

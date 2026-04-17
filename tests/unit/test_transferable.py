@@ -8,7 +8,7 @@ from c_two.crm.transferable import (
     create_default_transferable, auto_transfer,
     _extract_func_params, _TRANSFERABLE_MAP,
 )
-from tests.fixtures.ihello import HelloData, HelloItems, IHello
+from tests.fixtures.ihello import HelloData, HelloItems, Hello
 
 
 # Module-level plain class for pickle-compatibility in tests
@@ -563,10 +563,10 @@ class TestCrmToComBufferModes:
         class MockCRM:
             def echo(self, x):
                 return x
-        class MockICRM:
+        class MockCRM:
             direction = '<-'
-            crm = MockCRM()
-        return MockICRM()
+            resource = MockCRM()
+        return MockCRM()
 
     def test_copy_mode_calls_release(self):
         """In view mode (was copy), _release_fn is called."""
@@ -580,8 +580,8 @@ class TestCrmToComBufferModes:
                 return pickle.loads(data)
 
         wrapped = self._setup(CopyIn, buffer='view')
-        icrm = self._make_icrm()
-        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        crm = self._make_icrm()
+        result = wrapped(crm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert released, '_release_fn was not called in view mode'
 
     def test_view_mode_calls_release(self):
@@ -591,8 +591,8 @@ class TestCrmToComBufferModes:
         input_trans = create_default_transferable(fn, is_input=True)
 
         wrapped = self._setup(input_trans)
-        icrm = self._make_icrm()
-        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        crm = self._make_icrm()
+        result = wrapped(crm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert released, '_release_fn was not called in view mode'
 
     def test_hold_mode_skips_release(self):
@@ -607,16 +607,16 @@ class TestCrmToComBufferModes:
                 return pickle.loads(data) if isinstance(data, (bytes, memoryview)) else data
 
         wrapped = self._setup(HoldIn, buffer='hold')
-        icrm = self._make_icrm()
-        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        crm = self._make_icrm()
+        result = wrapped(crm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert not released, '_release_fn should NOT be called in hold mode'
         """When _release_fn is None (thread-local), all modes work fine."""
         def fn(self, x: int) -> int: ...
         input_trans = create_default_transferable(fn, is_input=True)
         wrapped = self._setup(input_trans)
-        icrm = self._make_icrm()
+        crm = self._make_icrm()
         # No _release_fn — must not crash
-        result = wrapped(icrm, pickle.dumps(42))
+        result = wrapped(crm, pickle.dumps(42))
         # result is (error_bytes, result_bytes) tuple
         assert isinstance(result, tuple)
 
@@ -632,9 +632,9 @@ class TestCrmToComBufferModes:
                 raise RuntimeError('boom')
 
         wrapped = self._setup(BadDeser)
-        icrm = self._make_icrm()
+        crm = self._make_icrm()
         # Should not raise — crm_to_com catches exceptions
-        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        result = wrapped(crm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert released, '_release_fn must be called even on error'
 
     def test_transfer_wrapper_has_buffer_mode_attrs(self):
@@ -674,12 +674,12 @@ class TestComToCrmBufferModes:
                 self.response = resp
             def call(self, method, data):
                 return self.response
-        class MockICRM:
+        class MockCRM:
             direction = '->'
             def __init__(self, client):
                 self.client = client
         client = MockClient(mock_resp)
-        return MockICRM(client), mock_resp
+        return MockCRM(client), mock_resp
 
     def test_view_mode_releases_response(self):
         """view mode: response is deserialized and released."""
@@ -693,10 +693,10 @@ class TestComToCrmBufferModes:
                 return pickle.loads(data)
 
         from c_two.crm.transferable import _build_transfer_wrapper
-        icrm, mock_resp = self._make_icrm(pickle.dumps(42))
+        crm, mock_resp = self._make_icrm(pickle.dumps(42))
         def fn(self) -> int: ...
         wrapped = _build_transfer_wrapper(fn, input=None, output=ViewOut)
-        result = wrapped(icrm)
+        result = wrapped(crm)
         assert result == 42
         assert mock_resp.released
 
@@ -711,10 +711,10 @@ class TestComToCrmBufferModes:
             def deserialize(data) -> int:
                 return pickle.loads(bytes(data)) if isinstance(data, memoryview) else pickle.loads(data)
 
-        icrm, mock_resp = self._make_icrm(pickle.dumps(42))
+        crm, mock_resp = self._make_icrm(pickle.dumps(42))
         def fn(self) -> int: ...
         wrapped = _build_transfer_wrapper(fn, input=None, output=HoldOut)
-        result = wrapped(icrm, _c2_buffer='hold')
+        result = wrapped(crm, _c2_buffer='hold')
         assert isinstance(result, HeldResult)
         assert result.value == 42
         assert not mock_resp.released  # SHM held until explicit release
@@ -911,15 +911,15 @@ class TestFromBufferDispatch:
         # Simulate server-side call (direction='<-')
         class FakeICRM:
             direction = '<-'
-            class crm:
+            class resource:
                 @staticmethod
                 def my_method(data):
                     return data.x
-        icrm = FakeICRM()
+        crm = FakeICRM()
 
         call_log.clear()
         payload = FBDispatch1.serialize(FBDispatch1(x=7))
-        result = wrapper(icrm, memoryview(payload))
+        result = wrapper(crm, memoryview(payload))
 
         assert 'from_buffer' in call_log
         assert 'deserialize' not in call_log
@@ -947,11 +947,11 @@ class TestFromBufferDispatch:
 
         class FakeICRM:
             direction = '<-'
-            class crm:
+            class resource:
                 @staticmethod
                 def my_method(data):
                     return data.x
-        icrm = FakeICRM()
+        crm = FakeICRM()
 
         call_log.clear()
         payload = FBDispatch2.serialize(FBDispatch2(x=7))
@@ -959,7 +959,7 @@ class TestFromBufferDispatch:
         def release_fn():
             nonlocal released
             released = True
-        result = wrapper(icrm, memoryview(payload), _release_fn=release_fn)
+        result = wrapper(crm, memoryview(payload), _release_fn=release_fn)
 
         assert 'deserialize' in call_log
         assert 'from_buffer' not in call_log
@@ -995,23 +995,23 @@ class TestFromBufferDispatch:
             direction = '->'
             client = FakeClient()
 
-        icrm = FakeICRM()
+        crm = FakeICRM()
         call_log.clear()
-        result = wrapper(icrm, _c2_buffer='hold')
+        result = wrapper(crm, _c2_buffer='hold')
         # Should use from_buffer for output when _c2_buffer='hold'
         assert 'from_buffer' in call_log
         assert isinstance(result, cc.HeldResult)
 
 
 # ---------------------------------------------------------------------------
-# End-to-end from_buffer auto-detection via ICRM decorator
+# End-to-end from_buffer auto-detection via CRM decorator
 # ---------------------------------------------------------------------------
 
 class TestFromBufferEndToEnd:
-    """End-to-end test: ICRM with from_buffer auto-detects hold mode."""
+    """End-to-end test: CRM with from_buffer auto-detects hold mode."""
 
     def test_icrm_auto_detects_hold_from_from_buffer(self):
-        """An ICRM method whose input type has from_buffer gets hold mode."""
+        """An CRM method whose input type has from_buffer gets hold mode."""
         import numpy as np
 
         @cc.transferable
@@ -1027,7 +1027,7 @@ class TestFromBufferEndToEnd:
             def from_buffer(b: bytes) -> 'NpData':
                 return NpData(arr=np.frombuffer(b, dtype=np.float64))
 
-        @cc.icrm(namespace='test.fb_e2e', version='0.1.0')
+        @cc.crm(namespace='test.fb_e2e', version='0.1.0')
         class ICompute:
             def process(self, data: NpData) -> int:
                 ...
@@ -1048,7 +1048,7 @@ class TestFromBufferEndToEnd:
             def from_buffer(b: bytes) -> 'BufData':
                 return BufData(x=pickle.loads(b))
 
-        @cc.icrm(namespace='test.fb_override', version='0.1.0')
+        @cc.crm(namespace='test.fb_override', version='0.1.0')
         class IOverride:
             @cc.transfer(buffer='view')
             def process(self, data: BufData) -> int:
@@ -1067,7 +1067,7 @@ class TestFromBufferEndToEnd:
             def deserialize(b: bytes) -> 'PlainData':
                 return PlainData(x=pickle.loads(b))
 
-        @cc.icrm(namespace='test.fb_plain', version='0.1.0')
+        @cc.crm(namespace='test.fb_plain', version='0.1.0')
         class IPlain:
             def process(self, data: PlainData) -> int:
                 ...

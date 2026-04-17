@@ -1,8 +1,8 @@
 from tests.fixtures.ihello import HelloData
 
 
-class Hello:
-    """Lightweight CRM implementation for testing. No heavy dependencies."""
+class HelloImpl:
+    """Lightweight resource implementation for testing. No heavy dependencies."""
 
     def greeting(self, name: str) -> str:
         return f'Hello, {name}!'

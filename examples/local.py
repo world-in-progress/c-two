@@ -15,10 +15,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 import c_two as cc
 
 
-# ── Define ICRM interfaces ──────────────────────────────────────────
+# ── Define CRM contracts ──────────────────────────────────────────
 
-@cc.icrm(namespace='demo.greeter', version='0.1.0')
-class IGreeter:
+@cc.crm(namespace='demo.greeter', version='0.1.0')
+class Greeter:
     @cc.read
     def greet(self, name: str) -> str: ...
 
@@ -26,8 +26,8 @@ class IGreeter:
     def language(self) -> str: ...
 
 
-@cc.icrm(namespace='demo.counter', version='0.1.0')
-class ICounter:
+@cc.crm(namespace='demo.counter', version='0.1.0')
+class Counter:
     def increment(self, amount: int) -> int: ...
 
     @cc.read
@@ -38,7 +38,7 @@ class ICounter:
 
 # ── Define CRM implementations ──────────────────────────────────────
 
-class Greeter:
+class GreeterImpl:
     def __init__(self, lang: str = 'en'):
         self._lang = lang
         self._templates = {
@@ -54,7 +54,7 @@ class Greeter:
         return self._lang
 
 
-class Counter:
+class CounterImpl:
     def __init__(self, initial: int = 0):
         self._value = initial
 
@@ -75,14 +75,14 @@ class Counter:
 
 def main():
     # 1. Register CRMs — implicitly starts a shared IPC server
-    cc.register(IGreeter, Greeter(lang='zh'), name='greeter')
-    cc.register(ICounter, Counter(initial=100), name='counter')
+    cc.register(Greeter, GreeterImpl(lang='zh'), name='greeter')
+    cc.register(Counter, CounterImpl(initial=100), name='counter')
     print(f'Server address: {cc.server_address()}')
     print(f'Registered routes: greeter, counter\n')
 
     # 2. Connect with thread preference (same process → zero serde)
-    greeter = cc.connect(IGreeter, name='greeter')
-    counter = cc.connect(ICounter, name='counter')
+    greeter = cc.connect(Greeter, name='greeter')
+    counter = cc.connect(Counter, name='counter')
 
     print(f'Greeter proxy mode: {greeter.client._mode}')   # → "thread"
     print(f'Counter proxy mode: {counter.client._mode}\n')  # → "thread"

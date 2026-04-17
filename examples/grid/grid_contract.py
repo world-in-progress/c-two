@@ -2,12 +2,12 @@ import c_two as cc
 
 from grid.transferables import GridSchema, GridAttribute
 
-@cc.icrm(namespace='icrm', version='0.1.0')
-class IGrid:
+@cc.crm(namespace='demo.grid', version='0.1.0')
+class Grid:
     """
-    IGrid
+    Grid
     =
-    Interface of Core Resource Model (ICRM) specifies how to interact with CRM. 
+    CRM contract for a nested multi-resolution grid resource. 
     """
     def get_schema(self) -> GridSchema:
         """Method to get grid schema

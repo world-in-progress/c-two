@@ -244,8 +244,8 @@ mod tests {
             relay_id: relay_id.into(),
             relay_url: format!("http://{relay_id}:8080"),
             ipc_address: Some(format!("ipc://{name}_{relay_id}")),
-            icrm_ns: "test.ns".into(),
-            icrm_ver: "0.1.0".into(),
+            crm_ns: "test.ns".into(),
+            crm_ver: "0.1.0".into(),
             locality: Locality::Local,
             registered_at: 1000.0,
         }
@@ -257,8 +257,8 @@ mod tests {
             relay_id: relay_id.into(),
             relay_url: format!("http://{relay_id}:8080"),
             ipc_address: None,
-            icrm_ns: "test.ns".into(),
-            icrm_ver: "0.1.0".into(),
+            crm_ns: "test.ns".into(),
+            crm_ver: "0.1.0".into(),
             locality: Locality::Peer,
             registered_at,
         }

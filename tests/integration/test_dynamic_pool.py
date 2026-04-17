@@ -25,12 +25,12 @@ from c_two.transport.server import Server
 
 
 # ---------------------------------------------------------------------------
-# Inline ICRM / CRM for pool-expansion testing
+# Inline CRM / CRM for pool-expansion testing
 # ---------------------------------------------------------------------------
 
-@cc.icrm(namespace='test.dynamic_pool', version='0.1.0')
+@cc.crm(namespace='test.dynamic_pool', version='0.1.0')
 class IPoolTest:
-    """ICRM that echoes bytes and produces large returns."""
+    """CRM that echoes bytes and produces large returns."""
 
     def echo(self, data: bytes) -> bytes:
         """Echo the input bytes back unchanged."""

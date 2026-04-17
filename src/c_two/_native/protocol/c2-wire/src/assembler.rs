@@ -182,6 +182,7 @@ mod tests {
             max_segments: 2,
             max_dedicated_segments: 2,
             dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_asm_test"),
         })

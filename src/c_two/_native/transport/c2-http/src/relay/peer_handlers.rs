@@ -30,14 +30,14 @@ pub async fn handle_peer_announce(
     match envelope.message {
         PeerMessage::RouteAnnounce {
             name, relay_id, relay_url, ipc_address,
-            icrm_ns, icrm_ver, registered_at,
+            crm_ns, crm_ver, registered_at,
         } => {
             if relay_id == state.relay_id() {
                 return StatusCode::OK;
             }
             state.register_peer_route(RouteEntry {
                 name, relay_id, relay_url, ipc_address,
-                icrm_ns, icrm_ver,
+                crm_ns, crm_ver,
                 locality: Locality::Peer,
                 registered_at,
             });
@@ -168,8 +168,8 @@ pub async fn handle_peer_digest(
                                 relay_id: entry.relay_id.clone(),
                                 relay_url: entry.relay_url.clone(),
                                 ipc_address: entry.ipc_address.clone(),
-                                icrm_ns: entry.icrm_ns.clone(),
-                                icrm_ver: entry.icrm_ver.clone(),
+                                crm_ns: entry.crm_ns.clone(),
+                                crm_ver: entry.crm_ver.clone(),
                                 registered_at: entry.registered_at,
                             });
                         }

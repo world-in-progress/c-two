@@ -5,7 +5,7 @@ Provides a singleton :class:`_ProcessRegistry` that manages:
 1. **CRM registration** — registers CRM objects to a process-level
    :class:`Server`, making them accessible via IPC.
 2. **Thread preference** — ``connect()`` returns a zero-serialization
-   :class:`ICRMProxy.thread_local` when the target CRM lives in the
+   :class:`CRMProxy.thread_local` when the target CRM lives in the
    same process.
 3. **Client pooling** — remote connections reuse Rust IPC/HTTP clients
    via :class:`RustClientPool` and :class:`RustHttpClientPool`.
@@ -15,14 +15,14 @@ Usage::
     import c_two as cc
 
     # Register CRMs with explicit names
-    cc.register(IGrid, grid_instance, name='grid')
+    cc.register(Grid, grid_instance, name='grid')
 
     # Connect (same process → thread-local, no serialization)
-    icrm = cc.connect(IGrid, name='grid')
-    result = icrm.subdivide_grids([1], [0])
+    grid = cc.connect(Grid, name='grid')
+    result = grid.subdivide_grids([1], [0])
 
     # Close the connection
-    cc.close(icrm)
+    cc.close(grid)
 
     # Unregister when done
     cc.unregister('grid')
@@ -46,13 +46,13 @@ from typing import TypeVar
 from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
 from c_two.config.settings import settings
 from c_two.error import ResourceNotFound, ResourceUnavailable, RegistryUnavailable
-from .client.proxy import ICRMProxy
+from .client.proxy import CRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
 from .server.native import NativeServerBridge as Server
 
 from ..crm.meta import MethodAccess
 
-ICRM = TypeVar('ICRM')
+CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
 
 
@@ -73,7 +73,7 @@ class _Registration:
     """Bookkeeping for a locally registered CRM."""
 
     name: str
-    icrm_class: type
+    crm_class: type
     crm_instance: object
     concurrency: ConcurrencyConfig | None
     scheduler: Scheduler | None = None
@@ -169,10 +169,9 @@ class _ProcessRegistry:
     def set_shm_threshold(self, threshold: int) -> None:
         """Set the SHM threshold globally (server + client).
 
-        Payloads smaller than *threshold* bytes are sent inline;
-        larger payloads use shared memory.  Default: 4096 bytes.
-
-        Must be called **before** any :func:`register` or :func:`connect`.
+        Thin wrapper over :meth:`set_config` kept for internal callers that
+        configure a single field.  Must be called **before** any
+        :func:`register` or :func:`connect`.
 
         Parameters
         ----------
@@ -181,13 +180,7 @@ class _ProcessRegistry:
         """
         if threshold <= 0:
             raise ValueError(f'shm_threshold must be > 0, got {threshold}')
-        with self._lock:
-            if self._server is not None:
-                raise RuntimeError(
-                    'Cannot set shm_threshold after CRMs have been registered. '
-                    'Call set_shm_threshold() before register().',
-                )
-            self._shm_threshold = threshold
+        self.set_config(shm_threshold=threshold)
 
     def set_config(self, *, shm_threshold: int | None = None) -> None:
         """Set global config. Must be called before register()/connect()."""
@@ -238,7 +231,7 @@ class _ProcessRegistry:
 
     def register(
         self,
-        icrm_class: type,
+        crm_class: type,
         crm_instance: object,
         *,
         name: str,
@@ -255,10 +248,10 @@ class _ProcessRegistry:
 
         Parameters
         ----------
-        icrm_class:
-            ``@cc.icrm``-decorated interface class.
+        crm_class:
+            ``@cc.crm``-decorated interface (contract) class.
         crm_instance:
-            Concrete CRM object that implements *icrm_class*.
+            Concrete CRM object that implements *crm_class*.
         name:
             Unique routing name for this CRM instance.
         concurrency:
@@ -282,11 +275,11 @@ class _ProcessRegistry:
                 self._server_address = addr
                 # Rust pool uses its own defaults; skip Python IPCConfig.
 
-            self._server.register_crm(icrm_class, crm_instance, concurrency, name=name)
+            self._server.register_crm(crm_class, crm_instance, concurrency, name=name)
             scheduler, access_map = self._server.get_slot_info(name)
             self._registrations[name] = _Registration(
                 name=name,
-                icrm_class=icrm_class,
+                crm_class=crm_class,
                 crm_instance=crm_instance,
                 concurrency=concurrency,
                 scheduler=scheduler,
@@ -302,20 +295,20 @@ class _ProcessRegistry:
         log.debug('Registered CRM %s at %s', name, server_address)
 
         # Notify relay (outside lock to avoid deadlocks).
-        icrm_ns = getattr(icrm_class, '__cc_icrm_namespace__', '')
-        icrm_ver = getattr(icrm_class, '__cc_icrm_version__', '')
-        self._relay_register(name, server_address, icrm_ns, icrm_ver)
+        crm_ns = getattr(crm_class, '__cc_namespace__', '')
+        crm_ver = getattr(crm_class, '__cc_version__', '')
+        self._relay_register(name, server_address, crm_ns, crm_ver)
 
         return name
 
     def connect(
         self,
-        icrm_class: type[ICRM],
+        crm_class: type[CRM],
         *,
         name: str,
         address: str | None = None,
-    ) -> ICRM:
-        """Obtain an ICRM instance connected to a CRM.
+    ) -> CRM:
+        """Obtain a CRM instance connected to a registered resource.
 
         **Thread preference**: when the target *name* is registered in
         this process and no explicit *address* is given, returns a
@@ -323,8 +316,8 @@ class _ProcessRegistry:
 
         Parameters
         ----------
-        icrm_class:
-            ``@cc.icrm``-decorated interface class.
+        crm_class:
+            ``@cc.crm``-decorated interface (contract) class.
         name:
             Routing name of the target CRM.
         address:
@@ -334,15 +327,15 @@ class _ProcessRegistry:
         Returns
         -------
         object
-            An ICRM instance with ``.client`` set to an
-            :class:`ICRMProxy`.
+            A CRM instance with ``.client`` set to an
+            :class:`CRMProxy`.
         """
         with self._lock:
             local = self._registrations.get(name)
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
-            proxy = ICRMProxy.thread_local(
+            proxy = CRMProxy.thread_local(
                 local.crm_instance,
                 scheduler=local.scheduler,
                 access_map=local.access_map,
@@ -350,7 +343,7 @@ class _ProcessRegistry:
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
             client = self._http_pool.acquire(address)
-            proxy = ICRMProxy.http(
+            proxy = CRMProxy.http(
                 client,
                 name,
                 on_terminate=lambda addr=address: self._http_pool.release(addr),
@@ -359,7 +352,7 @@ class _ProcessRegistry:
             # Remote IPC via pooled RustClient.
             self._ensure_pool_config()
             client = self._pool.acquire(address)
-            proxy = ICRMProxy.ipc(
+            proxy = CRMProxy.ipc(
                 client,
                 name,
                 on_terminate=lambda addr=address: self._pool.release(addr),
@@ -397,7 +390,7 @@ class _ProcessRegistry:
 
                     if address.startswith(('http://', 'https://')):
                         client = self._http_pool.acquire(address)
-                        proxy = ICRMProxy.http(
+                        proxy = CRMProxy.http(
                             client,
                             name,
                             on_terminate=lambda addr=address: self._http_pool.release(addr),
@@ -405,15 +398,15 @@ class _ProcessRegistry:
                     else:
                         self._ensure_pool_config()
                         client = self._pool.acquire(address)
-                        proxy = ICRMProxy.ipc(
+                        proxy = CRMProxy.ipc(
                             client,
                             name,
                             on_terminate=lambda addr=address: self._pool.release(addr),
                         )
 
-                    icrm = icrm_class()
-                    icrm.client = proxy
-                    return icrm
+                    crm = crm_class()
+                    crm.client = proxy
+                    return crm
                 except Exception as e:
                     last_error = e
                     self._route_cache.invalidate(name)
@@ -423,16 +416,16 @@ class _ProcessRegistry:
                 f"All routes for '{name}' unreachable: {last_error}",
             )
 
-        icrm = icrm_class()
-        icrm.client = proxy
-        return icrm
+        crm = crm_class()
+        crm.client = proxy
+        return crm
 
-    def close(self, icrm: object) -> None:
+    def close(self, crm: object) -> None:
         """Close a connection obtained from :func:`connect`.
 
         Terminates the underlying proxy and releases pool references.
         """
-        proxy = getattr(icrm, 'client', None)
+        proxy = getattr(crm, 'client', None)
         if proxy is not None and hasattr(proxy, 'terminate'):
             proxy.terminate()
 
@@ -616,7 +609,7 @@ class _ProcessRegistry:
     # ------------------------------------------------------------------
 
     def _relay_register(self, name: str, ipc_address: str,
-                        icrm_ns: str = '', icrm_ver: str = ''):
+                        crm_ns: str = '', crm_ver: str = ''):
         """Notify relay about a new CRM registration with retry."""
         relay_addr = settings.relay_address
         if not relay_addr:
@@ -628,8 +621,8 @@ class _ProcessRegistry:
         payload = json.dumps({
             "name": name,
             "address": ipc_address,
-            "icrm_ns": icrm_ns,
-            "icrm_ver": icrm_ver,
+            "crm_ns": crm_ns,
+            "crm_ver": crm_ver,
         }).encode()
 
         url = f'{relay_addr.rstrip("/")}/_register'
@@ -653,10 +646,10 @@ class _ProcessRegistry:
         log.warning('Relay unreachable for %s — scheduling background retry',
                     name)
         self._schedule_background_relay_register(
-            name, ipc_address, icrm_ns, icrm_ver)
+            name, ipc_address, crm_ns, crm_ver)
 
     def _schedule_background_relay_register(self, name, ipc_address,
-                                            icrm_ns, icrm_ver):
+                                            crm_ns, crm_ver):
         """Background thread that keeps trying to register with relay."""
         import urllib.request
         import json
@@ -667,7 +660,7 @@ class _ProcessRegistry:
                 return
             payload = json.dumps({
                 "name": name, "address": ipc_address,
-                "icrm_ns": icrm_ns, "icrm_ver": icrm_ver,
+                "crm_ns": crm_ns, "crm_ver": crm_ver,
             }).encode()
             url = f'{relay_addr.rstrip("/")}/_register'
             delay = 1.0
@@ -818,24 +811,8 @@ def set_relay(address: str) -> None:
     _ProcessRegistry.get().set_relay(address)
 
 
-# Deprecated aliases — remove in next version
-def set_shm_threshold(threshold: int) -> None:
-    """Deprecated: use set_config(shm_threshold=...) instead."""
-    set_config(shm_threshold=threshold)
-
-
-def set_server_ipc_config(**kw: object) -> None:
-    """Deprecated: use set_server() instead."""
-    set_server(**kw)
-
-
-def set_client_ipc_config(**kw: object) -> None:
-    """Deprecated: use set_client() instead."""
-    set_client(**kw)
-
-
 def register(
-    icrm_class: type,
+    crm_class: type,
     crm_instance: object,
     *,
     name: str,
@@ -846,7 +823,7 @@ def register(
     See :meth:`_ProcessRegistry.register`.
     """
     return _ProcessRegistry.get().register(
-        icrm_class,
+        crm_class,
         crm_instance,
         name=name,
         concurrency=concurrency,
@@ -854,24 +831,24 @@ def register(
 
 
 def connect(
-    icrm_class: type[ICRM],
+    crm_class: type[CRM],
     *,
     name: str,
     address: str | None = None,
-) -> ICRM:
-    """Obtain an ICRM proxy for a CRM.
+) -> CRM:
+    """Obtain a CRM proxy for a registered resource.
 
     See :meth:`_ProcessRegistry.connect`.
     """
-    return _ProcessRegistry.get().connect(icrm_class, name=name, address=address)
+    return _ProcessRegistry.get().connect(crm_class, name=name, address=address)
 
 
-def close(icrm: object) -> None:
+def close(crm: object) -> None:
     """Close a connection obtained from :func:`connect`.
 
     See :meth:`_ProcessRegistry.close`.
     """
-    _ProcessRegistry.get().close(icrm)
+    _ProcessRegistry.get().close(crm)
 
 
 def unregister(name: str) -> None:

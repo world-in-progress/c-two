@@ -84,14 +84,14 @@ class TestGetShutdownMethod:
 
 
 # ---------------------------------------------------------------------------
-# ICRM integration tests
+# CRM integration tests
 # ---------------------------------------------------------------------------
 
 class TestICRMOnShutdown:
 
     def test_shutdown_method_not_in_transfer(self):
         """@cc.on_shutdown methods should not be wrapped by auto_transfer."""
-        @cc.icrm(namespace='test.sd', version='0.1.0')
+        @cc.crm(namespace='test.sd', version='0.1.0')
         class IDemo:
             def work(self, x: int) -> int: ...
 
@@ -102,12 +102,12 @@ class TestICRMOnShutdown:
         assert hasattr(IDemo, 'work')
         # 'cleanup' should NOT be auto_transfer wrapped — it should
         # either be absent or be the original unwrapped function
-        # The @cc.icrm decorator skips @cc.on_shutdown methods
+        # The @cc.crm decorator skips @cc.on_shutdown methods
         # They won't appear as decorated_methods in the new class
 
     def test_read_write_shutdown_coexist(self):
         """@cc.read, @cc.write, and @cc.on_shutdown can coexist."""
-        @cc.icrm(namespace='test.coexist', version='0.1.0')
+        @cc.crm(namespace='test.coexist', version='0.1.0')
         class ICoexist:
             @cc.read
             def get_data(self) -> int: ...

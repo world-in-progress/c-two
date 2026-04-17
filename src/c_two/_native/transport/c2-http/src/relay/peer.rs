@@ -20,8 +20,8 @@ pub enum PeerMessage {
         relay_id: String,
         relay_url: String,
         ipc_address: Option<String>,
-        icrm_ns: String,
-        icrm_ver: String,
+        crm_ns: String,
+        crm_ver: String,
         registered_at: f64,
     },
     /// A CRM route was unregistered.
@@ -73,8 +73,8 @@ pub struct DigestDiffEntry {
     pub relay_id: String,
     pub relay_url: String,
     pub ipc_address: Option<String>,
-    pub icrm_ns: String,
-    pub icrm_ver: String,
+    pub crm_ns: String,
+    pub crm_ver: String,
     pub registered_at: f64,
 }
 
@@ -126,8 +126,8 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 ipc_address: Some("ipc://grid".into()),
-                icrm_ns: "cc.demo".into(),
-                icrm_ver: "0.1.0".into(),
+                crm_ns: "cc.demo".into(),
+                crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,
             },
         );

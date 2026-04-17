@@ -2,34 +2,32 @@
 
 Provides the complete transport stack for C-Two:
 - Server: Rust tokio-based multi-CRM IPC server (via NativeServerBridge)
-- ICRMProxy: unified proxy (thread-local / IPC / HTTP)
+- CRMProxy: unified proxy (thread-local / IPC / HTTP)
 - Registry: cc.register/connect/close/shutdown SOTA API
 """
 from __future__ import annotations
 
 __all__ = [
-    'ICRMProxy',
+    'CRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
     'set_config', 'set_server', 'set_client',
-    'set_shm_threshold', 'set_server_ipc_config', 'set_client_ipc_config',
+    'set_relay',
     'register', 'connect', 'close',
     'unregister', 'server_address', 'shutdown', 'serve',
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
-    'ICRMProxy':         ('.client.proxy',        'ICRMProxy'),
+    'CRMProxy':         ('.client.proxy',        'CRMProxy'),
     'Server':          ('.server.native',       'NativeServerBridge'),
     'CRMSlot':           ('.server.native',       'CRMSlot'),
     'Scheduler':         ('.server.scheduler',    'Scheduler'),
     'ConcurrencyConfig': ('.server.scheduler',    'ConcurrencyConfig'),
     'ConcurrencyMode':   ('.server.scheduler',    'ConcurrencyMode'),
-    'set_config':          ('.registry',            'set_config'),
-    'set_server':          ('.registry',            'set_server'),
-    'set_client':          ('.registry',            'set_client'),
-    'set_shm_threshold': ('.registry',            'set_shm_threshold'),
-    'set_server_ipc_config': ('.registry',        'set_server_ipc_config'),
-    'set_client_ipc_config': ('.registry',        'set_client_ipc_config'),
+    'set_config':        ('.registry',            'set_config'),
+    'set_server':        ('.registry',            'set_server'),
+    'set_client':        ('.registry',            'set_client'),
+    'set_relay':         ('.registry',            'set_relay'),
     'register':          ('.registry',            'register'),
     'connect':           ('.registry',            'connect'),
     'close':             ('.registry',            'close'),

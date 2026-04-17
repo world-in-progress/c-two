@@ -15,8 +15,8 @@ sys.path.insert(0, _examples_dir)
 
 import c_two as cc
 
-# Import the ICRM interface from the shared grid package.
-from grid.igrid import IGrid
+# Import the CRM contract from the shared grid package.
+from grid.grid_contract import Grid
 
 # RELAY_URL = 'http://127.0.0.1:8300'
 
@@ -28,7 +28,7 @@ def main():
     # ── Connect by name ──────────────────────────────────────────────
     # No IPC address needed — the relay resolves 'grid' to the right
     # CRM process automatically.
-    grid = cc.connect(IGrid, name='grid')
+    grid = cc.connect(Grid, name='grid')
     print(f'Connected to Grid (mode: {grid.client._mode})\n')
 
     # ── 1. Hello ─────────────────────────────────────────────────────

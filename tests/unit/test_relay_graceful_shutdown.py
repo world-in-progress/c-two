@@ -16,7 +16,7 @@ from c_two.transport.registry import _ProcessRegistry
 
 # -- Helpers ---------------------------------------------------------------
 
-@cc.icrm(namespace='cc.test.relay_shutdown', version='0.1.0')
+@cc.crm(namespace='cc.test.relay_shutdown', version='0.1.0')
 class IRelayShutdownCRM:
     def ping(self) -> str:
         ...
