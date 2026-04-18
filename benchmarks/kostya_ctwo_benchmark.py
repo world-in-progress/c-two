@@ -1,380 +1,330 @@
-"""Kostya-style benchmark for c-two: coordinates round-trip + columnar aggregate.
+"""Kostya-style coordinate benchmark — c-two IPC variants.
 
-Inspired by the canonical kostya `json` benchmark
-(https://github.com/kostya/benchmarks/tree/master/json) — generate N
-`{x: f64, y: f64, z: f64}` coordinates, transport them to a remote consumer,
-then compute `(mean_x, mean_y, mean_z)` so deserialization cost is observable.
+Compares three transferable strategies for transporting a list of coordinate
+records (matches fastdb's own kostya benchmark schema: row_id, x, y, z, name).
 
-This script compares three transferable strategies over the **same** c-two IPC
-transport, isolating serialization cost from RPC cost:
+Strategies:
+  * pickle-records  : list[dict] over pickle (kostya canonical, slow)
+  * pickle-arrays   : 4 numpy arrays over pickle (numpy fast path)
+  * fastdb-hold     : fastdb ORM raw buffer + zero-copy load_xbuffer in hold mode
 
-  1. `pickle-records`  — pickle of `list[Coordinate]` (naive Python objects)
-  2. `pickle-arrays`   — pickle of `{xs|ys|zs: np.ndarray}` (numpy-aware pickle)
-  3. `fastdb-hold`     — fastdb `Feature` with `from_buffer` + hold mode
-                         (zero-deserialization, columnar SHM view)
-
-Companion: `kostya_ray_benchmark.py` runs the equivalent through Ray actors
-for cross-framework comparison.
-
-Usage:
-    C2_RELAY_ADDRESS= uv run python benchmarks/kostya_ctwo_benchmark.py
-    C2_RELAY_ADDRESS= uv run python benchmarks/kostya_ctwo_benchmark.py --max-n 1000000
+Run:
+    C2_RELAY_ADDRESS= uv run python benchmarks/kostya_ctwo_benchmark.py \
+        --variant fastdb-hold --n 1000000 --iters 30
 """
 from __future__ import annotations
 
 import argparse
-import gc
-import math
+import multiprocessing as mp
 import os
 import pickle
 import statistics
-import sys
 import time
+from typing import Callable
 
 import numpy as np
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
-
 import c_two as cc
 
-import fastdb4py as fx
+# ---------------------------------------------------------------------------
+# fastdb is optional; only required for the fastdb-hold variant
+# ---------------------------------------------------------------------------
+try:
+    from fastdb4py import core, ORM, F64, U32, STR, Feature
+
+    class Coord(Feature):
+        row_id: U32
+        x: F64
+        y: F64
+        z: F64
+        name: STR
+
+    HAS_FASTDB = True
+except ImportError:
+    HAS_FASTDB = False
+    Coord = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
-# Workload sizing — N coordinates × 24 bytes/record (3 × f64)
-# ---------------------------------------------------------------------------
-
-SIZES = [
-    (1_000,      '1K'),
-    (10_000,     '10K'),
-    (100_000,    '100K'),
-    (1_000_000,  '1M'),
-    (10_000_000, '10M'),
-]
-
-WARMUP = 3
-
-
-def rounds_for(n: int) -> int:
-    if n <= 10_000:
-        return 200
-    if n <= 100_000:
-        return 50
-    if n <= 1_000_000:
-        return 20
-    return 5
-
-
-# ---------------------------------------------------------------------------
-# Variant 1 — pickle of list[Coordinate] (record-oriented, the slow case)
+# Transferables — one per wire-format strategy
 # ---------------------------------------------------------------------------
 
 @cc.transferable
 class CoordRecords:
-    n: int
-    seed: int
+    """Pickle of list[dict] — kostya canonical, brutal on per-row overhead."""
+    records: list
 
-    def serialize(self: 'CoordRecords') -> bytes:
-        return pickle.dumps((self.n, self.seed))
+    def serialize(data: 'CoordRecords') -> bytes:
+        return pickle.dumps(data.records, protocol=pickle.HIGHEST_PROTOCOL)
 
-    def deserialize(raw: bytes) -> 'CoordRecords':
-        n, seed = pickle.loads(bytes(raw) if isinstance(raw, memoryview) else raw)
-        return CoordRecords(n=n, seed=seed)
+    def deserialize(buf: bytes) -> 'CoordRecords':
+        return CoordRecords(records=pickle.loads(buf))
 
-
-@cc.transferable
-class CoordList:
-    """list[(x,y,z)] — pickled as a list of tuples; consumer iterates in Python."""
-    items: list  # list[tuple[float, float, float]]
-
-    def serialize(self: 'CoordList') -> bytes:
-        return pickle.dumps(self.items, protocol=5)
-
-    def deserialize(raw: bytes) -> 'CoordList':
-        return CoordList(items=pickle.loads(bytes(raw) if isinstance(raw, memoryview) else raw))
-
-
-# ---------------------------------------------------------------------------
-# Variant 2 — pickle of dict[str, ndarray] (numpy-aware, fast case)
-# ---------------------------------------------------------------------------
 
 @cc.transferable
 class CoordArrays:
-    """{xs, ys, zs} as numpy arrays; pickle is already numpy-aware."""
-    xs: np.ndarray
-    ys: np.ndarray
-    zs: np.ndarray
+    """Pickle of 4 numpy arrays + 1 string list — numpy fast path."""
+    row_id: np.ndarray
+    x: np.ndarray
+    y: np.ndarray
+    z: np.ndarray
+    name: list
 
-    def serialize(self: 'CoordArrays') -> bytes:
-        return pickle.dumps({'xs': self.xs, 'ys': self.ys, 'zs': self.zs}, protocol=5)
-
-    def deserialize(raw: bytes) -> 'CoordArrays':
-        d = pickle.loads(bytes(raw) if isinstance(raw, memoryview) else raw)
-        return CoordArrays(xs=d['xs'], ys=d['ys'], zs=d['zs'])
-
-
-# ---------------------------------------------------------------------------
-# Variant 3 — fastdb Feature with from_buffer (zero-deserialization, hold mode)
-# ---------------------------------------------------------------------------
-
-class CoordFeature(fx.Feature):
-    xs: np.ndarray
-    ys: np.ndarray
-    zs: np.ndarray
-
-
-@cc.transferable
-class CoordFastdb:
-    """Wraps a fastdb Feature; from_buffer parses directly out of an SHM view.
-
-    Triggers c-two's auto hold-mode (transferable.py:518-520) — the SHM
-    backing the response is held alive until the client releases it.
-    """
-    feat: object  # CoordFeature; declared as object to keep dataclass happy
-
-    def serialize(self: 'CoordFastdb') -> bytes:
-        return fx.FastSerializer.dumps(self.feat)
-
-    def deserialize(raw: bytes) -> 'CoordFastdb':
-        feat = fx.FastSerializer.loads(
-            bytes(raw) if isinstance(raw, memoryview) else raw,
-            CoordFeature,
+    def serialize(data: 'CoordArrays') -> bytes:
+        return pickle.dumps(
+            (data.row_id, data.x, data.y, data.z, data.name),
+            protocol=pickle.HIGHEST_PROTOCOL,
         )
-        return CoordFastdb(feat=feat)
 
-    def from_buffer(buf: memoryview) -> 'CoordFastdb':
-        # fastdb.loads accepts buffer-protocol objects without copying.
-        feat = fx.FastSerializer.loads(buf, CoordFeature)
-        return CoordFastdb(feat=feat)
+    def deserialize(buf: bytes) -> 'CoordArrays':
+        row_id, x, y, z, name = pickle.loads(buf)
+        return CoordArrays(row_id=row_id, x=x, y=y, z=z, name=name)
+
+
+if HAS_FASTDB:
+    @cc.transferable
+    class CoordFastdb:
+        """Wraps a fastdb ORM and exposes its raw columnar buffer.
+
+        The whole point: ``from_buffer(memoryview)`` calls
+        ``WxDatabase.load_xbuffer`` directly on c-two's hold-mode SHM view —
+        zero copy, zero parse, just a header walk in C++.
+        """
+        orm: object  # ORM (mutable side) or memoryview-backed ORM (consumer side)
+
+        def serialize(data: 'CoordFastdb') -> bytes:
+            buf = data.orm._origin.buffer().as_array(np.uint8)
+            return bytes(buf)
+
+        def deserialize(buf: bytes) -> 'CoordFastdb':
+            db = core.WxDatabase.load_xbuffer(memoryview(buf))
+            orm = ORM()
+            orm._origin = db
+            for i in range(db.get_layer_count()):
+                tbl = db.get_layer(i)
+                if tbl.name() == '_name_':
+                    orm._named_table = tbl
+                    break
+            return CoordFastdb(orm=orm)
+
+        def from_buffer(buf: memoryview) -> 'CoordFastdb':
+            db = core.WxDatabase.load_xbuffer(buf)
+            orm = ORM()
+            orm._origin = db
+            for i in range(db.get_layer_count()):
+                tbl = db.get_layer(i)
+                if tbl.name() == '_name_':
+                    orm._named_table = tbl
+                    break
+            return CoordFastdb(orm=orm)
 
 
 # ---------------------------------------------------------------------------
-# CRM contract — three methods, one per transferable variant
+# CRM contracts — one per variant (must match what server registers)
 # ---------------------------------------------------------------------------
 
 @cc.crm(namespace='bench.kostya', version='0.1.0')
-class CoordSource:
-    def gen_records(self, req: CoordRecords) -> CoordList: ...
-    def gen_arrays(self, req: CoordRecords) -> CoordArrays: ...
-    # Output has from_buffer → cc.hold() at call site picks the zero-copy path.
-    def gen_fastdb(self, req: CoordRecords) -> CoordFastdb: ...
+class ICoordRecords:
+    def echo(self, data: CoordRecords) -> CoordRecords: ...
 
 
-class CoordSourceImpl:
-    def gen_records(self, req: CoordRecords) -> CoordList:
-        rng = np.random.default_rng(req.seed)
-        # Generate columnar then convert to list of tuples — list-of-records
-        # is the slow representation we want to measure.
-        xs = rng.random(req.n)
-        ys = rng.random(req.n)
-        zs = rng.random(req.n)
-        items = list(zip(xs.tolist(), ys.tolist(), zs.tolist()))
-        return CoordList(items=items)
+@cc.crm(namespace='bench.kostya', version='0.1.0')
+class ICoordArrays:
+    def echo(self, data: CoordArrays) -> CoordArrays: ...
 
-    def gen_arrays(self, req: CoordRecords) -> CoordArrays:
-        rng = np.random.default_rng(req.seed)
-        return CoordArrays(
-            xs=rng.random(req.n),
-            ys=rng.random(req.n),
-            zs=rng.random(req.n),
+
+if HAS_FASTDB:
+    @cc.crm(namespace='bench.kostya', version='0.1.0')
+    class ICoordFastdb:
+        def echo(self, data: CoordFastdb) -> CoordFastdb: ...
+
+
+# ---------------------------------------------------------------------------
+# CRM implementations — pre-build the payload, return on each call
+# ---------------------------------------------------------------------------
+
+class CoordRecordsCRM:
+    def __init__(self, n: int):
+        self._payload = CoordRecords(records=[
+            {'row_id': i, 'x': i * 0.1, 'y': i * 0.2, 'z': i * 0.3,
+             'name': f'coord_{i % 50000:05d}'}
+            for i in range(n)
+        ])
+
+    def echo(self, data: CoordRecords) -> CoordRecords:
+        return self._payload
+
+
+class CoordArraysCRM:
+    def __init__(self, n: int):
+        idx = np.arange(n, dtype=np.uint32)
+        self._payload = CoordArrays(
+            row_id=idx,
+            x=idx.astype(np.float64) * 0.1,
+            y=idx.astype(np.float64) * 0.2,
+            z=idx.astype(np.float64) * 0.3,
+            name=[f'coord_{i % 50000:05d}' for i in range(n)],
         )
 
-    def gen_fastdb(self, req: CoordRecords) -> CoordFastdb:
-        rng = np.random.default_rng(req.seed)
-        feat = CoordFeature(
-            xs=rng.random(req.n),
-            ys=rng.random(req.n),
-            zs=rng.random(req.n),
-        )
-        return CoordFastdb(feat=feat)
+    def echo(self, data: CoordArrays) -> CoordArrays:
+        return self._payload
+
+
+if HAS_FASTDB:
+    class CoordFastdbCRM:
+        def __init__(self, n: int):
+            orm = ORM.create()
+            for i in range(n):
+                f = Coord()
+                f.row_id = i
+                f.x = i * 0.1
+                f.y = i * 0.2
+                f.z = i * 0.3
+                f.name = f'coord_{i % 50000:05d}'
+                orm.push(f)
+            orm._combine()
+            self._payload = CoordFastdb(orm=orm)
+
+        def echo(self, data: CoordFastdb) -> CoordFastdb:
+            return self._payload
 
 
 # ---------------------------------------------------------------------------
-# Consumers — same final aggregate (mean_x, mean_y, mean_z)
+# Consumer-side aggregations — what we measure includes both transport AND
+# the cost of materializing usable values from the received representation
 # ---------------------------------------------------------------------------
 
-def consume_list(result: CoordList) -> tuple[float, float, float]:
-    """Pure-Python aggregate over list-of-tuples — the slow path."""
-    items = result.items
-    n = len(items)
-    sx = sy = sz = 0.0
-    for x, y, z in items:
-        sx += x; sy += y; sz += z
-    return sx / n, sy / n, sz / n
+def consume_records(payload: CoordRecords) -> float:
+    return sum(r['x'] + r['y'] + r['z'] for r in payload.records)
 
 
-def consume_arrays(result: CoordArrays) -> tuple[float, float, float]:
-    return float(result.xs.mean()), float(result.ys.mean()), float(result.zs.mean())
+def consume_arrays(payload: CoordArrays) -> float:
+    return float(payload.x.sum() + payload.y.sum() + payload.z.sum())
 
 
-def consume_fastdb(result: CoordFastdb) -> tuple[float, float, float]:
-    feat = result.feat
-    return float(feat.xs.mean()), float(feat.ys.mean()), float(feat.zs.mean())
+def consume_fastdb(payload) -> float:
+    tbl = payload.orm[Coord][Coord]
+    cx = tbl.column.x
+    cy = tbl.column.y
+    cz = tbl.column.z
+    return float(cx[:].sum() + cy[:].sum() + cz[:].sum())
 
 
 # ---------------------------------------------------------------------------
-# IPC server bootstrap — single per-process server, three CRMs share it
+# Server / client harness
 # ---------------------------------------------------------------------------
 
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
+VARIANTS = {
+    'pickle-records': (ICoordRecords, CoordRecordsCRM, consume_records),
+    'pickle-arrays':  (ICoordArrays,  CoordArraysCRM,  consume_arrays),
+}
+if HAS_FASTDB:
+    VARIANTS['fastdb-hold'] = (ICoordFastdb, CoordFastdbCRM, consume_fastdb)
 
 
-def _wait_for_socket(address: str, timeout: float = 5.0) -> None:
-    region_id = address.replace('ipc://', '')
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
-            return
+def _server_main(variant: str, n: int, ready_path: str) -> None:
+    icrm_cls, crm_cls, _ = VARIANTS[variant]
+    cc.set_server(pool_segment_size=2 * 1024 * 1024 * 1024, max_pool_segments=8)
+    cc.register(icrm_cls, crm_cls(n), name='coords')
+    addr = cc.server_address() or ''
+    with open(ready_path, 'w') as f:
+        f.write(addr)
+    cc.serve()
+
+
+def _wait_ready(ready_path: str, timeout: float = 60.0) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(ready_path):
+            with open(ready_path) as f:
+                addr = f.read().strip()
+            if addr:
+                return addr
         time.sleep(0.05)
+    raise TimeoutError(f'server not ready in {timeout}s')
 
 
-# ---------------------------------------------------------------------------
-# Benchmark runners
-# ---------------------------------------------------------------------------
+def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict:
+    icrm_cls, _, consumer = VARIANTS[variant]
 
-def bench_variant(proxy, method_name: str, consumer, n: int, rounds: int,
-                  use_hold: bool) -> tuple[float, float, float]:
-    req = CoordRecords(n=n, seed=42)
+    ready_path = f'/tmp/kostya_{variant}_{os.getpid()}_{time.time_ns()}.ready'
 
-    method = getattr(proxy, method_name)
-
-    # Warmup
-    for _ in range(WARMUP):
-        if use_hold:
-            with cc.hold(method)(req) as held:
-                consumer(held.value)
-        else:
-            consumer(method(req))
-
-    rpc_lat: list[float] = []      # round-trip + serialization-only
-    total_lat: list[float] = []    # round-trip + consume (aggregate)
-
-    gc.disable()
+    ctx = mp.get_context('spawn')
+    proc = ctx.Process(target=_server_main, args=(variant, n, ready_path))
+    proc.start()
     try:
-        for _ in range(rounds):
+        address = _wait_ready(ready_path)
+
+        cc.set_client(pool_segment_size=2 * 1024 * 1024 * 1024, max_pool_segments=8)
+        proxy = cc.connect(icrm_cls, name='coords', address=address)
+
+        # Warmup
+        for _ in range(warmup):
+            with cc.hold(proxy.echo)(_dummy_for_variant(variant, 1)) as held:
+                _ = consumer(held.value)
+
+        # Measure end-to-end: call + materialize + columnar read
+        total_ms: list[float] = []
+        for _ in range(iters):
             t0 = time.perf_counter()
-            if use_hold:
-                with cc.hold(method)(req) as held:
-                    t1 = time.perf_counter()
-                    means = consumer(held.value)
-                    t2 = time.perf_counter()
-            else:
-                result = method(req)
-                t1 = time.perf_counter()
-                means = consumer(result)
-                t2 = time.perf_counter()
-                del result
-            rpc_lat.append(t1 - t0)
-            total_lat.append(t2 - t0)
+            with cc.hold(proxy.echo)(_dummy_for_variant(variant, 1)) as held:
+                _ = consumer(held.value)
+            total_ms.append((time.perf_counter() - t0) * 1000)
+
+        cc.close(proxy)
+        cc.shutdown()
+
+        return {
+            'variant': variant,
+            'n': n,
+            'iters': iters,
+            'p50_ms': statistics.median(total_ms),
+            'p10_ms': statistics.quantiles(total_ms, n=10)[0] if iters >= 10 else min(total_ms),
+            'p90_ms': statistics.quantiles(total_ms, n=10)[8] if iters >= 10 else max(total_ms),
+            'min_ms': min(total_ms),
+            'max_ms': max(total_ms),
+            'mean_ms': statistics.fmean(total_ms),
+        }
     finally:
-        gc.enable()
+        proc.terminate()
+        proc.join(timeout=5)
+        try: os.unlink(ready_path)
+        except FileNotFoundError: pass
 
-    # Sanity check
-    assert all(0.4 < m < 0.6 for m in means), f'unexpected means: {means}'
 
-    return (
-        statistics.median(rpc_lat) * 1000.0,
-        statistics.median(total_lat) * 1000.0,
-        statistics.median([t - r for t, r in zip(total_lat, rpc_lat)]) * 1000.0,
-    )
+def _dummy_for_variant(variant: str, n: int):
+    """Tiny request payload — what the client sends; server ignores it."""
+    if variant == 'pickle-records':
+        return CoordRecords(records=[{'row_id': 0, 'x': 0.0, 'y': 0.0, 'z': 0.0, 'name': 'x'}] * n)
+    if variant == 'pickle-arrays':
+        z = np.zeros(n, dtype=np.uint32)
+        zf = np.zeros(n, dtype=np.float64)
+        return CoordArrays(row_id=z, x=zf, y=zf, z=zf, name=['x'] * n)
+    if variant == 'fastdb-hold':
+        orm = ORM.create()
+        f = Coord(); f.row_id = 0; f.x = 0.0; f.y = 0.0; f.z = 0.0; f.name = 'x'
+        orm.push(f)
+        orm._combine()
+        return CoordFastdb(orm=orm)
+    raise ValueError(variant)
 
+
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Kostya-style coordinate benchmark for c-two')
-    parser.add_argument('--max-n', type=int, default=None, help='Cap maximum N')
-    parser.add_argument('--skip-records', action='store_true',
-                        help='Skip the slow list-of-records variant (huge at 10M)')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--variant', choices=sorted(VARIANTS.keys()), required=True)
+    p.add_argument('--n', type=int, required=True, help='record count')
+    p.add_argument('--iters', type=int, default=30)
+    p.add_argument('--warmup', type=int, default=3)
+    args = p.parse_args()
 
-    sizes = [(n, lbl) for n, lbl in SIZES if args.max_n is None or n <= args.max_n]
-
-    cc.set_server(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.set_client(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.register(CoordSource, CoordSourceImpl(), name='coord')
-    address = cc.server_address()
-    _wait_for_socket(address)
-
-    proxy = cc.connect(CoordSource, name='coord', address=address)
-
-    print('=' * 92)
-    print('Kostya-style coordinate benchmark — C-Two IPC, three transferable strategies')
-    print(f'NumPy: {np.__version__}  fastdb4py: present  Python: {sys.version.split()[0]}')
-    print(f'Warmup: {WARMUP}  |  Adaptive rounds')
-    print('=' * 92)
-    print(f'{"N":>8}  {"Strategy":>16}  {"RPC P50":>10}  {"Aggregate":>10}  {"Total P50":>10}  {"GB/s":>8}')
-    print('-' * 92)
-
-    rows: list[tuple[str, str, float, float, float]] = []
-
-    for n, label in sizes:
-        rounds = rounds_for(n)
-        size_bytes = n * 24  # 3 × f64
-
-        # Variant 1 — pickle of list-of-records
-        if not (args.skip_records and n >= 1_000_000):
-            try:
-                rpc, total, agg = bench_variant(
-                    proxy, 'gen_records', consume_list, n, rounds, use_hold=False,
-                )
-                tput = (size_bytes / (total / 1000.0)) / (1024 ** 3)
-                print(f'{label:>8}  {"pickle-records":>16}  '
-                      f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m  {tput:>6.2f}')
-                rows.append((label, 'pickle-records', rpc, total, agg))
-            except Exception as e:  # noqa: BLE001
-                print(f'{label:>8}  {"pickle-records":>16}  FAILED: {e}')
-
-        # Variant 2 — pickle of dict-of-arrays (numpy-aware)
-        try:
-            rpc, total, agg = bench_variant(
-                proxy, 'gen_arrays', consume_arrays, n, rounds, use_hold=False,
-            )
-            tput = (size_bytes / (total / 1000.0)) / (1024 ** 3)
-            print(f'{label:>8}  {"pickle-arrays":>16}  '
-                  f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m  {tput:>6.2f}')
-            rows.append((label, 'pickle-arrays', rpc, total, agg))
-        except Exception as e:  # noqa: BLE001
-            print(f'{label:>8}  {"pickle-arrays":>16}  FAILED: {e}')
-
-        # Variant 3 — fastdb + hold mode (zero-deser)
-        try:
-            rpc, total, agg = bench_variant(
-                proxy, 'gen_fastdb', consume_fastdb, n, rounds, use_hold=True,
-            )
-            tput = (size_bytes / (total / 1000.0)) / (1024 ** 3)
-            print(f'{label:>8}  {"fastdb-hold":>16}  '
-                  f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m  {tput:>6.2f}')
-            rows.append((label, 'fastdb-hold', rpc, total, agg))
-        except Exception as e:  # noqa: BLE001
-            print(f'{label:>8}  {"fastdb-hold":>16}  FAILED: {e}')
-
-        print()
-
-    print('=' * 92)
-    print('RPC P50    = client wall time, request → result object received')
-    print('Aggregate  = client time to compute (mean_x, mean_y, mean_z) over received data')
-    print('Total P50  = RPC + Aggregate (end-to-end work-completed latency)')
-    print('GB/s       = throughput based on raw payload size (24 bytes × N)')
-
-    cc.close(proxy)
-    cc.unregister('coord')
-    cc.shutdown()
-
-    # Persist results
-    results_dir = os.path.join(os.path.dirname(__file__), 'results')
-    os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, 'kostya_ctwo.txt')
-    with open(out_path, 'w') as f:
-        f.write('# Kostya-style coordinate benchmark — C-Two IPC\n')
-        f.write(f'# {len(rows)} measurements\n')
-        f.write(f'{"N":>8}\t{"Strategy":>16}\t{"RPC_ms":>10}\t{"Total_ms":>10}\t{"Aggregate_ms":>14}\n')
-        for label, strat, rpc, total, agg in rows:
-            f.write(f'{label:>8}\t{strat:>16}\t{rpc:>10.4f}\t{total:>10.4f}\t{agg:>14.4f}\n')
-    print(f'\nResults written to {out_path}')
-
-
-def _geomean(xs: list[float]) -> float:
-    return math.exp(sum(math.log(x) for x in xs) / len(xs))
+    res = run_variant(args.variant, args.n, args.iters, args.warmup)
+    print(f"\n=== c-two IPC | variant={res['variant']} N={res['n']:,} iters={res['iters']} ===")
+    print(f"  p10  {res['p10_ms']:8.2f} ms")
+    print(f"  p50  {res['p50_ms']:8.2f} ms")
+    print(f"  p90  {res['p90_ms']:8.2f} ms")
+    print(f"  mean {res['mean_ms']:8.2f} ms  (min {res['min_ms']:.2f} / max {res['max_ms']:.2f})")
 
 
 if __name__ == '__main__':

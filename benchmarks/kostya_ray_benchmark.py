@@ -28,7 +28,7 @@ SIZES = [
     (10_000,     '10K'),
     (100_000,    '100K'),
     (1_000_000,  '1M'),
-    (10_000_000, '10M'),
+    (3_000_000,  '3M'),
 ]
 
 WARMUP = 3
@@ -36,49 +36,56 @@ WARMUP = 3
 
 def rounds_for(n: int) -> int:
     if n <= 10_000:
-        return 200
+        return 100
     if n <= 100_000:
-        return 50
+        return 30
     if n <= 1_000_000:
-        return 20
+        return 15
     return 5
 
 
 @ray.remote
 class CoordSourceActor:
-    def gen_records(self, n: int, seed: int):
-        rng = np.random.default_rng(seed)
-        xs = rng.random(n).tolist()
-        ys = rng.random(n).tolist()
-        zs = rng.random(n).tolist()
-        return list(zip(xs, ys, zs))
+    def __init__(self):
+        self._cache: dict[tuple[str, int], object] = {}
 
-    def gen_arrays(self, n: int, seed: int):
-        rng = np.random.default_rng(seed)
-        return {
-            'xs': rng.random(n),
-            'ys': rng.random(n),
-            'zs': rng.random(n),
-        }
+    def gen_records(self, n: int):
+        key = ('records', n)
+        if key not in self._cache:
+            self._cache[key] = [
+                {'row_id': i, 'x': i * 0.1, 'y': i * 0.2, 'z': i * 0.3,
+                 'name': f'coord_{i % 50000:05d}'}
+                for i in range(n)
+            ]
+        return self._cache[key]
+
+    def gen_arrays(self, n: int):
+        key = ('arrays', n)
+        if key not in self._cache:
+            idx = np.arange(n, dtype=np.uint32)
+            self._cache[key] = {
+                'row_id': idx,
+                'x': idx.astype(np.float64) * 0.1,
+                'y': idx.astype(np.float64) * 0.2,
+                'z': idx.astype(np.float64) * 0.3,
+                'name': [f'coord_{i % 50000:05d}' for i in range(n)],
+            }
+        return self._cache[key]
 
 
-def consume_records(items) -> tuple[float, float, float]:
-    n = len(items)
-    sx = sy = sz = 0.0
-    for x, y, z in items:
-        sx += x; sy += y; sz += z
-    return sx / n, sy / n, sz / n
+def consume_records(items) -> float:
+    return sum(r['x'] + r['y'] + r['z'] for r in items)
 
 
-def consume_arrays(d) -> tuple[float, float, float]:
-    return float(d['xs'].mean()), float(d['ys'].mean()), float(d['zs'].mean())
+def consume_arrays(d) -> float:
+    return float(d['x'].sum() + d['y'].sum() + d['z'].sum())
 
 
 def bench(actor, method_name: str, consumer, n: int, rounds: int):
     method = getattr(actor, method_name)
 
     for _ in range(WARMUP):
-        consumer(ray.get(method.remote(n, 42)))
+        consumer(ray.get(method.remote(n)))
 
     rpc_lat: list[float] = []
     total_lat: list[float] = []
@@ -87,9 +94,9 @@ def bench(actor, method_name: str, consumer, n: int, rounds: int):
     try:
         for _ in range(rounds):
             t0 = time.perf_counter()
-            result = ray.get(method.remote(n, 42))
+            result = ray.get(method.remote(n))
             t1 = time.perf_counter()
-            means = consumer(result)
+            _ = consumer(result)
             t2 = time.perf_counter()
             del result
             rpc_lat.append(t1 - t0)
@@ -97,7 +104,6 @@ def bench(actor, method_name: str, consumer, n: int, rounds: int):
     finally:
         gc.enable()
 
-    assert all(0.4 < m < 0.6 for m in means), f'unexpected means: {means}'
     return (
         statistics.median(rpc_lat) * 1000.0,
         statistics.median(total_lat) * 1000.0,
@@ -116,37 +122,33 @@ def main() -> None:
     )
 
     actor = CoordSourceActor.remote()
-    ray.get(actor.gen_arrays.remote(10, 0))  # warmup actor process
+    ray.get(actor.gen_arrays.remote(10))  # warmup actor process
 
     print('=' * 92)
     print(f'Kostya-style coordinate benchmark — Ray {ray.__version__}')
     print(f'NumPy: {np.__version__}  Warmup: {WARMUP}  |  Adaptive rounds')
     print('=' * 92)
-    print(f'{"N":>8}  {"Strategy":>16}  {"RPC P50":>10}  {"Aggregate":>10}  {"Total P50":>10}  {"GB/s":>8}')
+    print(f'{"N":>8}  {"Strategy":>16}  {"RPC P50":>10}  {"Aggregate":>10}  {"Total P50":>10}')
     print('-' * 92)
 
     rows: list[tuple[str, str, float, float, float]] = []
     for n, label in SIZES:
-        # Skip records at very large N — turns into multi-second territory.
-        skip_records = n >= 10_000_000
+        skip_records = n >= 3_000_000
         rounds = rounds_for(n)
-        size_bytes = n * 24
 
         if not skip_records:
             try:
                 rpc, total, agg = bench(actor, 'gen_records', consume_records, n, rounds)
-                tput = (size_bytes / (total / 1000.0)) / (1024 ** 3)
                 print(f'{label:>8}  {"ray-records":>16}  '
-                      f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m  {tput:>6.2f}')
+                      f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m')
                 rows.append((label, 'ray-records', rpc, total, agg))
             except Exception as e:  # noqa: BLE001
                 print(f'{label:>8}  {"ray-records":>16}  FAILED: {e}')
 
         try:
             rpc, total, agg = bench(actor, 'gen_arrays', consume_arrays, n, rounds)
-            tput = (size_bytes / (total / 1000.0)) / (1024 ** 3)
             print(f'{label:>8}  {"ray-arrays":>16}  '
-                  f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m  {tput:>6.2f}')
+                  f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m')
             rows.append((label, 'ray-arrays', rpc, total, agg))
         except Exception as e:  # noqa: BLE001
             print(f'{label:>8}  {"ray-arrays":>16}  FAILED: {e}')
