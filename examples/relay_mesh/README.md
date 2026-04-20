@@ -3,7 +3,7 @@
 Demonstrates C-Two's **relay mesh** for automatic resource discovery.
 Clients connect to CRM resources **by name** — no IPC addresses needed.
 
-Reuses the `Grid` CRM and `IGrid` ICRM from `examples/grid/`.
+Reuses the `Grid` contract and `NestedGrid` resource from `examples/grid/`.
 
 ## Prerequisites
 
@@ -42,11 +42,11 @@ uv run examples/relay_mesh/client.py
 
 ## What this demonstrates
 
-- **Name-based discovery**: client uses `cc.connect(IGrid, name='grid')` without
+- **Name-based discovery**: client uses `cc.connect(Grid, name='grid')` without
   knowing the CRM process's IPC address
 - **Relay registration**: CRM process calls `cc.set_relay()` so `cc.register()`
   automatically announces the resource to the relay
-- **Transparent transport**: the same ICRM interface works identically across
+- **Transparent transport**: the same CRM contract works identically across
   thread-local, IPC, and HTTP relay modes
 - **Lifecycle management**: `cc.serve()` blocks until SIGINT, then gracefully
   unregisters from the relay

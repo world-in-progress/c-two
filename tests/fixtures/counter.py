@@ -1,12 +1,12 @@
-"""A second lightweight CRM/ICRM pair for multi-CRM server testing."""
+"""A second lightweight CRM contract / resource pair for multi-CRM server testing."""
 import pickle
 
 import c_two as cc
 
 
-@cc.icrm(namespace='test.counter', version='0.1.0')
-class ICounter:
-    """Lightweight ICRM for a stateful counter resource."""
+@cc.crm(namespace='test.counter', version='0.1.0')
+class Counter:
+    """Lightweight CRM contract for a stateful counter resource."""
 
     def get(self) -> int:
         ...
@@ -18,8 +18,8 @@ class ICounter:
         ...
 
 
-class Counter:
-    """Stateful CRM that maintains an integer counter."""
+class CounterImpl:
+    """Stateful resource that maintains an integer counter."""
 
     def __init__(self, initial: int = 0):
         self._value = initial

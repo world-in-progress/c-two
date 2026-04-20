@@ -12,8 +12,8 @@ from c_two.transport import Server
 from c_two.config.ipc import ServerIPCConfig
 from c_two.transport.client.util import ping
 
-from tests.fixtures.hello import Hello
-from tests.fixtures.ihello import IHello
+from tests.fixtures.hello import HelloImpl
+from tests.fixtures.ihello import Hello
 
 
 # ---------------------------------------------------------------------------
@@ -55,11 +55,11 @@ class TestHeartbeatIntegration:
         """An active client is NOT disconnected by heartbeat probes."""
         config = ServerIPCConfig(heartbeat_interval=0.3, heartbeat_timeout=0.8)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
+        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
-            proxy = cc.connect(IHello, name='hello', address=address)
+            proxy = cc.connect(Hello, name='hello', address=address)
             try:
                 # Make repeated calls over 1s (longer than heartbeat_interval)
                 for _ in range(4):
@@ -78,11 +78,11 @@ class TestHeartbeatIntegration:
         """An idle client that responds to PING survives heartbeat probes."""
         config = ServerIPCConfig(heartbeat_interval=0.2, heartbeat_timeout=0.6)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
+        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
-            proxy = cc.connect(IHello, name='hello', address=address)
+            proxy = cc.connect(Hello, name='hello', address=address)
             try:
                 # Do one call then go idle for longer than heartbeat_interval
                 result = proxy.greeting('Idle')
@@ -106,7 +106,7 @@ class TestHeartbeatIntegration:
         import socket
         config = ServerIPCConfig(heartbeat_interval=0.1, heartbeat_timeout=0.3)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
+        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
@@ -135,11 +135,11 @@ class TestHeartbeatIntegration:
         """When heartbeat_interval=0, no probes are sent."""
         config = ServerIPCConfig(heartbeat_interval=0, heartbeat_timeout=30)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, IHello, Hello(), ipc_config=config, name='hello')
+        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
         server.start()
         try:
             _wait_for_server(address)
-            proxy = cc.connect(IHello, name='hello', address=address)
+            proxy = cc.connect(Hello, name='hello', address=address)
             try:
                 # Idle for a while — should NOT be disconnected
                 time.sleep(0.3)

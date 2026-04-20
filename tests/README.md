@@ -26,8 +26,8 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 
 | File | Description |
 |------|-------------|
-| `test_icrm_decorator.py` | `@cc.icrm()` decorator, namespace/version validation, method registration |
-| `test_crm_template.py` | CRM template generation from ICRM interface classes |
+| `test_crm_decorator.py` | `@cc.crm()` decorator, namespace/version validation, method registration |
+| `test_crm_template.py` | CRM template generation from CRM interface classes |
 | `test_encoding.py` | Wire protocol encoding/decoding, message serialization |
 | `test_error.py` | `CCError` hierarchy — serialization/deserialization across wire |
 | `test_transferable.py` | `@transferable` decorator — serialize/deserialize, auto-dataclass, scatter-write tuples, memoryview-aware deserialize, bytes fast-path |
@@ -39,10 +39,10 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 |------|-------------|
 | `test_wire_v2.py` | Wire v2 codec — call/reply control encoding, default-route cache |
 | `test_scheduler.py` | Read/write concurrency scheduler for CRM method dispatch |
-| `test_concurrency.py` | Read/write lock semantics for ICRM method scheduling |
+| `test_concurrency.py` | Read/write lock semantics for CRM method scheduling |
 | `test_client_pool.py` | `ClientPool` — ref-counted IPC client management, grace period |
-| `test_icrm_proxy.py` | `ICRMProxy` — thread-local and IPC modes, method routing |
-| `test_proxy_concurrency.py` | ICRMProxy concurrency under read/write access control |
+| `test_crm_proxy.py` | `CRMProxy` — thread-local and IPC modes, method routing |
+| `test_proxy_concurrency.py` | CRMProxy concurrency under read/write access control |
 | `test_chunk_assembler.py` | Chunk assembler — OOM validation, reassembly, boundary checks |
 | `test_serve.py` | `cc.serve()` API — server start/stop lifecycle |
 | `test_security_v2.py` | v2 handshake security, frame validation |
@@ -75,21 +75,20 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `test_rpc_v2_basic.py` | IPC client backward compatibility with legacy IPC server |
 | `test_registry.py` | `cc.register()` / `cc.connect()` / `cc.close()` SOTA API lifecycle |
 | `test_multi_crm_server.py` | Multi-CRM routing — name-based dispatch, concurrent access |
-| `test_icrm_proxy.py` | ICRMProxy integration — thread-local + IPC modes end-to-end |
+| `test_crm_proxy.py` | CRMProxy integration — thread-local + IPC modes end-to-end |
 | `test_chunked_transfer.py` | Large payload chunked transfer across transports |
 | `test_backpressure.py` | Buddy pool OOM backpressure — L0/L1/L2 protection |
 | `test_concurrency_safety.py` | Concurrent client safety under load |
 | `test_error_propagation.py` | CRM-side exceptions propagate to client as typed `CCError` |
 | `test_p0_fixes.py` | P0 regression tests — scheduler, proxy, lifecycle fixes |
 | `test_serve.py` | `cc.serve()` integration — multi-protocol serving |
-| `test_component_runtime.py` | Component `@cc.runtime.connect` — injection, type matching, address passing |
 | `test_http_relay.py` | HTTP relay end-to-end — POST routing, error forwarding |
 
 ## Shared Fixtures (`tests/fixtures/`)
 
 | File | Description |
 |------|-------------|
-| `ihello.py` | `IHello` ICRM interface + `HelloData` / `HelloItems` transferable types |
+| `ihello.py` | `Hello` CRM interface + `HelloData` / `HelloItems` transferable types |
 | `hello.py` | `Hello` CRM implementation (stateful greeting service) |
 | `counter.py` | `ICounter` / `Counter` — minimal read/write CRM for concurrency tests |
 

@@ -5,6 +5,20 @@ description = "C-Two is a resource-RPC framework that enables resource-oriented 
 readme = "README.md"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
     "click>=8.2.1",
     "pydantic-settings>=2.0.0",

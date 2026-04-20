@@ -190,12 +190,12 @@ class TestRuntimeProtection:
     def test_set_server_after_register_warns(self):
         import warnings
         import c_two as cc
-        from tests.fixtures.ihello import IHello
-        from tests.fixtures.hello import Hello
+        from tests.fixtures.ihello import Hello
+        from tests.fixtures.hello import HelloImpl
 
         registered = False
         try:
-            cc.register(IHello, Hello(), name='rp_hello')
+            cc.register(Hello, HelloImpl(), name='rp_hello')
             registered = True
 
             with warnings.catch_warnings(record=True) as w:
@@ -212,16 +212,16 @@ class TestRuntimeProtection:
     def test_set_client_after_connect_warns(self):
         import warnings
         import c_two as cc
-        from tests.fixtures.ihello import IHello
-        from tests.fixtures.hello import Hello
+        from tests.fixtures.ihello import Hello
+        from tests.fixtures.hello import HelloImpl
 
         registered = False
         proxy = None
         try:
-            cc.register(IHello, Hello(), name='rp_hello2')
+            cc.register(Hello, HelloImpl(), name='rp_hello2')
             registered = True
             server_addr = cc.server_address()
-            proxy = cc.connect(IHello, name='rp_hello2',
+            proxy = cc.connect(Hello, name='rp_hello2',
                                address=server_addr)
 
             with warnings.catch_warnings(record=True) as w:

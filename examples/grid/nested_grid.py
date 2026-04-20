@@ -36,7 +36,7 @@ GRID_SCHEMA: pa.Schema = pa.schema([
 ])
 
 # @cc.crm
-class Grid:
+class NestedGrid:
     """
     CRM
     =

@@ -1,7 +1,5 @@
 """Read/write-aware task scheduler for CRM method execution.
 
-Extracted and simplified from :mod:`c_two.rpc.server._Scheduler`.
-
 Three concurrency modes:
 
 - **EXCLUSIVE**: all CRM calls serialized via a single lock.

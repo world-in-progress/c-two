@@ -1,7 +1,7 @@
 """SOTA API — client process.
 
 Connects to the server started by ``server.py`` via IPC and invokes
-CRM methods through the ICRM proxy.
+CRM methods through the CRM proxy.
 
 Run (after starting server.py in another terminal):
     uv run python examples/client.py
@@ -11,17 +11,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
 
 import c_two as cc
-from grid.igrid import (
-    IGrid,
+from grid.grid_contract import (
+    Grid,
     GridAttribute,
 )
-
-SERVER_ADDRESS = 'ipc://grid'
 
 
 def main():
     # Connect to the remote server via IPC
-    grid = cc.connect(IGrid, name='grid', address=SERVER_ADDRESS)
+    grid = cc.connect(Grid, name='grid')
     print(f'Connected (mode: {grid.client._mode})\n')
 
     # Say hello

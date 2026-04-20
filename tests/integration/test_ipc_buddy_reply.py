@@ -10,7 +10,7 @@ import c_two as cc
 from c_two.transport.registry import _ProcessRegistry
 
 
-@cc.icrm(namespace='test.buddy_reply', version='0.1.0')
+@cc.crm(namespace='test.buddy_reply', version='0.1.0')
 class IEcho:
     def echo(self, data: bytes) -> bytes: ...
 
@@ -31,7 +31,7 @@ def _cleanup():
 class TestBuddyReply:
     """Verify large responses transit via buddy SHM (not inline UDS)."""
 
-    def _setup_ipc(self) -> cc.ICRMProxy:
+    def _setup_ipc(self) -> cc.CRMProxy:
         cc.register(IEcho, Echo(), name='echo')
         time.sleep(0.3)
         address = cc.server_address()

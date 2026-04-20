@@ -14,7 +14,7 @@ from c_two.transport.registry import _ProcessRegistry
 
 # -- Helpers ---------------------------------------------------------------
 
-@cc.icrm(namespace='cc.test.serve', version='0.1.0')
+@cc.crm(namespace='cc.test.serve', version='0.1.0')
 class IServeCRM:
     def ping(self) -> str:
         ...

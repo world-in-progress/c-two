@@ -10,7 +10,10 @@
 
 <p align="center">
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/dm/c-two" alt="Downloads" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/pyversions/c-two" alt="Python" /></a>
   <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
+  <a href="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml"><img src="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
 </p>
 
@@ -32,20 +35,40 @@
 
 ---
 
+## Performance
+
+End-to-end cross-process IPC benchmark — same NumPy payload (`row_id u32` + `x,y,z f64`), same machine, same aggregation. Three transport modes compared:
+
+| Rows | C-Two hold (ms) | Ray (ms) | C-Two pickle (ms) | **Hold vs Ray** |
+|-----:|---:|---:|---:|---:|
+| 1 K | **0.07** | 6.1 | 0.19 | **86×** |
+| 10 K | **0.09** | 7.1 | 0.82 | **79×** |
+| 100 K | **0.38** | 9.8 | 8.7 | **26×** |
+| 1 M | **3.7** | 58 | 150 | **15×** |
+| 3 M | **9.7** | 129 | 598 | **13×** |
+
+- **C-Two hold** — SHM zero-copy via `np.frombuffer`; no serialization on read
+- **Ray** — object store with zero-copy numpy support (Ray 2.55)
+- **C-Two pickle** — standard pickle over SHM; included to show serialization cost
+
+> Apple M1 Max · Python 3.13 · NumPy 2.4 · See [`benchmarks/unified_numpy_benchmark.py`](benchmarks/unified_numpy_benchmark.py) for full methodology.
+
+---
+
 ## Quick Start
 
 ```bash
 pip install c-two
 ```
 
-### Define a resource interface and its implementation
+### Define a resource contract and its implementation
 
 ```python
 import c_two as cc
 
-# Interface — declares which methods are remotely accessible
-@cc.icrm(namespace='demo.counter', version='0.1.0')
-class ICounter:
+# CRM contract — declares which methods are remotely accessible
+@cc.crm(namespace='demo.counter', version='0.1.0')
+class Counter:
     def increment(self, amount: int) -> int: ...
 
     @cc.read
@@ -54,8 +77,8 @@ class ICounter:
     def reset(self) -> int: ...
 
 
-# Implementation — a plain Python class holding state
-class Counter:
+# Resource — a plain Python class implementing the contract
+class CounterImpl:
     def __init__(self, initial: int = 0):
         self._value = initial
 
@@ -75,8 +98,8 @@ class Counter:
 ### Use it locally (zero serialization)
 
 ```python
-cc.register(ICounter, Counter(initial=100), name='counter')
-counter = cc.connect(ICounter, name='counter')
+cc.register(Counter, CounterImpl(initial=100), name='counter')
+counter = cc.connect(Counter, name='counter')
 
 counter.increment(10)    # → 110
 counter.value()          # → 110
@@ -91,10 +114,10 @@ cc.close(counter)
 ```python
 # Server process
 cc.set_address('ipc:///tmp/my_server')
-cc.register(ICounter, Counter(), name='counter')
+cc.register(Counter, CounterImpl(), name='counter')
 
 # Client process (separate terminal)
-counter = cc.connect(ICounter, name='counter', address='ipc:///tmp/my_server')
+counter = cc.connect(Counter, name='counter', address='ipc:///tmp/my_server')
 counter.increment(5)     # works identically
 cc.close(counter)
 ```
@@ -105,13 +128,13 @@ cc.close(counter)
 
 ## Core Concepts
 
-### ICRM — Interface
+### CRM — Contract
 
-An ICRM (Interface of Core Resource Model) declares which CRM methods are remotely accessible. Decorated with `@cc.icrm()`, method bodies are `...` (pure interface — no implementation).
+A **CRM** (Core Resource Model) declares *which* methods a remote resource exposes. It's decorated with `@cc.crm()`, and method bodies are `...` (pure interface — no implementation).
 
 ```python
-@cc.icrm(namespace='demo.greeter', version='0.1.0')
-class IGreeter:
+@cc.crm(namespace='demo.greeter', version='0.1.0')
+class Greeter:
     @cc.read                              # concurrent reads allowed
     def greet(self, name: str) -> str: ...
 
@@ -121,12 +144,12 @@ class IGreeter:
 
 Methods can be annotated with `@cc.read` (concurrent access allowed) or left as default write (exclusive access).
 
-### CRM — Core Resource Model
+### Resource — Runtime Instance
 
-A CRM is a plain Python class that holds state and implements domain logic. It is **not** decorated — the framework discovers its methods through the ICRM interface.
+A **resource** is a plain Python class that implements a CRM contract. It holds state and domain logic. It is **not** decorated — the framework discovers its methods through the CRM contract it was registered under. Name the class by what it *is* (`GreeterImpl`, `PostgresGreeter`, `MultilingualGreeter`), not the interface.
 
 ```python
-class Greeter:
+class GreeterImpl:
     def __init__(self, lang: str = 'en'):
         self._lang = lang
         self._templates = {'en': 'Hello, {}!', 'zh': '你好, {}!'}
@@ -138,15 +161,60 @@ class Greeter:
         return self._lang
 ```
 
-### Component — Consumer
+### Client — Consumer
 
-Components consume CRM resources through ICRM proxies. The proxy is location-transparent — it works the same whether the CRM is in the same process or on a remote machine.
+Anything that calls `cc.connect(...)` is a **client** (or consumer / application code). The returned proxy is location-transparent — it works the same whether the resource lives in the same process or on a remote machine.
 
 ```python
-greeter = cc.connect(IGreeter, name='greeter')
+greeter = cc.connect(Greeter, name='greeter')
 greeter.greet('World')     # → 'Hello, World!'
 cc.close(greeter)
+
+# Or with context manager:
+with cc.connect(Greeter, name='greeter') as greeter:
+    greeter.greet('World')
 ```
+
+### Server — Resource Host
+
+A **server** is any process that calls `cc.register(...)` to host one or more resources, then usually `cc.serve()` to block on the request loop. One server process can host many resources (each under a unique `name`), and will auto-bind an IPC endpoint the first time a resource is registered.
+
+```python
+import c_two as cc
+
+cc.set_address('ipc://my_server')              # optional — default is auto UUID path
+cc.register(Greeter, GreeterImpl(), name='greeter')
+cc.register(Counter, CounterImpl(), name='counter')
+cc.serve()                                     # blocks; Ctrl-C triggers graceful shutdown
+```
+
+- **Address** (`ipc://...`) is the local transport endpoint. Clients in the *same process* skip it entirely (zero serialization); clients in a *different process on the same host* connect to this address directly.
+- **`cc.serve()`** is optional — if your host process has its own event loop (web server, GUI, simulation), you can register resources and let them serve in the background while your main loop runs.
+- A process can be both a server and a client at the same time (register some resources, connect to others).
+
+### Relay — Distributed Discovery
+
+An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach servers **by name**, across machines. Servers announce their IPC address to the relay when they register; clients ask the relay and get routed transparently.
+
+```bash
+# Start a relay anywhere reachable on your network
+c3 relay --bind 0.0.0.0:8080
+```
+
+```python
+# Server side — announce resources to the relay
+cc.set_relay('http://relay-host:8080')
+cc.register(MeshStore, MeshStoreImpl(), name='mesh')
+cc.serve()
+
+# Client side — resolve by name, no address needed
+cc.set_relay('http://relay-host:8080')
+mesh = cc.connect(MeshStore, name='mesh')
+```
+
+Multiple relays can form a **mesh cluster** via gossip — any relay can resolve any resource registered anywhere in the mesh. See the [Relay Mesh example](#relay-mesh--multi-relay-clusters) below.
+
+> **When do I need a relay?** Only for cross-machine or name-based discovery. Same-process and same-host (IPC) usage work without any relay.
 
 ### @transferable — Custom Serialization
 
@@ -189,11 +257,11 @@ When `from_buffer` is present, the server automatically uses **hold mode** — t
 
 ### @cc.transfer — Per-Method Control
 
-Use `@cc.transfer()` on ICRM methods to explicitly specify which transferable type handles serialization, or to override the buffer mode:
+Use `@cc.transfer()` on CRM contract methods to explicitly specify which transferable type handles serialization, or to override the buffer mode:
 
 ```python
-@cc.icrm(namespace='demo.compute', version='0.1.0')
-class ICompute:
+@cc.crm(namespace='demo.compute', version='0.1.0')
+class Compute:
     @cc.transfer(input=Matrix, output=Matrix, buffer='hold')
     def transform(self, mat: Matrix) -> Matrix: ...
 
@@ -212,7 +280,7 @@ On the client side, `cc.hold()` requests that the response SHM buffer remain ali
 3. **`__del__` fallback** — last resort, emits `ResourceWarning` if you forget to release
 
 ```python
-grid = cc.connect(ICompute, name='compute', address='ipc://server')
+grid = cc.connect(Compute, name='compute', address='ipc://server')
 
 # Normal call — buffer released immediately after deserialize
 result = grid.transform(matrix)
@@ -247,11 +315,11 @@ When `cc.connect()` targets a CRM registered in the same process, the proxy call
 ```python
 import c_two as cc
 
-cc.register(IGreeter, Greeter(lang='en'), name='greeter')
-cc.register(ICounter, Counter(initial=100), name='counter')
+cc.register(Greeter, Greeter(lang='en'), name='greeter')
+cc.register(Counter, Counter(initial=100), name='counter')
 
-greeter = cc.connect(IGreeter, name='greeter')
-counter = cc.connect(ICounter, name='counter')
+greeter = cc.connect(Greeter, name='greeter')
+counter = cc.connect(Counter, name='counter')
 
 print(greeter.greet('World'))    # → Hello, World!
 print(counter.value())           # → 100
@@ -293,8 +361,8 @@ class Mesh:
         arr = np.frombuffer(buf[4:], dtype=np.float64).reshape(n, 3)
         return Mesh(n_vertices=n, positions=arr)  # zero-copy view
 
-@cc.icrm(namespace='demo.mesh', version='0.1.0')
-class IMeshStore:
+@cc.crm(namespace='demo.mesh', version='0.1.0')
+class MeshStore:
     @cc.read
     def get_mesh(self) -> Mesh: ...
 
@@ -307,7 +375,7 @@ class IMeshStore:
 **Server** (`server.py`):
 ```python
 import c_two as cc
-from types import IMeshStore, Mesh
+from types import MeshStore, Mesh
 
 class MeshStore:
     def __init__(self):
@@ -324,17 +392,17 @@ class MeshStore:
         print('MeshStore shutting down')
 
 cc.set_address('ipc://mesh_server')
-cc.register(IMeshStore, MeshStore(), name='mesh')
+cc.register(MeshStore, MeshStore(), name='mesh')
 cc.serve()  # blocks until interrupted
 ```
 
 **Client** (`client.py`):
 ```python
 import c_two as cc
-from types import IMeshStore, Mesh
+from types import MeshStore, Mesh
 import numpy as np
 
-mesh_store = cc.connect(IMeshStore, name='mesh', address='ipc://mesh_server')
+mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://mesh_server')
 
 # Upload data
 big_mesh = Mesh(n_vertices=1_000_000,
@@ -355,42 +423,59 @@ cc.close(mesh_store)
 
 ### Cross-Machine — HTTP Relay
 
-An HTTP relay bridges network requests to CRM processes running on IPC.
+An HTTP relay bridges network requests to CRM processes running on IPC. CRM processes register with the relay, and clients discover resources **by name**.
 
+**CRM Server** (`resource.py`):
 ```python
-# CRM Server (resource.py)
+import c_two as cc
+
+cc.set_relay('http://relay-host:8080')
 cc.set_address('ipc://mesh_server')
-cc.register(IMeshStore, MeshStore(), name='mesh')
-cc.serve()
+cc.register(MeshStore, MeshStore(), name='mesh')
+cc.serve()  # blocks until Ctrl-C
+```
 
-# Relay (start via CLI)
-# c3 relay --upstream ipc://mesh_server --bind 0.0.0.0:8080
+**Relay** — start via the `c3` CLI:
+```bash
+# Bind address from CLI flag, env var C2_RELAY_BIND, or .env file
+c3 relay --bind 0.0.0.0:8080
+```
 
-# Client — same API, just change the address
-mesh = cc.connect(IMeshStore, name='mesh', address='http://relay-host:8080')
+**Client** (`client.py`):
+```python
+import c_two as cc
+
+cc.set_relay('http://relay-host:8080')
+mesh = cc.connect(MeshStore, name='mesh')  # relay resolves the name
 mesh.get_mesh()
 cc.close(mesh)
 ```
 
 > **Best for:** network-accessible services, web integration, cross-machine deployment.
 
-### Function-Based Components
+### Relay Mesh — Multi-Relay Clusters
 
-For scripting-style code, `@cc.runtime.connect` injects the ICRM proxy as the first parameter:
+Multiple relays form a **mesh network** with gossip-based route propagation. CRMs register with their local relay; clients discover resources across the entire cluster.
 
-```python
-@cc.runtime.connect
-def compute_centroid(store: IMeshStore) -> np.ndarray:
-    mesh = store.get_mesh()
-    return mesh.positions.mean(axis=0)
+```bash
+# Start relay A (seeds point to peer relays for auto-join)
+c3 relay --bind 0.0.0.0:8080 --relay-id relay-a \
+    --advertise-url http://relay-a:8080 --seeds http://relay-b:8080
 
-# Framework injects the proxy — caller only passes non-ICRM args
-result = compute_centroid(crm_address='ipc://mesh_server')
+# Start relay B
+c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
+    --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
+
+CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh.
+
+> **Best for:** multi-node clusters, high availability, geographic distribution.
+
+> **See [`examples/relay_mesh/`](examples/relay_mesh/) for a complete runnable mesh demo.**
 
 ### Server-Side Monitoring
 
-Use `cc.hold_stats()` to monitor SHM buffers held by CRM methods in hold mode:
+Use `cc.hold_stats()` to monitor SHM buffers held by resource methods in hold mode:
 
 ```python
 stats = cc.hold_stats()
@@ -403,13 +488,13 @@ stats = cc.hold_stats()
 
 **The design philosophy of C-Two is not to define services, but to empower resources.**
 
-In scientific computation, resources encapsulating complex state and domain-specific operations need to be organized into cohesive units. We call these **Core Resource Models (CRMs)**. Applications care more about *how to interact* with resources than *where they are located*. We call resource consumers **Components**. C-Two provides location transparency and uniform resource access, allowing components to interact with CRMs as if they were local objects.
+In scientific computation, resources encapsulating complex state and domain-specific operations need to be organized into cohesive units. We call the contracts describing these resources **Core Resource Models (CRMs)**. Applications care more about *how to interact* with resources than *where they are located*. C-Two provides location transparency and uniform resource access, so any **client** can interact with a resource as if it were a local object.
 
 ```mermaid
 graph LR
-    subgraph Component Layer
-        C1[Component] -->|cc.connect| P1[ICRM Proxy]
-        C2[Component] -->|cc.connect| P2[ICRM Proxy]
+    subgraph Client Layer
+        C1[Client] -->|cc.connect| P1[CRM Proxy]
+        C2[Client] -->|cc.connect| P2[CRM Proxy]
     end
 
     subgraph Transport Layer
@@ -420,30 +505,30 @@ graph LR
         T -->|http://| HTTP[HTTP<br/>Relay]
     end
 
-    subgraph CRM Layer
-        TH --> CRM1[CRM Instance]
+    subgraph Resource Layer
+        TH --> CRM1[Resource Instance]
         IPC --> CRM1
         HTTP --> CRM1
     end
 ```
 
-### Component Layer
+### Client Layer
 
-Client-side consumers that access remote resources through ICRM proxies. The proxy provides full type safety and location transparency — components don't know (or care) where the CRM is running.
+Any code that calls `cc.connect(...)` to consume a resource. The returned proxy provides full type safety and location transparency — clients don't know (or care) where the resource is running.
 
-- **Script-based**: `cc.connect(ICRMClass, name='...', address='...')` returns a typed ICRM proxy
-- **Function-based**: `@cc.runtime.connect` decorator injects the ICRM proxy as the first parameter
+- `cc.connect(CRMClass, name='...', address='...')` returns a typed CRM proxy
+- The proxy supports context management: `with cc.connect(...) as x:` auto-closes
 
-### CRM Layer
+### Resource Layer
 
-Server-side stateful resources exposed through standardized ICRM interfaces.
+Server-side stateful instances exposed through standardized CRM contracts.
 
-- **CRM**: Plain Python class — state + domain logic. Not decorated.
-- **ICRM**: Interface class decorated with `@cc.icrm()`. Only methods declared here are remotely accessible.
+- **CRM contract**: Interface class decorated with `@cc.crm()`. Only methods declared here are remotely accessible.
+- **Resource**: Plain Python class implementing the contract — state + domain logic. Not decorated.
 - **`@transferable`**: Custom serialization for domain data types. Optionally provides `from_buffer` for zero-copy SHM views.
 - **`@cc.transfer`**: Per-method control over input/output transferable types and buffer mode.
 - **`@cc.read` / `@cc.write`**: Concurrency annotations — parallel reads, exclusive writes.
-- **`@cc.on_shutdown`**: Lifecycle callback invoked when a CRM is unregistered (not exposed via RPC).
+- **`@cc.on_shutdown`**: Lifecycle callback invoked when a resource is unregistered (not exposed via RPC).
 
 ### Transport Layer
 
@@ -491,8 +576,10 @@ If no pre-built wheel is available for your platform, pip will build from source
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
-uv sync          # install dependencies + compile Rust extensions
-uv run pytest    # run the test suite
+cp .env.example .env               # configure environment (optional)
+uv sync                            # install dependencies + compile Rust extensions
+uv sync --group examples           # install examples dependencies (pandas, pyarrow)
+uv run pytest                      # run the test suite
 ```
 
 > Requires [uv](https://github.com/astral-sh/uv) and a Rust toolchain.
@@ -503,9 +590,10 @@ uv run pytest    # run the test suite
 
 | Feature | Status |
 |---------|--------|
-| Core RPC framework (CRM / ICRM / Component) | ✅ Stable |
+| Core RPC framework (CRM + Resource + Client) | ✅ Stable |
 | IPC transport with SHM buddy allocator | ✅ Stable |
 | HTTP relay (Rust-powered) | ✅ Stable |
+| Relay mesh with gossip-based discovery | ✅ Stable |
 | Chunked streaming (payloads > 256 MB) | ✅ Stable |
 | Heartbeat & connection management | ✅ Stable |
 | Read/write concurrency control | ✅ Stable |

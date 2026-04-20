@@ -2,7 +2,7 @@
 
 Compares cc.connect() in two modes:
   - Thread-local (same process, zero serialization)
-  - IPC (full serialize + SHM + UDS, 2GB buddy pool via cc.set_server_ipc_config / cc.set_client_ipc_config)
+  - IPC (full serialize + SHM + UDS, 2GB buddy pool via cc.set_server / cc.set_client)
 
 Uses @transferable Payload wrapper to avoid the raw bytes fast-path.
 100 rounds per size, P50 latency.
@@ -39,12 +39,12 @@ class Payload:
         return Payload(data=bytes(raw) if isinstance(raw, memoryview) else raw)
 
 
-@cc.icrm(namespace='bench.thread_ipc', version='0.1.0')
-class IEcho:
+@cc.crm(namespace='bench.thread_ipc', version='0.1.0')
+class Echo:
     def echo(self, payload: Payload) -> Payload: ...
 
 
-class Echo:
+class EchoImpl:
     def echo(self, payload: Payload) -> Payload:
         return payload
 
@@ -84,20 +84,20 @@ _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 # ---------------------------------------------------------------------------
 
 def bench_thread(payload_size: int) -> float:
-    cc.register(IEcho, Echo(), name='echo_thread')
+    cc.register(Echo, EchoImpl(), name='echo_thread')
     try:
-        icrm = cc.connect(IEcho, name='echo_thread')
+        crm = cc.connect(Echo, name='echo_thread')
         payload = Payload(data=b'\xAB' * payload_size)
 
         for _ in range(WARMUP):
-            icrm.echo(payload)
+            crm.echo(payload)
 
         latencies: list[float] = []
         gc.disable()
         try:
             for _ in range(ROUNDS):
                 t0 = time.perf_counter()
-                result = icrm.echo(payload)
+                result = crm.echo(payload)
                 elapsed = time.perf_counter() - t0
                 latencies.append(elapsed)
         finally:
@@ -106,7 +106,7 @@ def bench_thread(payload_size: int) -> float:
         assert isinstance(result, Payload)
         assert len(result.data) == payload_size
 
-        cc.close(icrm)
+        cc.close(crm)
     finally:
         cc.unregister('echo_thread')
         cc.shutdown()
@@ -125,9 +125,9 @@ def bench_ipc(payload_size: int) -> float:
     _ipc_counter += 1
 
     # 2 GB buddy segments to handle up to 1 GB payloads.
-    cc.set_server_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.register(IEcho, Echo(), name='echo_ipc')
+    cc.set_server(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_client(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
 
     # Wait for server socket.
@@ -143,16 +143,16 @@ def bench_ipc(payload_size: int) -> float:
     latencies: list[float] = []
 
     try:
-        icrm = cc.connect(IEcho, name='echo_ipc', address=address)
+        crm = cc.connect(Echo, name='echo_ipc', address=address)
 
         for _ in range(WARMUP):
-            icrm.echo(payload)
+            crm.echo(payload)
 
         gc.disable()
         try:
             for _ in range(ROUNDS):
                 t0 = time.perf_counter()
-                result = icrm.echo(payload)
+                result = crm.echo(payload)
                 elapsed = time.perf_counter() - t0
                 latencies.append(elapsed)
         finally:
@@ -161,7 +161,7 @@ def bench_ipc(payload_size: int) -> float:
         assert isinstance(result, Payload)
         assert len(result.data) == payload_size
 
-        cc.close(icrm)
+        cc.close(crm)
     finally:
         cc.unregister('echo_ipc')
         cc.shutdown()

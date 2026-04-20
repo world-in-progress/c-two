@@ -1,6 +1,6 @@
 import c_two as cc
-from icrm import IGrid
-from icrm import GridAttribute, GridSchema
+from crm import IGrid
+from crm import GridAttribute, GridSchema
 
 @cc.crm
 class Grid(IGrid):

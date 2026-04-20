@@ -4,8 +4,8 @@ import c_two as cc
 from c_two.crm.transferable import HeldResult
 from c_two.transport.registry import _ProcessRegistry
 
-from tests.fixtures.ihello import IHello
-from tests.fixtures.hello import Hello
+from tests.fixtures.ihello import Hello
+from tests.fixtures.hello import HelloImpl
 
 
 @pytest.fixture(autouse=True)
@@ -20,11 +20,11 @@ class TestIPCHoldMode:
 
     def test_hold_returns_held_result_ipc(self):
         """cc.hold() on IPC proxy returns HeldResult with valid data."""
-        crm = Hello()
-        cc.register(IHello, crm, name='hold_test')
+        crm = HelloImpl()
+        cc.register(Hello, crm, name='hold_test')
 
         try:
-            proxy = cc.connect(IHello, name='hold_test')
+            proxy = cc.connect(Hello, name='hold_test')
             try:
                 # Normal call
                 result = proxy.greeting('World')
@@ -46,11 +46,11 @@ class TestIPCHoldMode:
 
     def test_hold_context_manager_ipc(self):
         """HeldResult works as context manager through IPC."""
-        crm = Hello()
-        cc.register(IHello, crm, name='hold_ctx')
+        crm = HelloImpl()
+        cc.register(Hello, crm, name='hold_ctx')
 
         try:
-            proxy = cc.connect(IHello, name='hold_ctx')
+            proxy = cc.connect(Hello, name='hold_ctx')
             try:
                 with cc.hold(proxy.greeting)('World') as held:
                     assert held.value == 'Hello, World!'
@@ -64,11 +64,11 @@ class TestIPCHoldMode:
 
     def test_view_default_releases_after_call(self):
         """Default view mode: data is accessible as normal return, no HeldResult."""
-        crm = Hello()
-        cc.register(IHello, crm, name='view_test')
+        crm = HelloImpl()
+        cc.register(Hello, crm, name='view_test')
 
         try:
-            proxy = cc.connect(IHello, name='view_test')
+            proxy = cc.connect(Hello, name='view_test')
             try:
                 result = proxy.greeting('World')
                 assert result == 'Hello, World!'

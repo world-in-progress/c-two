@@ -14,11 +14,11 @@ from c_two.transport.server import Server
 from c_two.transport.client.util import ping
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
-    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction,
-    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling,
+    ResourceDeserializeInput, ResourceSerializeOutput, ResourceExecuteFunction,
+    ClientSerializeInput, ClientDeserializeOutput, ClientCallResource,
 )
-from tests.fixtures.hello import Hello
-from tests.fixtures.ihello import IHello, HelloData
+from tests.fixtures.hello import HelloImpl
+from tests.fixtures.ihello import Hello, HelloData
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -58,8 +58,9 @@ def error_server():
     address = f'ipc://error_test_{_next_id()}'
     server = Server(
         bind_address=address,
-        icrm_class=IHello,
+        crm_class=Hello,
         crm_instance=ErrorHello(),
+        name='hello',
     )
     server.start()
     deadline = time.monotonic() + 5.0
@@ -77,43 +78,43 @@ def error_server():
 # ---------------------------------------------------------------------------
 # Class 1 — CRM execution errors
 # ---------------------------------------------------------------------------
-class TestCRMExecuteFunction:
-    """Errors raised inside a CRM method should surface as CRMExecuteFunction."""
+class TestResourceExecuteFunction:
+    """Errors raised inside a CRM method should surface as ResourceExecuteFunction."""
 
     def test_value_error_in_crm(self, error_server):
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.add(1, 2)
             err = exc_info.value
-            assert err.code == ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING
+            assert err.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
             assert 'division by zero' in str(err)
 
     def test_type_error_in_crm(self, error_server):
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.greeting('test')
             assert 'name must be str' in str(exc_info.value)
 
     def test_runtime_error_in_crm(self, error_server):
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.get_data(1)
             assert 'database unavailable' in str(exc_info.value)
 
     def test_error_is_proper_subclass(self, error_server):
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.add(1, 2)
             err = exc_info.value
-            assert isinstance(err, CRMExecuteFunction)
+            assert isinstance(err, ResourceExecuteFunction)
             assert isinstance(err, CCError)
             assert isinstance(err, CCBaseError)
             assert isinstance(err, Exception)
 
     def test_no_multi_layer_wrapping(self, error_server):
-        """Server-side CRM errors must NOT be re-wrapped into a Compo error."""
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        """Server-side CRM errors must NOT be re-wrapped into a client error."""
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.add(1, 2)
             err_str = str(exc_info.value)
             assert 'ERROR_AT_COMPO' not in err_str
@@ -121,20 +122,20 @@ class TestCRMExecuteFunction:
     def test_error_propagates_through_connect_crm(self, error_server):
         """connect_crm must NOT swallow exceptions — they must reach the caller."""
         with pytest.raises(CCBaseError):
-            with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
+            with cc.connect(Hello, name='hello', address=error_server) as crm:
                 crm.add(1, 2)
 
 
 # ---------------------------------------------------------------------------
-# Class 2 — Compo client errors
+# Class 2 — Client errors
 # ---------------------------------------------------------------------------
-class TestCompoClientError:
+class TestClientError:
     """Errors triggered by client connectivity problems."""
 
     def test_connect_to_nonexistent_server(self):
         address = f'ipc://nonexistent_{_next_id()}'
         with pytest.raises(Exception):
-            with cc.compo.runtime.connect_crm(address, IHello) as crm:
+            with cc.connect(Hello, name='hello', address=address) as crm:
                 crm.greeting('test')
 
     def test_ping_nonexistent_returns_false(self):
@@ -146,8 +147,8 @@ class TestCompoClientError:
 # Class 3 — Error serialization round-trips
 # ---------------------------------------------------------------------------
 ALL_SUBCLASSES = [
-    CRMDeserializeInput, CRMSerializeOutput, CRMExecuteFunction,
-    CompoSerializeInput, CompoDeserializeOutput, CompoCRMCalling,
+    ResourceDeserializeInput, ResourceSerializeOutput, ResourceExecuteFunction,
+    ClientSerializeInput, ClientDeserializeOutput, ClientCallResource,
 ]
 
 
@@ -155,19 +156,19 @@ class TestErrorDeserialization:
     """Verify serialize → deserialize returns the proper subclass."""
 
     def test_crm_execute_function_round_trip(self):
-        original = CRMExecuteFunction('test msg')
+        original = ResourceExecuteFunction('test msg')
         data = CCError.serialize(original)
         restored = CCError.deserialize(memoryview(data))
-        assert isinstance(restored, CRMExecuteFunction)
-        assert restored.code == ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING
+        assert isinstance(restored, ResourceExecuteFunction)
+        assert restored.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
         assert 'test msg' in restored.message
 
     def test_crm_deserialize_input_round_trip(self):
-        original = CRMDeserializeInput('bad payload')
+        original = ResourceDeserializeInput('bad payload')
         data = CCError.serialize(original)
         restored = CCError.deserialize(memoryview(data))
-        assert isinstance(restored, CRMDeserializeInput)
-        assert restored.code == ERROR_Code.ERROR_AT_CRM_INPUT_DESERIALIZING
+        assert isinstance(restored, ResourceDeserializeInput)
+        assert restored.code == ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING
         assert 'bad payload' in restored.message
 
     @pytest.mark.parametrize('subclass', ALL_SUBCLASSES, ids=lambda c: c.__name__)
@@ -216,11 +217,11 @@ class TestSingleLayerPropagation:
 
     def test_server_error_single_layer(self, error_server):
         """Error string should be exactly 2 lines: code+description and original error."""
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.add(1, 2)
             lines = str(exc_info.value).strip().splitlines()
-            # Line 1: "ERROR_AT_CRM_FUNCTION_EXECUTING: Error occurred when executing function at CRM:"
+            # Line 1: "ERROR_AT_RESOURCE_FUNCTION_EXECUTING: Error occurred when executing function at CRM:"
             # Line 2: "division by zero"
             assert len(lines) == 2, (
                 f'Expected 2-line error (single layer), got {len(lines)} lines:\n'
@@ -229,17 +230,17 @@ class TestSingleLayerPropagation:
 
     def test_error_code_correct(self, error_server):
         """Error code must be CRM_FUNCTION_EXECUTING, not OUTPUT_SERIALIZING."""
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.add(1, 2)
-            assert exc_info.value.code == ERROR_Code.ERROR_AT_CRM_FUNCTION_EXECUTING
-            assert exc_info.value.code != ERROR_Code.ERROR_AT_CRM_OUTPUT_SERIALIZING
+            assert exc_info.value.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
+            assert exc_info.value.code != ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING
 
     def test_original_error_info_preserved(self, error_server):
         """The original exception message must survive serialization round-trip."""
-        with cc.compo.runtime.connect_crm(error_server, IHello) as crm:
-            with pytest.raises(CRMExecuteFunction) as exc_info:
+        with cc.connect(Hello, name='hello', address=error_server) as crm:
+            with pytest.raises(ResourceExecuteFunction) as exc_info:
                 crm.greeting('test')
             msg = exc_info.value.message
             assert 'name must be str' in msg
-            assert 'executing function at CRM' in msg
+            assert 'executing function at resource' in msg

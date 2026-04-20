@@ -23,7 +23,7 @@ from c_two.transport.client.util import ping
 # Test fixtures
 # ---------------------------------------------------------------------------
 
-@cc.icrm(namespace='cc.test.concurrency', version='0.1.0')
+@cc.crm(namespace='cc.test.concurrency', version='0.1.0')
 class IEcho:
     def echo(self, data: bytes) -> bytes: ...
     def add(self, a: int, b: int) -> int: ...
@@ -204,10 +204,10 @@ class TestSOTAAPIConcurrency:
             def worker(tid: int):
                 try:
                     for _ in range(5):
-                        icrm = cc.connect(IEcho, name='echo_conc')
-                        r = icrm.echo(f'tid={tid}'.encode())
+                        crm = cc.connect(IEcho, name='echo_conc')
+                        r = crm.echo(f'tid={tid}'.encode())
                         assert r == f'tid={tid}'.encode()
-                        cc.close(icrm)
+                        cc.close(crm)
                 except Exception as e:
                     errors.append((tid, e))
 

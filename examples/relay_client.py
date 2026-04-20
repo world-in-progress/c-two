@@ -1,6 +1,6 @@
 """HTTP client — connects to the Grid CRM via the relay.
 
-Demonstrates that the ICRM proxy works identically over HTTP as it
+Demonstrates that the CRM proxy works identically over HTTP as it
 does over IPC — only the address changes.
 
 Usage (3-terminal workflow):
@@ -20,14 +20,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../examples/')))
 
 import c_two as cc
-from grid.igrid import IGrid, GridAttribute
-
-RELAY_URL = 'http://127.0.0.1:8080'
+from grid.grid_contract import Grid, GridAttribute
 
 
 def main():
     # Connect via HTTP relay — same API as IPC, different address.
-    grid = cc.connect(IGrid, name='grid', address=RELAY_URL)
+    grid = cc.connect(Grid, name='grid')
     print(f'[Client] Connected via HTTP (mode: {grid.client._mode})\n')
 
     # ── Hello ─────────────────────────────────────────────────────

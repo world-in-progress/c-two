@@ -97,11 +97,11 @@ class TestBuildTransferWrapper:
         class MockCRM:
             def greet(self, data):
                 return _FakeOutput(y=f'Hi {data.x}')
-        class MockICRM:
+        class MockCRM:
             direction = '<-'
-            crm = MockCRM()
+            resource = MockCRM()
 
-        err_bytes, result_bytes = wrapped(MockICRM(), _FakeInput.serialize(_FakeInput(x=42)))
+        err_bytes, result_bytes = wrapped(MockCRM(), _FakeInput.serialize(_FakeInput(x=42)))
         from c_two.error import CCError
         assert CCError.deserialize(memoryview(err_bytes)) is None
         out = _FakeOutput.deserialize(result_bytes)
@@ -141,10 +141,10 @@ class TestAutoTransferWithConfig:
 
 
 class TestIcrmTransferIntegration:
-    """@cc.transfer metadata is consumed by icrm() via auto_transfer."""
+    """@cc.transfer metadata is consumed by crm() via auto_transfer."""
 
     def test_icrm_picks_up_transfer_metadata(self):
-        @cc.icrm(namespace='test.transfer', version='0.1.0')
+        @cc.crm(namespace='test.transfer', version='0.1.0')
         class ITest:
             @transfer(input=_FakeInputWithFromBuffer, buffer='hold')
             def process(self, x: int) -> str:
@@ -177,7 +177,7 @@ class TestIcrmTransferIntegration:
                 deserialize_calls.append(v)
                 return TrackedInput(val=v)
 
-        @cc.icrm(namespace='test.roundtrip', version='0.1.0')
+        @cc.crm(namespace='test.roundtrip', version='0.1.0')
         class IRoundTrip:
             @transfer(input=TrackedInput)
             def process(self, data: TrackedInput) -> int:
@@ -188,7 +188,7 @@ class TestIcrmTransferIntegration:
                 return data.val * 2
 
         server = IRoundTrip()
-        server.crm = CRM()
+        server.resource = CRM()
         server.direction = '<-'
 
         serialized = TrackedInput.serialize(TrackedInput(val=7))
@@ -200,7 +200,7 @@ class TestIcrmTransferIntegration:
 
     def test_plain_method_still_works(self):
         """Methods without @transfer still auto-bundle via pickle."""
-        @cc.icrm(namespace='test.plain', version='0.1.0')
+        @cc.crm(namespace='test.plain', version='0.1.0')
         class IPlain:
             def greet(self, name: str) -> str:
                 ...
@@ -210,7 +210,7 @@ class TestIcrmTransferIntegration:
                 return f'Hi {name}'
 
         server = IPlain()
-        server.crm = CRM()
+        server.resource = CRM()
         server.direction = '<-'
 
         err_bytes, result_bytes = server.greet(pickle.dumps('World'))
@@ -239,18 +239,18 @@ class TestMethodLevelBufferBehavior:
         class MockCRM:
             def echo(self, x):
                 return x
-        class MockICRM:
+        class MockCRM:
             direction = '<-'
-            crm = MockCRM()
-        icrm = MockICRM()
+            resource = MockCRM()
+        crm = MockCRM()
 
         released = []
-        result = wrapped(icrm, pickle.dumps(42), _release_fn=lambda: released.append(True))
+        result = wrapped(crm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert released, '_release_fn should be called in view mode'
 
     def test_hold_buffer_declared_at_method(self):
         """buffer='hold' is set via @cc.transfer, not on the type."""
-        @cc.icrm(namespace='test.buf.hold', version='0.1.0')
+        @cc.crm(namespace='test.buf.hold', version='0.1.0')
         class IBufHold:
             @transfer(buffer='hold')
             def process(self, data: _FakeInputWithFromBuffer) -> str:
@@ -277,7 +277,7 @@ class TestExports:
 
 
 class TestEndToEnd:
-    """Full round-trip: ICRM with @cc.transfer, proxy call, hold mode."""
+    """Full round-trip: CRM with @cc.transfer, proxy call, hold mode."""
 
     def test_auto_bundle_round_trip(self):
         """Methods without @cc.transfer auto-bundle via pickle."""
@@ -285,7 +285,7 @@ class TestEndToEnd:
         import c_two as cc
         from c_two.error import CCError
 
-        @cc.icrm(namespace='test.e2e.autobundle', version='0.1.0')
+        @cc.crm(namespace='test.e2e.autobundle', version='0.1.0')
         class IE2E:
             def greeting(self, name: str) -> str:
                 ...
@@ -295,7 +295,7 @@ class TestEndToEnd:
                 return f'Hello, {name}!'
 
         server_icrm = IE2E()
-        server_icrm.crm = CRM()
+        server_icrm.resource = CRM()
         server_icrm.direction = '<-'
 
         greet = getattr(server_icrm, 'greeting')
@@ -309,9 +309,9 @@ class TestEndToEnd:
         """cc.hold() on thread-local proxy returns HeldResult."""
         import c_two as cc
         from c_two.crm.transferable import HeldResult
-        from c_two.transport.client.proxy import ICRMProxy
+        from c_two.transport.client.proxy import CRMProxy
 
-        @cc.icrm(namespace='test.hold.threadlocal', version='0.1.0')
+        @cc.crm(namespace='test.hold.threadlocal', version='0.1.0')
         class IHoldTest:
             def compute(self, x: int) -> int:
                 ...
@@ -320,7 +320,7 @@ class TestEndToEnd:
             def compute(self, x: int) -> int:
                 return x * 2
 
-        proxy = ICRMProxy.thread_local(FakeCRM())
+        proxy = CRMProxy.thread_local(FakeCRM())
 
         client_icrm = IHoldTest()
         client_icrm.client = proxy
@@ -341,7 +341,7 @@ class TestEndToEnd:
 
         received_kwargs = {}
 
-        @cc.icrm(namespace='test.noleak', version='0.1.0')
+        @cc.crm(namespace='test.noleak', version='0.1.0')
         class INoLeak:
             def process(self, x: int) -> int:
                 ...
@@ -352,7 +352,7 @@ class TestEndToEnd:
                 return x
 
         server = INoLeak()
-        server.crm = CRM()
+        server.resource = CRM()
         server.direction = '<-'
 
         err, result = server.process(pickle.dumps(42))
@@ -366,9 +366,9 @@ class TestHoldVsViewSmoke:
         """Both modes return the same data; hold wraps in HeldResult."""
         import c_two as cc
         from c_two.crm.transferable import HeldResult
-        from c_two.transport.client.proxy import ICRMProxy
+        from c_two.transport.client.proxy import CRMProxy
 
-        @cc.icrm(namespace='test.holdview.smoke', version='0.1.0')
+        @cc.crm(namespace='test.holdview.smoke', version='0.1.0')
         class ISmoke:
             def echo(self, data: bytes) -> bytes: ...
 
@@ -376,19 +376,19 @@ class TestHoldVsViewSmoke:
             def echo(self, data: bytes) -> bytes:
                 return data
 
-        proxy = ICRMProxy.thread_local(SmokeEcho())
-        icrm = ISmoke()
-        icrm.client = proxy
-        icrm.direction = '->'
+        proxy = CRMProxy.thread_local(SmokeEcho())
+        crm = ISmoke()
+        crm.client = proxy
+        crm.direction = '->'
 
         payload = b'x' * 1024
 
         # View mode
-        view_result = icrm.echo(payload)
+        view_result = crm.echo(payload)
         assert view_result == payload
 
         # Hold mode
-        held = cc.hold(icrm.echo)(payload)
+        held = cc.hold(crm.echo)(payload)
         assert isinstance(held, HeldResult)
         assert held.value == payload
         held.release()

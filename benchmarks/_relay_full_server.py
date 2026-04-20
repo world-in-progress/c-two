@@ -5,13 +5,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import c_two as cc
 from c_two._native import NativeRelay
 from c_two.transport.registry import _ProcessRegistry
-from tests.fixtures.hello import Hello
-from tests.fixtures.ihello import IHello
+from tests.fixtures.hello import HelloImpl
+from tests.fixtures.ihello import Hello
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 19985
 
 _ProcessRegistry.reset()
-cc.register(IHello, Hello(), name='hello')
+cc.register(Hello, HelloImpl(), name='hello')
 ipc_addr = cc.server_address()
 
 relay = NativeRelay(f'127.0.0.1:{port}')

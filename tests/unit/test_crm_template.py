@@ -6,15 +6,15 @@ from c_two.crm.template import (
     _format_arguments,
     _format_return_annotation,
 )
-from tests.fixtures.ihello import IHello
+from tests.fixtures.ihello import Hello
 
 
 # ── helpers ──────────────────────────────────────────────────────────
 
 def _generate_and_parse(tmp_path):
-    """Generate template for IHello and return (source_text, ast_tree)."""
+    """Generate template for Hello and return (source_text, ast_tree)."""
     output = tmp_path / "hello_crm.py"
-    generate_crm_template(IHello, output)
+    generate_crm_template(Hello, output)
     source = output.read_text()
     return source, ast.parse(source)
 
@@ -49,31 +49,17 @@ class TestGenerateCrmTemplate:
         # ast.parse raises SyntaxError on invalid code
         ast.parse(source)
 
-    def test_class_name_strips_i_prefix(self, tmp_path):
+    def test_class_name_appends_impl(self, tmp_path):
+        """Generated resource class name is always ContractName + 'Impl'."""
         _, tree = _generate_and_parse(tmp_path)
         class_names = [
             n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
         ]
-        assert "Hello" in class_names
-
-    def test_class_name_appends_impl_when_no_i_prefix(self, tmp_path):
-        """If the ICRM class name doesn't start with 'I', append 'Impl'."""
-
-        @cc.icrm(namespace="test.foo", version="0.0.1")
-        class Foo:
-            def bar(self) -> None: ...
-
-        output = tmp_path / "foo_crm.py"
-        generate_crm_template(Foo, output)
-        tree = ast.parse(output.read_text())
-        class_names = [
-            n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
-        ]
-        assert "FooImpl" in class_names
+        assert "HelloImpl" in class_names
 
     def test_contains_all_public_methods(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         assert cls is not None
         method_names = _get_method_names(cls)
         expected = {"greeting", "add", "echo_none", "get_items", "get_data"}
@@ -81,7 +67,7 @@ class TestGenerateCrmTemplate:
 
     def test_greeting_signature(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         method = _get_method_node(cls, "greeting")
         assert method is not None
 
@@ -96,7 +82,7 @@ class TestGenerateCrmTemplate:
 
     def test_add_signature(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         method = _get_method_node(cls, "add")
         assert method is not None
 
@@ -108,7 +94,7 @@ class TestGenerateCrmTemplate:
 
     def test_echo_none_return_type(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         method = _get_method_node(cls, "echo_none")
         assert method is not None
         ret = ast.unparse(method.returns)
@@ -116,7 +102,7 @@ class TestGenerateCrmTemplate:
 
     def test_get_items_signature(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         method = _get_method_node(cls, "get_items")
         assert method is not None
 
@@ -127,7 +113,7 @@ class TestGenerateCrmTemplate:
 
     def test_get_data_signature(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         method = _get_method_node(cls, "get_data")
         assert method is not None
 
@@ -136,41 +122,41 @@ class TestGenerateCrmTemplate:
 
     def test_output_file_is_written(self, tmp_path):
         output = tmp_path / "subdir" / "hello_crm.py"
-        generate_crm_template(IHello, output)
+        generate_crm_template(Hello, output)
         assert output.exists()
         assert output.stat().st_size > 0
 
     def test_generated_class_inherits_icrm(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         assert cls is not None
         base_names = [ast.unparse(b) for b in cls.bases]
-        assert "IHello" in base_names
+        assert "Hello" in base_names
 
     def test_generated_class_has_crm_decorator(self, tmp_path):
         _, tree = _generate_and_parse(tmp_path)
-        cls = _get_class_node(tree, "Hello")
+        cls = _get_class_node(tree, "HelloImpl")
         assert cls is not None
-        decorator_names = [ast.unparse(d) for d in cls.decorator_list]
-        assert "cc.crm" in decorator_names
+        decorator_sources = [ast.unparse(d) for d in cls.decorator_list]
+        assert any(d.startswith("cc.crm") for d in decorator_sources)
 
 
 # ── validation ───────────────────────────────────────────────────────
 
 class TestGenerateCrmTemplateValidation:
-    def test_non_icrm_raises(self, tmp_path):
-        class NotAnICRM:
+    def test_non_crm_raises(self, tmp_path):
+        class NotACRM:
             pass
 
         with pytest.raises(ValueError):
-            generate_crm_template(NotAnICRM, tmp_path / "out.py")
+            generate_crm_template(NotACRM, tmp_path / "out.py")
 
     def test_class_without_direction_raises(self, tmp_path):
-        class AlmostICRM:
+        class AlmostCRM:
             direction = "<-"
 
         with pytest.raises(ValueError):
-            generate_crm_template(AlmostICRM, tmp_path / "out.py")
+            generate_crm_template(AlmostCRM, tmp_path / "out.py")
 
 
 # ── helper functions ─────────────────────────────────────────────────

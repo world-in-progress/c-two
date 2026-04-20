@@ -10,7 +10,7 @@ import c_two as cc
 from c_two.transport.registry import _ProcessRegistry
 
 
-@cc.icrm(namespace='test.zero_copy', version='0.1.0')
+@cc.crm(namespace='test.zero_copy', version='0.1.0')
 class IEchoZC:
     def echo(self, data: bytes) -> bytes: ...
 

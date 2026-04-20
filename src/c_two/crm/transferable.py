@@ -76,7 +76,7 @@ class HeldResult:
 
 
 def hold(method):
-    """Wrap an ICRM bound method to hold SHM on the response.
+    """Wrap a CRM bound method to hold SHM on the response.
 
     Usage: ``cc.hold(proxy.method)(args)`` — single-shot pattern.
     Returns a callable that injects ``_c2_buffer='hold'`` into kwargs.
@@ -89,7 +89,7 @@ def hold(method):
     name = getattr(method, '__name__', None)
     if self_obj is None or name is None:
         raise TypeError(
-            "cc.hold() requires a bound ICRM method, "
+            "cc.hold() requires a bound CRM method, "
             "e.g. cc.hold(grid.compute)"
         )
 
@@ -154,7 +154,7 @@ class Transferable(metaclass=TransferableMeta):
     """
     Transferable
     --
-    A base specification for classes that can be transferred between `Component` and `CRM`.  
+    A base specification for classes that can be transferred between `client` and `resource`.  
     Transferable classes are automatically converted to `dataclasses` and should implement the methods:
     - serialize: convert runtime `args` to `bytes` message
     - deserialize: convert `bytes` message to runtime `args`
@@ -329,10 +329,10 @@ def transferable(cls=None):
 _VALID_TRANSFER_BUFFERS = frozenset(('view', 'hold'))
 
 def transfer(*, input=None, output=None, buffer=None):
-    """Metadata-only decorator for ICRM methods.
+    """Metadata-only decorator for CRM methods.
 
     Attaches ``__cc_transfer__`` dict to the function. Does NOT wrap it.
-    Consumed by ``icrm()`` → ``auto_transfer()`` at class decoration time.
+    Consumed by ``crm()`` → ``auto_transfer()`` at class decoration time.
 
     Parameters
     ----------
@@ -341,7 +341,7 @@ def transfer(*, input=None, output=None, buffer=None):
     output : type[Transferable] | None
         Custom output transferable. None = auto-bundle via pickle.
     buffer : 'view' | 'hold' | None
-        Input buffer mode (CRM-side). None = auto-detect from input
+        Input buffer mode (resource-side). None = auto-detect from input
         transferable's ``from_buffer`` availability. Default None.
     """
     if buffer is not None and buffer not in _VALID_TRANSFER_BUFFERS:
@@ -382,10 +382,9 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             if len(args) < 1:
                 raise ValueError('Instance method requires self, but only get one argument.')
 
-            icrm = args[0]
-            client = icrm.client
+            crm = args[0]
+            client = crm.client
             request = args[1:] if len(args) > 1 else None
-
             # Thread fast path — skip all serialization/deserialization
             if getattr(client, 'supports_direct_call', False):
                 result = client.call_direct(method_name, request or ())
@@ -439,11 +438,11 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             raise
         except Exception as e:
             if stage == 'serialize_input':
-                raise error.CompoSerializeInput(str(e)) from e
+                raise error.ClientSerializeInput(str(e)) from e
             elif stage == 'call_crm':
-                raise error.CompoCRMCalling(str(e)) from e
+                raise error.ClientCallResource(str(e)) from e
             else:
-                raise error.CompoDeserializeOutput(str(e)) from e
+                raise error.ClientDeserializeOutput(str(e)) from e
 
     def crm_to_com(*args, _release_fn=None):
         # Select input deserializer based on buffer mode
@@ -465,8 +464,8 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             if len(args) < 1:
                 raise ValueError('Instance method requires self, but only get one argument.')
 
-            iicrm = args[0]
-            crm = iicrm.crm
+            contract = args[0]
+            crm = contract.resource
             request = args[1] if len(args) > 1 else None
 
             if request is not None and input_fn is not None:
@@ -488,7 +487,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
 
             crm_method = getattr(crm, method_name, None)
             if crm_method is None:
-                raise ValueError(f'Method "{method_name}" not found on CRM class.')
+                raise ValueError(f'Method "{method_name}" not found on resource class.')
 
             stage = 'execute_function'
             result = crm_method(*deserialized_args)
@@ -502,11 +501,11 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 except Exception:
                     pass
             if stage == 'deserialize_input':
-                err = error.CRMDeserializeInput(str(e))
+                err = error.ResourceDeserializeInput(str(e))
             elif stage == 'execute_function':
-                err = error.CRMExecuteFunction(str(e))
+                err = error.ResourceExecuteFunction(str(e))
             else:
-                err = error.CRMSerializeOutput(str(e))
+                err = error.ResourceSerializeOutput(str(e))
 
         serialized_error = error.CCError.serialize(err)
         serialized_result = b''
@@ -522,17 +521,17 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
         if not args:
             raise ValueError('No arguments provided to determine direction.')
 
-        icrm = args[0]
-        if not hasattr(icrm, 'direction'):
-            raise AttributeError('The ICRM instance does not have a "direction" attribute.')
+        crm = args[0]
+        if not hasattr(crm, 'direction'):
+            raise AttributeError('The CRM instance does not have a "direction" attribute.')
 
-        if icrm.direction == '->':
+        if crm.direction == '->':
             _c2_buffer = kwargs.pop('_c2_buffer', None)
             return com_to_crm(*args, _c2_buffer=_c2_buffer)
-        elif icrm.direction == '<-':
+        elif crm.direction == '<-':
             return crm_to_com(*args, **kwargs)
         else:
-            raise ValueError(f'Invalid direction value: {icrm.direction}. Expected "->" or "<-".')
+            raise ValueError(f'Invalid direction value: {crm.direction}. Expected "->" or "<-".')
 
     transfer_wrapper._input_buffer_mode = buffer
     return transfer_wrapper

@@ -1,12 +1,12 @@
-"""Unified client-compatible proxy for ICRM consumers.
+"""Unified client-compatible proxy for CRM consumers.
 
 Implements the same interface as :class:`rpc.Client` — assign to
-``icrm.client`` and the existing ``auto_transfer`` machinery works
+``crm.client`` and the existing ``auto_transfer`` machinery works
 transparently.
 
 Three modes:
 
-- **thread-local**: ``supports_direct_call = True``.  Calls CRM methods
+- **thread-local**: ``supports_direct_call = True``.  Calls resource methods
   directly via ``call_direct(method_name, args)`` — zero serialization.
 - **ipc**: ``supports_direct_call = False``.  Delegates to a Rust IPC
   client with routing-name-based ``call()``.
@@ -16,22 +16,22 @@ Three modes:
 Usage::
 
     # Thread-local (same process, skip serialization):
-    proxy = ICRMProxy.thread_local(crm_instance)
-    icrm = IHello()
-    icrm.client = proxy
-    icrm.greeting('World')       # → crm_instance.greeting('World')
+    proxy = CRMProxy.thread_local(resource_instance)
+    crm = Hello()
+    crm.client = proxy
+    crm.greeting('World')       # → resource_instance.greeting('World')
 
     # IPC (cross-process via RustClient):
-    proxy = ICRMProxy.ipc(rust_client, 'hello')
-    icrm = IHello()
-    icrm.client = proxy
-    icrm.greeting('World')       # → rust_client.call('hello', 'greeting', ...)
+    proxy = CRMProxy.ipc(rust_client, 'hello')
+    crm = Hello()
+    crm.client = proxy
+    crm.greeting('World')       # → rust_client.call('hello', 'greeting', ...)
 
     # HTTP (cross-node via RustHttpClient):
-    proxy = ICRMProxy.http(http_client, 'hello')
-    icrm = IHello()
-    icrm.client = proxy
-    icrm.greeting('World')       # → http_client.call('hello', 'greeting', ...)
+    proxy = CRMProxy.http(http_client, 'hello')
+    crm = Hello()
+    crm.client = proxy
+    crm.greeting('World')       # → http_client.call('hello', 'greeting', ...)
 """
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ if TYPE_CHECKING:
     from ..server.scheduler import Scheduler
 
 
-class ICRMProxy:
-    """Client-compatible proxy for ICRM consumers.
+class CRMProxy:
+    """Client-compatible proxy for CRM consumers.
 
     Do **not** instantiate directly — use the factory classmethods
     :meth:`thread_local` and :meth:`ipc`.
@@ -75,7 +75,7 @@ class ICRMProxy:
         scheduler: Scheduler | None = None,
         access_map: dict[str, MethodAccess] | None = None,
         on_terminate: Callable[[], None] | None = None,
-    ) -> ICRMProxy:
+    ) -> CRMProxy:
         """Create a thread-local proxy (same process, no serialization).
 
         ``supports_direct_call`` is ``True`` — the ``auto_transfer``
@@ -110,7 +110,7 @@ class ICRMProxy:
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
-    ) -> ICRMProxy:
+    ) -> CRMProxy:
         """Create an IPC proxy (cross-process via Rust IPC client).
 
         Calls are routed to the CRM registered under *name* on the
@@ -141,7 +141,7 @@ class ICRMProxy:
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
-    ) -> ICRMProxy:
+    ) -> CRMProxy:
         """Create an HTTP proxy (cross-node via Rust HTTP client + relay).
 
         Calls are sent to the relay server as

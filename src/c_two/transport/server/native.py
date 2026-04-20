@@ -4,7 +4,7 @@ Preserves the same interface as the Python :class:`Server` for
 ``registry.py`` compatibility, but delegates transport to the Rust
 ``c2-server`` crate via PyO3 bindings.
 
-CRM domain logic (ICRM creation, method discovery, dispatch tables,
+CRM domain logic (CRM instance creation, method discovery, dispatch tables,
 shutdown callbacks) remains in Python.  Only the UDS accept loop,
 frame parsing, heartbeat, and concurrency scheduling move to Rust.
 """
@@ -22,7 +22,7 @@ from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from c_two.config.ipc import ServerIPCConfig
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
-from .reply import unpack_icrm_result
+from .reply import unpack_resource_result
 from .hold_registry import HoldRegistry
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ class CRMSlot:
     """Per-CRM registration, keyed by routing name."""
 
     name: str
-    icrm: object
+    crm_instance: object
     method_table: MethodTable
     scheduler: Scheduler
     methods: list[str]
@@ -59,7 +59,7 @@ class CRMSlot:
         for name in self.methods:
             if name == self.shutdown_method:
                 continue
-            method = getattr(self.icrm, name, None)
+            method = getattr(self.crm_instance, name, None)
             if method is not None:
                 access = get_method_access(method)
                 buffer_mode = getattr(method, '_input_buffer_mode', 'view')
@@ -69,7 +69,7 @@ class CRMSlot:
 class NativeServerBridge:
     """Drop-in replacement for the Python ``Server`` class.
 
-    Manages CRM slots in Python (ICRM creation, dispatch tables,
+    Manages CRM slots in Python (CRM instance creation, dispatch tables,
     shutdown callbacks) while delegating the IPC transport to the
     Rust ``RustServer`` (c2-server crate).
     """
@@ -77,7 +77,7 @@ class NativeServerBridge:
     def __init__(
         self,
         bind_address: str,
-        icrm_class: type | None = None,
+        crm_class: type | None = None,
         crm_instance: object | None = None,
         ipc_config: ServerIPCConfig | None = None,
         concurrency: ConcurrencyConfig | None = None,
@@ -128,9 +128,9 @@ class NativeServerBridge:
         )
 
         # Register initial CRM if provided (compat with old Server constructor).
-        if icrm_class is not None and crm_instance is not None:
+        if crm_class is not None and crm_instance is not None:
             self.register_crm(
-                icrm_class, crm_instance, concurrency, name=name,
+                crm_class, crm_instance, concurrency, name=name,
             )
 
     # ------------------------------------------------------------------
@@ -139,20 +139,20 @@ class NativeServerBridge:
 
     def register_crm(
         self,
-        icrm_class: type,
+        crm_class: type,
         crm_instance: object,
         concurrency: ConcurrencyConfig | None = None,
         *,
         name: str | None = None,
     ) -> str:
         routing_name = (
-            name if name is not None else self._extract_namespace(icrm_class)
+            name if name is not None else self._extract_namespace(crm_class)
         )
-        icrm = self._create_icrm(icrm_class, crm_instance)
-        methods = self._discover_methods(icrm_class)
+        instance = self._create_crm_instance(crm_class, crm_instance)
+        methods = self._discover_methods(crm_class)
         cc_config = concurrency or self._default_concurrency
         scheduler = Scheduler(cc_config)
-        sd_method = get_shutdown_method(icrm_class)
+        sd_method = get_shutdown_method(crm_class)
 
         if sd_method is not None:
             methods = [m for m in methods if m != sd_method]
@@ -160,7 +160,7 @@ class NativeServerBridge:
 
         slot = CRMSlot(
             name=routing_name,
-            icrm=icrm,
+            crm_instance=instance,
             method_table=method_table,
             scheduler=scheduler,
             methods=methods,
@@ -259,29 +259,29 @@ class NativeServerBridge:
             slot.scheduler.shutdown()
 
     # ------------------------------------------------------------------
-    # ICRM helpers
+    # CRM instance helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _create_icrm(icrm_class: type, crm_instance: object) -> object:
-        icrm = icrm_class()
-        icrm.crm = crm_instance
-        icrm.direction = '<-'
-        return icrm
+    def _create_crm_instance(crm_class: type, crm_instance: object) -> object:
+        instance = crm_class()
+        instance.resource = crm_instance
+        instance.direction = '<-'
+        return instance
 
     @staticmethod
-    def _discover_methods(icrm_class: type) -> list[str]:
+    def _discover_methods(crm_class: type) -> list[str]:
         return sorted(
             name
             for name, _ in inspect.getmembers(
-                icrm_class, predicate=inspect.isfunction,
+                crm_class, predicate=inspect.isfunction,
             )
             if not name.startswith('_')
         )
 
     @staticmethod
-    def _extract_namespace(icrm_class: type) -> str:
-        tag = getattr(icrm_class, '__tag__', '')
+    def _extract_namespace(crm_class: type) -> str:
+        tag = getattr(crm_class, '__tag__', '')
         return tag.split('/')[0] if tag else ''
 
     # ------------------------------------------------------------------
@@ -293,7 +293,7 @@ class NativeServerBridge:
         sd = slot.shutdown_method
         if sd is None:
             return
-        crm = getattr(slot.icrm, 'crm', None)
+        crm = getattr(slot.crm_instance, 'resource', None)
         if crm is None:
             return
         try:
@@ -319,7 +319,7 @@ class NativeServerBridge:
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
         held.  Signature: ``(route_name, method_idx, shm_buffer, response_pool)``.
         It reads the request via ``memoryview(shm_buffer)``, resolves the
-        method, calls the ICRM, and returns result bytes (or *None* for empty
+        method, calls the resource, and returns result bytes (or *None* for empty
         responses).  For large responses (> shm_threshold), allocates from
         ``response_pool`` SHM and returns a ``(seg_idx, offset, data_size,
         is_dedicated)`` tuple — Rust sends the buddy frame directly.
@@ -388,7 +388,7 @@ class NativeServerBridge:
                         )
 
             # 3. Unpack result
-            res_part, err_part = unpack_icrm_result(result)
+            res_part, err_part = unpack_resource_result(result)
             if err_part:
                 raise CrmCallError(err_part)
             if not res_part:

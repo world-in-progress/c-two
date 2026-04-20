@@ -98,6 +98,9 @@ impl MemPool {
         if config.dedicated_crash_timeout_secs.is_nan() {
             return Err("dedicated_crash_timeout_secs must not be NaN".into());
         }
+        if config.buddy_idle_decay_secs.is_nan() {
+            return Err("buddy_idle_decay_secs must not be NaN".into());
+        }
         Ok(())
     }
 
@@ -256,7 +259,7 @@ impl MemPool {
     /// indices are encoded in wire frames). Always retains at least one segment.
     /// Returns the number of segments reclaimed.
     pub fn gc_buddy(&mut self) -> usize {
-        let secs = self.config.dedicated_crash_timeout_secs;
+        let secs = self.config.buddy_idle_decay_secs;
         let delay = if secs < 0.0 {
             std::time::Duration::ZERO
         } else {
@@ -1043,6 +1046,7 @@ mod tests {
             max_segments: 4,
             max_dedicated_segments: 0,
             dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
             ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
@@ -1200,6 +1204,56 @@ mod tests {
     }
 
     #[test]
+    fn test_gc_buddy_respects_decay_window() {
+        // With a large decay window, idle trailing segments should NOT be reclaimed.
+        let config = PoolConfig {
+            segment_size: 32 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 0,
+            dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 3600.0,
+            ..PoolConfig::default()
+        };
+        let mut pool = test_pool(config);
+        let a = pool.alloc(32 * 1024).unwrap();
+        let b = pool.alloc(32 * 1024).unwrap();
+        assert!(pool.segment_count() >= 2);
+        pool.free(&a).unwrap();
+        pool.free(&b).unwrap();
+        // Despite idleness, decay window prevents reclamation.
+        let reclaimed = pool.gc_buddy();
+        assert_eq!(reclaimed, 0);
+        assert!(pool.segment_count() >= 2);
+    }
+
+    #[test]
+    fn test_gc_buddy_reclaims_with_zero_decay() {
+        // With zero decay, idle trailing segments should be reclaimed immediately.
+        let config = PoolConfig {
+            segment_size: 32 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 0,
+            dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
+            ..PoolConfig::default()
+        };
+        let mut pool = test_pool(config);
+        let a = pool.alloc(32 * 1024).unwrap();
+        let b = pool.alloc(32 * 1024).unwrap();
+        let seg_before = pool.segment_count();
+        assert!(seg_before >= 2);
+        pool.free(&a).unwrap();
+        pool.free(&b).unwrap();
+        let reclaimed = pool.gc_buddy();
+        assert!(reclaimed >= 1, "expected at least one idle segment to be reclaimed");
+        assert!(pool.segment_count() < seg_before);
+        // gc_buddy always retains at least one segment.
+        assert!(pool.segment_count() >= 1);
+    }
+
+    #[test]
     fn test_dedicated_gc_flag_based() {
         let config = PoolConfig {
             segment_size: 32 * 1024,
@@ -1283,6 +1337,7 @@ mod tests {
             max_segments: 1,
             max_dedicated_segments: 0,
             dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_try_shm_test"),
         };
@@ -1314,6 +1369,7 @@ mod handle_tests {
             max_segments: 2,
             max_dedicated_segments: 2,
             dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0, // disable spill
             spill_dir: std::env::temp_dir().join("c2_pool_handle_test"),
         }

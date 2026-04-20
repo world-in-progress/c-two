@@ -23,20 +23,20 @@ from c_two.transport.registry import _ProcessRegistry
 
 # ── Echo CRMs ─────────────────────────────────────────────────────────
 
-@cc.icrm(namespace='bench.seg_bytes', version='0.1.0')
-class IEcho:
+@cc.crm(namespace='bench.seg_bytes', version='0.1.0')
+class Echo:
     def echo(self, data: bytes) -> bytes: ...
 
-class Echo:
+class EchoImpl:
     def echo(self, data: bytes) -> bytes:
         return data
 
 
-@cc.icrm(namespace='bench.seg_dict', version='0.1.0')
-class IDictEcho:
+@cc.crm(namespace='bench.seg_dict', version='0.1.0')
+class DictEcho:
     def echo(self, data: dict) -> dict: ...
 
-class DictEcho:
+class DictEchoImpl:
     def echo(self, data: dict) -> dict:
         return data
 
@@ -95,33 +95,33 @@ def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
     _counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server_ipc_config(segment_size=seg_size, max_segments=8,
+    cc.set_server(segment_size=seg_size, max_segments=8,
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.set_client_ipc_config(segment_size=seg_size, max_segments=8,
+    cc.set_client(segment_size=seg_size, max_segments=8,
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.register(IEcho, Echo(), name='echo_b')
+    cc.register(Echo, EchoImpl(), name='echo_b')
     address = cc.server_address()
     _wait_sock(address)
 
     payload = b'\xAB' * payload_size
     rounds = _rounds(payload_size)
     try:
-        icrm = cc.connect(IEcho, name='echo_b', address=address)
+        crm = cc.connect(Echo, name='echo_b', address=address)
         # warmup
         for _ in range(3):
-            r = icrm.echo(payload)
+            r = crm.echo(payload)
             if hasattr(r, 'release'): r.release()
         gc.collect()
 
         latencies = []
         for _ in range(rounds):
             t0 = time.perf_counter()
-            r = icrm.echo(payload)
+            r = crm.echo(payload)
             t1 = time.perf_counter()
             if hasattr(r, 'release'): r.release()
             latencies.append((t1 - t0) * 1000)
 
-        cc.close(icrm)
+        cc.close(crm)
         return statistics.median(latencies)
     except Exception as exc:
         print(f'  [bytes FAILED: {exc}]', file=sys.stderr)
@@ -138,11 +138,11 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
     _counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server_ipc_config(segment_size=seg_size, max_segments=8,
+    cc.set_server(segment_size=seg_size, max_segments=8,
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.set_client_ipc_config(segment_size=seg_size, max_segments=8,
+    cc.set_client(segment_size=seg_size, max_segments=8,
                               reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.register(IDictEcho, DictEcho(), name='echo_d')
+    cc.register(DictEcho, DictEchoImpl(), name='echo_d')
     address = cc.server_address()
     _wait_sock(address)
 
@@ -151,21 +151,21 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
     payload = {'data': b'\xCD' * payload_size, 'meta': {'size': payload_size}}
     rounds = _rounds(payload_size)
     try:
-        icrm = cc.connect(IDictEcho, name='echo_d', address=address)
+        crm = cc.connect(DictEcho, name='echo_d', address=address)
         for _ in range(3):
-            r = icrm.echo(payload)
+            r = crm.echo(payload)
             if hasattr(r, 'release'): r.release()
         gc.collect()
 
         latencies = []
         for _ in range(rounds):
             t0 = time.perf_counter()
-            r = icrm.echo(payload)
+            r = crm.echo(payload)
             t1 = time.perf_counter()
             if hasattr(r, 'release'): r.release()
             latencies.append((t1 - t0) * 1000)
 
-        cc.close(icrm)
+        cc.close(crm)
         return statistics.median(latencies)
     except Exception as exc:
         print(f'  [dict FAILED: {exc}]', file=sys.stderr)

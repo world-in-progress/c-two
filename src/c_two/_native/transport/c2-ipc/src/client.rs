@@ -349,6 +349,7 @@ impl IpcClient {
                 max_segments: 16,
                 max_dedicated_segments: 8,
                 dedicated_crash_timeout_secs: 60.0,
+                buddy_idle_decay_secs: 60.0,
                 spill_threshold: 1.0,
                 spill_dir: std::path::PathBuf::from("/tmp"),
             };

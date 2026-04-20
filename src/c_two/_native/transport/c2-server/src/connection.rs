@@ -227,6 +227,7 @@ impl Connection {
             max_segments: 16,
             max_dedicated_segments: 4,
             dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 60.0,
             spill_threshold: 1.0,
             spill_dir: std::path::PathBuf::from("/tmp/c_two_spill_srv"),
         };
