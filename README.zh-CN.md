@@ -10,7 +10,10 @@
 
 <p align="center">
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/dm/c-two" alt="Downloads" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/pyversions/c-two" alt="Python" /></a>
   <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
+  <a href="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml"><img src="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
 </p>
 
@@ -29,6 +32,31 @@
 - **为科学计算而生** — 原生支持 Apache Arrow、NumPy 数组和大体量载荷（超过 256 MB 自动分块流式传输）。专为计算密集型场景设计，而非微服务。
 
 - **Rust 驱动的传输层** — IPC 层使用 Rust buddy 分配器管理共享内存，HTTP 中继基于 Rust 实现高吞吐网络转发。
+
+---
+
+## 性能
+
+C-Two 的持有模式提供零拷贝 IPC — 客户端直接从共享内存读取数据，无需反序列化。
+
+**IPC 往返延迟** — [Kostya 风格坐标基准测试](benchmarks/)（5 列，混合类型）：
+
+| 行数 | C-Two (hold) | C-Two (pickle) | Ray (arrays) | C-Two 相对 Ray 加速 |
+|-----:|-------------:|----------------:|-------------:|--------------------:|
+| 10K | **0.6 ms** | 5.8 ms | 7.1 ms | **12×** |
+| 100K | **1.8 ms** | 69 ms | 8.9 ms | **5×** |
+| 1M | **8.7 ms** | 888 ms | 46 ms | **5×** |
+| 3M | **24 ms** | — | 137 ms | **6×** |
+
+**Hold vs Copy** — 零拷贝视图 vs 完整反序列化（9 列网格，列式读取）：
+
+| 载荷大小 | Copy (ms) | Hold / 零拷贝 (ms) | 加速比 |
+|---------:|----------:|--------------------:|-------:|
+| 1 MB | 0.48 | **0.018** | **27×** |
+| 100 MB | 47 | **2.1** | **22×** |
+| 1 GB | 490 | **25** | **20×** |
+
+> 测试环境：Apple M1 Max。完整方法和脚本见 [`benchmarks/`](benchmarks/)。
 
 ---
 

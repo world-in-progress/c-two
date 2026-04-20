@@ -10,7 +10,10 @@
 
 <p align="center">
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/dm/c-two" alt="Downloads" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/pyversions/c-two" alt="Python" /></a>
   <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
+  <a href="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml"><img src="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
 </p>
 
@@ -29,6 +32,31 @@
 - **Built for scientific Python** — Native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
 
 - **Rust-powered transport** — The IPC layer uses a Rust buddy allocator for shared memory and a Rust HTTP relay for high-throughput networking.
+
+---
+
+## Performance
+
+C-Two's hold mode delivers zero-copy IPC — the client reads directly from shared memory with no deserialization.
+
+**IPC round-trip latency** — [Kostya-style coordinate benchmark](benchmarks/) (5 columns, mixed types):
+
+| Rows | C-Two (hold) | C-Two (pickle) | Ray (arrays) | C-Two speedup vs Ray |
+|-----:|-------------:|----------------:|-------------:|---------------------:|
+| 10K | **0.6 ms** | 5.8 ms | 7.1 ms | **12×** |
+| 100K | **1.8 ms** | 69 ms | 8.9 ms | **5×** |
+| 1M | **8.7 ms** | 888 ms | 46 ms | **5×** |
+| 3M | **24 ms** | — | 137 ms | **6×** |
+
+**Hold vs Copy** — zero-copy view vs full deserialization (9-column grid, columnar read):
+
+| Payload | Copy (ms) | Hold / zero-copy (ms) | Speedup |
+|--------:|----------:|----------------------:|--------:|
+| 1 MB | 0.48 | **0.018** | **27×** |
+| 100 MB | 47 | **2.1** | **22×** |
+| 1 GB | 490 | **25** | **20×** |
+
+> Measured on Apple M1 Max. See [`benchmarks/`](benchmarks/) for full methodology and scripts.
 
 ---
 
