@@ -56,7 +56,7 @@ jobs:
             python3.13 python3.14 python3.14t
           manylinux: auto
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -75,7 +75,7 @@ jobs:
           command: sdist
           args: --out dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
