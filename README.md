@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/dm/c-two" alt="Downloads" /></a>
-  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/badge/python-%E2%89%A53.10-blue" alt="Python" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/pyversions/c-two" alt="Python" /></a>
   <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
   <a href="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml"><img src="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
