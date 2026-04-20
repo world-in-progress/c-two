@@ -37,26 +37,21 @@
 
 ## Performance
 
-C-Two's hold mode delivers zero-copy IPC — the client reads directly from shared memory with no deserialization.
+End-to-end cross-process IPC benchmark — same NumPy payload (`row_id u32` + `x,y,z f64`), same machine, same aggregation. Three transport modes compared:
 
-**IPC round-trip latency** — [Kostya-style coordinate benchmark](benchmarks/) (5 columns, mixed types):
+| Rows | C-Two hold (ms) | Ray (ms) | C-Two pickle (ms) | **Hold vs Ray** |
+|-----:|---:|---:|---:|---:|
+| 1 K | **0.07** | 6.1 | 0.19 | **86×** |
+| 10 K | **0.09** | 7.1 | 0.82 | **79×** |
+| 100 K | **0.38** | 9.8 | 8.7 | **26×** |
+| 1 M | **3.7** | 58 | 150 | **15×** |
+| 3 M | **9.7** | 129 | 598 | **13×** |
 
-| Rows | C-Two (hold) | C-Two (pickle) | Ray (arrays) | C-Two speedup vs Ray |
-|-----:|-------------:|----------------:|-------------:|---------------------:|
-| 10K | **0.6 ms** | 5.8 ms | 7.1 ms | **12×** |
-| 100K | **1.8 ms** | 69 ms | 8.9 ms | **5×** |
-| 1M | **8.7 ms** | 888 ms | 46 ms | **5×** |
-| 3M | **24 ms** | — | 137 ms | **6×** |
+- **C-Two hold** — SHM zero-copy via `np.frombuffer`; no serialization on read
+- **Ray** — object store with zero-copy numpy support (Ray 2.55)
+- **C-Two pickle** — standard pickle over SHM; included to show serialization cost
 
-**Hold vs Copy** — zero-copy view vs full deserialization (9-column grid, columnar read):
-
-| Payload | Copy (ms) | Hold / zero-copy (ms) | Speedup |
-|--------:|----------:|----------------------:|--------:|
-| 1 MB | 0.48 | **0.018** | **27×** |
-| 100 MB | 47 | **2.1** | **22×** |
-| 1 GB | 490 | **25** | **20×** |
-
-> Measured on Apple M1 Max. See [`benchmarks/`](benchmarks/) for full methodology and scripts.
+> Apple M4 Max · Python 3.13 · NumPy 2.4 · See [`benchmarks/unified_numpy_benchmark.py`](benchmarks/unified_numpy_benchmark.py) for full methodology.
 
 ---
 
