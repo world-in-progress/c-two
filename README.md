@@ -51,7 +51,7 @@ End-to-end cross-process IPC benchmark — same NumPy payload (`row_id u32` + `x
 - **Ray** — object store with zero-copy numpy support (Ray 2.55)
 - **C-Two pickle** — standard pickle over SHM; included to show serialization cost
 
-> Apple M4 Max · Python 3.13 · NumPy 2.4 · See [`benchmarks/unified_numpy_benchmark.py`](benchmarks/unified_numpy_benchmark.py) for full methodology.
+> Apple M1 Max · Python 3.13 · NumPy 2.4 · See [`benchmarks/unified_numpy_benchmark.py`](benchmarks/unified_numpy_benchmark.py) for full methodology.
 
 ---
 

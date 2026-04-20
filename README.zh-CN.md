@@ -51,7 +51,7 @@
 - **Ray** — 对象存储，内置 numpy 零拷贝支持（Ray 2.55）
 - **C-Two pickle** — 标准 pickle 经由 SHM 传输；展示序列化开销
 
-> Apple M4 Max · Python 3.13 · NumPy 2.4 · 完整方法见 [`benchmarks/unified_numpy_benchmark.py`](benchmarks/unified_numpy_benchmark.py)。
+> Apple M1 Max · Python 3.13 · NumPy 2.4 · 完整方法见 [`benchmarks/unified_numpy_benchmark.py`](benchmarks/unified_numpy_benchmark.py)。
 
 ---
 
