@@ -12,7 +12,7 @@ jobs:
       should_release: ${{ steps.check.outputs.should_release }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v5
         with:
@@ -44,7 +44,7 @@ jobs:
             target: x86_64-apple-darwin
     name: wheel (${{ matrix.target }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: PyO3/maturin-action@v1
         with:
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     name: sdist
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: PyO3/maturin-action@v1
         with:
