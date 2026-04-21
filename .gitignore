@@ -194,3 +194,4 @@ src/c_two/buddy/_buddy_core/target/
 # Benchmark results (local-only, not tracked)
 benchmarks/results/*
 !benchmarks/results/.gitkeep
+.superpowers/

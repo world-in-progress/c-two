@@ -10,6 +10,7 @@
 |------|------|
 | [`sota-patterns.md`](./sota-patterns.md) | C-Two RPC 的 SOTA 设计模式（隐式服务、注册-获取、资源托管） |
 | [`endgame-architecture.md`](./endgame-architecture.md) | 分布式资源运行时的 endgame 架构：Toodle / 智能体 / 人在回路 |
+| [`toodle-distributed.md`](./toodle-distributed.md) | Toodle (L2) M4 分布式架构设计，含 fastdb 生态准入契约与启动顺序 |
 
 ## 读者指南
 
