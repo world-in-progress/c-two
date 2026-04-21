@@ -25,7 +25,7 @@ from grid.grid_contract import Grid, GridAttribute
 
 def main():
     # Connect via HTTP relay — same API as IPC, different address.
-    grid = cc.connect(Grid, name='grid')
+    grid = cc.connect(Grid, name='examples/grid')
     print(f'[Client] Connected via HTTP (mode: {grid.client._mode})\n')
 
     # ── Hello ─────────────────────────────────────────────────────

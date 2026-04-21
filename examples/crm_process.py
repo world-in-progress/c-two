@@ -21,10 +21,7 @@ from grid.grid_contract import Grid
 
 logging.basicConfig(level=logging.DEBUG)
 
-
 def main():
-    # Init the Grid CRM (same as old server.py)
-
     # Init the Grid CRM (same as old server.py)
     epsg = 2326
     first_size = [64.0, 64.0]
@@ -35,7 +32,7 @@ def main():
     grid = NestedGrid(epsg, bounds, first_size, subdivide_rules)
 
     # Register — one line replaces ServerConfig + Server + start()
-    cc.register(Grid, grid, name='grid')
+    cc.register(Grid, grid, name='examples/grid')
     print(f'Grid CRM registered at {cc.server_address()}')
 
     # Block until SIGINT/SIGTERM, then auto-shutdown via atexit.

@@ -271,6 +271,37 @@ class TestCcConnectHttp:
         cc.close(crm)
         assert registry._http_pool.refcount(relay_url) == 0
 
+    def test_connect_http_with_slash_in_name(self):
+        """CRM names containing '/' (toodle-style resource paths) work over HTTP relay.
+
+        Regression: axum's single-segment ``Path<String>`` extractor would
+        404 on a raw ``/_resolve/a/b`` and split ``/{name}/{method}``
+        wrong. Both the Python registry and the Rust HTTP client now
+        percent-encode ``/`` as ``%2F``.
+        """
+        from c_two._native import NativeRelay
+
+        slashed_name = 'toodle/grid/0'
+        cc.register(Hello, HelloImpl(), name=slashed_name)
+        ipc_addr = cc.server_address()
+
+        http_port = 19000 + _next_id()
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        try:
+            _wait_for_relay(relay_url)
+            relay.register_upstream(slashed_name, ipc_addr)
+
+            # Forced HTTP mode (address explicitly set).
+            crm = cc.connect(Hello, name=slashed_name, address=relay_url)
+            try:
+                assert crm.greeting('Slash') == 'Hello, Slash!'
+            finally:
+                cc.close(crm)
+        finally:
+            relay.stop()
+
 
 # ---------------------------------------------------------------------------
 # Control-plane endpoint tests
