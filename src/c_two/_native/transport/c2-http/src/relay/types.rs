@@ -33,10 +33,16 @@ pub struct RouteInfo {
 
 impl RouteEntry {
     pub fn to_route_info(&self) -> RouteInfo {
+        // `ipc_address` is private to the owning relay's filesystem; only
+        // expose it for LOCAL routes. PEER routes go through `relay_url`.
+        let ipc_address = match self.locality {
+            Locality::Local => self.ipc_address.clone(),
+            Locality::Peer => None,
+        };
         RouteInfo {
             name: self.name.clone(),
             relay_url: self.relay_url.clone(),
-            ipc_address: self.ipc_address.clone(),
+            ipc_address,
             crm_ns: self.crm_ns.clone(),
             crm_ver: self.crm_ver.clone(),
         }

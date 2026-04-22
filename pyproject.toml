@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.4.5"
+version = "0.4.6"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
 license-files = ["LICENSE"]

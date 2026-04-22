@@ -169,7 +169,12 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
             if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
                 if let PeerMessage::DigestDiff { entries, extra: _ } = resp_env.message {
                     for diff_entry in entries {
-                        state.register_peer_route(diff_entry.into());
+                        // Defense-in-depth: scrub ipc_address from incoming
+                        // peer routes — the path is local to the sender.
+                        let mut entry: crate::relay::types::RouteEntry =
+                            diff_entry.into();
+                        entry.ipc_address = None;
+                        state.register_peer_route(entry);
                     }
                 }
             }
@@ -240,7 +245,10 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                     if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
                         if let PeerMessage::DigestDiff { entries, extra: _ } = resp_env.message {
                             for diff_entry in entries {
-                                state.register_peer_route(diff_entry.into());
+                                let mut entry: crate::relay::types::RouteEntry =
+                                    diff_entry.into();
+                                entry.ipc_address = None;
+                                state.register_peer_route(entry);
                             }
                         }
                     }
