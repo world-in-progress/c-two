@@ -37,13 +37,48 @@ import logging
 import os
 import signal
 import sys
+import os
 import threading
 import time
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from urllib.parse import quote as _urlquote
 from urllib.parse import urlparse as _urlparse
 from typing import TypeVar
+
+
+# Build once: an opener that BYPASSES system HTTP_PROXY for all relay traffic.
+# Rationale: the c-two relay is private mesh infrastructure on user-controlled
+# hosts. Routing relay traffic through a corporate / dev HTTP proxy causes
+# subtle bugs (e.g., proxies normalize percent-encoded `%2F` in path segments
+# to `/`, breaking resource names that contain `/`). It is also a privacy /
+# correctness hazard to leak internal mesh control traffic to a third-party
+# proxy. An empty ProxyHandler({}) tells urllib to never use any proxy.
+#
+# Users who actually want to route relay traffic through the system proxy
+# (e.g., behind a forward proxy that doesn't normalize URLs) can opt in by
+# setting C2_RELAY_USE_PROXY=1.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _relay_use_proxy() -> bool:
+    """Read C2_RELAY_USE_PROXY directly from the environment.
+
+    We read the env var at call time (not via the cached pydantic settings
+    object) so behavior matches the Rust side, which also reads the env on
+    every client creation. This avoids a confusing "Python and Rust
+    disagree" failure mode if the user mutates the env after import.
+    """
+    val = os.environ.get("C2_RELAY_USE_PROXY", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _relay_urlopen(req, timeout: float = 5.0):
+    """urlopen for relay traffic. Honors C2_RELAY_USE_PROXY (default: bypass)."""
+    if _relay_use_proxy():
+        return urllib.request.urlopen(req, timeout=timeout)
+    return _NO_PROXY_OPENER.open(req, timeout=timeout)
 
 from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
 from c_two.config.settings import settings
@@ -660,7 +695,6 @@ class _ProcessRegistry:
         if not relay_addr:
             return  # No relay configured — standalone mode.
 
-        import urllib.request
         import json
 
         payload = json.dumps({
@@ -678,7 +712,7 @@ class _ProcessRegistry:
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _relay_urlopen(req, timeout=5) as resp:
                     if resp.status in (200, 201):
                         log.info('Registered CRM %s with relay at %s',
                                  name, relay_addr)
@@ -696,7 +730,6 @@ class _ProcessRegistry:
     def _schedule_background_relay_register(self, name, ipc_address,
                                             crm_ns, crm_ver):
         """Background thread that keeps trying to register with relay."""
-        import urllib.request
         import json
 
         def retry_loop():
@@ -720,7 +753,7 @@ class _ProcessRegistry:
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
-                    with urllib.request.urlopen(req, timeout=5):
+                    with _relay_urlopen(req, timeout=5):
                         log.info('Background relay register succeeded for %s',
                                  name)
                         return
@@ -737,7 +770,6 @@ class _ProcessRegistry:
             return
 
         import json
-        import urllib.request
 
         url = f'{relay_addr.rstrip("/")}/_unregister'
         body = json.dumps({'name': name}).encode()
@@ -748,7 +780,7 @@ class _ProcessRegistry:
                     headers={'Content-Type': 'application/json'},
                     method='POST',
                 )
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with _relay_urlopen(req, timeout=timeout) as resp:
                     if resp.status in (200, 204):
                         log.info('Unregistered CRM %s from relay', name)
                         return
@@ -770,12 +802,11 @@ class _ProcessRegistry:
             raise RegistryUnavailable("No relay configured (set C2_RELAY_ADDRESS or call cc.set_relay())")
 
         import json
-        import urllib.request
 
         url = f'{relay_addr.rstrip("/")}/_resolve/{_urlquote(name, safe="")}'
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _relay_urlopen(req, timeout=5) as resp:
                 routes = json.loads(resp.read())
                 self._route_cache.put(name, routes)
                 return routes

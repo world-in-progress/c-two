@@ -20,10 +20,10 @@ pub struct FullBroadcast {
 impl FullBroadcast {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::builder()
+            http_client: crate::relay_client_builder()
                 .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            .build()
+                .expect("c-two: failed to build reqwest Client for relay traffic"),
         }
     }
 

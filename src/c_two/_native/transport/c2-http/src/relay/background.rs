@@ -133,10 +133,10 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     ticker.tick().await;
     let mut round_robin_idx: usize = 0;
 
-    let client = reqwest::Client::builder()
+    let client = crate::relay_client_builder()
         .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+            .build()
+        .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
         tokio::select! {
@@ -201,10 +201,10 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
 
-    let client = reqwest::Client::builder()
+    let client = crate::relay_client_builder()
         .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+            .build()
+        .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
         tokio::select! {
@@ -265,10 +265,10 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
 
-    let client = reqwest::Client::builder()
+    let client = crate::relay_client_builder()
         .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+            .build()
+        .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
         tokio::select! {
