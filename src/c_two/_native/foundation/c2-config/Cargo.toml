@@ -8,5 +8,5 @@ description = "Shared configuration types for C-Two IPC transport, memory pool, 
 name = "c2_config"
 
 [dependencies]
-gethostname = "0.2"
+gethostname = "1.1"
 uuid = { version = "1", features = ["v4"] }
