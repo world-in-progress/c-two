@@ -3,7 +3,21 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use thiserror::Error;
+
+/// Characters allowed unencoded in URL path segments — matches Python's
+/// ``urllib.parse.quote(s, safe='')`` so a `/` in a CRM route name is
+/// percent-encoded as `%2F` rather than splitting the path.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+fn encode_segment(s: &str) -> String {
+    utf8_percent_encode(s, PATH_SEGMENT).to_string()
+}
 
 // ── Shared tokio runtime ────────────────────────────────────────────────
 
@@ -84,7 +98,12 @@ impl HttpClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, HttpError> {
-        let url = format!("{}/{}/{}", self.base_url, route_name, method_name);
+        let url = format!(
+            "{}/{}/{}",
+            self.base_url,
+            encode_segment(route_name),
+            encode_segment(method_name),
+        );
         let resp = self
             .client
             .post(&url)

@@ -19,7 +19,7 @@ from grid.grid_contract import (
 
 def main():
     # Connect to the remote server via IPC
-    grid = cc.connect(Grid, name='grid')
+    grid = cc.connect(Grid, name='examples/grid')
     print(f'Connected (mode: {grid.client._mode})\n')
 
     # Say hello

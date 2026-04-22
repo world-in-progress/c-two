@@ -5,8 +5,8 @@
 //! OS thread with its own tokio runtime.
 //!
 //! **GIL handling**: `PyCrmCallback::invoke()` acquires the GIL internally
-//! (called from `spawn_blocking` inside tokio).  All blocking `PyServer`
-//! methods release the GIL via `py.allow_threads()`.
+//! (called from `spawn_blocking` inside tokio). All blocking `PyServer`
+//! methods release the GIL via `py.detach()`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyTuple};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
 
 use c2_mem::MemPool;
 use c2_config::{BaseIpcConfig, ServerIpcConfig};
@@ -30,12 +30,12 @@ use crate::shm_buffer::PyShmBuffer;
 // ---------------------------------------------------------------------------
 
 struct PyCrmCallback {
-    py_callable: PyObject,
-    response_pool_obj: PyObject,
+    py_callable: Py<PyAny>,
+    response_pool_obj: Py<PyAny>,
 }
 
-// SAFETY: PyObject is Send when accessed only under the GIL.
-// `invoke()` always acquires the GIL via `Python::with_gil` before
+// SAFETY: Py<PyAny> is Send when accessed only under the GIL.
+// `invoke()` always acquires the GIL via `Python::attach` before
 // touching `py_callable`.
 unsafe impl Send for PyCrmCallback {}
 unsafe impl Sync for PyCrmCallback {}
@@ -50,7 +50,7 @@ impl CrmCallback for PyCrmCallback {
         // re-creating PyMemPool on every call. Trait requires it for non-FFI impls.
         _response_pool: Arc<parking_lot::RwLock<MemPool>>,
     ) -> Result<ResponseMeta, CrmError> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Convert RequestData → PyShmBuffer
             let shm_buf = match request {
                 RequestData::Inline(data) => PyShmBuffer::from_inline(data),
@@ -67,14 +67,19 @@ impl CrmCallback for PyCrmCallback {
                 .map_err(|e| CrmError::InternalError(format!("failed to create ShmBuffer: {e}")))?;
 
             // Call Python: dispatcher(route_name, method_idx, shm_buffer, response_pool)
-            let args = (route_name, method_idx, buf_obj, &self.response_pool_obj);
+            let args = (
+                route_name,
+                method_idx,
+                buf_obj,
+                self.response_pool_obj.bind(py),
+            );
             match self.py_callable.call1(py, args) {
                 Ok(result) => parse_response_meta(py, result),
                 Err(e) => {
                     // Check for .error_bytes attribute (CrmCallError from Python).
                     let val = e.value(py);
                     if let Ok(attr) = val.getattr("error_bytes") {
-                        if let Ok(b) = attr.downcast::<PyBytes>() {
+                        if let Ok(b) = attr.cast::<PyBytes>() {
                             return Err(CrmError::UserError(b.as_bytes().to_vec()));
                         }
                     }
@@ -167,7 +172,7 @@ impl PyServer {
         &self,
         py: Python<'_>,
         name: &str,
-        dispatcher: PyObject,
+        dispatcher: Py<PyAny>,
         method_names: Vec<String>,
         access_map: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
@@ -189,7 +194,7 @@ impl PyServer {
         }
 
         // Create PyMemPool wrapping the server's response pool
-        let response_pool_obj: PyObject = {
+        let response_pool_obj: Py<PyAny> = {
             let pool_arc = self.inner.response_pool_arc();
             let py_pool = PyMemPool::from_arc(pool_arc);
             Py::new(py, py_pool)?.into_any()
@@ -212,7 +217,7 @@ impl PyServer {
 
         // Register requires async; use a short-lived runtime if the main
         // one hasn't started, or block_on the existing runtime's handle.
-        py.allow_threads(move || {
+        py.detach(move || {
             let rt_guard = self.rt.lock();
             if let Some(rt) = rt_guard.as_ref() {
                 rt.block_on(server.register_route(route));
@@ -237,7 +242,7 @@ impl PyServer {
         // Build the runtime while NOT holding the Mutex (avoid GIL↔Mutex deadlock).
         let server = Arc::clone(&self.inner);
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -271,7 +276,7 @@ impl PyServer {
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
         let server = Arc::clone(&self.inner);
 
-        py.allow_threads(|| {
+        py.detach(|| {
             server.shutdown();
 
             let rt = {
@@ -292,7 +297,7 @@ impl PyServer {
         let server = Arc::clone(&self.inner);
         let name = name.to_string();
 
-        py.allow_threads(move || {
+        py.detach(move || {
             let rt_guard = self.rt.lock();
             if let Some(rt) = rt_guard.as_ref() {
                 Ok(rt.block_on(server.unregister_route(&name)))
@@ -329,19 +334,21 @@ impl PyServer {
 /// - `None` → `ResponseMeta::Empty`
 /// - `bytes` → `ResponseMeta::Inline(vec)`
 /// - `(seg_idx: int, offset: int, data_size: int, is_dedicated: bool)` → `ResponseMeta::ShmAlloc`
-fn parse_response_meta(py: Python<'_>, result: PyObject) -> Result<ResponseMeta, CrmError> {
+fn parse_response_meta(py: Python<'_>, result: Py<PyAny>) -> Result<ResponseMeta, CrmError> {
+    let result = result.bind(py);
+
     // None → Empty
-    if result.is_none(py) {
+    if result.is_none() {
         return Ok(ResponseMeta::Empty);
     }
 
     // bytes → Inline
-    if let Ok(bytes) = result.downcast_bound::<PyBytes>(py) {
+    if let Ok(bytes) = result.cast::<PyBytes>() {
         return Ok(ResponseMeta::Inline(bytes.as_bytes().to_vec()));
     }
 
     // tuple (seg_idx, offset, data_size, is_dedicated) → ShmAlloc
-    if let Ok(tup) = result.downcast_bound::<PyTuple>(py) {
+    if let Ok(tup) = result.cast::<PyTuple>() {
         if tup.len() != 4 {
             return Err(CrmError::InternalError(format!(
                 "expected 4-element tuple (seg_idx, offset, data_size, is_dedicated), got {}-element tuple",

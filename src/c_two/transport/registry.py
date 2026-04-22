@@ -41,6 +41,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from urllib.parse import quote as _urlquote
 from typing import TypeVar
 
 from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
@@ -385,8 +386,10 @@ class _ProcessRegistry:
                     if ipc_addr:
                         address = ipc_addr
                     else:
-                        relay_url = route.get("relay_url", "")
-                        address = f"{relay_url}/{name}"
+                        # HTTP base URL is just the relay; the Rust HTTP
+                        # client appends `/{route_name}/{method_name}` on
+                        # each call.
+                        address = route.get("relay_url", "")
 
                     if address.startswith(('http://', 'https://')):
                         client = self._http_pool.acquire(address)
@@ -727,7 +730,7 @@ class _ProcessRegistry:
         import json
         import urllib.request
 
-        url = f'{relay_addr.rstrip("/")}/_resolve/{name}'
+        url = f'{relay_addr.rstrip("/")}/_resolve/{_urlquote(name, safe="")}'
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=5) as resp:
