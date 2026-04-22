@@ -3,6 +3,10 @@ import logging
 import re
 import signal
 import sys
+
+# Reuse the registry's proxy-bypass-aware urllib opener so
+# CLI admin commands honor the same C2_RELAY_USE_PROXY policy as runtime.
+from c_two.transport.registry import _relay_urlopen
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -267,7 +271,7 @@ def registry_list_routes(relay):
 
     url = f'{relay.rstrip("/")}/_routes'
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with _relay_urlopen(urllib.request.Request(url), timeout=5) as resp:
             routes = json.loads(resp.read())
             if not routes:
                 click.echo('No routes registered.')
@@ -290,7 +294,7 @@ def registry_resolve(relay, name):
 
     url = f'{relay.rstrip("/")}/_resolve/{name}'
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with _relay_urlopen(urllib.request.Request(url), timeout=5) as resp:
             routes = json.loads(resp.read())
             for route in routes:
                 click.echo(json.dumps(route, indent=2))
@@ -314,7 +318,7 @@ def registry_peers(relay):
 
     url = f'{relay.rstrip("/")}/_peers'
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with _relay_urlopen(urllib.request.Request(url), timeout=5) as resp:
             peer_list = json.loads(resp.read())
             if not peer_list:
                 click.echo('No peers known.')

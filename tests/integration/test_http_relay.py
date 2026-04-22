@@ -41,14 +41,18 @@ def _next_id() -> int:
 
 def _wait_for_relay(url: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f'{url}/health', timeout=0.5)
-            if resp.status_code == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(0.1)
+    # trust_env=False disables HTTP_PROXY / HTTPS_PROXY env reading so that
+    # tests which set a black-hole proxy (test_relay_traffic_bypasses_system_proxy)
+    # can still poll the local relay's /health.
+    with httpx.Client(trust_env=False, timeout=0.5) as client:
+        while time.monotonic() < deadline:
+            try:
+                resp = client.get(f'{url}/health')
+                if resp.status_code == 200:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.1)
     raise TimeoutError(f'Relay at {url} not ready after {timeout}s')
 
 
@@ -297,6 +301,49 @@ class TestCcConnectHttp:
             crm = cc.connect(Hello, name=slashed_name, address=relay_url)
             try:
                 assert crm.greeting('Slash') == 'Hello, Slash!'
+            finally:
+                cc.close(crm)
+        finally:
+            relay.stop()
+
+    def test_relay_traffic_bypasses_system_proxy(self, monkeypatch):
+        """All relay HTTP traffic must ignore HTTP_PROXY by default.
+
+        Regression: when a user sets HTTP_PROXY/HTTPS_PROXY (e.g. a corporate
+        forward proxy or a docker host proxy), Python urllib previously routed
+        relay control traffic through it, and proxies are known to normalize
+        percent-encoded ``%2F`` in URL paths to ``/`` — which then breaks
+        resource names containing ``/``. This test points HTTP_PROXY at a
+        black-hole address and verifies that name resolution + a CRM call
+        still succeed (i.e., proxy was bypassed).
+        """
+        from c_two._native import NativeRelay
+
+        # Black-hole proxy: connecting to TEST-NET-1 (RFC 5737) is guaranteed
+        # to time out / fail. If the request actually goes through the proxy,
+        # the test will fail loudly.
+        for var in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'):
+            monkeypatch.setenv(var, 'http://192.0.2.1:9')
+        for var in ('no_proxy', 'NO_PROXY'):
+            monkeypatch.delenv(var, raising=False)
+
+        name = 'proxy/bypass/test'
+        cc.register(Hello, HelloImpl(), name=name)
+        ipc_addr = cc.server_address()
+
+        http_port = 19000 + _next_id()
+        relay = NativeRelay(f'0.0.0.0:{http_port}')
+        relay.start()
+        relay_url = f'http://127.0.0.1:{http_port}'
+        try:
+            _wait_for_relay(relay_url)
+            relay.register_upstream(name, ipc_addr)
+
+            # urllib resolve must succeed (registry's _relay_urlopen bypasses proxy).
+            crm = cc.connect(Hello, name=name, address=relay_url)
+            try:
+                # reqwest call must succeed (Rust HttpClient builder bypasses proxy).
+                assert crm.greeting('NoProxy') == 'Hello, NoProxy!'
             finally:
                 cc.close(crm)
         finally:

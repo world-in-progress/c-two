@@ -69,7 +69,7 @@ impl HttpClient {
         timeout_secs: f64,
         max_connections: usize,
     ) -> Result<Self, HttpError> {
-        let client = reqwest::Client::builder()
+        let client = crate::relay_client_builder()
             .timeout(Duration::from_secs_f64(timeout_secs))
             .pool_max_idle_per_host(max_connections)
             .build()

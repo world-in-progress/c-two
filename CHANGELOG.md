@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.7] — 2026-04-22
+
+### Fixed
+
+- Cross-machine relay traffic no longer goes through system `HTTP_PROXY` /
+  `HTTPS_PROXY` by default. Forward proxies are known to normalize
+  percent-encoded `%2F` in URL path segments to `/`, which broke resource
+  names containing `/` (e.g., `nhri/simulator`) and silently rerouted CRM
+  call traffic through the proxy. Both the Python registry's `urllib`
+  client and all Rust `reqwest::Client` instances (CRM HTTP client, relay
+  mesh disseminator, anti-entropy / failure-detection / route-pull loops,
+  upstream IPC client builder) now bypass system proxies. Set
+  `C2_RELAY_USE_PROXY=1` to opt back in.
+
+  The `c3 registry list-routes / resolve / peers` admin commands also
+  bypass system proxies for consistency with runtime traffic. If
+  `reqwest::ClientBuilder::build()` ever fails, c-two now panics rather
+  than silently falling back to a proxy-respecting `Client::default()`.
+  The `C2_RELAY_USE_PROXY` flag is read directly from `os.environ` /
+  `std::env` on every call so Python and Rust layers always see a
+  consistent view (no cached pydantic settings).
+
+### Added
+
+- `C2_RELAY_USE_PROXY` env var (default: `false`) controlling whether
+  c-two relay HTTP traffic honors system proxy environment variables.
+
 ## [0.4.3] — 2026-04-18
 
 ### Added

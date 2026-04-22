@@ -186,10 +186,10 @@ impl RelayServer {
         if !state.config().seeds.is_empty() {
             let s = state.clone();
             tokio::spawn(async move {
-                let client = reqwest::Client::builder()
+                let client = crate::relay_client_builder()
                     .timeout(std::time::Duration::from_secs(5))
-                    .build()
-                    .unwrap_or_else(|_| reqwest::Client::new());
+            .build()
+                    .expect("c-two: failed to build reqwest Client for relay traffic");
                 for seed_url in &s.config().seeds {
                     let join_url = format!("{seed_url}/_peer/join");
                     let envelope = PeerEnvelope::new(

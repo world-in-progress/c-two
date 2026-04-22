@@ -27,6 +27,10 @@ class C2Settings(BaseSettings):
     relay_advertise_url: str | None = None       # C2_RELAY_ADVERTISE_URL
     relay_idle_timeout: int | None = None        # C2_RELAY_IDLE_TIMEOUT
     relay_anti_entropy_interval: float = 60.0    # C2_RELAY_ANTI_ENTROPY_INTERVAL
+    # NOTE: C2_RELAY_USE_PROXY is read directly via os.environ in
+    # transport/registry.py and Rust crate::relay_use_proxy(). It is NOT a
+    # pydantic field here because both layers must agree on its value at
+    # call time, not at settings-instantiation time.
 
     @property
     def relay_seed_list(self) -> list[str]:
