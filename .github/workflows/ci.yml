@@ -3,6 +3,7 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  merge_group:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -19,18 +20,32 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Skip redundant Dependabot matrix leg
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' && matrix.python != '3.12'
+        run: echo "Skipping this matrix leg for Dependabot pull requests"
+
       - uses: actions/setup-python@v5
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
         with:
           python-version: ${{ matrix.python }}
 
       - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+        with:
+          workspaces: src/c_two/_native -> target
 
       - uses: astral-sh/setup-uv@v6
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
 
       - name: Install dependencies & build native extension
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
         run: uv sync
 
       - name: Run tests
+        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
         run: uv run pytest tests/ -q --timeout=30
         env:
           C2_RELAY_ADDRESS: ""
