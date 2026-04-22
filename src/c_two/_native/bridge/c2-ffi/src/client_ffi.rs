@@ -4,7 +4,7 @@
 //! `RustClientPool` — a process-level pool of shared clients.
 //!
 //! **GIL handling**: all blocking operations release the GIL via
-//! `py.allow_threads()`.  `#[pyclass(frozen)]` ensures thread-safety
+//! `py.detach()`. `#[pyclass(frozen)]` ensures thread-safety
 //! for free-threading builds.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -316,7 +316,7 @@ impl PyRustClient {
         };
         let seg_size = config.pool_segment_size as usize;
         let addr = address.to_string();
-        let client = py.allow_threads(move || {
+        let client = py.detach(move || {
             let mut pc = c2_mem::PoolConfig::default();
             pc.segment_size = seg_size;
             let pool = Arc::new(parking_lot::Mutex::new(
@@ -353,7 +353,7 @@ impl PyRustClient {
             match inner.pool_alloc_and_write(data) {
                 Ok(alloc) => {
                     let data_size = data.len();
-                    let result = py.allow_threads(move || {
+                    let result = py.detach(move || {
                         inner.call_prealloc(&route, &method, &alloc, data_size)
                     });
                     return match result {
@@ -384,9 +384,9 @@ impl PyRustClient {
         }
 
         // Fallback: inline/chunked path (small payloads or pool unavailable).
-        // to_vec() is needed because allow_threads requires owned data.
+        // to_vec() is needed because detach requires owned data.
         let payload = data.to_vec();
-        let result = py.allow_threads(move || inner.call(&route, &method, &payload));
+        let result = py.detach(move || inner.call(&route, &method, &payload));
 
         match result {
             Ok(response_data) => {
@@ -468,7 +468,7 @@ impl PyRustClientPool {
         let addr = address.to_string();
         let pool = self.inner;
         let client = py
-            .allow_threads(move || pool.acquire(&addr, None))
+            .detach(move || pool.acquire(&addr, None))
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustClient { inner: client })
     }
@@ -528,7 +528,7 @@ impl PyRustClientPool {
 
     /// Shut down all pooled clients immediately.
     fn shutdown_all(&self, py: Python<'_>) {
-        py.allow_threads(|| self.inner.shutdown_all());
+        py.detach(|| self.inner.shutdown_all());
     }
 
     /// Number of active entries in the pool.

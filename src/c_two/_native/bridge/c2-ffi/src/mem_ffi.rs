@@ -17,7 +17,7 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 /// Python-visible pool configuration.
-#[pyclass(name = "PoolConfig", frozen)]
+#[pyclass(name = "PoolConfig", frozen, skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPoolConfig {
     #[pyo3(get)]
@@ -118,7 +118,7 @@ impl From<&PyPoolConfig> for PoolConfig {
 }
 
 /// Python-visible allocation result.
-#[pyclass(name = "PoolAlloc", frozen)]
+#[pyclass(name = "PoolAlloc", frozen, skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPoolAlloc {
     #[pyo3(get)]
@@ -156,7 +156,7 @@ impl From<PoolAllocation> for PyPoolAlloc {
 }
 
 /// Python-visible pool statistics.
-#[pyclass(name = "PoolStats", frozen)]
+#[pyclass(name = "PoolStats", frozen, skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPoolStats {
     #[pyo3(get)]

@@ -5,13 +5,14 @@
 //! OS thread with its own tokio runtime.
 //!
 //! **GIL handling**: All methods that block (start, stop, register, etc.)
-//! release the Python GIL via `py.allow_threads()` so the Python ServerV2
+//! release the Python GIL via `py.detach()` so the Python ServerV2
 //! asyncio loop can continue processing connections during handshake.
 
 use parking_lot::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
 
 use c2_http::relay::server::RelayServer;
 use c2_config::RelayConfig;
@@ -79,9 +80,9 @@ impl PyNativeRelay {
                 return Err(PyRuntimeError::new_err("Relay is already running"));
             }
             state.config.clone()
-        }; // lock dropped before allow_threads
+        }; // lock dropped before detach
         let server = py
-            .allow_threads(|| RelayServer::start(config))
+            .detach(|| RelayServer::start(config))
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to start relay: {e}")))?;
         self.state.lock().server = Some(server);
         Ok(())
@@ -97,8 +98,8 @@ impl PyNativeRelay {
                 .server
                 .take()
                 .ok_or_else(|| PyRuntimeError::new_err("Relay is not running"))?
-        }; // lock dropped before allow_threads
-        py.allow_threads(|| server.stop())
+        }; // lock dropped before detach
+        py.detach(|| server.stop())
             .map_err(|e| PyRuntimeError::new_err(format!("Stop failed: {e}")))?;
         Ok(())
     }
@@ -106,12 +107,12 @@ impl PyNativeRelay {
     /// Register a new upstream IPC connection.
     ///
     /// Releases the GIL while connecting to the upstream (UDS + handshake).
-    /// The Mutex is acquired inside `allow_threads` to prevent GIL↔Mutex
+    /// The Mutex is acquired inside `detach` to prevent GIL↔Mutex
     /// deadlock.
     fn register_upstream(&self, py: Python<'_>, name: &str, address: &str) -> PyResult<()> {
         let name = name.to_string();
         let address = address.to_string();
-        py.allow_threads(|| {
+        py.detach(|| {
             let state = self.state.lock();
             let server = state
                 .server
@@ -127,7 +128,7 @@ impl PyNativeRelay {
     /// Releases the GIL while waiting for the command to complete.
     fn unregister_upstream(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         let name = name.to_string();
-        py.allow_threads(|| {
+        py.detach(|| {
             let state = self.state.lock();
             let server = state
                 .server
@@ -141,9 +142,9 @@ impl PyNativeRelay {
     /// List all registered routes.
     ///
     /// Returns a list of dicts with "name" and "address" keys.
-    fn list_routes(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn list_routes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let routes = py
-            .allow_threads(|| {
+            .detach(|| {
                 let state = self.state.lock();
                 let server = state
                     .server

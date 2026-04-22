@@ -53,8 +53,7 @@ impl PyRustHttpClient {
         let method = method_name.to_string();
         let payload = data.to_vec();
 
-        let result =
-            py.allow_threads(move || inner.call(&route, &method, &payload));
+        let result = py.detach(move || inner.call(&route, &method, &payload));
 
         match result {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
@@ -72,7 +71,7 @@ impl PyRustHttpClient {
     /// Health check — GET /health on the relay.
     fn health(&self, py: Python<'_>) -> PyResult<bool> {
         let inner = Arc::clone(&self.inner);
-        py.allow_threads(move || inner.health())
+        py.detach(move || inner.health())
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))
     }
 
@@ -119,7 +118,7 @@ impl PyRustHttpClientPool {
         let url = base_url.to_string();
         let pool = self.inner;
         let client = py
-            .allow_threads(move || pool.acquire(&url))
+            .detach(move || pool.acquire(&url))
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustHttpClient { inner: client })
     }
@@ -131,7 +130,7 @@ impl PyRustHttpClientPool {
 
     /// Shut down all pooled HTTP clients immediately.
     fn shutdown_all(&self, py: Python<'_>) {
-        py.allow_threads(|| self.inner.shutdown_all());
+        py.detach(|| self.inner.shutdown_all());
     }
 
     /// Number of active entries in the pool.
