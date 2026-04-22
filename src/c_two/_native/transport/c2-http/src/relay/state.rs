@@ -123,6 +123,13 @@ impl RelayState {
     // -- PEER route operations (gossip) --
 
     pub fn register_peer_route(&self, entry: RouteEntry) {
+        // Never overwrite a LOCAL route with a peer-sourced one. Anti-entropy
+        // can echo our own routes back to us with `relay_id == our id`; if we
+        // accepted those, we'd silently replace `Locality::Local` with
+        // `Locality::Peer` and lose our own ipc_address.
+        if entry.relay_id == self.route_table.read().relay_id() {
+            return;
+        }
         self.route_table.write().register_route(entry);
     }
 
@@ -237,5 +244,30 @@ mod tests {
         assert_eq!(state.resolve("remote").len(), 1);
         state.unregister_peer_route("remote", "peer-1");
         assert!(state.resolve("remote").is_empty());
+    }
+
+    #[test]
+    fn register_peer_route_does_not_overwrite_local() {
+        // Anti-entropy can echo our own routes back to us. The peer-route
+        // entry path MUST refuse anything carrying our own relay_id, or it
+        // would silently demote a Local route (with ipc_address) to a Peer
+        // route (without ipc_address) and break local IPC dispatch.
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://grid"));
+        state.register_upstream("grid".into(), "ipc://grid".into(),
+            "test.ns".into(), "0.1.0".into(), client);
+
+        // Echo of our own route arriving via DigestDiff with our relay_id.
+        state.register_peer_route(RouteEntry {
+            name: "grid".into(), relay_id: "test-relay".into(),
+            relay_url: "http://elsewhere:8080".into(), ipc_address: None,
+            crm_ns: "test.ns".into(), crm_ver: "0.1.0".into(),
+            locality: Locality::Peer, registered_at: 1000.0,
+        });
+
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"),
+            "echoed peer route must not overwrite our LOCAL route");
     }
 }

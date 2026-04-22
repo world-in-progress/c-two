@@ -100,14 +100,15 @@ async fn handle_register(
 
     let entry = state.register_upstream(name.clone(), address, crm_ns, crm_ver, client);
 
-    // Gossip announce to peers
+    // Gossip announce to peers — strip ipc_address since it's a local UDS
+    // path on THIS relay's filesystem and is meaningless to remote peers.
     let envelope = PeerEnvelope::new(
         state.relay_id(),
         PeerMessage::RouteAnnounce {
             name: entry.name.clone(),
             relay_id: entry.relay_id.clone(),
             relay_url: entry.relay_url.clone(),
-            ipc_address: entry.ipc_address.clone(),
+            ipc_address: None,
             crm_ns: entry.crm_ns.clone(),
             crm_ver: entry.crm_ver.clone(),
             registered_at: entry.registered_at,
@@ -166,10 +167,24 @@ async fn handle_unregister(
 }
 
 /// `GET /_routes` — list all registered routes.
+///
+/// Intentionally omits `ipc_address` even for LOCAL routes: this endpoint is
+/// reachable by anyone who can hit the relay's HTTP port, and the local UDS
+/// path is filesystem-private to the owning host.
 async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
     let routes: Vec<serde_json::Value> = state.list_routes()
         .into_iter()
-        .map(|r| serde_json::json!({"name": r.name, "address": r.ipc_address.unwrap_or_default()}))
+        .map(|r| serde_json::json!({
+            "name": r.name,
+            "relay_id": r.relay_id,
+            "relay_url": r.relay_url,
+            "locality": match r.locality {
+                crate::relay::types::Locality::Local => "local",
+                crate::relay::types::Locality::Peer => "peer",
+            },
+            "crm_ns": r.crm_ns,
+            "crm_ver": r.crm_ver,
+        }))
         .collect();
     Json(serde_json::json!({"routes": routes}))
 }

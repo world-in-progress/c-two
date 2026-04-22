@@ -29,14 +29,18 @@ pub async fn handle_peer_announce(
     }
     match envelope.message {
         PeerMessage::RouteAnnounce {
-            name, relay_id, relay_url, ipc_address,
+            name, relay_id, relay_url, ipc_address: _,
             crm_ns, crm_ver, registered_at,
         } => {
             if relay_id == state.relay_id() {
                 return StatusCode::OK;
             }
+            // Defense-in-depth: ipc_address is a private local path on the
+            // sending relay; never store it in our PEER routes regardless of
+            // what the wire said.
             state.register_peer_route(RouteEntry {
-                name, relay_id, relay_url, ipc_address,
+                name, relay_id, relay_url,
+                ipc_address: None,
                 crm_ns, crm_ver,
                 locality: Locality::Peer,
                 registered_at,
@@ -74,6 +78,12 @@ pub async fn handle_peer_join(
             status: PeerStatus::Alive,
         });
         let mut snapshot = state.full_snapshot();
+        // Strip ipc_address from every route before sending — these paths
+        // are local to this relay's filesystem and cannot be reached by the
+        // joiner directly; they must use relay_url instead.
+        for entry in snapshot.routes.iter_mut() {
+            entry.ipc_address = None;
+        }
         // Include ourselves so the joiner can add us as a peer.
         snapshot.peers.push(PeerSnapshot {
             relay_id: state.relay_id().to_string(),
@@ -163,11 +173,13 @@ pub async fn handle_peer_digest(
                         if let Some(entry) = all_routes.iter()
                             .find(|e| e.name == key.0 && e.relay_id == key.1)
                         {
+                            // Strip ipc_address — it's a local-only path on
+                            // this relay's filesystem.
                             diff_entries.push(crate::relay::peer::DigestDiffEntry {
                                 name: entry.name.clone(),
                                 relay_id: entry.relay_id.clone(),
                                 relay_url: entry.relay_url.clone(),
-                                ipc_address: entry.ipc_address.clone(),
+                                ipc_address: None,
                                 crm_ns: entry.crm_ns.clone(),
                                 crm_ver: entry.crm_ver.clone(),
                                 registered_at: entry.registered_at,
@@ -190,7 +202,11 @@ pub async fn handle_peer_digest(
         }
         PeerMessage::DigestDiff { entries, extra } => {
             for diff in entries {
-                state.register_peer_route(diff.into());
+                // Defense-in-depth: scrub ipc_address from incoming peer
+                // routes — that path belongs to the sender's local filesystem.
+                let mut entry: RouteEntry = diff.into();
+                entry.ipc_address = None;
+                state.register_peer_route(entry);
             }
             for (name, relay_id) in extra {
                 state.unregister_peer_route(&name, &relay_id);

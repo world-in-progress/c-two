@@ -42,6 +42,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from urllib.parse import quote as _urlquote
+from urllib.parse import urlparse as _urlparse
 from typing import TypeVar
 
 from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
@@ -55,6 +56,31 @@ from ..crm.meta import MethodAccess
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
+
+
+_LOOPBACK_HOSTS = frozenset({
+    'localhost',
+    '127.0.0.1',
+    '::1',
+    '0.0.0.0',
+})
+
+
+def _is_local_relay_url(relay_url: str) -> bool:
+    """Return True if ``relay_url`` points at a relay on the same host.
+
+    Used to decide whether a route's ``ipc_address`` (a local UDS path on
+    the relay's filesystem) is reachable from this client. When the relay
+    sits at a non-loopback address it must be a remote machine, and the
+    UDS path is meaningless to us.
+    """
+    if not relay_url:
+        return False
+    try:
+        host = (_urlparse(relay_url).hostname or '').lower()
+    except Exception:
+        return False
+    return host in _LOOPBACK_HOSTS
 
 
 def _physical_memory() -> int | None:
@@ -382,14 +408,30 @@ class _ProcessRegistry:
             last_error = None
             for route in routes:
                 try:
+                    relay_url = route.get("relay_url", "") or ""
                     ipc_addr = route.get("ipc_address")
-                    if ipc_addr:
+                    # ipc_address is a UDS path on the relay's filesystem —
+                    # only usable when this client is on the same host as the
+                    # owning relay. Detect that via loopback / empty relay_url
+                    # (i.e. it's our local relay reporting one of its own
+                    # routes). Otherwise we MUST go through the relay's HTTP
+                    # endpoint instead.
+                    if ipc_addr and _is_local_relay_url(relay_url):
                         address = ipc_addr
-                    else:
+                    elif relay_url:
                         # HTTP base URL is just the relay; the Rust HTTP
                         # client appends `/{route_name}/{method_name}` on
                         # each call.
-                        address = route.get("relay_url", "")
+                        address = relay_url
+                    elif ipc_addr:
+                        # Last resort: no relay_url known, fall back to
+                        # ipc_addr (legacy behaviour).
+                        address = ipc_addr
+                    else:
+                        last_error = ResourceUnavailable(
+                            f"Route for {name!r} has neither relay_url nor ipc_address",
+                        )
+                        continue
 
                     if address.startswith(('http://', 'https://')):
                         client = self._http_pool.acquire(address)

@@ -190,6 +190,9 @@ impl RouteTable {
                 continue; // Don't overwrite our own LOCAL routes.
             }
             entry.locality = Locality::Peer;
+            // Defense-in-depth: ipc_address is a private local path on the
+            // sender's filesystem; never store it for PEER routes.
+            entry.ipc_address = None;
             let key = (entry.name.clone(), entry.relay_id.clone());
             self.routes.insert(key, entry);
         }
@@ -216,7 +219,13 @@ impl RouteTable {
         }
     }
 
-    /// Route digest for anti-entropy: (name, relay_id) → hash(registered_at, ipc_address).
+    /// Route digest for anti-entropy: (name, relay_id) → hash of fields that
+    /// every relay sees the same way.
+    ///
+    /// **Must not include `ipc_address`**: the route owner stores the local
+    /// UDS path, but peers (correctly) store `None`. Hashing the path would
+    /// make local-vs-peer digests permanently disagree and cause anti-entropy
+    /// to churn the same route forever.
     pub fn route_digest(&self) -> HashMap<(String, String), u64> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -226,7 +235,9 @@ impl RouteTable {
             .map(|(key, entry)| {
                 let mut hasher = DefaultHasher::new();
                 entry.registered_at.to_bits().hash(&mut hasher);
-                entry.ipc_address.hash(&mut hasher);
+                entry.relay_url.hash(&mut hasher);
+                entry.crm_ns.hash(&mut hasher);
+                entry.crm_ver.hash(&mut hasher);
                 (key.clone(), hasher.finish())
             })
             .collect()
@@ -374,12 +385,29 @@ mod tests {
     }
 
     #[test]
-    fn route_digest_changes_on_update() {
+    fn route_digest_stable_when_only_ipc_address_changes() {
+        // Critical anti-entropy invariant: ipc_address must NOT contribute
+        // to the digest, because the owning relay stores Some(...) but
+        // peers store None — if it contributed, the two views would never
+        // converge and anti-entropy would loop forever.
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_route(local_entry("grid", "relay-a"));
         let d1 = rt.route_digest();
         let mut entry = local_entry("grid", "relay-a");
         entry.ipc_address = Some("ipc://changed".into());
+        rt.register_route(entry);
+        let d2 = rt.route_digest();
+        let key = ("grid".to_string(), "relay-a".to_string());
+        assert_eq!(d1[&key], d2[&key]);
+    }
+
+    #[test]
+    fn route_digest_changes_on_relay_url_update() {
+        let mut rt = RouteTable::new("relay-a".into());
+        rt.register_route(local_entry("grid", "relay-a"));
+        let d1 = rt.route_digest();
+        let mut entry = local_entry("grid", "relay-a");
+        entry.relay_url = "http://changed:9090".into();
         rt.register_route(entry);
         let d2 = rt.route_digest();
         let key = ("grid".to_string(), "relay-a".to_string());
@@ -390,5 +418,44 @@ mod tests {
     fn resolve_missing_name_returns_empty() {
         let rt = RouteTable::new("relay-a".into());
         assert!(rt.resolve("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn merge_snapshot_strips_ipc_address_from_peer_routes() {
+        // Sender's local route includes an ipc_address (its own UDS path).
+        let mut rt_a = RouteTable::new("relay-a".into());
+        rt_a.register_route(local_entry("grid", "relay-a"));
+        let snapshot = rt_a.full_snapshot();
+        // Local snapshot still carries ipc_address — that's intentional;
+        // scrubbing happens at the wire boundary (handle_peer_join) and at
+        // merge time on the receiver below.
+
+        let mut rt_b = RouteTable::new("relay-b".into());
+        rt_b.merge_snapshot(snapshot);
+
+        let resolved = rt_b.resolve("grid");
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].ipc_address.is_none(),
+            "PEER routes must not expose sender's local UDS path",
+        );
+        assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
+    }
+
+    #[test]
+    fn to_route_info_strips_ipc_address_for_peer() {
+        // Even if a Peer entry somehow carries an ipc_address, to_route_info
+        // must not leak it to clients (defense-in-depth).
+        let mut entry = peer_entry("grid", "relay-b", 1000.0);
+        entry.ipc_address = Some("ipc://leaked".into());
+        let info = entry.to_route_info();
+        assert!(info.ipc_address.is_none());
+    }
+
+    #[test]
+    fn to_route_info_keeps_ipc_address_for_local() {
+        let entry = local_entry("grid", "relay-a");
+        let info = entry.to_route_info();
+        assert!(info.ipc_address.is_some());
     }
 }
