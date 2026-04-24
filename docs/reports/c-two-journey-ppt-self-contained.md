@@ -213,29 +213,53 @@ Explain the fallback chain as an operational guarantee. Under normal load the bu
 ## Slide 13. Relay Mesh: overview
 
 **Takeaway**
+C-Two’s Relay Mesh removes address coupling by turning `name -> route` lookup into a local control-plane step, so clients can connect by resource name instead of tracking process addresses.
 
 **Key points**
+- Address coupling is the wrong default because it forces every client to know where every CRM lives, even when processes move, restart, or replicate
+- The local relay is checked first for name resolution: same process, then local IPC route, then peer route if the resource lives on another node
+- Seed relays provide bootstrap only; they are just starting points for join, not a permanent coordinator or single point of control
+- The mesh is a resource-discovery layer: it decides where to connect, then the actual RPC still goes directly to the chosen relay and CRM
+- Standalone mode is intentional fallback for the no-seed case, so a node can run locally without treating mesh absence as failure
 
 **Suggested visual**
+A three-stage flow: client asks local relay for `name`, relay resolves to local or peer route, client connects directly. Add a small side branch showing seed relays only for bootstrap.
 
 **Speaker notes**
+Make the main message explicit: Relay Mesh does not replace the IPC data plane. It removes manual address wiring by giving C-Two a decentralized discovery layer that resolves names to routes, then hands the call back to the existing transport path.
 
 ## Slide 14. Relay Mesh: detailed mechanisms
 
 **Takeaway**
+C-Two keeps relay discovery consistent by storing route state inside each relay, spreading updates with gossip, and repairing gaps with anti-entropy.
 
 **Key points**
+- `RouteTable` is relay-internal state, not a CRM resource; it lives in Rust and tracks routes, peers, and route metadata without scheduler or serialization overhead
+- Join works through seed relays: a new relay contacts any reachable seed, receives a full snapshot, then merges that state into its local route table
+- Gossip is the dissemination mechanism for route updates, while anti-entropy is the correction mechanism that reconciles missed updates after delay or partition
+- Deterministic ordering keeps resolution stable: relays sort competing peer routes the same way, so every node converges on the same first choice
+- The consistency model is practical, not magical: local state is authoritative for a node, replicated peer state converges over time, and ordering is framed to be repeatable even when message arrival is not
 
 **Suggested visual**
+A relay mesh diagram with three labeled layers: local RouteTable state, gossip fan-out between relays, and periodic anti-entropy digests that patch missing or stale routes. Show ordered route entries to visualize deterministic selection.
 
 **Speaker notes**
+Walk from control-plane state to convergence. First explain that each relay owns its own route table, then show how gossip spreads changes, and finally show how anti-entropy repairs anything that gossip missed. Close by emphasizing that deterministic ordering matters because discovery must not become random when multiple relays advertise the same name.
 
 ## Slide 15. Final summary
 
 **Takeaway**
+C-Two’s journey is a move from pseudo-IPC to real IPC and then from address-based wiring to resource discovery, without losing Python resource semantics.
 
 **Key points**
+- The durable value is the combination of Python resource semantics, SHM-aware transport, and decentralized resolution
+- Pseudo-IPC gave way to real IPC, and then the system added discovery so clients could address resources by name instead of by location
+- The relay mesh completes the user story by making discovery decentralized and self-contained rather than dependent on a hard-coded host list
+- The boundary is honest: C-Two is not trying to replace every distributed runtime; it is focused on Python resources, efficient data movement, and practical discovery for that workload
+- The final shape is a system that keeps the application model, keeps the fast transport, and removes the last manual wiring step
 
 **Suggested visual**
+Closing arc diagram: file-backed IPC → real UDS/SHM IPC → relay-based resource discovery, with a callout box for “Python resource semantics + SHM-aware transport + decentralized resolution.”
 
 **Speaker notes**
+End on scope and value. The story is not “we built a universal distributed platform”; it is “we built a narrower system that matches the workload well.” That honesty makes the technical result stronger: C-Two now has a coherent path from resource identity to transport to discovery.
