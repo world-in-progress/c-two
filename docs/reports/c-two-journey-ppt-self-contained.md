@@ -172,7 +172,7 @@ IPC v3 delivered the measured speedup, but the meaningful result is the end-to-e
 Results table with three callouts: small-payload latency collapse, peak throughput at 100 MB, and a note box that labels the numbers as end-to-end benchmark results rather than transport-only intuition.
 
 **Speaker notes**
-Lead with the numbers, then explain the caveat. The transport is clearly faster, but the deck should make it obvious that the benchmark includes real serialization and payload handling work, so the speedup is not a misleading socket-only comparison.
+Lead with the numbers, then explain the caveat. The transport is clearly faster, but the deck should make it obvious that the benchmark includes real serialization and payload handling work, so the speedup is not a misleading socket-only comparison. This slide is the payload-size sweep vs `memory://`; Slide 2 is the row-based NumPy application comparison vs Ray.
 
 ## Slide 11. IPC v3: remaining issues
 
