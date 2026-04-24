@@ -23,18 +23,18 @@ Open with the end state: one Python-facing resource model, multiple transport pa
 ## Slide 2. Executive results
 
 **Takeaway**
-The project's main outcome is a step-change in transport efficiency and usability: lower fixed overhead than conventional Python actor RPC, zero-copy-friendly structured data paths, and relay-based name resolution.
+C-Two combines faster data movement with lower RPC overhead, zero-copy-friendly paths, and relay-based name resolution.
 
 **Key points**
 - `memory://` to IPC v3 moved the transport from polling and filesystem I/O to UDS + SHM
-- README benchmark shows hold-mode NumPy workloads substantially ahead of Ray on the tested single-host path
+- README benchmark shows hold-mode at 1K / 100K / 1M rows: 0.07 / 0.38 / 3.7 ms vs Ray's 6.1 / 9.8 / 58 ms
 - Relay Mesh removes address coupling by resolving `name -> route -> direct connection`
 
 **Suggested visual**
 Results dashboard with three columns: transport evolution, benchmark uplift, and relay discovery flow.
 
 **Speaker notes**
-Frame the deck around outcomes first: faster data movement, simpler client usage, and less wiring between names and addresses.
+Frame the deck around outcomes first: resource identity for app owners, SHM/relay mechanics for systems readers, and the practical payoff for everyone — less copying, less wiring, and easier local-to-remote use.
 
 ## Slide 3. Positioning: C-Two vs Ray vs iceoryx2
 
@@ -47,7 +47,7 @@ Ray is the closest Python comparison, while iceoryx2 is the closest transport id
 - C-Two: stateful resource objects + Python ergonomics + SHM data path + relay-based discovery
 
 **Suggested visual**
-Three-way positioning chart with axes for Python ergonomics and transport efficiency, placing C-Two between runtime and middleware styles.
+Three-way positioning chart. X-axis: Python resource ergonomics → transport middleware primitives. Y-axis: application semantics / statefulness → transport-only focus. Place Ray upper-left, iceoryx2 lower-right, and C-Two near the middle with a slight bias toward Python resource semantics and SHM-aware transport.
 
 **Speaker notes**
 Use workload language, not generic platform language: C-Two is built for Python resources that carry state and large payloads.
