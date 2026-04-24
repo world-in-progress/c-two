@@ -146,7 +146,7 @@ IPC v3 made the transport split explicit: a UDS control plane handles coordinati
 - The SHM data plane moves the actual bytes, which removes filesystem I/O from the hot path and keeps large transfers off the socket
 - A Rust buddy allocator is the core pool manager, so allocation, reuse, and crash recovery live in one place instead of being spread across Python objects
 - Block reuse is a steady-state optimization: when the next response fits the existing block, IPC v3 can reuse that allocation instead of paying a fresh alloc/free cycle
-- This architecture is designed for resource RPC, not transport demos, so the control path and data path are separated by purpose instead of by accident
+- This architecture is designed for resource RPC, not transport demos, so the control path and data path are split by role
 
 **Suggested visual**
 Two-lane diagram: a narrow UDS control lane on top for metadata and coordination, and a wide SHM lane below for payload bytes, with a buddy allocator shown as the pool behind the SHM lane.
@@ -165,13 +165,13 @@ IPC v3 delivered the measured speedup, but the meaningful result is the end-to-e
 - Larger payloads still paid for packing, unpacking, and checksum/mutation work, so the measured result is an end-to-end application result rather than a pure transport micro-benchmark
 - That distinction matters: a transport-only mental model would expect the SHM path to dominate everything, but the real curve also includes serialization cost and memory-copy cost
 - The practical conclusion is stronger than a micro-benchmark headline: IPC v3 is fast enough that the application work becomes visible again
-- The 1GB case still improved materially, but it also showed where large-buffer copies and materialization begin to matter again
+- The 1GB case still improved materially, but it also shows where large-buffer copies and materialization begin to matter again, which sets up the remaining-issues slide
 
 **Suggested visual**
 Results table with three callouts: small-payload latency collapse, peak throughput at 100 MB, and a note box that labels the numbers as end-to-end benchmark results rather than transport-only intuition.
 
 **Speaker notes**
-Lead with the numbers, then explain the caveat. The transport is clearly faster, but the deck should make it obvious that the benchmark includes real serialization and CRM work, so the speedup is not a misleading socket-only comparison.
+Lead with the numbers, then explain the caveat. The transport is clearly faster, but the deck should make it obvious that the benchmark includes real serialization and payload handling work, so the speedup is not a misleading socket-only comparison.
 
 ## Slide 11. IPC v3: remaining issues
 
@@ -208,7 +208,7 @@ The fallback story is a tiered safety net: buddy SHM first, dedicated SHM next, 
 Layered ladder diagram showing buddy SHM, dedicated SHM, and file-spill as descending tiers, with lifecycle arrows for open, read, reassemble, release, and recovery.
 
 **Speaker notes**
-Explain the fallback chain as an operational guarantee. Under normal load the buddy pool wins; under pressure, the transport can move down the ladder without breaking correctness, and cleanup remains safe even if a process dies mid-flight.
+Explain the fallback chain as an operational guarantee. Under normal load the buddy pool wins; under pressure, the transport can move down the ladder without breaking correctness, and cleanup remains safe even if a process dies mid-flight. The exact thresholds between buddy SHM, dedicated SHM, and file-spill are implementation-defined tuning choices, so the slide should be read as a guarantee of graceful fallback rather than a fixed cutoff map.
 
 ## Slide 13. Relay Mesh: overview
 
