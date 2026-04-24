@@ -18,7 +18,7 @@ C-Two is a resource-oriented RPC framework for Python that pushed from file-base
 Three-step timeline: file-based IPC → SHM-first IPC → relay discovery, with a resource object at the center.
 
 **Speaker notes**
-Open with the end state: one Python-facing resource model, multiple transport paths, and a clear progression in transport efficiency.
+For technical listeners, name the resource model and transport path changes; for non-technical listeners, translate that into fewer copies, less setup, and easier local-to-remote use.
 
 ## Slide 2. Executive results
 
@@ -27,7 +27,7 @@ C-Two combines faster data movement with lower RPC overhead, zero-copy-friendly 
 
 **Key points**
 - `memory://` to IPC v3 moved the transport from polling and filesystem I/O to UDS + SHM
-- README benchmark shows hold-mode at 1K / 100K / 1M rows: 0.07 / 0.38 / 3.7 ms vs Ray's 6.1 / 9.8 / 58 ms
+- README benchmark representative points at 1K / 100K / 1M rows: 0.07 / 0.38 / 3.7 ms vs Ray's 6.1 / 9.8 / 58 ms
 - Relay Mesh removes address coupling by resolving `name -> route -> direct connection`
 
 **Suggested visual**
@@ -66,7 +66,7 @@ The project started from a real pain point: Python resource objects with large p
 Pain-point diagram: a stateful Python object plus large arrays crossing process boundaries, with the old path showing copies and glue code.
 
 **Speaker notes**
-Explain the origin story in one sentence: the framework was shaped by workloads where object identity and data volume matter at the same time.
+For technical listeners, connect the origin story to process boundaries and payload size; for non-technical listeners, explain that the goal was to keep a Python object usable without turning it into copies and glue code.
 
 ## Slide 5. The earliest memory:// IPC
 
