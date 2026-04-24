@@ -140,20 +140,22 @@ Make the transition explicit here: IPC v2 confirmed the direction, but its gaps 
 ## Slide 9. IPC v3: architecture
 
 **Takeaway**
-IPC v3 made the transport split explicit: a UDS control plane handles coordination while SHM carries the payload, with a Rust buddy allocator managing the shared pool.
+IPC v3 made the transport split explicit: a UDS control plane handles coordination, SHM carries the fast-path payload, and chunked streaming covers the oversized or SHM-unavailable path, with a Rust buddy allocator managing the shared pool underneath.
 
 **Key points**
 - The UDS control plane keeps coordination low-latency and small, so request/response signaling stays cheap even when payloads are large
 - The SHM data plane moves the actual bytes, which removes filesystem I/O from the hot path and keeps large transfers off the socket
+- IPC v3 is not one transport path but a selector: small calls stay inline, larger ones prefer buddy SHM, and payloads beyond the chunk threshold fall back to chunked streaming
+- Chunked streaming is negotiated as a capability in the handshake, and the first chunk carries route/method control while later chunks are data-only
 - A Rust buddy allocator is the core pool manager, so allocation, reuse, and crash recovery live in one place instead of being spread across Python objects
 - Block reuse is a steady-state optimization: when the next response fits the existing block, IPC v3 can reuse that allocation instead of paying a fresh alloc/free cycle
 - This architecture is designed for resource RPC, not transport demos, so the control path and data path are split by role
 
 **Suggested visual**
-Two-lane diagram: a narrow UDS control lane on top for metadata and coordination, and a wide SHM lane below for payload bytes, with a buddy allocator shown as the pool behind the SHM lane.
+Three-path diagram: inline frame for small calls, buddy SHM fast path for large calls, and chunked streaming path for oversized or SHM-failed transfers. Keep a narrow UDS control lane above them and show the buddy allocator behind the SHM path.
 
 **Speaker notes**
-Emphasize that IPC v3 is not “just faster sockets.” The point is to keep signaling tiny and deterministic while moving bulk data through shared memory, and then to make the steady state cheaper by reusing blocks instead of constantly reallocating them.
+Emphasize that IPC v3 is not “just faster sockets.” The point is to keep signaling tiny and deterministic while choosing among inline, SHM, and chunked paths based on payload size and allocator state. Chunked streaming matters here because it prevents one giant frame from becoming the only fallback once the preferred SHM route is unavailable.
 
 ## Slide 10. IPC v3: benchmark results
 
@@ -182,7 +184,7 @@ IPC v3 solved the common case, but remaining issues still showed up under large 
 **Key points**
 - Large payload stress exposed that even a fast transport still has to move and materialize enough data to matter at 500 MB and 1 GB
 - Memory pressure remains a real limit when the receiver must rebuild a full payload in memory before it can hand the result back up the stack
-- Receiver-side reassembly is not free: chunk tracking, ordering, and final buffer assembly all add work that is separate from the SHM transport itself
+- Chunked streaming avoids one monolithic frame, but it is still bounded reassembly rather than true incremental consumption: chunk tracking, ordering, and final buffer assembly all add work of their own
 - The limitations are therefore about end-to-end payload handling, not about the UDS control plane or the buddy allocator alone
 - These are the places where a fallback architecture has to take over cleanly instead of turning a large call into a hard failure
 
@@ -190,27 +192,28 @@ IPC v3 solved the common case, but remaining issues still showed up under large 
 Stress-path diagram that shows a very large payload splitting into chunks, then reassembling on the receiver side, with warning markers for memory pressure and large-payload limits.
 
 **Speaker notes**
-Use this slide to separate wins from limits. IPC v3 is the right default, but it does not make large payloads free, and it still needs a deliberate fallback story when memory pressure appears.
+Use this slide to separate wins from limits. IPC v3 is the right default, and chunked streaming helps it survive larger transfers, but the current design still reassembles the full payload before handing it upward. That means “streaming” here is a transport-level chunked path, not an application-level incremental processing model.
 
 ## Slide 12. Comprehensive fallback strategy
 
 **Takeaway**
-The fallback story is a tiered safety net: buddy SHM first, dedicated SHM next, then file-spill, so the system can keep working under pressure instead of failing the request.
+The fallback story is not one generic ladder: sender-side allocation and receiver-side reassembly take different paths, but both degrade explicitly from fast SHM toward slower dedicated or file-backed storage instead of failing the call outright.
 
 **Key points**
-- Sender chooses the backing tier while receiver identifies the tier and reassembles accordingly
-- The dedicated SHM path is the first fallback when the shared buddy pool is exhausted or a payload needs an isolated segment
-- The file-spill path is the last resort when memory pressure is severe and shared memory allocation is no longer the right answer
-- This fallback chain preserves service continuity for large payload stress cases instead of forcing a single failure mode
-- Receiver-side reassembly must understand which tier produced the data so it can open, read, and release the right backing store safely
-- Crash recovery and lifecycle safety matter at every tier: stale allocations must be recoverable, ownership must be clear, and cleanup must not depend on perfect shutdown
-- The design goal is graceful degradation, not silent loss of performance: each fallback is slower, but each one is still usable and explicit
+- Transport fallback and storage fallback are separate layers: if the preferred buddy SHM request/reply path cannot be used, the system can fall back to chunked streaming first, and then the reassembly buffer still chooses buddy SHM, dedicated SHM, or file-spill underneath
+- Sender-side SHM allocation prefers existing buddy segments first, then reclaims trailing idle segments and lazily opens new buddy segments before it gives up on the shared pool
+- Dedicated SHM is the oversized or no-buddy-capacity path: one payload gets its own segment, plus a small `read_done` header so creator-side GC can wait for peer consumption or crash timeout
+- Receiver-side reassembly does not just mirror the sender: `alloc_handle` can land directly in buddy SHM, dedicated SHM, or file-spill depending on size, free space, and current RAM pressure
+- File-spill is not a visible temp-file protocol; it is an unlink-on-create mmap fallback used when low-memory heuristics say “do not create more SHM mappings” or when SHM creation fails
+- After chunk reassembly completes on file-spill, the code still tries to promote the finished buffer back into SHM, so disk is a survival path rather than the preferred steady state
+- Release rules differ by tier: buddy frees immediately and marks segments idle, dedicated frees are deferred until reader completion or timeout, and file-spill is reclaimed by dropping the mmap after the backing file is already unlinked
+- The guarantee is graceful degradation with explicit slower tiers, not a magical zero-copy path that works the same way under all pressure conditions
 
 **Suggested visual**
-Layered ladder diagram showing buddy SHM, dedicated SHM, and file-spill as descending tiers, with lifecycle arrows for open, read, reassemble, release, and recovery.
+Two-level diagram: top level is transport selection (`buddy reply/request or chunked streaming`), bottom level is backing-store selection during reassembly (`buddy/dedicated/file-spill -> optional promote back to SHM -> release`). Add callouts for `read_done` on dedicated SHM and unlink-on-create semantics for file-spill.
 
 **Speaker notes**
-Explain the fallback chain as an operational guarantee. Under normal load the buddy pool wins; under pressure, the transport can move down the ladder without breaking correctness, and cleanup remains safe even if a process dies mid-flight. The exact thresholds between buddy SHM, dedicated SHM, and file-spill are implementation-defined tuning choices, so the slide should be read as a guarantee of graceful fallback rather than a fixed cutoff map.
+Explain this slide as two related fallback paths, not one generic memory tier chart. First comes transport choice: SHM pointer transfer when possible, chunked streaming when the request or reply cannot stay on the preferred SHM path. Then comes reassembly storage choice: the receiving side may rebuild into buddy SHM, dedicated SHM, or file-spill, and if it ends on file-spill it can still try to promote the completed buffer back into SHM. Dedicated SHM also has stricter lifecycle tracking than buddy SHM: the reader marks completion, and creator-side GC waits for that signal or a crash timeout. The exact thresholds are implementation-defined tuning choices, so the point of the slide is the guarantee of explicit, recoverable degradation rather than one fixed cutoff table.
 
 ## Slide 13. Relay Mesh: overview
 
