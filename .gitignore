@@ -195,3 +195,4 @@ src/c_two/buddy/_buddy_core/target/
 benchmarks/results/*
 !benchmarks/results/.gitkeep
 .superpowers/
+.worktrees/
