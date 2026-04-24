@@ -139,42 +139,76 @@ Make the transition explicit here: IPC v2 confirmed the direction, but its gaps 
 ## Slide 9. IPC v3: architecture
 
 **Takeaway**
+IPC v3 made the transport split explicit: a UDS control plane handles coordination while SHM carries the payload, with a Rust buddy allocator managing the shared pool.
 
 **Key points**
+- The UDS control plane keeps coordination low-latency and small, so request/response signaling stays cheap even when payloads are large
+- The SHM data plane moves the actual bytes, which removes filesystem I/O from the hot path and keeps large transfers off the socket
+- A Rust buddy allocator is the core pool manager, so allocation, reuse, and crash recovery live in one place instead of being spread across Python objects
+- Block reuse is a steady-state optimization: when the next response fits the existing block, IPC v3 can reuse that allocation instead of paying a fresh alloc/free cycle
+- This architecture is designed for resource RPC, not transport demos, so the control path and data path are separated by purpose instead of by accident
 
 **Suggested visual**
+Two-lane diagram: a narrow UDS control lane on top for metadata and coordination, and a wide SHM lane below for payload bytes, with a buddy allocator shown as the pool behind the SHM lane.
 
 **Speaker notes**
+Emphasize that IPC v3 is not “just faster sockets.” The point is to keep signaling tiny and deterministic while moving bulk data through shared memory, and then to make the steady state cheaper by reusing blocks instead of constantly reallocating them.
 
 ## Slide 10. IPC v3: benchmark results
 
 **Takeaway**
+IPC v3 delivered the measured speedup, but the meaningful result is the end-to-end round trip: transport-only intuition is too optimistic unless serialization and application work are included.
 
 **Key points**
+- On the realistic benchmark, IPC v3 reached a **10.7× geomean P50 speedup** for payloads at or above 10 MB, with **5.03 GB/s** peak throughput around 100 MB
+- Small payloads benefited most from eliminating polling, with 64B latency dropping from **31.1 ms** to **0.12 ms**
+- Larger payloads still paid for packing, unpacking, and checksum/mutation work, so the measured result is an end-to-end application result rather than a pure transport micro-benchmark
+- That distinction matters: a transport-only mental model would expect the SHM path to dominate everything, but the real curve also includes serialization cost and memory-copy cost
+- The practical conclusion is stronger than a micro-benchmark headline: IPC v3 is fast enough that the application work becomes visible again
+- The 1GB case still improved materially, but it also showed where large-buffer copies and materialization begin to matter again
 
 **Suggested visual**
+Results table with three callouts: small-payload latency collapse, peak throughput at 100 MB, and a note box that labels the numbers as end-to-end benchmark results rather than transport-only intuition.
 
 **Speaker notes**
+Lead with the numbers, then explain the caveat. The transport is clearly faster, but the deck should make it obvious that the benchmark includes real serialization and CRM work, so the speedup is not a misleading socket-only comparison.
 
 ## Slide 11. IPC v3: remaining issues
 
 **Takeaway**
+IPC v3 solved the common case, but remaining issues still showed up under large payload stress, memory pressure, and receiver-side reassembly limits.
 
 **Key points**
+- Large payload stress exposed that even a fast transport still has to move and materialize enough data to matter at 500 MB and 1 GB
+- Memory pressure remains a real limit when the receiver must rebuild a full payload in memory before it can hand the result back up the stack
+- Receiver-side reassembly is not free: chunk tracking, ordering, and final buffer assembly all add work that is separate from the SHM transport itself
+- The limitations are therefore about end-to-end payload handling, not about the UDS control plane or the buddy allocator alone
+- These are the places where a fallback architecture has to take over cleanly instead of turning a large call into a hard failure
 
 **Suggested visual**
+Stress-path diagram that shows a very large payload splitting into chunks, then reassembling on the receiver side, with warning markers for memory pressure and large-payload limits.
 
 **Speaker notes**
+Use this slide to separate wins from limits. IPC v3 is the right default, but it does not make large payloads free, and it still needs a deliberate fallback story when memory pressure appears.
 
 ## Slide 12. Comprehensive fallback strategy
 
 **Takeaway**
+The fallback story is a tiered safety net: buddy SHM first, dedicated SHM next, then file-spill, so the system can keep working under pressure instead of failing the request.
 
 **Key points**
+- The dedicated SHM path is the first fallback when the shared buddy pool is exhausted or a payload needs an isolated segment
+- The file-spill path is the last resort when memory pressure is severe and shared memory allocation is no longer the right answer
+- This fallback chain preserves service continuity for large payload stress cases instead of forcing a single failure mode
+- Receiver-side reassembly must understand which tier produced the data so it can open, read, and release the right backing store safely
+- Crash recovery and lifecycle safety matter at every tier: stale allocations must be recoverable, ownership must be clear, and cleanup must not depend on perfect shutdown
+- The design goal is graceful degradation, not silent loss of performance: each fallback is slower, but each one is still usable and explicit
 
 **Suggested visual**
+Layered ladder diagram showing buddy SHM, dedicated SHM, and file-spill as descending tiers, with lifecycle arrows for open, read, reassemble, release, and recovery.
 
 **Speaker notes**
+Explain the fallback chain as an operational guarantee. Under normal load the buddy pool wins; under pressure, the transport can move down the ladder without breaking correctness, and cleanup remains safe even if a process dies mid-flight.
 
 ## Slide 13. Relay Mesh: overview
 
