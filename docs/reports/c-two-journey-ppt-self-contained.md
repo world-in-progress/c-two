@@ -27,7 +27,7 @@ C-Two combines faster data movement with lower RPC overhead, zero-copy-friendly 
 
 **Key points**
 - `memory://` to IPC v3 moved the transport from polling and filesystem I/O to UDS + SHM
-- Benchmark representative points at 1K / 100K / 1M rows: 0.07 / 0.38 / 3.7 ms vs Ray's 6.1 / 9.8 / 58 ms
+- Hold-mode / SHM zero-copy, same NumPy payload, end-to-end representative points at 1K / 100K / 1M rows: 0.07 / 0.38 / 3.7 ms vs Ray's 6.1 / 9.8 / 58 ms
 - Relay Mesh removes address coupling by resolving `name -> route -> direct connection`
 
 **Suggested visual**
@@ -125,6 +125,7 @@ Frame IPC v2 as a necessary proof point: it showed the project should keep movin
 IPC v2 was necessary but incomplete: it improved the control path, but it still did not unify lifecycle, large-payload handling, and memory behavior into one clean transport story.
 
 **Key points**
+- IPC v2 proved the UDS control path could replace file polling for request and response handling
 - The story was still split across the UDS control path, the `multiprocessing.SharedMemory` pool, and pickle-based payload handling
 - Lifecycle management was not yet unified end to end
 - Large payload handling still lacked a single clean model
@@ -160,7 +161,7 @@ Emphasize that IPC v3 is not “just faster sockets.” The point is to keep sig
 IPC v3 delivered the measured speedup, but the meaningful result is the end-to-end round trip: transport-only intuition is too optimistic unless serialization and application work are included.
 
 **Key points**
-- On the realistic benchmark, IPC v3 reached a **10.7× geomean P50 speedup** for payloads at or above 10 MB, with **5.03 GB/s** peak throughput around 100 MB
+- On the realistic benchmark, IPC v3 reached a **10.7× geomean P50 speedup** over `memory://` for payloads at or above 10 MB, with **5.03 GB/s** peak throughput around 100 MB
 - Small payloads benefited most from eliminating polling, with 64B latency dropping from **31.1 ms** to **0.12 ms**
 - Larger payloads still paid for packing, unpacking, and checksum/mutation work, so the measured result is an end-to-end application result rather than a pure transport micro-benchmark
 - That distinction matters: a transport-only mental model would expect the SHM path to dominate everything, but the real curve also includes serialization cost and memory-copy cost
@@ -197,6 +198,7 @@ Use this slide to separate wins from limits. IPC v3 is the right default, but it
 The fallback story is a tiered safety net: buddy SHM first, dedicated SHM next, then file-spill, so the system can keep working under pressure instead of failing the request.
 
 **Key points**
+- Sender chooses the backing tier while receiver identifies the tier and reassembles accordingly
 - The dedicated SHM path is the first fallback when the shared buddy pool is exhausted or a payload needs an isolated segment
 - The file-spill path is the last resort when memory pressure is severe and shared memory allocation is no longer the right answer
 - This fallback chain preserves service continuity for large payload stress cases instead of forcing a single failure mode
