@@ -1,6 +1,6 @@
 # C-Two Journey PPT Self-Contained Report
 
-> Audience: mixed technical/report audience
+> Audience: mixed technical / business audience
 > Target deck size: 13–16 slides
 > Narrative mode: results first
 
@@ -27,7 +27,7 @@ C-Two combines faster data movement with lower RPC overhead, zero-copy-friendly 
 
 **Key points**
 - `memory://` to IPC v3 moved the transport from polling and filesystem I/O to UDS + SHM
-- README benchmark representative points at 1K / 100K / 1M rows: 0.07 / 0.38 / 3.7 ms vs Ray's 6.1 / 9.8 / 58 ms
+- Benchmark representative points at 1K / 100K / 1M rows: 0.07 / 0.38 / 3.7 ms vs Ray's 6.1 / 9.8 / 58 ms
 - Relay Mesh removes address coupling by resolving `name -> route -> direct connection`
 
 **Suggested visual**
