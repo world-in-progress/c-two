@@ -71,13 +71,13 @@ For technical listeners, connect the origin story to process boundaries and payl
 ## Slide 5. The earliest memory:// IPC
 
 **Takeaway**
-memory:// started as filesystem-mediated IPC: the client wrote a request artifact, the server polled it, and the response came back as another file.
+memory:// started as filesystem-mediated IPC: the client wrote a request file, the server polled for it, and the response came back as another file.
 
 **Key points**
 - The client serialized each request and wrote it through the filesystem
-- The server and client both relied on polling to discover request and response artifacts
-- There was no SHM-backed zero-copy path; file I/O and serialization carried the work
-- It was a workable first transport, but it was already shaped by the filesystem
+- The server and client both relied on polling to discover request and response files
+- Each call was a file exchange, which made the transport simple to prototype but tied it to disk-backed artifacts
+- The transport was already shaped by the filesystem rather than by IPC-native mechanics
 
 **Suggested visual**
 Two-process diagram with a shared folder in the middle: client writes request file, server polls and writes response file, client polls again to read it.
@@ -105,19 +105,19 @@ Use this slide to make the core lesson explicit: the transport was not merely sl
 ## Slide 7. IPC v2: transition architecture
 
 **Takeaway**
-IPC v2 was the first clear transition away from file polling and toward real IPC.
+IPC v2 was the first clear transition away from file polling and toward real IPC by adding a Unix Domain Socket (UDS) control path.
 
 **Key points**
-- It removed the most obvious file-polling pain on the control path
+- It introduced a UDS control path that replaced file polling for request and response handling
 - It proved the direction was right: move toward real IPC rather than pseudo-IPC over files
-- It made the transport feel more like a transport and less like a filesystem workflow
+- It moved request handling onto an explicit IPC channel instead of temp files and watchers
 - It was a transition architecture, not yet the end state
 
 **Suggested visual**
 Bridge diagram from a folder-and-polling icon on the left to a slimmer control-path icon on the right, with the old path crossed out and the new path highlighted.
 
 **Speaker notes**
-Frame IPC v2 as a necessary proof point: it showed the project should keep moving toward IPC-native mechanics, but it still carried legacy complexity.
+Frame IPC v2 as a necessary proof point: it showed the project should keep moving toward IPC-native mechanics, but it still carried Python `multiprocessing.SharedMemory` pool overhead and pickle-based payload handling.
 
 ## Slide 8. IPC v2: results and remaining problems
 
@@ -125,7 +125,7 @@ Frame IPC v2 as a necessary proof point: it showed the project should keep movin
 IPC v2 was necessary but incomplete: it improved the control path, but it still did not unify lifecycle, large-payload handling, and memory behavior into one clean transport story.
 
 **Key points**
-- The control path was better, but the overall transport story was still split
+- The story was still split across the UDS control path, the `multiprocessing.SharedMemory` pool, and pickle-based payload handling
 - Lifecycle management was not yet unified end to end
 - Large payload handling still lacked a single clean model
 - Memory behavior remained more complicated than the final architecture would need
