@@ -1,6 +1,6 @@
 # C-Two Journey PPT Self-Contained Report
 
-> Audience: mixed technical / business audience
+> Audience: mixed technical/report audience
 > Target deck size: 13–16 slides
 > Narrative mode: results first
 
