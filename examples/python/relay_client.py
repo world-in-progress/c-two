@@ -5,15 +5,17 @@ does over IPC — only the address changes.
 
 Usage (3-terminal workflow):
 
-    # Terminal 1 — start the Grid CRM
-    uv run python examples/python/crm_process.py
-
-    # Terminal 2 — start the HTTP relay
+    # Terminal 1 — start the HTTP relay
     c3 relay -b 0.0.0.0:8300
 
+    # Terminal 2 — start the Grid CRM and register it with the relay
+    uv run python examples/python/crm_process.py --relay-url http://127.0.0.1:8300
+
     # Terminal 3 — run this client
-    uv run python examples/python/relay_client.py
+    uv run python examples/python/relay_client.py --relay-url http://127.0.0.1:8300
 """
+import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -23,8 +25,28 @@ sys.path.insert(0, str(EXAMPLES_ROOT))
 import c_two as cc
 from grid.grid_contract import Grid, GridAttribute
 
+DEFAULT_RELAY_URL = 'http://127.0.0.1:8300'
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description='Connect to the Grid CRM through an HTTP relay.',
+    )
+    parser.add_argument(
+        '--relay-url',
+        default=os.environ.get('C2_RELAY_ADDRESS') or DEFAULT_RELAY_URL,
+        help=(
+            'HTTP relay URL used for name resolution '
+            f'(default: C2_RELAY_ADDRESS or {DEFAULT_RELAY_URL}).'
+        ),
+    )
+    return parser.parse_args()
+
 
 def main():
+    args = parse_args()
+    cc.set_relay(args.relay_url)
+
     # Connect via HTTP relay — same API as IPC, different address.
     grid = cc.connect(Grid, name='examples/grid')
     print(f'[Client] Connected via HTTP (mode: {grid.client._mode})\n')
