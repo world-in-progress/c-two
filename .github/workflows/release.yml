@@ -49,6 +49,7 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           command: build
+          working-directory: sdk/python
           target: ${{ matrix.target }}
           args: >-
             --release --out dist
@@ -59,7 +60,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.target }}
-          path: dist/*.whl
+          path: sdk/python/dist/*.whl
 
   # ── Build source distribution ───────────────────────────────
   build-sdist:
@@ -73,12 +74,13 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
+          working-directory: sdk/python
           args: --out dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: dist/*.tar.gz
+          path: sdk/python/dist/*.tar.gz
 
   # ── Publish to PyPI via OIDC ────────────────────────────────
   publish:

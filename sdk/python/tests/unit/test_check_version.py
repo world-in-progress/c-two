@@ -47,6 +47,11 @@ def _parse_output(path: Path) -> dict[str, str]:
 
 
 class TestCheckVersion:
+    def test_default_pyproject_path_points_to_python_sdk(self, cv):
+        expected = _ROOT / "sdk" / "python" / "pyproject.toml"
+        assert Path(cv.PYPROJECT_PATH) == expected
+        assert expected.is_file()
+
     def _run(self, cv, tmp_path, monkeypatch, local_ver, *, pypi_mock=None, pypi_err=None):
         """Helper: write temp pyproject.toml, mock PyPI, run main(), return outputs."""
         toml = tmp_path / "pyproject.toml"
