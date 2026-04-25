@@ -4,15 +4,16 @@ Registers CRMs and keeps the process alive so remote clients can connect
 via IPC.  Press Ctrl-C to shut down.
 
 Run:
-    uv run python examples/crm_process.py
+    uv run python examples/python/crm_process.py
 
 Then in another terminal:
-    uv run python examples/compo.py
+    uv run python examples/python/client.py
 """
-import os, sys
+import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
+EXAMPLES_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
 import logging

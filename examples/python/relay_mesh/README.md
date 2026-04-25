@@ -3,7 +3,7 @@
 Demonstrates C-Two's **relay mesh** for automatic resource discovery.
 Clients connect to CRM resources **by name** — no IPC addresses needed.
 
-Reuses the `Grid` contract and `NestedGrid` resource from `examples/grid/`.
+Reuses the `Grid` contract and `NestedGrid` resource from `examples/python/grid/`.
 
 ## Prerequisites
 
@@ -34,10 +34,10 @@ uv sync --group examples
 c3 relay -b 0.0.0.0:8300
 
 # Terminal 2 — start the Grid CRM (auto-registers with relay)
-uv run examples/relay_mesh/resource.**py**
+uv run python examples/python/relay_mesh/resource.py
 
 # Terminal 3 — client discovers and uses Grid via relay
-uv run examples/relay_mesh/client.py
+uv run python examples/python/relay_mesh/client.py
 ```
 
 ## What this demonstrates

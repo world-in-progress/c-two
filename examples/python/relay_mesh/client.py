@@ -4,14 +4,13 @@ Connects to the Grid CRM **by name only**. The relay resolves the name
 to the CRM process's IPC address automatically.
 
 Run (after starting relay.py and resource.py):
-    uv run python examples/relay_mesh/client.py
+    uv run python examples/python/relay_mesh/client.py
 """
-import os, sys
+import sys
+from pathlib import Path
 
-# Ensure c_two and the sibling grid package are importable.
-_examples_dir = os.path.dirname(os.path.dirname(__file__))
-sys.path.insert(0, os.path.join(_examples_dir, '..', 'src'))
-sys.path.insert(0, _examples_dir)
+EXAMPLES_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
 

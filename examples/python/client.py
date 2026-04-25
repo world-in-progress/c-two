@@ -4,11 +4,13 @@ Connects to the server started by ``server.py`` via IPC and invokes
 CRM methods through the CRM proxy.
 
 Run (after starting server.py in another terminal):
-    uv run python examples/client.py
+    uv run python examples/python/client.py
 """
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../examples/')))
+import sys
+from pathlib import Path
+
+EXAMPLES_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
 from grid.grid_contract import (

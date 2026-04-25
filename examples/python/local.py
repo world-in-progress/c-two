@@ -7,10 +7,8 @@ Demonstrates:
   - Multi-CRM in one process
 
 Run:
-    uv run python examples/local.py
+    uv run python examples/python/local.py
 """
-import os, sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 
 import c_two as cc
 

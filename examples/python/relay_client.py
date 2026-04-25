@@ -6,18 +6,19 @@ does over IPC — only the address changes.
 Usage (3-terminal workflow):
 
     # Terminal 1 — start the Grid CRM
-    uv run python examples/v2_relay/resource.py
+    uv run python examples/python/crm_process.py
 
     # Terminal 2 — start the HTTP relay
-    uv run python examples/v2_relay/relay_server.py
+    c3 relay -b 0.0.0.0:8300
 
     # Terminal 3 — run this client
-    uv run python examples/v2_relay/http_client.py
+    uv run python examples/python/relay_client.py
 """
-import os, sys
+import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../src/')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../examples/')))
+EXAMPLES_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
 from grid.grid_contract import Grid, GridAttribute
