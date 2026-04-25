@@ -359,7 +359,11 @@ class _ProcessRegistry:
         # Notify relay (outside lock to avoid deadlocks).
         crm_ns = getattr(crm_class, '__cc_namespace__', '')
         crm_ver = getattr(crm_class, '__cc_version__', '')
-        self._relay_register(name, server_address, crm_ns, crm_ver)
+        try:
+            self._relay_register(name, server_address, crm_ns, crm_ver)
+        except Exception:
+            self._rollback_registration(name)
+            raise
 
         return name
 
@@ -717,9 +721,26 @@ class _ProcessRegistry:
                         log.info('Registered CRM %s with relay at %s',
                                  name, relay_addr)
                         return
+                    raise RuntimeError(
+                        f'Relay registration failed for {name!r}: '
+                        f'HTTP {resp.status}',
+                    )
+            except urllib.error.HTTPError as e:
+                if e.code == 409:
+                    raise RuntimeError(
+                        f'Route name already registered with relay: {name!r}',
+                    ) from e
+                if e.code < 500:
+                    raise RuntimeError(
+                        f'Relay registration failed for {name!r}: HTTP {e.code}',
+                    ) from e
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
             except Exception:
                 if attempt < 2:
                     time.sleep(1)
+                    continue
 
         # All retries failed → register locally, schedule background retry.
         log.warning('Relay unreachable for %s — scheduling background retry',
@@ -857,6 +878,33 @@ class _ProcessRegistry:
                 chunk_size=cfg.chunk_size,
             )
             self._pool_config_applied = True
+
+    def _rollback_registration(self, name: str) -> None:
+        """Undo a local registration after relay registration fails."""
+        with self._lock:
+            reg = self._registrations.pop(name, None)
+            server = self._server
+            should_shutdown = server is not None and not self._registrations
+
+        if reg is None:
+            return
+
+        if server is not None:
+            try:
+                server.unregister_crm(name)
+            except Exception:
+                log.warning('Failed to rollback local CRM %s', name, exc_info=True)
+
+        if should_shutdown and server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                log.warning('Failed to shutdown server during rollback', exc_info=True)
+            with self._lock:
+                if self._server is server and not self._registrations:
+                    self._server = None
+                    self._server_address = None
+                    self._server_config = None
 
     @staticmethod
     def _auto_address() -> str:

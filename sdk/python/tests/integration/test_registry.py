@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
 import c_two as cc
+from c_two._native import NativeRelay
 from c_two.transport.registry import _ProcessRegistry
 from c_two.transport.client.proxy import CRMProxy
 
@@ -22,6 +24,17 @@ from c_two.transport.client.proxy import CRMProxy
 from tests.fixtures.ihello import Hello
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.counter import Counter, CounterImpl
+
+
+_port_counter = 0
+_port_lock = threading.Lock()
+
+
+def _next_relay_port() -> int:
+    global _port_counter
+    with _port_lock:
+        _port_counter += 1
+        return 19150 + _port_counter
 
 
 @pytest.fixture(autouse=True)
@@ -285,3 +298,39 @@ class TestErrors:
             assert crm.greeting('Z') == 'Hello, Z!'
         finally:
             cc.close(crm)
+
+    def test_relay_registration_failure_rolls_back_local_registration(self):
+        registry = _ProcessRegistry.get()
+        with patch.object(
+            registry,
+            '_relay_register',
+            side_effect=RuntimeError("Route name already registered: 'hello'"),
+        ):
+            with pytest.raises(RuntimeError, match='already registered'):
+                cc.register(Hello, HelloImpl(), name='hello')
+
+        assert 'hello' not in registry.names
+        assert cc.server_address() is None
+
+    def test_relay_rejects_duplicate_name_from_second_registry(self):
+        relay = NativeRelay(f'127.0.0.1:{_next_relay_port()}')
+        relay.start()
+        relay_url = f'http://{relay.bind_address}'
+
+        first = _ProcessRegistry()
+        second = _ProcessRegistry()
+        try:
+            first.set_relay(relay_url)
+            second.set_relay(relay_url)
+
+            first.register(Hello, HelloImpl(), name='hello')
+
+            with pytest.raises(RuntimeError, match='already registered'):
+                second.register(Hello, HelloImpl(), name='hello')
+
+            assert second.names == []
+            assert second.get_server_address() is None
+        finally:
+            second.shutdown()
+            first.shutdown()
+            relay.stop()
