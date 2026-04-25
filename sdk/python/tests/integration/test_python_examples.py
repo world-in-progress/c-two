@@ -87,6 +87,9 @@ def _example_env() -> dict[str, str]:
 
 
 def test_relay_client_workflow_uses_explicit_relay_url():
+    pytest.importorskip("pandas", reason="Python grid examples require examples dependencies")
+    pytest.importorskip("pyarrow", reason="Python grid examples require examples dependencies")
+
     root = _repo_root()
     port = _free_port()
     relay_url = f"http://127.0.0.1:{port}"
