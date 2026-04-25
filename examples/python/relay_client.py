@@ -45,7 +45,8 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    cc.set_relay(args.relay_url)
+    if args.relay_url:
+        cc.set_relay(args.relay_url)
 
     # Connect via HTTP relay — same API as IPC, different address.
     grid = cc.connect(Grid, name='examples/grid')

@@ -1,15 +1,19 @@
 """SOTA API — client process.
 
-Connects to the server started by ``crm_process.py`` via IPC and invokes
-CRM methods through the CRM proxy.
+Connects to the Grid CRM process. With ``--relay-url`` or ``C2_RELAY_ADDRESS``,
+the client resolves the CRM by name through the relay. Without a relay, pass the
+printed IPC address from ``crm_process.py``.
 
-Run:
+IPC:
     uv run python examples/python/crm_process.py
-
-Copy the printed IPC address, then in another terminal:
     uv run python examples/python/client.py <address>
+
+Relay:
+    uv run python examples/python/crm_process.py --relay-url http://127.0.0.1:8300
+    uv run python examples/python/client.py --relay-url http://127.0.0.1:8300
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -25,20 +29,35 @@ from grid.grid_contract import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Connect to the Grid CRM process via its printed IPC address.',
+        description='Connect to the Grid CRM process via relay name resolution or IPC address.',
     )
     parser.add_argument(
         'address',
+        nargs='?',
         help='Server IPC address printed by examples/python/crm_process.py, such as ipc://...',
     )
-    return parser.parse_args()
+    parser.add_argument(
+        '--relay-url',
+        default=os.environ.get('C2_RELAY_ADDRESS'),
+        help=(
+            'HTTP relay URL used for name resolution. When set, the IPC address '
+            f'is optional. Example: {'http://127.0.0.1:8300'}.'
+        ),
+    )
+    args = parser.parse_args()
+    if not args.relay_url and not args.address:
+        parser.error('address is required when --relay-url or C2_RELAY_ADDRESS is not set')
+    return args
 
 
 def main():
     args = parse_args()
 
-    # Connect to the remote server via IPC
-    grid = cc.connect(Grid, name='examples/grid', address=args.address)
+    if args.relay_url:
+        cc.set_relay(args.relay_url)
+        grid = cc.connect(Grid, name='examples/grid')
+    else:
+        grid = cc.connect(Grid, name='examples/grid', address=args.address)
     print(f'Connected (mode: {grid.client._mode})\n')
 
     # Say hello
