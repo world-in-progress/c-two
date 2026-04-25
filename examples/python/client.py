@@ -1,11 +1,15 @@
 """SOTA API — client process.
 
-Connects to the server started by ``server.py`` via IPC and invokes
+Connects to the server started by ``crm_process.py`` via IPC and invokes
 CRM methods through the CRM proxy.
 
-Run (after starting server.py in another terminal):
-    uv run python examples/python/client.py
+Run:
+    uv run python examples/python/crm_process.py
+
+Copy the printed IPC address, then in another terminal:
+    uv run python examples/python/client.py <address>
 """
+import argparse
 import sys
 from pathlib import Path
 
@@ -19,9 +23,22 @@ from grid.grid_contract import (
 )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description='Connect to the Grid CRM process via its printed IPC address.',
+    )
+    parser.add_argument(
+        'address',
+        help='Server IPC address printed by examples/python/crm_process.py, such as ipc://...',
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     # Connect to the remote server via IPC
-    grid = cc.connect(Grid, name='examples/grid')
+    grid = cc.connect(Grid, name='examples/grid', address=args.address)
     print(f'Connected (mode: {grid.client._mode})\n')
 
     # Say hello

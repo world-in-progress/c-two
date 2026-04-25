@@ -6,8 +6,8 @@ via IPC.  Press Ctrl-C to shut down.
 Run:
     uv run python examples/python/crm_process.py
 
-Then in another terminal:
-    uv run python examples/python/client.py
+Copy the printed IPC address, then in another terminal:
+    uv run python examples/python/client.py <address>
 """
 import sys
 from pathlib import Path
@@ -34,7 +34,7 @@ def main():
 
     # Register — one line replaces ServerConfig + Server + start()
     cc.register(Grid, grid, name='examples/grid')
-    print(f'Grid CRM registered at {cc.server_address()}')
+    print(f'Grid CRM registered at {cc.server_address()}', flush=True)
 
     # Block until SIGINT/SIGTERM, then auto-shutdown via atexit.
     cc.serve()

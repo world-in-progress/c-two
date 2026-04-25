@@ -29,14 +29,17 @@ uv sync --group examples
 
 ## Run (3 terminals)
 
+The resource and client use `http://127.0.0.1:8300` by default. Set
+`C2_RELAY_ADDRESS` only if you start the relay at a different address.
+
 ```bash
 # Terminal 1 — start the relay server
 c3 relay -b 0.0.0.0:8300
 
-# Terminal 2 — start the Grid CRM (auto-registers with relay)
+# Terminal 2 — start the Grid CRM (auto-registers with the default relay)
 uv run python examples/python/relay_mesh/resource.py
 
-# Terminal 3 — client discovers and uses Grid via relay
+# Terminal 3 — client discovers and uses Grid via the default relay
 uv run python examples/python/relay_mesh/client.py
 ```
 

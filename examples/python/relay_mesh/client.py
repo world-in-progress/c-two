@@ -6,6 +6,7 @@ to the CRM process's IPC address automatically.
 Run (after starting relay.py and resource.py):
     uv run python examples/python/relay_mesh/client.py
 """
+import os
 import sys
 from pathlib import Path
 
@@ -17,12 +18,12 @@ import c_two as cc
 # Import the CRM contract from the shared grid package.
 from grid.grid_contract import Grid
 
-# RELAY_URL = 'http://127.0.0.1:8300'
+RELAY_URL = os.environ.get('C2_RELAY_ADDRESS', 'http://127.0.0.1:8300')
 
 
 def main():
     # Tell C-Two where the relay is — all name resolution goes through it.
-    # cc.set_relay(RELAY_URL)
+    cc.set_relay(RELAY_URL)
 
     # ── Connect by name ──────────────────────────────────────────────
     # No IPC address needed — the relay resolves 'grid' to the right

@@ -6,6 +6,7 @@ types from ``examples/python/grid/``.
 Run (after starting relay.py):
     uv run python examples/python/relay_mesh/resource.py
 """
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,8 @@ import logging
 from grid.grid_contract import Grid
 from grid.nested_grid import NestedGrid
 
+RELAY_URL = os.environ.get('C2_RELAY_ADDRESS', 'http://127.0.0.1:8300')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [resource] %(levelname)s %(message)s',
@@ -27,6 +30,8 @@ logging.basicConfig(
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
+    cc.set_relay(RELAY_URL)
+
     grid = NestedGrid(
         epsg=2326,
         bounds=[808357.5, 824117.5, 838949.5, 843957.5],
