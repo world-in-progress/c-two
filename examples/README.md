@@ -29,6 +29,17 @@ uv run python examples/python/client.py ipc://...
 
 ### Relay Mode
 
+`c3` is the native C-Two CLI. From a source checkout, build it once and link it
+into a development bin directory:
+
+```bash
+python tools/dev/c3_tool.py --build --link
+```
+
+If the selected bin directory is not already on `PATH`, the tool prints the
+exact `export PATH=...` command. Linking to a persistent PATH directory such as
+`~/.cargo/bin` avoids repeating this in every terminal.
+
 Start the relay:
 
 ```bash

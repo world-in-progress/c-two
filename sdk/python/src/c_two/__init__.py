@@ -19,18 +19,3 @@ from .transport.registry import (
     serve,
     hold_stats,
 )
-
-def _load_banner(name: str) -> str:
-    """Load a pre-generated banner from package resources.
-
-    Returns empty string if the file does not exist.
-    """
-    from importlib.resources import files
-    resource = files("c_two").joinpath(name)
-    try:
-        return resource.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
-
-
-LOGO_UNICODE = _load_banner("banner_unicode.txt")

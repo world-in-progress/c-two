@@ -45,6 +45,7 @@ uv run python examples/python/crm_process.py    # terminal 1: server
 uv run python examples/python/client.py <address>  # terminal 2: client
 
 # Run relay mesh example (three terminals)
+python tools/dev/c3_tool.py --build --link                 # one-time source checkout setup
 c3 relay -b 0.0.0.0:8300                                 # terminal 1: relay
 uv run python examples/python/relay_mesh/resource.py      # terminal 2: CRM server
 uv run python examples/python/relay_mesh/client.py        # terminal 3: client
@@ -54,7 +55,7 @@ uv sync --group examples
 
 # CLI tool
 c3 --version
-c3 relay --upstream ipc://my_server --bind 0.0.0.0:8080
+c3 relay --upstream grid=ipc://my_server --bind 0.0.0.0:8080
 ```
 
 Tests use **pytest** with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures in `sdk/python/tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource).
@@ -136,10 +137,13 @@ A Cargo workspace of 7 crates organized in 4 layers, compiled into a single `c_t
 
 **Import:** `from c_two.mem import MemPool, PoolConfig, MemHandle, ChunkAssembler`
 
-### CLI (`sdk/python/src/c_two/cli.py`)
-The `c3` CLI provides `relay` (HTTP relay server) and `dev` (developer tools) commands.
+### CLI
+The `c3` command is implemented by the root `cli/` Rust package. Python does
+not own CLI behavior. For source-checkout development, use
+`python tools/dev/c3_tool.py --build --link` to build and link a local `c3`.
+Do not add CLI command behavior under `sdk/python/src/c_two`.
 
-**`c3 relay`** options (all support env vars via `C2Settings` / `.env`):
+**`c3 relay`** options:
 
 | Option | Env var | Default | Purpose |
 |--------|---------|---------|---------|
@@ -148,8 +152,6 @@ The `c3` CLI provides `relay` (HTTP relay server) and `dev` (developer tools) co
 | `--relay-id` | `C2_RELAY_ID` | auto UUID | Stable relay identifier |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | `""` | Publicly reachable URL for peers |
 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `300` | IPC idle disconnect timeout (seconds) |
-
-Priority: CLI flag → env var / `.env` → hardcoded default.
 
 ## Key Conventions
 

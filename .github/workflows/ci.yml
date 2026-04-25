@@ -10,6 +10,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cli:
+    runs-on: ubuntu-latest
+    name: cli
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            core -> target
+            cli -> target
+
+      - name: Test c3
+        run: cargo test --manifest-path cli/Cargo.toml
+
+      - name: Smoke test c3
+        run: |
+          cli/target/debug/c3 --version
+          cli/target/debug/c3 --help
+          cli/target/debug/c3 relay --help
+          cli/target/debug/c3 registry --help
+
   test:
     runs-on: ubuntu-latest
     strategy:

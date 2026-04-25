@@ -196,6 +196,10 @@ cc.serve()                                     # blocks; Ctrl-C triggers gracefu
 
 An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach servers **by name**, across machines. Servers announce their IPC address to the relay when they register; clients ask the relay and get routed transparently.
 
+The `c3` command is C-Two's cross-language native CLI. From a source checkout,
+build and link a local development binary with
+`python tools/dev/c3_tool.py --build --link`.
+
 ```bash
 # Start a relay anywhere reachable on your network
 c3 relay --bind 0.0.0.0:8080
@@ -554,6 +558,11 @@ The Rust workspace contains 7 crates organized in 4 layers (foundation → proto
 
 The Rust extension is compiled automatically during `pip install c-two` (from pre-built wheels) or `uv sync` (from source).
 
+The `c3` command is distributed as a native CLI binary and built from the root
+`cli/` package. Source checkouts can link a local development binary with
+`python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned
+by the CLI release pipeline rather than by any language SDK.
+
 ---
 
 ## Installation
@@ -579,6 +588,7 @@ cd c-two
 cp .env.example .env               # configure environment (optional)
 uv sync                            # install dependencies + compile Rust extensions
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)
+cargo build --manifest-path cli/Cargo.toml  # build the native c3 CLI in source checkouts
 uv run pytest                      # run the test suite
 ```
 

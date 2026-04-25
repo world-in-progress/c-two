@@ -71,17 +71,3 @@ class TestUnregisterRelayAbsence:
 
         assert any('unreachable' in r.message.lower() or 'relay' in r.message.lower()
                     for r in caplog.records)
-
-# -- Tests: c3 relay defaults to native -----------------------------------
-
-class TestRelayDefaultNative:
-    """Verify relay command uses NativeRelay."""
-
-    def test_relay_help_shows_bind(self):
-        from click.testing import CliRunner
-        from c_two.cli import cli
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ['relay', '--help'])
-        assert result.exit_code == 0
-        assert '--bind' in result.output

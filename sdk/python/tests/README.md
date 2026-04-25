@@ -62,7 +62,6 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 
 | File | Description |
 |------|-------------|
-| `test_cli_relay.py` | CLI relay commands — start/stop, config |
 | `test_http_client.py` | HTTP client transport — request/response, error handling |
 | `test_native_relay.py` | `NativeRelay` (Rust/axum) — start/stop, upstream registration |
 | `test_relay_graceful_shutdown.py` | Relay graceful shutdown — drain, timeout |
