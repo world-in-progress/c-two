@@ -20,7 +20,7 @@ The first cross-language step should therefore be a repository structure migrati
 - Move the Python package to `sdk/python/`.
 - Keep the published Python package name and import surface stable.
 - Preserve existing Python behavior, tests, examples, and benchmark entry points.
-- Introduce a small `spec/` area for protocol and compatibility contract material.
+- Preserve the root README as the repository-level introduction and add Python SDK-specific documentation under `sdk/python/`.
 - Keep Fortran and TypeScript-browser as follow-up work, not phase 1 implementation work.
 
 ## Non-Goals
@@ -28,8 +28,9 @@ The first cross-language step should therefore be a repository structure migrati
 - Do not implement `sdk/fortran/`.
 - Do not implement `sdk/typescript-browser/`.
 - Do not redesign the wire format, transfer system, CRM API, or Rust crate boundaries.
+- Do not rename Rust crates or remove the `c2-*` crate prefix.
 - Do not introduce a broad canonical value model.
-- Do not move language-independent conformance suites before they exist.
+- Do not create `spec/` before there are concrete specification files to place there.
 
 ## Target Structure
 
@@ -43,15 +44,16 @@ c-two/
 │   └── bridge/
 ├── sdk/
 │   └── python/
+│       ├── README.md
 │       ├── pyproject.toml
 │       ├── src/c_two/
 │       ├── tests/
 │       └── benchmarks/
 ├── examples/
 │   └── python/
-├── spec/
-│   └── README.md
 ├── docs/
+├── README.md
+├── README.zh-CN.md
 ├── pyproject.toml
 └── uv.lock
 ```
@@ -73,10 +75,13 @@ core/
 
 The existing crate names remain `c2-*`. The root directory name `core/` describes the repository role, while crate names keep the project namespace and avoid collision with Rust's standard `core` crate.
 
+The `c2-*` prefix is intentionally retained in phase 1. It is slightly redundant in local paths such as `core/foundation/c2-config`, but it is useful for Rust package identity, dependency readability, future publishing, and avoiding generic crate names like `config`, `wire`, `ipc`, or `server`. Renaming crates would also touch Cargo package names, dependency keys, Rust import names, lockfile metadata, and build configuration, which is outside a zero-regression layout migration.
+
 ### `sdk/python/`
 
 `sdk/python/` owns the real Python package:
 
+- `sdk/python/README.md` contains Python SDK-specific installation, API, build, test, and benchmark notes.
 - `sdk/python/pyproject.toml` contains `[project] name = "c-two"` and maturin build metadata.
 - `sdk/python/src/c_two/` contains the Python package.
 - `sdk/python/tests/` contains Python SDK tests.
@@ -107,6 +112,12 @@ members = ["sdk/python"]
 
 This keeps root-level development workflows usable while putting Python package ownership in the Python SDK directory.
 
+### Repository READMEs
+
+The root `README.md` and `README.zh-CN.md` remain repository-level entry points. They should describe C-Two at the project level, link to `sdk/python/README.md` for Python SDK details, and later link to additional language SDK documentation as it appears.
+
+The Python package metadata should use `sdk/python/README.md` as its package-specific readme unless packaging validation proves that the root README is the better PyPI long description source. The key ownership rule is that Python-specific SDK documentation lives under `sdk/python/`.
+
 ### `examples/`
 
 Examples stay at the repository root because they are user-facing demonstrations, not Python package internals. They are grouped by language:
@@ -130,7 +141,7 @@ Phase 1 only moves existing examples to `examples/python/`.
 
 ### `spec/`
 
-`spec/` is the source of compatibility contracts, not a runtime implementation layer. Phase 1 adds only a minimal README to establish ownership.
+`spec/` is the future source of compatibility contracts, not a runtime implementation layer. Phase 1 does not create `spec/` because there is not yet a concrete wire ABI, error code, fixture, or conformance document to place there.
 
 Future content may include:
 
@@ -182,8 +193,8 @@ uv run pytest sdk/python/tests
 5. Move existing example files and directories to `examples/python/`.
 6. Move Python package metadata from root `pyproject.toml` to `sdk/python/pyproject.toml`.
 7. Replace root `pyproject.toml` with a uv workspace/development entry point.
-8. Add `spec/README.md`.
-9. Update path references in docs, tests, examples, benchmarks, and build configuration.
+8. Add `sdk/python/README.md` for Python SDK-specific documentation and keep root READMEs as repository-level entry points.
+9. Update path references in docs, tests, examples, benchmarks, README files, and build configuration.
 
 ## Validation
 
@@ -212,9 +223,9 @@ Tests, benchmarks, docs, and examples may refer to `src/c_two`, `tests`, `exampl
 
 The Python SDK remains the only functional SDK in phase 1. The implementation must preserve public imports, CLI entry point `c3`, and native extension module name `c_two._native`.
 
-### Premature cross-language scaffolding
+### Premature cross-language or spec scaffolding
 
-Creating empty `sdk/fortran/` or `sdk/typescript-browser/` directories would imply implementation progress that is out of scope. These directories should not be added in phase 1.
+Creating empty `sdk/fortran/`, `sdk/typescript-browser/`, or placeholder-only `spec/` directories would imply implementation or specification progress that is out of scope. These directories should not be added in phase 1.
 
 ## Follow-Up Phases
 
