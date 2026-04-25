@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-_SCRIPT_DIR = str(Path(__file__).resolve().parents[2] / ".github" / "scripts")
+_ROOT = next(
+    parent
+    for parent in Path(__file__).resolve().parents
+    if (parent / ".github" / "scripts" / "check_version.py").is_file()
+)
+_SCRIPT_DIR = str(_ROOT / ".github" / "scripts")
 
 
 @pytest.fixture(scope="module")

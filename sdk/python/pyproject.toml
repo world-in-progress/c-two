@@ -1,0 +1,54 @@
+[project]
+name = "c-two"
+version = "0.4.7"
+description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
+readme = "README.md"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "click>=8.2.1",
+    "pydantic-settings>=2.0.0",
+]
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "../../core/bridge/c2-ffi/Cargo.toml"
+module-name = "c_two._native"
+python-source = "src"
+features = ["pyo3/extension-module"]
+include = ["LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+timeout = 30
+
+[tool.uv]
+package = true
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "../../core/**/*.rs" },
+    { file = "../../core/**/Cargo.toml" },
+]
+
+[project.scripts]
+c3 = "c_two.cli:cli"
