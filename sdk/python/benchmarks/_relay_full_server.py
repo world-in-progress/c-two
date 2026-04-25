@@ -1,6 +1,8 @@
 """Start NativeRelay + CRM server for full-chain benchmarking."""
-import signal, time, sys, os, pickle
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import signal, time, sys, pickle
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import c_two as cc
 from c_two._native import NativeRelay

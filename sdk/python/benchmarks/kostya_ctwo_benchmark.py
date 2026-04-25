@@ -9,7 +9,7 @@ Strategies:
   * fastdb-hold     : fastdb ORM raw buffer + zero-copy load_xbuffer in hold mode
 
 Run:
-    C2_RELAY_ADDRESS= uv run python benchmarks/kostya_ctwo_benchmark.py \
+    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/kostya_ctwo_benchmark.py \
         --variant fastdb-hold --n 1000000 --iters 30
 """
 from __future__ import annotations

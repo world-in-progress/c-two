@@ -8,7 +8,7 @@ Uses @transferable Payload wrapper to avoid the raw bytes fast-path.
 100 rounds per size, P50 latency.
 
 Usage:
-    uv run python benchmarks/thread_vs_ipc_benchmark.py
+    uv run python sdk/python/benchmarks/thread_vs_ipc_benchmark.py
 """
 from __future__ import annotations
 
@@ -16,10 +16,7 @@ import gc
 import math
 import os
 import statistics
-import sys
 import time
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 
 import c_two as cc
 

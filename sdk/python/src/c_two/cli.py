@@ -342,7 +342,10 @@ def _is_dev_environment() -> bool:
     try:
         root = Path.cwd()
         for parent in [root, *root.parents]:
-            if (parent / "pyproject.toml").exists() and (parent / "src" / "c_two").is_dir():
+            if (
+                (parent / "pyproject.toml").exists()
+                and (parent / "sdk" / "python" / "src" / "c_two").is_dir()
+            ):
                 return True
     except OSError:
         pass
@@ -356,13 +359,16 @@ if _is_dev_environment():
         """Developer tools for C-Two (only available in dev checkout)."""
 
     def _find_project_root() -> Path:
-        """Walk up from CWD to find the project root (contains pyproject.toml)."""
+        """Walk up from CWD to find the monorepo root."""
         cwd = Path.cwd()
         for parent in [cwd, *cwd.parents]:
-            if (parent / "pyproject.toml").exists():
+            if (
+                (parent / "pyproject.toml").exists()
+                and (parent / "sdk" / "python" / "src" / "c_two").is_dir()
+            ):
                 return parent
         raise click.ClickException(
-            "Cannot find project root (no pyproject.toml). "
+            "Cannot find project root. "
             "Run this command from inside the C-Two project tree."
         )
 
@@ -416,7 +422,7 @@ if _is_dev_environment():
         """Generate Unicode half-block banner from the logo image.
 
         \b
-        Output: src/c_two/banner_unicode.txt
+        Output: sdk/python/src/c_two/banner_unicode.txt
         """
         try:
             from PIL import Image
@@ -426,7 +432,7 @@ if _is_dev_environment():
             )
 
         root = _find_project_root()
-        pkg_dir = root / "src" / "c_two"
+        pkg_dir = root / "sdk" / "python" / "src" / "c_two"
         bw_path = Path(image) if image else root / "docs" / "images" / "logo_bw.png"
         if not bw_path.exists():
             raise click.ClickException(f"Image not found: {bw_path}")

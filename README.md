@@ -51,7 +51,7 @@ End-to-end cross-process IPC benchmark — same NumPy payload (`row_id u32` + `x
 - **Ray** — object store with zero-copy numpy support (Ray 2.55)
 - **C-Two pickle** — standard pickle over SHM; included to show serialization cost
 
-> Apple M1 Max · Python 3.13 · NumPy 2.4 · See [`benchmarks/unified_numpy_benchmark.py`](benchmarks/unified_numpy_benchmark.py) for full methodology.
+> Apple M1 Max · Python 3.13 · NumPy 2.4 · See [`sdk/python/benchmarks/unified_numpy_benchmark.py`](sdk/python/benchmarks/unified_numpy_benchmark.py) for full methodology.
 
 ---
 
@@ -122,7 +122,7 @@ counter.increment(5)     # works identically
 cc.close(counter)
 ```
 
-> **See [`examples/`](examples/) for complete runnable demos.**
+> **See [`examples/python/`](examples/python/) for complete runnable demos.**
 
 ---
 
@@ -471,7 +471,7 @@ CRM processes register with their local relay; the mesh propagates routes automa
 
 > **Best for:** multi-node clusters, high availability, geographic distribution.
 
-> **See [`examples/relay_mesh/`](examples/relay_mesh/) for a complete runnable mesh demo.**
+> **See [`examples/python/relay_mesh/`](examples/python/relay_mesh/) for a complete runnable mesh demo.**
 
 ### Server-Side Monitoring
 

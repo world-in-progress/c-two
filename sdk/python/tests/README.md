@@ -4,23 +4,23 @@
 
 ```bash
 # Full test suite (855 tests, ~80s on Apple Silicon)
-uv run pytest -q
+uv run pytest sdk/python/tests -q
 
 # Single test file
-uv run pytest tests/unit/test_encoding.py -q
+uv run pytest sdk/python/tests/unit/test_wire.py -q
 
 # Single test function
-uv run pytest tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
+uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 
 # Run with verbose output
-uv run pytest -v --timeout=30
+uv run pytest sdk/python/tests -v --timeout=30
 ```
 
 All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-threaded).
 
 ---
 
-## Unit Tests (`tests/unit/`)
+## Unit Tests (`sdk/python/tests/unit/`)
 
 ### CRM Core
 
@@ -67,7 +67,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `test_native_relay.py` | `NativeRelay` (Rust/axum) — start/stop, upstream registration |
 | `test_relay_graceful_shutdown.py` | Relay graceful shutdown — drain, timeout |
 
-## Integration Tests (`tests/integration/`)
+## Integration Tests (`sdk/python/tests/integration/`)
 
 | File | Description |
 |------|-------------|
@@ -84,7 +84,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `test_serve.py` | `cc.serve()` integration — multi-protocol serving |
 | `test_http_relay.py` | HTTP relay end-to-end — POST routing, error forwarding |
 
-## Shared Fixtures (`tests/fixtures/`)
+## Shared Fixtures (`sdk/python/tests/fixtures/`)
 
 | File | Description |
 |------|-------------|
@@ -92,7 +92,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `hello.py` | `Hello` CRM implementation (stateful greeting service) |
 | `counter.py` | `ICounter` / `Counter` — minimal read/write CRM for concurrency tests |
 
-## Protocol Address Fixtures (`tests/conftest.py`)
+## Protocol Address Fixtures (`sdk/python/tests/conftest.py`)
 
 Parametrized `protocol_address` fixture provides unique addresses for each protocol:
 
@@ -108,9 +108,9 @@ Parametrized `protocol_address` fixture provides unique addresses for each proto
 
 ---
 
-## Benchmarks (`benchmarks/`)
+## Benchmarks (`sdk/python/benchmarks/`)
 
-Run benchmarks with `uv run python benchmarks/<script>.py`.
+Run benchmarks with `uv run python sdk/python/benchmarks/<script>.py`.
 
 | File | Description |
 |------|-------------|
@@ -130,17 +130,13 @@ Run benchmarks with `uv run python benchmarks/<script>.py`.
 
 ---
 
-## Rust Tests (`src/c_two/buddy/_buddy_core/`)
+## Rust Tests (`core/`)
 
-The Rust buddy allocator has its own test suite:
+The Rust workspace has its own test suite:
 
 ```bash
-# Run Rust tests (must use --no-default-features on macOS to avoid PyO3 linker errors)
-cd src/c_two/buddy/_buddy_core && cargo test --no-default-features
+# Run focused Rust tests that do not need Python linkage
+cd core && cargo test -p c2-mem -p c2-wire
 ```
 
-Currently **36 Rust tests** covering:
-- `allocator::tests` — alloc/free, buddy merge, fragmentation, double-free detection, invalid input rejection
-- `pool::tests` — multi-segment pool, dedicated fallback, gc_buddy idle reclamation, config validation
-- `spinlock::tests` — lock/unlock, RAII guard, concurrent correctness, PID-based crash recovery
-- `bitmap::tests` — bit manipulation, CAS alloc/free
+Run `cd core && cargo check --workspace` before broader Rust changes.

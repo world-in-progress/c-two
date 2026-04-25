@@ -11,8 +11,8 @@ includes a columnar operation (elevation.sum()) to verify data is usable.
 Payload sizes: 64B .. 1GB
 
 Usage:
-    C2_RELAY_ADDRESS= uv run python benchmarks/hold_vs_view_benchmark.py
-    C2_RELAY_ADDRESS= uv run python benchmarks/hold_vs_view_benchmark.py --max-mb 100
+    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/hold_vs_view_benchmark.py
+    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/hold_vs_view_benchmark.py --max-mb 100
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import time
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Grid dtype — mirrors GridAttribute from examples/grid
+# Grid dtype — mirrors GridAttribute from examples/python/grid
 # ---------------------------------------------------------------------------
 
 GRID_DTYPE = np.dtype([

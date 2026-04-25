@@ -10,7 +10,7 @@ Mirrors `kostya_ctwo_benchmark.py`:
 Notes:
   * Ray on macOS caps object_store_memory at 2 GiB. Cap N accordingly.
   * Run from the dedicated Ray venv:
-        /tmp/ray_bench_env/bin/python benchmarks/kostya_ray_benchmark.py
+        /tmp/ray_bench_env/bin/python sdk/python/benchmarks/kostya_ray_benchmark.py
 """
 from __future__ import annotations
 

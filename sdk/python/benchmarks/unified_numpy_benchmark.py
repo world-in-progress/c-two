@@ -7,8 +7,8 @@ cross-process RPC + client-side aggregation.
 Requires: numpy, ray, c-two  (run from a Python 3.12/3.13 venv)
 
 Usage:
-    python benchmarks/unified_numpy_benchmark.py
-    python benchmarks/unified_numpy_benchmark.py --sizes 1000 10000 100000 1000000
+    python sdk/python/benchmarks/unified_numpy_benchmark.py
+    python sdk/python/benchmarks/unified_numpy_benchmark.py --sizes 1000 10000 100000 1000000
 """
 from __future__ import annotations
 

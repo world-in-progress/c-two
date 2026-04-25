@@ -11,11 +11,11 @@ Two payload types compared:
 
 Payload sizes: 64B, 256B, 1KB, 4KB, 64KB, 1MB, 10MB, 50MB, 100MB, 500MB, 1GB
 
-Results are written to benchmarks/results/ (git-ignored).
+Results are written to sdk/python/benchmarks/results/ (git-ignored).
 
 Usage:
-    C2_RELAY_ADDRESS= uv run python benchmarks/three_mode_benchmark.py
-    C2_RELAY_ADDRESS= uv run python benchmarks/three_mode_benchmark.py --segment-size 268435456
+    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py
+    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py --segment-size 268435456
 """
 from __future__ import annotations
 
@@ -25,10 +25,7 @@ import glob
 import math
 import os
 import statistics
-import sys
 import time
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/')))
 
 import c_two as cc
 from c_two._native import NativeRelay

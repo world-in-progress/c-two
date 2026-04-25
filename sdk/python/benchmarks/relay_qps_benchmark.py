@@ -14,8 +14,9 @@ import subprocess
 import sys
 import time
 import pickle
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import c_two as cc
 from c_two._native import NativeRelay

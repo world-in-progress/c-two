@@ -1,6 +1,5 @@
 """Start NativeRelay for external benchmarking. Runs until killed."""
-import signal, time, sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import signal, time, sys
 from c_two._native import NativeRelay
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 19985

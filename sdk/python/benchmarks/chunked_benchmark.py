@@ -4,7 +4,7 @@ Compares latency and throughput across payload sizes from 4 KB to 1 GB,
 covering both the normal path and the chunked path.
 
 Usage:
-    uv run python benchmarks/chunked_benchmark.py [--max-mb 512]
+    uv run python sdk/python/benchmarks/chunked_benchmark.py [--max-mb 512]
 """
 
 from __future__ import annotations

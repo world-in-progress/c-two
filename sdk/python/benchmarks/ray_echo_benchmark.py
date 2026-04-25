@@ -10,7 +10,7 @@ Ray wraps a `@ray.remote` EchoActor to parallel C-Two's CRM + connect model.
 NOTE: Ray does not run on free-threaded CPython 3.14t. Run this script with
 stock Python 3.12:
 
-    /tmp/ray_bench_env/bin/python benchmarks/ray_echo_benchmark.py
+    /tmp/ray_bench_env/bin/python sdk/python/benchmarks/ray_echo_benchmark.py
 """
 from __future__ import annotations
 
