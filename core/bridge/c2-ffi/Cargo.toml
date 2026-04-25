@@ -14,6 +14,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 c2-config = { path = "../../foundation/c2-config" }
+c2-error = { path = "../../foundation/c2-error" }
 c2-mem = { path = "../../foundation/c2-mem" }
 c2-wire = { path = "../../protocol/c2-wire" }
 c2-http = { path = "../../transport/c2-http", features = ["relay"] }

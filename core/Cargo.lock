@@ -158,10 +158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "c2-error"
+version = "0.1.0"
+
+[[package]]
 name = "c2-ffi"
 version = "0.1.0"
 dependencies = [
  "c2-config",
+ "c2-error",
  "c2-http",
  "c2-ipc",
  "c2-mem",
@@ -180,6 +185,7 @@ dependencies = [
  "anyhow",
  "axum",
  "c2-config",
+ "c2-error",
  "c2-ipc",
  "c2-wire",
  "clap",

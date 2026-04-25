@@ -4,6 +4,7 @@ from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
     ResourceDeserializeInput, ResourceSerializeOutput, ResourceExecuteFunction,
     ClientSerializeInput, ClientDeserializeOutput, ClientCallResource,
+    ResourceAlreadyRegistered, StaleResource, WriteConflict,
 )
 
 
@@ -16,9 +17,12 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING == 5
         assert ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING == 6
         assert ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE == 7
+        assert ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED == 703
+        assert ERROR_Code.ERROR_STALE_RESOURCE == 704
+        assert ERROR_Code.ERROR_WRITE_CONFLICT == 706
 
-    def test_has_exactly_10_members(self):
-        assert len(ERROR_Code) == 10
+    def test_has_exactly_13_members(self):
+        assert len(ERROR_Code) == 13
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -99,6 +103,28 @@ class TestCCErrorSerialization:
         assert restored.code == ERROR_Code.ERROR_UNKNOWN
         assert restored.message == original.message
 
+    def test_unknown_numeric_code_deserializes_to_unknown_with_context(self):
+        restored = CCError.deserialize(memoryview(b"9999:low-level relay failure"))
+        assert restored is not None
+        assert type(restored) is CCError
+        assert restored.code == ERROR_Code.ERROR_UNKNOWN
+        assert restored.message == "Unknown error code 9999: low-level relay failure"
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_fragment"),
+        [
+            (b"abc:not a number", "Malformed error payload"),
+            (b"3", "Malformed error payload"),
+            (b"\xff", "Malformed error payload"),
+        ],
+    )
+    def test_malformed_payload_deserializes_to_unknown(self, payload, expected_fragment):
+        restored = CCError.deserialize(memoryview(payload))
+        assert restored is not None
+        assert type(restored) is CCError
+        assert restored.code == ERROR_Code.ERROR_UNKNOWN
+        assert expected_fragment in restored.message
+
 
 SUBCLASS_PARAMS = [
     (ResourceDeserializeInput,   ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING,    'deserializing input at resource'),
@@ -166,6 +192,28 @@ class TestSubclassDeserialization:
         assert result.code == ERROR_Code.ERROR_UNKNOWN
         assert result.message == 'generic'
 
+    def test_resource_already_registered_round_trip(self):
+        original = ResourceAlreadyRegistered("Route name already registered: 'grid'")
+        data = CCError.serialize(original)
+        result = CCError.deserialize(memoryview(data))
+        assert isinstance(result, ResourceAlreadyRegistered)
+        assert result.code == ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED
+        assert result.message == "Route name already registered: 'grid'"
+
+    def test_future_mesh_errors_round_trip(self):
+        stale = StaleResource("grid stale")
+        conflict = WriteConflict("grid write conflict")
+
+        stale_result = CCError.deserialize(memoryview(CCError.serialize(stale)))
+        conflict_result = CCError.deserialize(memoryview(CCError.serialize(conflict)))
+
+        assert isinstance(stale_result, StaleResource)
+        assert stale_result.code == ERROR_Code.ERROR_STALE_RESOURCE
+        assert stale_result.message == "grid stale"
+        assert isinstance(conflict_result, WriteConflict)
+        assert conflict_result.code == ERROR_Code.ERROR_WRITE_CONFLICT
+        assert conflict_result.message == "grid write conflict"
+
     @pytest.mark.parametrize("subclass", ALL_SUBCLASSES, ids=lambda c: c.__name__)
     def test_none_message_produces_description(self, subclass):
         err = subclass(message=None)
@@ -182,3 +230,29 @@ class TestErrorCodeToClass:
         assert type(result) is CCError
         assert result.code == ERROR_Code.ERROR_UNKNOWN
         assert result.message == 'some message'
+
+
+class TestNativeErrorRegistryParity:
+    def test_python_error_codes_match_native_registry(self):
+        from c_two import _native
+
+        native = _native.error_registry()
+        python_codes = {code.name.removeprefix("ERROR_"): code.value for code in ERROR_Code}
+        expected_python_names = {
+            "UNKNOWN": "Unknown",
+            "AT_RESOURCE_INPUT_DESERIALIZING": "ResourceInputDeserializing",
+            "AT_RESOURCE_OUTPUT_SERIALIZING": "ResourceOutputSerializing",
+            "AT_RESOURCE_FUNCTION_EXECUTING": "ResourceFunctionExecuting",
+            "AT_CLIENT_INPUT_SERIALIZING": "ClientInputSerializing",
+            "AT_CLIENT_OUTPUT_DESERIALIZING": "ClientOutputDeserializing",
+            "AT_CLIENT_CALLING_RESOURCE": "ClientCallingResource",
+            "RESOURCE_NOT_FOUND": "ResourceNotFound",
+            "RESOURCE_UNAVAILABLE": "ResourceUnavailable",
+            "RESOURCE_ALREADY_REGISTERED": "ResourceAlreadyRegistered",
+            "STALE_RESOURCE": "StaleResource",
+            "REGISTRY_UNAVAILABLE": "RegistryUnavailable",
+            "WRITE_CONFLICT": "WriteConflict",
+        }
+        assert set(expected_python_names.values()) == set(native)
+        for python_name, native_name in expected_python_names.items():
+            assert python_codes[python_name] == native[native_name]

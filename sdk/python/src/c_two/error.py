@@ -12,7 +12,10 @@ class ERROR_Code(IntEnum):
     ERROR_AT_CLIENT_CALLING_RESOURCE        = 7
     ERROR_RESOURCE_NOT_FOUND                = 701
     ERROR_RESOURCE_UNAVAILABLE              = 702
+    ERROR_RESOURCE_ALREADY_REGISTERED       = 703
+    ERROR_STALE_RESOURCE                    = 704
     ERROR_REGISTRY_UNAVAILABLE              = 705
+    ERROR_WRITE_CONFLICT                    = 706
 
 class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
@@ -66,11 +69,36 @@ class CCError(CCBaseError):
         if not data:
             return None
 
-        parts = data.tobytes().decode('utf-8').split(':', 1)
-        code_value = int(parts[0])
-        message = parts[1] if len(parts) > 1 else None
+        raw_bytes = data.tobytes()
+        try:
+            raw = raw_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return CCError(
+                code=ERROR_Code.ERROR_UNKNOWN,
+                message=f'Malformed error payload: invalid UTF-8 ({raw_bytes!r})',
+            )
+
+        parts = raw.split(':', 1)
+        if len(parts) != 2:
+            return CCError(
+                code=ERROR_Code.ERROR_UNKNOWN,
+                message=f'Malformed error payload: missing ":" separator ({raw!r})',
+            )
+
+        code_raw, message = parts
+        try:
+            code_value = int(code_raw)
+        except ValueError:
+            return CCError(
+                code=ERROR_Code.ERROR_UNKNOWN,
+                message=f'Malformed error payload: invalid code {code_raw!r}: {message}',
+            )
         
-        code = ERROR_Code(code_value)
+        try:
+            code = ERROR_Code(code_value)
+        except ValueError:
+            code = ERROR_Code.ERROR_UNKNOWN
+            message = f'Unknown error code {code_value}: {message or ""}'
         subclass = _CODE_TO_CLASS.get(code, CCError)
         obj = Exception.__new__(subclass)
         obj.code = code
@@ -124,12 +152,36 @@ class ResourceUnavailable(CCError):
             msg = f'{msg}: {detail}'
         super().__init__(code=ERROR_Code.ERROR_RESOURCE_UNAVAILABLE, message=msg)
 
+class ResourceAlreadyRegistered(CCError):
+    """Raised when a relay rejects duplicate registration for a resource name."""
+    ERROR_CODE = 703
+
+    def __init__(self, message: str | None = None):
+        super().__init__(
+            code=ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED,
+            message=message or 'Resource already registered',
+        )
+
+class StaleResource(CCError):
+    """Raised when a stale resource cannot serve a read under the active policy."""
+    ERROR_CODE = 704
+
+    def __init__(self, message: str | None = None):
+        super().__init__(code=ERROR_Code.ERROR_STALE_RESOURCE, message=message or 'Stale resource')
+
 class RegistryUnavailable(CCError):
     """Raised when no relay is available for name resolution."""
     ERROR_CODE = 705
 
     def __init__(self, message: str | None = None):
         super().__init__(code=ERROR_Code.ERROR_REGISTRY_UNAVAILABLE, message=message or 'Registry unavailable')
+
+class WriteConflict(CCError):
+    """Raised when a write cannot acquire the required resource coordination."""
+    ERROR_CODE = 706
+
+    def __init__(self, message: str | None = None):
+        super().__init__(code=ERROR_Code.ERROR_WRITE_CONFLICT, message=message or 'Write conflict')
 
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
@@ -140,5 +192,8 @@ _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE:      ClientCallResource,
     ERROR_Code.ERROR_RESOURCE_NOT_FOUND:               ResourceNotFound,
     ERROR_Code.ERROR_RESOURCE_UNAVAILABLE:             ResourceUnavailable,
+    ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED:      ResourceAlreadyRegistered,
+    ERROR_Code.ERROR_STALE_RESOURCE:                   StaleResource,
     ERROR_Code.ERROR_REGISTRY_UNAVAILABLE:             RegistryUnavailable,
+    ERROR_Code.ERROR_WRITE_CONFLICT:                   WriteConflict,
 }

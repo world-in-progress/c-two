@@ -643,9 +643,10 @@ cc.register(IGrid, grid, name='grid', consistency='coordinate')
 |-------|------|-------------|
 | `ResourceNotFound` | 701 | `cc.connect(name)` finds no route in registry |
 | `ResourceUnavailable` | 702 | Route exists but target relay is unreachable |
-| `WriteConflict` | 703 | Concurrent write to replicated resource (Phase 2) |
+| `ResourceAlreadyRegistered` | 703 | Relay-backed duplicate resource registration is rejected |
 | `StaleResource` | 704 | Read from stale replica with `refuse` policy (Phase 2) |
 | `RegistryUnavailable` | 705 | No relay configured and no local match |
+| `WriteConflict` | 706 | Concurrent write to replicated resource (Phase 2) |
 
 All errors follow fast-fail semantics (no automatic retry at the C-Two level). Clients handle retries explicitly.
 

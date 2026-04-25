@@ -23,12 +23,56 @@ use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::RelayState;
 
+/// Errors from the embeddable relay control API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayControlError {
+    DuplicateRoute { name: String },
+    Other(String),
+}
+
+impl std::fmt::Display for RelayControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelayControlError::DuplicateRoute { name } => {
+                write!(f, "Route name already registered: '{name}'")
+            }
+            RelayControlError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RelayControlError {}
+
+impl RelayControlError {
+    pub fn to_c2_error(&self) -> c2_error::C2Error {
+        match self {
+            RelayControlError::DuplicateRoute { .. } => c2_error::C2Error::new(
+                c2_error::ErrorCode::ResourceAlreadyRegistered,
+                self.to_string(),
+            ),
+            RelayControlError::Other(message) => c2_error::C2Error::unknown(message.clone()),
+        }
+    }
+}
+
+impl From<String> for RelayControlError {
+    fn from(message: String) -> Self {
+        RelayControlError::Other(message)
+    }
+}
+
+impl From<&str> for RelayControlError {
+    fn from(message: &str) -> Self {
+        RelayControlError::Other(message.to_string())
+    }
+}
+
 /// Commands sent from the sync API to the async runtime.
 enum Command {
     RegisterUpstream {
         name: String,
         address: String,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), RelayControlError>>,
     },
     UnregisterUpstream {
         name: String,
@@ -99,16 +143,17 @@ impl RelayServer {
     }
 
     /// Register a new upstream IPC connection.
-    pub fn register_upstream(&self, name: &str, address: &str) -> Result<(), String> {
+    pub fn register_upstream(&self, name: &str, address: &str) -> Result<(), RelayControlError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send_cmd(Command::RegisterUpstream {
             name: name.to_string(),
             address: address.to_string(),
             reply: reply_tx,
-        })?;
+        })
+        .map_err(RelayControlError::Other)?;
         reply_rx
             .blocking_recv()
-            .map_err(|_| "Relay thread dropped".to_string())?
+            .map_err(|_| RelayControlError::Other("Relay thread dropped".to_string()))?
     }
 
     /// Unregister an upstream by name.
@@ -293,7 +338,7 @@ impl RelayServer {
             match cmd {
                 Command::RegisterUpstream { name, address, reply } => {
                     if state.has_local_route(&name) {
-                        let _ = reply.send(Err(format!("Route name already registered: '{name}'")));
+                        let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
                         continue;
                     }
                     let mut client = IpcClient::new(&address);
@@ -302,7 +347,7 @@ impl RelayServer {
                             state.register_upstream(name, address, String::new(), String::new(), Arc::new(client));
                             Ok(())
                         }
-                        Err(e) => Err(format!("Failed to connect: {e}")),
+                        Err(e) => Err(RelayControlError::Other(format!("Failed to connect: {e}"))),
                     };
                     let _ = reply.send(result);
                 }
@@ -344,5 +389,36 @@ impl RelayServer {
 impl Drop for RelayServer {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RelayControlError;
+
+    #[test]
+    fn duplicate_route_error_has_stable_variant_and_message() {
+        let err = RelayControlError::DuplicateRoute {
+            name: "grid".to_string(),
+        };
+
+        assert_eq!(
+            err,
+            RelayControlError::DuplicateRoute {
+                name: "grid".to_string(),
+            },
+        );
+        assert_eq!(err.to_string(), "Route name already registered: 'grid'");
+    }
+
+    #[test]
+    fn duplicate_route_error_maps_to_c2_error() {
+        let err = RelayControlError::DuplicateRoute {
+            name: "grid".to_string(),
+        };
+        let c2 = err.to_c2_error();
+
+        assert_eq!(c2.code, c2_error::ErrorCode::ResourceAlreadyRegistered);
+        assert_eq!(c2.message, "Route name already registered: 'grid'");
     }
 }

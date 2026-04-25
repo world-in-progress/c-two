@@ -12,14 +12,38 @@ use parking_lot::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyType};
 
-use c2_http::relay::server::RelayServer;
+use c2_http::relay::server::{RelayControlError, RelayServer};
 use c2_config::RelayConfig;
 
 struct ServerState {
     config: RelayConfig,
     server: Option<RelayServer>,
+}
+
+fn resource_already_registered_err(py: Python<'_>, message: String) -> PyErr {
+    let cls_obj = match py
+        .import("c_two.error")
+        .and_then(|module| module.getattr("ResourceAlreadyRegistered"))
+    {
+        Ok(cls_obj) => cls_obj,
+        Err(_) => return PyRuntimeError::new_err(message),
+    };
+    let cls = match cls_obj.cast_into::<PyType>() {
+        Ok(cls) => cls,
+        Err(_) => return PyRuntimeError::new_err(message),
+    };
+    PyErr::from_type(cls, message)
+}
+
+fn register_upstream_err(py: Python<'_>, err: RelayControlError) -> PyErr {
+    match err {
+        RelayControlError::DuplicateRoute { .. } => {
+            resource_already_registered_err(py, err.to_string())
+        }
+        RelayControlError::Other(message) => PyRuntimeError::new_err(message),
+    }
 }
 
 /// An embedded HTTP relay server backed by Rust (axum + tokio).
@@ -120,7 +144,7 @@ impl PyNativeRelay {
                 .ok_or_else(|| "Relay is not running".to_string())?;
             server.register_upstream(&name, &address)
         })
-        .map_err(|e| PyRuntimeError::new_err(e))
+        .map_err(|e| register_upstream_err(py, e))
     }
 
     /// Remove a registered upstream.

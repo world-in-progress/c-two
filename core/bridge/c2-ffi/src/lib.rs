@@ -12,6 +12,8 @@
 #[cfg(feature = "python")]
 mod client_ffi;
 #[cfg(feature = "python")]
+mod error_ffi;
+#[cfg(feature = "python")]
 mod http_ffi;
 #[cfg(feature = "python")]
 mod mem_ffi;
@@ -34,6 +36,7 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 #[pymodule(name = "_native", gil_used = false)]
 fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    error_ffi::register_module(m)?;
     client_ffi::register_module(m)?;
     http_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;

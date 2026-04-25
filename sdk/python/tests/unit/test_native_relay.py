@@ -6,6 +6,7 @@ import time
 import pytest
 
 from c_two._native import NativeRelay
+from c_two.error import ResourceAlreadyRegistered
 
 
 class TestNativeRelayLifecycle:
@@ -80,6 +81,30 @@ class TestNativeRelayUpstreamErrors:
                 relay.register_upstream('bad', 'ipc://nonexistent_server_xyz')
         finally:
             relay.stop()
+
+    def test_register_duplicate_upstream_raises_resource_already_registered(self):
+        import c_two as cc
+        from c_two.transport.registry import _ProcessRegistry
+        from tests.fixtures.hello import HelloImpl
+        from tests.fixtures.ihello import Hello
+
+        _ProcessRegistry.reset()
+
+        try:
+            cc.register(Hello, HelloImpl(), name='hello')
+            ipc_addr = cc.server_address()
+
+            relay = NativeRelay('127.0.0.1:19912')
+            relay.start()
+            try:
+                relay.register_upstream('hello', ipc_addr)
+                with pytest.raises(ResourceAlreadyRegistered, match='already registered'):
+                    relay.register_upstream('hello', ipc_addr)
+            finally:
+                relay.stop()
+        finally:
+            cc.shutdown()
+            _ProcessRegistry.reset()
 
 
 class TestNativeRelayWithServer:

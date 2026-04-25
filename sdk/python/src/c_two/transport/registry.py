@@ -82,7 +82,12 @@ def _relay_urlopen(req, timeout: float = 5.0):
 
 from c_two.config.ipc import ServerIPCConfig, ClientIPCConfig, build_server_config, build_client_config
 from c_two.config.settings import settings
-from c_two.error import ResourceNotFound, ResourceUnavailable, RegistryUnavailable
+from c_two.error import (
+    ResourceAlreadyRegistered,
+    ResourceNotFound,
+    ResourceUnavailable,
+    RegistryUnavailable,
+)
 from .client.proxy import CRMProxy
 from .server.scheduler import ConcurrencyConfig, Scheduler
 from .server.native import NativeServerBridge as Server
@@ -727,7 +732,7 @@ class _ProcessRegistry:
                     )
             except urllib.error.HTTPError as e:
                 if e.code == 409:
-                    raise RuntimeError(
+                    raise ResourceAlreadyRegistered(
                         f'Route name already registered with relay: {name!r}',
                     ) from e
                 if e.code < 500:

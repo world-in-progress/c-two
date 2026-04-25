@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "foundation/c2-config",
+    "foundation/c2-error",
     "foundation/c2-mem",
     "protocol/c2-wire",
     "transport/c2-ipc",

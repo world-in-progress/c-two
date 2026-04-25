@@ -17,6 +17,7 @@ import pytest
 
 import c_two as cc
 from c_two._native import NativeRelay
+from c_two.error import ResourceAlreadyRegistered
 from c_two.transport.registry import _ProcessRegistry
 from c_two.transport.client.proxy import CRMProxy
 
@@ -304,9 +305,9 @@ class TestErrors:
         with patch.object(
             registry,
             '_relay_register',
-            side_effect=RuntimeError("Route name already registered: 'hello'"),
+            side_effect=ResourceAlreadyRegistered("Route name already registered: 'hello'"),
         ):
-            with pytest.raises(RuntimeError, match='already registered'):
+            with pytest.raises(ResourceAlreadyRegistered, match='already registered'):
                 cc.register(Hello, HelloImpl(), name='hello')
 
         assert 'hello' not in registry.names
@@ -325,7 +326,7 @@ class TestErrors:
 
             first.register(Hello, HelloImpl(), name='hello')
 
-            with pytest.raises(RuntimeError, match='already registered'):
+            with pytest.raises(ResourceAlreadyRegistered, match='already registered'):
                 second.register(Hello, HelloImpl(), name='hello')
 
             assert second.names == []
