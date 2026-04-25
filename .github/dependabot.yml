@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: "cargo"
-    directory: "/src/c_two/_native"
+    directory: "/core"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
@@ -14,6 +14,13 @@ updates:
 
   - package-ecosystem: "pip"
     directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    rebase-strategy: "disabled"
+
+  - package-ecosystem: "pip"
+    directory: "/sdk/python"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

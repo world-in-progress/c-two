@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
         with:
-          workspaces: src/c_two/_native -> target
+          workspaces: core -> target
 
       - uses: astral-sh/setup-uv@v6
         if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
@@ -46,6 +46,6 @@ jobs:
 
       - name: Run tests
         if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
-        run: uv run pytest tests/ -q --timeout=30
+        run: uv run pytest sdk/python/tests -q --timeout=30
         env:
           C2_RELAY_ADDRESS: ""
