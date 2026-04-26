@@ -1,0 +1,165 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="920" viewBox="0 0 1600 920" role="img" aria-labelledby="title desc">
+  <title id="title">C-Two architecture</title>
+  <desc id="desc">A clean architecture diagram for C-Two showing CRM contract, resource runtime, application runtime, transport paths, relay mesh, and Rust native core.</desc>
+  <defs>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#263b45"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#c9561e"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#057fa8"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#24743a"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfaf7; }
+      .band-interface { fill: #ff9393; }
+      .band-resource { fill: #dff4fb; }
+      .band-app { fill: #d3f2c5; }
+      .band-native { fill: #f8e3d4; }
+      .divider { stroke: #58727c; stroke-width: 2.5; stroke-dasharray: 10 10; opacity: 0.55; }
+      .card { fill: #ffffff; stroke: #263b45; stroke-width: 3; }
+      .card-dashed { fill: rgba(255,255,255,0.62); stroke: #263b45; stroke-width: 3; stroke-dasharray: 12 8; }
+      .card-orange { fill: #ffffff; stroke: #c9561e; stroke-width: 3.5; }
+      .card-blue { fill: #ffffff; stroke: #057fa8; stroke-width: 3.5; }
+      .card-green { fill: #ffffff; stroke: #24743a; stroke-width: 3.5; }
+      .native { fill: #fffaf7; stroke: #9a5a38; stroke-width: 2.5; }
+      .title { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 46px; font-weight: 800; fill: #101827; letter-spacing: 0; }
+      .subtitle { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 18px; font-weight: 500; fill: #182b34; letter-spacing: 0; }
+      .section { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 32px; font-weight: 800; fill: #101827; letter-spacing: 0; }
+      .h { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 23px; font-weight: 800; fill: #101827; letter-spacing: 0; }
+      .body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; font-weight: 500; fill: #283a43; letter-spacing: 0; }
+      .small { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; fill: #344852; letter-spacing: 0; }
+      .code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 15px; font-weight: 700; fill: #283a43; letter-spacing: 0; }
+      .label { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; font-weight: 800; fill: #344852; letter-spacing: 0; }
+      .orange { fill: #c9561e; }
+      .blue { fill: #057fa8; }
+      .green { fill: #24743a; }
+      .line { fill: none; stroke: #263b45; stroke-width: 3; marker-end: url(#arrow-slate); }
+      .line-orange { fill: none; stroke: #c9561e; stroke-width: 3.5; marker-end: url(#arrow-orange); }
+      .line-blue { fill: none; stroke: #057fa8; stroke-width: 3.5; marker-end: url(#arrow-blue); }
+      .line-green { fill: none; stroke: #24743a; stroke-width: 3.5; marker-end: url(#arrow-green); }
+      .line-thin { fill: none; stroke: #425966; stroke-width: 2.5; }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="920"/>
+  <rect class="band-interface" x="0" y="0" width="1600" height="200"/>
+  <rect class="band-resource" x="0" y="200" width="800" height="510"/>
+  <rect class="band-app" x="800" y="200" width="800" height="510"/>
+  <rect class="band-native" x="0" y="710" width="1600" height="210"/>
+  <line class="divider" x1="800" y1="200" x2="800" y2="710"/>
+
+  <text class="title" x="48" y="62">C-Two Architecture</text>
+  <text class="subtitle" x="50" y="94">One CRM contract, local / IPC / HTTP execution paths.</text>
+
+  <rect class="card" x="505" y="32" width="590" height="120" rx="14"/>
+  <text class="h orange" x="800" y="72" text-anchor="middle">CRM Contract / Interface</text>
+  <text class="code" x="800" y="102" text-anchor="middle">@cc.crm()  +  @cc.read / @cc.write</text>
+  <text class="body" x="800" y="128" text-anchor="middle">method contract, transfer metadata, concurrency intent</text>
+
+  <rect class="card" x="130" y="124" width="220" height="48" rx="24"/>
+  <text class="code" x="240" y="153" text-anchor="middle">@transferable</text>
+  <line class="line-thin dash" x1="350" y1="148" x2="505" y2="148"/>
+  <rect class="card" x="1250" y="124" width="220" height="48" rx="24"/>
+  <text class="code" x="1360" y="153" text-anchor="middle">from_buffer / hold</text>
+  <line class="line-thin dash" x1="1095" y1="148" x2="1250" y2="148"/>
+
+  <text class="section" x="48" y="248">Resource Runtime</text>
+  <text class="section" x="848" y="248">Application Runtime</text>
+
+  <rect class="card-dashed" x="54" y="292" width="260" height="124" rx="14"/>
+  <text class="h orange" x="184" y="329" text-anchor="middle">Resource Object</text>
+  <text class="body" x="184" y="357" text-anchor="middle">plain Python state</text>
+  <text class="body" x="184" y="382" text-anchor="middle">domain methods</text>
+  <text class="small" x="184" y="406" text-anchor="middle">not framework-owned</text>
+
+  <rect class="card-orange" x="432" y="292" width="260" height="124" rx="14"/>
+  <text class="h orange" x="562" y="329" text-anchor="middle">Process Registry</text>
+  <text class="code" x="562" y="357" text-anchor="middle">cc.register(name)</text>
+  <text class="body" x="562" y="382" text-anchor="middle">lazy server start</text>
+  <text class="small" x="562" y="406" text-anchor="middle">relay registration when configured</text>
+
+  <rect class="card-orange" x="432" y="494" width="260" height="124" rx="14"/>
+  <text class="h orange" x="562" y="531" text-anchor="middle">NativeServerBridge</text>
+  <text class="body" x="562" y="559" text-anchor="middle">CRMSlot + MethodTable</text>
+  <text class="body" x="562" y="584" text-anchor="middle">Scheduler + HoldRegistry</text>
+  <text class="code" x="562" y="608" text-anchor="middle">Python dispatch</text>
+
+  <rect class="card" x="94" y="572" width="220" height="54" rx="12"/>
+  <text class="h orange" x="204" y="606" text-anchor="middle">thread://</text>
+
+  <rect class="card" x="545" y="640" width="190" height="60" rx="12"/>
+  <text class="h blue" x="640" y="672" text-anchor="middle">RustServer</text>
+  <text class="small" x="640" y="692" text-anchor="middle">UDS endpoint</text>
+
+  <rect class="card-dashed" x="1286" y="292" width="260" height="124" rx="14"/>
+  <text class="h green" x="1416" y="329" text-anchor="middle">Application Code</text>
+  <text class="body" x="1416" y="357" text-anchor="middle">script / function</text>
+  <text class="body" x="1416" y="382" text-anchor="middle">scientific workflow</text>
+  <text class="small" x="1416" y="406" text-anchor="middle">location-transparent calls</text>
+
+  <rect class="card-blue" x="908" y="292" width="260" height="124" rx="14"/>
+  <text class="h blue" x="1038" y="329" text-anchor="middle">Typed CRM Proxy</text>
+  <text class="code" x="1038" y="357" text-anchor="middle">cc.connect(name)</text>
+  <text class="body" x="1038" y="382" text-anchor="middle">same Python API</text>
+  <text class="small" x="1038" y="406" text-anchor="middle">thread / ipc / http modes</text>
+
+  <rect class="card-blue" x="908" y="494" width="260" height="124" rx="14"/>
+  <text class="h blue" x="1038" y="531" text-anchor="middle">IPC Client Pool</text>
+  <text class="body" x="1038" y="559" text-anchor="middle">RustClientPool</text>
+  <text class="body" x="1038" y="584" text-anchor="middle">UDS connection reuse</text>
+  <text class="code" x="1038" y="608" text-anchor="middle">ipc:///path</text>
+
+  <rect class="card-green" x="1286" y="494" width="260" height="124" rx="14"/>
+  <text class="h green" x="1416" y="531" text-anchor="middle">HTTP Client Pool</text>
+  <text class="body" x="1416" y="559" text-anchor="middle">RustHttpClientPool</text>
+  <text class="body" x="1416" y="584" text-anchor="middle">relay route resolution</text>
+  <text class="code" x="1416" y="608" text-anchor="middle">http://relay</text>
+
+  <rect class="card-green" x="1020" y="640" width="350" height="60" rx="12"/>
+  <text class="h green" x="1195" y="672" text-anchor="middle">NativeRelay / Relay Mesh</text>
+  <text class="small" x="1195" y="692" text-anchor="middle">RouteTable, peer gossip, HTTP to IPC bridge</text>
+
+  <line class="line-orange" x1="314" y1="354" x2="422" y2="354"/>
+  <line class="line-orange" x1="562" y1="416" x2="562" y2="484"/>
+  <line class="line-orange" x1="204" y1="416" x2="204" y2="562"/>
+  <line class="line-blue" x1="1038" y1="416" x2="1038" y2="484"/>
+  <line class="line-green" x1="1286" y1="354" x2="1178" y2="354"/>
+  <line class="line-green" x1="1416" y1="494" x2="1416" y2="426"/>
+  <line class="line-green" x1="1416" y1="618" x2="1416" y2="670"/>
+  <line class="line-blue" x1="908" y1="556" x2="735" y2="556"/>
+  <line class="line-orange" x1="692" y1="556" x2="898" y2="556"/>
+  <line class="line-blue" x1="1038" y1="618" x2="1038" y2="670"/>
+
+  <text class="label" x="800" y="534" text-anchor="middle">UDS control plane</text>
+  <text class="label" x="1227" y="534" text-anchor="middle">HTTP</text>
+  <text class="label" x="800" y="584" text-anchor="middle">SHM data plane</text>
+
+  <text class="section" x="48" y="765">Rust Native Core</text>
+
+  <rect class="native" x="54" y="800" width="132" height="46" rx="11"/>
+  <text class="code" x="120" y="829" text-anchor="middle">c2-config</text>
+  <rect class="native" x="54" y="858" width="132" height="46" rx="11"/>
+  <text class="code" x="120" y="887" text-anchor="middle">c2-mem</text>
+  <rect class="native" x="202" y="800" width="108" height="46" rx="11"/>
+  <text class="code" x="256" y="829" text-anchor="middle">c2-wire</text>
+  <rect class="native" x="202" y="858" width="108" height="46" rx="11"/>
+  <text class="code" x="256" y="887" text-anchor="middle">c2-ffi</text>
+
+  <rect class="card" x="410" y="782" width="780" height="104" rx="16"/>
+  <text class="h" x="800" y="820" text-anchor="middle">Control Plane / Data Plane Split</text>
+  <text class="body" x="800" y="850" text-anchor="middle">UDS frames carry routes, method indexes, heartbeats, and lifecycle signals.</text>
+  <text class="body" x="800" y="874" text-anchor="middle">Large payloads use shared memory: buddy segments, dedicated segments, file spill, and chunks.</text>
+
+  <rect class="native" x="1282" y="800" width="106" height="46" rx="11"/>
+  <text class="code" x="1335" y="829" text-anchor="middle">c2-ipc</text>
+  <rect class="native" x="1282" y="858" width="106" height="46" rx="11"/>
+  <text class="code" x="1335" y="887" text-anchor="middle">c2-http</text>
+  <rect class="native" x="1406" y="800" width="130" height="46" rx="11"/>
+  <text class="code" x="1471" y="829" text-anchor="middle">c2-server</text>
+</svg>
