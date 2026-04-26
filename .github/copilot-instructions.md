@@ -21,49 +21,50 @@ uv sync
 uv sync --reinstall-package c-two
 
 # Run the full test suite (C2_RELAY_ADDRESS= avoids env interference)
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Run a single test file
-uv run pytest tests/unit/test_encoding.py -q
+uv run pytest sdk/python/tests/unit/test_wire.py -q
 
 # Run a single test class or function
-uv run pytest tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
+uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 
 # Rust type-check (no PyO3 link needed)
-cd src/c_two/_native && cargo check --workspace
+cd core && cargo check --workspace
 
 # Rust unit tests (pure Rust, no Python linkage)
-cd src/c_two/_native && cargo test -p c2-mem -p c2-wire
+cd core && cargo test -p c2-mem -p c2-wire
 
 # Note: c2-ffi tests need Python linkage — use `cargo check` not `cargo test`
 
 # Run example (single-process, thread preference)
-uv run python examples/local.py
+uv run python examples/python/local.py
 
 # Run IPC example (two terminals)
-uv run python examples/crm_process.py    # terminal 1: server
-uv run python examples/client.py         # terminal 2: client
+uv run python examples/python/crm_process.py    # terminal 1: server
+uv run python examples/python/client.py <address>  # terminal 2: client
 
 # Run relay mesh example (three terminals)
-c3 relay -b 0.0.0.0:8300                          # terminal 1: relay
-uv run python examples/relay_mesh/resource.py      # terminal 2: CRM server
-uv run python examples/relay_mesh/client.py        # terminal 3: client
+python tools/dev/c3_tool.py --build --link                 # one-time source checkout setup
+c3 relay -b 0.0.0.0:8300                                 # terminal 1: relay
+uv run python examples/python/relay_mesh/resource.py      # terminal 2: CRM server
+uv run python examples/python/relay_mesh/client.py        # terminal 3: client
 
 # Install examples dependencies (pandas, pyarrow — needed for grid example)
 uv sync --group examples
 
 # CLI tool
 c3 --version
-c3 relay --upstream ipc://my_server --bind 0.0.0.0:8080
+c3 relay --upstream grid=ipc://my_server --bind 0.0.0.0:8080
 ```
 
-Tests use **pytest** with a 30-second per-test timeout. Tests live under `tests/unit/` and `tests/integration/`, with shared fixtures in `tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource).
+Tests use **pytest** with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures in `sdk/python/tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource).
 
 ## Architecture
 
 Two-language design: Python owns domain logic (CRM + Resource + client code); Rust owns transport, memory, and wire codec. PyO3/maturin bridges them as `c_two._native`.
 
-### 1. CRM Layer (`src/c_two/crm/`)
+### 1. CRM Layer (`sdk/python/src/c_two/crm/`)
 - **CRM contract**: An interface class decorated with `@cc.crm(namespace='...', version='...')` that declares which methods are remotely accessible. Only methods in the contract are exposed. Method bodies are `...` (ellipsis).
 - **Resource**: A plain Python class implementing a CRM contract — holds state and domain logic. Not decorated. Name it by domain semantics (`NestedGrid`, `PostgresVectorLayer`), never by the contract name.
 - **`@transferable`**: Decorator for custom data types that need to cross the wire. Automatically makes classes into dataclasses and registers `serialize`/`deserialize`/`from_buffer` as static methods. Without `@transferable`, pickle is used as fallback.
@@ -77,7 +78,7 @@ Two-language design: Python owns domain logic (CRM + Resource + client code); Ru
 - The proxy supports `with`: `with cc.connect(Grid, name='grid') as g: ...` auto-closes on exit.
 - There is no separate `compo/` module, no `@cc.runtime.connect` decorator, and no "Component" type.
 
-### 3. Config Layer (`src/c_two/config/`)
+### 3. Config Layer (`sdk/python/src/c_two/config/`)
 
 Unified configuration with Python as the single source of truth, passed through to Rust via FFI.
 
@@ -88,7 +89,7 @@ Unified configuration with Python as the single source of truth, passed through 
 
 Config priority chain: explicit kwargs (`cc.set_*()`) → environment variables / `.env` → class defaults.
 
-### 4. Transport Layer (`src/c_two/transport/`)
+### 4. Transport Layer (`sdk/python/src/c_two/transport/`)
 
 The transport layer is a thin Python orchestration shell around a Rust-native core. Python handles CRM registration, scheduling, and serialization; Rust handles IPC, wire framing, SHM, and HTTP relay.
 
@@ -115,7 +116,7 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 
 **Relay priority:** `cc.set_relay()` > `C2_RELAY_ADDRESS` env var > none (standalone mode).
 
-### 5. Rust Native Layer (`src/c_two/_native/`)
+### 5. Rust Native Layer (`core/`)
 
 A Cargo workspace of 7 crates organized in 4 layers, compiled into a single `c_two._native` Python extension module:
 
@@ -136,10 +137,13 @@ A Cargo workspace of 7 crates organized in 4 layers, compiled into a single `c_t
 
 **Import:** `from c_two.mem import MemPool, PoolConfig, MemHandle, ChunkAssembler`
 
-### CLI (`src/c_two/cli.py`)
-The `c3` CLI provides `relay` (HTTP relay server) and `dev` (developer tools) commands.
+### CLI
+The `c3` command is implemented by the root `cli/` Rust package. Python does
+not own CLI behavior. For source-checkout development, use
+`python tools/dev/c3_tool.py --build --link` to build and link a local `c3`.
+Do not add CLI command behavior under `sdk/python/src/c_two`.
 
-**`c3 relay`** options (all support env vars via `C2Settings` / `.env`):
+**`c3 relay`** options:
 
 | Option | Env var | Default | Purpose |
 |--------|---------|---------|---------|
@@ -148,8 +152,6 @@ The `c3` CLI provides `relay` (HTTP relay server) and `dev` (developer tools) co
 | `--relay-id` | `C2_RELAY_ID` | auto UUID | Stable relay identifier |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | `""` | Publicly reachable URL for peers |
 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `300` | IPC idle disconnect timeout (seconds) |
-
-Priority: CLI flag → env var / `.env` → hardcoded default.
 
 ## Key Conventions
 

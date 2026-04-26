@@ -16,7 +16,7 @@ from pathlib import Path
 
 from packaging.version import Version
 
-PYPROJECT_PATH = str(Path(__file__).resolve().parents[2] / "pyproject.toml")
+PYPROJECT_PATH = str(Path(__file__).resolve().parents[2] / "sdk" / "python" / "pyproject.toml")
 PYPI_URL = "https://pypi.org/pypi/c-two/json"
 PYPI_TIMEOUT = 10
 

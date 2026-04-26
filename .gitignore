@@ -196,3 +196,4 @@ benchmarks/results/*
 !benchmarks/results/.gitkeep
 .superpowers/
 .worktrees/
+.bin/

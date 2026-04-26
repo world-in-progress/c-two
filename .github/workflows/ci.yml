@@ -10,6 +10,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cli:
+    runs-on: ubuntu-latest
+    name: cli
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            core -> target
+            cli -> target
+
+      - name: Test c3
+        run: cargo test --manifest-path cli/Cargo.toml
+
+      - name: Smoke test c3
+        run: |
+          cli/target/debug/c3 --version
+          cli/target/debug/c3 --help
+          cli/target/debug/c3 relay --help
+          cli/target/debug/c3 registry --help
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -35,7 +59,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
         with:
-          workspaces: src/c_two/_native -> target
+          workspaces: core -> target
 
       - uses: astral-sh/setup-uv@v6
         if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
@@ -46,6 +70,6 @@ jobs:
 
       - name: Run tests
         if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
-        run: uv run pytest tests/ -q --timeout=30
+        run: uv run pytest sdk/python/tests -q --timeout=30
         env:
           C2_RELAY_ADDRESS: ""

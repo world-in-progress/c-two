@@ -1,0 +1,117 @@
+name: Python Package Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # ── Version comparison ──────────────────────────────────────
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging
+        run: pip install packaging
+
+      - name: Check version against PyPI
+        id: check
+        run: python .github/scripts/check_version.py
+
+  # ── Build wheels (4 platforms × 6 interpreters) ─────────────
+  build-wheels:
+    needs: version-check
+    if: needs.version-check.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux-image: quay.io/pypa/manylinux2014_x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux-image: quay.io/pypa/manylinux2014_aarch64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    name: wheel (${{ matrix.target }})
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          working-directory: sdk/python
+          target: ${{ matrix.target }}
+          args: >-
+            --release --out dist
+            --interpreter python3.10 python3.11 python3.12
+            python3.13 python3.14 python3.14t
+          manylinux: 2014
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: sdk/python/dist/*.whl
+
+  # ── Build source distribution ───────────────────────────────
+  build-sdist:
+    needs: version-check
+    if: needs.version-check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    name: sdist
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist
+        run: |
+          python -m pip install build
+          python -m build --sdist --outdir dist sdk/python
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ── Publish to PyPI via OIDC ────────────────────────────────
+  publish:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    name: publish
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true
+          skip-existing: true

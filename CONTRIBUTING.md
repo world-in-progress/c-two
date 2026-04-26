@@ -22,17 +22,17 @@ uv sync --reinstall-package c-two
 
 ```bash
 # Full Python test suite (set C2_RELAY_ADDRESS= to avoid env interference)
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Single file / single test
-uv run pytest tests/unit/test_encoding.py -q
-uv run pytest tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
+uv run pytest sdk/python/tests/unit/test_wire.py -q
+uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 
 # Rust type-check
-cd src/c_two/_native && cargo check --workspace
+cd core && cargo check --workspace
 
 # Rust unit tests (pure Rust crates only — c2-ffi needs Python linkage)
-cd src/c_two/_native && cargo test -p c2-mem -p c2-wire
+cd core && cargo test -p c2-mem -p c2-wire
 ```
 
 All new code **must** include tests. Ensure the full suite passes before opening a PR.
@@ -70,24 +70,29 @@ refactor: simplify MethodTable index lookup
 
 ### Rust
 
-- Code lives in `src/c_two/_native/` (a Cargo workspace of 7 crates).
+- Code lives in `core/` (a Cargo workspace of 7 crates).
 - Run `cargo check --workspace` and `cargo test -p c2-mem -p c2-wire` before submitting.
 - Prefer zero-copy and single-allocation patterns in wire/transport code.
 
 ## Project Structure
 
 ```
-src/c_two/
+core/
+├── foundation/
+├── protocol/
+├── transport/
+└── bridge/
+sdk/python/src/c_two/
 ├── crm/          # CRM contracts, @transferable, decorators
 ├── transport/    # Registry, proxy, server bridge, scheduler
 ├── config/       # Settings (pydantic), IPC config
 ├── mem/          # Python wrappers for Rust memory subsystem
-├── _native/      # Rust workspace (c2-mem, c2-wire, c2-ipc, c2-server, c2-http, c2-config, c2-ffi)
 └── cli.py        # `c3` CLI entry point
-tests/
+sdk/python/tests/
 ├── unit/
 ├── integration/
 └── fixtures/     # Shared test CRM contracts and resources
+examples/python/
 ```
 
 ## Environment Variables
