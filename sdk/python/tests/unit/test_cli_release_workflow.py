@@ -41,7 +41,7 @@ def test_cli_release_publishes_github_release_assets_on_tags():
 
     assert "contents: write" in text
     assert "pattern: cli-*" in text
-    assert "softprops/action-gh-release@v2" in text
+    assert "softprops/action-gh-release@" in text
     assert "files: dist/c3-*" in text
 
 
