@@ -26,6 +26,8 @@ from grid.grid_contract import (
     GridAttribute,
 )
 
+DEFAULT_RELAY_URL = 'http://127.0.0.1:8300'
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -41,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get('C2_RELAY_ADDRESS'),
         help=(
             'HTTP relay URL used for name resolution. When set, the IPC address '
-            f'is optional. Example: {'http://127.0.0.1:8300'}.'
+            f'is optional. Example: {DEFAULT_RELAY_URL}.'
         ),
     )
     args = parser.parse_args()

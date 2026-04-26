@@ -42,7 +42,7 @@ wheels = [
 
 [[package]]
 name = "c-two"
-version = "0.4.7"
+version = "0.4.8"
 source = { editable = "sdk/python" }
 dependencies = [
     { name = "pydantic-settings" },

@@ -9,7 +9,10 @@ from pathlib import Path
 
 
 def repo_root() -> Path:
-    return next(parent for parent in Path(__file__).resolve().parents if (parent / "cli").is_dir())
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "cli").is_dir():
+            return parent
+    raise SystemExit("c3_tool.py must be run from within a C-Two source checkout.")
 
 
 def binary_name() -> str:
