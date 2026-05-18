@@ -283,7 +283,7 @@ Without `@cc.transfer`, the framework automatically matches registered `@transfe
 
 ### cc.hold() — Client-Side Zero-Copy
 
-On the client side, `cc.hold()` requests that the response SHM buffer remain alive, enabling zero-copy reads of the result. The returned `HeldResult` wraps the value and provides a three-layer safety net for SHM lifecycle:
+On the client side, `cc.hold()` requests that the response buffer remain alive, enabling zero-copy reads when the output transferable can build a view from a memoryview. The returned `HeldResult` wraps the value, exposes the retained raw wire buffer as `.buffer` for advanced provider/user parsing, and provides a three-layer safety net for buffer lifecycle:
 
 1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
 2. **Context manager (`with`)** — recommended for single-buffer scopes
@@ -298,6 +298,7 @@ result = grid.transform(matrix)
 # Option 1: Context manager — clean for single holds
 with cc.hold(grid.transform)(matrix) as held:
     data = held.value          # zero-copy NumPy array backed by SHM
+    raw = held.buffer          # retained wire buffer, valid only inside the hold scope
     process(data)              # read directly from shared memory
 # SHM buffer released on context exit
 
@@ -588,7 +589,7 @@ c3 contract infer mypkg.resources:GridResource \
   --out grid.contract.json
 ```
 
-Payload codecs are enabled through providers, not by making C-Two core understand every wire format. The py-arrow provider is the optional `c_two.providers.arrow` module: import it only in projects that need Arrow IPC, mark dataclass payloads with `@arrow.record`, and let CRM-bound provider resolution generate both single-record and `list[record]` batch codec refs for portable descriptors. `@arrow.record` is the complete opt-in: it marks the record and registers the default Arrow provider for the current process. By default, Arrow schema identity is derived from the CRM namespace, CRM name, CRM version, and record name, so per-record `schema_id` or per-record versions are not the normal path.
+Payload codecs are enabled through providers, not by making C-Two core understand every wire format. The py-arrow provider is the optional `c_two.providers.arrow` module: import it only in projects that need Arrow IPC, mark dataclass payloads with `@arrow.record`, and let CRM-bound provider resolution generate both single-record and `list[record]` batch codec refs for portable descriptors. `list[record]` is the normal batch path: regular calls return a materialized Python list, while `cc.hold(proxy.method)(...)` can return an Arrow-backed `ArrowBatchView` and still expose the retained raw wire buffer through `HeldResult.buffer`. `@arrow.record` is the complete opt-in: it marks the record and registers the default Arrow provider for the current process. By default, Arrow schema identity is derived from the CRM namespace, CRM name, CRM version, and record name, so per-record `schema_id` or per-record versions are not the normal path.
 
 ```python
 from c_two.providers import arrow

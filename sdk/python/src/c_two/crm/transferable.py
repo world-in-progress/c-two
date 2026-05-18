@@ -44,11 +44,12 @@ class HeldResult:
     3. __del__ fallback — last resort with warning
     """
 
-    __slots__ = ('_value', '_release_cb', '_released')
+    __slots__ = ('_value', '_release_cb', '_released', '_buffer')
 
-    def __init__(self, value, release_cb=None):
+    def __init__(self, value, release_cb=None, buffer=None):
         self._value = value
         self._release_cb = release_cb
+        self._buffer = buffer
         self._released = False
 
     @property
@@ -57,17 +58,28 @@ class HeldResult:
             raise RuntimeError("SHM released — value no longer accessible")
         return self._value
 
+    @property
+    def buffer(self):
+        if self._released:
+            raise RuntimeError("SHM released — buffer no longer accessible")
+        if self._buffer is None:
+            raise RuntimeError("HeldResult has no retained buffer")
+        return self._buffer
+
     def release(self):
         if not self._released:
             self._released = True
             cb = self._release_cb
             self._release_cb = None
             self._value = None
-            if cb is not None:
-                try:
-                    cb()
-                except Exception:
-                    pass
+            try:
+                if cb is not None:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+            finally:
+                self._buffer = None
 
     def __enter__(self):
         return self
@@ -834,7 +846,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view', codec_
                             response.release()
                         except Exception:
                             pass
-                    return HeldResult(result, release_cb)
+                    return HeldResult(result, release_cb, buffer=mv)
                 else:
                     # view (default)
                     try:
@@ -846,6 +858,20 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view', codec_
                         response.release()
                     return result
             else:
+                if _c2_buffer == 'hold':
+                    mv = memoryview(response)
+                    try:
+                        result = output_fn(mv) if output_hook == 'from_buffer' else output_fn(response)
+                    except Exception as exc:
+                        mv.release()
+                        if output_hook == 'from_buffer':
+                            raise error.ClientOutputFromBuffer(str(exc)) from exc
+                        raise
+
+                    def release_cb():
+                        mv.release()
+
+                    return HeldResult(result, release_cb, buffer=mv)
                 result = output_fn(response)
                 if _c2_buffer == 'hold':
                     return HeldResult(result, None)
@@ -1061,6 +1087,7 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None, codec_cont
                 input_transferable is not None
                 and hasattr(input_transferable, 'from_buffer')
                 and callable(input_transferable.from_buffer)
+                and getattr(input_transferable, '_c2_auto_input_hold', True)
             )
             effective_buffer = 'hold' if has_from_buffer else 'view'
             

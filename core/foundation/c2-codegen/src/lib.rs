@@ -55,6 +55,7 @@ pub fn generate_typescript_client(
     render_support_types(&mut output);
     render_contract_const(&mut output, &const_prefix, crm, &digest)?;
     render_codec_requirements(&mut output, &const_prefix, &requirements)?;
+    render_codec_stubs(&mut output, &const_prefix, &requirements);
     render_client_class(&mut output, &class_name, &const_prefix, methods)?;
     render_helpers(&mut output);
     Ok(output)
@@ -87,6 +88,16 @@ export interface C2CodecRequirement {
   readonly mediaType?: string;
   readonly capabilities: readonly string[];
 }
+
+export interface C2CodecImplementation<CodecId extends string = string> {
+  readonly id: CodecId;
+  readonly requirement: C2CodecRequirement;
+  encode(value: unknown): Uint8Array | Promise<Uint8Array>;
+  decode(data: Uint8Array): unknown | Promise<unknown>;
+  fromBuffer?(data: Uint8Array): unknown | Promise<unknown>;
+}
+
+export type C2CodecRegistry = Readonly<Record<string, C2CodecImplementation<string>>>;
 
 "#,
     );
@@ -159,6 +170,19 @@ fn render_codec_requirements(
     }
     output.push_str("];\n\n");
     Ok(())
+}
+
+fn render_codec_stubs(
+    output: &mut String,
+    const_prefix: &str,
+    requirements: &BTreeMap<String, Value>,
+) {
+    if requirements.is_empty() {
+        return;
+    }
+    output.push_str(&format!(
+        "export function createCodecStubs(): C2CodecRegistry {{\n  const registry: Record<string, C2CodecImplementation<string>> = {{}};\n  for (const requirement of {const_prefix}_CODEC_REQUIREMENTS) {{\n    registry[requirement.id] = {{\n      id: requirement.id,\n      requirement,\n      encode(_value: unknown): Uint8Array {{\n        throw missingCodecImplementation(requirement);\n      }},\n      decode(_data: Uint8Array): unknown {{\n        throw missingCodecImplementation(requirement);\n      }},\n      fromBuffer(_data: Uint8Array): unknown {{\n        throw missingCodecImplementation(requirement);\n      }},\n    }};\n  }}\n  return registry;\n}}\n\n"
+    ));
 }
 
 fn render_client_class(
@@ -261,6 +285,10 @@ fn render_helpers(output: &mut String) {
     end -= 1;
   }
   return values.slice(0, end);
+}
+
+function missingCodecImplementation(requirement: C2CodecRequirement): Error {
+  return new Error(`Codec ${requirement.id} requires application runtime implementation.`);
 }
 "#,
     );

@@ -859,6 +859,7 @@ class TestComToCrmBufferModes:
 
         assert isinstance(result, HeldResult)
         assert result.value == 42
+        assert bytes(result.buffer) == pickle.dumps(42)
         assert not response.released
         assert tracker.stats()['active_holds'] == 1
         assert tracker.stats()['by_direction']['client_response']['active_holds'] == 1
@@ -867,6 +868,8 @@ class TestComToCrmBufferModes:
 
         assert response.released
         assert tracker.stats()['active_holds'] == 0
+        with pytest.raises(RuntimeError, match='released'):
+            _ = result.buffer
 
     def test_hold_output_from_buffer_failure_raises_specific_error_and_releases_response(self):
         from c_two import _native

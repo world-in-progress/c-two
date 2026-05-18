@@ -245,3 +245,59 @@ def test_arrow_record_name_and_schema_id_overrides():
     assert 'org.example.shared-cell.arrow-ipc' in (
         OverrideStore.explicit._output_transferable._c2_schema_text
     )
+
+
+def test_arrow_explicit_batch_annotation_returns_arrow_view_without_changing_list_behavior():
+    from c_two.providers import arrow
+
+    @arrow.record
+    class Cell:
+        level: int
+        global_id: int
+        active: bool
+
+    @cc.crm(namespace='test.arrow-view', version='0.1.0')
+    class CellStore:
+        def list_cells(self) -> list[Cell]:
+            ...
+
+        def view_cells(self) -> arrow.Batch[Cell]:
+            ...
+
+    descriptor = build_contract_descriptor(CellStore, portable=True)
+    methods = {method['name']: method for method in descriptor['methods']}
+
+    assert methods['list_cells']['return']['kind'] == 'list'
+    assert methods['list_cells']['return']['item']['kind'] == 'codec'
+    assert hasattr(CellStore.list_cells._output_transferable, 'from_buffer')
+    assert 'buffer-view' in CellStore.list_cells._output_transferable.__cc_codec_ref__.capabilities
+    assert '"mode":"batch"' in CellStore.list_cells._output_transferable._c2_schema_text
+
+    assert methods['view_cells']['return']['kind'] == 'codec'
+    assert methods['view_cells']['wire']['output']['id'] == arrow.ARROW_IPC_CODEC_ID
+    assert hasattr(CellStore.view_cells._output_transferable, 'from_buffer')
+    assert 'buffer-view' in CellStore.view_cells._output_transferable.__cc_codec_ref__.capabilities
+    assert '"mode":"batch"' in CellStore.view_cells._output_transferable._c2_schema_text
+    assert (
+        CellStore.list_cells._output_transferable.__cc_codec_ref__
+        == CellStore.view_cells._output_transferable.__cc_codec_ref__
+    )
+
+    payload = [
+        Cell(level=1, global_id=10, active=True),
+        Cell(level=1, global_id=11, active=False),
+    ]
+    data = CellStore.list_cells._output_transferable.serialize(payload)
+
+    materialized = CellStore.list_cells._output_transferable.deserialize(data)
+    assert materialized == payload
+
+    view = CellStore.list_cells._output_transferable.from_buffer(memoryview(data))
+
+    assert isinstance(view, arrow.ArrowBatchView)
+    assert len(view) == 2
+    assert view.to_records() == payload
+
+    held_view = CellStore.view_cells._output_transferable.from_buffer(memoryview(data))
+    assert isinstance(held_view, arrow.ArrowBatchView)
+    assert held_view.to_records() == payload

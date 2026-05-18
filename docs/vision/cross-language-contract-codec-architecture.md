@@ -149,6 +149,10 @@ fastdb 是第一个 domain-specific provider pilot，而不是 CRM IDL。fastdb 
 
 py-arrow 是第一个 mature external format provider pilot。C-Two examples 已经把 grid Arrow IPC payload 收敛为可复用 `c_two.providers.arrow` provider，控制参数也已经能通过 `c-two.control.json.v1` 脱离 pickle；grid 现在只声明领域 payload 类型，Arrow schema identity 由 CRM context 默认生成，provider/codegen 自动组合能力仍保留为后续清晰边界。
 
+`c_two.providers.custom` 是 opaque custom codec 的主路径。它装饰业务 payload 类型，要求开发者声明稳定 `CodecRef` identity 和 schema hash/text，并手写 Python runtime 的 `serialize`、`deserialize`、可选 `from_buffer`；portable descriptor 仍导出 `portable=true` 的 codec ref，TypeScript 等 SDK codegen 只生成类型表面、codec requirement 和 runtime implementation stub，不假装能自动实现未知 wire format。
+
+Arrow 的 wire ABI 与 Python 侧 materialization policy 分开处理。`list[@arrow.record]` 是正常 batch wire path：普通调用仍返回物化后的 Python list，`cc.hold(proxy.method)(...)` 则保留底层 response lease 并可返回 `ArrowBatchView`，同时 `HeldResult.buffer` 暴露原始 Arrow IPC wire buffer 供高级用户自行用 PyArrow/NumPy 等解析。`arrow.Batch[Record]` 只保留为“普通调用也返回 Arrow-backed view”的显式 annotation，不再代表另一套 schema identity。
+
 Protobuf、FlatBuffers、Avro、JSON Schema、GeoArrow、WKB 等都应作为 provider families 进入，不应让某一种格式成为 C-Two core 的内置 worldview。
 
 ## 实现顺序
@@ -167,7 +171,8 @@ Protobuf、FlatBuffers、Avro、JSON Schema、GeoArrow、WKB 等都应作为 pro
 12. 已完成：在 fastdb 侧实现 provider-owned codegen helper，把 `fastdb.schema.v1` 生成 TypeScript payload codec helper stub 或明确的 unsupported diagnostic，应用层组合 c-two RPC skeleton 与 fastdb payload helper。
 13. 已完成：用 grid 资源导出、Rust 校验、生成 TypeScript artifact，并继续验证 Python thread-local、direct IPC 和 relay 三条运行时路径。
 14. 已完成：把 py-arrow provider 从 grid 示例手写 adapter 升级为可复用 `c_two.providers.arrow` 可选模块，支持记录类型和 `list[record]` 批量 payload，并让默认 Arrow schema identity 从 CRM namespace/name/version 与 record 信息生成，不让 C-Two core 理解 Arrow schema 内部结构。
-15. 下一步：把 fastdb provider 从可选 wrapper 升级为可复用 package，并为 TypeScript/WASM payload codec runtime 补齐真实 encode/decode/from-buffer 实现。
+15. 已完成：新增 `c_two.providers.custom` 作为手写 runtime codec 的 portable stub 路径，并把 py-arrow `list[record]` 收敛为单一 batch wire identity：普通调用物化为 list，`cc.hold(...)` 返回 `ArrowBatchView` 并通过 `HeldResult.buffer` 暴露 retained wire buffer；`arrow.Batch[Record]` 保留为普通调用也返回 view 的显式入口。
+16. 下一步：把 fastdb provider 从可选 wrapper 升级为可复用 package，并为 TypeScript/WASM payload codec runtime 补齐真实 encode/decode/from-buffer 实现。
 
 ## 非目标
 

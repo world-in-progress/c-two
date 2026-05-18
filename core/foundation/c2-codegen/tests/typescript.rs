@@ -207,6 +207,9 @@ fn generates_opaque_types_and_requirements_for_external_codecs() {
     assert!(output.contains(
         "schemaSha256: \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\""
     ));
+    assert!(output.contains("export interface C2CodecImplementation"));
+    assert!(output.contains("export function createCodecStubs(): C2CodecRegistry"));
+    assert!(output.contains("Codec ${requirement.id} requires application runtime implementation"));
 }
 
 #[test]

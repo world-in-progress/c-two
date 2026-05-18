@@ -283,7 +283,7 @@ class Compute:
 
 ### cc.hold() — 客户端零拷贝
 
-在客户端，`cc.hold()` 请求响应的共享内存缓冲区保持存活，实现结果的零拷贝读取。返回的 `HeldResult` 包装了值，并提供三层共享内存生命周期安全网：
+在客户端，`cc.hold()` 请求响应缓冲区保持存活；当输出 transferable 能从 memoryview 构造 view 时，这条路径可以实现零拷贝读取。返回的 `HeldResult` 包装了值，并把保留中的原始 wire buffer 暴露为 `.buffer`，供高级 provider 或用户自行解析，同时提供三层缓冲区生命周期安全网：
 
 1. **显式 `.release()`** — 推荐用于同时持有多个缓冲区的复杂工作流
 2. **上下文管理器（`with`）** — 推荐用于单缓冲区作用域
@@ -298,6 +298,7 @@ result = grid.transform(matrix)
 # Option 1: Context manager — clean for single holds
 with cc.hold(grid.transform)(matrix) as held:
     data = held.value          # zero-copy NumPy array backed by SHM
+    raw = held.buffer          # retained wire buffer, valid only inside the hold scope
     process(data)              # read directly from shared memory
 # SHM buffer released on context exit
 
@@ -586,7 +587,7 @@ c3 contract infer mypkg.resources:GridResource \
   --out grid.contract.json
 ```
 
-Payload codec 通过 provider 启用，而不是让 C-Two core 理解每一种 wire format。py-arrow provider 是可选的 `c_two.providers.arrow` 模块：只在需要 Arrow IPC 的项目里导入它，用 `@arrow.record` 标记 dataclass payload，然后让 CRM 绑定阶段自动生成 single-record 和 `list[record]` batch 的 codec ref。`@arrow.record` 是完整 opt-in：它会标记 record，并为当前进程注册默认 Arrow provider。默认 Arrow schema identity 由 CRM namespace、CRM name、CRM version 和 record name 派生，因此主路径不需要为每个 record 手写 `schema_id` 或 record 级版本。
+Payload codec 通过 provider 启用，而不是让 C-Two core 理解每一种 wire format。py-arrow provider 是可选的 `c_two.providers.arrow` 模块：只在需要 Arrow IPC 的项目里导入它，用 `@arrow.record` 标记 dataclass payload，然后让 CRM 绑定阶段自动生成 single-record 和 `list[record]` batch 的 codec ref。`list[record]` 是正常 batch 路径：普通调用返回物化后的 Python list，而 `cc.hold(proxy.method)(...)` 可以返回 Arrow-backed `ArrowBatchView`，同时仍可通过 `HeldResult.buffer` 取得保留中的原始 wire buffer。`@arrow.record` 是完整 opt-in：它会标记 record，并为当前进程注册默认 Arrow provider。默认 Arrow schema identity 由 CRM namespace、CRM name、CRM version 和 record name 派生，因此主路径不需要为每个 record 手写 `schema_id` 或 record 级版本。
 
 ```python
 from c_two.providers import arrow
