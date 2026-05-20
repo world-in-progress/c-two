@@ -593,6 +593,8 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
         """)
     (package_dir / 'smoke.ts').write_text(smoke_source)
     subprocess.run([tsc, '-p', str(package_dir / 'tsconfig.json')], check=True, cwd=package_dir)
+    if not (fastdb4ts / 'dist' / 'wasm' / 'fastdb4ts.wasm').exists():
+        pytest.skip('grid FastDB TypeScript runtime smoke requires the fastdb4ts wasm artifact')
     subprocess.run([node, str(package_dir / 'dist' / 'smoke.js')], check=True, cwd=package_dir)
 
     previous_shm_threshold = settings._shm_threshold  # noqa: SLF001
