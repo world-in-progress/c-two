@@ -629,7 +629,8 @@ class _ProcessRegistry:
             return
 
         try:
-            self._serve_stop.wait()
+            while not self._serve_stop.wait(timeout=0.1):
+                pass
         except KeyboardInterrupt:
             # On some platforms, SIGINT also raises KeyboardInterrupt
             # even when a custom handler is installed.
