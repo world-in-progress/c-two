@@ -159,20 +159,6 @@ jobs:
         with:
           workspaces: core -> target
 
-      - name: Checkout FastDB path dependency
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        uses: actions/checkout@v6
-        with:
-          repository: world-in-progress/fastdb
-          ref: dev-feature
-          path: fastdb
-
-      - name: Link FastDB path dependency
-        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        run: |
-          rm -rf "$GITHUB_WORKSPACE/../fastdb"
-          ln -s "$GITHUB_WORKSPACE/fastdb" "$GITHUB_WORKSPACE/../fastdb"
-
       - uses: astral-sh/setup-uv@v6
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
 

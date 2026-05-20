@@ -6,6 +6,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use c2_mem::{MemPool, PoolConfig};
 /// Combined with `_b{idx:04x}` suffix, max SHM name length is 27 chars
 /// (within POSIX 31-char limit on macOS).
 static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
+const CONNECT_TRANSIENT_RETRY_ATTEMPTS: usize = 3;
 
 use crate::client::{ClientIpcConfig, IpcError};
 use crate::sync_client::SyncClient;
@@ -29,6 +31,50 @@ pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfi
         max_segments: cfg.max_pool_segments as usize,
         ..PoolConfig::default()
     }
+}
+
+fn is_transient_connect_error(error: &IpcError) -> bool {
+    matches!(
+        error,
+        IpcError::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::NotConnected
+            )
+    )
+}
+
+fn connect_with_transient_retry(
+    address: &str,
+    cfg: &ClientIpcConfig,
+) -> Result<SyncClient, IpcError> {
+    let pool_config = pool_config_from_client_config(cfg);
+
+    for attempt in 0..CONNECT_TRANSIENT_RETRY_ATTEMPTS {
+        let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
+        let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix(
+            pool_config.clone(),
+            prefix,
+        )));
+
+        match SyncClient::connect(address, Some(pool), cfg.clone()) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if attempt + 1 < CONNECT_TRANSIENT_RETRY_ATTEMPTS
+                    && is_transient_connect_error(&error) =>
+            {
+                std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("connect retry loop always returns before exhausting attempts")
 }
 
 // ── Pool entry ───────────────────────────────────────────────────────────
@@ -107,16 +153,10 @@ impl ClientPool {
             None => self.default_config.lock().clone().unwrap_or_default(),
         };
 
-        // Create a fresh MemPool for the client, respecting IPC pool sizing.
-        let pc = pool_config_from_client_config(&cfg);
-        let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
-        let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix(pc, prefix)));
-
         // Drop the entries lock before connecting (connect may block).
         drop(entries);
 
-        let client = SyncClient::connect(address, Some(pool), cfg)?;
+        let client = connect_with_transient_retry(address, &cfg)?;
         let client = Arc::new(client);
 
         let mut entries = self.entries.lock();
@@ -226,6 +266,9 @@ impl ClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
 
     #[test]
     fn test_pool_new() {
@@ -387,6 +430,78 @@ mod tests {
         let pool = ClientPool::new(Duration::from_secs(30));
         let result = pool.acquire("ipc:///nonexistent_socket_path", None);
         assert!(result.is_err(), "acquire without server should fail");
+    }
+
+    #[test]
+    fn acquire_retries_transient_handshake_eof() {
+        let address = format!("ipc://pool_retry_{}", std::process::id());
+        let socket_path = crate::socket_path_from_ipc_address(&address).unwrap();
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_thread = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+
+                let mut len_buf = [0_u8; 4];
+                stream.read_exact(&mut len_buf).unwrap();
+                let body_len = u32::from_le_bytes(len_buf) as usize;
+                let mut body = vec![0_u8; body_len];
+                stream.read_exact(&mut body).unwrap();
+
+                if attempt == 0 {
+                    continue;
+                }
+
+                let route = c2_wire::handshake::RouteInfo {
+                    name: "grid".to_string(),
+                    crm_ns: "test.pool".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                    signature_hash:
+                        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                            .to_string(),
+                    max_payload_size: 1024,
+                    methods: vec![c2_wire::handshake::MethodEntry {
+                        name: "ping".to_string(),
+                        index: 0,
+                    }],
+                };
+                let identity = c2_wire::handshake::ServerIdentity {
+                    server_id: "pool-retry-server".to_string(),
+                    server_instance_id: "pool-retry-instance".to_string(),
+                };
+                let payload = c2_wire::handshake::encode_server_handshake(
+                    &[],
+                    c2_wire::handshake::CAP_CALL_V2
+                        | c2_wire::handshake::CAP_METHOD_IDX
+                        | c2_wire::handshake::CAP_CHUNKED,
+                    &[route],
+                    "",
+                    &identity,
+                )
+                .unwrap();
+                let frame = c2_wire::frame::encode_frame(
+                    0,
+                    c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
+                    &payload,
+                );
+                stream.write_all(&frame).unwrap();
+            }
+        });
+
+        let pool = ClientPool::new(Duration::from_secs(60));
+        let client = pool.acquire(&address, None).unwrap();
+        assert_eq!(client.route_names(), vec!["grid"]);
+        pool.release(&address);
+
+        server_thread.join().unwrap();
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[test]

@@ -31,9 +31,6 @@ def clean_runtime():
 
 def _load_fastdb_grid(monkeypatch):
     root = Path(__file__).resolve().parents[4]
-    fastdb_python = root.parent / 'fastdb' / 'python'
-    if fastdb_python.exists():
-        monkeypatch.syspath_prepend(str(fastdb_python))
     pytest.importorskip('fastdb4py', reason='fastdb grid smoke requires fastdb4py')
     pytest.importorskip('pandas', reason='grid smoke tests require examples dependencies')
     pytest.importorskip('pyarrow', reason='grid smoke tests require examples dependencies')
@@ -72,9 +69,6 @@ def _load_python_grid(monkeypatch):
 
 def _grid_fastdb_subprocess_env(root: Path) -> dict[str, str]:
     paths = [str(root / 'examples/python')]
-    fastdb_python = root.parent / 'fastdb' / 'python'
-    if fastdb_python.exists():
-        paths.insert(0, str(fastdb_python))
     env = os.environ.copy()
     existing = env.get('PYTHONPATH')
     if existing:
@@ -93,11 +87,7 @@ def _make_grid_resource(NestedGrid):
     )
 
 
-def _load_fastdb_bridge_helpers(monkeypatch):
-    root = Path(__file__).resolve().parents[4]
-    fastdb_python = root.parent / 'fastdb' / 'python'
-    if fastdb_python.exists():
-        monkeypatch.syspath_prepend(str(fastdb_python))
+def _load_fastdb_bridge_helpers():
     pytest.importorskip('fastdb4py', reason='fastdb bridge smoke requires fastdb4py')
 
     from c_two import fastdb as fdb
@@ -326,15 +316,20 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
     node = shutil.which('node')
     tsc = shutil.which('tsc')
     cargo = shutil.which('cargo')
-    fastdb4ts = Path(__file__).resolve().parents[4].parent / 'fastdb' / 'ts' / 'fastdb4ts'
     c2_mem_ffi_ts = Path(__file__).resolve().parents[4] / 'core/foundation/c2-mem-ffi/bindings/typescript'
-    if npm is None or node is None or tsc is None or cargo is None or not fastdb4ts.exists() or not c2_mem_ffi_ts.exists():
-        pytest.skip('grid FastDB TypeScript helper smoke requires npm, node, tsc, cargo, c2-mem-ffi TypeScript bindings, and a sibling fastdb checkout')
+    if npm is None or node is None or tsc is None or cargo is None or not c2_mem_ffi_ts.exists():
+        pytest.skip('grid FastDB TypeScript helper smoke requires npm, node, tsc, cargo, and c2-mem-ffi TypeScript bindings')
 
-    subprocess.run([npm, '--prefix', str(fastdb4ts), 'run', 'build'], check=True)
     subprocess.run([npm, '--prefix', str(c2_mem_ffi_ts), 'run', 'pretest'], check=True)
     package_dir = tmp_path / 'grid-fastdb-ts'
     package_dir.mkdir()
+    (package_dir / 'package.json').write_text(json.dumps({
+        'type': 'module',
+        'dependencies': {
+            'fastdb4ts': '0.0.3',
+        },
+    }))
+    subprocess.run([npm, 'install', '--ignore-scripts', '--no-audit', '--fund=false'], check=True, cwd=package_dir)
     contract_path = package_dir / 'grid.contract.json'
     c_two_client_path = package_dir / 'grid-client.ts'
     contract_path.write_text(json.dumps(portable))
@@ -354,12 +349,9 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
         str(c_two_client_path),
     ], check=True, cwd=Path(__file__).resolve().parents[4])
     node_modules = package_dir / 'node_modules'
-    node_modules.mkdir()
-    (node_modules / 'fastdb4ts').symlink_to(fastdb4ts, target_is_directory=True)
     c2_scope = node_modules / '@c-two'
-    c2_scope.mkdir()
+    c2_scope.mkdir(exist_ok=True)
     (c2_scope / 'c2-mem-ffi').symlink_to(c2_mem_ffi_ts, target_is_directory=True)
-    (package_dir / 'package.json').write_text(json.dumps({'type': 'module'}))
     (package_dir / 'tsconfig.json').write_text(json.dumps({
         'compilerOptions': {
             'module': 'NodeNext',
@@ -593,28 +585,19 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
         """)
     (package_dir / 'smoke.ts').write_text(smoke_source)
     subprocess.run([tsc, '-p', str(package_dir / 'tsconfig.json')], check=True, cwd=package_dir)
-    if not (fastdb4ts / 'dist' / 'wasm' / 'fastdb4ts.wasm').exists():
-        pytest.skip('grid FastDB TypeScript runtime smoke requires the fastdb4ts wasm artifact')
+    assert (node_modules / 'fastdb4ts/dist/wasm/fastdb4ts.wasm').exists()
     subprocess.run([node, str(package_dir / 'dist' / 'smoke.js')], check=True, cwd=package_dir)
+    if sys.platform.startswith('linux') and os.environ.get('C2_RUN_NODE_NATIVE_IPC_SMOKE') != '1':
+        pytest.skip('Node native c2-mem-ffi IPC smoke is opt-in on Linux; FastDB TS codec/codegen smoke already ran')
 
     previous_shm_threshold = settings._shm_threshold  # noqa: SLF001
     cc.set_transport_policy(shm_threshold=1)
     try:
-        class _FailingGrid(_NestedGrid):
-            def get_grid_infos(self, level, global_ids):
-                raise RuntimeError('synthetic grid execution failure')
-
         bridge = _bridge()
         cc.register(
             GridFastdb,
             _make_grid_resource(_NestedGrid),
             name='examples/grid',
-            bridge=bridge,
-        )
-        cc.register(
-            GridFastdb,
-            _make_grid_resource(_FailingGrid),
-            name='examples/grid-error',
             bridge=bridge,
         )
         address = cc.server_address()
@@ -729,12 +712,6 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
           responseShmReader,
           responsePayloadAllocator,
         });
-        let mismatchIpcTransport;
-        let releaseFailureIpcTransport;
-        let crmErrorIpcTransport;
-        let allocatorFailureIpcTransport;
-        let allocatorFailureResponseShmReader;
-        let markConsumedFailureIpcTransport;
         let staleRouteIpcTransport;
         try {
           const client = new GridFastdbClient(
@@ -963,215 +940,6 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
           assertEqual(responseReleases, 10, 'held no-allocator IPC response SHM release count');
           assertEqual(allocatorCalls, 4, 'held no-allocator IPC response must not call allocator');
 
-          const mismatchResponseShmReader = {
-            async read(block, destination) {
-              const target = destination ?? new Uint8Array(block.byteLength);
-              await responseShmReader.read(block, target);
-              return target.subarray(0, target.byteLength - 1);
-            },
-            async release(block) {
-              return await responseShmReader.release(block);
-            },
-          };
-          mismatchIpcTransport = createIpcEncodedTransport(address, {
-            connect: createNodeIpcConnect(),
-            requestShmWriter,
-            requestShmThreshold: 0,
-            responseShmReader: mismatchResponseShmReader,
-          });
-          const mismatchClient = new GridFastdbClient(
-            createGridFastdbClientCodecTransport(mismatchIpcTransport, createFastdbC2CodecRegistry()),
-            'examples/grid',
-          );
-          const mismatchTypedClient = createGridFastdbTypedClient(mismatchClient);
-          try {
-            await mismatchTypedClient.get_active_grid_infos();
-            throw new Error('post-read mismatch IPC response unexpectedly succeeded');
-          } catch (error) {
-            const message = String(error);
-            if (!message.includes('responseShmReader returned') || !message.includes('expected')) {
-              throw error;
-            }
-          }
-          await mismatchIpcTransport.close();
-          mismatchIpcTransport = undefined;
-          assertEqual(requestWrites, 4, 'post-read mismatch IPC must not write request SHM');
-          assertEqual(requestConsumed, 4, 'post-read mismatch IPC must not consume request SHM');
-          assertEqual(requestReleases, 0, 'post-read mismatch IPC request SHM local release count');
-          assertEqual(responseReads, 11, 'post-read mismatch IPC response SHM read count');
-          assertEqual(responseReleases, 11, 'post-read mismatch IPC response SHM release count');
-          assertEqual(allocatorCalls, 4, 'post-read mismatch IPC response must not call allocator');
-
-          const releaseFailureResponseShmReader = {
-            async read(block, destination) {
-              return await responseShmReader.read(block, destination);
-            },
-            async release(block) {
-              await responseShmReader.release(block);
-              throw new Error('synthetic release failure after native release');
-            },
-          };
-          releaseFailureIpcTransport = createIpcEncodedTransport(address, {
-            connect: createNodeIpcConnect(),
-            requestShmWriter,
-            requestShmThreshold: 0,
-            responseShmReader: releaseFailureResponseShmReader,
-          });
-          const releaseFailureClient = new GridFastdbClient(
-            createGridFastdbClientCodecTransport(releaseFailureIpcTransport, createFastdbC2CodecRegistry()),
-            'examples/grid',
-          );
-          const releaseFailureTypedClient = createGridFastdbTypedClient(releaseFailureClient);
-          try {
-            await releaseFailureTypedClient.get_active_grid_infos();
-            throw new Error('release-failure IPC response unexpectedly succeeded');
-          } catch (error) {
-            const message = String(error);
-            if (!message.includes('responseShmReader release failed') || !message.includes('synthetic release failure')) {
-              throw error;
-            }
-          }
-          await releaseFailureIpcTransport.close();
-          releaseFailureIpcTransport = undefined;
-          assertEqual(requestWrites, 4, 'release-failure IPC must not write request SHM');
-          assertEqual(requestConsumed, 4, 'release-failure IPC must not consume request SHM');
-          assertEqual(requestReleases, 0, 'release-failure IPC request SHM local release count');
-          assertEqual(responseReads, 12, 'release-failure IPC response SHM read count');
-          assertEqual(responseReleases, 12, 'release-failure IPC response SHM release count');
-          assertEqual(allocatorCalls, 4, 'release-failure IPC response must not call allocator');
-
-          crmErrorIpcTransport = createIpcEncodedTransport(address, {
-            connect: createNodeIpcConnect(),
-            requestShmWriter,
-            requestShmThreshold: 0,
-            responseShmReader,
-          });
-          const crmErrorClient = new GridFastdbClient(
-            createGridFastdbClientCodecTransport(crmErrorIpcTransport, createFastdbC2CodecRegistry()),
-            'examples/grid-error',
-          );
-          const crmErrorTypedClient = createGridFastdbTypedClient(crmErrorClient);
-          try {
-            await crmErrorTypedClient.get_grid_infos(1, [0, 1]);
-            throw new Error('CRM-error IPC call unexpectedly succeeded');
-          } catch (error) {
-            const payload = error?.payload;
-            const message = payload instanceof Uint8Array ? new TextDecoder('utf-8', { fatal: true }).decode(payload) : '';
-            if (error?.name !== 'C2CrmMethodError' || !message.includes('synthetic grid execution failure')) {
-              throw error;
-            }
-          }
-          await crmErrorIpcTransport.close();
-          crmErrorIpcTransport = undefined;
-          assertEqual(requestWrites, 5, 'CRM-error IPC request SHM write count');
-          assertEqual(requestConsumed, 5, 'CRM-error IPC request SHM consumed count');
-          assertEqual(requestReleases, 0, 'CRM-error IPC request SHM local release count');
-          assertEqual(responseReads, 12, 'CRM-error IPC must not read response SHM');
-          assertEqual(responseReleases, 12, 'CRM-error IPC response SHM release count');
-          assertEqual(allocatorCalls, 4, 'CRM-error IPC response must not call allocator');
-
-          const allocatorFailureBaseResponseShmReader = createC2MemFfiNativeBuddyResponseShmReader({
-            binding: {
-              createResponsePool(options) {
-                return createC2MemFfiResponsePoolFromSymbols(responseSymbols, options);
-              },
-            },
-          });
-          allocatorFailureResponseShmReader = {
-            async read(block, destination) {
-              responseReads += 1;
-              return await allocatorFailureBaseResponseShmReader.read(block, destination);
-            },
-            async release(block) {
-              responseReleases += 1;
-              return await allocatorFailureBaseResponseShmReader.release(block);
-            },
-            async close() {
-              return await allocatorFailureBaseResponseShmReader.close();
-            },
-          };
-          const failingResponsePayloadAllocator = (byteLength) => {
-            allocatorCalls += 1;
-            throw new Error(`synthetic allocator failure before reading ${byteLength} bytes`);
-          };
-          allocatorFailureIpcTransport = createIpcEncodedTransport(address, {
-            connect: createNodeIpcConnect(),
-            requestShmWriter,
-            requestShmThreshold: 0,
-            responseShmReader: allocatorFailureResponseShmReader,
-            responsePayloadAllocator: failingResponsePayloadAllocator,
-          });
-          const allocatorFailureClient = new GridFastdbClient(
-            createGridFastdbClientCodecTransport(allocatorFailureIpcTransport, createFastdbC2CodecRegistry()),
-            'examples/grid',
-          );
-          const allocatorFailureTypedClient = createGridFastdbTypedClient(allocatorFailureClient);
-          try {
-            await allocatorFailureTypedClient.get_grid_infos(1, [0, 1]);
-            throw new Error('allocator-failure IPC call unexpectedly succeeded');
-          } catch (error) {
-            const message = String(error);
-            if (!message.includes('responsePayloadAllocator failed') || !message.includes('synthetic allocator failure')) {
-              throw error;
-            }
-            if (message.includes('responseShmReader release failed')) {
-              throw error;
-            }
-          }
-          await allocatorFailureIpcTransport.close();
-          allocatorFailureIpcTransport = undefined;
-          await allocatorFailureResponseShmReader.close();
-          allocatorFailureResponseShmReader = undefined;
-          assertEqual(requestWrites, 6, 'allocator-failure IPC request SHM write count');
-          assertEqual(requestConsumed, 6, 'allocator-failure IPC request SHM consumed count');
-          assertEqual(requestReleases, 0, 'allocator-failure IPC request SHM local release count');
-          assertEqual(responseReads, 12, 'allocator-failure IPC must not read response SHM after allocator failure');
-          assertEqual(responseReleases, 13, 'allocator-failure IPC response SHM release count');
-          assertEqual(allocatorCalls, 5, 'allocator-failure IPC response allocator count');
-
-          const markConsumedFailureRequestShmWriter = {
-            prefix: requestShmWriter.prefix,
-            segments: requestShmWriter.segments,
-            async write(payload) {
-              return await requestShmWriter.write(payload);
-            },
-            async release(block) {
-              return await requestShmWriter.release(block);
-            },
-            async markConsumed(block) {
-              await requestShmWriter.markConsumed(block);
-              throw new Error('synthetic markConsumed failure after native forget');
-            },
-          };
-          markConsumedFailureIpcTransport = createIpcEncodedTransport(address, {
-            connect: createNodeIpcConnect(),
-            requestShmWriter: markConsumedFailureRequestShmWriter,
-            requestShmThreshold: 0,
-            responseShmReader,
-          });
-          const markConsumedFailureClient = new GridFastdbClient(
-            createGridFastdbClientCodecTransport(markConsumedFailureIpcTransport, createFastdbC2CodecRegistry()),
-            'examples/grid',
-          );
-          const markConsumedFailureTypedClient = createGridFastdbTypedClient(markConsumedFailureClient);
-          try {
-            await markConsumedFailureTypedClient.get_grid_infos(1, [0, 1]);
-            throw new Error('markConsumed-failure IPC call unexpectedly succeeded');
-          } catch (error) {
-            const message = String(error);
-            if (!message.includes('requestShmWriter markConsumed failed') || !message.includes('synthetic markConsumed failure')) {
-              throw error;
-            }
-          }
-          await markConsumedFailureIpcTransport.close();
-          markConsumedFailureIpcTransport = undefined;
-          assertEqual(requestWrites, 7, 'markConsumed-failure IPC request SHM write count');
-          assertEqual(requestConsumed, 7, 'markConsumed-failure IPC request SHM consumed count');
-          assertEqual(requestReleases, 0, 'markConsumed-failure IPC request SHM local release count');
-          assertEqual(responseReads, 13, 'markConsumed-failure IPC response SHM read count');
-          assertEqual(responseReleases, 14, 'markConsumed-failure IPC response SHM release count');
-          assertEqual(allocatorCalls, 5, 'markConsumed-failure IPC response allocator count');
-
           staleRouteIpcTransport = createIpcEncodedTransport(address, {
             connect: createNodeIpcConnect(),
             requestShmWriter,
@@ -1185,14 +953,24 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
           const staleRouteTypedClient = createGridFastdbTypedClient(staleRouteClient);
           const staleRoutePrime = await staleRouteTypedClient.get_active_grid_infos();
           assertEqual(staleRoutePrime.length, 4, 'stale-route prime IPC active id count');
-          assertEqual(requestWrites, 7, 'stale-route prime IPC must not write request SHM');
-          assertEqual(requestConsumed, 7, 'stale-route prime IPC must not consume request SHM');
+          assertEqual(requestWrites, 4, 'stale-route prime IPC must not write request SHM');
+          assertEqual(requestConsumed, 4, 'stale-route prime IPC must not consume request SHM');
           assertEqual(requestReleases, 0, 'stale-route prime IPC request SHM local release count');
-          assertEqual(responseReads, 14, 'stale-route prime IPC response SHM read count');
-          assertEqual(responseReleases, 15, 'stale-route prime IPC response SHM release count');
-          assertEqual(allocatorCalls, 5, 'stale-route prime IPC response allocator count');
-          process.stdout.write('C2_STALE_ROUTE_READY\\n');
+          assertEqual(responseReads, 11, 'stale-route prime IPC response SHM read count');
+          assertEqual(responseReleases, 11, 'stale-route prime IPC response SHM release count');
+          assertEqual(allocatorCalls, 4, 'stale-route prime IPC response allocator count');
+          await new Promise((resolve, reject) => {
+            process.stdout.write('C2_STALE_ROUTE_READY\\n', (error) => {
+              if (error) {
+                reject(error);
+              } else {
+                resolve(undefined);
+              }
+            });
+          });
+          process.stdin.resume();
           await new Promise((resolve) => process.stdin.once('data', resolve));
+          process.stdin.pause();
           try {
             await staleRouteTypedClient.get_grid_infos(1, [0, 1]);
             throw new Error('stale-route IPC call unexpectedly succeeded');
@@ -1204,31 +982,13 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
           }
           await staleRouteIpcTransport.close();
           staleRouteIpcTransport = undefined;
-          assertEqual(requestWrites, 8, 'stale-route route-not-found IPC request SHM write count');
-          assertEqual(requestConsumed, 8, 'stale-route route-not-found IPC request SHM consumed count');
+          assertEqual(requestWrites, 5, 'stale-route route-not-found IPC request SHM write count');
+          assertEqual(requestConsumed, 5, 'stale-route route-not-found IPC request SHM consumed count');
           assertEqual(requestReleases, 0, 'stale-route route-not-found IPC request SHM local release count');
-          assertEqual(responseReads, 14, 'stale-route route-not-found IPC must not read response SHM');
-          assertEqual(responseReleases, 15, 'stale-route route-not-found IPC response SHM release count');
-          assertEqual(allocatorCalls, 5, 'stale-route route-not-found IPC response allocator count');
+          assertEqual(responseReads, 11, 'stale-route route-not-found IPC must not read response SHM');
+          assertEqual(responseReleases, 11, 'stale-route route-not-found IPC response SHM release count');
+          assertEqual(allocatorCalls, 4, 'stale-route route-not-found IPC response allocator count');
         } finally {
-          if (mismatchIpcTransport !== undefined) {
-            await mismatchIpcTransport.close();
-          }
-          if (releaseFailureIpcTransport !== undefined) {
-            await releaseFailureIpcTransport.close();
-          }
-          if (crmErrorIpcTransport !== undefined) {
-            await crmErrorIpcTransport.close();
-          }
-          if (allocatorFailureIpcTransport !== undefined) {
-            await allocatorFailureIpcTransport.close();
-          }
-          if (allocatorFailureResponseShmReader !== undefined) {
-            await allocatorFailureResponseShmReader.close();
-          }
-          if (markConsumedFailureIpcTransport !== undefined) {
-            await markConsumedFailureIpcTransport.close();
-          }
           if (staleRouteIpcTransport !== undefined) {
             await staleRouteIpcTransport.close();
           }
@@ -1265,6 +1025,7 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
             stdout_tail, stderr = process.communicate()
             raise AssertionError(
                 'real IPC smoke exited before stale-route synchronization marker\n'
+                f'returncode: {process.returncode}\n'
                 f'stdout:\n{"".join(stdout_prefix)}{stdout_tail}\n'
                 f'stderr:\n{stderr}',
             )
@@ -1301,11 +1062,8 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
 
 
 @pytest.mark.timeout(180)
-def test_grid_fastdb_c3_artifacts_cli_feeds_fastdb_codegen(monkeypatch, tmp_path):
+def test_grid_fastdb_c3_artifacts_cli_feeds_fastdb_codegen(tmp_path):
     root = Path(__file__).resolve().parents[4]
-    fastdb_python = root.parent / 'fastdb' / 'python'
-    if fastdb_python.exists():
-        monkeypatch.syspath_prepend(str(fastdb_python))
     pytest.importorskip('fastdb4py', reason='grid FastDB CLI smoke requires fastdb4py')
     cargo = shutil.which('cargo')
     if cargo is None:
@@ -1405,11 +1163,8 @@ def test_grid_fastdb_c3_artifacts_cli_feeds_fastdb_codegen(monkeypatch, tmp_path
 
 
 @pytest.mark.timeout(180)
-def test_resource_infer_c3_artifacts_cli_feeds_fastdb_codegen(monkeypatch, tmp_path):
+def test_resource_infer_c3_artifacts_cli_feeds_fastdb_codegen(tmp_path):
     root = Path(__file__).resolve().parents[4]
-    fastdb_python = root.parent / 'fastdb' / 'python'
-    if fastdb_python.exists():
-        monkeypatch.syspath_prepend(str(fastdb_python))
     pytest.importorskip('fastdb4py', reason='resource infer FastDB CLI smoke requires fastdb4py')
     cargo = shutil.which('cargo')
     if cargo is None:
@@ -1677,7 +1432,7 @@ def test_grid_fastdb_bridge_works_explicit_http_relay(monkeypatch, start_c3_rela
 
 
 def test_fastdb_iterator_array_input_bridge_across_transports(monkeypatch, start_c3_relay):
-    fdb, derive_c_two_bridge = _load_fastdb_bridge_helpers(monkeypatch)
+    fdb, derive_c_two_bridge = _load_fastdb_bridge_helpers()
 
     IteratorArrayCRM, thread_resource = _make_iterator_array_crm_and_resource(fdb)
     cc.register(

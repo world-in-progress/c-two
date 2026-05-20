@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
-from pathlib import Path
 from typing import (
     Mapping as TypingMapping,
     MutableMapping as TypingMutableMapping,
@@ -19,11 +18,7 @@ from c_two.transport.registry import _ProcessRegistry
 
 
 @pytest.fixture(autouse=True)
-def clean_runtime(monkeypatch):
-    root = Path(__file__).resolve().parents[4]
-    fastdb_python = root.parent / 'fastdb' / 'python'
-    if fastdb_python.exists():
-        monkeypatch.syspath_prepend(str(fastdb_python))
+def clean_runtime():
     previous_relay = settings.relay_anchor_address
     _ProcessRegistry.reset()
     try:
