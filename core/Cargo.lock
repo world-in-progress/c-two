@@ -184,6 +184,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "c2-mem-ffi"
+version = "0.1.0"
+dependencies = [
+ "c2-mem",
+]
+
+[[package]]
 name = "c2-runtime"
 version = "0.1.0"
 dependencies = [

@@ -1397,6 +1397,9 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
                 let chunk_processing_permit = match server.try_acquire_chunk_processing_permit() {
                     Ok(permit) => permit,
                     Err(limit) => {
+                        if c2_wire::flags::is_buddy(flags) {
+                            cleanup_buddy_request_block(&conn, payload);
+                        }
                         write_chunk_processing_capacity_error(&writer, request_id, limit).await;
                         continue;
                     }
@@ -1428,6 +1431,7 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
                             ?e,
                             "buddy call control decode error"
                         );
+                        cleanup_buddy_request_block(&conn, payload);
                         continue;
                     }
                 };
@@ -1436,6 +1440,7 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
                     {
                         Ok(admission) => admission,
                         Err(err) => {
+                            cleanup_buddy_request_block(&conn, payload);
                             write_route_admission_error(&writer, request_id, err).await;
                             continue;
                         }
@@ -1444,6 +1449,7 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
                     Ok(permit) => permit,
                     Err(limit) => {
                         drop(route_admission.pending_permit);
+                        cleanup_buddy_request_block(&conn, payload);
                         write_server_pending_capacity_error(&writer, request_id, limit).await;
                         continue;
                     }
@@ -2022,6 +2028,32 @@ async fn dispatch_call(
 // CRM call dispatch — buddy SHM
 // ---------------------------------------------------------------------------
 
+fn schedule_peer_buddy_gc_if_idle(conn: &Arc<Connection>, free_result: c2_mem::FreeResult) {
+    if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
+        let conn2 = Arc::clone(conn);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            conn2.gc_peer_buddy();
+        });
+    }
+}
+
+fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8]) {
+    let (bp, _) = match decode_buddy_payload(payload) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            warn!(
+                conn_id = conn.conn_id(),
+                ?e,
+                "buddy request cleanup decode error"
+            );
+            return;
+        }
+    };
+    let free_result = conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+    schedule_peer_buddy_gc_if_idle(conn, free_result);
+}
+
 async fn dispatch_admitted_buddy_call(
     server: &Server,
     conn: &Arc<Connection>,
@@ -2101,13 +2133,7 @@ async fn dispatch_admitted_buddy_call(
         };
         let free_result =
             conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
-        if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
-            let conn2 = Arc::clone(&conn);
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                conn2.gc_peer_buddy();
-            });
-        }
+        schedule_peer_buddy_gc_if_idle(conn, free_result);
         let mut combined = args;
         combined.extend_from_slice(extra_args);
         RequestData::Inline(combined)
@@ -2164,13 +2190,7 @@ async fn dispatch_chunked_call(
             Ok(data) => {
                 let free_result =
                     conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
-                if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
-                    let conn2 = Arc::clone(&conn);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                        conn2.gc_peer_buddy();
-                    });
-                }
+                schedule_peer_buddy_gc_if_idle(conn, free_result);
                 shm_data = Some(data);
             }
             Err(e) => {
@@ -4979,7 +4999,9 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
 
         let buddy_start = source
-            .find("if c2_wire::flags::is_buddy(flags)")
+            .find(
+                "if c2_wire::flags::is_buddy(flags) {\n                let (ctrl, ctrl_consumed) = match decode_call_control(payload, BUDDY_PAYLOAD_SIZE)",
+            )
             .expect("buddy branch must exist");
         let buddy_rest = &source[buddy_start..];
         let buddy_end = buddy_rest
@@ -5110,6 +5132,216 @@ mod tests {
         let (ctrl, _) = decode_call_control(&payload, BUDDY_PAYLOAD_SIZE).unwrap();
         assert_eq!(ctrl.route_name, "grid");
         assert_eq!(ctrl.method_idx, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_buddy_request_block_frees_unconsumed_peer_block() {
+        use c2_mem::MemHandle;
+        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+
+        let mut peer_pool = MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 1,
+                dedicated_crash_timeout_secs: 0.0,
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix("rq"),
+        );
+        let handle = peer_pool.try_alloc_shm(128).unwrap();
+        let (seg_idx, offset, len) = match handle {
+            MemHandle::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => (seg_idx, offset, len),
+            other => panic!("expected buddy request block, got {other:?}"),
+        };
+        let segment_name = peer_pool
+            .segment_name(seg_idx as usize)
+            .unwrap()
+            .to_string();
+        let segment_size = peer_pool
+            .segment(seg_idx as usize)
+            .unwrap()
+            .allocator()
+            .data_size() as u32;
+        assert_eq!(peer_pool.stats().alloc_count, 1);
+
+        let conn = Arc::new(Connection::new(7));
+        conn.init_peer_shm(
+            peer_pool.prefix().to_string(),
+            vec![(segment_name, segment_size)],
+        );
+        let payload = encode_buddy_payload(&BuddyPayload {
+            seg_idx,
+            offset,
+            data_size: len as u32,
+            is_dedicated: false,
+        });
+
+        cleanup_buddy_request_block(&conn, &payload);
+
+        assert_eq!(peer_pool.stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization() {
+        use c2_mem::MemHandle;
+        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+        use c2_wire::control::encode_call_control;
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct SeenShmRequest {
+            seg_idx: u16,
+            offset: u32,
+            data_size: u32,
+            is_dedicated: bool,
+        }
+
+        struct InspectingCallback {
+            seen: Arc<StdMutex<Option<SeenShmRequest>>>,
+        }
+
+        impl CrmCallback for InspectingCallback {
+            fn invoke(
+                &self,
+                route_name: &str,
+                method_idx: u16,
+                request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                assert_eq!(route_name, "grid");
+                assert_eq!(method_idx, 0);
+                match request {
+                    RequestData::Shm {
+                        pool,
+                        seg_idx,
+                        offset,
+                        data_size,
+                        is_dedicated,
+                    } => {
+                        *self.seen.lock().unwrap() = Some(SeenShmRequest {
+                            seg_idx,
+                            offset,
+                            data_size,
+                            is_dedicated,
+                        });
+                        cleanup_request(RequestData::Shm {
+                            pool,
+                            seg_idx,
+                            offset,
+                            data_size,
+                            is_dedicated,
+                        });
+                        Ok(ResponseMeta::Inline(b"ok".to_vec()))
+                    }
+                    other => {
+                        panic!("expected buddy dispatch to preserve SHM request, got {other:?}")
+                    }
+                }
+            }
+        }
+
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("buddy_callback_shm"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let seen = Arc::new(StdMutex::new(None));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(InspectingCallback {
+            seen: Arc::clone(&seen),
+        });
+        server.register_route(route).await.unwrap();
+
+        let mut peer_pool = MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 1,
+                dedicated_crash_timeout_secs: 0.0,
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix("rqcb"),
+        );
+        let handle = peer_pool.try_alloc_shm(128).unwrap();
+        let (seg_idx, offset, len) = match handle {
+            MemHandle::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => (seg_idx, offset, len),
+            other => panic!("expected buddy request block, got {other:?}"),
+        };
+        let segment_name = peer_pool
+            .segment_name(seg_idx as usize)
+            .unwrap()
+            .to_string();
+        let segment_size = peer_pool
+            .segment(seg_idx as usize)
+            .unwrap()
+            .allocator()
+            .data_size() as u32;
+        assert_eq!(peer_pool.stats().alloc_count, 1);
+
+        let conn = Arc::new(Connection::new(70));
+        conn.init_peer_shm(
+            peer_pool.prefix().to_string(),
+            vec![(segment_name, segment_size)],
+        );
+
+        let mut payload = encode_buddy_payload(&BuddyPayload {
+            seg_idx,
+            offset,
+            data_size: len as u32,
+            is_dedicated: false,
+        })
+        .to_vec();
+        let call_control = encode_call_control("grid", 0).unwrap();
+        let ctrl_consumed = call_control.len();
+        payload.extend_from_slice(&call_control);
+
+        let admission = match reserve_route_execution(&server, "grid", 0).await {
+            Ok(admission) => admission,
+            Err(_) => panic!("route admission should succeed"),
+        };
+        let pending_permit = server.try_acquire_pending_request().unwrap();
+        dispatch_admitted_buddy_call(
+            &server,
+            &conn,
+            77,
+            &payload,
+            ctrl_consumed,
+            admission.route,
+            0,
+            &closed_writer(),
+            pending_permit,
+            admission.pending_permit,
+        )
+        .await;
+
+        let observed = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("callback should receive the buddy request");
+        assert_eq!(
+            observed,
+            SeenShmRequest {
+                seg_idx,
+                offset,
+                data_size: len as u32,
+                is_dedicated: false,
+            }
+        );
+        assert_eq!(peer_pool.stats().alloc_count, 0);
     }
 
     // -- chunked reassembly via ChunkRegistry --

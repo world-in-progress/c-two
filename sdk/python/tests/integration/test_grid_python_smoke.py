@@ -7,7 +7,6 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.crm.codec import _clear_codec_registry_for_tests
 from c_two.transport.registry import _ProcessRegistry
 
 
@@ -15,13 +14,11 @@ from c_two.transport.registry import _ProcessRegistry
 def clean_runtime():
     previous_relay = settings.relay_anchor_address
     _ProcessRegistry.reset()
-    _clear_codec_registry_for_tests()
     try:
         yield
     finally:
         _ProcessRegistry.reset()
         settings.relay_anchor_address = previous_relay
-        _clear_codec_registry_for_tests()
 
 
 def _load_grid(monkeypatch):
@@ -30,15 +27,14 @@ def _load_grid(monkeypatch):
     root = Path(__file__).resolve().parents[4]
     monkeypatch.syspath_prepend(str(root / 'examples/python'))
     for module_name in (
-        'grid.grid_contract',
         'grid.nested_grid',
-        'grid.transferables',
+        'grid.grid_py_crm',
     ):
         sys.modules.pop(module_name, None)
-    from grid.grid_contract import Grid
     from grid.nested_grid import NestedGrid
+    from grid.grid_py_crm import GridPython
 
-    return Grid, NestedGrid
+    return GridPython, NestedGrid
 
 
 def _make_grid_resource(NestedGrid):
@@ -66,11 +62,15 @@ def _exercise_grid(grid) -> None:
     assert keys == ['2-0', '2-1', '2-4', '2-5']
 
 
-def test_grid_arrow_payloads_work_thread_local(monkeypatch):
-    Grid, NestedGrid = _load_grid(monkeypatch)
-    cc.register(Grid, _make_grid_resource(NestedGrid), name='grid-arrow-thread')
+def test_grid_python_payloads_work_thread_local(monkeypatch):
+    GridPython, NestedGrid = _load_grid(monkeypatch)
+    cc.register(
+        GridPython,
+        _make_grid_resource(NestedGrid),
+        name='grid-python-thread',
+    )
 
-    grid = cc.connect(Grid, name='grid-arrow-thread')
+    grid = cc.connect(GridPython, name='grid-python-thread')
     try:
         assert grid.client._mode == 'thread'  # noqa: SLF001
         _exercise_grid(grid)
@@ -78,16 +78,20 @@ def test_grid_arrow_payloads_work_thread_local(monkeypatch):
         cc.close(grid)
 
 
-def test_grid_arrow_payloads_work_direct_ipc_with_bad_relay(monkeypatch):
-    Grid, NestedGrid = _load_grid(monkeypatch)
-    cc.register(Grid, _make_grid_resource(NestedGrid), name='grid-arrow-ipc')
+def test_grid_python_payloads_work_direct_ipc_with_bad_relay(monkeypatch):
+    GridPython, NestedGrid = _load_grid(monkeypatch)
+    cc.register(
+        GridPython,
+        _make_grid_resource(NestedGrid),
+        name='grid-python-ipc',
+    )
     address = cc.server_address()
     assert address is not None
 
     previous_relay = settings.relay_anchor_address
     settings.relay_anchor_address = 'http://127.0.0.1:9'
     try:
-        grid = cc.connect(Grid, name='grid-arrow-ipc', address=address)
+        grid = cc.connect(GridPython, name='grid-python-ipc', address=address)
     finally:
         settings.relay_anchor_address = previous_relay
 
@@ -98,13 +102,17 @@ def test_grid_arrow_payloads_work_direct_ipc_with_bad_relay(monkeypatch):
         cc.close(grid)
 
 
-def test_grid_arrow_payloads_work_explicit_http_relay(monkeypatch, start_c3_relay):
-    Grid, NestedGrid = _load_grid(monkeypatch)
+def test_grid_python_payloads_work_explicit_http_relay(monkeypatch, start_c3_relay):
+    GridPython, NestedGrid = _load_grid(monkeypatch)
     relay = start_c3_relay()
     cc.set_relay_anchor(relay.url)
-    cc.register(Grid, _make_grid_resource(NestedGrid), name='grid-arrow-relay')
+    cc.register(
+        GridPython,
+        _make_grid_resource(NestedGrid),
+        name='grid-python-relay',
+    )
 
-    grid = cc.connect(Grid, name='grid-arrow-relay', address=relay.url)
+    grid = cc.connect(GridPython, name='grid-python-relay', address=relay.url)
     try:
         assert grid.client._mode == 'http'  # noqa: SLF001
         _exercise_grid(grid)

@@ -1,0 +1,34 @@
+{
+  "name": "@c-two/c2-mem-ffi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/native/"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "$NODE scripts/build-types.mjs",
+    "build:node-addon": "$NODE scripts/build-node-addon.mjs",
+    "build:rust": "$NODE scripts/build-rust.mjs",
+    "pretest": "$NODE scripts/build-runtime.mjs",
+    "prepack": "$NODE scripts/build-runtime.mjs",
+    "pack:check": "$NODE scripts/pack-check.mjs",
+    "test:node-addon": "$NODE scripts/test-node-addon.mjs",
+    "typecheck": "$NODE scripts/build-types.mjs --no-emit",
+    "test": "$NODE --test tests/*.test.mjs"
+  }
+}

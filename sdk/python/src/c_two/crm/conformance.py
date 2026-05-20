@@ -3,17 +3,36 @@ from __future__ import annotations
 import inspect
 from typing import Any, get_type_hints
 
+from .bridge import ResourceBridge, normalize_bridge_map
 from .contract import crm_contract_identity
 from .methods import rpc_method_names
 
 
-def validate_resource_conformance(crm_class: type, resource: object) -> None:
+def validate_resource_conformance(
+    crm_class: type,
+    resource: object,
+    *,
+    bridge: dict[str, ResourceBridge] | None = None,
+) -> None:
     crm_contract_identity(crm_class)
-    for method_name in rpc_method_names(crm_class):
-        _validate_method(crm_class, resource, method_name)
+    methods = rpc_method_names(crm_class)
+    bridge_map = normalize_bridge_map(bridge, method_names=methods)
+    for method_name in methods:
+        _validate_method(
+            crm_class,
+            resource,
+            method_name,
+            bridge=bridge_map.get(method_name),
+        )
 
 
-def _validate_method(crm_class: type, resource: object, method_name: str) -> None:
+def _validate_method(
+    crm_class: type,
+    resource: object,
+    method_name: str,
+    *,
+    bridge: ResourceBridge | None,
+) -> None:
     resource_method = getattr(resource, method_name, None)
     if resource_method is None or not callable(resource_method):
         raise TypeError(
@@ -26,14 +45,20 @@ def _validate_method(crm_class: type, resource: object, method_name: str) -> Non
     resource_signature = inspect.signature(inspect.unwrap(resource_method))
     crm_params = _callable_params(crm_signature, skip_self=True)
     resource_params = _callable_params(resource_signature, skip_self=False)
-    _validate_parameter_shape(method_name, crm_params, resource_params)
-    _validate_annotations(
-        method_name,
-        crm_method,
-        resource_method,
-        crm_params,
-        resource_params,
-    )
+    validate_input = bridge is None or bridge.input is None
+    validate_output = bridge is None or bridge.output is None
+    if validate_input:
+        _validate_parameter_shape(method_name, crm_params, resource_params)
+    if validate_input or validate_output:
+        _validate_annotations(
+            method_name,
+            crm_method,
+            resource_method,
+            crm_params,
+            resource_params,
+            validate_parameters=validate_input,
+            validate_return=validate_output,
+        )
 
 
 def _callable_params(
@@ -114,6 +139,9 @@ def _validate_annotations(
     resource_method: object,
     crm_params: list[inspect.Parameter],
     resource_params: list[inspect.Parameter],
+    *,
+    validate_parameters: bool,
+    validate_return: bool,
 ) -> None:
     crm_hints = _type_hints(crm_method, method_name, 'CRM')
     resource_hints = _type_hints(resource_method, method_name, 'resource')
@@ -126,19 +154,20 @@ def _validate_annotations(
         }
     ]
 
-    for crm_param, resource_param in zip(crm_params, resource_positional):
-        if resource_param.name not in resource_hints:
-            continue
-        crm_annotation = _normalize_annotation(crm_hints.get(crm_param.name))
-        resource_annotation = _normalize_annotation(resource_hints[resource_param.name])
-        if crm_annotation != resource_annotation:
-            raise TypeError(
-                f'{method_name}.{crm_param.name} annotation mismatch: CRM '
-                f'{_annotation_name(crm_annotation)}, resource '
-                f'{_annotation_name(resource_annotation)}.',
-            )
+    if validate_parameters:
+        for crm_param, resource_param in zip(crm_params, resource_positional):
+            if resource_param.name not in resource_hints:
+                continue
+            crm_annotation = _normalize_annotation(crm_hints.get(crm_param.name))
+            resource_annotation = _normalize_annotation(resource_hints[resource_param.name])
+            if crm_annotation != resource_annotation:
+                raise TypeError(
+                    f'{method_name}.{crm_param.name} annotation mismatch: CRM '
+                    f'{_annotation_name(crm_annotation)}, resource '
+                    f'{_annotation_name(resource_annotation)}.',
+                )
 
-    if 'return' in resource_hints:
+    if validate_return and 'return' in resource_hints:
         crm_return = _normalize_annotation(crm_hints.get('return'))
         resource_return = _normalize_annotation(resource_hints['return'])
         if crm_return != resource_return:

@@ -1,0 +1,13 @@
+[package]
+name = "c2-mem-ffi"
+edition.workspace = true
+version.workspace = true
+description = "C ABI substrate for C-Two c2-mem runtime adapters"
+
+[lib]
+name = "c2_mem_ffi"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+c2-mem = { path = "../c2-mem" }
+

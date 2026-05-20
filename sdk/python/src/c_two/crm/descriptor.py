@@ -7,7 +7,12 @@ import types
 from typing import Any, ForwardRef, Union, get_args, get_origin, get_type_hints
 
 from .contract import crm_contract_identity
-from .codec import CodecRef, codec_ref_for_transferable, resolve_codec
+from ._payload_abi import (
+    PayloadAbiRef,
+    MethodPayloadAbiShape,
+    MethodParameterShape,
+    payload_abi_ref_for_transferable,
+)
 from .meta import MethodAccess, get_method_access
 from .methods import rpc_method_names
 from .transferable import DEFAULT_PICKLE_PROTOCOL, Transferable
@@ -22,6 +27,9 @@ _PICKLE_DEFAULT_REF = {
     'python_min': '3.10',
     'portable': False,
     'version': f'pickle-protocol-{DEFAULT_PICKLE_PROTOCOL}',
+}
+_FASTDB_FIRST_PORTABLE_PAYLOAD_ABI_IDS = {
+    'org.fastdb.call-db',
 }
 _PRIMITIVES = {
     bool: 'bool',
@@ -62,6 +70,10 @@ def build_contract_fingerprints(
     methods: list[str] | None = None,
 ) -> tuple[str, str]:
     descriptor = build_contract_descriptor(crm_class, methods)
+    return _fingerprints_from_descriptor(descriptor)
+
+
+def _fingerprints_from_descriptor(descriptor: dict[str, Any]) -> tuple[str, str]:
     abi_descriptor = {
         'crm': descriptor['crm'],
         'methods': [
@@ -98,8 +110,14 @@ def build_portable_contract_descriptor(
     methods: list[str] | None = None,
 ) -> dict[str, Any]:
     descriptor = build_contract_descriptor(crm_class, methods, portable=True)
+    runtime_descriptor = build_contract_descriptor(crm_class, methods)
+    abi_hash, signature_hash = _fingerprints_from_descriptor(runtime_descriptor)
     return {
         'crm': descriptor['crm'],
+        'fingerprints': {
+            'abi_hash': abi_hash,
+            'signature_hash': signature_hash,
+        },
         'methods': [
             {
                 'access': method['access'],
@@ -121,6 +139,185 @@ def build_portable_contract_descriptor(
         ],
         'schema': _PORTABLE_CONTRACT_SCHEMA,
     }
+
+
+def build_contract_payload_abi_artifacts(
+    crm_class: type,
+    methods: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    method_names = rpc_method_names(crm_class) if methods is None else list(methods)
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for method_name in method_names:
+        method = getattr(crm_class, method_name)
+        for transferable_cls in (
+            getattr(method, '_input_transferable', None),
+            getattr(method, '_output_transferable', None),
+        ):
+            for artifact in _payload_abi_artifacts_for_transferable(transferable_cls):
+                key = _canonical_json(artifact)
+                if key in seen:
+                    continue
+                seen.add(key)
+                artifacts.append(artifact)
+    return artifacts
+
+
+def export_contract_payload_abi_artifacts(
+    crm_class: type,
+    methods: list[str] | None = None,
+    *,
+    pretty: bool = False,
+) -> str:
+    artifacts = build_contract_payload_abi_artifacts(crm_class, methods)
+    if pretty:
+        return json.dumps(artifacts, sort_keys=True, indent=2) + '\n'
+    return json.dumps(artifacts, sort_keys=True, separators=(',', ':'))
+
+
+def contract_descriptor_diagnostics(
+    crm_class: type,
+    methods: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    method_names = rpc_method_names(crm_class) if methods is None else list(methods)
+    diagnostics.extend(_fastdb_method_payload_abi_diagnostics_for_contract(crm_class, method_names))
+    try:
+        descriptor = build_contract_descriptor(crm_class, methods)
+    except Exception as exc:
+        diagnostics.append({
+            'code': 'descriptor_build_failed',
+            'message': f'Contract descriptor could not be built: {exc}',
+            'severity': 'error',
+        })
+        return _dedupe_diagnostics(diagnostics)
+    for method in descriptor['methods']:
+        method_name = method['name']
+        wire = method['wire']
+        for position in ('input', 'output'):
+            diagnostic = _fastdb_first_wire_diagnostic(
+                method_name,
+                position,
+                wire.get(position),
+            )
+            if diagnostic is not None:
+                diagnostics.append(diagnostic)
+    return _dedupe_diagnostics(diagnostics)
+
+
+def _fastdb_method_payload_abi_diagnostics_for_contract(
+    crm_class: type,
+    method_names: list[str],
+) -> list[dict[str, Any]]:
+    crm_ns, crm_name, crm_ver = crm_contract_identity(crm_class)
+    diagnostics: list[dict[str, Any]] = []
+    for method_name in method_names:
+        try:
+            method = getattr(crm_class, method_name)
+            signature_target = inspect.unwrap(method)
+            sig = inspect.signature(signature_target)
+            type_hints = _resolved_type_hints(signature_target, method_name)
+        except Exception as exc:
+            diagnostics.append({
+                'code': 'fastdb_diagnostics_unavailable',
+                'message': f'FastDB diagnostics for {method_name} could not inspect annotations: {exc}',
+                'method': method_name,
+                'severity': 'error',
+            })
+            continue
+        payload_abi_context = dict(getattr(method, '_payload_abi_context', None) or {})
+        payload_abi_context.setdefault('crm_namespace', crm_ns)
+        payload_abi_context.setdefault('crm_name', crm_name)
+        payload_abi_context.setdefault('crm_version', crm_ver)
+        payload_abi_context.setdefault('method_name', method_name)
+        signature_params = [
+            param
+            for index, param in enumerate(sig.parameters.values())
+            if not (index == 0 and param.name in {'self', 'cls'})
+        ]
+        parameters = tuple(
+            MethodParameterShape(
+                name=param.name,
+                annotation=type_hints[param.name],
+                default=param.default,
+                kind=param.kind.name,
+            )
+            for param in signature_params
+            if param.name in type_hints
+        )
+        input_transferable = getattr(method, '_input_transferable', None)
+        output_transferable = getattr(method, '_output_transferable', None)
+        if parameters:
+            shape = MethodPayloadAbiShape(
+                method_name=method_name,
+                direction='input',
+                crm_namespace=crm_ns,
+                crm_name=crm_name,
+                crm_version=crm_ver,
+                parameters=parameters,
+            )
+            context = dict(payload_abi_context, position='input')
+            if _payload_abi_ref_for_annotation(input_transferable) is None:
+                diagnostics.extend(_fastdb_method_payload_abi_diagnostics(shape, context))
+        if 'return' in type_hints and type_hints['return'] not in (None, type(None)):
+            shape = MethodPayloadAbiShape(
+                method_name=method_name,
+                direction='output',
+                crm_namespace=crm_ns,
+                crm_name=crm_name,
+                crm_version=crm_ver,
+                return_annotation=type_hints['return'],
+            )
+            context = dict(payload_abi_context, position='output')
+            if _payload_abi_ref_for_annotation(output_transferable) is None:
+                diagnostics.extend(_fastdb_method_payload_abi_diagnostics(shape, context))
+    return diagnostics
+
+
+def _fastdb_method_payload_abi_diagnostics(
+    shape: MethodPayloadAbiShape,
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        from c_two.fastdb.call_db import diagnostics_for_method_payload_abi
+    except ImportError:
+        return []
+    result = diagnostics_for_method_payload_abi(shape, context)
+    diagnostics: list[dict[str, Any]] = []
+    for item in result:
+        if not isinstance(item, dict):
+            raise TypeError('FastDB method payload ABI diagnostics must be dicts.')
+        payload = dict(item)
+        payload.setdefault('method', shape.method_name)
+        payload.setdefault('position', shape.direction)
+        payload.setdefault('planner', 'c_two.fastdb.call_db')
+        payload.setdefault('severity', 'warning')
+        message = payload.get('message')
+        if not isinstance(message, str) or not message:
+            payload['message'] = (
+                f'c_two.fastdb.call_db reported a payload ABI diagnostic for '
+                f'{shape.method_name}.{shape.direction}.'
+            )
+        diagnostics.append(payload)
+    return diagnostics
+
+
+def _dedupe_diagnostics(diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[object, ...]] = set()
+    for diagnostic in diagnostics:
+        key = (
+            diagnostic.get('code'),
+            diagnostic.get('method'),
+            diagnostic.get('position'),
+            diagnostic.get('reason'),
+            diagnostic.get('message'),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(diagnostic)
+    return deduped
 
 
 def export_contract_descriptor(
@@ -161,9 +358,15 @@ def _method_descriptor(
     sig = inspect.signature(signature_target)
     type_hints = _resolved_type_hints(signature_target, method_name)
     transfer = getattr(method, '__cc_transfer__', None) or {}
-    codec_context = getattr(method, '_codec_context', None) or {}
+    payload_abi_context = getattr(method, '_payload_abi_context', None) or {}
     input_transferable = getattr(method, '_input_transferable', None)
     output_transferable = getattr(method, '_output_transferable', None)
+    input_method_payload_abi_aggregate = bool(
+        getattr(method, '_input_method_payload_abi_aggregate', False),
+    )
+    output_method_payload_abi_aggregate = bool(
+        getattr(method, '_output_method_payload_abi_aggregate', False),
+    )
     buffer_mode = getattr(method, '_input_buffer_mode', transfer.get('buffer', 'view'))
 
     signature_params = [
@@ -171,9 +374,9 @@ def _method_descriptor(
         for index, param in enumerate(sig.parameters.values())
         if not (index == 0 and param.name in {'self', 'cls'})
     ]
-    input_annotation_ref = _codec_ref_for_annotation(input_transferable)
+    input_annotation_ref = _payload_abi_ref_for_annotation(input_transferable)
     input_annotation_transferable = input_transferable
-    if len(signature_params) != 1:
+    if len(signature_params) != 1 and not input_method_payload_abi_aggregate:
         input_annotation_ref = None
         input_annotation_transferable = None
 
@@ -196,10 +399,11 @@ def _method_descriptor(
             'annotation': _annotation_descriptor(
                 annotation,
                 method_name,
-                codec_ref=input_annotation_ref,
-                codec_context=codec_context,
+                payload_abi_ref=input_annotation_ref,
+                payload_abi_context=payload_abi_context,
                 portable=portable,
                 transferable_cls=input_annotation_transferable,
+                aggregate_payload_abi=input_method_payload_abi_aggregate,
             ),
             'default': _default_descriptor(param.default, method_name, param.name),
             'kind': param.kind.name,
@@ -224,10 +428,11 @@ def _method_descriptor(
         'return': _annotation_descriptor(
             return_annotation,
             method_name,
-            codec_ref=_codec_ref_for_annotation(output_transferable),
-            codec_context=codec_context,
+            payload_abi_ref=_payload_abi_ref_for_annotation(output_transferable),
+            payload_abi_context=payload_abi_context,
             portable=portable,
             transferable_cls=output_transferable,
+            aggregate_payload_abi=output_method_payload_abi_aggregate,
         ),
         'transfer': {
             'input': _transfer_annotation_descriptor(input_transferable),
@@ -257,10 +462,11 @@ def _annotation_descriptor(
     annotation: Any,
     method_name: str,
     *,
-    codec_ref: CodecRef | None = None,
-    codec_context: dict[str, Any] | None = None,
+    payload_abi_ref: PayloadAbiRef | None = None,
+    payload_abi_context: dict[str, Any] | None = None,
     portable: bool = False,
     transferable_cls: type | None = None,
+    aggregate_payload_abi: bool = False,
 ) -> dict[str, Any]:
     if annotation is inspect.Signature.empty:
         raise TypeError(f'{method_name} contains a missing annotation.')
@@ -276,11 +482,16 @@ def _annotation_descriptor(
         return {'kind': 'primitive', 'name': _PRIMITIVES[annotation]}
     if annotation in _BARE_CONTAINERS:
         raise TypeError(f'{method_name} uses a bare container annotation.')
+    if aggregate_payload_abi and payload_abi_ref is not None:
+        return {
+            'codec': payload_abi_ref.to_wire_ref(),
+            'kind': 'codec',
+        }
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin in {Union, types.UnionType}:
         items = [
-            _annotation_descriptor(arg, method_name, codec_context=codec_context, portable=portable)
+            _annotation_descriptor(arg, method_name, payload_abi_context=payload_abi_context, portable=portable)
             for arg in args
         ]
         items.sort(key=_canonical_json)
@@ -288,13 +499,13 @@ def _annotation_descriptor(
     if origin is list:
         if not args:
             raise TypeError(f'{method_name} uses a bare container annotation.')
-        item_codec_ref = _item_codec_ref_for_transferable(transferable_cls)
+        item_payload_abi_ref = _item_payload_abi_ref_for_transferable(transferable_cls)
         return {
             'item': _annotation_descriptor(
                 args[0],
                 method_name,
-                codec_ref=item_codec_ref,
-                codec_context=codec_context,
+                payload_abi_ref=item_payload_abi_ref,
+                payload_abi_context=payload_abi_context,
                 portable=portable,
             ),
             'kind': 'list',
@@ -306,14 +517,14 @@ def _annotation_descriptor(
             'key': _annotation_descriptor(
                 args[0],
                 method_name,
-                codec_context=codec_context,
+                payload_abi_context=payload_abi_context,
                 portable=portable,
             ),
             'kind': 'dict',
             'value': _annotation_descriptor(
                 args[1],
                 method_name,
-                codec_context=codec_context,
+                payload_abi_context=payload_abi_context,
                 portable=portable,
             ),
         }
@@ -325,38 +536,28 @@ def _annotation_descriptor(
                 'item': _annotation_descriptor(
                     args[0],
                     method_name,
-                    codec_context=codec_context,
+                    payload_abi_context=payload_abi_context,
                     portable=portable,
                 ),
                 'kind': 'tuple_variadic',
             }
         return {
             'items': [
-                _annotation_descriptor(arg, method_name, codec_context=codec_context, portable=portable)
+                _annotation_descriptor(arg, method_name, payload_abi_context=payload_abi_context, portable=portable)
                 for arg in args
             ],
             'kind': 'tuple',
         }
 
-    if codec_ref is not None:
+    if payload_abi_ref is not None:
         return {
-            'codec': codec_ref.to_wire_ref(),
+            'codec': payload_abi_ref.to_wire_ref(),
             'kind': 'codec',
         }
     if _is_transferable_type(annotation):
         return {
             'abi_ref': _transferable_abi_ref(annotation),
             'kind': 'transferable',
-        }
-    resolution_context = dict(codec_context or {})
-    resolution_context['method'] = method_name
-    resolution_context['method_name'] = method_name
-    resolution_context['position'] = 'annotation'
-    binding = resolve_codec(annotation, resolution_context)
-    if binding is not None:
-        return {
-            'codec': binding.codec_ref.to_wire_ref(),
-            'kind': 'codec',
         }
     if not portable and isinstance(annotation, type):
         return _python_type_descriptor(annotation)
@@ -380,13 +581,13 @@ def _python_type_descriptor(annotation: type) -> dict[str, str]:
     }
 
 
-def _item_codec_ref_for_transferable(transferable_cls: type | None) -> CodecRef | None:
+def _item_payload_abi_ref_for_transferable(transferable_cls: type | None) -> PayloadAbiRef | None:
     if transferable_cls is None:
         return None
-    ref = getattr(transferable_cls, '_c2_item_codec_ref', None)
+    ref = getattr(transferable_cls, '_c2_item_payload_abi_ref', None)
     if ref is None:
         return None
-    if isinstance(ref, CodecRef):
+    if isinstance(ref, PayloadAbiRef):
         return ref
     return None
 
@@ -442,12 +643,12 @@ def _transfer_annotation_descriptor(transferable_cls: type | None) -> dict[str, 
     return _transferable_abi_ref(transferable_cls)
 
 
-def _codec_ref_for_annotation(transferable_cls: type | None) -> CodecRef | None:
+def _payload_abi_ref_for_annotation(transferable_cls: type | None) -> PayloadAbiRef | None:
     if transferable_cls is None or _is_default_transferable(transferable_cls):
         return None
     if not _is_transferable_type(transferable_cls):
         return None
-    return codec_ref_for_transferable(transferable_cls)
+    return payload_abi_ref_for_transferable(transferable_cls)
 
 
 def _transferable_abi_ref(transferable_cls: type) -> dict[str, Any]:
@@ -457,9 +658,9 @@ def _transferable_abi_ref(transferable_cls: type) -> dict[str, Any]:
         raise TypeError(
             f'{transferable_cls!r} is not a Transferable subclass.',
         )
-    codec_ref = codec_ref_for_transferable(transferable_cls)
-    if codec_ref is not None:
-        return codec_ref.to_wire_ref()
+    payload_abi_ref = payload_abi_ref_for_transferable(transferable_cls)
+    if payload_abi_ref is not None:
+        return payload_abi_ref.to_wire_ref()
 
     abi = getattr(transferable_cls, '__cc_transferable_abi__', None) or {}
     abi_id = abi.get('abi_id')
@@ -480,6 +681,32 @@ def _transferable_abi_ref(transferable_cls: type) -> dict[str, Any]:
         f'{transferable_cls.__name__} appears in a remote signature, but a '
         'dataclass-field ABI is not defined yet.',
     )
+
+
+def _payload_abi_artifacts_for_transferable(transferable_cls: type | None) -> tuple[dict[str, Any], ...]:
+    if transferable_cls is None:
+        return ()
+    raw_artifacts = getattr(transferable_cls, '__cc_payload_abi_artifacts__', ())
+    if raw_artifacts is None:
+        return ()
+    if isinstance(raw_artifacts, dict):
+        raw_items = (raw_artifacts,)
+    else:
+        try:
+            raw_items = tuple(raw_artifacts)
+        except TypeError as exc:
+            raise TypeError(
+                f'{transferable_cls.__name__}.__cc_payload_abi_artifacts__ must be a JSON object or iterable of JSON objects.',
+            ) from exc
+    artifacts: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            raise TypeError(
+                f'{transferable_cls.__name__}.__cc_payload_abi_artifacts__ entries must be JSON objects.',
+            )
+        _canonical_json(item)
+        artifacts.append(item)
+    return tuple(artifacts)
 
 
 def _is_default_transferable(transferable_cls: type) -> bool:
@@ -516,6 +743,58 @@ def _ensure_portable_wire_ref(
             f'{method_name} cannot be exported as a portable contract: '
             f'{position} uses python-pickle-default.',
         )
+    payload_abi_id = wire_ref.get('id')
+    if wire_ref.get('kind') != 'codec_ref' or not isinstance(payload_abi_id, str):
+        raise ValueError(
+            f'{method_name} cannot be exported as a portable contract: '
+            f'{position} does not use a PayloadAbiRef wire identity.',
+        )
+    if payload_abi_id not in _FASTDB_FIRST_PORTABLE_PAYLOAD_ABI_IDS:
+        raise ValueError(
+            f'{method_name} cannot be exported as a portable contract: '
+            f'{position} uses non-FastDB payload ABI {payload_abi_id}.',
+        )
+
+
+def _fastdb_first_wire_diagnostic(
+    method_name: str,
+    position: str,
+    wire_ref: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if wire_ref is None:
+        return None
+    base = {
+        'method': method_name,
+        'position': position,
+        'severity': 'warning',
+    }
+    if wire_ref.get('family') == 'python-pickle-default' or wire_ref.get('portable') is False:
+        return {
+            **base,
+            'code': 'python_only_pickle',
+            'message': (
+                f'{method_name}.{position} uses python-pickle-default; this method can run in Python-only mode but is not a fastdb-first portable CRM payload.'
+            ),
+        }
+    payload_abi_id = wire_ref.get('id')
+    if wire_ref.get('kind') != 'codec_ref' or not isinstance(payload_abi_id, str):
+        return {
+            **base,
+            'code': 'non_codec_wire_ref',
+            'message': (
+                f'{method_name}.{position} does not use a PayloadAbiRef wire identity and cannot be treated as a fastdb-first portable CRM payload.'
+            ),
+        }
+    if payload_abi_id not in _FASTDB_FIRST_PORTABLE_PAYLOAD_ABI_IDS:
+        return {
+            **base,
+            'code': 'non_fastdb_portable_payload_abi',
+            'payload_abi_id': payload_abi_id,
+            'message': (
+                f'{method_name}.{position} uses payload ABI {payload_abi_id}; strict fastdb-first CRM workflows require FastDB call-db PayloadAbiRef values or no payload.'
+            ),
+        }
+    return None
 
 
 def _canonical_json(value: object) -> str:

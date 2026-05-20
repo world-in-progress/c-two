@@ -146,7 +146,7 @@ def crm(*, namespace: str = 'cc', version: str = '0.1.0'):
             if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__', '__tag__'):
                 if getattr(value, _SHUTDOWN_ATTR, False):
                     continue  # @cc.on_shutdown methods are not RPC-callable
-                codec_context = {
+                payload_abi_context = {
                     'crm_namespace': namespace,
                     'crm_name': cls.__name__,
                     'crm_version': version,
@@ -156,13 +156,13 @@ def crm(*, namespace: str = 'cc', version: str = '0.1.0'):
                 if transfer_config:
                     decorated_methods[name] = auto_transfer(
                         value,
-                        codec_context=codec_context,
+                        payload_abi_context=payload_abi_context,
                         **transfer_config,
                     )
                 else:
                     decorated_methods[name] = auto_transfer(
                         value,
-                        codec_context=codec_context,
+                        payload_abi_context=payload_abi_context,
                     )
 
         # Define a new class with CRMMeta metaclass that inherits from the original class

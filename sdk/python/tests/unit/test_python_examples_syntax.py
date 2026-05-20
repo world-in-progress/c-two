@@ -179,3 +179,24 @@ def test_relay_client_env_file(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "relay_url=http://127.0.0.1:9137"
+
+
+def test_fastdb_relay_client_cli_wins(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
+
+    result = _parse_args(
+        "fastdb_relay_client.py",
+        ["--relay-url", "http://127.0.0.1:9140"],
+        env={"C2_ENV_FILE": str(env_file)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "relay_url=http://127.0.0.1:9140"
+
+
+def test_fastdb_relay_resource_rejects_ipc():
+    result = _parse_args("fastdb_relay_resource.py", ["--relay-url", "ipc://not-a-relay"])
+
+    assert result.returncode == 2
+    assert "http://" in result.stderr

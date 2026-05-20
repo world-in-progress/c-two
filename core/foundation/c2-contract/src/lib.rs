@@ -131,7 +131,7 @@ pub fn validate_portable_contract_descriptor_json(json_bytes: &[u8]) -> Result<(
 
 pub fn validate_portable_contract_descriptor_value(value: &Value) -> Result<(), ContractError> {
     let root = object_at(value, "$")?;
-    ensure_keys(root, "$", &["schema", "crm", "methods"])?;
+    ensure_keys(root, "$", &["schema", "crm", "fingerprints", "methods"])?;
     let schema = string_at(required(root, "$", "schema")?, "$.schema")?;
     if schema != PORTABLE_CONTRACT_SCHEMA {
         return Err(invalid(
@@ -148,6 +148,8 @@ pub fn validate_portable_contract_descriptor_value(value: &Value) -> Result<(), 
     let crm_ver = string_at(required(crm, crm_path, "version")?, "$.crm.version")?;
     validate_crm_tag(crm_ns, crm_name, crm_ver)?;
 
+    validate_fingerprints(required(root, "$", "fingerprints")?, "$.fingerprints")?;
+
     let methods = array_at(required(root, "$", "methods")?, "$.methods")?;
     let mut method_names = BTreeSet::new();
     for (index, method) in methods.iter().enumerate() {
@@ -155,6 +157,20 @@ pub fn validate_portable_contract_descriptor_value(value: &Value) -> Result<(), 
         validate_method_descriptor(method, &method_path, &mut method_names)?;
     }
     Ok(())
+}
+
+fn validate_fingerprints(value: &Value, path: &str) -> Result<(), ContractError> {
+    let object = object_at(value, path)?;
+    ensure_keys(object, path, &["abi_hash", "signature_hash"])?;
+    let abi_hash_path = format!("{path}.abi_hash");
+    let abi_hash = string_at(required(object, path, "abi_hash")?, &abi_hash_path)?;
+    validate_hash_text(&abi_hash_path, abi_hash)?;
+    let signature_hash_path = format!("{path}.signature_hash");
+    let signature_hash = string_at(
+        required(object, path, "signature_hash")?,
+        &signature_hash_path,
+    )?;
+    validate_hash_text(&signature_hash_path, signature_hash)
 }
 
 fn validate_method_descriptor(
@@ -678,6 +694,40 @@ mod tests {
     }
 
     #[test]
+    fn portable_descriptor_accepts_route_contract_fingerprints() {
+        let mut descriptor = valid_portable_descriptor();
+        descriptor["fingerprints"] = serde_json::json!({
+            "abi_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "signature_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        });
+
+        validate_portable_contract_descriptor_json(descriptor.to_string().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn portable_descriptor_rejects_invalid_route_contract_fingerprints() {
+        let mut descriptor = valid_portable_descriptor();
+        descriptor["fingerprints"] = serde_json::json!({
+            "abi_hash": "bad",
+            "signature_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        });
+
+        let err = validate_portable_contract_descriptor_json(descriptor.to_string().as_bytes())
+            .unwrap_err();
+        assert!(err.to_string().contains("abi_hash"));
+    }
+
+    #[test]
+    fn portable_descriptor_requires_route_contract_fingerprints() {
+        let mut descriptor = valid_portable_descriptor();
+        descriptor.as_object_mut().unwrap().remove("fingerprints");
+
+        let err = validate_portable_contract_descriptor_json(descriptor.to_string().as_bytes())
+            .unwrap_err();
+        assert!(err.to_string().contains("fingerprints"));
+    }
+
+    #[test]
     fn portable_descriptor_rejects_wrong_schema() {
         let mut descriptor = valid_portable_descriptor();
         descriptor["schema"] = Value::String("c-two.python.crm.descriptor.v2".to_string());
@@ -726,6 +776,51 @@ mod tests {
     }
 
     #[test]
+    fn portable_descriptor_rejects_non_string_codec_identity_fields() {
+        for (field, value) in [
+            ("version", serde_json::json!(1)),
+            ("schema", serde_json::json!(["example.schema.v1"])),
+            ("schema_sha256", serde_json::json!(null)),
+            ("media_type", serde_json::json!(false)),
+        ] {
+            let mut descriptor = valid_portable_descriptor();
+            descriptor["methods"][0]["wire"]["output"][field] = value;
+
+            let err = validate_portable_contract_descriptor_json(descriptor.to_string().as_bytes())
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("wire.output.{field}")),
+                "unexpected error for {field}: {err}"
+            );
+            assert!(
+                err.to_string().contains("expected string"),
+                "unexpected error for {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_descriptor_rejects_malformed_codec_capabilities() {
+        let mut descriptor = valid_portable_descriptor();
+        descriptor["methods"][0]["wire"]["output"]["capabilities"] =
+            Value::String("bytes".to_string());
+
+        let err = validate_portable_contract_descriptor_json(descriptor.to_string().as_bytes())
+            .unwrap_err();
+        assert!(err.to_string().contains("wire.output.capabilities"));
+        assert!(err.to_string().contains("expected array"));
+
+        let mut descriptor = valid_portable_descriptor();
+        descriptor["methods"][0]["wire"]["output"]["capabilities"] =
+            serde_json::json!(["bytes", 1]);
+
+        let err = validate_portable_contract_descriptor_json(descriptor.to_string().as_bytes())
+            .unwrap_err();
+        assert!(err.to_string().contains("wire.output.capabilities[1]"));
+        assert!(err.to_string().contains("expected string"));
+    }
+
+    #[test]
     fn portable_descriptor_rejects_bad_annotation_shape() {
         let mut descriptor = valid_portable_descriptor();
         descriptor["methods"][0]["parameters"][0]["type"] = serde_json::json!({
@@ -755,6 +850,10 @@ mod tests {
                 "namespace": "test.contract",
                 "name": "Portable",
                 "version": "0.1.0"
+            },
+            "fingerprints": {
+                "abi_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "signature_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
             },
             "methods": [
                 {

@@ -40,8 +40,10 @@ import threading
 from collections.abc import Mapping
 from typing import TypeVar
 
+from c_two.crm.bridge import ResourceBridge, normalize_bridge_map
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
+from c_two.crm.methods import rpc_method_names
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.settings import settings
 from c_two.error import (
@@ -240,6 +242,7 @@ class _ProcessRegistry:
         *,
         name: str,
         concurrency: ConcurrencyConfig | None = None,
+        bridge: dict[str, ResourceBridge] | None = None,
     ) -> str:
         """Register a CRM, making it available via :func:`connect`.
 
@@ -267,7 +270,15 @@ class _ProcessRegistry:
             The *name* string (echoed back for convenience).
         """
         crm_contract_identity(crm_class)
-        validate_resource_conformance(crm_class, crm_instance)
+        method_bridge_map = normalize_bridge_map(
+            bridge,
+            method_names=rpc_method_names(crm_class),
+        )
+        validate_resource_conformance(
+            crm_class,
+            crm_instance,
+            bridge=method_bridge_map,
+        )
         with self._lock:
             created_server = False
             try:
@@ -290,6 +301,7 @@ class _ProcessRegistry:
                     crm_instance,
                     concurrency,
                     name=name,
+                    bridge=method_bridge_map,
                     runtime_session=self._runtime_session,
                     relay_anchor_address=None,
                 )
@@ -705,6 +717,7 @@ def register(
     *,
     name: str,
     concurrency: ConcurrencyConfig | None = None,
+    bridge: dict[str, ResourceBridge] | None = None,
 ) -> str:
     """Register a CRM in the current process.
 
@@ -715,6 +728,7 @@ def register(
         crm_instance,
         name=name,
         concurrency=concurrency,
+        bridge=bridge,
     )
 
 

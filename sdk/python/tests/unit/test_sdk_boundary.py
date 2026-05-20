@@ -135,6 +135,65 @@ def test_top_level_exposes_public_override_schemas():
     } <= set(cc.__all__)
 
 
+def test_top_level_exposes_contract_projection_tools():
+    import c_two as cc
+    from c_two.crm.descriptor import (
+        contract_descriptor_diagnostics,
+        export_contract_payload_abi_artifacts,
+        export_contract_descriptor,
+    )
+    from c_two.crm.infer import infer_crm_from_resource
+
+    assert cc.contract_descriptor_diagnostics is contract_descriptor_diagnostics
+    assert cc.export_contract_payload_abi_artifacts is export_contract_payload_abi_artifacts
+    assert cc.export_contract_descriptor is export_contract_descriptor
+    assert cc.infer_crm_from_resource is infer_crm_from_resource
+    assert {
+        'contract_descriptor_diagnostics',
+        'export_contract_payload_abi_artifacts',
+        'export_contract_descriptor',
+        'infer_crm_from_resource',
+    } <= set(cc.__all__)
+
+
+def test_payload_abi_internals_are_not_public_sdk_surface():
+    import importlib.util
+
+    import c_two as cc
+
+    forbidden = {
+        'CodecBinding',
+        'CodecRef',
+        'MethodCodecShape',
+        'PayloadAbiBinding',
+        'PayloadAbiRef',
+        'bind_' + 'codec',
+        'use_' + 'codec',
+        'MethodPayloadAbiShape',
+        'MethodParameterShape',
+    }
+
+    assert forbidden.isdisjoint(set(cc.__all__))
+    for name in forbidden:
+        assert not hasattr(cc, name)
+
+    removed_package = 'c_two.' + 'pro' + 'viders'
+    assert importlib.util.find_spec(removed_package) is None
+
+
+def test_python_examples_do_not_import_removed_provider_package():
+    root = Path(__file__).resolve().parents[4]
+    examples_root = root / 'examples' / 'python'
+    removed_package = 'c_two.' + 'pro' + 'viders'
+    offenders = []
+    for path in examples_root.rglob('*.py'):
+        text = path.read_text(encoding='utf-8')
+        if removed_package in text:
+            offenders.append(str(path.relative_to(root)))
+
+    assert offenders == []
+
+
 def test_error_facade_does_not_reimplement_wire_codec():
     source_path = Path(__file__).resolve().parents[2] / "src" / "c_two" / "error.py"
     source = source_path.read_text(encoding="utf-8")

@@ -11,11 +11,15 @@ pub struct ContractArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ContractCommand {
+    /// Export payload ABI artifact descriptors from a Python CRM class.
+    Artifacts(PythonArtifactsArgs),
     /// Generate SDK artifacts from a portable descriptor.
     Codegen(CodegenArgs),
+    /// Report fastdb-first portability diagnostics for a Python CRM class.
+    Diagnose(PythonDiagnoseArgs),
     /// Export a portable descriptor from a Python CRM class.
     Export(PythonExportArgs),
-    /// Infer and export a portable descriptor from a Python resource class.
+    /// Infer a portable descriptor or diagnostics from a Python resource class.
     Infer(PythonInferArgs),
     /// Validate a portable c-two.contract.v1 descriptor.
     Validate(ValidateArgs),
@@ -33,9 +37,45 @@ pub struct CodegenArgs {
     pub command: CodegenCommand,
 }
 
+#[derive(Debug, Args)]
+pub struct PythonDiagnoseArgs {
+    /// Python CRM class target as module:ClassName.
+    pub target: String,
+    /// Python executable used for import/reflection. Defaults to C2_PYTHON or python3.
+    #[arg(long)]
+    pub python: Option<String>,
+    /// Limit diagnostics to one CRM method; repeatable.
+    #[arg(long = "method")]
+    pub methods: Vec<String>,
+    /// Write diagnostics JSON to this file instead of stdout.
+    #[arg(long)]
+    pub out: Option<String>,
+    /// Pretty-print diagnostics JSON.
+    #[arg(long)]
+    pub pretty: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PythonArtifactsArgs {
+    /// Python CRM class target as module:ClassName.
+    pub target: String,
+    /// Python executable used for import/reflection. Defaults to C2_PYTHON or python3.
+    #[arg(long)]
+    pub python: Option<String>,
+    /// Limit artifacts to one CRM method; repeatable.
+    #[arg(long = "method")]
+    pub methods: Vec<String>,
+    /// Write payload ABI artifact JSON to this file instead of stdout.
+    #[arg(long)]
+    pub out: Option<String>,
+    /// Pretty-print payload ABI artifact JSON.
+    #[arg(long)]
+    pub pretty: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum CodegenCommand {
-    /// Generate a dependency-neutral TypeScript client skeleton.
+    /// Generate a TypeScript client and optional C-Two FastDB helpers.
     Typescript(TypeScriptCodegenArgs),
 }
 
@@ -49,6 +89,15 @@ pub struct TypeScriptCodegenArgs {
     /// Fail when the descriptor references codecs without built-in TypeScript support.
     #[arg(long)]
     pub strict_codecs: bool,
+    /// FastDB schema descriptor JSON file or artifact bundle for C-Two FastDB helper generation; repeatable.
+    #[arg(long = "fastdb-schema")]
+    pub fastdb_schemas: Vec<String>,
+    /// Write generated C-Two FastDB TypeScript helpers to this file.
+    #[arg(long = "fastdb-out")]
+    pub fastdb_out: Option<String>,
+    /// Python executable used for C-Two FastDB helper generation. Defaults to C2_PYTHON or python3.
+    #[arg(long)]
+    pub python: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -88,21 +137,67 @@ pub struct PythonInferArgs {
     /// Python executable used for import/reflection. Defaults to C2_PYTHON or python3.
     #[arg(long)]
     pub python: Option<String>,
-    /// Write descriptor JSON to this file instead of stdout.
+    /// Write portability diagnostics for the inferred projection instead of exporting a portable descriptor.
+    #[arg(long)]
+    pub diagnose: bool,
+    /// Write payload ABI artifacts for the inferred projection instead of exporting a portable descriptor.
+    #[arg(long)]
+    pub artifacts: bool,
+    /// Write descriptor, diagnostics, or payload ABI artifact JSON to this file instead of stdout.
     #[arg(long)]
     pub out: Option<String>,
-    /// Pretty-print descriptor JSON.
+    /// Pretty-print descriptor, diagnostics, or payload ABI artifact JSON.
     #[arg(long)]
     pub pretty: bool,
 }
 
 pub fn run(args: ContractArgs) -> Result<()> {
     match args.command {
+        ContractCommand::Artifacts(args) => artifacts(args),
         ContractCommand::Codegen(args) => codegen(args),
+        ContractCommand::Diagnose(args) => diagnose(args),
         ContractCommand::Export(args) => export(args),
         ContractCommand::Infer(args) => infer(args),
         ContractCommand::Validate(args) => validate(&args.path),
     }
+}
+
+fn artifacts(args: PythonArtifactsArgs) -> Result<()> {
+    let mut py_args = vec![
+        "-m".to_string(),
+        "c_two.cli.contract".to_string(),
+        "artifacts".to_string(),
+        args.target,
+    ];
+    for method in args.methods {
+        py_args.push("--method".to_string());
+        py_args.push(method);
+    }
+    if args.pretty {
+        py_args.push("--pretty".to_string());
+    }
+    let payload = run_python_contract(args.python.as_deref(), &py_args)?;
+    validate_artifact_payload(&payload)?;
+    write_payload(&payload, args.out.as_deref())
+}
+
+fn diagnose(args: PythonDiagnoseArgs) -> Result<()> {
+    let mut py_args = vec![
+        "-m".to_string(),
+        "c_two.cli.contract".to_string(),
+        "diagnose".to_string(),
+        args.target,
+    ];
+    for method in args.methods {
+        py_args.push("--method".to_string());
+        py_args.push(method);
+    }
+    if args.pretty {
+        py_args.push("--pretty".to_string());
+    }
+    let payload = run_python_contract(args.python.as_deref(), &py_args)?;
+    validate_diagnostic_payload(&payload)?;
+    write_payload(&payload, args.out.as_deref())
 }
 
 fn validate(path: &str) -> Result<()> {
@@ -123,6 +218,19 @@ fn codegen(args: CodegenArgs) -> Result<()> {
 }
 
 fn codegen_typescript(args: TypeScriptCodegenArgs) -> Result<()> {
+    if args.fastdb_out.is_some() && args.fastdb_schemas.is_empty() {
+        return Err(anyhow!(
+            "--fastdb-out requires at least one --fastdb-schema"
+        ));
+    }
+    if !args.fastdb_schemas.is_empty() && args.fastdb_out.is_none() {
+        return Err(anyhow!("--fastdb-schema requires --fastdb-out"));
+    }
+    if !args.fastdb_schemas.is_empty() && args.path == "-" {
+        return Err(anyhow!(
+            "--fastdb-schema requires a descriptor file path, not stdin"
+        ));
+    }
     let payload = read_payload(&args.path)?;
     let generated = c2_codegen::generate_typescript_client(
         payload.as_bytes(),
@@ -131,7 +239,42 @@ fn codegen_typescript(args: TypeScriptCodegenArgs) -> Result<()> {
         },
     )
     .map_err(|err| anyhow!("{err}"))?;
-    write_payload(&generated, args.out.as_deref())
+    write_payload(&generated, args.out.as_deref())?;
+    if let Some(fastdb_out) = args.fastdb_out.as_deref() {
+        run_python_fastdb_typescript(
+            args.python.as_deref(),
+            &args.path,
+            fastdb_out,
+            &args.fastdb_schemas,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_python_fastdb_typescript(
+    python: Option<&str>,
+    contract_path: &str,
+    output_path: &str,
+    schema_paths: &[String],
+) -> Result<()> {
+    let mut py_args = vec![
+        "-m".to_string(),
+        "c_two.fastdb.typescript".to_string(),
+        contract_path.to_string(),
+        output_path.to_string(),
+    ];
+    for schema_path in schema_paths {
+        py_args.push("--schema".to_string());
+        py_args.push(schema_path.clone());
+    }
+    let payload = run_python_contract(python, &py_args)?;
+    if !payload.trim().is_empty() {
+        return Err(anyhow!(
+            "C-Two FastDB TypeScript helper generation wrote unexpected stdout: {}",
+            payload.trim()
+        ));
+    }
+    Ok(())
 }
 
 fn export(args: PythonExportArgs) -> Result<()> {
@@ -154,6 +297,11 @@ fn export(args: PythonExportArgs) -> Result<()> {
 }
 
 fn infer(args: PythonInferArgs) -> Result<()> {
+    if args.diagnose && args.artifacts {
+        return Err(anyhow!(
+            "--diagnose and --artifacts cannot be used together"
+        ));
+    }
     let mut py_args = vec![
         "-m".to_string(),
         "c_two.cli.contract".to_string(),
@@ -172,11 +320,23 @@ fn infer(args: PythonInferArgs) -> Result<()> {
         py_args.push("--method".to_string());
         py_args.push(method);
     }
+    if args.diagnose {
+        py_args.push("--diagnose".to_string());
+    }
+    if args.artifacts {
+        py_args.push("--artifacts".to_string());
+    }
     if args.pretty {
         py_args.push("--pretty".to_string());
     }
     let payload = run_python_contract(args.python.as_deref(), &py_args)?;
-    validate_descriptor_payload(&payload)?;
+    if args.artifacts {
+        validate_artifact_payload(&payload)?;
+    } else if args.diagnose {
+        validate_diagnostic_payload(&payload)?;
+    } else {
+        validate_descriptor_payload(&payload)?;
+    }
     write_payload(&payload, args.out.as_deref())
 }
 
@@ -210,10 +370,34 @@ fn validate_descriptor_payload(payload: &str) -> Result<()> {
         .map_err(|err| anyhow!("{err}"))
 }
 
+fn validate_artifact_payload(payload: &str) -> Result<()> {
+    let parsed: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|err| anyhow!("payload ABI artifact output is not valid JSON: {err}"))?;
+    match parsed {
+        serde_json::Value::Array(items) if items.iter().all(|item| item.is_object()) => Ok(()),
+        serde_json::Value::Array(_) => Err(anyhow!(
+            "payload ABI artifact output must be a JSON array of objects"
+        )),
+        _ => Err(anyhow!("payload ABI artifact output must be a JSON array")),
+    }
+}
+
+fn validate_diagnostic_payload(payload: &str) -> Result<()> {
+    let parsed: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|err| anyhow!("diagnostic output is not valid JSON: {err}"))?;
+    match parsed {
+        serde_json::Value::Array(items) if items.iter().all(|item| item.is_object()) => Ok(()),
+        serde_json::Value::Array(_) => {
+            Err(anyhow!("diagnostic output must be a JSON array of objects"))
+        }
+        _ => Err(anyhow!("diagnostic output must be a JSON array")),
+    }
+}
+
 fn write_payload(payload: &str, out: Option<&str>) -> Result<()> {
     if let Some(path) = out {
         std::fs::write(path, payload)
-            .map_err(|err| anyhow!("failed to write descriptor to {path}: {err}"))?;
+            .map_err(|err| anyhow!("failed to write payload to {path}: {err}"))?;
     } else {
         print!("{payload}");
         if !payload.ends_with('\n') {

@@ -22,7 +22,7 @@ EXAMPLES_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
-from grid.grid_contract import Grid, GridAttribute
+from grid.grid_py_crm import GridAttribute, GridPython
 from relay_config import ensure_http_relay_url, resolved_relay_url
 
 DEFAULT_RELAY_URL = 'http://127.0.0.1:8300'
@@ -61,7 +61,7 @@ def main() -> None:
     cc.set_relay_anchor(args.relay_url)
 
     # Connect via HTTP relay — same API as IPC, different address.
-    grid = cc.connect(Grid, name='examples/grid')
+    grid = cc.connect(GridPython, name='examples/grid')
     print(f'[Client] Connected via HTTP (mode: {grid.client._mode})\n')
 
     # ── Hello ─────────────────────────────────────────────────────

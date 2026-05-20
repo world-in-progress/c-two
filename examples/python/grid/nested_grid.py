@@ -1,11 +1,10 @@
 import os
-import c_two as cc
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-from grid.transferables import (
+from grid.grid_py_crm import (
     GridSchema,
     GridAttribute,
 )

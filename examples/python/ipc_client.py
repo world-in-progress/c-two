@@ -13,7 +13,7 @@ EXAMPLES_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
-from grid.grid_contract import Grid, GridAttribute
+from grid.grid_py_crm import GridAttribute, GridPython
 
 
 def _ipc_address(value: str) -> str:
@@ -37,7 +37,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    grid = cc.connect(Grid, name='examples/grid', address=args.address)
+    grid = cc.connect(GridPython, name='examples/grid', address=args.address)
     print(f'Connected (mode: {grid.client._mode})\n')
 
     print(grid.hello('IPC Client'))

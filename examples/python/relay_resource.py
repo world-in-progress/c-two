@@ -14,8 +14,8 @@ EXAMPLES_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
-from grid.grid_contract import Grid
 from grid.nested_grid import NestedGrid
+from grid.grid_py_crm import GridPython
 from relay_config import ensure_http_relay_url, resolved_relay_url
 
 DEFAULT_RELAY_URL = 'http://127.0.0.1:8300'
@@ -62,7 +62,7 @@ def main() -> None:
         [[478, 310], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [1, 1]],
     )
 
-    cc.register(Grid, grid, name='examples/grid')
+    cc.register(GridPython, grid, name='examples/grid')
     print(f'Grid CRM registered at {cc.server_address()}', flush=True)
     cc.serve()
 

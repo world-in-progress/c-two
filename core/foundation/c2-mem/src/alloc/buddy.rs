@@ -328,6 +328,18 @@ impl BuddyAllocator {
         }
 
         // R-C5: Double-free detection — block must be currently allocated.
+        // After a prior free merges children into a larger parent, the child
+        // bitmap entries are marked used again. Check ancestors first so a
+        // repeated free of a merged child cannot corrupt allocator accounting.
+        for ancestor_level in 0..level {
+            let ancestor_idx = block_idx >> (level - ancestor_level);
+            if self.bitmaps[ancestor_level].is_free(ancestor_idx) {
+                return Err(format!(
+                    "double free detected: block {} at level {} is already covered by free ancestor {} at level {}",
+                    block_idx, level, ancestor_idx, ancestor_level
+                ));
+            }
+        }
         if self.bitmaps[level].is_free(block_idx) {
             return Err(format!(
                 "double free detected: block {} at level {} is already free",
@@ -592,6 +604,23 @@ mod tests {
             "should report double free"
         );
         alloc.free(b.offset, b.level).unwrap();
+    }
+
+    #[test]
+    fn test_double_free_after_merge_returns_error() {
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        let a = alloc.alloc(4096).unwrap();
+        alloc.free(a.offset, a.level).unwrap();
+
+        let result = alloc.free(a.offset, a.level);
+        assert!(
+            result.is_err(),
+            "double free after merge should return error"
+        );
+        assert!(
+            result.unwrap_err().contains("double free"),
+            "should report double free"
+        );
     }
 
     #[test]

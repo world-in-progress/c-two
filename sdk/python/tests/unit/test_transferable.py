@@ -6,7 +6,6 @@ from c_two.crm.transferable import (
     Transferable, TransferableMeta,
     register_transferable, get_transferable,
     create_default_transferable, auto_transfer,
-    CONTROL_JSON_CODEC_REF,
     _extract_func_params, _TRANSFERABLE_MAP,
 )
 from tests.fixtures.ihello import HelloData, HelloItems, Hello
@@ -217,25 +216,27 @@ class TestAutoTransfer:
         wrapped = auto_transfer(unique_fn)
         assert callable(wrapped)
 
-    def test_json_safe_control_shapes_use_portable_control_codec(self):
-        @cc.crm(namespace='test.control-json', version='0.1.0')
-        class Control:
+    def test_python_native_control_shapes_use_pickle_fallback(self):
+        @cc.crm(namespace='test.python-native', version='0.1.0')
+        class PythonNative:
             def combine(self, values: list[int], label: str | None = None) -> list[str | None]:
                 ...
 
             def active(self) -> tuple[list[int], list[int]]:
                 ...
 
-        combine_input = getattr(Control.combine, '_input_transferable')
-        combine_output = getattr(Control.combine, '_output_transferable')
-        active_output = getattr(Control.active, '_output_transferable')
+        combine_input = getattr(PythonNative.combine, '_input_transferable')
+        combine_output = getattr(PythonNative.combine, '_output_transferable')
+        active_output = getattr(PythonNative.active, '_output_transferable')
 
-        assert combine_input.__cc_codec_ref__ == CONTROL_JSON_CODEC_REF
-        assert combine_output.__cc_codec_ref__ == CONTROL_JSON_CODEC_REF
-        assert active_output.__cc_codec_ref__ == CONTROL_JSON_CODEC_REF
+        assert combine_input.__module__ == 'Default'
+        assert combine_output.__module__ == 'Default'
+        assert active_output.__module__ == 'Default'
+        assert not hasattr(combine_input, '__cc_payload_abi_ref__')
+        assert not hasattr(combine_output, '__cc_payload_abi_ref__')
+        assert not hasattr(active_output, '__cc_payload_abi_ref__')
 
         raw_input = combine_input.serialize([1, 2], None)
-        assert raw_input.startswith(b'{"schema":"c-two.control.json.v1"')
         assert combine_input.deserialize(raw_input) == ([1, 2], None)
         assert combine_output.deserialize(combine_output.serialize(['1', None])) == ['1', None]
         assert active_output.deserialize(active_output.serialize([1], [2])) == ([1], [2])

@@ -90,3 +90,72 @@ def test_validate_resource_conformance_allows_extra_optional_resource_params():
             return base + left + right
 
     validate_resource_conformance(Greeting, ExtraOptional())
+
+
+def test_validate_resource_conformance_accepts_mismatched_method_with_bridge():
+    class BytesGreeting:
+        def greet(self, payload: bytes) -> bytes:
+            return payload
+
+        def add(self, left: int, right: int) -> int:
+            return left + right
+
+    validate_resource_conformance(
+        Greeting,
+        BytesGreeting(),
+        bridge={
+            'greet': cc.bridge(
+                input=lambda name: (name.encode(),),
+                output=lambda payload: payload.decode(),
+            ),
+        },
+    )
+
+
+def test_validate_resource_conformance_rejects_unknown_bridge_method():
+    with pytest.raises(TypeError, match='unknown bridge method.*missing'):
+        validate_resource_conformance(
+            Greeting,
+            GreetingResource(),
+            bridge={'missing': cc.bridge()},
+        )
+
+
+def test_empty_bridge_does_not_bypass_resource_annotation_validation():
+    class BadAnnotation:
+        def greet(self, name: bytes) -> str:
+            return name.decode()
+
+        def add(self, left: int, right: int) -> int:
+            return left + right
+
+    with pytest.raises(TypeError, match='greet.name.*str.*bytes'):
+        validate_resource_conformance(
+            Greeting,
+            BadAnnotation(),
+            bridge={'greet': cc.bridge()},
+        )
+
+
+def test_output_only_bridge_does_not_bypass_resource_parameter_validation():
+    class BadParameter:
+        def greet(self, name: bytes) -> bytes:
+            return name
+
+        def add(self, left: int, right: int) -> int:
+            return left + right
+
+    with pytest.raises(TypeError, match='greet.name.*str.*bytes'):
+        validate_resource_conformance(
+            Greeting,
+            BadParameter(),
+            bridge={'greet': cc.bridge(output=lambda payload: payload.decode())},
+        )
+
+
+def test_resource_bridge_rejects_non_callable_hooks():
+    with pytest.raises(TypeError, match='bridge input must be callable'):
+        cc.ResourceBridge(input='not-callable')
+
+    with pytest.raises(TypeError, match='bridge output must be callable'):
+        cc.ResourceBridge(output='not-callable')
