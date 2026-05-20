@@ -1,9 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::Path;
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::path::PathBuf;
 
@@ -140,15 +137,45 @@ fn fastdb_call_db_contract_json() -> String {
 }
 
 #[cfg(unix)]
-fn fake_python(tempdir: &tempfile::TempDir, payload: &str) -> PathBuf {
-    let path = tempdir.path().join("python-fake");
-    let script =
-        format!("#!/bin/sh\ncat <<'C_TWO_CONTRACT_JSON'\n{payload}\nC_TWO_CONTRACT_JSON\n");
-    std::fs::write(&path, script).unwrap();
-    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&path, permissions).unwrap();
-    path
+struct FakePython {
+    pythonpath: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakePython {
+    fn executable(&self) -> &'static str {
+        "python3"
+    }
+
+    fn pythonpath(&self) -> &Path {
+        &self.pythonpath
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_python_package(tempdir: &tempfile::TempDir) -> PathBuf {
+    let cli_package = tempdir.path().join("c_two/cli");
+    std::fs::create_dir_all(&cli_package).unwrap();
+    std::fs::write(tempdir.path().join("c_two/__init__.py"), "").unwrap();
+    std::fs::write(cli_package.join("__init__.py"), "").unwrap();
+    cli_package
+}
+
+#[cfg(unix)]
+fn fake_python(tempdir: &tempfile::TempDir, payload: &str) -> FakePython {
+    let cli_package = write_fake_python_package(tempdir);
+    std::fs::write(cli_package.join("payload.txt"), payload).unwrap();
+    std::fs::write(
+        cli_package.join("contract.py"),
+        r#"from pathlib import Path
+
+print(Path(__file__).with_name("payload.txt").read_text(encoding="utf-8"), end="")
+"#,
+    )
+    .unwrap();
+    FakePython {
+        pythonpath: tempdir.path().to_path_buf(),
+    }
 }
 
 #[cfg(unix)]
@@ -157,16 +184,25 @@ fn fake_python_requiring_arg(
     required_arg: &str,
     matched_payload: &str,
     missing_payload: &str,
-) -> PathBuf {
-    let path = tempdir.path().join("python-fake-requires-arg");
-    let script = format!(
-        "#!/bin/sh\ncase \" $* \" in\n  *\" {required_arg} \"*) cat <<'C_TWO_CONTRACT_MATCHED'\n{matched_payload}\nC_TWO_CONTRACT_MATCHED\n    ;;\n  *) cat <<'C_TWO_CONTRACT_MISSING'\n{missing_payload}\nC_TWO_CONTRACT_MISSING\n    ;;\nesac\n"
-    );
-    std::fs::write(&path, script).unwrap();
-    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&path, permissions).unwrap();
-    path
+) -> FakePython {
+    let cli_package = write_fake_python_package(tempdir);
+    std::fs::write(cli_package.join("matched_payload.txt"), matched_payload).unwrap();
+    std::fs::write(cli_package.join("missing_payload.txt"), missing_payload).unwrap();
+    std::fs::write(
+        cli_package.join("contract.py"),
+        format!(
+            r#"import sys
+from pathlib import Path
+
+payload = "matched_payload.txt" if {required_arg:?} in sys.argv[1:] else "missing_payload.txt"
+print(Path(__file__).with_name(payload).read_text(encoding="utf-8"), end="")
+"#
+        ),
+    )
+    .unwrap();
+    FakePython {
+        pythonpath: tempdir.path().to_path_buf(),
+    }
 }
 
 #[cfg(unix)]
@@ -219,12 +255,13 @@ fn contract_artifacts_wraps_python_without_contract_validation() {
     let output = tempdir.path().join("payload-abi-artifacts.json");
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "artifacts",
         "example.contracts:Grid",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--out",
         output.to_str().unwrap(),
     ])
@@ -244,12 +281,13 @@ fn contract_diagnose_wraps_python_and_validates_diagnostic_shape() {
     let output = tempdir.path().join("diagnostics.json");
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "diagnose",
         "example.contracts:Grid",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--out",
         output.to_str().unwrap(),
     ])
@@ -267,12 +305,13 @@ fn contract_diagnose_rejects_non_array_python_output() {
     let python = fake_python(&tempdir, r#"{"code":"python_only_pickle"}"#);
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "diagnose",
         "example.contracts:Grid",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
     ])
     .assert()
     .failure()
@@ -288,12 +327,13 @@ fn contract_diagnose_rejects_non_object_diagnostics() {
     let python = fake_python(&tempdir, r#"["python_only_pickle"]"#);
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "diagnose",
         "example.contracts:Grid",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
     ])
     .assert()
     .failure()
@@ -346,12 +386,13 @@ fn contract_export_wraps_python_and_validates_output() {
     let python = fake_python(&tempdir, &valid_contract_json());
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "export",
         "example.contracts:Grid",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--method",
         "echo",
     ])
@@ -368,12 +409,13 @@ fn contract_infer_wraps_python_and_writes_validated_output() {
     let output = tempdir.path().join("inferred.contract.json");
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -402,12 +444,13 @@ fn contract_infer_diagnose_wraps_python_and_validates_diagnostic_shape() {
     let output = tempdir.path().join("inferred.diagnostics.json");
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -434,12 +477,13 @@ fn contract_infer_diagnose_rejects_non_array_python_output() {
     let python = fake_python(&tempdir, r#"{"code":"python_only_pickle"}"#);
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -462,12 +506,13 @@ fn contract_infer_diagnose_rejects_non_object_diagnostics() {
     let python = fake_python(&tempdir, r#"["python_only_pickle"]"#);
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -493,12 +538,13 @@ fn contract_infer_artifacts_wraps_python_and_validates_artifact_shape() {
     let output = tempdir.path().join("inferred.payload-abi-artifacts.json");
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -525,12 +571,13 @@ fn contract_infer_artifacts_rejects_non_array_python_output() {
     let python = fake_python(&tempdir, r#"{"schema":"example.schema.v1"}"#);
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -553,12 +600,13 @@ fn contract_infer_artifacts_rejects_non_object_artifacts() {
     let python = fake_python(&tempdir, r#"["payload-abi-artifact"]"#);
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -581,12 +629,13 @@ fn contract_infer_rejects_conflicting_artifact_and_diagnostic_modes() {
     let python = fake_python(&tempdir, "[]");
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "infer",
         "example.resources:GridResource",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
         "--namespace",
         "example.grid",
         "--version",
@@ -610,12 +659,13 @@ fn contract_export_rejects_invalid_python_descriptor() {
     let python = fake_python(&tempdir, &invalid_pickle_contract_json());
 
     let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("PYTHONPATH", python.pythonpath());
     cmd.args([
         "contract",
         "export",
         "example.contracts:Grid",
         "--python",
-        python.to_str().unwrap(),
+        python.executable(),
     ])
     .assert()
     .failure()
