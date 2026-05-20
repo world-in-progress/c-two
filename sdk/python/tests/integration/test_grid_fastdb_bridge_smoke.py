@@ -279,6 +279,7 @@ def test_grid_fastdb_contract_uses_call_db_refs(monkeypatch):
     assert 'python-pickle-default' not in portable_encoded
 
 
+@pytest.mark.timeout(180)
 def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_path):
     GridFastdb, _GridId, _NestedGrid, _bridge = _load_fastdb_grid(monkeypatch)
 
@@ -1297,6 +1298,7 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
             cc.unregister('examples/grid-error')
 
 
+@pytest.mark.timeout(180)
 def test_grid_fastdb_c3_artifacts_cli_feeds_fastdb_codegen(monkeypatch, tmp_path):
     root = Path(__file__).resolve().parents[4]
     fastdb_python = root.parent / 'fastdb' / 'python'
@@ -1400,6 +1402,7 @@ def test_grid_fastdb_c3_artifacts_cli_feeds_fastdb_codegen(monkeypatch, tmp_path
     assert 'python-pickle-default' not in generated
 
 
+@pytest.mark.timeout(180)
 def test_resource_infer_c3_artifacts_cli_feeds_fastdb_codegen(monkeypatch, tmp_path):
     root = Path(__file__).resolve().parents[4]
     fastdb_python = root.parent / 'fastdb' / 'python'
