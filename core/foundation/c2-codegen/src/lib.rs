@@ -91,29 +91,31 @@ export interface C2HeldClientTransport extends C2ClientTransport {
   hold<T>(routeName: string, contract: C2ContractIdentity, method: string, args: readonly unknown[]): Promise<C2HeldResult<T>>;
 }
 
+export type C2ByteArray = Uint8Array & { readonly buffer: ArrayBufferLike };
+
 export interface C2EncodedClientTransport {
-  call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<C2ResponsePayload>;
+  call(routeName: string, contract: C2ContractIdentity, method: string, payload: C2ByteArray): Promise<C2ResponsePayload>;
 }
 
-export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload = Uint8Array> extends C2EncodedClientTransport {
-  call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload>;
+export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport {
+  call(routeName: string, contract: C2ContractIdentity, method: string, payload: C2ByteArray): Promise<Payload>;
 }
 
-export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = Uint8Array> extends C2EncodedClientTransport {
-  call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload>;
+export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport {
+  call(routeName: string, contract: C2ContractIdentity, method: string, payload: C2ByteArray): Promise<Payload>;
 }
 
 export interface C2IpcConnection {
-  write(data: Uint8Array): void | Promise<void>;
-  readExactly(byteLength: number): Uint8Array | Promise<Uint8Array>;
+  write(data: C2ByteArray): void | Promise<void>;
+  readExactly(byteLength: number): C2ByteArray | Promise<C2ByteArray>;
   close?(): void | Promise<void>;
 }
 
 export type C2IpcConnect = (socketPath: string) => C2IpcConnection | Promise<C2IpcConnection>;
 
 export interface C2NodeIpcSocket {
-  write(data: Uint8Array, callback?: (error?: Error | null) => void): boolean | void;
-  on(event: "data", listener: (chunk: Uint8Array) => void): this | void;
+  write(data: C2ByteArray, callback?: (error?: Error | null) => void): boolean | void;
+  on(event: "data", listener: (chunk: C2ByteArray) => void): this | void;
   on(event: "error", listener: (error: Error) => void): this | void;
   on(event: "close", listener: () => void): this | void;
   once(event: "connect", listener: () => void): this | void;
@@ -149,8 +151,8 @@ export interface C2IpcResponseShmBlock {
 export interface C2IpcResponseShmReader {
   read(
     block: C2IpcResponseShmBlock,
-    destination?: Uint8Array,
-  ): Uint8Array | ArrayBuffer | void | Promise<Uint8Array | ArrayBuffer | void>;
+    destination?: C2ByteArray,
+  ): C2ByteArray | ArrayBufferLike | void | Promise<C2ByteArray | ArrayBufferLike | void>;
   release(block: C2IpcResponseShmBlock): void | Promise<void>;
 }
 
@@ -279,7 +281,7 @@ export interface C2MemFfiNativeBuddyRequestShmWriterOptions {
   readonly pool: C2MemFfiRequestPoolBinding;
 }
 
-export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = Uint8Array> {
+export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> {
   readonly connect: C2IpcConnect;
   readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;
   readonly responseShmReader?: C2IpcResponseShmReader;
@@ -288,8 +290,8 @@ export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = Uint8
   readonly requestChunkSize?: number;
 }
 
-export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = Uint8Array> extends C2EncodedClientTransport {
-  call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload>;
+export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport {
+  call(routeName: string, contract: C2ContractIdentity, method: string, payload: C2ByteArray): Promise<Payload>;
   close(): Promise<void>;
 }
 
@@ -297,11 +299,11 @@ export interface C2ProviderOwnedResponsePayload {
   readonly byteLength: number;
 }
 
-export type C2ResponsePayload = Uint8Array | ArrayBuffer | C2ProviderOwnedResponsePayload;
+export type C2ResponsePayload = C2ByteArray | ArrayBufferLike | C2ProviderOwnedResponsePayload;
 
 export interface C2AllocatedResponsePayload<Payload extends C2ResponsePayload = C2ResponsePayload> {
   readonly payload: Payload;
-  readonly view: Uint8Array;
+  readonly view: C2ByteArray;
   release?(): void;
 }
 
@@ -314,7 +316,7 @@ export interface C2FetchHeaders {
 }
 
 export interface C2ReadableStreamReader {
-  read(): Promise<{ done: boolean; value?: Uint8Array }>;
+  read(): Promise<{ done: boolean; value?: C2ByteArray }>;
   releaseLock?(): void;
 }
 
@@ -326,7 +328,7 @@ export interface C2FetchResponse {
   readonly status: number;
   readonly headers?: C2FetchHeaders;
   readonly body?: C2ReadableStream | null;
-  arrayBuffer(): Promise<ArrayBuffer>;
+  arrayBuffer(): Promise<ArrayBufferLike>;
   text(): Promise<string>;
 }
 
@@ -340,12 +342,12 @@ export type C2Fetch = (
   init: {
     readonly method: "GET" | "POST";
     readonly headers: Readonly<Record<string, string>>;
-    readonly body?: Uint8Array;
+    readonly body?: C2ByteArray;
     readonly signal?: C2AbortSignal;
   },
 ) => Promise<C2FetchResponse>;
 
-export interface C2HttpRelayTransportOptions<Payload extends C2ResponsePayload = Uint8Array> {
+export interface C2HttpRelayTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> {
   readonly fetch?: C2Fetch;
   readonly headers?: Readonly<Record<string, string>>;
   readonly callTimeoutMs?: number;
@@ -354,7 +356,7 @@ export interface C2HttpRelayTransportOptions<Payload extends C2ResponsePayload =
   readonly responsePayloadUnknownLengthMaxBytes?: number;
 }
 
-export interface C2RelayAwareHttpTransportOptions<Payload extends C2ResponsePayload = Uint8Array> extends C2HttpRelayTransportOptions<Payload> {
+export interface C2RelayAwareHttpTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> extends C2HttpRelayTransportOptions<Payload> {
   readonly maxAttempts?: number;
   readonly routeCacheTtlMs?: number;
   readonly resolveTimeoutMs?: number;
@@ -470,7 +472,7 @@ export class C2IpcRouteNotFoundError extends Error {
   }
 }
 
-export function createIpcEncodedTransport<Payload extends C2ResponsePayload = Uint8Array>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
+export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
   const socketPath = ipcSocketPathFromAddress(address);
   const connect = normalizeIpcConnect(options, "C-Two IPC transport options");
   const responsePayloadAllocator = normalizeResponsePayloadAllocator(options.responsePayloadAllocator, "C-Two IPC responsePayloadAllocator");
@@ -618,7 +620,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = Ui
   };
 }
 
-export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayload = Uint8Array>(baseUrl: string, options: C2HttpRelayTransportOptions<Payload> = {}): C2HttpRelayEncodedTransport<Payload> {
+export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(baseUrl: string, options: C2HttpRelayTransportOptions<Payload> = {}): C2HttpRelayEncodedTransport<Payload> {
   const normalizedOptions = normalizeHttpRelayTransportOptions(options, "C-Two HTTP relay transport options");
   const normalizedBaseUrl = normalizeRelayBaseUrl(baseUrl, "C-Two HTTP relay base URL");
   const fetchImpl = normalizeFetch(normalizedOptions.fetch, "C-Two HTTP relay fetch") ?? globalFetch();
@@ -684,7 +686,7 @@ export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayloa
   };
 }
 
-export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = Uint8Array>(anchorUrl: string, options: C2RelayAwareHttpTransportOptions<Payload> = {}): C2RelayAwareHttpEncodedTransport<Payload> {
+export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(anchorUrl: string, options: C2RelayAwareHttpTransportOptions<Payload> = {}): C2RelayAwareHttpEncodedTransport<Payload> {
   const normalizedOptions = normalizeHttpRelayTransportOptions(options, "C-Two relay-aware HTTP transport options");
   const normalizedAnchorUrl = normalizeRelayBaseUrl(anchorUrl, "C-Two relay anchor URL");
   const fetchImpl = normalizeFetch(normalizedOptions.fetch, "C-Two relay-aware HTTP fetch") ?? globalFetch();
@@ -1206,13 +1208,17 @@ function requireUint8Array(value: unknown, label: string): Uint8Array {
 }
 
 function requireResponsePayload(value: unknown, label: string): C2ResponsePayload {
-  if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+  if (value instanceof Uint8Array || isArrayBufferLike(value)) {
     return value;
   }
   if (isProviderOwnedResponsePayload(value)) {
     return value;
   }
   throw new Error(`${label} must be a Uint8Array, ArrayBuffer, or provider-owned response payload.`);
+}
+
+function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
+  return value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer);
 }
 
 function normalizeIpcConnect<Payload extends C2ResponsePayload>(value: C2IpcTransportOptions<Payload>, label: string): C2IpcConnect {
@@ -1279,7 +1285,7 @@ function requireNodeIpcSocket(value: unknown): C2NodeIpcSocket {
 }
 
 async function wrapNodeIpcSocket(socket: C2NodeIpcSocket, socketPath: string): Promise<C2IpcConnection> {
-  const chunks: Uint8Array[] = [];
+  const chunks: C2ByteArray[] = [];
   const pendingReads: C2NodeIpcPendingRead[] = [];
   let bufferedBytes = 0;
   let terminalError: C2IpcTransportError | undefined;
@@ -1729,7 +1735,7 @@ export function createNodePosixNativeBuddyResponseShmReader(options: C2NodePosix
       if (target.byteLength !== block.byteLength) {
         throw new C2IpcTransportError(`C-Two Node/POSIX native buddy SHM reader destination length ${target.byteLength} does not match block byteLength ${block.byteLength}.`);
       }
-      const result = (await backend.readResponse(block, target)) as Uint8Array | ArrayBuffer | void;
+      const result = (await backend.readResponse(block, target)) as C2ByteArray | ArrayBufferLike | void;
       let postReadError: unknown;
       try {
         if (result !== undefined) {
@@ -2867,7 +2873,7 @@ async function readIpcShmSuccessPayload<Payload extends C2ResponsePayload>(
     } catch (error) {
       return await releaseIpcShmResponseBlockAfterAllocatorFailure(reader, block, error);
     }
-    let result: Uint8Array | ArrayBuffer | void;
+    let result: C2ByteArray | ArrayBufferLike | void;
     try {
       result = await reader.read(block, allocated.view);
     } catch (error) {
@@ -2900,7 +2906,7 @@ async function readIpcShmSuccessPayload<Payload extends C2ResponsePayload>(
     return allocated.payload;
   }
   const destination = new Uint8Array(block.byteLength);
-  let result: Uint8Array | ArrayBuffer | void;
+  let result: C2ByteArray | ArrayBufferLike | void;
   try {
     result = await reader.read(block, destination);
   } catch (error) {
@@ -2963,11 +2969,11 @@ async function releaseIpcShmResponseBlock(reader: C2IpcResponseShmReader, block:
   }
 }
 
-function requireIpcShmReaderBytes(value: Uint8Array | ArrayBuffer): Uint8Array {
+function requireIpcShmReaderBytes(value: C2ByteArray | ArrayBufferLike): Uint8Array {
   if (value instanceof Uint8Array) {
     return value;
   }
-  if (value instanceof ArrayBuffer) {
+  if (isArrayBufferLike(value)) {
     return new Uint8Array(value);
   }
   throw new C2IpcTransportError("C-Two IPC responseShmReader must return a Uint8Array, ArrayBuffer, or undefined.");
@@ -3115,7 +3121,7 @@ function readLengthPrefixedReplyBytes(payload: Uint8Array, field: string): Uint8
   return payload.slice(5);
 }
 
-function concatUint8Arrays(chunks: readonly Uint8Array[]): Uint8Array {
+function concatUint8Arrays(chunks: readonly C2ByteArray[]): C2ByteArray {
   let total = 0;
   for (const chunk of chunks) {
     total += chunk.byteLength;
@@ -3326,7 +3332,7 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
   allocator: C2ResponsePayloadAllocator<Payload>,
   maxBytes: number,
 ): Promise<Payload> {
-  const chunks: Uint8Array[] = [];
+  const chunks: C2ByteArray[] = [];
   let byteLength = 0;
   let reader: C2ReadableStreamReader | undefined;
   try {

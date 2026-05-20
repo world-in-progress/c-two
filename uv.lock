@@ -69,6 +69,8 @@ dev = [
     { name = "httpx" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pillow" },
     { name = "pyarrow" },
     { name = "pytest" },
@@ -93,6 +95,7 @@ benchmark = [
 dev = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "numpy", specifier = ">=2.2.4" },
+    { name = "pandas", specifier = ">=2.2.0" },
     { name = "pillow", specifier = ">=12.1.1" },
     { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "pytest", specifier = ">=8.0.0" },

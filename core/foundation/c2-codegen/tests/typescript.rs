@@ -351,15 +351,15 @@ fn strict_codec_mode_allows_fastdb_call_db_codecs() {
     assert!(output.contains("export interface C2EncodedClientTransport"));
     assert!(
         output.contains(
-            "export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload = Uint8Array> extends C2EncodedClientTransport"
+            "export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport"
         )
     );
     assert!(output.contains(
-        "export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = Uint8Array> extends C2EncodedClientTransport"
+        "export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport"
     ));
     assert!(output.contains("export interface C2ProviderOwnedResponsePayload"));
     assert!(output.contains(
-        "export type C2ResponsePayload = Uint8Array | ArrayBuffer | C2ProviderOwnedResponsePayload"
+        "export type C2ResponsePayload = C2ByteArray | ArrayBufferLike | C2ProviderOwnedResponsePayload"
     ));
     assert!(output.contains("export interface C2AllocatedResponsePayload"));
     assert!(output.contains("export type C2ResponsePayloadAllocator"));
@@ -420,7 +420,7 @@ fn strict_codec_mode_allows_fastdb_call_db_codecs() {
     assert!(output.contains("export function createIpcEncodedTransport"));
     assert!(
         output.contains(
-            "export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = Uint8Array> {\n  readonly connect: C2IpcConnect;\n  readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;\n  readonly responseShmReader?: C2IpcResponseShmReader;\n  readonly requestShmWriter?: C2IpcRequestShmWriter;\n  readonly requestShmThreshold?: number;\n  readonly requestChunkSize?: number;\n}"
+            "export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> {\n  readonly connect: C2IpcConnect;\n  readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;\n  readonly responseShmReader?: C2IpcResponseShmReader;\n  readonly requestShmWriter?: C2IpcRequestShmWriter;\n  readonly requestShmThreshold?: number;\n  readonly requestChunkSize?: number;\n}"
         )
     );
     assert!(output.contains("readonly requestShmWriter?: C2IpcRequestShmWriter;"));
@@ -428,7 +428,7 @@ fn strict_codec_mode_allows_fastdb_call_db_codecs() {
     assert!(output.contains("readonly requestChunkSize?: number;"));
     assert!(output.contains("requestShmWriter markConsumed must be a function when provided"));
     assert!(
-        output.contains("export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = Uint8Array> extends C2EncodedClientTransport")
+        output.contains("export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport")
     );
     assert!(
         output.contains("readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;")

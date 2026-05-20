@@ -1184,12 +1184,14 @@ fn contract_codegen_typescript_strict_fastdb_output_compiles_with_tsc() {
   createRelayAwareHttpEncodedTransport,
 } from "./fastdb-client.js";
 
+type SmokeByteArray = Uint8Array & { readonly buffer: ArrayBufferLike };
+
 const fetchCalls: Array<{ input: string; init: { method?: string; headers?: Record<string, string>; body?: Uint8Array } }> = [];
 const fetchImpl = async (input: string, init: { method?: string; headers?: Record<string, string>; body?: Uint8Array }) => {
   fetchCalls.push({ input, init });
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -1423,7 +1425,7 @@ const C2_IPC_SMOKE_CAP_CALL_V2 = 1 << 0;
 const C2_IPC_SMOKE_CAP_METHOD_IDX = 1 << 1;
 const C2_IPC_SMOKE_CAP_CHUNKED = 1 << 2;
 
-function ipcConcat(chunks: readonly Uint8Array[]): Uint8Array {
+function ipcConcat(chunks: readonly SmokeByteArray[]): SmokeByteArray {
   const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
   const out = new Uint8Array(total);
   let offset = 0;
@@ -1739,7 +1741,7 @@ class FakeC2MemFfiResponseFactory implements C2MemFfiResponsePoolFactory {
 class FakeC2MemFfiRequestPool implements C2MemFfiRequestPoolBinding {
   readonly prefix = "/cc2nffi1";
   readonly segments = [{ name: "/cc2nffi1_b0000", size: 4096 }];
-  readonly writes: Uint8Array[] = [];
+  readonly writes: SmokeByteArray[] = [];
   readonly releases: C2IpcRequestShmBlock[] = [];
   readonly consumed: C2IpcRequestShmBlock[] = [];
   closeCount = 0;
@@ -1769,16 +1771,16 @@ class FakeC2MemFfiRequestPool implements C2MemFfiRequestPoolBinding {
 }
 
 class FakeIpcConnection implements C2IpcConnection {
-  readonly writes: Uint8Array[] = [];
+  readonly writes: SmokeByteArray[] = [];
   readonly readSizes: number[] = [];
   closed = false;
   private pending: Uint8Array;
 
-  constructor(reads: readonly Uint8Array[]) {
+  constructor(reads: readonly SmokeByteArray[]) {
     this.pending = ipcConcat(reads);
   }
 
-  write(data: Uint8Array): void {
+  write(data: SmokeByteArray): void {
     this.writes.push(data.slice());
   }
 
@@ -1799,13 +1801,13 @@ class FakeIpcConnection implements C2IpcConnection {
 
 class FailAfterWriteIpcConnection extends FakeIpcConnection {
   constructor(
-    reads: readonly Uint8Array[],
+    reads: readonly SmokeByteArray[],
     private readonly failAtWriteCount: number,
   ) {
     super(reads);
   }
 
-  write(data: Uint8Array): void {
+  write(data: SmokeByteArray): void {
     super.write(data);
     if (this.writes.length === this.failAtWriteCount) {
       throw new Error(`fake IPC write failure at ${this.failAtWriteCount}`);
@@ -1860,8 +1862,8 @@ if (!ipcConnection.closed) {
 }
 
 type C2NodeSmokeServerSocket = {
-  on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
-  write(data: Uint8Array): boolean | void;
+  on(event: "data", listener: (chunk: SmokeByteArray) => void): unknown;
+  write(data: SmokeByteArray): boolean | void;
   end?(): void;
 };
 type C2NodeSmokeServer = {
@@ -1885,12 +1887,12 @@ const nodeSocketPath = `/tmp/c_two_ipc/${nodeSocketRegion}.sock`;
 nodeFs.mkdirSync("/tmp/c_two_ipc", { recursive: true });
 nodeFs.rmSync(nodeSocketPath, { force: true });
 const nodeSocketServer = nodeNet.createServer();
-let nodeSocketPending = new Uint8Array();
+let nodeSocketPending: SmokeByteArray = new Uint8Array();
 let nodeSocketHandshakeSeen = false;
 let nodeSocketCallSeen = false;
 let nodeSocketServerFailure: Error | undefined;
 nodeSocketServer.on("connection", (socket: C2NodeSmokeServerSocket) => {
-  socket.on("data", (chunk: Uint8Array) => {
+  socket.on("data", (chunk: SmokeByteArray) => {
     if (nodeSocketServerFailure !== undefined) {
       return;
     }
@@ -3847,7 +3849,7 @@ const streamingFetch: C2Fetch = async (_input, _init) => {
     body: {
       getReader() {
         return {
-          async read(): Promise<{ done: boolean; value?: Uint8Array }> {
+          async read(): Promise<{ done: boolean; value?: SmokeByteArray }> {
             const value = chunks[index++];
             if (value === undefined) {
               return { done: true };
@@ -3858,7 +3860,7 @@ const streamingFetch: C2Fetch = async (_input, _init) => {
         };
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("streaming response allocator should not fall back to arrayBuffer");
     },
     async text(): Promise<string> {
@@ -3905,7 +3907,7 @@ const missingLengthFetch: C2Fetch = async (_input, _init) => {
         throw new Error("response allocator should not read a stream without Content-Length");
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("response allocator must not fall back to arrayBuffer without Content-Length");
     },
     async text(): Promise<string> {
@@ -3941,7 +3943,7 @@ const oversizedNoAllocatorFetch: C2Fetch = async (_input, _init) => {
       },
     },
     body: null,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       oversizedNoAllocatorArrayBufferCalls += 1;
       throw new Error("oversized Content-Length response should fail before arrayBuffer");
     },
@@ -3984,7 +3986,7 @@ const oversizedLengthFetch: C2Fetch = async (_input, _init) => {
         throw new Error("oversized Content-Length response should fail before reading body");
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("oversized Content-Length response allocator should not fall back to arrayBuffer");
     },
     async text(): Promise<string> {
@@ -4030,7 +4032,7 @@ const oversizedCrmErrorFetch: C2Fetch = async (_input, _init) => {
       },
     },
     body: null,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       oversizedCrmErrorArrayBufferCalls += 1;
       throw new Error("oversized CRM error response should fail before arrayBuffer");
     },
@@ -4066,7 +4068,7 @@ const mismatchedNoAllocatorFetch: C2Fetch = async (_input, _init) => {
       },
     },
     body: null,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array([1, 2]).buffer;
     },
     async text(): Promise<string> {
@@ -4098,7 +4100,7 @@ const mismatchedCrmErrorFetch: C2Fetch = async (_input, _init) => {
       },
     },
     body: null,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array([9, 8]).buffer;
     },
     async text(): Promise<string> {
@@ -4137,7 +4139,7 @@ const unknownLengthFetch: C2Fetch = async (_input, _init) => {
     body: {
       getReader() {
         return {
-          async read(): Promise<{ done: boolean; value?: Uint8Array }> {
+          async read(): Promise<{ done: boolean; value?: SmokeByteArray }> {
             const value = chunks[index++];
             if (value === undefined) {
               return { done: true };
@@ -4148,7 +4150,7 @@ const unknownLengthFetch: C2Fetch = async (_input, _init) => {
         };
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("unknown-length response allocator should not fall back to arrayBuffer");
     },
     async text(): Promise<string> {
@@ -4199,7 +4201,7 @@ const reusedUnknownLengthFetch: C2Fetch = async (_input, _init) => {
     body: {
       getReader() {
         return {
-          async read(): Promise<{ done: boolean; value?: Uint8Array }> {
+          async read(): Promise<{ done: boolean; value?: SmokeByteArray }> {
             reusedUnknownLengthReadCount += 1;
             if (reusedUnknownLengthReadCount === 1) {
               reusedUnknownLengthChunk[0] = 10;
@@ -4217,7 +4219,7 @@ const reusedUnknownLengthFetch: C2Fetch = async (_input, _init) => {
         };
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("reused unknown-length response allocator should not fall back to arrayBuffer");
     },
     async text(): Promise<string> {
@@ -4262,7 +4264,7 @@ const unknownLengthOverLimitFetch: C2Fetch = async (_input, _init) => {
     body: {
       getReader() {
         return {
-          async read(): Promise<{ done: boolean; value?: Uint8Array }> {
+          async read(): Promise<{ done: boolean; value?: SmokeByteArray }> {
             const value = chunks[index++];
             if (value === undefined) {
               return { done: true };
@@ -4275,7 +4277,7 @@ const unknownLengthOverLimitFetch: C2Fetch = async (_input, _init) => {
         };
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("over-limit unknown-length allocator should not fall back to arrayBuffer");
     },
     async text(): Promise<string> {
@@ -4356,7 +4358,7 @@ const missingBodyFetch: C2Fetch = async (_input, _init) => {
       },
     },
     body: null,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("response allocator must not fall back to arrayBuffer without a body stream");
     },
     async text(): Promise<string> {
@@ -4403,7 +4405,7 @@ const readerFailureFetch: C2Fetch = async (_input, _init) => {
         throw new Error("getReader failed");
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("response allocator must not fall back to arrayBuffer after reader failure");
     },
     async text(): Promise<string> {
@@ -4503,7 +4505,7 @@ const malformedAllocationFetch: C2Fetch = async (_input, _init) => {
         throw new Error("malformed allocation should fail before reading stream");
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("response allocator must not fall back to arrayBuffer after malformed allocation");
     },
     async text(): Promise<string> {
@@ -4552,7 +4554,7 @@ async function expectAllocatorStreamFailure(label: string, contentLength: string
       body: {
         getReader() {
           return {
-            async read(): Promise<{ done: boolean; value?: Uint8Array }> {
+            async read(): Promise<{ done: boolean; value?: SmokeByteArray }> {
               if (index >= chunks.length) {
                 return { done: true };
               }
@@ -4563,7 +4565,7 @@ async function expectAllocatorStreamFailure(label: string, contentLength: string
           };
         },
       },
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         throw new Error(`${label} allocator failure must not fall back to arrayBuffer`);
       },
       async text(): Promise<string> {
@@ -4828,7 +4830,7 @@ const malformedContractWire = createHttpRelayEncodedTransport("http://relay.exam
     malformedContractFetchCalls += 1;
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -4892,7 +4894,7 @@ const emptyRouteWire = createHttpRelayEncodedTransport("http://relay.example/bas
     emptyRouteFetchCalls += 1;
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -4963,7 +4965,7 @@ const routeNameSlashWire = createHttpRelayEncodedTransport("http://relay.example
     }
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -4997,7 +4999,7 @@ const emptyRelayAwareWire = createRelayAwareHttpEncodedTransport("http://anchor.
     emptyRelayAwareFetchCalls += 1;
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5098,7 +5100,7 @@ if (!String(throwingFetchError).includes("C-Two HTTP relay call fetch failed")) 
 const brokenBodyWire = createHttpRelayEncodedTransport("http://relay.example/base/", {
   fetch: async () => ({
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("response body unavailable");
     },
     async text(): Promise<string> {
@@ -5122,7 +5124,7 @@ if (!String(brokenBodyError).includes("C-Two HTTP relay call body read failed"))
 const brokenCrmErrorBodyWire = createHttpRelayEncodedTransport("http://relay.example/base/", {
   fetch: async () => ({
     status: 500,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("crm error body unavailable");
     },
     async text(): Promise<string> {
@@ -5146,7 +5148,7 @@ if (!String(brokenCrmErrorBodyError).includes("C-Two HTTP relay call body read f
 const brokenRelayErrorBodyWire = createHttpRelayEncodedTransport("http://relay.example/base/", {
   fetch: async () => ({
     status: 404,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -5176,7 +5178,7 @@ const oversizedRelayErrorBodyWire = createHttpRelayEncodedTransport("http://rela
         return name.toLowerCase() === "content-length" ? "2147483648" : null;
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -5262,7 +5264,7 @@ const relayFetchImpl = async (input: string, init: { method?: string; headers?: 
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5294,7 +5296,7 @@ const relayFetchImpl = async (input: string, init: { method?: string; headers?: 
   if (input.startsWith("http://stale.example/base/")) {
     return {
       status: 502,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5304,7 +5306,7 @@ const relayFetchImpl = async (input: string, init: { method?: string; headers?: 
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -5360,7 +5362,7 @@ const relayAwareAllocatedFetch: C2Fetch = async (input: string, init: { method?:
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5391,7 +5393,7 @@ const relayAwareAllocatedFetch: C2Fetch = async (input: string, init: { method?:
     body: {
       getReader() {
         return {
-          async read(): Promise<{ done: boolean; value?: Uint8Array }> {
+          async read(): Promise<{ done: boolean; value?: SmokeByteArray }> {
             const value = chunks[index++];
             if (value === undefined) {
               return { done: true };
@@ -5402,7 +5404,7 @@ const relayAwareAllocatedFetch: C2Fetch = async (input: string, init: { method?:
         };
       },
     },
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       throw new Error("relay-aware response allocator should not fall back to arrayBuffer");
     },
     async text(): Promise<string> {
@@ -5445,7 +5447,7 @@ const relayHeaderFetchImpl = async (input: string, init: { method?: string; head
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5466,7 +5468,7 @@ const relayHeaderFetchImpl = async (input: string, init: { method?: string; head
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -5517,7 +5519,7 @@ const resolveTransportRetryFetchImpl = async (input: string, init: { method?: st
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5538,7 +5540,7 @@ const resolveTransportRetryFetchImpl = async (input: string, init: { method?: st
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -5567,7 +5569,7 @@ const resolveShapeRetryFetchImpl = async (input: string, init: { method?: string
   if (init.method === "GET" && resolveShapeRetryFetchCalls.filter((call) => call.init.method === "GET").length === 1) {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5578,7 +5580,7 @@ const resolveShapeRetryFetchImpl = async (input: string, init: { method?: string
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5599,7 +5601,7 @@ const resolveShapeRetryFetchImpl = async (input: string, init: { method?: string
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -5673,7 +5675,7 @@ const zeroMaxFetchImpl = async (input: string, init: { method?: string; headers?
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5694,7 +5696,7 @@ const zeroMaxFetchImpl = async (input: string, init: { method?: string; headers?
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -5720,7 +5722,7 @@ const onlyStaleFetchImpl = async (input: string, init: { method?: string; header
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5741,7 +5743,7 @@ const onlyStaleFetchImpl = async (input: string, init: { method?: string; header
   }
   return {
     status: 502,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -5775,7 +5777,7 @@ const noCacheFetchImpl = async (input: string, init: { method?: string; headers?
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5796,7 +5798,7 @@ const noCacheFetchImpl = async (input: string, init: { method?: string; headers?
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -5900,7 +5902,7 @@ const resolveRetryFetchImpl = async (input: string, init: { method?: string; hea
     if (resolveRetryAttempts === 1) {
       return {
         status: 503,
-        async arrayBuffer(): Promise<ArrayBuffer> {
+        async arrayBuffer(): Promise<ArrayBufferLike> {
           return new Uint8Array().buffer;
         },
         async text(): Promise<string> {
@@ -5910,7 +5912,7 @@ const resolveRetryFetchImpl = async (input: string, init: { method?: string; hea
     }
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -5931,7 +5933,7 @@ const resolveRetryFetchImpl = async (input: string, init: { method?: string; hea
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -5961,7 +5963,7 @@ const resolveErrorBodyFetchImpl = async (_input: string, init: { method?: string
   if (init.method === "GET") {
     return {
       status: 503,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -6001,7 +6003,7 @@ const oversizedResolveErrorFetchImpl = async (_input: string, init: { method?: s
           return name.toLowerCase() === "content-length" ? "2147483648" : null;
         },
       },
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -6041,7 +6043,7 @@ const oversizedResolveSuccessFetchImpl = async (_input: string, init: { method?:
           return name.toLowerCase() === "content-length" ? "2147483648" : null;
         },
       },
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -6088,7 +6090,7 @@ const contractCacheFetchImpl = async (input: string, init: { method?: string; he
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -6112,7 +6114,7 @@ const contractCacheFetchImpl = async (input: string, init: { method?: string; he
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -6135,7 +6137,7 @@ const fatalFetchImpl = async (input: string, init: { method?: string; headers?: 
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -6156,7 +6158,7 @@ const fatalFetchImpl = async (input: string, init: { method?: string; headers?: 
   }
   return {
     status: 502,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -6190,7 +6192,7 @@ const payloadLimitFetchImpl = async (input: string, init: { method?: string; hea
   if (init.method === "GET") {
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -6224,7 +6226,7 @@ const payloadLimitFetchImpl = async (input: string, init: { method?: string; hea
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
@@ -6255,7 +6257,7 @@ const oversizedFetchImpl = async (input: string, init: { method?: string; header
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -6302,7 +6304,7 @@ const malformedLimitFetchImpl = async (input: string, init: { method?: string; h
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -6349,7 +6351,7 @@ const mismatchedRouteFetchImpl = async (input: string, init: { method?: string; 
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -6396,7 +6398,7 @@ const invalidResolvedRelayUrlFetchImpl = async (input: string, init: { method?: 
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -6443,7 +6445,7 @@ const whitespaceResolvedRelayUrlFetchImpl = async (input: string, init: { method
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -6490,7 +6492,7 @@ const credentialsResolvedRelayUrlFetchImpl = async (input: string, init: { metho
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return new Uint8Array().buffer;
     },
     async text(): Promise<string> {
@@ -6542,7 +6544,7 @@ const cacheScopeFetchImpl = async (input: string, init: { method?: string; heade
     const isAlt = input.includes("crm_name=FastdbPortableAlt");
     return {
       status: 200,
-      async arrayBuffer(): Promise<ArrayBuffer> {
+      async arrayBuffer(): Promise<ArrayBufferLike> {
         return new Uint8Array().buffer;
       },
       async text(): Promise<string> {
@@ -6568,7 +6570,7 @@ const cacheScopeFetchImpl = async (input: string, init: { method?: string; heade
     if (cacheScopeADataPlaneCalls >= 2) {
       return {
         status: 404,
-        async arrayBuffer(): Promise<ArrayBuffer> {
+        async arrayBuffer(): Promise<ArrayBufferLike> {
           return new Uint8Array().buffer;
         },
         async text(): Promise<string> {
@@ -6579,7 +6581,7 @@ const cacheScopeFetchImpl = async (input: string, init: { method?: string; heade
   }
   return {
     status: 200,
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async arrayBuffer(): Promise<ArrayBufferLike> {
       return (init.body ?? new Uint8Array()).buffer;
     },
     async text(): Promise<string> {
