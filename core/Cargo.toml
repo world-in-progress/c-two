@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "foundation/c2-contract",
     "foundation/c2-config",
+    "foundation/c2-codegen",
     "foundation/c2-error",
     "foundation/c2-mem",
+    "foundation/c2-mem-ffi",
     "protocol/c2-wire",
     "transport/c2-ipc",
     "transport/c2-http",

@@ -42,8 +42,14 @@ wheels = [
 
 [[package]]
 name = "c-two"
-version = "0.4.11"
+version = "0.5.0"
 source = { editable = "sdk/python" }
+dependencies = [
+    { name = "fastdb4py" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "fastdb4py", specifier = ">=0.1.17" }]
 
 [[package]]
 name = "c-two-workspace"
@@ -63,6 +69,8 @@ dev = [
     { name = "httpx" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pillow" },
     { name = "pyarrow" },
     { name = "pytest" },
@@ -87,6 +95,7 @@ benchmark = [
 dev = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "numpy", specifier = ">=2.2.4" },
+    { name = "pandas", specifier = ">=2.2.0" },
     { name = "pillow", specifier = ">=12.1.1" },
     { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "pytest", specifier = ">=8.0.0" },
@@ -243,6 +252,48 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8a/0e/97c33bf5009bdbac74fd2beace167cab3f978feb69cc36f1ef79360d6c4e/exceptiongroup-1.3.1-py3-none-any.whl", hash = "sha256:a7a39a3bd276781e98394987d3a5701d0c4edffb633bb7a5144577f82c773598", size = 16740, upload-time = "2025-11-21T23:01:53.443Z" },
+]
+
+[[package]]
+name = "fastdb4py"
+version = "0.1.17"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/10/4c/d90e4238fa14665a3d94564f7010fdba80d8df0c844b5d893a99c07ac524/fastdb4py-0.1.17.tar.gz", hash = "sha256:bf461342beb10124c1b2a9e6b246a3678d117e726e3a2083ce70448be122b5a6", size = 645930, upload-time = "2026-05-20T15:52:18.518Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f4/f2/93868ca29d97e105ba9ed7eb667655c6a4feddf82d8c2973ee8ee0f4a804/fastdb4py-0.1.17-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:0c1f903b2c3ba1641d59b89baf0ba050100bcb8fe4be415fa7ba49b60bc7ae24", size = 611088, upload-time = "2026-05-20T15:51:35.838Z" },
+    { url = "https://files.pythonhosted.org/packages/69/0d/410d89010915a33665c91002499113bd29ee2b52fc4b23af4fc1b7fcdb90/fastdb4py-0.1.17-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:3e79fc2c2995c825c666c669b317fe51f4e8d17c92941f2da51cdcbc66dc2840", size = 550146, upload-time = "2026-05-20T15:51:37.521Z" },
+    { url = "https://files.pythonhosted.org/packages/20/1f/dead1e3bfdc0f4a85d8239b80c60b870a80763ba0a30da02b365c1b94ccd/fastdb4py-0.1.17-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6d6e3d8674a179d72ef5067ffe91dfdcfccbf47fccf40da9335972dc068dba09", size = 671097, upload-time = "2026-05-20T15:51:39.156Z" },
+    { url = "https://files.pythonhosted.org/packages/17/6d/2defe889ac517cf2c444c42a3bf5f42911d6b548b071e56fa726c66b4d08/fastdb4py-0.1.17-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:94c095d7bf5b10a6b4434b137f793970c5dbb526a5851918d74d58d245b5f34e", size = 697501, upload-time = "2026-05-20T15:51:40.751Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/5f/aba79c761905508f36940675e89d3b8486b096285cc8951c9bcb53403fa8/fastdb4py-0.1.17-cp310-cp310-win_amd64.whl", hash = "sha256:aa77d6462d7fd1516902c9c2d5da99ce4b87bd5dae83a910bc695bde5bb03135", size = 242501, upload-time = "2026-05-20T15:51:41.931Z" },
+    { url = "https://files.pythonhosted.org/packages/21/2d/7649e21ad8cc6c7d207cf2f20d7b7ce6cbf86a6d4e82a7b032d4bf3895c8/fastdb4py-0.1.17-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:a4bdf663cc0402e6fa4e7d5e9443a33cf9e1a79360a3fe3a427165afa8352dc8", size = 611088, upload-time = "2026-05-20T15:51:43.561Z" },
+    { url = "https://files.pythonhosted.org/packages/af/ff/7bdd4ad1ae96c52d3bbbd952ed6ade67aff9b1baabc56ccbabcdd78cdd49/fastdb4py-0.1.17-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:e7674f80216291552fe26be91efb64f253f05ccc1cab981f48de708d8b9578e3", size = 550143, upload-time = "2026-05-20T15:51:45.469Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/ee/e4ae6bf0c66979232bbaa30fced9ab4b009bc38eaf47dc144b4ac3ba665c/fastdb4py-0.1.17-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:794616814a6db2c00dafb96f8d62d08a3b67828ff89b61bdf5e5e6ed755d210a", size = 671207, upload-time = "2026-05-20T15:51:46.707Z" },
+    { url = "https://files.pythonhosted.org/packages/74/2b/228f9f6a21be5ce90ddc82d7771c72de1d1489e10eee138da2bc37390aba/fastdb4py-0.1.17-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c684796001b8a7599994cf5c1b52f0fe11769073695b9f6997e9fe661e902f7c", size = 697459, upload-time = "2026-05-20T15:51:48.039Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/a5/d00b657259c56475eb524f91255b50828320bbf5925ef4e6d93e41a45b4d/fastdb4py-0.1.17-cp311-cp311-win_amd64.whl", hash = "sha256:8f4bc41eed3bad26b7a95e279cf375dcf3fc5d1530714bb3f244aba02e43eada", size = 242424, upload-time = "2026-05-20T15:51:49.557Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/73/ca0e967dabcd777e92315a7b85fb9c6b62c808ab3a875e8822a52cc33481/fastdb4py-0.1.17-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:9fcb8a97dfc2ea67b28ec61973c5240c3d72f4481f23b4f2a162548e460bc2b6", size = 608439, upload-time = "2026-05-20T15:51:50.95Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/f0/e96c70b3b2abb994ad1157cb01c399b0978cba0942da92bb68fa6371724d/fastdb4py-0.1.17-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:e82bb5b5d41d603438e91770789cc9b276b1877e4aa3757637b6f8a8ecae4b60", size = 550842, upload-time = "2026-05-20T15:51:52.292Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/e8/1b0d3687df9534f4f939150c7d4544a299f4b0b30dedbf0a28991c54f044/fastdb4py-0.1.17-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:85fba88f60a7805ac275317f9fcfaaa16ee332d4a7970f779a020285ff6773de", size = 671568, upload-time = "2026-05-20T15:51:54.152Z" },
+    { url = "https://files.pythonhosted.org/packages/65/27/0c21fc0d276ce5dbdbc4155619033c447fa902d042e3e56c8cb2e2c8bd94/fastdb4py-0.1.17-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c3e59849463dcfbceaedaea4390998c19da67d4c7517977f60b22ba0d6018b2d", size = 698106, upload-time = "2026-05-20T15:51:55.728Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/42/97f9525006fd0dc165985fe37b3c7e05d36f09cf15173bb0f44b53d89e25/fastdb4py-0.1.17-cp312-cp312-win_amd64.whl", hash = "sha256:60a36dd35c4ee7796ad26546c0885278b139faa08d8c36445277cf3067cba039", size = 242167, upload-time = "2026-05-20T15:51:56.879Z" },
+    { url = "https://files.pythonhosted.org/packages/79/b9/8de2d9f9fce7e4be9b0f20126a74e7a87103ad0f4881196d2e05b7669732/fastdb4py-0.1.17-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:6fbfbef07ac2d1f0efe62cd6d1dc6ae64db5829d782df9c4be1a95770982b12d", size = 608062, upload-time = "2026-05-20T15:51:58.033Z" },
+    { url = "https://files.pythonhosted.org/packages/60/7f/ca3e8de4deb9324f8c6e55603f47674ed9cbe8f8da167110535ad4d6f9d4/fastdb4py-0.1.17-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:053b95652e48ddcd8a3644666234cc1ef1285f8be64e3b14a51581fd9c8a4557", size = 550187, upload-time = "2026-05-20T15:51:59.149Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/1e/b7d18f1094eaa8d7046c2c7324704b2578d2995ee7994a25293621a18831/fastdb4py-0.1.17-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b8974912d21c92237f7d5915470ac017204a37fe912e1a9f8cc64e3eab1f13bf", size = 671004, upload-time = "2026-05-20T15:52:00.371Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/88/6c564718c14ea81c88925d80af7f62fc50539b9f1262fc1c50ce7f74aa22/fastdb4py-0.1.17-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3c0c38debab7b9741191eda5f6737881105773929cbf21c7c0e6de89aa2168de", size = 697398, upload-time = "2026-05-20T15:52:01.91Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/08/94b6851a1d0c748b25a331ced6c73235ac49e6777eb577989604e2df4fcc/fastdb4py-0.1.17-cp313-cp313-win_amd64.whl", hash = "sha256:3512a4c415d8971f3e9f30fb4f78bd6f091c48d29908c5a20ffbc75aac0b3c24", size = 242189, upload-time = "2026-05-20T15:52:03.335Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/05/fd52df9c5193f04af887818cb117f649202c6ffe6d9ee98aaf68b18410e4/fastdb4py-0.1.17-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:2e0d681a64b24aa9f277b1112808e6341c7321a283ae14fadace5fd85f1c478c", size = 608873, upload-time = "2026-05-20T15:52:04.76Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/30/4e2a777543dee23f3cc22c5adfb4fe3020ab547f916df09160b07bd3b511/fastdb4py-0.1.17-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:fa5f84375373832fe673f0b9b53d8cf4b7fe88a43f515d398e58e37d8a0f83b6", size = 550241, upload-time = "2026-05-20T15:52:06.278Z" },
+    { url = "https://files.pythonhosted.org/packages/02/1a/788dc8bf6f8af158dc88a5d30a7621f91598e40b10a86ef2de02ed7db022/fastdb4py-0.1.17-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1fbd0d48643e451aaf22de3c47d90d83044b6cf3b8937ea83962aabe6868b9cf", size = 671159, upload-time = "2026-05-20T15:52:07.458Z" },
+    { url = "https://files.pythonhosted.org/packages/27/cc/ff30b5d99bd21bee802c877b0d86d6e9e697ef8f040bcff62b99f5d54012/fastdb4py-0.1.17-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:990f2efad1ff87a43f726965f824f68613793110a08689342b8892fd81c3758b", size = 697729, upload-time = "2026-05-20T15:52:08.725Z" },
+    { url = "https://files.pythonhosted.org/packages/80/66/20cca547ad0850b5871831d5cf82e83b28045f0de46bff26fd9b306f6b1d/fastdb4py-0.1.17-cp314-cp314-win_amd64.whl", hash = "sha256:12d58fc3d844583d08e66aa4ce4e44c093e67ea6af9b99588e0b7ae9b901708c", size = 247950, upload-time = "2026-05-20T15:52:10.342Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/d3/7934d0f93b572326fe066cc121c1a154b552faa7254e4bd021d82b330279/fastdb4py-0.1.17-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:479b533a5ddc8912d33524817dca111e4e2fb0391bac0af0b390c63026362009", size = 613027, upload-time = "2026-05-20T15:52:11.825Z" },
+    { url = "https://files.pythonhosted.org/packages/94/8f/c659c5a8da50d49411dbd1964bbde43871302eb239fc8167ccc6dbf45486/fastdb4py-0.1.17-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:f036372b6fec985ecd14d75c42bc698489974d5ddf60ff63b1a2b5cdb16e5612", size = 553126, upload-time = "2026-05-20T15:52:12.968Z" },
+    { url = "https://files.pythonhosted.org/packages/36/cd/627aa17604c89e0fdef9011e163214dd34f15126bcf5d2f160fad984e534/fastdb4py-0.1.17-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c912cf1bd5dd6d04fb75a5d83d8825d1934ae09c36b60b53599b9b4ce1d4658d", size = 669947, upload-time = "2026-05-20T15:52:14.273Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/6b/3b0053680ec03768e9e0358f198e3567ef78be4a06e513511551373e51e7/fastdb4py-0.1.17-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:61274182c0d6e77ebdd75047650a78876864125c1a0e796e236331ba8c550cd0", size = 692786, upload-time = "2026-05-20T15:52:15.521Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/61/4f930632806c86f477ef02ff1011bf05156b85cd18a0e801ae7f460c986c/fastdb4py-0.1.17-cp314-cp314t-win_amd64.whl", hash = "sha256:ddffbf4c72b7717d818ceb375ce6ea79ee5fe33fa1e5f8b1eef6b03daac13126", size = 255626, upload-time = "2026-05-20T15:52:17.037Z" },
 ]
 
 [[package]]

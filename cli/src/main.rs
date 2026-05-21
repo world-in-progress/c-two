@@ -1,3 +1,4 @@
+mod contract;
 mod registry;
 mod relay;
 mod version;
@@ -23,6 +24,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Validate and inspect portable C-Two contract descriptors.
+    Contract(contract::ContractArgs),
     /// Start the C-Two HTTP relay server.
     Relay(relay::RelayArgs),
     /// Query relay registry state.
@@ -33,6 +36,7 @@ fn main() -> Result<()> {
     let matches = Cli::command().before_help(render_banner()).get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
+        Commands::Contract(args) => contract::run(args),
         Commands::Relay(args) => relay::run(args),
         Commands::Registry(args) => registry::run(args),
     }

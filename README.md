@@ -28,7 +28,7 @@
 
 - **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting you read columnar data (NumPy, Arrow, …) directly from SHM — no deserialization, no copies.
 
-- **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
+- **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked payload transfer for data beyond 256 MB). Designed for computational workloads, not microservices.
 
 - **Rust-powered core** — Shared transport, memory, wire codec, route-contract validation, relay, and configuration live in Rust so future SDKs reuse one runtime contract.
 
@@ -196,36 +196,20 @@ cc.serve()                                     # blocks; Ctrl-C triggers gracefu
 
 An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach servers **by route name and CRM contract**, across machines. Servers announce their IPC address plus CRM tag and contract fingerprints to the relay when they register; clients ask the relay with the route name and the expected CRM contract derived from `cc.connect(CRMClass, name='...')`.
 
-The `c3` command is C-Two's cross-language native CLI. From a source checkout,
-build and link a local development binary with
-`python tools/dev/c3_tool.py --build --link`.
-The Python SDK does not embed or start the relay server; start `c3 relay`,
-Docker Compose, or your orchestrator separately, then point Python code at its
-relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`.
-The anchor is the control-plane registration/name-resolution endpoint. Remote
-HTTP calls still go directly to the resolved route's `relay_url`; local direct
-IPC is used only when the anchor endpoint is loopback/local.
-Relay-aware clients preflight routes before the first call and re-resolve
-structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
-maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
-treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds
-(default `300`; `0` disables the reqwest total timeout). Set
-`C2_REMOTE_PAYLOAD_CHUNK_SIZE` to tune C-Two remote payload batching for relay
-HTTP and future remote protocols (default `1048576`; max `134217728`). This is
-not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee. Ambiguous
-data-plane failures are not replayed. Relay resolve, probe, and call paths
-reject name-only lookups and CRM contract mismatches instead of falling back to
-an untyped route with the same name.
+The `c3` command is C-Two's cross-language native CLI. From a source checkout, build and link a local development binary with `python tools/dev/c3_tool.py --build --link`. For released binaries, install the latest `c3` with:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+```
+
+The Python SDK does not embed or start the relay server; start `c3 relay`, Docker Compose, or your orchestrator separately, then point Python code at its relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is the control-plane registration/name-resolution endpoint. Remote HTTP calls still go directly to the resolved route's `relay_url`; local direct IPC is used only when the anchor endpoint is loopback/local. Relay-aware clients preflight routes before the first call and re-resolve structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds (default `300`; `0` disables the reqwest total timeout). Set `C2_REMOTE_PAYLOAD_CHUNK_SIZE` to tune C-Two remote payload batching for relay HTTP and future remote protocols (default `1048576`; max `134217728`). This is not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee. Ambiguous data-plane failures are not replayed. Relay resolve, probe, and call paths reject name-only lookups and CRM contract mismatches instead of falling back to an untyped route with the same name.
 
 ```bash
 # Start a relay anywhere reachable on your network
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Relay HTTP and mesh endpoints are intended for a trusted network boundary. Do
-not expose them directly to the public internet; production deployments should
-restrict access with infrastructure such as private networking, firewalls,
-Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
+Relay HTTP and mesh endpoints are intended for a trusted network boundary. Do not expose them directly to the public internet; production deployments should restrict access with infrastructure such as private networking, firewalls, Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
 
 ```python
 # Server side — announce resources to the relay
@@ -299,7 +283,7 @@ Without `@cc.transfer`, the framework automatically matches registered `@transfe
 
 ### cc.hold() — Client-Side Zero-Copy
 
-On the client side, `cc.hold()` requests that the response SHM buffer remain alive, enabling zero-copy reads of the result. The returned `HeldResult` wraps the value and provides a three-layer safety net for SHM lifecycle:
+On the client side, `cc.hold()` requests that the response buffer remain alive, enabling zero-copy reads when the output transferable can build a view from a memoryview. The returned `HeldResult` wraps the value, exposes the retained raw wire buffer as `.buffer` for advanced user parsing, and provides a three-layer safety net for buffer lifecycle:
 
 1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
 2. **Context manager (`with`)** — recommended for single-buffer scopes
@@ -314,6 +298,7 @@ result = grid.transform(matrix)
 # Option 1: Context manager — clean for single holds
 with cc.hold(grid.transform)(matrix) as held:
     data = held.value          # zero-copy NumPy array backed by SHM
+    raw = held.buffer          # retained wire buffer, valid only inside the hold scope
     process(data)              # read directly from shared memory
 # SHM buffer released on context exit
 
@@ -467,9 +452,7 @@ cc.serve()  # blocks until Ctrl-C
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Expose relay HTTP only inside a trusted deployment boundary. The relay mesh
-protocol assumes infrastructure-level access control, not public internet
-reachability.
+Expose relay HTTP only inside a trusted deployment boundary. The relay mesh protocol assumes infrastructure-level access control, not public internet reachability.
 
 **Client** (`client.py`):
 ```python
@@ -497,8 +480,7 @@ c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
     --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
 
-Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and
-must be protected by the same trusted network boundary as the relay HTTP API.
+Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and must be protected by the same trusted network boundary as the relay HTTP API.
 
 CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh using the same CRM class and route name.
 
@@ -571,10 +553,87 @@ The Rust workspace contains 9 core crates organized in 4 layers (foundation → 
 
 The Rust extension is compiled automatically during `pip install c-two` (from pre-built wheels) or `uv sync` (from source).
 
-The `c3` command is distributed as a native CLI binary and built from the root
-`cli/` package. Source checkouts can link a local development binary with
-`python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned
-by the CLI release pipeline rather than by any language SDK.
+The `c3` command is distributed as a native CLI binary and built from the root `cli/` package. Install released binaries with:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+```
+
+Source checkouts can link a local development binary with `python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned by the CLI release pipeline rather than by any language SDK.
+
+Portable CRM descriptors can be exported from Python CRM classes and validated by the Rust CLI before they are used as codegen input:
+
+```bash
+uv run python -m c_two.cli.contract export mypkg.contracts:Grid --out grid.contract.json
+c3 contract artifacts mypkg.contracts:Grid --python .venv/bin/python --out grid.payload-abi-artifacts.json
+c3 contract diagnose mypkg.contracts:Grid --python .venv/bin/python --pretty
+c3 contract export mypkg.contracts:Grid --python .venv/bin/python --out grid.contract.json
+c3 contract validate grid.contract.json
+```
+
+`c3 contract diagnose` reports fastdb-first portability warnings such as Python-only pickle fallback or a non-FastDB `PayloadAbiRef` before strict cross-language workflows fail, and the Rust CLI requires Python diagnostics to be a JSON array of objects before writing them. `c3 contract artifacts` exports FastDB ABI sidecar descriptors such as `fastdb.call-db.schema.v1` and root/dependency `fastdb.schema.v1` objects without making C-Two runtime route/relay/IPC/scheduler/lease layers parse FastDB storage internals. Feed that artifact bundle directly to C-Two codegen with `--fastdb-schema` and `--fastdb-out`:
+
+```bash
+c3 contract codegen typescript \
+  grid.contract.json \
+  --out grid.client.ts \
+  --fastdb-schema grid.payload-abi-artifacts.json \
+  --fastdb-out grid.fastdb.ts
+```
+
+Validated descriptors can generate TypeScript clients. FastDB-backed payloads are emitted with method wire specs, route fingerprints, a codec transport factory, `createHttpRelayEncodedTransport(...)` for explicit relay URLs, and `createRelayAwareHttpEncodedTransport(...)` for contract-scoped relay resolve with a contract-keyed route cache, current-route preference, payload-limit guardrails, stale-route invalidation/re-resolve, resolve transport-error/5xx retry, data-plane transport-error classification, `maxAttempts`, `routeCacheTtlMs`, `callTimeoutMs`, `resolveTimeoutMs`, construction-time HTTP option/base URL/fetch/header validation, and reserved C-Two expected-contract header protection. Use `--strict-codecs` when CI should fail until every FastDB ABI requirement has generated TypeScript support:
+
+```bash
+c3 contract codegen typescript grid.contract.json --out grid.client.ts
+c3 contract codegen typescript grid.contract.json --strict-codecs
+```
+
+For resource-first projects, `infer` can build a CRM projection descriptor from explicitly selected Python resource methods. Inference does not expose all public methods, and fastdb-first portable workflows still require every selected method payload to resolve to a FastDB call-db `PayloadAbiRef` or no payload. Python-native primitives and containers are useful for Python-only prototypes, but they fall back to `python-pickle-default` and are rejected by portable export; explicit non-FastDB `PayloadAbiRef` values are internal diagnostic cases, not a public extension path. Use `c3 contract infer --diagnose` to inspect those diagnostics before exporting, and `c3 contract infer --artifacts` to export FastDB ABI artifacts from the same inferred projection for C-Two codegen.
+
+```bash
+c3 contract infer mypkg.resources:GridResource \
+  --python .venv/bin/python \
+  --namespace mypkg.grid \
+  --version 0.1.0 \
+  --name Grid \
+  --method get_schema \
+  --method subdivide_grids \
+  --diagnose \
+  --pretty
+
+c3 contract infer mypkg.resources:GridResource \
+  --python .venv/bin/python \
+  --namespace mypkg.grid \
+  --version 0.1.0 \
+  --name Grid \
+  --method get_schema \
+  --method subdivide_grids \
+  --artifacts \
+  --out grid.payload-abi-artifacts.json
+
+c3 contract infer mypkg.resources:GridResource \
+  --python .venv/bin/python \
+  --namespace mypkg.grid \
+  --version 0.1.0 \
+  --name Grid \
+  --method get_schema \
+  --method subdivide_grids \
+  --out grid.contract.json
+```
+
+FastDB call-db is the portable CRM payload ABI. The Python fallback path uses ordinary Python annotations and pickle for local or Python-only IPC prototypes; it is intentionally rejected by strict portable export/codegen. C-Two no longer ships optional payload registry modules or a public codec registry.
+
+```python
+from c_two import fastdb as fdb
+
+@fdb.feature
+class GridAttribute:
+    level: fdb.I32
+    global_id: fdb.I32
+    activate: fdb.BOOL
+```
+
+To move a method onto the portable path, use `c_two.fastdb` aliases, `Array[...]`, `Batch[...]`, and `@fdb.feature` so the method plans as FastDB call-db. Unmarked Python payloads can still use pickle in non-portable local/IPC prototype paths, but strict portable export rejects pickle and non-FastDB `PayloadAbiRef` values.
 
 ---
 
@@ -622,7 +681,7 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | IPC transport with SHM buddy allocator | ✅ Stable |
 | HTTP relay (Rust-powered) | ✅ Stable |
 | Relay mesh with gossip-based discovery | ✅ Stable |
-| Chunked streaming (payloads > 256 MB) | ✅ Stable |
+| Chunked payload transfer (payloads > 256 MB) | ✅ Stable |
 | Heartbeat & connection management | ✅ Stable |
 | Read/write concurrency control | ✅ Stable |
 | Unified config architecture (Rust resolver SSOT) | ✅ Stable |
@@ -630,10 +689,16 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | Disk spill for extreme payloads | ✅ Stable |
 | Hold mode with `from_buffer` zero-copy | ✅ Stable |
 | SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
+| Contract version compatibility negotiation | 🔜 Planned |
+| `auth_hook` + call metadata | 🔜 Planned |
+| Dry-run hooks | 🔜 Planned |
 | Async interfaces | 🔜 Planned |
-| Cross-language clients (TypeScript/Rust) | 🔮 Future |
+| Adaptive memory lifecycle policy | 🔜 Planned |
+| Streaming RPC / pipeline semantics | 🔜 Planned |
+| Cross-language clients (Rust first, TypeScript later) | 🔮 Future |
+| Global discovery & namespace governance | 🔮 Future |
 
-See the [full roadmap](docs/plans/c-two-rpc-v2-roadmap.md) for details.
+See the [current roadmap](docs/roadmap.md) for details. Historical roadmap notes remain archived under `docs/plans/`.
 
 ---
 

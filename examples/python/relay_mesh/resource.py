@@ -1,7 +1,7 @@
 """Grid CRM process — auto-registers with the relay.
 
-Reuses the existing ``Grid`` contract, ``NestedGrid`` resource, and transferable
-types from ``examples/python/grid/``.
+Reuses the pure-Python ``GridPython`` contract and ``NestedGrid`` resource from
+``examples/python/grid/``.
 
 Run (after starting relay.py):
     uv run python examples/python/relay_mesh/resource.py
@@ -15,8 +15,8 @@ sys.path.insert(0, str(EXAMPLES_ROOT))
 import c_two as cc
 import logging
 
-from grid.grid_contract import Grid
 from grid.nested_grid import NestedGrid
+from grid.grid_py_crm import GridPython
 from relay_config import ensure_http_relay_url, resolved_relay_url
 
 RELAY_URL = ensure_http_relay_url(resolved_relay_url('http://127.0.0.1:8300'))
@@ -39,7 +39,7 @@ def main():
         subdivide_rules=[[4, 3], [2, 2], [2, 2], [2, 2]],
     )
 
-    cc.register(Grid, grid, name='grid')
+    cc.register(GridPython, grid, name='grid')
     print(f'Grid CRM registered (IPC: {cc.server_address()})')
     print('Press Ctrl-C to stop.\n')
 

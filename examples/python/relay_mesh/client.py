@@ -14,8 +14,7 @@ sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
 
-# Import the CRM contract from the shared grid package.
-from grid.grid_contract import Grid
+from grid.grid_py_crm import GridPython
 from relay_config import ensure_http_relay_url, resolved_relay_url
 
 RELAY_URL = ensure_http_relay_url(resolved_relay_url('http://127.0.0.1:8300'))
@@ -27,8 +26,8 @@ def main():
 
     # ── Connect by name ──────────────────────────────────────────────
     # No IPC address needed — the SDK asks the relay for a route matching
-    # both 'grid' and the Grid CRM contract fingerprint.
-    grid = cc.connect(Grid, name='grid')
+    # both 'grid' and the GridPython CRM contract fingerprint.
+    grid = cc.connect(GridPython, name='grid')
     print(f'Connected to Grid (mode: {grid.client._mode})\n')
 
     # ── 1. Hello ─────────────────────────────────────────────────────

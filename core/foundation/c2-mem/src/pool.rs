@@ -339,7 +339,25 @@ impl MemPool {
     /// Called before handshake so the client can announce its SHM segments
     /// to the server.  Does nothing if segments already exist.
     pub fn ensure_ready(&mut self) -> Result<(), String> {
-        if self.segments.is_empty() && self.config.max_segments > 0 {
+        if self.config.max_segments > 0 {
+            self.ensure_buddy_segments(1)?;
+        }
+        Ok(())
+    }
+
+    /// Ensure a stable set of buddy segments exists before peer advertisement.
+    ///
+    /// Runtime adapters that advertise their client buddy pool in an IPC
+    /// handshake should call this before exposing segment metadata. This avoids
+    /// later lazy allocation from returning a segment index the peer never saw.
+    pub fn ensure_buddy_segments(&mut self, count: usize) -> Result<(), String> {
+        if count > self.config.max_segments {
+            return Err(format!(
+                "requested {} buddy segments exceeds configured max_segments {}",
+                count, self.config.max_segments
+            ));
+        }
+        while self.segments.len() < count {
             let seg = self.create_segment()?;
             self.segments.push(seg);
             self.idle_since.push(None);
@@ -977,6 +995,17 @@ mod tests {
         pool.free(&a).unwrap();
         let stats = pool.stats();
         assert_eq!(stats.alloc_count, 0);
+    }
+
+    #[test]
+    fn test_ensure_buddy_segments_precreates_advertised_segments() {
+        let mut pool = test_pool(small_config());
+        pool.ensure_buddy_segments(3).unwrap();
+        assert_eq!(pool.segment_count(), 3);
+        assert!(pool.segment_name(0).unwrap().ends_with("_b0000"));
+        assert!(pool.segment_name(1).unwrap().ends_with("_b0001"));
+        assert!(pool.segment_name(2).unwrap().ends_with("_b0002"));
+        assert!(pool.ensure_buddy_segments(5).is_err());
     }
 
     #[test]

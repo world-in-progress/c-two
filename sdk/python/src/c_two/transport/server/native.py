@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ...crm.bridge import ResourceBridge, normalize_bridge_map, wrap_resource
 from ...crm.contract import (
     CRMContract,
     crm_contract_identity,
@@ -200,6 +201,7 @@ class NativeServerBridge:
         concurrency: ConcurrencyConfig | None = None,
         *,
         name: str,
+        bridge: dict[str, ResourceBridge] | None = None,
         runtime_session: object | None = None,
         relay_anchor_address: str | None = None,
     ) -> str:
@@ -207,8 +209,10 @@ class NativeServerBridge:
         if not isinstance(name, str):
             raise TypeError('name must be an explicit route name string')
         routing_name = name
-        instance = self._create_crm_instance(crm_class, crm_instance)
         methods = self._discover_methods(crm_class)
+        method_bridge_map = normalize_bridge_map(bridge, method_names=methods)
+        runtime_resource = wrap_resource(crm_instance, method_bridge_map)
+        instance = self._create_crm_instance(crm_class, runtime_resource)
         cc_config = concurrency or ConcurrencyConfig()
         sd_method = get_shutdown_method(crm_class)
 
@@ -226,7 +230,7 @@ class NativeServerBridge:
         slot = CRMSlot(
             name=routing_name,
             crm_instance=instance,
-            direct_instance=crm_instance,
+            direct_instance=runtime_resource,
             crm_ns=crm_ns,
             crm_name=crm_name,
             crm_ver=crm_ver,

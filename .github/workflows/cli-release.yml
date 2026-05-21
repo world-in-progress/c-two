@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
+      should_publish_installer: ${{ steps.check.outputs.should_publish_installer }}
       version: ${{ steps.check.outputs.version }}
       tag: ${{ steps.check.outputs.tag }}
     steps:
@@ -82,8 +83,26 @@ jobs:
             cli-dist/c3-${{ matrix.target }}
             cli-dist/c3-${{ matrix.target }}.sha256
 
+  installer:
+    needs: version-check
+    if: needs.version-check.outputs.should_release == 'true' || needs.version-check.outputs.should_publish_installer == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Package c3 installer
+        shell: bash
+        run: |
+          mkdir -p cli-dist
+          cp cli/install-c3.sh cli-dist/c3-installer.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-installer
+          path: cli-dist/c3-installer.sh
+
   publish:
-    needs: [version-check, build]
+    needs: [version-check, build, installer]
     if: needs.version-check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -101,3 +120,22 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: c3 ${{ needs.version-check.outputs.version }}
           files: dist/c3-*
+
+  publish-installer:
+    needs: [version-check, installer]
+    if: needs.version-check.outputs.should_publish_installer == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-installer
+          path: dist
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version-check.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: c3 ${{ needs.version-check.outputs.version }}
+          files: dist/c3-installer.sh

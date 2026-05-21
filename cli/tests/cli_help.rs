@@ -8,6 +8,7 @@ fn c3_help_lists_runtime_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("relay"))
+        .stdout(predicate::str::contains("contract"))
         .stdout(predicate::str::contains("registry"));
 }
 
