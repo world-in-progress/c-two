@@ -164,6 +164,34 @@ def test_descriptor_normalizes_optional_union_and_ignores_shutdown_without_retur
     assert 'cleanup' not in encoded
 
 
+def test_non_portable_descriptor_allows_pickle_fallback_for_plain_python_payloads():
+    class PlainPayload:
+        value: int
+
+    @cc.crm(namespace='test.descriptor.pickle-fallback', version='0.1.0')
+    class PickleFallback:
+        def list_payloads(self) -> list[PlainPayload]:
+            ...
+
+    from c_two.crm.descriptor import build_contract_descriptor
+
+    descriptor = build_contract_descriptor(PickleFallback)
+    method = descriptor['methods'][0]
+
+    assert method['wire']['output']['family'] == 'python-pickle-default'
+    assert method['return'] == {
+        'item': {
+            'kind': 'python_type',
+            'module': __name__,
+            'name': 'PlainPayload',
+        },
+        'kind': 'list',
+    }
+    assert _contract_hashes(PickleFallback)
+    with pytest.raises(ValueError, match='python-pickle-default'):
+        cc.export_contract_descriptor(PickleFallback)
+
+
 @pytest.mark.parametrize(
     ('method_source', 'error_pattern'),
     [

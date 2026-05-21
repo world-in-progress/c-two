@@ -13,6 +13,13 @@ from typing import get_type_hints, Any, Callable, TypeVar, Type
 import struct as _struct
 
 from .. import error
+from ._payload_abi import (
+    PayloadAbiBinding,
+    PayloadAbiRef,
+    MethodPayloadAbiShape,
+    MethodParameterShape,
+    normalize_payload_abi_ref,
+)
 
 
 R = TypeVar('R')
@@ -32,11 +39,12 @@ class HeldResult:
     3. __del__ fallback — last resort with warning
     """
 
-    __slots__ = ('_value', '_release_cb', '_released')
+    __slots__ = ('_value', '_release_cb', '_released', '_buffer')
 
-    def __init__(self, value, release_cb=None):
+    def __init__(self, value, release_cb=None, buffer=None):
         self._value = value
         self._release_cb = release_cb
+        self._buffer = buffer
         self._released = False
 
     @property
@@ -45,17 +53,28 @@ class HeldResult:
             raise RuntimeError("SHM released — value no longer accessible")
         return self._value
 
+    @property
+    def buffer(self):
+        if self._released:
+            raise RuntimeError("SHM released — buffer no longer accessible")
+        if self._buffer is None:
+            raise RuntimeError("HeldResult has no retained buffer")
+        return self._buffer
+
     def release(self):
         if not self._released:
             self._released = True
             cb = self._release_cb
             self._release_cb = None
             self._value = None
-            if cb is not None:
-                try:
-                    cb()
-                except Exception:
-                    pass
+            try:
+                if cb is not None:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+            finally:
+                self._buffer = None
 
     def __enter__(self):
         return self
@@ -339,14 +358,33 @@ def _validate_transferable_abi(
     return abi_id, abi_schema
 
 
-def transferable(cls=None, *, abi_id: str | None = None, abi_schema: str | None = None):
+def transferable(
+    cls=None,
+    *,
+    abi_id: str | None = None,
+    abi_schema: str | None = None,
+):
     """Decorator to make a class inherit from Transferable.
 
     Supports ``@cc.transferable``, ``@cc.transferable()``, and explicit ABI
     declarations for custom byte formats via ``abi_id`` or ``abi_schema``.
     """
     abi_id, abi_schema = _validate_transferable_abi(abi_id, abi_schema)
+    return _make_transferable_decorator(cls, abi_id=abi_id, abi_schema=abi_schema)
 
+
+def _payload_abi_ref_transferable(cls=None, *, payload_abi_ref: object):
+    payload_abi_ref = normalize_payload_abi_ref(payload_abi_ref)
+    return _make_transferable_decorator(cls, payload_abi_ref=payload_abi_ref)
+
+
+def _make_transferable_decorator(
+    cls=None,
+    *,
+    abi_id: str | None = None,
+    abi_schema: str | None = None,
+    payload_abi_ref: PayloadAbiRef | None = None,
+):
     def wrap(cls):
         new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
         new_cls.__module__ = cls.__module__
@@ -355,6 +393,7 @@ def transferable(cls=None, *, abi_id: str | None = None, abi_schema: str | None 
             'abi_id': abi_id,
             'abi_schema': abi_schema,
         }
+        new_cls.__cc_payload_abi_ref__ = payload_abi_ref
         return new_cls
 
     if cls is not None:
@@ -396,7 +435,7 @@ def transfer(*, input=None, output=None, buffer=None):
     return decorator
 
 
-def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
+def _build_transfer_wrapper(func, input=None, output=None, buffer='view', payload_abi_context=None):
     """Build the com_to_crm / crm_to_com / transfer_wrapper closure.
 
     This is the internal implementation that was previously inside transfer().
@@ -405,6 +444,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
     method_name = func.__name__
 
     def com_to_crm(*args, _c2_buffer=None):
+        stage = 'call_crm'
         input_transferable = input.serialize if input else None
         # Output construction hook: from_buffer when hold mode and available
         if output is not None:
@@ -427,6 +467,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             request = args[1:] if len(args) > 1 else None
             # Thread fast path — skip all serialization/deserialization
             if getattr(client, 'supports_direct_call', False):
+                stage = 'execute_direct'
                 result = client.call_direct(method_name, request or ())
                 if _c2_buffer == 'hold':
                     return HeldResult(result, None)
@@ -478,7 +519,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                             response.release()
                         except Exception:
                             pass
-                    return HeldResult(result, release_cb)
+                    return HeldResult(result, release_cb, buffer=mv)
                 else:
                     # view (default)
                     try:
@@ -490,6 +531,20 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                         response.release()
                     return result
             else:
+                if _c2_buffer == 'hold':
+                    mv = memoryview(response)
+                    try:
+                        result = output_fn(mv) if output_hook == 'from_buffer' else output_fn(response)
+                    except Exception as exc:
+                        mv.release()
+                        if output_hook == 'from_buffer':
+                            raise error.ClientOutputFromBuffer(str(exc)) from exc
+                        raise
+
+                    def release_cb():
+                        mv.release()
+
+                    return HeldResult(result, release_cb, buffer=mv)
                 result = output_fn(response)
                 if _c2_buffer == 'hold':
                     return HeldResult(result, None)
@@ -502,6 +557,8 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 raise error.ClientSerializeInput(str(e)) from e
             elif stage == 'call_crm':
                 raise error.ClientCallResource(str(e)) from e
+            elif stage == 'execute_direct':
+                raise error.ResourceExecuteFunction(str(e)) from e
             elif output_hook == 'from_buffer':
                 raise error.ClientOutputFromBuffer(str(e)) from e
             else:
@@ -615,9 +672,10 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
     transfer_wrapper._input_buffer_mode = buffer
     transfer_wrapper._input_transferable = input
     transfer_wrapper._output_transferable = output
+    transfer_wrapper._payload_abi_context = dict(payload_abi_context or {})
     return transfer_wrapper
 
-def auto_transfer(func=None, *, input=None, output=None, buffer=None):
+def auto_transfer(func=None, *, input=None, output=None, buffer=None, payload_abi_context=None):
     """Auto-wrap a function with transfer logic.
 
     When called without kwargs, performs auto-matching:
@@ -630,25 +688,48 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
     - buffer='view'/'hold': explicit override
     """
     def create_wrapper(func):
+        base_payload_abi_context = dict(payload_abi_context or {})
+        base_payload_abi_context.setdefault('method_name', func.__name__)
+
         # --- Input Matching ---
         input_transferable = input
+        input_method_payload_abi_aggregate = False
 
         if input_transferable is None:
             func_params = _extract_func_params(func)
             is_empty_input = len(func_params) == 0
+
+            if not is_empty_input:
+                shape = _method_payload_abi_shape(
+                    base_payload_abi_context,
+                    func,
+                    'input',
+                    parameters=func_params,
+                )
+                resolution_context = _payload_abi_resolution_context(
+                    base_payload_abi_context,
+                    func,
+                    'input',
+                )
+                binding = _resolve_fastdb_method_payload_abi(shape, resolution_context)
+                if binding is not None:
+                    input_transferable = binding.transferable
+                    input_method_payload_abi_aggregate = True
 
             if not is_empty_input and len(func_params) == 1:
                 _, param_type, _ = func_params[0]
                 param_module = getattr(param_type, '__module__', None)
                 param_name = getattr(param_type, '__name__', str(param_type))
                 full_name = f'{param_module}.{param_name}' if param_module else param_name
-                input_transferable = get_transferable(full_name)
+                if input_transferable is None:
+                    input_transferable = get_transferable(full_name)
 
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
 
         # --- Output Matching ---
         output_transferable = output
+        output_method_payload_abi_aggregate = False
 
         if output_transferable is None:
             try:
@@ -661,10 +742,26 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                 if return_type is None or return_type is type(None):
                     output_transferable = None
                 else:
-                    return_type_name = getattr(return_type, '__name__', str(return_type))
-                    return_type_module = getattr(return_type, '__module__', None)
-                    return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
-                    output_transferable = get_transferable(return_type_full_name)
+                    shape = _method_payload_abi_shape(
+                        base_payload_abi_context,
+                        func,
+                        'output',
+                        return_annotation=return_type,
+                    )
+                    resolution_context = _payload_abi_resolution_context(
+                        base_payload_abi_context,
+                        func,
+                        'output',
+                    )
+                    binding = _resolve_fastdb_method_payload_abi(shape, resolution_context)
+                    if binding is not None:
+                        output_transferable = binding.transferable
+                        output_method_payload_abi_aggregate = True
+                    if output_transferable is None:
+                        return_type_name = getattr(return_type, '__name__', str(return_type))
+                        return_type_module = getattr(return_type, '__module__', None)
+                        return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
+                        output_transferable = get_transferable(return_type_full_name)
                     if output_transferable is None and not (return_type is None or return_type is type(None)):
                         output_transferable = create_default_transferable(func, is_input=False)
 
@@ -676,6 +773,7 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                 input_transferable is not None
                 and hasattr(input_transferable, 'from_buffer')
                 and callable(input_transferable.from_buffer)
+                and getattr(input_transferable, '_c2_auto_input_hold', True)
             )
             effective_buffer = 'hold' if has_from_buffer else 'view'
             
@@ -700,7 +798,15 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                 )
 
         # --- Wrapping ---
-        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable, buffer=effective_buffer)
+        wrapped_func = _build_transfer_wrapper(
+            func,
+            input=input_transferable,
+            output=output_transferable,
+            buffer=effective_buffer,
+            payload_abi_context=base_payload_abi_context,
+        )
+        wrapped_func._input_method_payload_abi_aggregate = input_method_payload_abi_aggregate
+        wrapped_func._output_method_payload_abi_aggregate = output_method_payload_abi_aggregate
         return wrapped_func
 
     if func is None:
@@ -711,6 +817,87 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
         return create_wrapper(func)
 
 # Helpers #########################################################################
+
+def _resolve_fastdb_method_payload_abi(
+    shape: MethodPayloadAbiShape,
+    context: dict[str, Any],
+) -> PayloadAbiBinding | None:
+    try:
+        from c_two.fastdb.call_db import resolve_method_payload_abi
+    except ImportError:
+        return None
+    binding = resolve_method_payload_abi(shape, context)
+    if binding is None:
+        return None
+    if not isinstance(binding, PayloadAbiBinding):
+        raise TypeError('FastDB method payload ABI resolver returned a non-PayloadAbiBinding value.')
+    return binding
+
+
+def _payload_abi_resolution_context(
+    base_context: dict[str, Any],
+    func: Callable,
+    position: str,
+) -> dict[str, Any]:
+    context = dict(base_context)
+    context['function'] = func
+    context['position'] = position
+    context.setdefault('method_name', func.__name__)
+    return context
+
+
+def _method_payload_abi_shape(
+    base_context: dict[str, Any],
+    func: Callable,
+    direction: str,
+    *,
+    parameters: list[tuple[str, type, Any]] | None = None,
+    return_annotation: object | None = None,
+) -> MethodPayloadAbiShape:
+    return MethodPayloadAbiShape(
+        method_name=str(base_context.get('method_name') or func.__name__),
+        direction=direction,
+        crm_namespace=base_context.get('crm_namespace'),
+        crm_name=base_context.get('crm_name'),
+        crm_version=base_context.get('crm_version'),
+        parameters=(
+            _extract_method_parameter_shapes(func)
+            if parameters is not None
+            else ()
+        ),
+        return_annotation=return_annotation,
+    )
+
+
+def _extract_method_parameter_shapes(
+    func: Callable,
+) -> tuple[MethodParameterShape, ...]:
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return ()
+    try:
+        type_hints = get_type_hints(func)
+    except (NameError, ValueError, TypeError):
+        type_hints = {}
+
+    shapes = []
+    for index, (name, param) in enumerate(sig.parameters.items()):
+        if index == 0 and name in ('self', 'cls'):
+            continue
+        annotation = type_hints.get(name, param.annotation)
+        if annotation is inspect.Parameter.empty:
+            annotation = Any
+        shapes.append(
+            MethodParameterShape(
+                name=name,
+                annotation=annotation,
+                default=param.default,
+                kind=param.kind.name,
+            )
+        )
+    return tuple(shapes)
+
 
 def _extract_func_params(func: Callable) -> list[tuple[str, type, Any]]:
     """

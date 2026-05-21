@@ -1,0 +1,10 @@
+[package]
+name = "c2-codegen"
+edition.workspace = true
+version.workspace = true
+description = "Language-neutral SDK code generation for C-Two contracts"
+
+[dependencies]
+c2-contract = { path = "../c2-contract" }
+serde_json = "1"
+thiserror = "2"

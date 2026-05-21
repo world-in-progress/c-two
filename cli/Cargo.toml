@@ -1,6 +1,6 @@
 [package]
 name = "c2-cli"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Cross-language command-line interface for C-Two"
 
@@ -13,6 +13,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 c2-config = { path = "../core/foundation/c2-config" }
+c2-codegen = { path = "../core/foundation/c2-codegen" }
+c2-contract = { path = "../core/foundation/c2-contract" }
 c2-http = { path = "../core/transport/c2-http", features = ["relay"] }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

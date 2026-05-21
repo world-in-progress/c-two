@@ -72,6 +72,20 @@ class TestHeldResultBasic:
         with pytest.raises(Exception):
             _ = hr.value
 
+    def test_buffer_exposes_held_memoryview_until_release(self):
+        from c_two.crm.transferable import HeldResult
+
+        raw = memoryview(b'abc')
+        hr = HeldResult('value', release_cb=raw.release, buffer=raw)
+
+        assert bytes(hr.buffer) == b'abc'
+        assert hr.value == 'value'
+
+        hr.release()
+
+        with pytest.raises(Exception):
+            _ = hr.buffer
+
 
 class TestHoldFunction:
     """cc.hold() wraps a bound CRM method to inject _c2_buffer='hold'."""

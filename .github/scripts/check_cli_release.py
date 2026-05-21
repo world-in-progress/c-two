@@ -2,6 +2,7 @@
 
 Outputs to $GITHUB_OUTPUT:
   should_release=true|false
+  should_publish_installer=true|false
   version=X.Y.Z
   tag=c3-vX.Y.Z
 """
@@ -18,6 +19,7 @@ from pathlib import Path
 CLI_MANIFEST_PATH = str(Path(__file__).resolve().parents[2] / "cli" / "Cargo.toml")
 GITHUB_API_TIMEOUT = 10
 TAG_PREFIX = "c3-v"
+INSTALLER_ASSET = "c3-installer.sh"
 
 
 def _read_local_version() -> str:
@@ -25,10 +27,10 @@ def _read_local_version() -> str:
         return tomllib.load(f)["package"]["version"]
 
 
-def _release_exists(tag: str) -> bool | None:
+def _release_state(tag: str) -> tuple[bool | None, bool]:
     repository = os.environ.get("GITHUB_REPOSITORY")
     if not repository:
-        return None
+        return None, False
 
     url = f"https://api.github.com/repos/{repository}/releases/tags/{tag}"
     headers = {
@@ -43,28 +45,47 @@ def _release_exists(tag: str) -> bool | None:
     try:
         with urllib.request.urlopen(request, timeout=GITHUB_API_TIMEOUT) as resp:
             data = json.loads(resp.read())
-            return data.get("tag_name") == tag
+            exists = data.get("tag_name") == tag
+            installer_exists = any(
+                asset.get("name") == INSTALLER_ASSET
+                for asset in data.get("assets", [])
+                if isinstance(asset, dict)
+            )
+            return exists, installer_exists if exists else False
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return False
-        return None
+            return False, False
+        return None, False
     except Exception:
-        return None
+        return None, False
 
 
 def main() -> None:
     version = _read_local_version()
     tag = f"{TAG_PREFIX}{version}"
-    exists = _release_exists(tag)
+    exists, installer_exists = _release_state(tag)
     should = exists is False
+    should_publish_installer = exists is True and not installer_exists
 
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
         f.write(f"should_release={'true' if should else 'false'}\n")
+        f.write(
+            f"should_publish_installer={'true' if should_publish_installer else 'false'}\n"
+        )
         f.write(f"version={version}\n")
         f.write(f"tag={tag}\n")
 
-    action = "RELEASING" if should else "SKIPPING"
-    print(f"[check_cli_release] version={version} tag={tag} exists={exists} -> {action}")
+    if should:
+        action = "RELEASING"
+    elif should_publish_installer:
+        action = "BACKFILLING_INSTALLER"
+    else:
+        action = "SKIPPING"
+    print(
+        "[check_cli_release] "
+        f"version={version} tag={tag} exists={exists} "
+        f"installer_exists={installer_exists} -> {action}"
+    )
 
 
 if __name__ == "__main__":

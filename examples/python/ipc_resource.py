@@ -16,8 +16,8 @@ EXAMPLES_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
-from grid.grid_contract import Grid
 from grid.nested_grid import NestedGrid
+from grid.grid_py_crm import GridPython
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,7 +30,7 @@ def main() -> None:
         [[478, 310], [2, 2], [2, 2], [2, 2], [2, 2], [2, 2], [1, 1]],
     )
 
-    cc.register(Grid, grid, name='examples/grid')
+    cc.register(GridPython, grid, name='examples/grid')
     print(f'Grid CRM registered at {cc.server_address()}', flush=True)
     cc.serve()
 

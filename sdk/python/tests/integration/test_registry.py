@@ -43,6 +43,63 @@ class UndecoratedHello:
         ...
 
 
+class MissingGreetingImpl:
+    def other(self, name: str) -> str:
+        return name
+
+
+class BadGreetingAnnotationImpl:
+    def greeting(self, name: bytes) -> str:
+        return name.decode()
+
+    def add(self, a: int, b: int) -> int:
+        return a + b
+
+    def echo_none(self, msg: str) -> str | None:
+        return msg
+
+    def get_items(self, ids: list[int]) -> list[str]:
+        return []
+
+    def get_data(self, id: int):
+        return None
+
+
+@cc.crm(namespace='test.direct_error', version='0.1.0')
+class DirectError:
+    def fail(self) -> str:
+        ...
+
+
+class DirectErrorImpl:
+    def fail(self) -> str:
+        raise RuntimeError('direct resource failed')
+
+
+@cc.crm(namespace='test.bridge_text', version='0.1.0')
+class BridgeText:
+    def shout(self, text: str) -> str:
+        ...
+
+
+class BytesTextResource:
+    def __init__(self) -> None:
+        self.seen: list[bytes] = []
+
+    def shout(self, payload: bytes) -> bytes:
+        self.seen.append(payload)
+        return payload.upper() + b'!'
+
+
+def _text_bridge():
+    return {
+        'shout': cc.bridge(
+            input=lambda text: (text.encode(),),
+            output=lambda payload: payload.decode(),
+        ),
+    }
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Ensure a clean registry for every test."""
@@ -68,6 +125,62 @@ class TestRegisterConnect:
 
         assert cc.server_address() is None
 
+    def test_register_rejects_resource_missing_crm_method_before_server_creation(self):
+        with pytest.raises(TypeError, match='missing method'):
+            cc.register(Hello, MissingGreetingImpl(), name='hello')
+
+        assert cc.server_address() is None
+
+    def test_register_rejects_resource_annotation_mismatch_before_server_creation(self):
+        with pytest.raises(TypeError, match='greeting.name.*str.*bytes'):
+            cc.register(Hello, BadGreetingAnnotationImpl(), name='hello')
+
+        assert cc.server_address() is None
+
+    def test_register_accepts_bridged_resource_annotation_mismatch(self):
+        resource = BytesTextResource()
+        cc.register(BridgeText, resource, name='bridge-text', bridge=_text_bridge())
+
+        crm = cc.connect(BridgeText, name='bridge-text')
+        try:
+            assert crm.client._mode == 'thread'  # noqa: SLF001
+            assert crm.shout('hello') == 'HELLO!'
+            assert resource.seen == [b'hello']
+        finally:
+            cc.close(crm)
+
+    def test_direct_ipc_calls_apply_resource_bridge(self):
+        resource = BytesTextResource()
+        cc.register(BridgeText, resource, name='bridge-text-ipc', bridge=_text_bridge())
+        address = cc.server_address()
+        assert address is not None
+
+        crm = cc.connect(BridgeText, name='bridge-text-ipc', address=address)
+        try:
+            assert crm.client._mode == 'ipc'  # noqa: SLF001
+            assert crm.shout('remote') == 'REMOTE!'
+            assert resource.seen == [b'remote']
+        finally:
+            cc.close(crm)
+
+    def test_explicit_http_relay_calls_apply_resource_bridge(self, start_c3_relay):
+        previous_relay = settings.relay_anchor_address
+        relay = start_c3_relay()
+        resource = BytesTextResource()
+        try:
+            cc.set_relay_anchor(relay.url)
+            cc.register(BridgeText, resource, name='bridge-text-relay', bridge=_text_bridge())
+
+            crm = cc.connect(BridgeText, name='bridge-text-relay', address=relay.url)
+            try:
+                assert crm.client._mode == 'http'  # noqa: SLF001
+                assert crm.shout('relay') == 'RELAY!'
+                assert resource.seen == [b'relay']
+            finally:
+                cc.close(crm)
+        finally:
+            settings.relay_anchor_address = previous_relay
+
     def test_connect_thread_local(self):
         """Same-process connect returns thread-local proxy (zero serde)."""
         cc.register(Hello, HelloImpl(), name='hello')
@@ -85,6 +198,16 @@ class TestRegisterConnect:
         try:
             result = crm.greeting('World')
             assert result == 'Hello, World!'
+        finally:
+            cc.close(crm)
+
+    def test_connect_thread_local_resource_error_is_classified(self):
+        """Thread-local resource errors should not be masked by client wrapper state."""
+        cc.register(DirectError, DirectErrorImpl(), name='direct-error')
+        crm = cc.connect(DirectError, name='direct-error')
+        try:
+            with pytest.raises(cc.error.ResourceExecuteFunction, match='direct resource failed'):
+                crm.fail()
         finally:
             cc.close(crm)
 

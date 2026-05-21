@@ -72,6 +72,41 @@ def test_cli_release_publishes_github_release_assets_for_detected_tag():
     assert "files: dist/c3-*" in text
 
 
+def test_cli_release_publishes_installer_script_asset():
+    text = _workflow_text()
+
+    assert "installer:" in text
+    assert "name: cli-installer" in text
+    assert "c3-installer.sh" in text
+    assert "path: cli-dist/c3-installer.sh" in text
+    assert "needs: [version-check, build, installer]" in text
+    assert "should_publish_installer: ${{ steps.check.outputs.should_publish_installer }}" in text
+    assert "needs.version-check.outputs.should_publish_installer == 'true'" in text
+    assert "files: dist/c3-*" in text
+
+
+def test_cli_release_can_backfill_installer_when_current_release_exists():
+    text = _workflow_text()
+
+    assert "publish-installer:" in text
+    assert "needs: [version-check, installer]" in text
+    assert "tag_name: ${{ needs.version-check.outputs.tag }}" in text
+    assert "files: dist/c3-installer.sh" in text
+
+
+def test_readmes_document_the_c3_installer_asset():
+    root = _repo_root()
+
+    for path in [
+        root / "README.md",
+        root / "README.zh-CN.md",
+        root / "examples" / "README.md",
+        root / "cli" / "README.md",
+    ]:
+        text = path.read_text(encoding="utf-8")
+        assert "releases/latest/download/c3-installer.sh" in text
+
+
 def test_ci_runs_cli_rust_tests():
     ci_text = (_repo_root() / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
@@ -95,6 +130,7 @@ def test_ci_routes_tests_by_changed_domain():
     assert "cli/**" in ci_text
     assert "tools/dev/**" in ci_text
     assert ".github/dependabot.yml" in ci_text
+    assert "cli/install-c3.sh" in _filter_lines(ci_text, "workflow_policy")
     assert "tests/repo/**" in _filter_lines(ci_text, "workflow_policy")
     assert ".github/workflows/cli-release.yml" in ci_text
     assert "github.event_name == 'merge_group'" in ci_text
@@ -123,6 +159,7 @@ def test_ci_keeps_workflow_policy_tests_lightweight():
     assert "tests/repo/test_check_cli_release.py" in ci_text
     assert "sdk/python/tests/unit/test_check_cli_release.py" not in ci_text
     assert "tests/repo/test_c3_tool.py" in ci_text
+    assert "tests/repo/test_c3_installer.py" in ci_text
     assert "sdk/python/tests/unit/test_c3_tool.py" not in ci_text
     assert "tests/repo/test_python_package_release_workflow.py" in ci_text
     assert "sdk/python/tests/unit/test_python_package_release_workflow.py" not in ci_text

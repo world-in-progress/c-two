@@ -199,7 +199,7 @@ class TestIcrmTransferIntegration:
         assert 7 in deserialize_calls
 
     def test_plain_method_still_works(self):
-        """Methods without @transfer still auto-bundle via pickle."""
+        """Methods without @transfer still auto-bundle through their resolved transferable."""
         @cc.crm(namespace='test.plain', version='0.1.0')
         class IPlain:
             def greet(self, name: str) -> str:
@@ -213,10 +213,13 @@ class TestIcrmTransferIntegration:
         server.resource = CRM()
         server.direction = '<-'
 
-        err_bytes, result_bytes = server.greet(pickle.dumps('World'))
+        input_transferable = getattr(IPlain.greet, '_input_transferable')
+        output_transferable = getattr(IPlain.greet, '_output_transferable')
+
+        err_bytes, result_bytes = server.greet(input_transferable.serialize('World'))
         from c_two.error import CCError
         assert CCError.deserialize(memoryview(err_bytes)) is None
-        assert pickle.loads(result_bytes) == 'Hi World'
+        assert output_transferable.deserialize(result_bytes) == 'Hi World'
 
 
 class TestMethodLevelBufferBehavior:
@@ -280,8 +283,7 @@ class TestEndToEnd:
     """Full round-trip: CRM with @cc.transfer, proxy call, hold mode."""
 
     def test_auto_bundle_round_trip(self):
-        """Methods without @cc.transfer auto-bundle via pickle."""
-        import pickle
+        """Methods without @cc.transfer auto-bundle through their resolved transferable."""
         import c_two as cc
         from c_two.error import CCError
 
@@ -299,11 +301,13 @@ class TestEndToEnd:
         server_icrm.direction = '<-'
 
         greet = getattr(server_icrm, 'greeting')
-        serialized_input = pickle.dumps('World')
+        input_transferable = getattr(IE2E.greeting, '_input_transferable')
+        output_transferable = getattr(IE2E.greeting, '_output_transferable')
+        serialized_input = input_transferable.serialize('World')
         err_bytes, result_bytes = greet(serialized_input)
 
         assert CCError.deserialize(memoryview(err_bytes)) is None
-        assert pickle.loads(result_bytes) == 'Hello, World!'
+        assert output_transferable.deserialize(result_bytes) == 'Hello, World!'
 
     def test_hold_mode_thread_local(self):
         """cc.hold() on thread-local proxy returns HeldResult."""

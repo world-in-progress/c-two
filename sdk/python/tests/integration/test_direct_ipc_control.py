@@ -352,6 +352,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_waits_for_active_call_before_
     try:
         server.register_crm(DirectActiveCleanup, impl, name='cleanup')
         server.start(timeout=5.0)
+        _wait_for_ping(address)
         client = cc.connect(DirectActiveCleanup, name='cleanup', address=address)
         assert client.client._mode == 'ipc'  # noqa: SLF001
 

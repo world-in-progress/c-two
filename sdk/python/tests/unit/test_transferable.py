@@ -216,6 +216,31 @@ class TestAutoTransfer:
         wrapped = auto_transfer(unique_fn)
         assert callable(wrapped)
 
+    def test_python_native_control_shapes_use_pickle_fallback(self):
+        @cc.crm(namespace='test.python-native', version='0.1.0')
+        class PythonNative:
+            def combine(self, values: list[int], label: str | None = None) -> list[str | None]:
+                ...
+
+            def active(self) -> tuple[list[int], list[int]]:
+                ...
+
+        combine_input = getattr(PythonNative.combine, '_input_transferable')
+        combine_output = getattr(PythonNative.combine, '_output_transferable')
+        active_output = getattr(PythonNative.active, '_output_transferable')
+
+        assert combine_input.__module__ == 'Default'
+        assert combine_output.__module__ == 'Default'
+        assert active_output.__module__ == 'Default'
+        assert not hasattr(combine_input, '__cc_payload_abi_ref__')
+        assert not hasattr(combine_output, '__cc_payload_abi_ref__')
+        assert not hasattr(active_output, '__cc_payload_abi_ref__')
+
+        raw_input = combine_input.serialize([1, 2], None)
+        assert combine_input.deserialize(raw_input) == ([1, 2], None)
+        assert combine_output.deserialize(combine_output.serialize(['1', None])) == ['1', None]
+        assert active_output.deserialize(active_output.serialize([1], [2])) == ([1], [2])
+
     def test_callable_check(self):
         """Passing a non-callable raises TypeError."""
         with pytest.raises(TypeError):
@@ -835,6 +860,7 @@ class TestComToCrmBufferModes:
 
         assert isinstance(result, HeldResult)
         assert result.value == 42
+        assert bytes(result.buffer) == pickle.dumps(42)
         assert not response.released
         assert tracker.stats()['active_holds'] == 1
         assert tracker.stats()['by_direction']['client_response']['active_holds'] == 1
@@ -843,6 +869,8 @@ class TestComToCrmBufferModes:
 
         assert response.released
         assert tracker.stats()['active_holds'] == 0
+        with pytest.raises(RuntimeError, match='released'):
+            _ = result.buffer
 
     def test_hold_output_from_buffer_failure_raises_specific_error_and_releases_response(self):
         from c_two import _native

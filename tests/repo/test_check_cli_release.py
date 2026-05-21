@@ -29,9 +29,14 @@ def cli_release():
     sys.modules.pop("check_cli_release", None)
 
 
-def _mock_github_release() -> MagicMock:
+def _mock_github_release(*, assets: list[dict[str, str]] | None = None) -> MagicMock:
     resp = MagicMock()
-    resp.read.return_value = json.dumps({"tag_name": "c3-v0.1.0"}).encode()
+    resp.read.return_value = json.dumps(
+        {
+            "tag_name": "c3-v0.1.0",
+            "assets": assets if assets is not None else [{"name": "c3-installer.sh"}],
+        }
+    ).encode()
     resp.__enter__ = lambda s: s
     resp.__exit__ = MagicMock(return_value=False)
     return resp
@@ -83,6 +88,7 @@ def test_release_missing_triggers_publish(cli_release, tmp_path, monkeypatch):
     result = _run(cli_release, tmp_path, monkeypatch, "0.2.0", github_result=err)
 
     assert result["should_release"] == "true"
+    assert result["should_publish_installer"] == "false"
     assert result["version"] == "0.2.0"
     assert result["tag"] == "c3-v0.2.0"
 
@@ -97,6 +103,24 @@ def test_existing_release_skips_publish(cli_release, tmp_path, monkeypatch):
     )
 
     assert result["should_release"] == "false"
+    assert result["should_publish_installer"] == "false"
+    assert result["version"] == "0.1.0"
+    assert result["tag"] == "c3-v0.1.0"
+
+
+def test_existing_release_missing_installer_triggers_installer_publish(
+    cli_release, tmp_path, monkeypatch
+):
+    result = _run(
+        cli_release,
+        tmp_path,
+        monkeypatch,
+        "0.1.0",
+        github_result=_mock_github_release(assets=[{"name": "c3-x86_64-unknown-linux-gnu"}]),
+    )
+
+    assert result["should_release"] == "false"
+    assert result["should_publish_installer"] == "true"
     assert result["version"] == "0.1.0"
     assert result["tag"] == "c3-v0.1.0"
 
@@ -107,5 +131,6 @@ def test_github_api_failure_skips_publish(cli_release, tmp_path, monkeypatch):
     result = _run(cli_release, tmp_path, monkeypatch, "0.3.0", github_result=err)
 
     assert result["should_release"] == "false"
+    assert result["should_publish_installer"] == "false"
     assert result["version"] == "0.3.0"
     assert result["tag"] == "c3-v0.3.0"

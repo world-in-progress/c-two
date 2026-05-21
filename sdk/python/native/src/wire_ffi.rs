@@ -488,6 +488,12 @@ fn contract_descriptor_sha256_hex(payload: &[u8]) -> PyResult<String> {
         .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+#[pyfunction]
+fn validate_portable_contract_descriptor(payload: &[u8]) -> PyResult<()> {
+    c2_contract::validate_portable_contract_descriptor_json(payload)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
 // ── Module registration ─────────────────────────────────────────────────
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -528,6 +534,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_server_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(decode_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(contract_descriptor_sha256_hex, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_portable_contract_descriptor, m)?)?;
 
     // ── Flag constants (Python names — no _V2 suffix) ───────────────
     m.add("FLAG_SHM", c2_wire::flags::FLAG_SHM)?;
