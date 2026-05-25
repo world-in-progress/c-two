@@ -61,6 +61,24 @@ def test_payload_binding_carries_fdb_wire_identity_and_artifacts():
     assert not binding.supports_retained_view
 
 
+def test_payload_binding_serializer_may_return_memoryview():
+    payload_ref = PayloadAbiRef(
+        id='org.fastdb.call-db',
+        version='1',
+        schema='fastdb.call-db.schema.v1',
+        schema_sha256='c' * 64,
+    )
+    payload = memoryview(b'fastdb-buffer')
+    binding = PayloadBinding(
+        kind=PayloadPlanKind.FDB,
+        serialize=lambda value: payload,
+        deserialize=lambda data: data,
+        payload_abi_ref=payload_ref,
+    )
+
+    assert binding.serialize(object()) is payload
+
+
 def test_portable_descriptor_rejects_pickle_only_wire_refs():
     @cc.crm(namespace='test.payload-abi-ref', version='0.1.0')
     class PickleOnlyContract:

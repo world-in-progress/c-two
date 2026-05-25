@@ -18,6 +18,7 @@ from fastdb4py import (
     FastdbCallDbTable,
     decode_call_db,
     encode_call_db,
+    try_export_call_db,
     view_call_db,
 )
 from fastdb4py.decorator import feature
@@ -232,9 +233,13 @@ class FastdbCallPlan:
             tables=tuple(_fastdb_runtime_table(table) for table in self.tables),
         )
 
-    def serialize_values(self, values: object) -> bytes:
+    def serialize_values(self, values: object) -> bytes | memoryview:
         self._validate_identity()
-        return encode_call_db(self.fastdb_binding, values)
+        binding = self.fastdb_binding
+        exported = try_export_call_db(binding, values)
+        if exported is not None:
+            return exported
+        return encode_call_db(binding, values)
 
     def deserialize_values(self, data: bytes | bytearray | memoryview) -> object:
         self._validate_identity()
@@ -1115,7 +1120,7 @@ def _method_payload_binding_for(plan: FastdbCallPlan) -> object:
 
     from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind
 
-    def serialize(*values, _plan=plan) -> bytes:
+    def serialize(*values, _plan=plan) -> bytes | memoryview:
         if _plan.direction == 'input':
             return _plan.serialize_values(values)
         return _plan.serialize_values(values[0] if len(values) == 1 else values)

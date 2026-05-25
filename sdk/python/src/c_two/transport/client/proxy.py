@@ -189,7 +189,7 @@ class CRMProxy:
         """Native retained-buffer lease tracker for this process session."""
         return self._lease_tracker
 
-    def call(self, method_name: str, data: bytes | None = None) -> bytes:
+    def call(self, method_name: str, data: bytes | bytearray | memoryview | None = None) -> bytes:
         """Send a serialized CRM call (IPC or HTTP mode).
 
         Raises :class:`NotImplementedError` in thread-local mode — use

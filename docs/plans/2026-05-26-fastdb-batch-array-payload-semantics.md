@@ -72,13 +72,13 @@ Normal calls may return owned FastDB views over copied bytes when that is the sa
 
 ### PayloadBinding Should Accept Buffer-Like Results
 
-`PayloadBinding.serialize` is currently typed as returning `bytes`, while the native server already accepts Python `bytes` or generic buffer-protocol objects and copies large payloads directly into response SHM. C-Two should update the Python-side type contract and tests so FastDB exporters can return `bytes`, `memoryview`, or other buffer-protocol values without pretending everything is a newly allocated `bytes`.
+`PayloadBinding.serialize` must allow buffer-like return values because the native server already accepts Python `bytes` or generic buffer-protocol objects and copies large payloads directly into response SHM. C-Two now types the serializer as returning `bytes | bytearray | memoryview` and has focused tests so FastDB exporters can return `memoryview` without pretending everything is a newly allocated `bytes`.
 
 This is a C-Two API cleanup around the payload binding boundary, not a FastDB storage optimization.
 
 ### FastDB Export Before Encode
 
-Once FastDB provides a generic API such as `try_export_call_db(binding, value)`, C-Two's FastDB payload serializer should ask FastDB for a fast export before falling back to `encode_call_db(...)`. The fallback order should be FastDB-owned:
+FastDB now provides `try_export_call_db(binding, value)` for the first exact-export case. C-Two's FastDB payload serializer asks FastDB for a fast export before falling back to `encode_call_db(...)`. The fallback order stays FastDB-owned:
 
 1. Exact call-db-compatible buffer export.
 2. Encoded snapshot cache.
@@ -99,9 +99,9 @@ FastDB can detect stale FastDB-managed views through `FdbViewOwner`, but C-Two s
 
 C-Two should not attempt the main fast path until FastDB lands the generic prerequisites:
 
-- named table/layout construction for call-db target table names;
+- named table/layout construction for call-db target table names; implemented in FastDB Python as `Layout(..., name=...)`;
+- exact-match call-db buffer export for at least single fixed `Batch[T]`; implemented in FastDB Python as `try_export_call_db(...)`;
 - logical batch/array runtime metadata distinct from storage table metadata;
-- exact-match call-db buffer export for at least single fixed `Batch[T]`;
 - generation-based encoded snapshot invalidation;
 - scalar array runtime/view cleanup;
 - optional encode-into-writer API after the buffer export path is stable.
@@ -116,11 +116,11 @@ Update C-Two docs and examples so `Batch`/`Array` are described as logical paylo
 
 ### Phase 2: Payload Binding Buffer Protocol Cleanup
 
-Update `PayloadBinding.serialize` typing and focused tests so serializers may return buffer-protocol objects. Confirm native server response handling still copies such buffers into SHM without materializing an extra Python `bytes` object at the C-Two layer.
+Status: implemented for the Python type boundary and focused tests. `PayloadBinding.serialize` now accepts standard buffer-like return values, and C-Two unit tests cover `memoryview` serializers.
 
 ### Phase 3: Consume FastDB Export Capability
 
-After FastDB exposes exact-match export, change C-Two FastDB call-db serialization to call the FastDB exporter first and fall back to `encode_call_db(...)`. Keep C-Two-specific planning, `PayloadAbiRef`, bridge policy, and error mapping in C-Two.
+Status: implemented for FastDB's single fixed `Batch[T]` export surface. C-Two FastDB call-db serialization now calls `try_export_call_db(...)` first and falls back to `encode_call_db(...)`, while C-Two-specific planning, `PayloadAbiRef`, bridge policy, and error mapping stay in C-Two.
 
 ### Phase 4: Re-Benchmark And Document Performance Tiers
 
@@ -131,6 +131,8 @@ Re-run the Kostya-style benchmark with at least these variants:
 - FastDB exact-export normal path;
 - old structured numeric-only custom-transferable baseline, clearly labeled as non-equivalent historical baseline;
 - Ray arrays and records.
+
+Sanity evidence after consuming FastDB exact export on 2026-05-26 with 3M `Coord` rows and 5 measured iterations: `fastdb-hold` p50 27.86 ms, `fastdb-normal` p50 37.22 ms, and `fastdb-hold-unsafe` p50 21.23 ms. This confirms the prior 90 ms class result was dominated by server-side call-db repack and that the remaining spread is mostly client view/copy and safe-column wrapper overhead. A full comparative run with Ray and historical structured-transferable baselines remains the formal Phase 4 follow-up.
 
 The README should avoid claiming equivalence between historical raw ndarray hold and full FastDB CRM unless the payload schema and wire layout are actually equivalent.
 

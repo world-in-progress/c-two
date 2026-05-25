@@ -75,7 +75,7 @@ def test_c_two_python_package_declares_fastdb_dependency():
 
     dependencies = pyproject['project']['dependencies']
 
-    assert 'fastdb4py>=0.1.19' in dependencies
+    assert 'fastdb4py>=0.1.20' in dependencies
 
 
 def test_c_two_workspace_uses_sibling_fastdb_for_local_integration():
@@ -145,3 +145,100 @@ class UnsupportedFastdbShape:
     assert fastdb_items[0]['position'] == 'input'
     assert 'portable fastdb call-db payload' in fastdb_items[0]['message']
     assert 'Array[...]' in fastdb_items[0]['reason']
+
+
+def test_fastdb_call_plan_uses_fastdb_exporter_before_encoder(monkeypatch):
+    import c_two.fastdb.call_db as c2_call_db
+    import fastdb4py as fdb
+
+    namespace = {'fdb': fdb}
+    exec(compile("""
+@fdb.feature
+class ExportPoint:
+    x: fdb.F64
+""", '<fastdb_export_point>', 'exec', dont_inherit=True), namespace)
+    ExportPoint = namespace['ExportPoint']
+
+    plan = c2_call_db.plan_call_db_output(
+        method_name='points',
+        return_annotation=fdb.Batch[ExportPoint],
+        crm_context={
+            'crm_namespace': 'test.fastdb-abi',
+            'crm_name': 'ExportContract',
+            'crm_version': '0.1.0',
+        },
+    )
+    exported = memoryview(b'exact-fastdb-buffer')
+
+    def fake_export(binding, value):
+        assert binding.method == 'points'
+        assert value == []
+        return exported
+
+    def fail_encode(*args, **kwargs):
+        raise AssertionError('FastDB exact export must be tried before encode_call_db')
+
+    monkeypatch.setattr(c2_call_db, 'try_export_call_db', fake_export)
+    monkeypatch.setattr(c2_call_db, 'encode_call_db', fail_encode)
+
+    assert plan.serialize_values([]) is exported
+
+
+def test_fastdb_call_plan_falls_back_to_encoder_when_exporter_misses(monkeypatch):
+    import c_two.fastdb.call_db as c2_call_db
+    import fastdb4py as fdb
+
+    namespace = {'fdb': fdb}
+    exec(compile("""
+@fdb.feature
+class FallbackPoint:
+    x: fdb.F64
+""", '<fastdb_fallback_point>', 'exec', dont_inherit=True), namespace)
+    FallbackPoint = namespace['FallbackPoint']
+
+    plan = c2_call_db.plan_call_db_output(
+        method_name='points',
+        return_annotation=fdb.Batch[FallbackPoint],
+        crm_context={
+            'crm_namespace': 'test.fastdb-abi',
+            'crm_name': 'FallbackContract',
+            'crm_version': '0.1.0',
+        },
+    )
+
+    monkeypatch.setattr(c2_call_db, 'try_export_call_db', lambda binding, value: None)
+    monkeypatch.setattr(c2_call_db, 'encode_call_db', lambda binding, value: b'encoded')
+
+    assert plan.serialize_values([]) == b'encoded'
+
+
+def test_fastdb_call_plan_returns_memoryview_for_exact_named_batch():
+    import c_two.fastdb.call_db as c2_call_db
+    import fastdb4py as fdb
+    import numpy as np
+
+    namespace = {'fdb': fdb}
+    exec(compile("""
+@fdb.feature
+class ExactPoint:
+    x: fdb.F64
+""", '<fastdb_exact_point>', 'exec', dont_inherit=True), namespace)
+    ExactPoint = namespace['ExactPoint']
+
+    plan = c2_call_db.plan_call_db_output(
+        method_name='points',
+        return_annotation=fdb.Batch[ExactPoint],
+        crm_context={
+            'crm_namespace': 'test.fastdb-abi',
+            'crm_name': 'ExactContract',
+            'crm_version': '0.1.0',
+        },
+    )
+    engine = fdb.ColumnEngine.truncate([fdb.Layout(ExactPoint, 3, name='return_0')])
+    table = engine.table(ExactPoint, name='return_0')
+    table.fill(x=np.array([1.0, 2.0, 3.0], dtype=np.float64))
+
+    serialized = plan.serialize_values(table)
+
+    assert isinstance(serialized, memoryview)
+    assert serialized.obj is table._db._buffer  # noqa: SLF001

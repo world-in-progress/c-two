@@ -260,9 +260,11 @@ class Grid:
 
 For Python-only resources, use ordinary Python types and dataclasses. They are convenient locally, but they are intentionally diagnosed as nonportable by contract export.
 
+For FastDB outputs, C-Two asks FastDB's generic `try_export_call_db(...)` runtime for an exact buffer export before falling back to `encode_call_db(...)`. A resource can return a logical `fdb.Batch[T]` value backed by a named fixed FastDB table, such as `Layout(Point, n, name="return_0")`, without exposing raw `bytes` in the CRM signature.
+
 ### cc.hold() — Client-Side Borrowed Responses
 
-On the client side, normal FastDB CRM calls materialize the response into owned values and release the transport buffer immediately. `cc.hold()` explicitly requests that the response buffer remain alive, enabling zero-copy reads when an FDB output payload supports retained views. The returned `cc.Held[R]` wraps the CRM logical return value, exposes the retained raw wire buffer as `.unsafe_buffer` for advanced use, and provides a three-layer safety net for buffer lifecycle:
+On the client side, normal FastDB CRM calls copy the response payload into an owned local buffer before exposing the logical FastDB value, then release the transport buffer immediately. `cc.hold()` explicitly requests that the transport response buffer remain alive, enabling zero-copy reads when an FDB output payload supports retained views. The returned `cc.Held[R]` wraps the CRM logical return value, exposes the retained raw wire buffer as `.unsafe_buffer` for advanced use, and provides a three-layer safety net for buffer lifecycle:
 
 1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
 2. **Context manager (`with`)** — recommended for single-buffer scopes
@@ -452,7 +454,7 @@ Protocol-agnostic communication with automatic protocol detection based on addre
 | `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
 | `http://host:port` | HTTP relay | Cross-machine, web-compatible |
 
-The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory — zero-copy on the data path. Normal FastDB calls materialize input and output values before releasing buffers; `cc.hold()` and `cc.InputLifetime.BORROWED` are the explicit lifetime controls for retained response buffers and call-scoped borrowed request buffers.
+The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory. Normal FastDB calls detach from transport buffers before returning to user code; `cc.hold()` and `cc.InputLifetime.BORROWED` are the explicit lifetime controls for retained response buffers and call-scoped borrowed request buffers.
 
 ### Rust Native Layer
 

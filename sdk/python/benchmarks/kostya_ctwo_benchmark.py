@@ -112,8 +112,8 @@ def _make_coord_arrays(n: int) -> CoordArrays:
 
 def _make_coord_table(n: int) -> fdb.Table[Coord]:
     idx = _coord_index(n)
-    engine = fdb.ColumnEngine.truncate([fdb.Layout(Coord, n)])
-    table = engine.table(Coord)
+    engine = fdb.ColumnEngine.truncate([fdb.Layout(Coord, n, name='return_0')])
+    table = engine.table(Coord, name='return_0')
     table.fill(
         row_id=idx,
         x=idx.astype(np.float64) * 0.1,
@@ -121,7 +121,7 @@ def _make_coord_table(n: int) -> fdb.Table[Coord]:
         z=idx.astype(np.float64) * 0.3,
         name=_coord_names(n),
     )
-    return engine.table(Coord)
+    return table
 
 
 class CoordRecordsCRM:

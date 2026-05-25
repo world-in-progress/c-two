@@ -10,6 +10,7 @@ from typing import Any
 from ._payload_abi import PayloadAbiRef, normalize_payload_abi_ref
 
 DEFAULT_PICKLE_PROTOCOL = 4
+SerializedPayload = bytes | bytearray | memoryview
 
 
 @enum.unique
@@ -22,7 +23,7 @@ class PayloadPlanKind(enum.Enum):
 @dataclass(frozen=True)
 class PayloadBinding:
     kind: PayloadPlanKind
-    serialize: Callable[..., bytes] | None = None
+    serialize: Callable[..., SerializedPayload] | None = None
     deserialize: Callable[[bytes | bytearray | memoryview | None], object] | None = None
     payload_abi_ref: PayloadAbiRef | dict[str, Any] | None = None
     payload_abi_artifacts: Iterable[dict[str, Any]] = ()
