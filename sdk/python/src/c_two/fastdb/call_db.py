@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from fastdb4py import core
+from fastdb4py import FdbViewOwner, core, materialize as _fastdb_materialize
 from fastdb4py.column_engine import ColumnEngine, _get_default_table_build
 from fastdb4py.decorator import feature
 from fastdb4py.object_engine import LayerState, ObjectEngine
@@ -54,6 +54,14 @@ _CRM_CONTEXT_KEYS = (
     'crm_name',
     'crm_version',
 )
+
+
+def _to_owned_fastdb_value(value: object) -> object:
+    return _fastdb_materialize(value)
+
+
+def _new_retained_owner() -> FdbViewOwner:
+    return FdbViewOwner(checked=True, writeable=False)
 
 _SCALAR_TABLE_NAME = '__c2_args'
 _NONE_TYPE = type(None)
@@ -272,18 +280,23 @@ class FastdbCallPlan:
         engine = _column_engine_from_buffer(data)
         return self._materialize_values(engine)
 
-    def view_from_buffer(self, data: memoryview) -> 'FastdbCallView':
+    def view_from_buffer(self, data: memoryview) -> object:
         self._validate_identity()
         if not self.supports_buffer_view:
             raise ValueError(f'{self.profile} does not support retained buffer views.')
-        if self.direction != 'output':
-            raise ValueError('call-db buffer views are only supported for output plans.')
         _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        return FastdbCallView(
+        view = FastdbCallView(
             plan=self,
             engine=_column_engine_from_buffer(data),
             buffer=data,
+            owner=_new_retained_owner(),
         )
+        logical_values = view.logical_values()
+        if self.direction == 'input':
+            return logical_values
+        if len(logical_values) == 1:
+            return logical_values[0]
+        return logical_values
 
     def _materialize_values(self, engine: ColumnEngine) -> object:
         self._validate_identity()
@@ -320,9 +333,9 @@ class FastdbCallPlan:
                 raise ValueError(f'feature table {table.name!r} is missing value position.')
             fastdb_table = engine.table(table.feature_type, name=table.name)
             if table.cardinality == 'many':
-                values[table.value_position] = list(fastdb_table)
+                values[table.value_position] = _to_owned_fastdb_value(fastdb_table)
             else:
-                values[table.value_position] = fastdb_table[0]
+                values[table.value_position] = _to_owned_fastdb_value(fastdb_table[0])
 
         if self.direction == 'input':
             return tuple(values)
@@ -446,10 +459,43 @@ class FastdbCallView:
     plan: FastdbCallPlan
     engine: ColumnEngine
     buffer: memoryview
+    owner: FdbViewOwner
+
+    @property
+    def _fdb_owner(self) -> FdbViewOwner:
+        return self.owner
 
     def materialize(self) -> object:
         self._ensure_alive()
         return self.plan._materialize_values(self.engine)
+
+    def to_owned(self) -> object:
+        return self.materialize()
+
+    def logical_values(self) -> tuple[object, ...]:
+        self._ensure_alive()
+        values: list[Any] = [None] * _value_count(
+            self.plan.tables,
+            scalar_feature_type=self.plan.scalar_feature_type,
+        )
+        for table in self.plan.tables:
+            if table.kind == 'scalars':
+                for field_offset, field in enumerate(table.scalar_fields):
+                    values[table.scalar_positions[field_offset]] = self.scalar(field['name'])
+                continue
+            if table.value_position is None:
+                raise ValueError(f'table {table.name!r} is missing value position.')
+            if table.kind == 'feature':
+                if table.cardinality == 'many':
+                    values[table.value_position] = self.table(table.name)
+                else:
+                    values[table.value_position] = self.feature(table.name)
+                continue
+            if table.kind == 'array':
+                values[table.value_position] = self.array(table.name)
+                continue
+            raise ValueError(f'unsupported call-db table kind {table.kind!r}.')
+        return tuple(values)
 
     def table(self, name_or_index: str | int) -> 'FastdbCallTableView':
         self._ensure_alive()
@@ -475,7 +521,12 @@ class FastdbCallView:
         table, field = self._scalar_field(name_or_index)
         if table.feature_type is None:
             raise ValueError(f'scalar table {table.name!r} is missing feature type.')
-        rows = self.engine.table(table.feature_type, name=table.name)
+        rows = self.engine.table(
+            table.feature_type,
+            name=table.name,
+            owner=self.owner,
+            writeable=False,
+        )
         if len(rows) < 1:
             raise IndexError(f'scalar table {table.name!r} is empty.')
         return _materialize_scalar_value(field['kind'], getattr(rows[0], field['name']))
@@ -512,7 +563,31 @@ class FastdbCallView:
                 return table, field
         raise KeyError(f'scalar field {name_or_index!r} not found')
 
+    def _single_logical_view(self) -> object:
+        values = self.logical_values()
+        if len(values) != 1:
+            raise TypeError('direct view access is available only for single-value call-db payloads.')
+        return values[0]
+
+    @property
+    def column(self) -> 'FastdbCallColumnView':
+        value = self._single_logical_view()
+        column = getattr(value, 'column', None)
+        if column is None:
+            raise TypeError('single call-db value does not expose columns.')
+        return column
+
+    def __len__(self) -> int:
+        return len(self._single_logical_view())  # type: ignore[arg-type]
+
+    def __getitem__(self, index: int) -> Any:
+        return self._single_logical_view()[index]  # type: ignore[index]
+
+    def __iter__(self):
+        yield from self._single_logical_view()  # type: ignore[misc]
+
     def _ensure_alive(self) -> None:
+        self.owner.assert_alive()
         try:
             _ = self.buffer.nbytes
         except ValueError as exc:
@@ -524,8 +599,15 @@ class FastdbCallTableView:
     call_view: FastdbCallView
     spec: FastdbCallTableSpec
 
+    @property
+    def _fdb_owner(self) -> FdbViewOwner:
+        return self.call_view.owner
+
     def materialize(self) -> list[Any]:
-        return list(self._table())
+        return _to_owned_fastdb_value(self._table())  # type: ignore[return-value]
+
+    def to_owned(self) -> list[Any]:
+        return self.materialize()
 
     @property
     def column(self) -> 'FastdbCallColumnView':
@@ -547,13 +629,22 @@ class FastdbCallTableView:
         self.call_view._ensure_alive()
         if self.spec.feature_type is None:
             raise ValueError(f'feature table {self.spec.name!r} is missing feature type.')
-        return self.call_view.engine.table(self.spec.feature_type, name=self.spec.name)
+        return self.call_view.engine.table(
+            self.spec.feature_type,
+            name=self.spec.name,
+            owner=self.call_view.owner,
+            writeable=False,
+        )
 
 
 @dataclass(frozen=True)
 class FastdbCallColumnView:
     table_view: FastdbCallTableView
     accessor: Any
+
+    @property
+    def _fdb_owner(self) -> FdbViewOwner:
+        return self.table_view.call_view.owner
 
     def __getattr__(self, name: str) -> Any:
         self.table_view.call_view._ensure_alive()
@@ -565,12 +656,19 @@ class FastdbCallArrayView:
     call_view: FastdbCallView
     spec: FastdbCallTableSpec
 
+    @property
+    def _fdb_owner(self) -> FdbViewOwner:
+        return self.call_view.owner
+
     def materialize(self) -> list[Any]:
         item_kind = _array_item_kind(self.spec)
         return [
             _materialize_scalar_value(item_kind, getattr(row, _ARRAY_VALUE_FIELD))
             for row in self._table()
         ]
+
+    def to_owned(self) -> list[Any]:
+        return self.materialize()
 
     def __len__(self) -> int:
         return len(self._table())
@@ -595,7 +693,12 @@ class FastdbCallArrayView:
         self.call_view._ensure_alive()
         if self.spec.feature_type is None:
             raise ValueError(f'array table {self.spec.name!r} is missing feature type.')
-        return self.call_view.engine.table(self.spec.feature_type, name=self.spec.name)
+        return self.call_view.engine.table(
+            self.spec.feature_type,
+            name=self.spec.name,
+            owner=self.call_view.owner,
+            writeable=False,
+        )
 
 
 def plan_call_db_input(
@@ -1610,11 +1713,11 @@ def _is_array_annotation(annotation: object) -> bool:
     return get_origin(annotation) is Array
 
 
-_METHOD_TRANSFERABLE_CACHE: dict[tuple[str, str, str, str], type] = {}
+_METHOD_PAYLOAD_BINDING_CACHE: dict[tuple[str, str, str, str], object] = {}
 
 
 def resolve_method_payload_abi(shape: object, context: object | None = None) -> object | None:
-    """Resolve a C-Two method shape to a FastDB call-db transferable binding."""
+    """Resolve a C-Two method shape to a FastDB call-db payload binding."""
     try:
         direction = str(getattr(shape, 'direction'))
         if direction == 'input':
@@ -1637,12 +1740,7 @@ def resolve_method_payload_abi(shape: object, context: object | None = None) -> 
     except (TypeError, ValueError):
         return None
 
-    from c_two.crm._payload_abi import PayloadAbiBinding
-
-    return PayloadAbiBinding(
-        transferable=_method_transferable_for(plan),
-        payload_abi_ref=plan.payload_abi_ref,
-    )
+    return _method_payload_binding_for(plan)
 
 
 def diagnostics_for_method_payload_abi(
@@ -1673,7 +1771,7 @@ def diagnostics_for_method_payload_abi(
     return []
 
 
-def _method_transferable_for(plan: FastdbCallPlan) -> type:
+def _method_payload_binding_for(plan: FastdbCallPlan) -> object:
     payload_abi_ref = plan.payload_abi_ref
     key = (
         plan.direction,
@@ -1681,36 +1779,37 @@ def _method_transferable_for(plan: FastdbCallPlan) -> type:
         plan.profile,
         payload_abi_ref['schema_sha256'],
     )
-    cached = _METHOD_TRANSFERABLE_CACHE.get(key)
+    cached = _METHOD_PAYLOAD_BINDING_CACHE.get(key)
     if cached is not None:
         return cached
 
-    from c_two.crm.transferable import _payload_abi_ref_transferable
+    from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind
 
-    @_payload_abi_ref_transferable(payload_abi_ref=payload_abi_ref)
-    class FastdbC2CallTransferable:
-        def serialize(*values, _plan=plan) -> bytes:
-            if _plan.direction == 'input':
-                return _plan.serialize_values(values)
-            return _plan.serialize_values(values[0] if len(values) == 1 else values)
+    def serialize(*values, _plan=plan) -> bytes:
+        if _plan.direction == 'input':
+            return _plan.serialize_values(values)
+        return _plan.serialize_values(values[0] if len(values) == 1 else values)
 
-        def deserialize(data, _plan=plan):
-            return _plan.deserialize_values(data)
+    def deserialize(data, _plan=plan):
+        return _plan.deserialize_values(data)
 
-        def from_buffer(data: memoryview, _plan=plan):
-            if _plan.direction == 'output' and _plan.supports_buffer_view:
-                return _plan.view_from_buffer(data)
-            return _plan.deserialize_values(data)
+    view_from_buffer = None
+    if plan.supports_buffer_view:
+        def view_from_buffer(data: memoryview, _plan=plan):
+            return _plan.view_from_buffer(data)
 
     suffix = f'{plan.method_name}_{plan.direction}_{payload_abi_ref["schema_sha256"][:10]}'
-    name = f'FastdbC2Call{_safe_identifier(suffix)}Transferable'
-    FastdbC2CallTransferable.__name__ = name
-    FastdbC2CallTransferable.__qualname__ = name
-    FastdbC2CallTransferable.__cc_payload_abi_artifacts__ = _plan_payload_abi_artifacts(plan)
-    if plan.direction == 'input':
-        FastdbC2CallTransferable._c2_auto_input_hold = False
-    _METHOD_TRANSFERABLE_CACHE[key] = FastdbC2CallTransferable
-    return FastdbC2CallTransferable
+    binding = PayloadBinding(
+        kind=PayloadPlanKind.FDB,
+        serialize=serialize,
+        deserialize=deserialize,
+        payload_abi_ref=payload_abi_ref,
+        payload_abi_artifacts=_plan_payload_abi_artifacts(plan),
+        view_from_buffer=view_from_buffer,
+        label=f'FastdbC2Call{_safe_identifier(suffix)}',
+    )
+    _METHOD_PAYLOAD_BINDING_CACHE[key] = binding
+    return binding
 
 
 def _crm_context_from_shape(shape: object, context: object | None) -> dict[str, str]:

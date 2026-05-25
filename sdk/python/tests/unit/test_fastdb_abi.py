@@ -11,15 +11,24 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
-def test_c_two_fastdb_module_exposes_fastdb_abi_aliases():
+def test_c_two_fastdb_module_exposes_c_two_integration_helpers_only():
     import c_two as cc
     from c_two import fastdb as top_level_fastdb
-    import c_two.fastdb as fdb
+    import c_two.fastdb as c2_fastdb
+    import fastdb4py as fdb
 
-    assert top_level_fastdb is fdb
-    assert cc.fastdb is fdb
-    assert 'FastDB call-db' in (fdb.__doc__ or '')
-    assert 'portable CRM payload ABI' in (fdb.__doc__ or '')
+    assert top_level_fastdb is c2_fastdb
+    assert cc.fastdb is c2_fastdb
+    assert 'C-Two integration helpers' in (c2_fastdb.__doc__ or '')
+
+    for name in (
+        'derive_bridge_hooks',
+        'derive_c_two_bridge',
+        'CTwoCodegenError',
+        'generate_c_two_typescript_helpers',
+        'run_codegen_c_two_ts',
+    ):
+        assert hasattr(c2_fastdb, name), name
 
     for name in (
         'BOOL',
@@ -40,8 +49,9 @@ def test_c_two_fastdb_module_exposes_fastdb_abi_aliases():
         'feature',
     ):
         assert hasattr(fdb, name), name
+        assert not hasattr(c2_fastdb, name), name
 
-    assert not any(name.startswith('install_c_two') for name in dir(fdb))
+    assert not any(name.startswith('install_c_two') for name in dir(c2_fastdb))
 
 
 def test_import_c_two_does_not_eagerly_load_legacy_fastdb_glue():
@@ -65,7 +75,7 @@ def test_c_two_python_package_declares_fastdb_dependency():
 
     dependencies = pyproject['project']['dependencies']
 
-    assert 'fastdb4py>=0.1.17' in dependencies
+    assert 'fastdb4py>=0.1.18' in dependencies
 
 
 def test_c_two_workspace_does_not_override_fastdb_release_dependency():
@@ -78,7 +88,7 @@ def test_c_two_workspace_does_not_override_fastdb_release_dependency():
 
 def test_fastdb_abi_plans_portable_descriptor_without_extra_setup():
     import c_two as cc
-    from c_two import fastdb as fdb
+    import fastdb4py as fdb
 
     namespace = {'cc': cc, 'fdb': fdb}
     source = """
@@ -111,7 +121,7 @@ class FastdbPortable:
 
 def test_fastdb_abi_diagnostics_explain_rejected_shapes_without_extra_setup():
     import c_two as cc
-    from c_two import fastdb as fdb
+    import fastdb4py as fdb
 
     namespace = {'cc': cc, 'fdb': fdb}
     source = """

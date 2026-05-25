@@ -1977,11 +1977,14 @@ def _assert_fastdb_echo(crm, Point) -> None:
 
 def _assert_fastdb_held_echo(crm, Point) -> None:
     with cc.hold(crm.echo)(Point(x=1.0, y=2.0, name='held')) as held:
-        result = held.value.feature('return_0')
+        result = held.value
         assert isinstance(result, Point)
         assert result.x == pytest.approx(2.0)
         assert result.y == pytest.approx(4.0)
         assert result.name == 'held:ok'
+    import fastdb4py as fdb
+    with pytest.raises(fdb.FdbViewInvalidatedError):
+        _ = result.x
 
 
 def test_fastdb_crm_payloads_work_thread_local_and_direct_ipc():
@@ -2056,7 +2059,7 @@ def test_fastdb_native_resource_uses_empty_bridge_across_transports(start_c3_rel
         assert ipc_crm.summarize([4, 5, 6]) == 15
         assert_rows(ipc_crm.active(), 2)
         with cc.hold(ipc_crm.active)() as held:
-            assert_rows(held.value.table('return_0'), 3)
+            assert_rows(held.value, 3)
     finally:
         cc.close(ipc_crm)
 
@@ -2075,7 +2078,7 @@ def test_fastdb_native_resource_uses_empty_bridge_across_transports(start_c3_rel
         assert relay_crm.summarize([7, 8, 9]) == 24
         assert_rows(relay_crm.active(), 4)
         with cc.hold(relay_crm.active)() as held:
-            assert_rows(held.value.table('return_0'), 5)
+            assert_rows(held.value, 5)
     finally:
         cc.close(relay_crm)
 
@@ -2586,13 +2589,13 @@ def _assert_grid_ids(rows, expected: Sequence[tuple[int, int]] = ((1, 10), (2, 2
 
 
 def _assert_held_grid_ids(held, expected: Sequence[tuple[int, int]] = ((1, 10), (2, 20))) -> None:
-    table = held.value.table('return_0')
+    table = held.value
     _assert_grid_ids(table, expected)
     assert table.column.global_id[1] == expected[1][1]
 
 
 def _assert_held_levels(held) -> None:
-    array = held.value.array('return_0')
+    array = held.value
     assert array.materialize() == [1, 2, 3]
     assert list(array) == [1, 2, 3]
     assert array[1] == 2
@@ -2604,8 +2607,8 @@ def _assert_origin_point(result, Point) -> None:
 
 
 def _assert_held_origin_point(held, Point) -> None:
-    _assert_origin_point(held.value.feature('return_0'), Point)
-    assert held.value.feature(0).label == '123'
+    _assert_origin_point(held.value, Point)
+    assert held.value.label == '123'
 
 
 def _assert_blob_rows(rows) -> None:
@@ -2614,7 +2617,7 @@ def _assert_blob_rows(rows) -> None:
 
 
 def _assert_held_blob_rows(held) -> None:
-    table = held.value.table('return_0')
+    table = held.value
     _assert_blob_rows(table)
     assert table.column.name[0] == '123'
     assert bytes(table.column.payload[1]) == b'xyz'
@@ -2762,18 +2765,19 @@ def test_fastdb_derived_bridge_maps_tuple_return_thread_local_and_direct_ipc():
 
 def test_fastdb_derived_bridge_tuple_return_hold_across_remote_transports(start_c3_relay):
     def assert_held_tuple_view(held):
-        view = held.value
+        levels, rows = held.value
         raw_buffer = held.buffer
-        assert view.array('return_0').materialize() == [1, 2]
-        _assert_grid_ids(view.table('return_1'))
-        assert view.table('return_1').column.global_id[1] == 20
+        assert levels.materialize() == [1, 2]
+        _assert_grid_ids(rows)
+        assert rows.column.global_id[1] == 20
         held.release()
         with pytest.raises(RuntimeError, match='released'):
             _ = held.value
         with pytest.raises(ValueError):
             _ = raw_buffer.nbytes
-        with pytest.raises(RuntimeError, match='released'):
-            view.array('return_0')
+        import fastdb4py as fdb
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            levels.materialize()
 
     _GridId, FastdbTupleReturn, ipc_resource, ipc_bridge = _make_fastdb_tuple_return_bridge_contract('tuple-return-hold-ipc')
     cc.register(
@@ -3424,11 +3428,11 @@ def test_fastdb_scalar_call_db_coercion_direct_ipc_and_explicit_http_relay(start
         assert ipc_crm.invert('false') is True
         assert ipc_crm.current() == 42
         with cc.hold(ipc_crm.increment)('10') as held:
-            assert held.value.scalar('return_0') == 11
+            assert held.value == 11
         with cc.hold(ipc_crm.invert)('true') as held:
-            assert held.value.scalar('return_0') is False
+            assert held.value is False
         with cc.hold(ipc_crm.current)() as held:
-            assert held.value.scalar('return_0') == 42
+            assert held.value == 42
     finally:
         cc.close(ipc_crm)
 
@@ -3445,11 +3449,11 @@ def test_fastdb_scalar_call_db_coercion_direct_ipc_and_explicit_http_relay(start
         assert relay_crm.invert('true') is False
         assert relay_crm.current() == 42
         with cc.hold(relay_crm.increment)('12') as held:
-            assert held.value.scalar('return_0') == 13
+            assert held.value == 13
         with cc.hold(relay_crm.invert)('false') as held:
-            assert held.value.scalar('return_0') is True
+            assert held.value is True
         with cc.hold(relay_crm.current)() as held:
-            assert held.value.scalar('return_0') == 42
+            assert held.value == 42
     finally:
         cc.close(relay_crm)
 
@@ -3485,7 +3489,7 @@ def test_fastdb_derived_scalar_bridge_across_transports(start_c3_relay):
         assert ipc_crm.increment('10') == 11
         assert ipc_crm.invert('true') is False
         with cc.hold(ipc_crm.current)() as held:
-            assert held.value.scalar('return_0') == 42
+            assert held.value == 42
     finally:
         cc.close(ipc_crm)
 
@@ -3506,7 +3510,7 @@ def test_fastdb_derived_scalar_bridge_across_transports(start_c3_relay):
         assert relay_crm.increment('12') == 13
         assert relay_crm.invert('false') is True
         with cc.hold(relay_crm.current)() as held:
-            assert held.value.scalar('return_0') == 42
+            assert held.value == 42
     finally:
         cc.close(relay_crm)
 
@@ -3549,6 +3553,20 @@ def test_fastdb_derived_bridge_maps_wstr_and_bytes_feature_output_across_transpo
         _assert_blob_rows(ipc_crm.blobs())
         with cc.hold(ipc_crm.blobs)() as held:
             _assert_held_blob_rows(held)
+        held = cc.hold(ipc_crm.blobs)()
+        try:
+            table = held.value
+            name_column = table.column.name
+            payload_column = table.column.payload
+            assert name_column[0] == '123'
+            assert bytes(payload_column[1]) == b'xyz'
+        finally:
+            held.release()
+        import fastdb4py as fdb
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            _ = name_column[0]
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            _ = payload_column[1]
     finally:
         cc.close(ipc_crm)
 
@@ -3572,7 +3590,7 @@ def test_fastdb_derived_bridge_maps_wstr_and_bytes_feature_output_across_transpo
     finally:
         cc.close(relay_crm)
 
-    assert resource.calls == 3
+    assert resource.calls == 4
     assert relay_resource.calls == 2
 
 
@@ -3710,7 +3728,7 @@ def test_fastdb_derived_bridge_maps_table_like_tuple_row_batch_output_across_tra
         ]
 
     def assert_held_points(held):
-        table = held.value.table('return_0')
+        table = held.value
         assert [(row.x, row.y, row.label) for row in table] == [
             (1.5, 2.5, '123'),
             (3.5, 4.5, 'edge'),
@@ -3778,7 +3796,7 @@ def test_fastdb_derived_bridge_maps_iterator_tuple_row_batch_output_across_trans
         ]
 
     def assert_held_points(held):
-        table = held.value.table('return_0')
+        table = held.value
         assert [(row.x, row.y, row.label) for row in table] == [
             (1.5, 2.5, '123'),
             (3.5, 4.5, 'edge'),
@@ -3849,7 +3867,7 @@ def test_fastdb_derived_bridge_maps_mapping_row_batch_output_across_transports(s
         ]
 
     def assert_held_points(held):
-        table = held.value.table('return_0')
+        table = held.value
         assert [(row.x, row.y, row.label) for row in table] == [
             (1.5, 2.5, '123'),
             (3.5, 4.5, 'edge'),
@@ -4880,7 +4898,7 @@ def test_fastdb_derived_bridge_maps_variadic_tuple_batch_rows_across_transports(
         assert [(point.x, point.y, point.label) for point in result] == expected_active
 
     def assert_held_active(held):
-        table = held.value.table('return_0')
+        table = held.value
         assert [(row.x, row.y, row.label) for row in table] == expected_active
         assert table.column.x[0] == pytest.approx(1.5)
         assert table.column.label.to_pylist()[1] == expected_active[1][2]

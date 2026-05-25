@@ -81,18 +81,6 @@ class PayloadAbiRef:
 
 
 @dataclass(frozen=True)
-class PayloadAbiBinding:
-    transferable: type
-    payload_abi_ref: PayloadAbiRef
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.transferable, type):
-            raise TypeError('transferable must be a Transferable class.')
-        _ensure_transferable_candidate(self.transferable)
-        object.__setattr__(self, 'payload_abi_ref', normalize_payload_abi_ref(self.payload_abi_ref))
-
-
-@dataclass(frozen=True)
 class MethodParameterShape:
     name: str
     annotation: object
@@ -122,20 +110,6 @@ def normalize_payload_abi_ref(value: PayloadAbiRef | dict[str, Any]) -> PayloadA
         raise ValueError('PayloadAbiRef wire dict kind must be "codec_ref".')
     capabilities = payload.pop('capabilities', ())
     return PayloadAbiRef(capabilities=tuple(capabilities), **payload)
-
-
-def payload_abi_ref_for_transferable(transferable_cls: type) -> PayloadAbiRef | None:
-    ref = getattr(transferable_cls, '__cc_payload_abi_ref__', None)
-    if ref is None:
-        return None
-    return normalize_payload_abi_ref(ref)
-
-
-def _ensure_transferable_candidate(candidate: type) -> None:
-    from .transferable import Transferable
-
-    if not issubclass(candidate, Transferable) or candidate is Transferable:
-        raise TypeError('payload ABI candidates must be Transferable subclasses.')
 
 
 def _nonempty_identity(value: str, field: str) -> str:

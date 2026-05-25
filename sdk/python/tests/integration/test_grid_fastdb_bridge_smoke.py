@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import c_two as cc
+import fastdb4py as fdb
 from c_two.config.settings import settings
 from c_two.crm.descriptor import build_contract_descriptor
 from c_two.transport.registry import _ProcessRegistry
@@ -90,7 +91,6 @@ def _make_grid_resource(NestedGrid):
 def _load_fastdb_bridge_helpers():
     pytest.importorskip('fastdb4py', reason='fastdb bridge smoke requires fastdb4py')
 
-    from c_two import fastdb as fdb
     from c_two.fastdb.bridge import derive_c_two_bridge
 
     return fdb, derive_c_two_bridge
@@ -1173,7 +1173,7 @@ def test_resource_infer_c3_artifacts_cli_feeds_fastdb_codegen(tmp_path):
     module_path = tmp_path / 'infer_fastdb_resource.py'
     module_path.write_text(textwrap.dedent(
         '''
-        from c_two import fastdb as fdb
+        import fastdb4py as fdb
 
         @fdb.feature
         class Point:
@@ -1332,9 +1332,12 @@ def test_grid_fastdb_bridge_works_direct_ipc(monkeypatch):
 
 def test_grid_fastdb_input_uses_view_mode_without_resource_input_hold(monkeypatch):
     GridFastdb, _GridId, NestedGrid, grid_fastdb_bridge = _load_fastdb_grid(monkeypatch)
-    input_transferable = GridFastdb.get_grid_infos._input_transferable  # noqa: SLF001
+    from c_two.crm.payload_plan import PayloadPlanKind
+
+    input_binding = GridFastdb.get_grid_infos._input_payload_binding  # noqa: SLF001
     assert GridFastdb.get_grid_infos._input_buffer_mode == 'view'  # noqa: SLF001
-    assert getattr(input_transferable, '_c2_auto_input_hold') is False
+    assert input_binding.kind is PayloadPlanKind.FDB
+    assert input_binding.supports_retained_view is True
 
     cc.register(
         GridFastdb,
@@ -1355,6 +1358,226 @@ def test_grid_fastdb_input_uses_view_mode_without_resource_input_hold(monkeypatc
         cc.close(grid)
 
 
+def test_fastdb_input_defaults_to_materialized_python_values(monkeypatch):
+    pytest.importorskip('fastdb4py', reason='fastdb input lifetime tests require fastdb4py')
+
+    @cc.crm(namespace='demo.fastdb.input_lifetime', version='0.1.0')
+    class IntArraySum:
+        def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
+            ...
+
+    class IntArraySumResource:
+        def __init__(self):
+            self.values = None
+
+        def total(self, values):
+            self.values = values
+            return sum(values)
+
+    resource = IntArraySumResource()
+    cc.register(IntArraySum, resource, name='fastdb-materialized-input')
+    address = cc.server_address()
+    assert address is not None
+
+    client = cc.connect(IntArraySum, name='fastdb-materialized-input', address=address)
+    try:
+        assert client.total([1, 2, 3]) == 6
+        assert resource.values == [1, 2, 3]
+        assert type(resource.values) is list
+    finally:
+        cc.close(client)
+
+
+def test_fastdb_input_lifetime_borrowed_passes_view_then_releases(monkeypatch):
+    pytest.importorskip('fastdb4py', reason='fastdb input lifetime tests require fastdb4py')
+
+    @cc.crm(namespace='demo.fastdb.input_lifetime', version='0.1.0')
+    class IntArraySum:
+        def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
+            ...
+
+    class IntArraySumResource:
+        def __init__(self):
+            self.values = None
+
+        def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
+            self.values = values
+            assert type(values).__name__ == 'FastdbCallArrayView'
+            return sum(values)
+
+    resource = IntArraySumResource()
+    cc.register(
+        IntArraySum,
+        resource,
+        name='fastdb-borrowed-input',
+        input_lifetime={'total': cc.InputLifetime.BORROWED},
+    )
+    address = cc.server_address()
+    assert address is not None
+
+    client = cc.connect(IntArraySum, name='fastdb-borrowed-input', address=address)
+    try:
+        assert client.total([1, 2, 3]) == 6
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            len(resource.values)
+        stats = cc.hold_stats()
+        assert stats['by_direction']['resource_input']['active_holds'] == 0
+    finally:
+        cc.close(client)
+
+
+def test_fastdb_borrowed_single_feature_input_invalidates_after_call(monkeypatch):
+    import fastdb4py as fdb
+
+    class Point:
+        pass
+
+    Point.__annotations__ = {'x': fdb.F64, 'y': fdb.F64}
+    Point = fdb.feature(Point)
+
+    class PointSum:
+        def total(self, point):
+            ...
+
+    PointSum.total.__annotations__ = {'point': Point, 'return': fdb.F64}
+    PointSum = cc.crm(namespace='demo.fastdb.input_lifetime.feature', version='0.1.0')(PointSum)
+
+    class PointSumResource:
+        def __init__(self):
+            self.point = None
+
+        def total(self, point):
+            self.point = point
+            return point.x + point.y
+
+    PointSumResource.total.__annotations__ = {'point': Point, 'return': fdb.F64}
+
+    resource = PointSumResource()
+    cc.register(
+        PointSum,
+        resource,
+        name='fastdb-borrowed-feature-input',
+        input_lifetime={'total': cc.InputLifetime.BORROWED},
+    )
+    address = cc.server_address()
+    assert address is not None
+
+    client = cc.connect(PointSum, name='fastdb-borrowed-feature-input', address=address)
+    try:
+        assert client.total(Point(x=1.5, y=2.5)) == pytest.approx(4.0)
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            _ = resource.point.x
+    finally:
+        cc.close(client)
+
+
+def test_fastdb_borrowed_input_can_be_retained_by_materializing(monkeypatch):
+    import fastdb4py as fdb
+
+    class Point:
+        pass
+
+    Point.__annotations__ = {'x': fdb.F64, 'y': fdb.F64}
+    Point = fdb.feature(Point)
+
+    class PointSum:
+        def total(self, point):
+            ...
+
+    PointSum.total.__annotations__ = {'point': Point, 'return': fdb.F64}
+    PointSum = cc.crm(namespace='demo.fastdb.input_lifetime.materialize', version='0.1.0')(PointSum)
+
+    class PointSumResource:
+        def __init__(self):
+            self.point = None
+
+        def total(self, point):
+            self.point = fdb.materialize(point)
+            return point.x + point.y
+
+    PointSumResource.total.__annotations__ = {'point': Point, 'return': fdb.F64}
+
+    resource = PointSumResource()
+    cc.register(
+        PointSum,
+        resource,
+        name='fastdb-borrowed-feature-materialized-input',
+        input_lifetime={'total': cc.InputLifetime.BORROWED},
+    )
+    address = cc.server_address()
+    assert address is not None
+
+    client = cc.connect(PointSum, name='fastdb-borrowed-feature-materialized-input', address=address)
+    try:
+        assert client.total(Point(x=3.5, y=4.5)) == pytest.approx(8.0)
+        assert resource.point.x == pytest.approx(3.5)
+        assert resource.point.y == pytest.approx(4.5)
+    finally:
+        cc.close(client)
+
+
+def test_borrowed_input_lifetime_rejects_python_pickle_fallback():
+    @cc.crm(namespace='demo.fastdb.input_lifetime', version='0.1.0')
+    class PythonListSum:
+        def total(self, values: list[int]) -> int:
+            ...
+
+    class PythonListSumResource:
+        def total(self, values: list[int]) -> int:
+            return sum(values)
+
+    with pytest.raises(ValueError, match='requires a buffer-view FDB input payload'):
+        cc.register(
+            PythonListSum,
+            PythonListSumResource(),
+            name='python-borrowed-input',
+            input_lifetime={'total': cc.InputLifetime.BORROWED},
+        )
+
+
+def test_borrowed_input_lifetime_rejects_bridge_input(monkeypatch):
+    pytest.importorskip('fastdb4py', reason='fastdb input lifetime tests require fastdb4py')
+
+    @cc.crm(namespace='demo.fastdb.input_lifetime', version='0.1.0')
+    class IntArraySum:
+        def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
+            ...
+
+    class IntArraySumResource:
+        def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
+            return sum(values)
+
+    with pytest.raises(ValueError, match='cannot be combined with bridge.input'):
+        cc.register(
+            IntArraySum,
+            IntArraySumResource(),
+            name='fastdb-borrowed-bridge-input',
+            bridge={'total': cc.bridge(input=lambda values: (values,))},
+            input_lifetime={'total': cc.InputLifetime.BORROWED},
+        )
+
+
+def test_borrowed_input_lifetime_rejects_missing_resource_annotation(monkeypatch):
+    pytest.importorskip('fastdb4py', reason='fastdb input lifetime tests require fastdb4py')
+
+    @cc.crm(namespace='demo.fastdb.input_lifetime', version='0.1.0')
+    class IntArraySum:
+        def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
+            ...
+
+    class IntArraySumResource:
+        def total(self, values):
+            return sum(values)
+
+    with pytest.raises(TypeError, match='requires resource parameter'):
+        cc.register(
+            IntArraySum,
+            IntArraySumResource(),
+            name='fastdb-borrowed-missing-resource-annotation',
+            input_lifetime={'total': cc.InputLifetime.BORROWED},
+        )
+
+
 def test_grid_fastdb_hold_returns_retained_view_for_direct_ipc(monkeypatch):
     GridFastdb, _GridId, NestedGrid, grid_fastdb_bridge = _load_fastdb_grid(monkeypatch)
     cc.register(
@@ -1368,13 +1591,22 @@ def test_grid_fastdb_hold_returns_retained_view_for_direct_ipc(monkeypatch):
 
     grid = cc.connect(GridFastdb, name='grid-fastdb-hold', address=address)
     try:
-        with cc.hold(grid.get_active_grid_infos)() as held:
-            view = held.value
-            assert view.table('return_0')[0].level == 1
-            assert view.table('return_0')[0].global_id == 0
-            columns = view.table('return_0').column
-            assert columns.level[0] == 1
-            assert columns.global_id[0] == 0
+        held = cc.hold(grid.get_active_grid_infos)()
+        view = held.value
+        row = view[0]
+        level_column = view.column.level
+        assert row.level == 1
+        assert row.global_id == 0
+        assert level_column[0] == 1
+        owned = view.to_owned()
+        assert [item.global_id for item in owned] == [0, 1, 2, 3]
+        held.release()
+        assert [item.global_id for item in owned] == [0, 1, 2, 3]
+        import fastdb4py as fdb
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            _ = row.level
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            _ = level_column[0]
     finally:
         cc.close(grid)
 
@@ -1395,9 +1627,9 @@ def test_grid_fastdb_hold_returns_view_for_explicit_http_relay(monkeypatch, star
         assert grid.client._mode == 'http'  # noqa: SLF001
         with cc.hold(grid.get_active_grid_infos)() as held:
             view = held.value
-            assert view.table('return_0')[0].level == 1
-            assert view.table('return_0')[0].global_id == 0
-            columns = view.table('return_0').column
+            assert view[0].level == 1
+            assert view[0].global_id == 0
+            columns = view.column
             assert columns.level[0] == 1
             assert columns.global_id[0] == 0
     finally:

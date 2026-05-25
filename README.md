@@ -226,64 +226,32 @@ Multiple relays can form a **mesh cluster** via gossip — any relay can resolve
 
 > **When do I need a relay?** Only for cross-machine or name-and-contract-based discovery. Same-process and same-host (IPC) usage work without any relay.
 
-### @transferable — Custom Serialization
+### Payload Model — FDB First
 
-For custom data types that need to cross the wire, use `@cc.transferable`. Without it, pickle is used as fallback.
+C-Two CRM payload planning has three internal outcomes: `FDB`, `PYTHON_PICKLE`, and `NO_PAYLOAD`. Portable, cross-language contracts use FastDB call-db payload ABI refs derived from `fastdb4py` annotations. Plain Python annotations still run through Python pickle fallback for Python-only prototyping, but strict portable export rejects those methods.
 
-A transferable class defines up to three static methods (written without `@staticmethod` — the framework adds it automatically):
-
-| Method | Required | Purpose |
-|--------|----------|---------|
-| `serialize(data) → bytes` | ✅ Yes | Encode data for wire transfer (outbound) |
-| `deserialize(raw) → T` | ✅ Yes | Decode wire bytes into an owned Python object (inbound) |
-| `from_buffer(buf) → T` | ❌ Optional | Build a zero-copy view over the raw buffer (inbound, hold mode) |
+Use the FastDB grid example when authoring portable payloads:
 
 ```python
-import numpy as np
+import c_two as cc
+import fastdb4py as fdb
 
-@cc.transferable
-class Matrix:
-    rows: int
-    cols: int
-    data: np.ndarray
+@fdb.feature
+class GridCell:
+    global_id: fdb.I32
+    level: fdb.I32
 
-    def serialize(mat: 'Matrix') -> bytes:
-        header = struct.pack('>II', mat.rows, mat.cols)
-        return header + mat.data.tobytes()
-
-    def deserialize(raw: bytes) -> 'Matrix':
-        rows, cols = struct.unpack_from('>II', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=8).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr.copy())  # owned copy
-
-    def from_buffer(buf: memoryview) -> 'Matrix':
-        header = bytes(buf[:8])
-        rows, cols = struct.unpack('>II', header)
-        arr = np.frombuffer(buf[8:], dtype=np.float64).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr)  # zero-copy view into SHM
+@cc.crm(namespace='demo.grid', version='0.1.0')
+class Grid:
+    def get_cells(self, level: fdb.I32, ids: fdb.Array[fdb.I32]) -> fdb.Batch[GridCell]:
+        ...
 ```
 
-When `from_buffer` is present, the server automatically uses **hold mode** — the SHM buffer stays alive so `from_buffer` can return a zero-copy view. Without `from_buffer`, the server uses **view mode** — the buffer is released immediately after `deserialize`.
+For Python-only resources, use ordinary Python types and dataclasses. They are convenient locally, but they are intentionally diagnosed as nonportable by contract export.
 
-### @cc.transfer — Per-Method Control
+### cc.hold() — Client-Side Borrowed Responses
 
-Use `@cc.transfer()` on CRM contract methods to explicitly specify which transferable type handles serialization, or to override the buffer mode:
-
-```python
-@cc.crm(namespace='demo.compute', version='0.1.0')
-class Compute:
-    @cc.transfer(input=Matrix, output=Matrix, buffer='hold')
-    def transform(self, mat: Matrix) -> Matrix: ...
-
-    @cc.transfer(input=Matrix, buffer='view')  # force copy even if from_buffer exists
-    def ingest(self, mat: Matrix) -> None: ...
-```
-
-Without `@cc.transfer`, the framework automatically matches registered `@transferable` types by function signature and resolves the buffer mode from the input type's capabilities.
-
-### cc.hold() — Client-Side Zero-Copy
-
-On the client side, `cc.hold()` requests that the response buffer remain alive, enabling zero-copy reads when the output transferable can build a view from a memoryview. The returned `HeldResult` wraps the value, exposes the retained raw wire buffer as `.buffer` for advanced user parsing, and provides a three-layer safety net for buffer lifecycle:
+On the client side, normal FastDB CRM calls materialize the response into owned values and release the transport buffer immediately. `cc.hold()` explicitly requests that the response buffer remain alive, enabling zero-copy reads when an FDB output payload supports retained views. The returned `cc.Held[R]` wraps the CRM logical return value, exposes the retained raw wire buffer as `.buffer` for advanced use, and provides a three-layer safety net for buffer lifecycle:
 
 1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
 2. **Context manager (`with`)** — recommended for single-buffer scopes
@@ -317,6 +285,23 @@ finally:
 
 ---
 
+### InputLifetime — Server-Side Borrowed Inputs
+
+On the server side, FastDB inputs are materialized by default before the resource method is called. Use `input_lifetime={...}` only when the resource method has the same FDB input signature as the CRM and is prepared to treat the value as call-scoped borrowed data.
+
+```python
+cc.register(
+    GridFastdb,
+    grid_resource,
+    name='grid',
+    input_lifetime={
+        'get_grid_infos': cc.InputLifetime.BORROWED,
+    },
+)
+```
+
+`cc.InputLifetime.BORROWED` is valid only for FDB payloads with buffer-view support. It cannot be combined with `bridge.input`, and any data retained after the method returns must be copied first with `fastdb4py.materialize(value)` or `value.to_owned()`.
+
 ## Examples
 
 ### Single Process — Thread Preference
@@ -343,93 +328,9 @@ cc.shutdown()
 
 > **Best for:** local prototyping, testing, single-machine computation.
 
-### Multi-Process IPC — with Custom Transferable
+### Multi-Process IPC — FDB Payloads
 
-Separate server and client processes communicating over Unix domain sockets with shared memory.
-
-**Shared types** (`types.py`):
-```python
-import c_two as cc
-import numpy as np, struct
-
-@cc.transferable
-class Mesh:
-    n_vertices: int
-    positions: np.ndarray   # (N, 3) float64
-
-    def serialize(mesh: 'Mesh') -> bytes:
-        header = struct.pack('>I', mesh.n_vertices)
-        return header + mesh.positions.tobytes()
-
-    def deserialize(raw: bytes) -> 'Mesh':
-        (n,) = struct.unpack_from('>I', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=4).reshape(n, 3).copy()
-        return Mesh(n_vertices=n, positions=arr)
-
-    def from_buffer(buf: memoryview) -> 'Mesh':
-        header = bytes(buf[:4])
-        (n,) = struct.unpack('>I', header)
-        arr = np.frombuffer(buf[4:], dtype=np.float64).reshape(n, 3)
-        return Mesh(n_vertices=n, positions=arr)  # zero-copy view
-
-@cc.crm(namespace='demo.mesh', version='0.1.0')
-class MeshStore:
-    @cc.read
-    def get_mesh(self) -> Mesh: ...
-
-    def update_positions(self, mesh: Mesh) -> int: ...
-
-    @cc.on_shutdown
-    def cleanup(self) -> None: ...
-```
-
-**Server** (`server.py`):
-```python
-import c_two as cc
-from types import MeshStore, Mesh
-
-class MeshStoreImpl:
-    def __init__(self):
-        self._mesh = Mesh(n_vertices=0, positions=np.empty((0, 3)))
-
-    def get_mesh(self) -> Mesh:
-        return self._mesh
-
-    def update_positions(self, mesh: Mesh) -> int:
-        self._mesh = mesh
-        return mesh.n_vertices
-
-    def cleanup(self):
-        print('MeshStore shutting down')
-
-cc.register(MeshStore, MeshStoreImpl(), name='mesh')
-print(cc.server_id())
-print(cc.server_address())
-cc.serve()  # blocks until interrupted
-```
-
-**Client** (`client.py`):
-```python
-import c_two as cc
-from types import MeshStore, Mesh
-import numpy as np
-
-mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://<server-address>')
-
-# Upload data
-big_mesh = Mesh(n_vertices=1_000_000,
-                positions=np.random.randn(1_000_000, 3))
-mesh_store.update_positions(big_mesh)
-
-# Read with hold — zero-copy SHM access
-with cc.hold(mesh_store.get_mesh)() as held:
-    positions = held.value.positions  # np.ndarray backed by SHM, no copy
-    centroid = positions.mean(axis=0)
-    print(f'Centroid: {centroid}')
-# SHM released here
-
-cc.close(mesh_store)
-```
+Separate server and client processes communicate over Unix domain sockets with shared memory. For portable structured payloads, define the CRM with `fastdb4py` annotations and let C-Two derive the FastDB call-db payload ABI. See `examples/python/grid/grid_fdb_crm.py`, `examples/python/fastdb_relay_resource.py`, and `examples/python/fastdb_relay_client.py` for a complete FDB-first resource and client.
 
 > **Best for:** multi-process on same host, worker isolation, high-throughput local IPC.
 
@@ -523,8 +424,8 @@ Server-side stateful instances exposed through standardized CRM contracts.
 
 - **CRM contract**: Interface class decorated with `@cc.crm()`. Only methods declared here are remotely accessible.
 - **Resource**: Plain Python class implementing the contract — state + domain logic. Not decorated.
-- **`@transferable`**: Custom serialization for domain data types. Optionally provides `from_buffer` for zero-copy SHM views.
-- **`@cc.transfer`**: Per-method control over input/output transferable types and buffer mode.
+- **FDB payloads**: Portable CRM payloads are derived from `fastdb4py` annotations and represented as FastDB call-db payload ABI refs.
+- **Python pickle fallback**: Plain Python types remain usable for Python-only prototyping, but strict portable export rejects them.
 - **`@cc.read` / `@cc.write`**: Concurrency annotations — parallel reads, exclusive writes.
 - **`@cc.on_shutdown`**: Lifecycle callback invoked when a resource is unregistered (not exposed via RPC).
 
@@ -538,7 +439,7 @@ Protocol-agnostic communication with automatic protocol detection based on addre
 | `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
 | `http://host:port` | HTTP relay | Cross-machine, web-compatible |
 
-The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory — zero-copy on the data path. When `from_buffer` is available, **hold mode** keeps the SHM buffer alive across the CRM method call, enabling the CRM to operate directly on shared memory without deserialization.
+The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory — zero-copy on the data path. Normal FastDB calls materialize input and output values before releasing buffers; `cc.hold()` and `cc.InputLifetime.BORROWED` are the explicit lifetime controls for retained response buffers and call-scoped borrowed request buffers.
 
 ### Rust Native Layer
 
@@ -624,7 +525,7 @@ c3 contract infer mypkg.resources:GridResource \
 FastDB call-db is the portable CRM payload ABI. The Python fallback path uses ordinary Python annotations and pickle for local or Python-only IPC prototypes; it is intentionally rejected by strict portable export/codegen. C-Two no longer ships optional payload registry modules or a public codec registry.
 
 ```python
-from c_two import fastdb as fdb
+import fastdb4py as fdb
 
 @fdb.feature
 class GridAttribute:
@@ -633,7 +534,7 @@ class GridAttribute:
     activate: fdb.BOOL
 ```
 
-To move a method onto the portable path, use `c_two.fastdb` aliases, `Array[...]`, `Batch[...]`, and `@fdb.feature` so the method plans as FastDB call-db. Unmarked Python payloads can still use pickle in non-portable local/IPC prototype paths, but strict portable export rejects pickle and non-FastDB `PayloadAbiRef` values.
+To move a method onto the portable path, use `fastdb4py` scalar aliases, `Array[...]`, `Batch[...]`, and `@fdb.feature` so the method plans as FastDB call-db. Unmarked Python payloads can still use pickle in non-portable local/IPC prototype paths, but strict portable export rejects pickle and non-FastDB `PayloadAbiRef` values.
 
 ---
 

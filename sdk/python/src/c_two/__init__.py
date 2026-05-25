@@ -12,8 +12,8 @@ from .crm.descriptor import (
 )
 from .crm.infer import infer_crm_from_resource
 from .crm.meta import crm, read, write, on_shutdown
-from .crm.transferable import transferable
-from .crm.transferable import transfer, hold, HeldResult
+from .crm.transferable import hold, Held, HeldResult
+from .transport.input_lifetime import InputLifetime
 from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 from .transport.registry import (
     set_transport_policy,
@@ -48,10 +48,10 @@ __all__ = [
     'read',
     'write',
     'on_shutdown',
-    'transferable',
-    'transfer',
     'hold',
+    'Held',
     'HeldResult',
+    'InputLifetime',
     'ConcurrencyConfig',
     'ConcurrencyMode',
     'set_transport_policy',

@@ -6,7 +6,6 @@ from typing import Any, get_type_hints
 
 from .meta import _METHOD_ACCESS_ATTR, crm
 
-_TRANSFER_ATTR = '__cc_transfer__'
 _RPC_METHODS_ATTR = '__cc_rpc_methods__'
 
 
@@ -125,6 +124,4 @@ def _stub_from_method(source: Any, crm_name: str, method_name: str) -> Any:
     _stub.__signature__ = sig
     if hasattr(source, _METHOD_ACCESS_ATTR):
         setattr(_stub, _METHOD_ACCESS_ATTR, getattr(source, _METHOD_ACCESS_ATTR))
-    if hasattr(source, _TRANSFER_ATTR):
-        setattr(_stub, _TRANSFER_ATTR, getattr(source, _TRANSFER_ATTR))
     return _stub

@@ -45,8 +45,8 @@ def generate_crm_template(crm_class: Type[T], output_path: str | Path) -> None:
     # Extract method information using AST
     methods = _extract_method_from_ast(crm_class_node)
     
-    # Extract transferable dependencies
-    transferable_deps = _extract_transferable_dependencies(crm_class, methods)
+    # Extract same-module domain type dependencies
+    domain_type_deps = _extract_domain_type_dependencies(crm_class, methods)
     
     # Generate class name
     class_name = crm_class.__name__
@@ -58,7 +58,7 @@ def generate_crm_template(crm_class: Type[T], output_path: str | Path) -> None:
         crm_class_name,
         methods,
         crm_class.__module__,
-        transferable_deps
+        domain_type_deps
     )
     
     # Write to file
@@ -197,9 +197,9 @@ def _extract_types_from_ast_node(node: ast.FunctionDef) -> set[str]:
     
     return types
 
-def _extract_transferable_dependencies(crm_class: Type[T], methods: list[dict]) -> set[str]:
-    """Extract all transferable types used in method signatures."""
-    transferable_deps = set()
+def _extract_domain_type_dependencies(crm_class: Type[T], methods: list[dict]) -> set[str]:
+    """Extract same-module domain types used in method signatures."""
+    domain_type_deps = set()
     
     # Extract types from method signatures
     for method in methods:
@@ -211,22 +211,20 @@ def _extract_transferable_dependencies(crm_class: Type[T], methods: list[dict]) 
             try:
                 method_hints = get_type_hints(method_func)
                 for hint_name, hint_type in method_hints.items():
-                    transferable_deps.update(_extract_types_from_annotation(hint_type))
+                    domain_type_deps.update(_extract_types_from_annotation(hint_type))
             except (NameError, AttributeError):
                 # Parse from AST if runtime type hints fail
                 ast_node = method['ast_node'] 
-                transferable_deps.update(_extract_types_from_ast_node(ast_node))
+                domain_type_deps.update(_extract_types_from_ast_node(ast_node))
     
-    # Filter to only include types that are likely transferables
-    # (types defined in the same module as the CRM contract)
+    # Filter to types defined in the same module as the CRM contract.
     crm_module = sys.modules[crm_class.__module__]
     filtered_deps = set()
     
-    for dep in transferable_deps:
+    for dep in domain_type_deps:
         if hasattr(crm_module, dep):
-            # Check if it's a transferable class
             dep_class = getattr(crm_module, dep)
-            if hasattr(dep_class, '__dict__') and hasattr(dep_class, 'serialize') and hasattr(dep_class, 'deserialize'):
+            if isinstance(dep_class, type):
                 filtered_deps.add(dep)
     
     return filtered_deps
@@ -263,7 +261,7 @@ def _generate_method_template_ast(method_info: dict) -> list[str]:
     
     return method_lines
 
-def _generate_template_content_ast(crm_contract_name: str, crm_name: str, methods: list, crm_module: str, transferable_deps: set[str]) -> str:
+def _generate_template_content_ast(crm_contract_name: str, crm_name: str, methods: list, crm_module: str, domain_type_deps: set[str]) -> str:
     """Generate the template file content using AST-extracted information."""
     
     # Build import statements
@@ -272,10 +270,10 @@ def _generate_template_content_ast(crm_contract_name: str, crm_name: str, method
     # Import CRM contract
     crm_import = f'from {crm_module} import {crm_contract_name}'
     
-    # Import transferable dependencies
-    if transferable_deps:
-        transferable_import = f'from {crm_module} import {", ".join(sorted(transferable_deps))}'
-        import_lines.extend([crm_import, transferable_import])
+    # Import same-module domain type dependencies
+    if domain_type_deps:
+        domain_import = f'from {crm_module} import {", ".join(sorted(domain_type_deps))}'
+        import_lines.extend([crm_import, domain_import])
     else:
         import_lines.append(crm_import)
         

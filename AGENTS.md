@@ -248,42 +248,32 @@ class Grid:
         ...
 ```
 
-### Transferable Pattern
+### FastDB CRM Pattern
 
-`serialize`, `deserialize`, and `from_buffer` are written as regular methods. The `TransferableMeta` metaclass converts them to static methods. Do not add `@staticmethod` yourself.
+Author portable FDB-first CRM value types with `fastdb4py`, not `c_two.fastdb`. Keep `c_two.fastdb` for C-Two-owned integration helpers such as bridge derivation, call-db planning, and TypeScript helper generation.
 
 ```python
-@cc.transferable
-class MyData:
-    value: int
+import c_two as cc
+import fastdb4py as fdb
 
-    def serialize(data: 'MyData') -> bytes:
-        ...
+@fdb.feature
+class GridCell:
+    global_id: fdb.I32
+    level: fdb.I32
 
-    def deserialize(data: bytes) -> 'MyData':
-        ...
-
-    def from_buffer(buf: memoryview) -> 'MyData':
+@cc.crm(namespace='demo.grid', version='0.1.0')
+class Grid:
+    def get_cells(self, ids: fdb.Array[fdb.I32]) -> fdb.Batch[GridCell]:
         ...
 ```
 
-### Transfer Decorator Pattern
-
-`@cc.transfer()` is metadata-only. It attaches `__cc_transfer__` to CRM contract methods and does not wrap the function.
-
-```python
-@cc.crm(namespace='ns', version='0.1.0')
-class MyResource:
-    @cc.transfer(input=MyData, output=MyData, buffer='hold')
-    def process(self, data: MyData) -> MyData:
-        ...
-```
+`@cc.transfer(input=..., output=...)`, `@cc.transferable`, and `@cc.transfer(buffer='hold')` are not the portable FDB-first authoring path. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
 
 ### Hold Mode Pattern
 
 `cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It returns `HeldResult` with `.value` and `.release()`. Safety layers are explicit release, context manager, and `__del__` fallback.
 
-Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers.
+Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For FastDB call-db payloads, `held.value` is the logical CRM return value such as `fdb.Batch[T]`, `fdb.Array[T]`, a single feature, a scalar, or a tuple of those values; do not expose the internal call-db envelope as the public held API.
 
 ```python
 with cc.hold(proxy.method)(args) as held:
@@ -298,7 +288,13 @@ finally:
     b.release()
 ```
 
-When `@cc.transfer(buffer=None)`, the framework checks whether the input transferable has `from_buffer`. If yes, it uses hold mode; otherwise it uses view mode.
+### FastDB View Lifetime Boundary
+
+FastDB can enforce stale-use detection only at the FastDB view layer. In FastDB 0.1.18, checked `FdbViewOwner` instances track alive state and generation; `fdb.invalidate(...)` recursively finds owners through FastDB-managed containers and invalidates table, row, checked numeric column, string column, and bytes column views. C-Two must bind held responses and borrowed inputs to checked read-only owners, invalidate them before releasing the transport buffer, and use `fdb.materialize(...)` / `.to_owned()` when data must outlive the lease.
+
+FastDB cannot reliably invalidate every raw pointer a user deliberately extracts from a view. In particular, unsafe NumPy access can produce an ndarray or pointer that no longer consults the FastDB owner on later reads. Treat such APIs as explicit unsafe escapes: tests should assert normal FastDB view invalidation after release, but do not claim that a leaked raw NumPy pointer can be made mechanically impossible in Python.
+
+The C-Two transport design reduces the practical blast radius of those unsafe escapes. IPC request and response memory pools are directional rather than a single full-duplex shared pool, so leaked or malicious stale access in one direction should not expose the opposite channel. HTTP/relay paths necessarily copy at the relay/network boundary, which breaks the shared-memory eavesdropping path. These mitigations are not a substitute for FastDB view invalidation or explicit materialization; they are the reason C-Two treats stale raw-pointer exposure as a developer-safety/performance footgun rather than a primary cross-channel security model.
 
 ### SOTA API Pattern
 

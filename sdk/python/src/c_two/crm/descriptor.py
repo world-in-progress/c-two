@@ -11,11 +11,10 @@ from ._payload_abi import (
     PayloadAbiRef,
     MethodPayloadAbiShape,
     MethodParameterShape,
-    payload_abi_ref_for_transferable,
 )
 from .meta import MethodAccess, get_method_access
 from .methods import rpc_method_names
-from .transferable import DEFAULT_PICKLE_PROTOCOL, Transferable
+from .payload_plan import DEFAULT_PICKLE_PROTOCOL, PayloadBinding, PayloadPlanKind
 
 _DESCRIPTOR_SCHEMA = 'c-two.python.crm.descriptor.v2'
 _PORTABLE_CONTRACT_SCHEMA = 'c-two.contract.v1'
@@ -150,11 +149,11 @@ def build_contract_payload_abi_artifacts(
     seen: set[str] = set()
     for method_name in method_names:
         method = getattr(crm_class, method_name)
-        for transferable_cls in (
-            getattr(method, '_input_transferable', None),
-            getattr(method, '_output_transferable', None),
+        for binding in (
+            getattr(method, '_input_payload_binding', None),
+            getattr(method, '_output_payload_binding', None),
         ):
-            for artifact in _payload_abi_artifacts_for_transferable(transferable_cls):
+            for artifact in _payload_abi_artifacts_for_binding(binding):
                 key = _canonical_json(artifact)
                 if key in seen:
                     continue
@@ -245,8 +244,8 @@ def _fastdb_method_payload_abi_diagnostics_for_contract(
             for param in signature_params
             if param.name in type_hints
         )
-        input_transferable = getattr(method, '_input_transferable', None)
-        output_transferable = getattr(method, '_output_transferable', None)
+        input_binding = getattr(method, '_input_payload_binding', None)
+        output_binding = getattr(method, '_output_payload_binding', None)
         if parameters:
             shape = MethodPayloadAbiShape(
                 method_name=method_name,
@@ -257,7 +256,7 @@ def _fastdb_method_payload_abi_diagnostics_for_contract(
                 parameters=parameters,
             )
             context = dict(payload_abi_context, position='input')
-            if _payload_abi_ref_for_annotation(input_transferable) is None:
+            if _payload_abi_ref_for_binding(input_binding) is None:
                 diagnostics.extend(_fastdb_method_payload_abi_diagnostics(shape, context))
         if 'return' in type_hints and type_hints['return'] not in (None, type(None)):
             shape = MethodPayloadAbiShape(
@@ -269,7 +268,7 @@ def _fastdb_method_payload_abi_diagnostics_for_contract(
                 return_annotation=type_hints['return'],
             )
             context = dict(payload_abi_context, position='output')
-            if _payload_abi_ref_for_annotation(output_transferable) is None:
+            if _payload_abi_ref_for_binding(output_binding) is None:
                 diagnostics.extend(_fastdb_method_payload_abi_diagnostics(shape, context))
     return diagnostics
 
@@ -357,28 +356,27 @@ def _method_descriptor(
     signature_target = inspect.unwrap(method)
     sig = inspect.signature(signature_target)
     type_hints = _resolved_type_hints(signature_target, method_name)
-    transfer = getattr(method, '__cc_transfer__', None) or {}
     payload_abi_context = getattr(method, '_payload_abi_context', None) or {}
-    input_transferable = getattr(method, '_input_transferable', None)
-    output_transferable = getattr(method, '_output_transferable', None)
+    input_binding = getattr(method, '_input_payload_binding', None)
+    output_binding = getattr(method, '_output_payload_binding', None)
     input_method_payload_abi_aggregate = bool(
         getattr(method, '_input_method_payload_abi_aggregate', False),
     )
     output_method_payload_abi_aggregate = bool(
         getattr(method, '_output_method_payload_abi_aggregate', False),
     )
-    buffer_mode = getattr(method, '_input_buffer_mode', transfer.get('buffer', 'view'))
+    buffer_mode = getattr(method, '_input_buffer_mode', 'view')
 
     signature_params = [
         param
         for index, param in enumerate(sig.parameters.values())
         if not (index == 0 and param.name in {'self', 'cls'})
     ]
-    input_annotation_ref = _payload_abi_ref_for_annotation(input_transferable)
-    input_annotation_transferable = input_transferable
+    input_annotation_ref = _payload_abi_ref_for_binding(input_binding)
+    input_annotation_binding = input_binding
     if len(signature_params) != 1 and not input_method_payload_abi_aggregate:
         input_annotation_ref = None
-        input_annotation_transferable = None
+        input_annotation_binding = None
 
     params = []
     for param in signature_params:
@@ -402,7 +400,7 @@ def _method_descriptor(
                 payload_abi_ref=input_annotation_ref,
                 payload_abi_context=payload_abi_context,
                 portable=portable,
-                transferable_cls=input_annotation_transferable,
+                payload_binding=input_annotation_binding,
                 aggregate_payload_abi=input_method_payload_abi_aggregate,
             ),
             'default': _default_descriptor(param.default, method_name, param.name),
@@ -415,8 +413,8 @@ def _method_descriptor(
     return_annotation = type_hints['return']
 
     access = get_method_access(method)
-    input_wire = _wire_ref_for_input(input_transferable, params)
-    output_wire = _wire_ref_for_output(output_transferable, return_annotation)
+    input_wire = _wire_ref_for_input(input_binding, params)
+    output_wire = _wire_ref_for_output(output_binding, return_annotation)
     if portable:
         _ensure_portable_wire_ref(input_wire, method_name, 'input')
         _ensure_portable_wire_ref(output_wire, method_name, 'output')
@@ -428,15 +426,15 @@ def _method_descriptor(
         'return': _annotation_descriptor(
             return_annotation,
             method_name,
-            payload_abi_ref=_payload_abi_ref_for_annotation(output_transferable),
+            payload_abi_ref=_payload_abi_ref_for_binding(output_binding),
             payload_abi_context=payload_abi_context,
             portable=portable,
-            transferable_cls=output_transferable,
+            payload_binding=output_binding,
             aggregate_payload_abi=output_method_payload_abi_aggregate,
         ),
         'transfer': {
-            'input': _transfer_annotation_descriptor(input_transferable),
-            'output': _transfer_annotation_descriptor(output_transferable),
+            'input': _payload_binding_descriptor(input_binding),
+            'output': _payload_binding_descriptor(output_binding),
         },
         'wire': {
             'input': input_wire,
@@ -465,7 +463,7 @@ def _annotation_descriptor(
     payload_abi_ref: PayloadAbiRef | None = None,
     payload_abi_context: dict[str, Any] | None = None,
     portable: bool = False,
-    transferable_cls: type | None = None,
+    payload_binding: PayloadBinding | None = None,
     aggregate_payload_abi: bool = False,
 ) -> dict[str, Any]:
     if annotation is inspect.Signature.empty:
@@ -491,7 +489,13 @@ def _annotation_descriptor(
     args = get_args(annotation)
     if origin in {Union, types.UnionType}:
         items = [
-            _annotation_descriptor(arg, method_name, payload_abi_context=payload_abi_context, portable=portable)
+            _annotation_descriptor(
+                arg,
+                method_name,
+                payload_abi_context=payload_abi_context,
+                portable=portable,
+                payload_binding=payload_binding,
+            )
             for arg in args
         ]
         items.sort(key=_canonical_json)
@@ -499,7 +503,7 @@ def _annotation_descriptor(
     if origin is list:
         if not args:
             raise TypeError(f'{method_name} uses a bare container annotation.')
-        item_payload_abi_ref = _item_payload_abi_ref_for_transferable(transferable_cls)
+        item_payload_abi_ref = _item_payload_abi_ref_for_binding(payload_binding)
         return {
             'item': _annotation_descriptor(
                 args[0],
@@ -507,6 +511,7 @@ def _annotation_descriptor(
                 payload_abi_ref=item_payload_abi_ref,
                 payload_abi_context=payload_abi_context,
                 portable=portable,
+                payload_binding=payload_binding,
             ),
             'kind': 'list',
         }
@@ -519,6 +524,7 @@ def _annotation_descriptor(
                 method_name,
                 payload_abi_context=payload_abi_context,
                 portable=portable,
+                payload_binding=payload_binding,
             ),
             'kind': 'dict',
             'value': _annotation_descriptor(
@@ -526,6 +532,7 @@ def _annotation_descriptor(
                 method_name,
                 payload_abi_context=payload_abi_context,
                 portable=portable,
+                payload_binding=payload_binding,
             ),
         }
     if origin is tuple:
@@ -538,28 +545,39 @@ def _annotation_descriptor(
                     method_name,
                     payload_abi_context=payload_abi_context,
                     portable=portable,
+                    payload_binding=payload_binding,
                 ),
                 'kind': 'tuple_variadic',
             }
         return {
             'items': [
-                _annotation_descriptor(arg, method_name, payload_abi_context=payload_abi_context, portable=portable)
-                for arg in args
-            ],
-            'kind': 'tuple',
-        }
+                    _annotation_descriptor(
+                        arg,
+                        method_name,
+                        payload_abi_context=payload_abi_context,
+                        portable=portable,
+                        payload_binding=payload_binding,
+                    )
+                    for arg in args
+                ],
+                'kind': 'tuple',
+            }
 
     if payload_abi_ref is not None:
         return {
             'codec': payload_abi_ref.to_wire_ref(),
             'kind': 'codec',
         }
-    if _is_transferable_type(annotation):
-        return {
-            'abi_ref': _transferable_abi_ref(annotation),
-            'kind': 'transferable',
-        }
-    if not portable and isinstance(annotation, type):
+    if (
+        isinstance(annotation, type)
+        and (
+            not portable
+            or (
+                payload_binding is not None
+                and payload_binding.kind is PayloadPlanKind.PYTHON_PICKLE
+            )
+        )
+    ):
         return _python_type_descriptor(annotation)
 
     raise TypeError(
@@ -581,14 +599,9 @@ def _python_type_descriptor(annotation: type) -> dict[str, str]:
     }
 
 
-def _item_payload_abi_ref_for_transferable(transferable_cls: type | None) -> PayloadAbiRef | None:
-    if transferable_cls is None:
+def _item_payload_abi_ref_for_binding(binding: PayloadBinding | None) -> PayloadAbiRef | None:
+    if binding is None:
         return None
-    ref = getattr(transferable_cls, '_c2_item_payload_abi_ref', None)
-    if ref is None:
-        return None
-    if isinstance(ref, PayloadAbiRef):
-        return ref
     return None
 
 
@@ -616,77 +629,57 @@ def _default_descriptor(value: object, method_name: str, param_name: str) -> dic
 
 
 def _wire_ref_for_input(
-    input_transferable: type | None,
+    input_binding: PayloadBinding | None,
     params: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    if input_transferable is not None:
-        return _transferable_abi_ref(input_transferable)
+    if input_binding is not None and input_binding.kind is not PayloadPlanKind.NO_PAYLOAD:
+        return _payload_binding_wire_ref(input_binding)
     if not params:
         return None
     return dict(_PICKLE_DEFAULT_REF)
 
 
 def _wire_ref_for_output(
-    output_transferable: type | None,
+    output_binding: PayloadBinding | None,
     return_annotation: Any,
 ) -> dict[str, Any] | None:
-    if output_transferable is not None:
-        return _transferable_abi_ref(output_transferable)
+    if output_binding is not None and output_binding.kind is not PayloadPlanKind.NO_PAYLOAD:
+        return _payload_binding_wire_ref(output_binding)
     if return_annotation is None or return_annotation is type(None):
         return None
     return dict(_PICKLE_DEFAULT_REF)
 
 
-def _transfer_annotation_descriptor(transferable_cls: type | None) -> dict[str, Any] | None:
-    if transferable_cls is None:
+def _payload_binding_descriptor(binding: PayloadBinding | None) -> dict[str, Any] | None:
+    if binding is None or binding.kind is PayloadPlanKind.NO_PAYLOAD:
         return None
-    return _transferable_abi_ref(transferable_cls)
+    return _payload_binding_wire_ref(binding)
 
 
-def _payload_abi_ref_for_annotation(transferable_cls: type | None) -> PayloadAbiRef | None:
-    if transferable_cls is None or _is_default_transferable(transferable_cls):
+def _payload_abi_ref_for_binding(binding: PayloadBinding | None) -> PayloadAbiRef | None:
+    if binding is None or binding.kind is not PayloadPlanKind.FDB:
         return None
-    if not _is_transferable_type(transferable_cls):
-        return None
-    return payload_abi_ref_for_transferable(transferable_cls)
+    ref = binding.payload_abi_ref
+    return ref if isinstance(ref, PayloadAbiRef) else None
 
 
-def _transferable_abi_ref(transferable_cls: type) -> dict[str, Any]:
-    if _is_default_transferable(transferable_cls):
+def _payload_binding_wire_ref(binding: PayloadBinding) -> dict[str, Any]:
+    if binding.kind is PayloadPlanKind.PYTHON_PICKLE:
         return dict(_PICKLE_DEFAULT_REF)
-    if not _is_transferable_type(transferable_cls):
-        raise TypeError(
-            f'{transferable_cls!r} is not a Transferable subclass.',
-        )
-    payload_abi_ref = payload_abi_ref_for_transferable(transferable_cls)
-    if payload_abi_ref is not None:
-        return payload_abi_ref.to_wire_ref()
-
-    abi = getattr(transferable_cls, '__cc_transferable_abi__', None) or {}
-    abi_id = abi.get('abi_id')
-    abi_schema = abi.get('abi_schema')
-    if abi_id:
-        return {'kind': 'custom_id', 'value': abi_id}
-    if abi_schema:
-        return {
-            'kind': 'custom_schema',
-            'sha256': _hash_descriptor({'abi_schema': abi_schema}),
-        }
-    if _has_custom_transfer_hooks(transferable_cls):
-        raise ValueError(
-            f'{transferable_cls.__name__} defines custom transfer hooks but '
-            'does not declare an explicit ABI.',
-        )
-    raise ValueError(
-        f'{transferable_cls.__name__} appears in a remote signature, but a '
-        'dataclass-field ABI is not defined yet.',
-    )
+    if binding.kind is PayloadPlanKind.FDB:
+        ref = binding.payload_abi_ref
+        if not isinstance(ref, PayloadAbiRef):
+            raise TypeError('FDB payload bindings must carry a PayloadAbiRef.')
+        return ref.to_wire_ref()
+    if binding.kind is PayloadPlanKind.NO_PAYLOAD:
+        raise ValueError('NO_PAYLOAD bindings do not have a wire ref.')
+    raise ValueError(f'Unsupported payload binding kind {binding.kind!r}.')
 
 
-def _payload_abi_artifacts_for_transferable(transferable_cls: type | None) -> tuple[dict[str, Any], ...]:
-    if transferable_cls is None:
+def _payload_abi_artifacts_for_binding(binding: PayloadBinding | None) -> tuple[dict[str, Any], ...]:
+    if binding is None:
         return ()
-    raw_artifacts = getattr(transferable_cls, '__cc_payload_abi_artifacts__', ())
+    raw_artifacts = binding.payload_abi_artifacts
     if raw_artifacts is None:
         return ()
     if isinstance(raw_artifacts, dict):
@@ -696,39 +689,17 @@ def _payload_abi_artifacts_for_transferable(transferable_cls: type | None) -> tu
             raw_items = tuple(raw_artifacts)
         except TypeError as exc:
             raise TypeError(
-                f'{transferable_cls.__name__}.__cc_payload_abi_artifacts__ must be a JSON object or iterable of JSON objects.',
+                f'{binding.label or binding.kind.value} payload_abi_artifacts must be a JSON object or iterable of JSON objects.',
             ) from exc
     artifacts: list[dict[str, Any]] = []
     for item in raw_items:
         if not isinstance(item, dict):
             raise TypeError(
-                f'{transferable_cls.__name__}.__cc_payload_abi_artifacts__ entries must be JSON objects.',
+                f'{binding.label or binding.kind.value} payload_abi_artifacts entries must be JSON objects.',
             )
         _canonical_json(item)
         artifacts.append(item)
     return tuple(artifacts)
-
-
-def _is_default_transferable(transferable_cls: type) -> bool:
-    return (
-        getattr(transferable_cls, '__module__', None) == 'Default'
-        and hasattr(transferable_cls, '_original_func')
-    )
-
-
-def _is_transferable_type(value: object) -> bool:
-    return (
-        isinstance(value, type)
-        and issubclass(value, Transferable)
-        and value is not Transferable
-    )
-
-
-def _has_custom_transfer_hooks(transferable_cls: type) -> bool:
-    return any(
-        name in getattr(transferable_cls, '__dict__', {})
-        for name in ('serialize', 'deserialize', 'from_buffer')
-    )
 
 
 def _ensure_portable_wire_ref(

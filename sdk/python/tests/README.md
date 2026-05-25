@@ -43,7 +43,7 @@ UV_PROJECT_ENVIRONMENT=.venv-py310 uv run --python 3.10 pytest sdk/python/tests/
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 
 # Single test function
-uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
+uv run pytest sdk/python/tests/unit/test_crm_descriptor.py::test_top_level_custom_transferable_api_is_removed -q
 
 # Run with verbose output
 uv run pytest sdk/python/tests -v --timeout=30
@@ -66,7 +66,7 @@ equivalent to a passing 3.10 check.
 | `test_crm_template.py` | CRM template generation from CRM interface classes |
 | `test_encoding.py` | Wire protocol encoding/decoding, message serialization |
 | `test_error.py` | `CCError` hierarchy — serialization/deserialization across wire |
-| `test_transferable.py` | `@transferable` decorator — serialize/deserialize, auto-dataclass, scatter-write tuples, memoryview-aware deserialize, bytes fast-path |
+| `test_payload_abi_ref.py` | Payload ABI refs and internal payload binding validation |
 | `test_shutdown_decorator.py` | `@cc.on_shutdown` CRM lifecycle cleanup |
 
 ### rpc_v2 Transport

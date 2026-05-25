@@ -26,6 +26,12 @@ from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...error import ResourceAlreadyRegistered
 from c_two.config.ipc import ServerIPCOverrides, _resolve_server_ipc_config
+from ..input_lifetime import (
+    InputLifetime,
+    InputLifetimeLike,
+    normalize_input_lifetime_map,
+    validate_input_lifetime_resource_contract,
+)
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_resource_result
@@ -62,6 +68,7 @@ class CRMSlot:
     scheduler: Scheduler
     methods: list[str]
     shutdown_method: str | None = None
+    input_lifetime: dict[str, InputLifetime] = field(default_factory=dict)
     _dispatch_table: dict[str, tuple[Any, MethodAccess, str]] = field(
         default_factory=dict, repr=False,
     )
@@ -73,7 +80,23 @@ class CRMSlot:
             method = getattr(self.crm_instance, name, None)
             if method is not None:
                 access = get_method_access(method)
-                buffer_mode = getattr(method, '_input_buffer_mode', 'view')
+                lifetime = self.input_lifetime.get(name)
+                if lifetime is InputLifetime.BORROWED:
+                    binding = getattr(method, '_input_payload_binding', None)
+                    if getattr(binding, 'view_from_buffer', None) is None:
+                        raise ValueError(
+                            f'input_lifetime BORROWED for {name!r} requires a buffer-view FDB input payload',
+                        )
+                    buffer_mode = 'borrowed'
+                elif lifetime is InputLifetime.MATERIALIZED:
+                    buffer_mode = 'view'
+                else:
+                    buffer_mode = getattr(method, '_input_buffer_mode', 'view')
+                    if buffer_mode == 'hold':
+                        raise ValueError(
+                            "server-side borrowed input is controlled by "
+                            "cc.register(..., input_lifetime=...), not @cc.transfer(buffer='hold')",
+                        )
                 self._dispatch_table[name] = (method, access, buffer_mode)
 
 
@@ -202,6 +225,7 @@ class NativeServerBridge:
         *,
         name: str,
         bridge: dict[str, ResourceBridge] | None = None,
+        input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
         runtime_session: object | None = None,
         relay_anchor_address: str | None = None,
     ) -> str:
@@ -211,6 +235,16 @@ class NativeServerBridge:
         routing_name = name
         methods = self._discover_methods(crm_class)
         method_bridge_map = normalize_bridge_map(bridge, method_names=methods)
+        input_lifetime_map = normalize_input_lifetime_map(
+            input_lifetime,
+            method_names=methods,
+        )
+        validate_input_lifetime_resource_contract(
+            crm_class,
+            crm_instance,
+            input_lifetime_map,
+            bridge=method_bridge_map,
+        )
         runtime_resource = wrap_resource(crm_instance, method_bridge_map)
         instance = self._create_crm_instance(crm_class, runtime_resource)
         cc_config = concurrency or ConcurrencyConfig()
@@ -240,6 +274,7 @@ class NativeServerBridge:
             scheduler=None,  # type: ignore[arg-type]
             methods=methods,
             shutdown_method=sd_method,
+            input_lifetime=input_lifetime_map,
         )
         slot.build_dispatch_table()
 
@@ -516,11 +551,15 @@ class NativeServerBridge:
                         except Exception:
                             pass
                 try:
-                    result = method(mv, _release_fn=release_fn)
+                    result = method(
+                        mv,
+                        _release_fn=release_fn,
+                        _c2_input_buffer_mode=buffer_mode,
+                    )
                 finally:
                     if not released:
                         release_fn()
-            else:  # hold
+            else:  # hold or borrowed
                 if lease_tracker is not None and hasattr(request_buf, 'track_retained'):
                     request_buf.track_retained(
                         lease_tracker,
@@ -542,11 +581,17 @@ class NativeServerBridge:
                             pass
 
                 try:
-                    result = method(mv, _release_fn=release_fn)
+                    result = method(
+                        mv,
+                        _release_fn=release_fn,
+                        _c2_input_buffer_mode=buffer_mode,
+                    )
                 except Exception:
                     if not released:
                         release_fn()
                     raise
+                if buffer_mode == 'borrowed' and not released:
+                    release_fn()
 
                 nonlocal hold_dispatch_count
                 hold_dispatch_count += 1

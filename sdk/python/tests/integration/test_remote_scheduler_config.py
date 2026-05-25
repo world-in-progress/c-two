@@ -1,9 +1,9 @@
 """Remote IPC scheduler configuration is enforced by Rust c2-server."""
 from __future__ import annotations
 
-import pickle
 import threading
 import time
+from dataclasses import dataclass
 
 import pytest
 
@@ -43,53 +43,31 @@ def _join_all(threads: list[threading.Thread]) -> None:
     assert not alive, f'threads did not finish: {alive}'
 
 
-@cc.transferable(abi_id='c-two.tests.remote-scheduler.delay.pickle-float.v1')
+@dataclass
 class Delay:
     value: float
 
-    def serialize(value: 'Delay') -> bytes:
-        return pickle.dumps(value.value)
 
-    def deserialize(buf: memoryview) -> 'Delay':
-        return Delay(float(pickle.loads(bytes(buf))))
-
-
-@cc.transferable(abi_id='c-two.tests.remote-scheduler.window.pickle-tuple-float-float.v1')
+@dataclass
 class Window:
     start: float
     end: float
 
-    def serialize(value: 'Window') -> bytes:
-        return pickle.dumps((value.start, value.end))
 
-    def deserialize(buf: memoryview) -> 'Window':
-        start, end = pickle.loads(bytes(buf))
-        return Window(float(start), float(end))
-
-
-@cc.transferable(abi_id='c-two.tests.remote-scheduler.count.pickle-int.v1')
+@dataclass
 class Count:
     value: int
-
-    def serialize(value: 'Count') -> bytes:
-        return pickle.dumps(value.value)
-
-    def deserialize(buf: memoryview) -> 'Count':
-        return Count(int(pickle.loads(bytes(buf))))
 
 
 @cc.crm(namespace='test.remote.scheduler', version='0.1.0')
 class RemoteSchedulerProbe:
     @cc.read
-    @cc.transfer(input=Delay, output=Window)
     def read_op(self, delay: Delay) -> Window: ...
 
     @cc.write
-    @cc.transfer(input=Delay, output=Window)
     def write_op(self, delay: Delay) -> Window: ...
 
     @cc.write
-    @cc.transfer(output=Count)
     def max_active(self) -> Count: ...
 
 
@@ -124,11 +102,9 @@ class RemoteSchedulerProbeImpl:
 @cc.crm(namespace='test.remote.scheduler.shared', version='0.1.0')
 class SharedLimitProbe:
     @cc.write
-    @cc.transfer(input=Delay, output=Window)
     def hold(self, delay: Delay) -> Window: ...
 
     @cc.write
-    @cc.transfer(output=Count)
     def probe(self) -> Count: ...
 
 
@@ -301,75 +277,6 @@ def test_remote_ipc_registers_all_public_concurrency_modes(mode):
         assert client.max_active().value == 0
     finally:
         cc.close(client)
-
-
-@cc.transferable(abi_id='c-two.tests.remote-scheduler.large-payload.raw-bytes.v1')
-class LargePayload:
-    data: bytes
-
-    def serialize(value: 'LargePayload') -> bytes:
-        return value.data
-
-    def deserialize(buf: memoryview) -> 'LargePayload':
-        return LargePayload(bytes(buf))
-
-    def from_buffer(buf: memoryview) -> 'LargePayload':
-        base = getattr(buf, 'obj', None)
-        is_inline = getattr(base, 'is_inline', None)
-        LargePayloadResource.last_buffer_info = (
-            type(buf).__name__,
-            type(base).__name__ if base is not None else None,
-            is_inline,
-            len(buf),
-        )
-        return LargePayload(bytes(buf[:8]))
-
-
-@cc.crm(namespace='test.remote.scheduler.large', version='0.1.0')
-class LargePayloadCRM:
-    @cc.transfer(input=LargePayload, output=LargePayload, buffer='hold')
-    def echo_large(self, payload: LargePayload) -> LargePayload: ...
-
-    @cc.read
-    def last_info(self) -> tuple[str | None, str | None, bool | None, int]: ...
-
-
-class LargePayloadResource:
-    last_buffer_info: tuple[str | None, str | None, bool | None, int] = (
-        None, None, None, 0,
-    )
-
-    def echo_large(self, payload: LargePayload) -> LargePayload:
-        return payload
-
-    def last_info(self) -> tuple[str | None, str | None, bool | None, int]:
-        return self.last_buffer_info
-
-
-def test_remote_ipc_large_hold_input_reaches_python_as_shm_memoryview():
-    settings.shm_threshold = 1024
-    LargePayloadResource.last_buffer_info = (None, None, None, 0)
-    cc.register(
-        LargePayloadCRM,
-        LargePayloadResource(),
-        name='large_zero_copy',
-        concurrency=ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE),
-    )
-    cc.serve(blocking=False)
-
-    client = _direct_client(LargePayloadCRM, 'large_zero_copy')
-    try:
-        payload = LargePayload(b'x' * 8192)
-        result = client.echo_large(payload)
-        assert result.data == b'x' * 8
-        view_type, base_type, is_inline, size = client.last_info()
-    finally:
-        cc.close(client)
-
-    assert view_type == 'memoryview'
-    assert base_type == 'ShmBuffer'
-    assert is_inline is False
-    assert size == 8192
 
 
 def test_remote_ipc_scheduler_direct_address_ignores_bad_relay(monkeypatch):
