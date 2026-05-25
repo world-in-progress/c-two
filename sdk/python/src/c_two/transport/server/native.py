@@ -24,6 +24,7 @@ from ...crm.contract import (
 )
 from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
+from ...crm.payload_plan import PayloadPlanKind
 from ...error import ResourceAlreadyRegistered
 from c_two.config.ipc import ServerIPCOverrides, _resolve_server_ipc_config
 from ..input_lifetime import (
@@ -83,7 +84,10 @@ class CRMSlot:
                 lifetime = self.input_lifetime.get(name)
                 if lifetime is InputLifetime.BORROWED:
                     binding = getattr(method, '_input_payload_binding', None)
-                    if getattr(binding, 'view_from_buffer', None) is None:
+                    if (
+                        getattr(binding, 'kind', None) is not PayloadPlanKind.FDB
+                        or getattr(binding, 'view_from_buffer', None) is None
+                    ):
                         raise ValueError(
                             f'input_lifetime BORROWED for {name!r} requires a buffer-view FDB input payload',
                         )
@@ -559,14 +563,7 @@ class NativeServerBridge:
                 finally:
                     if not released:
                         release_fn()
-            else:  # hold or borrowed
-                if lease_tracker is not None and hasattr(request_buf, 'track_retained'):
-                    request_buf.track_retained(
-                        lease_tracker,
-                        route_name,
-                        method_name,
-                        'resource_input',
-                    )
+            else:  # borrowed
                 mv = memoryview(request_buf)
                 released = False
 
@@ -581,6 +578,13 @@ class NativeServerBridge:
                             pass
 
                 try:
+                    if lease_tracker is not None and hasattr(request_buf, 'track_retained'):
+                        request_buf.track_retained(
+                            lease_tracker,
+                            route_name,
+                            method_name,
+                            'resource_input',
+                        )
                     result = method(
                         mv,
                         _release_fn=release_fn,

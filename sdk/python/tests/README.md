@@ -125,7 +125,7 @@ multi-relay route propagation and discovery.
 
 | File | Description |
 |------|-------------|
-| `ihello.py` | `Hello` CRM interface + `HelloData` / `HelloItems` transferable types |
+| `ihello.py` | `Hello` CRM interface + Python-only `HelloData` pickle fallback type |
 | `hello.py` | `Hello` CRM implementation (stateful greeting service) |
 | `counter.py` | `ICounter` / `Counter` — minimal read/write CRM for concurrency tests |
 
@@ -160,7 +160,7 @@ Run benchmarks with `uv run python sdk/python/benchmarks/<script>.py`.
 
 ### Key Benchmark Notes
 
-- Benchmarks use **realistic `@transferable` paths** (not echo-optimized)
+- Benchmarks use realistic payload paths rather than echo-optimized no-op shortcuts
 - Default round count: 100 per size tier
 - Payload sizes typically span: 64B, 1KB, 4KB, 64KB, 1MB, 10MB, 50MB, 100MB, 500MB, 1GB
 - Metrics: P50 latency, throughput (GB/s), ops/sec, min/max latency

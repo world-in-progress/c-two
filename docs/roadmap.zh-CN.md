@@ -34,7 +34,7 @@
 
 后续 agent 和人类开发者应从上面第一个尚未完成的工作流开始，除非用户明确重定向范围。实现前先读这个路线图、相关当前代码、[`docs/vision/cross-language-contract-codec-architecture.md`](./vision/cross-language-contract-codec-architecture.md)，以及当前 fastdb-first 计划 [`docs/plans/2026-05-18-fastdb-first-crm-abi-and-bridge.md`](./plans/2026-05-18-fastdb-first-crm-abi-and-bridge.md)；更早的 `docs/plans/`、`docs/spikes/`、`docs/superpowers/` 文件只作为历史证据，除非当前路线图明确链接它。
 
-语言无关的运行时机制必须留在 Rust core 或 FFI 中。Python 和未来 SDK 应保持薄层：typed facade、transferable serialization 和语言 ergonomics。不要把 config resolution、relay routing、retries、caching、contract authority、scheduler policy、backpressure 或 memory lifecycle policy 放进单一 SDK。
+语言无关的运行时机制必须留在 Rust core 或 FFI 中。Python 和未来 SDK 应保持薄层：typed facade、payload orchestration 和语言 ergonomics。不要把 config resolution、relay routing、retries、caching、contract authority、scheduler policy、backpressure 或 memory lifecycle policy 放进单一 SDK。
 
 不要创建投机性的 SDK 脚手架。新的 SDK 目录只有在同时包含可运行切片、测试或示例，以及证明端到端可用的文档时才应该出现。
 
@@ -54,7 +54,7 @@
 | 统一配置 | Rust `c2-config` 是环境变量、`.env` 和默认值解析的事实源。 |
 | 多平台 Python 打包 | CI 为支持的平台和 Python 版本构建并发布 wheel。 |
 | 极端载荷磁盘溢出 | Rust 内存管理会在配置阈值要求时把超大载荷溢写到文件。 |
-| Hold 模式与 `from_buffer` 零拷贝 | `cc.hold()` 和 transferable `from_buffer` 通过原生 lease accounting 支持保留式 buffer view。 |
+| FastDB held response views | `cc.hold()` 为具备 buffer-view capability 的 FastDB payload 保留 response lease；普通调用会立即物化并释放。 |
 | SHM 驻留监控 | `cc.hold_stats()` 暴露 SDK 可见的保留 buffer 统计。 |
 
 ## 规划中
@@ -102,8 +102,8 @@
 | FastDB mapping-row annotation guardrail | FastDB bridge derivation 现在会拒绝 key type 不是 `str` 的显式 mapping-shaped single-feature 与 batch row annotation。 | schema field-name 所有权留在 FastDB bridge helpers；C-Two 注册 bridge 之前就阻止非字符串 key 被误当成 feature field name。 |
 | FastDB variadic tuple row Batch bridge | FastDB bridge derivation 现在会把 `tuple[Row, ...]` 识别为不可变的 `Batch[Feature]` row sequence 输入/输出，而固定长度 tuple 标注仍表示 tuple columns。 | 这属于 FastDB-owned bridge ergonomics；C-Two 只在 thread-local、direct IPC 和 relay 中执行最终派生出的 `cc.bridge(...)` hooks。 |
 | FastDB batch sequence row annotation guardrail | FastDB bridge derivation 现在会拒绝 `Batch[Feature]` input/output row sequence 中类似 `list[int]` 的显式标量 item 注解，同时保留 bare `list` 和 `list[Feature]` 的 feature-row 路径。 | 防止错误 resource 注解延迟成运行期 row-field 错误；C-Two 仍只应用 FastDB-owned `cc.bridge(...)` hook。 |
-| FastDB input hold ownership guardrail | FastDB call-db input transferable 在 `from_buffer` 只是物化值时会退出 C-Two 自动 input hold；grid direct IPC smoke 证明 `get_grid_infos` 调用后不会留下活跃 `resource_input` lease。 | 区分 input 物化和 output held view；只有真正返回 resource-facing retained view 的 FastDB hook 才应该自动选择 C-Two input hold。 |
-| FastDB raw feature input hold ownership guardrail | Raw fastdb feature transferable 现在也使用相同的 auto-input-hold opt-out，因为它的 `from_buffer` 只是物化 feature 对象，而不是返回 retained resource-facing view。 | 让 raw feature FastDB 公共面和 call-db input ownership 规则保持一致；portable CRM 方法仍应优先使用 call-db envelope。 |
+| FastDB borrowed input ownership guardrail | FastDB call-db input 默认物化；`cc.InputLifetime.BORROWED` 是唯一 server-side retained-input gate，并会拒绝 bridge input、Python fallback payload、非 FDB binding 和不匹配的 resource 签名。 | 区分 input 物化和 output held view；borrowed resource input 必须显式、FDB-only、call-scoped，并在释放 request buffer 前失效。 |
+| FastDB raw feature input lifetime guardrail | 单个 FastDB feature 的 borrowed input 使用和 batch/array view 相同的 checked-owner invalidation path。 | 让 raw feature 和 call-db input lifetime 行为保持一致；portable CRM 方法仍应优先使用显式 FastDB CRM annotation 和生成的 descriptor。 |
 | FastDB free-threading row-read safety | FastDB `Table` row access、`iter_reuse()` 和 fallback string lookup 现在会用 per-table `RLock` 序列化 native `tryGetFeature(...)` row materialization；当前 free-threaded Python 环境下的 FastDB all-in-one Python suite 已经通过。 | FastDB 内部 native row materialization 的线程安全留在 FastDB；C-Two 只依赖稳定 FastDB 行为，不拥有 FastDB 内部锁。 |
 | 契约版本兼容 | 精确 CRM 契约校验已经存在，但还没有 semver 或 range-based 兼容协商。 | 保留精确 route validation 作为安全底线。在 Rust `c2-contract` 中增加兼容匹配，再通过 Python 薄 facade 暴露，例如在 `cc.connect(...)` 上支持版本要求。 |
 | `auth_hook` 与 call metadata | C-Two 还没有提供上层实现 AuthN/AuthZ 所需的 metadata 透传和 hook 表面。 | C-Two 提供机制，下游系统如 Toodle 保留策略。metadata 必须显式且保持契约作用域。 |

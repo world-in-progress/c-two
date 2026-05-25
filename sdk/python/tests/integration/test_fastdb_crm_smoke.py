@@ -117,6 +117,60 @@ def _make_fastdb_native_resource_contract(namespace: str):
     )
 
 
+def test_thread_local_hold_does_not_invalidate_resource_owned_fastdb_view():
+    import fastdb4py as fdb
+    from fastdb4py.column_engine import ColumnEngine
+
+    class Point:
+        pass
+
+    Point.__annotations__ = {'x': fdb.F64}
+    Point = fdb.feature(Point)
+
+    class FastdbViewSource:
+        def active(self):
+            ...
+
+    FastdbViewSource.active.__annotations__ = {'return': fdb.Batch[Point]}
+    FastdbViewSource = cc.crm(
+        namespace='test.fastdb.thread_hold_external_owner',
+        version='0.1.0',
+    )(FastdbViewSource)
+
+    class FastdbViewResource:
+        def __init__(self):
+            engine = ColumnEngine.create()
+            engine.push(Point(x=2.0), table_name='points')
+            engine.combine()
+            self.owner = fdb.FdbViewOwner(checked=True, writeable=False)
+            self.table = engine.table(
+                Point,
+                name='points',
+                owner=self.owner,
+                writeable=False,
+            )
+
+        def active(self):
+            return self.table
+
+    FastdbViewResource.active.__annotations__ = {'return': fdb.Batch[Point]}
+
+    resource = FastdbViewResource()
+    cc.register(FastdbViewSource, resource, name='fastdb-thread-hold-external-owner')
+    crm = cc.connect(FastdbViewSource, name='fastdb-thread-hold-external-owner')
+    try:
+        held = cc.hold(crm.active)()
+        row = held.value[0]
+        assert row.x == pytest.approx(2.0)
+
+        held.release()
+
+        assert resource.owner.alive is True
+        assert row.x == pytest.approx(2.0)
+    finally:
+        cc.close(crm)
+
+
 def _make_fastdb_batch_input_bridge_contract(namespace: str):
     pytest.importorskip('fastdb4py', reason='fastdb C-Two smoke requires fastdb4py')
     import fastdb4py as fdb
@@ -2766,7 +2820,7 @@ def test_fastdb_derived_bridge_maps_tuple_return_thread_local_and_direct_ipc():
 def test_fastdb_derived_bridge_tuple_return_hold_across_remote_transports(start_c3_relay):
     def assert_held_tuple_view(held):
         levels, rows = held.value
-        raw_buffer = held.buffer
+        raw_buffer = held.unsafe_buffer
         assert levels.materialize() == [1, 2]
         _assert_grid_ids(rows)
         assert rows.column.global_id[1] == 20

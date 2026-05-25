@@ -40,7 +40,7 @@ C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_example
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 
 # Run one test class or function
-uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
+uv run pytest sdk/python/tests/unit/test_held_result.py::TestHeldResultBasic::test_access_value -q
 
 # Rust core tests
 cargo test --manifest-path core/Cargo.toml --workspace
@@ -88,10 +88,10 @@ Path: `sdk/python/src/c_two/crm/`
 - Only methods in the contract are exposed remotely.
 - CRM route contracts are identified by route name plus the CRM namespace, CRM name, CRM version, ABI hash, and signature hash. Python may compute the descriptor/fingerprints from the CRM class, but Rust `c2-contract` validates the complete expected route contract at IPC and relay boundaries.
 - Resource implementations are plain Python classes and are not decorated.
-- `@transferable` marks custom data types that cross the wire. It converts the class into a dataclass and registers `serialize`, `deserialize`, and optional `from_buffer`.
-- `from_buffer` enables zero-copy buffer views for hold mode.
+- Portable FastDB CRM payloads are inferred from `fastdb4py` annotations and represented by `PayloadAbiRef` values. Python-only fallback values use pickle and must not be treated as portable schema/codegen inputs.
+- FastDB retained response views are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
 - CRM methods can use `@cc.read` or `@cc.write`; writes are the default.
-- `@cc.transfer()` is metadata-only for CRM contract methods. It does not wrap the function.
+- `@cc.transfer(input=..., output=...)`, `@cc.transferable`, and `@cc.transfer(buffer='hold')` are obsolete for the FDB-first path and must not be reintroduced as codec or lifetime selection mechanisms.
 - `@on_shutdown` marks one public method as a shutdown callback. It is not exposed through RPC.
 
 ### Client Layer
@@ -271,9 +271,9 @@ class Grid:
 
 ### Hold Mode Pattern
 
-`cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It returns `HeldResult` with `.value` and `.release()`. Safety layers are explicit release, context manager, and `__del__` fallback.
+`cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It returns `HeldResult` with `.value`, `.unsafe_buffer`, and `.release()`. Safety layers are explicit release, context manager, and `__del__` fallback.
 
-Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For FastDB call-db payloads, `held.value` is the logical CRM return value such as `fdb.Batch[T]`, `fdb.Array[T]`, a single feature, a scalar, or a tuple of those values; do not expose the internal call-db envelope as the public held API.
+Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For FastDB call-db payloads, `held.value` is the logical CRM return value such as `fdb.Batch[T]`, `fdb.Array[T]`, a single feature, a scalar, or a tuple of those values; do not expose the internal call-db envelope as the public held API. `held.unsafe_buffer` is a raw `memoryview` escape hatch for advanced users and cannot mechanically invalidate raw NumPy or pointer aliases created from it; normal code should use checked FastDB views from `held.value` and call `fdb.materialize(...)` before storing data beyond the hold scope.
 
 ```python
 with cc.hold(proxy.method)(args) as held:

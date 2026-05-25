@@ -251,7 +251,7 @@ For Python-only resources, use ordinary Python types and dataclasses. They are c
 
 ### cc.hold() — Client-Side Borrowed Responses
 
-On the client side, normal FastDB CRM calls materialize the response into owned values and release the transport buffer immediately. `cc.hold()` explicitly requests that the response buffer remain alive, enabling zero-copy reads when an FDB output payload supports retained views. The returned `cc.Held[R]` wraps the CRM logical return value, exposes the retained raw wire buffer as `.buffer` for advanced use, and provides a three-layer safety net for buffer lifecycle:
+On the client side, normal FastDB CRM calls materialize the response into owned values and release the transport buffer immediately. `cc.hold()` explicitly requests that the response buffer remain alive, enabling zero-copy reads when an FDB output payload supports retained views. The returned `cc.Held[R]` wraps the CRM logical return value, exposes the retained raw wire buffer as `.unsafe_buffer` for advanced use, and provides a three-layer safety net for buffer lifecycle:
 
 1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
 2. **Context manager (`with`)** — recommended for single-buffer scopes
@@ -265,8 +265,8 @@ result = grid.transform(matrix)
 
 # Option 1: Context manager — clean for single holds
 with cc.hold(grid.transform)(matrix) as held:
-    data = held.value          # zero-copy NumPy array backed by SHM
-    raw = held.buffer          # retained wire buffer, valid only inside the hold scope
+    data = held.value          # checked FastDB view backed by the retained response
+    raw = held.unsafe_buffer   # raw wire buffer, valid only inside the hold scope
     process(data)              # read directly from shared memory
 # SHM buffer released on context exit
 
@@ -282,6 +282,8 @@ finally:
 ```
 
 > **When to use hold mode:** Large array/columnar data where deserialization dominates cost. For small payloads (< 1 MB), the overhead of tracking SHM lifecycle exceeds the copy cost.
+
+`held.value` is the normal API. It uses FastDB checked views where possible, so child rows and columns fail fast after `held.release()`. `held.unsafe_buffer` is a raw `memoryview` escape hatch; C-Two can release the transport lease, but it cannot mechanically invalidate raw NumPy arrays or other pointers that user code derives from that buffer. Materialize values with `fdb.materialize(...)` before storing them beyond the hold scope.
 
 ---
 
@@ -588,7 +590,7 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | Unified config architecture (Rust resolver SSOT) | ✅ Stable |
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
 | Disk spill for extreme payloads | ✅ Stable |
-| Hold mode with `from_buffer` zero-copy | ✅ Stable |
+| FastDB held response views through `cc.hold()` | ✅ Stable |
 | SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
 | Contract version compatibility negotiation | 🔜 Planned |
 | `auth_hook` + call metadata | 🔜 Planned |

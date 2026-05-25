@@ -1578,6 +1578,27 @@ def test_borrowed_input_lifetime_rejects_missing_resource_annotation(monkeypatch
         )
 
 
+def test_borrowed_input_lifetime_rejects_extra_resource_parameter(monkeypatch):
+    pytest.importorskip('fastdb4py', reason='fastdb input lifetime tests require fastdb4py')
+
+    @cc.crm(namespace='demo.fastdb.input_lifetime.extra_param', version='0.1.0')
+    class IntArraySum:
+        def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
+            ...
+
+    class IntArraySumResource:
+        def total(self, values: fdb.Array[fdb.I32], scale: fdb.I32 = 1) -> fdb.I32:
+            return sum(values) * scale
+
+    with pytest.raises(TypeError, match='same positional parameters'):
+        cc.register(
+            IntArraySum,
+            IntArraySumResource(),
+            name='fastdb-borrowed-extra-resource-parameter',
+            input_lifetime={'total': cc.InputLifetime.BORROWED},
+        )
+
+
 def test_grid_fastdb_hold_returns_retained_view_for_direct_ipc(monkeypatch):
     GridFastdb, _GridId, NestedGrid, grid_fastdb_bridge = _load_fastdb_grid(monkeypatch)
     cc.register(
@@ -1627,11 +1648,18 @@ def test_grid_fastdb_hold_returns_view_for_explicit_http_relay(monkeypatch, star
         assert grid.client._mode == 'http'  # noqa: SLF001
         with cc.hold(grid.get_active_grid_infos)() as held:
             view = held.value
-            assert view[0].level == 1
-            assert view[0].global_id == 0
+            row = view[0]
+            assert row.level == 1
+            assert row.global_id == 0
             columns = view.column
-            assert columns.level[0] == 1
+            level_column = columns.level
+            assert level_column[0] == 1
             assert columns.global_id[0] == 0
+        import fastdb4py as fdb
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            _ = row.level
+        with pytest.raises(fdb.FdbViewInvalidatedError):
+            _ = level_column[0]
     finally:
         cc.close(grid)
 

@@ -3,7 +3,7 @@ import inspect
 import sys
 import warnings
 from functools import wraps
-from typing import get_type_hints, Any, Callable, Generic, TypeVar, Type
+from typing import get_type_hints, Any, Callable, Generic, ParamSpec, TypeVar, Type
 
 from .. import error
 from ._payload_abi import (
@@ -21,6 +21,7 @@ from .payload_plan import (
 
 
 R = TypeVar('R')
+P = ParamSpec('P')
 
 
 class HeldResult(Generic[R]):
@@ -32,11 +33,12 @@ class HeldResult(Generic[R]):
     3. __del__ fallback — last resort with warning
     """
 
-    __slots__ = ('_value', '_release_cb', '_released', '_buffer')
+    __slots__ = ('_value', '_release_cb', '_invalidate_cb', '_released', '_buffer')
 
-    def __init__(self, value, release_cb=None, buffer=None):
+    def __init__(self, value, release_cb=None, buffer=None, invalidate_cb=None):
         self._value = value
         self._release_cb = release_cb
+        self._invalidate_cb = invalidate_cb
         self._buffer = buffer
         self._released = False
 
@@ -48,6 +50,10 @@ class HeldResult(Generic[R]):
 
     @property
     def buffer(self):
+        return self.unsafe_buffer
+
+    @property
+    def unsafe_buffer(self):
         if self._released:
             raise RuntimeError("SHM released — buffer no longer accessible")
         if self._buffer is None:
@@ -59,8 +65,14 @@ class HeldResult(Generic[R]):
             self._released = True
             cb = self._release_cb
             self._release_cb = None
+            invalidate_cb = self._invalidate_cb
+            self._invalidate_cb = None
             value = self._value
-            _invalidate_fastdb_value(value)
+            if invalidate_cb is not None:
+                try:
+                    invalidate_cb(value)
+                except Exception:
+                    pass
             self._value = None
             try:
                 if cb is not None:
@@ -110,7 +122,7 @@ def _invalidate_fastdb_value(value: object) -> None:
         pass
 
 
-def hold(method):
+def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]:
     """Wrap a CRM bound method to hold SHM on the response.
 
     Usage: ``cc.hold(proxy.method)(args)`` — single-shot pattern.
@@ -260,7 +272,12 @@ def _build_transfer_wrapper(
                             response.release()
                         except Exception:
                             pass
-                    return HeldResult(result, release_cb, buffer=mv)
+                    return HeldResult(
+                        result,
+                        release_cb,
+                        buffer=mv,
+                        invalidate_cb=_invalidate_fastdb_value,
+                    )
                 else:
                     try:
                         result = output_fn(mv)
@@ -286,7 +303,12 @@ def _build_transfer_wrapper(
                     def release_cb():
                         mv.release()
 
-                    return HeldResult(result, release_cb, buffer=mv)
+                    return HeldResult(
+                        result,
+                        release_cb,
+                        buffer=mv,
+                        invalidate_cb=_invalidate_fastdb_value,
+                    )
                 result = output_fn(response)
                 if _c2_buffer == 'hold':
                     return HeldResult(result, None)
@@ -309,9 +331,15 @@ def _build_transfer_wrapper(
     def crm_to_com(*args, _release_fn=None, _c2_input_buffer_mode=None):
         input_buffer_mode = _c2_input_buffer_mode or buffer
         if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD:
-            if input_buffer_mode == 'borrowed' and input.view_from_buffer is not None:
-                input_fn = input.view_from_buffer
+            if input_buffer_mode == 'borrowed':
                 input_hook = 'retained_view'
+                if input.kind is PayloadPlanKind.FDB and input.view_from_buffer is not None:
+                    input_fn = input.view_from_buffer
+                else:
+                    def input_fn(_request):
+                        raise ValueError(
+                            'borrowed input requires a buffer-view FDB input payload',
+                        )
             else:
                 input_fn = input.deserialize
                 input_hook = 'deserialize'

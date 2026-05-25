@@ -75,18 +75,28 @@ def _validate_borrowed_signature(
         inspect.signature(resource_method),
         skip_self=False,
     )
-    resource_positional = [
-        param
-        for param in resource_params
-        if param.kind in {
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        }
-    ]
+    crm_positional = _borrowed_positional_params(crm_params, method_name, 'CRM')
+    resource_positional = _borrowed_positional_params(
+        resource_params,
+        method_name,
+        'resource',
+    )
+    if len(crm_positional) != len(resource_positional):
+        raise TypeError(
+            f'input_lifetime BORROWED for {method_name!r} requires CRM and '
+            f'resource methods to have the same positional parameters; '
+            f'got {len(crm_positional)} CRM parameters and '
+            f'{len(resource_positional)} resource parameters',
+        )
     crm_hints = _type_hints(crm_method, method_name, 'CRM')
     resource_hints = _type_hints(resource_method, method_name, 'resource')
 
-    for crm_param, resource_param in zip(crm_params, resource_positional):
+    for crm_param, resource_param in zip(crm_positional, resource_positional):
+        if crm_param.name not in crm_hints:
+            raise TypeError(
+                f'input_lifetime BORROWED for {method_name!r} requires CRM parameter '
+                f'{crm_param.name!r} to be annotated',
+            )
         if resource_param.name not in resource_hints:
             raise TypeError(
                 f'input_lifetime BORROWED for {method_name!r} requires resource parameter '
@@ -111,6 +121,26 @@ def _callable_params(
     params = list(signature.parameters.values())
     if skip_self and params and params[0].name in {'self', 'cls'}:
         params = params[1:]
+    return params
+
+
+def _borrowed_positional_params(
+    params: list[inspect.Parameter],
+    method_name: str,
+    owner: str,
+) -> list[inspect.Parameter]:
+    allowed = {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    }
+    invalid = [param for param in params if param.kind not in allowed]
+    if invalid:
+        names = ', '.join(param.name for param in invalid)
+        raise TypeError(
+            f'input_lifetime BORROWED for {method_name!r} requires {owner} '
+            f'parameters to be positional-only or positional-or-keyword; '
+            f'unsupported parameters: {names}',
+        )
     return params
 
 
