@@ -36,21 +36,32 @@
 
 ## Performance
 
-End-to-end cross-process IPC benchmark — same NumPy payload (`row_id u32` + `x,y,z f64`), same machine, same aggregation. Three transport modes compared:
+End-to-end cross-process IPC benchmark using the Kostya-style coordinate schema: `row_id u32`, `x/y/z f64`, and `name STR`. Each call returns a cached coordinate table from a remote process and the client computes `sum(x + y + z)` from the received payload.
 
-| Rows | C-Two hold (ms) | Ray (ms) | C-Two pickle (ms) | **Hold vs Ray** |
-|-----:|---:|---:|---:|---:|
-| 1 K | **0.07** | 6.1 | 0.19 | **86×** |
-| 10 K | **0.09** | 7.1 | 0.82 | **79×** |
-| 100 K | **0.38** | 9.8 | 8.7 | **26×** |
-| 1 M | **3.7** | 58 | 150 | **15×** |
-| 3 M | **9.7** | 129 | 598 | **13×** |
+| Rows | C-Two FDB normal (ms) | C-Two FDB hold (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Hold vs Ray arrays** |
+|-----:|---:|---:|---:|---:|---:|
+| 1 K | 1.55 | **1.57** | 6.39 | 0.61 | **4.1×** |
+| 10 K | 1.86 | **1.89** | 7.67 | 1.38 | **4.1×** |
+| 100 K | 5.76 | **4.88** | 8.97 | 10.31 | **1.8×** |
+| 1 M | 44.90 | **33.54** | 47.12 | 157.06 | **1.4×** |
+| 3 M | 170.20 | **96.20** | 137.21 | 621.94 | **1.4×** |
 
-- **C-Two hold** — SHM zero-copy via `np.frombuffer`; no serialization on read
-- **Ray** — object store with zero-copy numpy support (Ray 2.55)
-- **C-Two pickle** — standard pickle over SHM; included to show serialization cost
+Row-oriented fallback paths are much slower at large sizes and are included only to show Python object materialization cost:
 
-> Apple M1 Max · Python 3.13 · NumPy 2.4 · See [`sdk/python/benchmarks/unified_numpy_benchmark.py`](sdk/python/benchmarks/unified_numpy_benchmark.py) for full methodology.
+| Rows | C-Two pickle records (ms) | Ray records (ms) | **Hold vs Ray records** |
+|-----:|---:|---:|---:|
+| 1 K | 1.04 | 6.74 | **4.3×** |
+| 10 K | 6.38 | 11.65 | **6.2×** |
+| 100 K | 67.34 | 57.09 | **11.7×** |
+| 1 M | 891.30 | 547.97 | **16.3×** |
+| 3 M | SKIP | SKIP | - |
+
+- **C-Two FDB normal** - copies the response payload bytes once into a process-owned buffer, then returns a FastDB owned-buffer view.
+- **C-Two FDB hold** - `cc.hold()` retains the IPC response buffer and maps FastDB views directly over it, avoiding the normal response bytes copy.
+- **Ray arrays** - Ray object-store transfer of NumPy columns plus the `name` string list.
+- **Pickle arrays / records** - Python-only fallback baselines; records intentionally exercise row-oriented Python object overhead.
+
+> Apple M1 Max · C-Two: Python 3.14.3t + NumPy 2.4.4 · Ray: Python 3.12.10 + NumPy 2.4.6 + Ray 2.55.1 · See [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py), [`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py), and [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh) for methodology.
 
 ---
 

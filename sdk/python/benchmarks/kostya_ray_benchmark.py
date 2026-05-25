@@ -9,11 +9,13 @@ Mirrors `kostya_ctwo_benchmark.py`:
 
 Notes:
   * Ray on macOS caps object_store_memory at 2 GiB. Cap N accordingly.
-  * Run from the dedicated Ray venv:
-        /tmp/ray_bench_env/bin/python sdk/python/benchmarks/kostya_ray_benchmark.py
+  * Ray is unavailable on Python 3.14t today. For local smoke runs:
+        uv run --no-project --python 3.12 --with ray --with numpy \
+          python sdk/python/benchmarks/kostya_ray_benchmark.py --sizes 1000,10000 --iters 5
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import math
 import statistics
@@ -31,7 +33,7 @@ SIZES = [
     (3_000_000,  '3M'),
 ]
 
-WARMUP = 3
+DEFAULT_WARMUP = 3
 
 
 def rounds_for(n: int) -> int:
@@ -42,6 +44,37 @@ def rounds_for(n: int) -> int:
     if n <= 1_000_000:
         return 15
     return 5
+
+
+def _format_size_label(n: int) -> str:
+    if n % 1_000_000 == 0:
+        return f'{n // 1_000_000}M'
+    if n % 1_000 == 0:
+        return f'{n // 1_000}K'
+    return str(n)
+
+
+def _parse_sizes(value: str | None) -> list[tuple[int, str]]:
+    if not value:
+        return SIZES
+    sizes: list[tuple[int, str]] = []
+    for raw in value.split(','):
+        token = raw.strip()
+        if not token:
+            continue
+        lower = token.lower()
+        multiplier = 1
+        if lower.endswith('k'):
+            multiplier = 1_000
+            lower = lower[:-1]
+        elif lower.endswith('m'):
+            multiplier = 1_000_000
+            lower = lower[:-1]
+        n = int(lower) * multiplier
+        sizes.append((n, _format_size_label(n)))
+    if not sizes:
+        raise ValueError('--sizes must contain at least one positive integer')
+    return sizes
 
 
 @ray.remote
@@ -81,10 +114,10 @@ def consume_arrays(d) -> float:
     return float(d['x'].sum() + d['y'].sum() + d['z'].sum())
 
 
-def bench(actor, method_name: str, consumer, n: int, rounds: int):
+def bench(actor, method_name: str, consumer, n: int, rounds: int, warmup: int):
     method = getattr(actor, method_name)
 
-    for _ in range(WARMUP):
+    for _ in range(warmup):
         consumer(ray.get(method.remote(n)))
 
     rpc_lat: list[float] = []
@@ -112,9 +145,30 @@ def bench(actor, method_name: str, consumer, n: int, rounds: int):
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--sizes',
+        help='comma-separated row counts; supports raw integers plus K/M suffixes',
+    )
+    parser.add_argument(
+        '--iters',
+        type=int,
+        help='override adaptive rounds for every selected size',
+    )
+    parser.add_argument('--warmup', type=int, default=DEFAULT_WARMUP)
+    parser.add_argument(
+        '--object-store-memory',
+        type=int,
+        default=2 * 1024 * 1024 * 1024,
+        help='Ray object store memory in bytes',
+    )
+    args = parser.parse_args()
+    sizes = _parse_sizes(args.sizes)
+    rounds_label = str(args.iters) if args.iters is not None else 'adaptive'
+
     ray.init(
         num_cpus=2,
-        object_store_memory=2 * 1024 * 1024 * 1024,
+        object_store_memory=args.object_store_memory,
         include_dashboard=False,
         ignore_reinit_error=True,
         logging_level='WARNING',
@@ -126,19 +180,21 @@ def main() -> None:
 
     print('=' * 92)
     print(f'Kostya-style coordinate benchmark — Ray {ray.__version__}')
-    print(f'NumPy: {np.__version__}  Warmup: {WARMUP}  |  Adaptive rounds')
+    print(f'NumPy: {np.__version__}  Warmup: {args.warmup}  |  Rounds: {rounds_label}')
     print('=' * 92)
     print(f'{"N":>8}  {"Strategy":>16}  {"RPC P50":>10}  {"Aggregate":>10}  {"Total P50":>10}')
     print('-' * 92)
 
     rows: list[tuple[str, str, float, float, float]] = []
-    for n, label in SIZES:
+    for n, label in sizes:
         skip_records = n >= 3_000_000
-        rounds = rounds_for(n)
+        rounds = args.iters if args.iters is not None else rounds_for(n)
 
         if not skip_records:
             try:
-                rpc, total, agg = bench(actor, 'gen_records', consume_records, n, rounds)
+                rpc, total, agg = bench(
+                    actor, 'gen_records', consume_records, n, rounds, args.warmup,
+                )
                 print(f'{label:>8}  {"ray-records":>16}  '
                       f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m')
                 rows.append((label, 'ray-records', rpc, total, agg))
@@ -146,7 +202,9 @@ def main() -> None:
                 print(f'{label:>8}  {"ray-records":>16}  FAILED: {e}')
 
         try:
-            rpc, total, agg = bench(actor, 'gen_arrays', consume_arrays, n, rounds)
+            rpc, total, agg = bench(
+                actor, 'gen_arrays', consume_arrays, n, rounds, args.warmup,
+            )
             print(f'{label:>8}  {"ray-arrays":>16}  '
                   f'{rpc:>9.3f}m  {agg:>9.3f}m  {total:>9.3f}m')
             rows.append((label, 'ray-arrays', rpc, total, agg))
@@ -169,6 +227,10 @@ def main() -> None:
     with open(out_path, 'w') as f:
         f.write('# Kostya-style coordinate benchmark — Ray\n')
         f.write(f'# Ray {ray.__version__}\n')
+        f.write(
+            f'# sizes={",".join(label for _, label in sizes)} '
+            f'iters={rounds_label} warmup={args.warmup}\n'
+        )
         f.write(f'{"N":>8}\t{"Strategy":>16}\t{"RPC_ms":>10}\t{"Total_ms":>10}\t{"Aggregate_ms":>14}\n')
         for label, strat, rpc, total, agg in rows:
             f.write(f'{label:>8}\t{strat:>16}\t{rpc:>10.4f}\t{total:>10.4f}\t{agg:>14.4f}\n')

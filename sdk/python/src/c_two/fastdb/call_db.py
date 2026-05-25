@@ -2,22 +2,28 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from fastdb4py import FdbViewOwner, core, materialize as _fastdb_materialize
-from fastdb4py.column_engine import ColumnEngine, _get_default_table_build
+from fastdb4py import (
+    CALL_DB_CODEC_ID as FASTDB_CALL_DB_CODEC_ID,
+    CALL_DB_COLUMNAR_PROFILE as FASTDB_CALL_DB_COLUMNAR_PROFILE,
+    CALL_DB_OBJECT_GRAPH_PROFILE as FASTDB_CALL_DB_OBJECT_GRAPH_PROFILE,
+    CALL_DB_SCHEMA_VERSION as FASTDB_CALL_DB_SCHEMA_VERSION,
+    FastdbCallDbArrayItem,
+    FastdbCallDbBinding,
+    FastdbCallDbFeatureDependency,
+    FastdbCallDbScalarField,
+    FastdbCallDbTable,
+    decode_call_db,
+    encode_call_db,
+    view_call_db,
+)
 from fastdb4py.decorator import feature
-from fastdb4py.object_engine import LayerState, ObjectEngine
-from fastdb4py.orm.table import Table
 from fastdb4py.registry import (
     get_schema,
     is_feature,
-    lookup_class,
-    non_native_list_storage_diagnostics,
-    raw_payload_storage_diagnostics,
 )
 from fastdb4py.schema import (
     columnar_capability,
@@ -36,15 +42,14 @@ from fastdb4py.type import (
     STR,
     WSTR,
     OriginFieldType,
-    coerce_bool_scalar,
     get_origin_type,
 )
 
-CALL_DB_SCHEMA_VERSION = 'fastdb.call-db.schema.v1'
-CALL_DB_CODEC_ID = 'org.fastdb.call-db'
+CALL_DB_SCHEMA_VERSION = FASTDB_CALL_DB_SCHEMA_VERSION
+CALL_DB_CODEC_ID = FASTDB_CALL_DB_CODEC_ID
 CALL_DB_CODEC_VERSION = '1'
-CALL_DB_COLUMNAR_PROFILE = 'fastdb.call.columnar.v1'
-CALL_DB_OBJECT_GRAPH_PROFILE = 'fastdb.call.object-graph.v1'
+CALL_DB_COLUMNAR_PROFILE = FASTDB_CALL_DB_COLUMNAR_PROFILE
+CALL_DB_OBJECT_GRAPH_PROFILE = FASTDB_CALL_DB_OBJECT_GRAPH_PROFILE
 _VALID_CALL_DB_PROFILES = {
     CALL_DB_COLUMNAR_PROFILE,
     CALL_DB_OBJECT_GRAPH_PROFILE,
@@ -54,14 +59,6 @@ _CRM_CONTEXT_KEYS = (
     'crm_name',
     'crm_version',
 )
-
-
-def _to_owned_fastdb_value(value: object) -> object:
-    return _fastdb_materialize(value)
-
-
-def _new_retained_owner() -> FdbViewOwner:
-    return FdbViewOwner(checked=True, writeable=False)
 
 _SCALAR_TABLE_NAME = '__c2_args'
 _NONE_TYPE = type(None)
@@ -223,482 +220,35 @@ class FastdbCallPlan:
             raise ValueError(f'fastdb call-db plan has unsupported call-db profile {self.profile!r}.')
         _validate_crm_context(self.crm_context)
 
+    @property
+    def fastdb_binding(self) -> FastdbCallDbBinding:
+        """Return the generic FastDB runtime binding for this C-Two CRM plan."""
+        return FastdbCallDbBinding(
+            codec_id=CALL_DB_CODEC_ID,
+            direction=self.direction,
+            method=self.method_name,
+            profile=self.profile,
+            schema_sha256=self.schema_sha256,
+            tables=tuple(_fastdb_runtime_table(table) for table in self.tables),
+        )
+
     def serialize_values(self, values: object) -> bytes:
         self._validate_identity()
-        if self.profile == CALL_DB_OBJECT_GRAPH_PROFILE:
-            return self._serialize_values_object_graph(values)
-        normalized = self._normalize_values(values)
-        engine = ColumnEngine.create()
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                scalar_values = {
-                    field['name']: _coerce_scalar_value(
-                        field['kind'],
-                        normalized[table.scalar_positions[field_offset]],
-                    )
-                    for field_offset, field in enumerate(table.scalar_fields)
-                }
-                engine.push(self.scalar_feature_type(**scalar_values), table_name=table.name)
-                continue
-            if table.kind == 'array':
-                if table.feature_type is None:
-                    raise ValueError(f'array table {table.name!r} is missing runtime feature type.')
-                if table.value_position is None:
-                    raise ValueError(f'array table {table.name!r} is missing value position.')
-                items = _array_table_values(table, normalized[table.value_position])
-                if items:
-                    engine.push_many([
-                        table.feature_type(value=item)
-                        for item in items
-                    ], table_name=table.name)
-                else:
-                    _create_empty_feature_table(engine, table)
-                continue
-            if table.value_position is None:
-                raise ValueError(f'feature table {table.name!r} is missing value position.')
-            value = normalized[table.value_position]
-            if table.cardinality == 'many':
-                rows = _feature_table_rows(table, value)
-                if rows:
-                    engine.push_many(rows, table_name=table.name)
-                else:
-                    _create_empty_feature_table(engine, table)
-                continue
-            engine.push(value, table_name=table.name)
-        engine.combine()
-        chunk = engine._origin.buffer()  # noqa: SLF001
-        return chunk.to_bytes()
+        return encode_call_db(self.fastdb_binding, values)
 
     def deserialize_values(self, data: bytes | bytearray | memoryview) -> object:
         self._validate_identity()
         _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        if self.profile == CALL_DB_OBJECT_GRAPH_PROFILE:
-            engine = _object_engine_from_buffer(data, self.tables)
-            return self._materialize_values_object_graph(engine)
-        engine = _column_engine_from_buffer(data)
-        return self._materialize_values(engine)
+        if self.profile == CALL_DB_COLUMNAR_PROFILE:
+            return view_call_db(self.fastdb_binding, bytes(data)).logical_value()
+        return decode_call_db(self.fastdb_binding, data)
 
     def view_from_buffer(self, data: memoryview) -> object:
         self._validate_identity()
         if not self.supports_buffer_view:
             raise ValueError(f'{self.profile} does not support retained buffer views.')
         _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        view = FastdbCallView(
-            plan=self,
-            engine=_column_engine_from_buffer(data),
-            buffer=data,
-            owner=_new_retained_owner(),
-        )
-        logical_values = view.logical_values()
-        if self.direction == 'input':
-            return logical_values
-        if len(logical_values) == 1:
-            return logical_values[0]
-        return logical_values
-
-    def _materialize_values(self, engine: ColumnEngine) -> object:
-        self._validate_identity()
-        values: list[Any] = [None] * _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                row = engine.table(self.scalar_feature_type, name=table.name)[0]
-                for field_offset, field in enumerate(table.scalar_fields):
-                    values[table.scalar_positions[field_offset]] = _materialize_scalar_value(
-                        field['kind'],
-                        getattr(row, field['name']),
-                    )
-                continue
-            if table.kind == 'array':
-                if table.feature_type is None:
-                    raise ValueError(f'array table {table.name!r} is missing feature type.')
-                if table.value_position is None:
-                    raise ValueError(f'array table {table.name!r} is missing value position.')
-                fastdb_table = engine.table(table.feature_type, name=table.name)
-                item_kind = _array_item_kind(table)
-                values[table.value_position] = [
-                    _materialize_scalar_value(
-                        item_kind,
-                        getattr(row, _ARRAY_VALUE_FIELD),
-                    )
-                    for row in fastdb_table
-                ]
-                continue
-            if table.feature_type is None:
-                raise ValueError(f'feature table {table.name!r} is missing feature type.')
-            if table.value_position is None:
-                raise ValueError(f'feature table {table.name!r} is missing value position.')
-            fastdb_table = engine.table(table.feature_type, name=table.name)
-            if table.cardinality == 'many':
-                values[table.value_position] = _to_owned_fastdb_value(fastdb_table)
-            else:
-                values[table.value_position] = _to_owned_fastdb_value(fastdb_table[0])
-
-        if self.direction == 'input':
-            return tuple(values)
-        if len(values) == 1:
-            return values[0]
-        return tuple(values)
-
-    def _serialize_values_object_graph(self, values: object) -> bytes:
-        self._validate_identity()
-        normalized = self._normalize_values(values)
-        engine = ObjectEngine.create()
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                scalar_values = {
-                    field['name']: _coerce_scalar_value(
-                        field['kind'],
-                        normalized[table.scalar_positions[field_offset]],
-                    )
-                    for field_offset, field in enumerate(table.scalar_fields)
-                }
-                engine.push(self.scalar_feature_type(**scalar_values))
-                continue
-            if table.value_position is None:
-                raise ValueError(f'table {table.name!r} is missing value position.')
-            value = normalized[table.value_position]
-            if table.kind == 'array':
-                if table.feature_type is None:
-                    raise ValueError(f'array table {table.name!r} is missing runtime feature type.')
-                items = _array_table_values(table, value)
-                if not items:
-                    engine._ensure_layer(table.feature_type)  # noqa: SLF001
-                    continue
-                for item in items:
-                    engine.push(table.feature_type(value=item))
-                continue
-            if table.feature_type is None:
-                raise ValueError(f'feature table {table.name!r} is missing feature type.')
-            if table.cardinality == 'many':
-                rows = _feature_table_rows(table, value)
-                if not rows:
-                    engine._ensure_layer(table.feature_type)  # noqa: SLF001
-                    continue
-                for item in rows:
-                    engine.push(item)
-                continue
-            engine.push(value)
-        engine.combine()
-        return bytes(engine._buffer)  # noqa: SLF001
-
-    def _materialize_values_object_graph(self, engine: ObjectEngine) -> object:
-        self._validate_identity()
-        values: list[Any] = [None] * _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        seen: dict[tuple[type, int], object] = {}
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                row = engine.get(self.scalar_feature_type, 0, mode='copy')
-                for field_offset, field in enumerate(table.scalar_fields):
-                    values[table.scalar_positions[field_offset]] = _materialize_scalar_value(
-                        field['kind'],
-                        getattr(row, field['name']),
-                    )
-                continue
-            if table.feature_type is None:
-                raise ValueError(f'table {table.name!r} is missing feature type.')
-            if table.value_position is None:
-                raise ValueError(f'table {table.name!r} is missing value position.')
-            if table.kind == 'array':
-                item_kind = _array_item_kind(table)
-                values[table.value_position] = [
-                    _materialize_scalar_value(
-                        item_kind,
-                        getattr(row, _ARRAY_VALUE_FIELD),
-                    )
-                    for row in engine.iter(table.feature_type, mode='copy')
-                ]
-                continue
-            if table.cardinality == 'many':
-                values[table.value_position] = [
-                    _copy_object_graph_feature(engine, table.feature_type, index, seen)
-                    for index in range(engine.count(table.feature_type))
-                ]
-            else:
-                values[table.value_position] = _copy_object_graph_feature(
-                    engine,
-                    table.feature_type,
-                    0,
-                    seen,
-                )
-
-        if self.direction == 'input':
-            return tuple(values)
-        if len(values) == 1:
-            return values[0]
-        return tuple(values)
-
-    def _normalize_values(self, values: object) -> tuple[Any, ...]:
-        self._validate_identity()
-        if self.direction == 'input':
-            if not isinstance(values, tuple):
-                raise TypeError('input call-db serialization expects a tuple of parameter values.')
-            expected = _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-            if len(values) != expected:
-                raise ValueError(f'expected {expected} input values, got {len(values)}.')
-            return values
-        expected = _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        if expected == 1:
-            return (values,)
-        if not isinstance(values, tuple):
-            raise TypeError('multi-value output call-db serialization expects a tuple.')
-        if len(values) != expected:
-            raise ValueError(f'expected {expected} output values, got {len(values)}.')
-        return values
-
-
-@dataclass(frozen=True)
-class FastdbCallView:
-    plan: FastdbCallPlan
-    engine: ColumnEngine
-    buffer: memoryview
-    owner: FdbViewOwner
-
-    @property
-    def _fdb_owner(self) -> FdbViewOwner:
-        return self.owner
-
-    def materialize(self) -> object:
-        self._ensure_alive()
-        return self.plan._materialize_values(self.engine)
-
-    def to_owned(self) -> object:
-        return self.materialize()
-
-    def logical_values(self) -> tuple[object, ...]:
-        self._ensure_alive()
-        values: list[Any] = [None] * _value_count(
-            self.plan.tables,
-            scalar_feature_type=self.plan.scalar_feature_type,
-        )
-        for table in self.plan.tables:
-            if table.kind == 'scalars':
-                for field_offset, field in enumerate(table.scalar_fields):
-                    values[table.scalar_positions[field_offset]] = self.scalar(field['name'])
-                continue
-            if table.value_position is None:
-                raise ValueError(f'table {table.name!r} is missing value position.')
-            if table.kind == 'feature':
-                if table.cardinality == 'many':
-                    values[table.value_position] = self.table(table.name)
-                else:
-                    values[table.value_position] = self.feature(table.name)
-                continue
-            if table.kind == 'array':
-                values[table.value_position] = self.array(table.name)
-                continue
-            raise ValueError(f'unsupported call-db table kind {table.kind!r}.')
-        return tuple(values)
-
-    def table(self, name_or_index: str | int) -> 'FastdbCallTableView':
-        self._ensure_alive()
-        table = self._feature_table(name_or_index)
-        return FastdbCallTableView(self, table)
-
-    def feature(self, name_or_index: str | int) -> Any:
-        self._ensure_alive()
-        table_view = self.table(name_or_index)
-        if table_view.spec.cardinality != 'one':
-            raise TypeError(f'feature view {table_view.spec.name!r} has cardinality {table_view.spec.cardinality!r}; use table(...) for batch outputs.')
-        if len(table_view) < 1:
-            raise IndexError(f'feature table {table_view.spec.name!r} is empty.')
-        return table_view[0]
-
-    def array(self, name_or_index: str | int) -> 'FastdbCallArrayView':
-        self._ensure_alive()
-        table = self._array_table(name_or_index)
-        return FastdbCallArrayView(self, table)
-
-    def scalar(self, name_or_index: str | int) -> object:
-        self._ensure_alive()
-        table, field = self._scalar_field(name_or_index)
-        if table.feature_type is None:
-            raise ValueError(f'scalar table {table.name!r} is missing feature type.')
-        rows = self.engine.table(
-            table.feature_type,
-            name=table.name,
-            owner=self.owner,
-            writeable=False,
-        )
-        if len(rows) < 1:
-            raise IndexError(f'scalar table {table.name!r} is empty.')
-        return _materialize_scalar_value(field['kind'], getattr(rows[0], field['name']))
-
-    def _feature_table(self, name_or_index: str | int) -> FastdbCallTableSpec:
-        feature_tables = [table for table in self.plan.tables if table.kind == 'feature']
-        if isinstance(name_or_index, int):
-            return feature_tables[name_or_index]
-        for table in feature_tables:
-            if table.name == name_or_index:
-                return table
-        raise KeyError(f'feature table {name_or_index!r} not found')
-
-    def _array_table(self, name_or_index: str | int) -> FastdbCallTableSpec:
-        array_tables = [table for table in self.plan.tables if table.kind == 'array']
-        if isinstance(name_or_index, int):
-            return array_tables[name_or_index]
-        for table in array_tables:
-            if table.name == name_or_index:
-                return table
-        raise KeyError(f'array table {name_or_index!r} not found')
-
-    def _scalar_field(self, name_or_index: str | int) -> tuple[FastdbCallTableSpec, dict[str, str]]:
-        scalar_fields = [
-            (table, field)
-            for table in self.plan.tables
-            if table.kind == 'scalars'
-            for field in table.scalar_fields
-        ]
-        if isinstance(name_or_index, int):
-            return scalar_fields[name_or_index]
-        for table, field in scalar_fields:
-            if field['name'] == name_or_index:
-                return table, field
-        raise KeyError(f'scalar field {name_or_index!r} not found')
-
-    def _single_logical_view(self) -> object:
-        values = self.logical_values()
-        if len(values) != 1:
-            raise TypeError('direct view access is available only for single-value call-db payloads.')
-        return values[0]
-
-    @property
-    def column(self) -> 'FastdbCallColumnView':
-        value = self._single_logical_view()
-        column = getattr(value, 'column', None)
-        if column is None:
-            raise TypeError('single call-db value does not expose columns.')
-        return column
-
-    def __len__(self) -> int:
-        return len(self._single_logical_view())  # type: ignore[arg-type]
-
-    def __getitem__(self, index: int) -> Any:
-        return self._single_logical_view()[index]  # type: ignore[index]
-
-    def __iter__(self):
-        yield from self._single_logical_view()  # type: ignore[misc]
-
-    def _ensure_alive(self) -> None:
-        self.owner.assert_alive()
-        try:
-            _ = self.buffer.nbytes
-        except ValueError as exc:
-            raise RuntimeError('FastdbCallView buffer has been released.') from exc
-
-
-@dataclass(frozen=True)
-class FastdbCallTableView:
-    call_view: FastdbCallView
-    spec: FastdbCallTableSpec
-
-    @property
-    def _fdb_owner(self) -> FdbViewOwner:
-        return self.call_view.owner
-
-    def materialize(self) -> list[Any]:
-        return _to_owned_fastdb_value(self._table())  # type: ignore[return-value]
-
-    def to_owned(self) -> list[Any]:
-        return self.materialize()
-
-    @property
-    def column(self) -> 'FastdbCallColumnView':
-        return FastdbCallColumnView(self, self._table().column)
-
-    def __len__(self) -> int:
-        return len(self._table())
-
-    def __getitem__(self, index: int) -> Any:
-        return self._table()[index]
-
-    def __iter__(self):
-        table = self._table()
-        for index in range(len(table)):
-            self.call_view._ensure_alive()
-            yield table[index]
-
-    def _table(self) -> Table:
-        self.call_view._ensure_alive()
-        if self.spec.feature_type is None:
-            raise ValueError(f'feature table {self.spec.name!r} is missing feature type.')
-        return self.call_view.engine.table(
-            self.spec.feature_type,
-            name=self.spec.name,
-            owner=self.call_view.owner,
-            writeable=False,
-        )
-
-
-@dataclass(frozen=True)
-class FastdbCallColumnView:
-    table_view: FastdbCallTableView
-    accessor: Any
-
-    @property
-    def _fdb_owner(self) -> FdbViewOwner:
-        return self.table_view.call_view.owner
-
-    def __getattr__(self, name: str) -> Any:
-        self.table_view.call_view._ensure_alive()
-        return getattr(self.accessor, name)
-
-
-@dataclass(frozen=True)
-class FastdbCallArrayView:
-    call_view: FastdbCallView
-    spec: FastdbCallTableSpec
-
-    @property
-    def _fdb_owner(self) -> FdbViewOwner:
-        return self.call_view.owner
-
-    def materialize(self) -> list[Any]:
-        item_kind = _array_item_kind(self.spec)
-        return [
-            _materialize_scalar_value(item_kind, getattr(row, _ARRAY_VALUE_FIELD))
-            for row in self._table()
-        ]
-
-    def to_owned(self) -> list[Any]:
-        return self.materialize()
-
-    def __len__(self) -> int:
-        return len(self._table())
-
-    def __getitem__(self, index: int) -> Any:
-        return _materialize_scalar_value(
-            _array_item_kind(self.spec),
-            getattr(self._table()[index], _ARRAY_VALUE_FIELD),
-        )
-
-    def __iter__(self):
-        table = self._table()
-        item_kind = _array_item_kind(self.spec)
-        for index in range(len(table)):
-            self.call_view._ensure_alive()
-            yield _materialize_scalar_value(
-                item_kind,
-                getattr(table[index], _ARRAY_VALUE_FIELD),
-            )
-
-    def _table(self) -> Table:
-        self.call_view._ensure_alive()
-        if self.spec.feature_type is None:
-            raise ValueError(f'array table {self.spec.name!r} is missing feature type.')
-        return self.call_view.engine.table(
-            self.spec.feature_type,
-            name=self.spec.name,
-            owner=self.call_view.owner,
-            writeable=False,
-        )
+        return view_call_db(self.fastdb_binding, data).logical_value()
 
 
 def plan_call_db_input(
@@ -1003,6 +553,46 @@ def _ensure_object_graph_call_supported(tables: list[FastdbCallTableSpec]) -> No
             claim_layer(dependency_layer_name, f'dependency {dependency_name}', 'dependency')
 
 
+def _fastdb_runtime_table(table: FastdbCallTableSpec) -> FastdbCallDbTable:
+    return FastdbCallDbTable(
+        cardinality=table.cardinality,
+        feature=table.feature_type,
+        feature_schema_sha256=(
+            schema_sha256(table.feature_schema)
+            if table.feature_schema is not None
+            else None
+        ),
+        feature_schema_dependencies=tuple(
+            FastdbCallDbFeatureDependency(
+                feature_schema_sha256=schema_sha256(dependency),
+            )
+            for dependency in table.feature_schema_dependencies
+        ),
+        fields=tuple(
+            FastdbCallDbScalarField(
+                kind=field['kind'],
+                name=field['name'],
+                parameter=field.get('parameter'),
+                value_position=table.scalar_positions[index],
+            )
+            for index, field in enumerate(table.scalar_fields)
+        ),
+        item=(
+            FastdbCallDbArrayItem(
+                kind=table.array_item['kind'],
+                name=table.array_item['name'],
+            )
+            if table.array_item is not None
+            else None
+        ),
+        kind=table.kind,
+        name=table.name,
+        parameter=table.parameter,
+        return_index=table.return_index,
+        value_position=table.value_position,
+    )
+
+
 def _feature_dependency_layer_names(feature_type: type) -> tuple[tuple[str, str], ...]:
     dependencies: dict[str, tuple[str, str]] = {}
     visiting: set[type] = set()
@@ -1035,240 +625,6 @@ def _feature_dependency_layer_names(feature_type: type) -> tuple[tuple[str, str]
     )
 
 
-def _create_empty_feature_table(engine: ColumnEngine, table: FastdbCallTableSpec) -> None:
-    if table.feature_type is None:
-        raise ValueError(f'feature table {table.name!r} is missing feature type.')
-    schema = get_schema(table.feature_type)
-    diagnostics = [
-        *raw_payload_storage_diagnostics(schema),
-        *non_native_list_storage_diagnostics(schema),
-    ]
-    if diagnostics:
-        raise TypeError(
-            f"fastdb call-db cannot create a native table for "
-            f"{table.feature_type.__name__}: {'; '.join(diagnostics)}"
-        )
-    origin = engine._origin
-    mapped = Table.map_from(
-        table.feature_type,
-        _get_default_table_build(
-            origin,
-            table.name,
-            raw_payload=bool(schema.bytes_plan),
-        ),
-        origin,
-    )
-    for field in schema.fields:
-        if field.field_type == OriginFieldType.list:
-            mapped._origin.add_list_field(field.name, field.cpp_type)  # noqa: SLF001
-        else:
-            mapped._origin.add_field(field.name, field.field_type.value)  # noqa: SLF001
-    engine._table_map[table.name] = mapped  # noqa: SLF001
-    engine._table_feature_types[table.name] = table.feature_type  # noqa: SLF001
-
-
-def _array_table_values(table: FastdbCallTableSpec, value: Any) -> list[Any]:
-    if table.feature_type is None:
-        raise ValueError(f'array table {table.name!r} is missing feature type.')
-    if isinstance(value, (str, bytes, bytearray, memoryview, Mapping)) or not isinstance(value, Iterable):
-        raise TypeError(f'{table.name} expected an iterable Array[{_array_item_kind(table)}], got {type(value).__name__}.')
-    item_kind = _array_item_kind(table)
-    return [_coerce_scalar_value(item_kind, item) for item in value]
-
-
-def _feature_table_rows(table: FastdbCallTableSpec, value: Any) -> list[Any]:
-    if table.feature_type is None:
-        raise ValueError(f'feature table {table.name!r} is missing feature type.')
-    records = _table_like_records(value)
-    source = records if records is not None else value
-    if isinstance(source, (str, bytes, bytearray, memoryview, Mapping)) or not isinstance(source, Iterable):
-        raise TypeError(f'{table.name} expected an iterable Batch[{table.feature_type.__name__}], got {type(value).__name__}.')
-    return [_coerce_feature_row(table.feature_type, row) for row in source]
-
-
-def _coerce_feature_row(feature_type: type, row: Any) -> Any:
-    if isinstance(row, feature_type):
-        return row
-    values: dict[str, Any] = {}
-    for field in get_schema(feature_type).fields:
-        if isinstance(row, Mapping):
-            if field.name not in row:
-                raise KeyError(f'missing field {field.name!r} for fastdb feature {feature_type.__name__}.')
-            value = row[field.name]
-            kind = _FIELD_SCALAR_KIND_BY_FIELD_TYPE.get(field.field_type)
-            values[field.name] = _coerce_scalar_value(kind, value) if kind is not None else value
-            continue
-        if not hasattr(row, field.name):
-            raise KeyError(f'missing field {field.name!r} for fastdb feature {feature_type.__name__}.')
-        value = getattr(row, field.name)
-        kind = _FIELD_SCALAR_KIND_BY_FIELD_TYPE.get(field.field_type)
-        values[field.name] = _coerce_scalar_value(kind, value) if kind is not None else value
-    return feature_type(**values)
-
-
-def _table_like_records(value: Any) -> Iterable[Any] | None:
-    if isinstance(value, (str, bytes, bytearray, memoryview, Mapping)):
-        return None
-    to_pylist = getattr(value, 'to_pylist', None)
-    if callable(to_pylist):
-        return to_pylist()
-    to_dicts = getattr(value, 'to_dicts', None)
-    if callable(to_dicts):
-        return to_dicts()
-    to_dict = getattr(value, 'to_dict', None)
-    if not callable(to_dict):
-        return None
-    try:
-        return to_dict('records')
-    except TypeError:
-        try:
-            return to_dict(orient='records')
-        except TypeError:
-            return None
-
-
-def _column_engine_from_buffer(data: bytes | bytearray | memoryview) -> ColumnEngine:
-    engine = ColumnEngine()
-    engine._origin = core.WxDatabase.load_xbuffer(data)  # noqa: SLF001
-    engine._origin._buffer = data  # noqa: SLF001
-    return engine
-
-
-def _object_engine_from_buffer(
-    data: bytes | bytearray | memoryview,
-    tables: tuple[FastdbCallTableSpec, ...] = (),
-) -> ObjectEngine:
-    engine = ObjectEngine()
-    engine._db = core.WxDatabase.load_xbuffer(data)  # noqa: SLF001
-    engine._db._buffer = data  # noqa: SLF001
-    engine._buffer = data  # noqa: SLF001
-    engine._built = True  # noqa: SLF001
-
-    for index in range(engine._db.get_layer_count()):  # noqa: SLF001
-        layer = engine._db.get_layer(index)  # noqa: SLF001
-        registered_cls = lookup_class(layer.name())
-        if registered_cls is None:
-            continue
-        schema = get_schema(registered_cls)
-        state = LayerState(
-            cls=registered_cls,
-            schema=schema,
-            layer_idx=index,
-            row_count=layer.get_feature_count(),
-        )
-        engine._layers[registered_cls] = state  # noqa: SLF001
-        engine._layer_order.append(registered_cls)  # noqa: SLF001
-    _bind_call_plan_layers(engine, tables)
-    return engine
-
-
-def _bind_call_plan_layers(
-    engine: ObjectEngine,
-    tables: tuple[FastdbCallTableSpec, ...],
-) -> None:
-    if not tables:
-        return
-    layer_indices = {
-        engine._db.get_layer(index).name(): index  # noqa: SLF001
-        for index in range(engine._db.get_layer_count())  # noqa: SLF001
-    }
-    for table in tables:
-        if table.feature_type is None:
-            continue
-        schema = get_schema(table.feature_type)
-        layer_idx = layer_indices.get(schema.layer_name)
-        if layer_idx is None:
-            continue
-        layer = engine._db.get_layer(layer_idx)  # noqa: SLF001
-        engine._layers[table.feature_type] = LayerState(  # noqa: SLF001
-            cls=table.feature_type,
-            schema=schema,
-            layer_idx=layer_idx,
-            row_count=layer.get_feature_count(),
-        )
-        if table.feature_type not in engine._layer_order:  # noqa: SLF001
-            engine._layer_order.append(table.feature_type)  # noqa: SLF001
-
-
-def _copy_object_graph_feature(
-    engine: ObjectEngine,
-    feature_type: type,
-    row_idx: int,
-    seen: dict[tuple[type, int], object],
-) -> object:
-    key = (feature_type, row_idx)
-    existing = seen.get(key)
-    if existing is not None:
-        return existing
-
-    state = engine._layers[feature_type]  # noqa: SLF001
-    layer = engine._db.get_layer(state.layer_idx)  # noqa: SLF001
-    feature_value = layer.tryGetFeature(row_idx)
-    schema = get_schema(feature_type)
-    obj = feature_type.__new__(feature_type)
-    seen[key] = obj
-
-    from fastdb4py.reader import _read_field
-
-    for field in schema.fields:
-        if field.field_type == OriginFieldType.ref:
-            ref = feature_value.get_field_as_ref(field.field_id)
-            target_type = _target_type_from_ref(engine, ref, field.ref_target)
-            if target_type is None:
-                value = None
-            else:
-                value = _copy_object_graph_feature(
-                    engine,
-                    target_type,
-                    _decode_ref_row(ref),
-                    seen,
-                )
-        elif field.field_type == OriginFieldType.list and field.list_elem_type == OriginFieldType.ref:
-            target_type = field.list_ref_target
-            value = []
-            for index in range(feature_value.get_field_list_size(field.field_id)):
-                ref = feature_value.get_field_list_ref_at(field.field_id, index)
-                item_type = _target_type_from_ref(engine, ref, target_type)
-                if item_type is None:
-                    value.append(None)
-                else:
-                    value.append(
-                        _copy_object_graph_feature(
-                            engine,
-                            item_type,
-                            _decode_ref_row(ref),
-                            seen,
-                        ),
-                    )
-        else:
-            value = _read_field(feature_value, field)
-        obj.__dict__[field.name] = value
-    return obj
-
-
-def _target_type_from_ref(
-    engine: ObjectEngine,
-    ref: object,
-    declared_target: type | None,
-) -> type | None:
-    if ref is None:
-        return None
-    layer_idx = getattr(ref, 'ilayer', None)
-    if layer_idx is None:
-        return None
-    if declared_target is not None:
-        return declared_target
-    if 0 <= layer_idx < len(engine._layer_order):  # noqa: SLF001
-        return engine._layer_order[layer_idx]  # noqa: SLF001
-    return None
-
-
-def _decode_ref_row(ref: object) -> int:
-    low = int(getattr(ref, 'ifeature', 0))
-    high = int(getattr(ref, 'ifeatureH', 0))
-    return low | (high << 8)
-
-
 def _scalar_kind(annotation: object) -> str | None:
     if annotation is BOOL:
         return 'bool'
@@ -1293,32 +649,6 @@ def _runtime_scalar_annotation(annotation: object) -> object:
     if field_type == OriginFieldType.bytes:
         return BYTES
     return annotation
-
-
-def _materialize_scalar_value(kind: str, value: object) -> object:
-    if kind == 'bool':
-        return coerce_bool_scalar(value)
-    return value
-
-
-def _coerce_scalar_value(kind: str, value: object) -> object:
-    if kind == 'bool':
-        return coerce_bool_scalar(value)
-    if kind in {'u8', 'u16', 'u32', 'i32', 'u8n', 'u16n'}:
-        return int(value)
-    if kind in {'f32', 'f64'}:
-        return float(value)
-    if kind in {'str', 'wstr'}:
-        return str(value)
-    if kind == 'bytes':
-        return bytes(value)
-    return value
-
-
-def _array_item_kind(table: FastdbCallTableSpec) -> str:
-    if table.array_item is None:
-        raise ValueError(f'array table {table.name!r} is missing item schema.')
-    return table.array_item['kind']
 
 
 def _is_python_builtin_scalar(annotation: object) -> bool:

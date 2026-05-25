@@ -4789,7 +4789,7 @@ def test_fastdb_derived_bridge_maps_batch_input_to_variadic_tuple_shapes_across_
             Point(x=3.5, y=4.5, label=label_b),
         ]
 
-    def expected_seen(label_a, label_b):
+    def expected_seen(label_a, label_b, *, remote: bool = False):
         if resource_shape == 'tuple_row':
             payload = [(1.5, 2.5, label_a), (3.5, 4.5, label_b)]
         elif resource_shape == 'mapping':
@@ -4798,9 +4798,10 @@ def test_fastdb_derived_bridge_maps_batch_input_to_variadic_tuple_shapes_across_
                 {'x': 3.5, 'y': 4.5, 'label': label_b},
             ]
         elif resource_shape == 'feature':
+            point_type_name = 'RpcPointFastdbView' if remote else 'RpcPoint'
             payload = [
-                ('RpcPoint', 1.5, 2.5, label_a),
-                ('RpcPoint', 3.5, 4.5, label_b),
+                (point_type_name, 1.5, 2.5, label_a),
+                (point_type_name, 3.5, 4.5, label_b),
             ]
         else:
             payload = [
@@ -4843,8 +4844,8 @@ def test_fastdb_derived_bridge_maps_batch_input_to_variadic_tuple_shapes_across_
 
     assert resource.seen == [
         expected_seen('thread-a', 'thread-b'),
-        expected_seen('ipc-a', 'ipc-b'),
-        expected_seen('relay-a', 'relay-b'),
+        expected_seen('ipc-a', 'ipc-b', remote=True),
+        expected_seen('relay-a', 'relay-b', remote=True),
     ]
 
 
@@ -5110,16 +5111,17 @@ def test_fastdb_derived_bridge_maps_batch_input_to_feature_list_resource_across_
     finally:
         cc.close(relay_crm)
 
-    def expected_seen(label_a: str, label_b: str):
+    def expected_seen(label_a: str, label_b: str, *, remote: bool = False):
+        point_type_name = 'RpcPointFastdbView' if remote else 'RpcPoint'
         return [
-            ('RpcPoint', 1.5, 2.5, label_a),
-            ('RpcPoint', 3.5, 4.5, label_b),
+            (point_type_name, 1.5, 2.5, label_a),
+            (point_type_name, 3.5, 4.5, label_b),
         ]
 
     assert resource.seen == [
         expected_seen('thread-a', 'thread-b'),
-        expected_seen('ipc-a', 'ipc-b'),
-        expected_seen('relay-a', 'relay-b'),
+        expected_seen('ipc-a', 'ipc-b', remote=True),
+        expected_seen('relay-a', 'relay-b', remote=True),
     ]
     assert Point.__name__ == 'RpcPoint'
 

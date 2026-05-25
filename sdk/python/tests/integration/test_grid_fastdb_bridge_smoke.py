@@ -1358,7 +1358,7 @@ def test_grid_fastdb_input_uses_view_mode_without_resource_input_hold(monkeypatc
         cc.close(grid)
 
 
-def test_fastdb_input_defaults_to_materialized_python_values(monkeypatch):
+def test_fastdb_input_defaults_to_owned_fastdb_values(monkeypatch):
     pytest.importorskip('fastdb4py', reason='fastdb input lifetime tests require fastdb4py')
 
     @cc.crm(namespace='demo.fastdb.input_lifetime', version='0.1.0')
@@ -1382,8 +1382,10 @@ def test_fastdb_input_defaults_to_materialized_python_values(monkeypatch):
     client = cc.connect(IntArraySum, name='fastdb-materialized-input', address=address)
     try:
         assert client.total([1, 2, 3]) == 6
-        assert resource.values == [1, 2, 3]
-        assert type(resource.values) is list
+        assert isinstance(resource.values, fdb.FastdbCallDbArrayView)
+        assert list(resource.values) == [1, 2, 3]
+        stats = cc.hold_stats()
+        assert stats['by_direction']['resource_input']['active_holds'] == 0
     finally:
         cc.close(client)
 
@@ -1402,7 +1404,7 @@ def test_fastdb_input_lifetime_borrowed_passes_view_then_releases(monkeypatch):
 
         def total(self, values: fdb.Array[fdb.I32]) -> fdb.I32:
             self.values = values
-            assert type(values).__name__ == 'FastdbCallArrayView'
+            assert isinstance(values, fdb.FastdbCallDbArrayView)
             return sum(values)
 
     resource = IntArraySumResource()
@@ -1597,6 +1599,32 @@ def test_borrowed_input_lifetime_rejects_extra_resource_parameter(monkeypatch):
             name='fastdb-borrowed-extra-resource-parameter',
             input_lifetime={'total': cc.InputLifetime.BORROWED},
         )
+
+
+def test_grid_fastdb_normal_output_returns_owned_view_for_direct_ipc(monkeypatch):
+    GridFastdb, _GridId, NestedGrid, grid_fastdb_bridge = _load_fastdb_grid(monkeypatch)
+    cc.register(
+        GridFastdb,
+        _make_grid_resource(NestedGrid),
+        name='grid-fastdb-normal-owned-view',
+        bridge=grid_fastdb_bridge(),
+    )
+    address = cc.server_address()
+    assert address is not None
+
+    grid = cc.connect(GridFastdb, name='grid-fastdb-normal-owned-view', address=address)
+    try:
+        view = grid.get_active_grid_infos()
+        assert isinstance(view, fdb.Table)
+        row = view[0]
+        level_column = view.column.level
+        assert row.level == 1
+        assert row.global_id == 0
+        assert level_column[0] == 1
+        stats = cc.hold_stats()
+        assert stats['by_direction']['client_response']['active_holds'] == 0
+    finally:
+        cc.close(grid)
 
 
 def test_grid_fastdb_hold_returns_retained_view_for_direct_ipc(monkeypatch):

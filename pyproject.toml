@@ -43,6 +43,7 @@ cache-keys = [
 
 [tool.uv.sources]
 c-two = { workspace = true }
+fastdb4py = { path = "../fastdb", editable = true }
 
 [tool.uv.workspace]
 members = ["sdk/python"]
