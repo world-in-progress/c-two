@@ -29,6 +29,7 @@ use c2_server::{
 
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 use crate::shm_buffer::PyShmBuffer;
+use crate::writable_sink::{prepared_plan_nbytes, write_python_payload_plan};
 
 pub(crate) fn parse_concurrency_mode(mode: &str) -> PyResult<ConcurrencyMode> {
     match mode {
@@ -424,6 +425,27 @@ fn parse_response_meta(
     // None → Empty
     if result.is_none() {
         return Ok(ResponseMeta::Empty);
+    }
+
+    // Prepared write plan → native response selection with direct destination fill.
+    if let Some(len) = prepared_plan_nbytes(result)
+        .map_err(|e| resource_output_error(format!("prepared response size failed: {e}")))?
+    {
+        if len == 0 {
+            return Ok(ResponseMeta::Empty);
+        }
+        ensure_response_len_within_limit(len, max_payload_size)?;
+        if let Some(meta) = try_prepare_shm_response(response_pool, shm_threshold, len, |dst| {
+            write_python_payload_plan(py, result, dst).map_err(|e| e.to_string())
+        })
+        .map_err(resource_output_error)?
+        {
+            return Ok(meta);
+        }
+        let mut data = allocate_response_vec(len)?;
+        write_python_payload_plan(py, result, &mut data)
+            .map_err(|e| resource_output_error(format!("failed to write prepared response: {e}")))?;
+        return Ok(ResponseMeta::Inline(data));
     }
 
     // bytes → direct SHM preparation for large payloads, otherwise owned data.

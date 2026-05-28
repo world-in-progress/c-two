@@ -28,6 +28,8 @@ mod server_ffi;
 pub(crate) mod shm_buffer;
 #[cfg(feature = "python")]
 mod wire_ffi;
+#[cfg(feature = "python")]
+mod writable_sink;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;

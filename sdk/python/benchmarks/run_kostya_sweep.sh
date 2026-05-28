@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full Kostya-style sweep for c-two (pickle fallback / FastDB normal / FastDB hold).
+# Full Kostya-style sweep for c-two (pickle fallback / FastDB normal / FastDB require / hold).
 # Run after activating the c-two uv env.
 set -euo pipefail
 
@@ -20,7 +20,7 @@ for entry in "1000:1K:30" "10000:10K:30" "100000:100K:20" "1000000:1M:10" "30000
   LBL="${rest%%:*}"
   ITERS="${rest##*:}"
 
-  for V in pickle-records pickle-arrays fastdb-normal fastdb-hold fastdb-hold-unsafe; do
+  for V in pickle-records pickle-arrays fastdb-normal fastdb-hold fastdb-hold-unsafe fastdb-require-normal fastdb-require-hold fastdb-require-hold-unsafe; do
     # Skip pickle-records at 3M — multi-second territory, dominated by Python loop.
     if [[ "$V" == "pickle-records" && "$N" -gt 1000000 ]]; then
       printf '%-8s  %-16s  %-7s  %-7s  %-7s  %-7s\n' "$LBL" "$V" SKIP SKIP SKIP SKIP >> "$OUT"

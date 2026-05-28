@@ -1,15 +1,18 @@
 """Kostya-style coordinate benchmark — C-Two IPC variants.
 
-Compares Python pickle fallback with the current FastDB-first CRM ABI and
-client-side ``cc.hold(...)`` model for transporting coordinate records:
+Compares Python pickle fallback with the current FastDB-first CRM ABI,
+prepared call-db SHM writing, and client-side ``cc.hold(...)`` model for
+transporting coordinate records:
 ``row_id, x, y, z, name``.
 
 Strategies:
   * pickle-records       : list[dict] over Python pickle
   * pickle-arrays        : numpy arrays + string list over Python pickle
-  * fastdb-normal        : fdb.Batch[Coord] normal call, owned-buffer safe columns
-  * fastdb-hold          : fdb.Batch[Coord] held response, safe owner-checked columns
-  * fastdb-hold-unsafe   : fdb.Batch[Coord] held response, explicit unsafe numpy views
+  * fastdb-normal        : prepared fdb.Batch[Coord] call, owned-buffer safe columns
+  * fastdb-hold          : prepared fdb.Batch[Coord] held response, safe owner-checked columns
+  * fastdb-hold-unsafe   : prepared fdb.Batch[Coord] held response, explicit unsafe numpy views
+  * fastdb-require-*     : same FastDB CRM, but resource payload is allocated
+                           through fdb.require(fdb.batch(...))
 
 Run:
     C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/kostya_ctwo_benchmark.py \
@@ -110,18 +113,30 @@ def _make_coord_arrays(n: int) -> CoordArrays:
     )
 
 
-def _make_coord_table(n: int) -> fdb.Table[Coord]:
+def _make_coord_batch(n: int) -> fdb.Batch[Coord]:
     idx = _coord_index(n)
-    engine = fdb.ColumnEngine.truncate([fdb.Layout(Coord, n, name='return_0')])
-    table = engine.table(Coord, name='return_0')
-    table.fill(
+    batch = fdb.Batch.allocate(Coord, n)
+    batch.fill(
         row_id=idx,
         x=idx.astype(np.float64) * 0.1,
         y=idx.astype(np.float64) * 0.2,
         z=idx.astype(np.float64) * 0.3,
         name=_coord_names(n),
     )
-    return table
+    return batch
+
+
+def _make_coord_require_batch(n: int) -> fdb.Batch[Coord]:
+    idx = _coord_index(n)
+    batch = fdb.require(fdb.batch(Coord, rows=n))
+    batch.fill(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
+        name=_coord_names(n),
+    )
+    return batch
 
 
 class CoordRecordsCRM:
@@ -151,7 +166,15 @@ class CoordArraysCRM:
 
 class CoordFastdbCRM:
     def __init__(self, n: int):
-        self._payload = _make_coord_table(n)
+        self._payload = _make_coord_batch(n)
+
+    def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
+        return self._payload
+
+
+class CoordFastdbRequireCRM:
+    def __init__(self, n: int):
+        self._payload = _make_coord_require_batch(n)
 
     def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
         return self._payload
@@ -168,8 +191,8 @@ def consume_arrays(payload: CoordArrays) -> float:
     return float(payload.x.sum() + payload.y.sum() + payload.z.sum())
 
 
-def consume_fastdb_safe(table: fdb.Table[Coord]) -> float:
-    column = table.column
+def consume_fastdb_safe(batch: fdb.Batch[Coord]) -> float:
+    column = batch.column
     return float(
         np.asarray(column.x).sum()
         + np.asarray(column.y).sum()
@@ -177,8 +200,8 @@ def consume_fastdb_safe(table: fdb.Table[Coord]) -> float:
     )
 
 
-def consume_fastdb_unsafe(table: fdb.Table[Coord]) -> float:
-    column = table.column
+def consume_fastdb_unsafe(batch: fdb.Batch[Coord]) -> float:
+    column = batch.column
     return float(
         column.x.unsafe_numpy_view().sum()
         + column.y.unsafe_numpy_view().sum()
@@ -238,6 +261,24 @@ VARIANTS: dict[str, VariantSpec] = {
     'fastdb-hold-unsafe': VariantSpec(
         contract=ICoordFastdb,
         resource_factory=CoordFastdbCRM,
+        consumer=consume_fastdb_unsafe,
+        use_hold=True,
+    ),
+    'fastdb-require-normal': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=False,
+    ),
+    'fastdb-require-hold': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=True,
+    ),
+    'fastdb-require-hold-unsafe': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbRequireCRM,
         consumer=consume_fastdb_unsafe,
         use_hold=True,
     ),

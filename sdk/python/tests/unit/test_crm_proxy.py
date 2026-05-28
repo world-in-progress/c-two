@@ -36,6 +36,20 @@ class _MockClient:
         return b'result'
 
 
+class _PreparedMockClient(_MockClient):
+    def call_prepared(self, method_name: str, plan) -> bytes:
+        self.calls.append(('prepared', method_name, plan))
+        return b'prepared-result'
+
+
+class _PreparedPlan:
+    def __init__(self, payload: bytes = b'prepared-payload'):
+        self.payload = payload
+
+    def to_bytes(self) -> bytes:
+        return self.payload
+
+
 # ---------------------------------------------------------------------------
 # Thread-local proxy
 # ---------------------------------------------------------------------------
@@ -117,6 +131,25 @@ class TestIPCProxy:
         proxy = CRMProxy.ipc(client, 'ns')
         proxy.call('method')
         assert client.calls == [('method', b'')]
+
+    def test_call_prepared_delegates_when_native_client_supports_it(self):
+        client = _PreparedMockClient()
+        proxy = CRMProxy.ipc(client, 'ns')
+        plan = _PreparedPlan()
+
+        result = proxy.call_prepared('method', plan)
+
+        assert result == b'prepared-result'
+        assert client.calls == [('prepared', 'method', plan)]
+
+    def test_call_prepared_materializes_for_clients_without_prepared_path(self):
+        client = _MockClient()
+        proxy = CRMProxy.ipc(client, 'ns')
+
+        result = proxy.call_prepared('method', _PreparedPlan())
+
+        assert result == b'result'
+        assert client.calls == [('method', b'prepared-payload')]
 
     def test_raw_relay_entrypoint_is_not_available_on_route_bound_proxy(self):
         client = _MockClient()

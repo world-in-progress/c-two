@@ -433,6 +433,20 @@ def test_native_server_response_parser_does_not_accept_shm_coordinate_tuples():
     assert offenders == []
 
 
+def test_prepared_payload_detection_requires_write_into_before_nbytes():
+    root = Path(__file__).resolve().parents[4]
+    sink_source = (
+        root / "sdk" / "python" / "native" / "src" / "writable_sink.rs"
+    ).read_text(encoding="utf-8")
+    start = sink_source.index("pub(crate) fn prepared_plan_nbytes")
+    end = sink_source.index("pub(crate) fn write_python_payload_plan", start)
+    helper_source = sink_source[start:end]
+
+    assert 'plan.getattr("write_into")' in helper_source
+    assert "value.is_callable()" in helper_source
+    assert helper_source.index('plan.getattr("write_into")') < helper_source.index('plan.getattr("nbytes")')
+
+
 def test_python_ipc_config_facade_does_not_validate_override_keys():
     root = Path(__file__).resolve().parents[2] / "src" / "c_two"
     ipc_source = (root / "config" / "ipc.py").read_text(encoding="utf-8")

@@ -13,6 +13,10 @@ def test_rust_server_exposes_native_readiness_api():
     assert hasattr(_native.RustServer, "is_running")
 
 
+def test_rust_client_exposes_prepared_payload_call_api():
+    assert hasattr(_native.RustClient, "call_prepared")
+
+
 def test_start_and_wait_rejects_invalid_timeout(monkeypatch):
     # Construct through the public Python Server wrapper in implementation tests;
     # this low-level test only locks API validation shape after PyO3 exposes it.

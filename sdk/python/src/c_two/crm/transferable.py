@@ -197,6 +197,11 @@ def _build_transfer_wrapper(
             if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
             else None
         )
+        input_prepare_writer = (
+            input.prepare_write
+            if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
+            else None
+        )
         if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD:
             if _c2_buffer == 'hold' and output.view_from_buffer is not None:
                 output_fn = output.view_from_buffer
@@ -228,10 +233,22 @@ def _build_transfer_wrapper(
 
             # Standard cross-process path
             stage = 'serialize_input'
-            serialized_args = input_serializer(*request) if (request is not None and input_serializer is not None) else None
+            prepared_args = (
+                input_prepare_writer(*request)
+                if (
+                    request is not None
+                    and input_prepare_writer is not None
+                    and callable(getattr(client, 'call_prepared', None))
+                )
+                else None
+            )
 
             stage = 'call_crm'
-            response = client.call(method_name, serialized_args)
+            if prepared_args is not None:
+                response = client.call_prepared(method_name, prepared_args)
+            else:
+                serialized_args = input_serializer(*request) if (request is not None and input_serializer is not None) else None
+                response = client.call(method_name, serialized_args)
 
             stage = 'deserialize_output'
             if not output_fn:
@@ -351,6 +368,11 @@ def _build_transfer_wrapper(
             if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
             else None
         )
+        output_prepare_writer = (
+            output.prepare_write
+            if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
+            else None
+        )
 
         err = None
         result = None
@@ -421,12 +443,18 @@ def _build_transfer_wrapper(
                 err = error.ResourceSerializeOutput(str(e))
 
         serialized_result = b''
-        if err is None and output_serializer is not None and result is not None:
+        if err is None and result is not None and (output_prepare_writer is not None or output_serializer is not None):
             try:
-                serialized_result = (
-                    output_serializer(*result) if isinstance(result, tuple)
-                    else output_serializer(result)
-                )
+                if output_prepare_writer is not None:
+                    serialized_result = (
+                        output_prepare_writer(*result) if isinstance(result, tuple)
+                        else output_prepare_writer(result)
+                    )
+                else:
+                    serialized_result = (
+                        output_serializer(*result) if isinstance(result, tuple)
+                        else output_serializer(result)
+                    )
             except Exception as e:
                 err = error.ResourceSerializeOutput(str(e))
                 serialized_result = b''

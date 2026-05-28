@@ -25,6 +25,7 @@ class PayloadBinding:
     kind: PayloadPlanKind
     serialize: Callable[..., SerializedPayload] | None = None
     deserialize: Callable[[bytes | bytearray | memoryview | None], object] | None = None
+    prepare_write: Callable[..., object | None] | None = None
     payload_abi_ref: PayloadAbiRef | dict[str, Any] | None = None
     payload_abi_artifacts: Iterable[dict[str, Any]] = ()
     view_from_buffer: Callable[[memoryview], object] | None = None
@@ -48,7 +49,11 @@ class PayloadBinding:
         object.__setattr__(self, 'payload_abi_artifacts', artifacts)
 
         if kind is PayloadPlanKind.NO_PAYLOAD:
-            if self.serialize is not None or self.deserialize is not None:
+            if (
+                self.serialize is not None
+                or self.deserialize is not None
+                or self.prepare_write is not None
+            ):
                 raise ValueError('NO_PAYLOAD bindings cannot define payload encode/decode hooks.')
             if self.payload_abi_ref is not None:
                 raise ValueError('NO_PAYLOAD bindings cannot carry a PayloadAbiRef.')

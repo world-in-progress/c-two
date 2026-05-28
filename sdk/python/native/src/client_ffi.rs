@@ -17,6 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::lease_ffi::PyBufferLeaseTracker;
+use crate::writable_sink::{prepared_plan_nbytes, write_python_payload_plan};
 use c2_config::{BaseIpcConfig, ClientIpcConfig};
 use c2_ipc::{ClientPool, IpcError, ResponseData, ServerPoolState, SyncClient};
 use c2_mem::{BufferLeaseGuard, MemPool};
@@ -531,6 +532,72 @@ impl PyRustClient {
             ));
         };
         call_sync_client(py, &self.inner, bound_route_name, method_name, data)
+    }
+
+    /// Call a CRM method with a prepared payload write plan.
+    fn call_prepared<'py>(
+        &self,
+        py: Python<'py>,
+        method_name: &str,
+        plan: &Bound<'py, PyAny>,
+    ) -> PyResult<PyResponseBuffer> {
+        let Some(bound_route_name) = self.bound_route_name.as_ref() else {
+            return Err(PyRuntimeError::new_err(
+                "RustClient CRM calls require a route-bound client from RuntimeSession.acquire_ipc_client()",
+            ));
+        };
+        let data_size = prepared_plan_nbytes(plan)?.ok_or_else(|| {
+            PyValueError::new_err("prepared payload plan must expose nbytes or byte_length")
+        })?;
+        if data_size > u32::MAX as usize {
+            return Err(PyValueError::new_err(format!(
+                "prepared request payload size {data_size} exceeds buddy wire limit {}",
+                u32::MAX
+            )));
+        }
+        if !self.inner.should_use_shm(data_size) {
+            let payload = plan.call_method0("to_bytes")?;
+            let bytes = payload.cast::<PyBytes>()?;
+            return call_sync_client(
+                py,
+                &self.inner,
+                bound_route_name,
+                method_name,
+                bytes.as_bytes(),
+            );
+        }
+
+        let alloc = self
+            .inner
+            .pool_alloc_and_fill(data_size, |destination| {
+                write_python_payload_plan(py, plan, destination).map_err(|err| {
+                    format!("{}", err.value(py))
+                })
+            })
+            .map_err(|err| PyRuntimeError::new_err(format!("{err}")))?;
+
+        let client = Arc::clone(&self.inner);
+        let route = bound_route_name.to_string();
+        let method = method_name.to_string();
+        let result = py.detach(move || client.call_prealloc(&route, &method, &alloc, data_size));
+        match result {
+            Ok(response_data) => {
+                let pool = self.inner.server_pool_arc();
+                let reassembly = self.inner.reassembly_pool_arc();
+                Ok(PyResponseBuffer::from_response_data(
+                    response_data,
+                    pool,
+                    reassembly,
+                ))
+            }
+            Err(IpcError::CrmError(err_bytes)) => {
+                let exc = PyErr::new::<CrmCallError, _>("CRM method error");
+                exc.value(py)
+                    .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
+                Err(exc)
+            }
+            Err(err) => Err(PyRuntimeError::new_err(format!("{err}"))),
+        }
     }
 
     /// Whether the client is connected.

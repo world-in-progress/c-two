@@ -1615,7 +1615,8 @@ def test_grid_fastdb_normal_output_returns_owned_view_for_direct_ipc(monkeypatch
     grid = cc.connect(GridFastdb, name='grid-fastdb-normal-owned-view', address=address)
     try:
         view = grid.get_active_grid_infos()
-        assert isinstance(view, fdb.Table)
+        assert isinstance(view, fdb.Batch)
+        assert not isinstance(view, fdb.Table)
         row = view[0]
         level_column = view.column.level
         assert row.level == 1

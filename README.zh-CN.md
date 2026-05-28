@@ -36,21 +36,23 @@
 
 ## 性能
 
-端到端跨进程 IPC 基准测试 — 相同的 NumPy 载荷（`row_id u32` + `x,y,z f64`），相同机器，相同聚合运算。三种传输模式对比：
+端到端跨进程 IPC 基准测试，Kostya-style 坐标 schema：`row_id u32`、`x/y/z f64`、`name STR`。每次调用从远端进程返回缓存坐标表，客户端计算 `sum(x + y + z)`。
 
-| 行数 | C-Two hold (ms) | Ray (ms) | C-Two pickle (ms) | **Hold vs Ray** |
-|-----:|---:|---:|---:|---:|
-| 1 K | **0.07** | 6.1 | 0.19 | **86×** |
-| 10 K | **0.09** | 7.1 | 0.82 | **79×** |
-| 100 K | **0.38** | 9.8 | 8.7 | **26×** |
-| 1 M | **3.7** | 58 | 150 | **15×** |
-| 3 M | **9.7** | 129 | 598 | **13×** |
+| 行数 | C-Two FDB normal (ms) | C-Two FDB require normal (ms) | C-Two FDB hold (ms) | C-Two FDB require hold (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Require hold vs Ray arrays** |
+|-----:|---:|---:|---:|---:|---:|---:|---:|
+| 1 K | 1.28 | 1.33 | 1.30 | **1.12** | 6.51 | 0.57 | **5.8×** |
+| 10 K | 1.83 | 1.27 | 1.52 | **1.26** | 7.42 | 1.24 | **5.9×** |
+| 100 K | 5.10 | 2.64 | 4.91 | **1.91** | 8.22 | 9.69 | **4.3×** |
+| 1 M | 36.39 | 12.29 | 29.85 | **8.36** | 48.59 | 130.65 | **5.8×** |
+| 3 M | 147.89 | 39.08 | 93.80 | **23.29** | 164.32 | 529.47 | **7.1×** |
 
-- **C-Two hold** — SHM 零拷贝，通过 `np.frombuffer` 读取；读端无序列化
-- **Ray** — 对象存储，内置 numpy 零拷贝支持（Ray 2.55）
-- **C-Two pickle** — 标准 pickle 经由 SHM 传输；展示序列化开销
+- **C-Two FDB normal / hold** — 普通 `fdb.Batch.allocate(...)` 资源实现；不会获得通用 wire-layer rewrite 快路，用来展示未显式进入 call envelope 时的 repack 成本。
+- **C-Two FDB require normal** — 资源实现使用 `fdb.require(fdb.batch(...))`；3M 行 normal-call p50 从 147.89 ms 降到 39.08 ms。
+- **C-Two FDB require hold** — 组合 `fdb.require(...)` 和 `cc.hold()`，保留 IPC 响应缓冲区并直接映射 FastDB view，是当前推荐的安全高性能路径。
+- **Ray arrays** — Ray object store 传输 NumPy 列和 `name` 字符串列表。
+- **Pickle arrays** — Python-only fallback baseline，用于展示普通 Python 序列化成本。
 
-> Apple M1 Max · Python 3.13 · NumPy 2.4 · 完整方法见 [`sdk/python/benchmarks/unified_numpy_benchmark.py`](sdk/python/benchmarks/unified_numpy_benchmark.py)。
+> Apple M1 Max · measured May 27, 2026 · C-Two: Python 3.14.3 + NumPy 2.4.4 · Ray: Python 3.12 + NumPy 2.4.6 + Ray 2.55.1 · 完整方法见 [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py)、[`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py) 和 [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh)。
 
 ---
 
@@ -226,92 +228,65 @@ mesh = cc.connect(MeshStore, name='mesh')
 
 > **何时需要中继？** 仅用于跨机器或按路由名与 CRM 契约发现的场景。同进程和同主机（IPC）用法完全不需要中继。
 
-### @transferable — 自定义序列化
+### FastDB-first payload
 
-对于需要跨进程传输的自定义数据类型，使用 `@cc.transferable`。未使用此装饰器时，默认使用 pickle。
-
-一个 transferable 类最多可定义三个静态方法（以普通方法风格编写，无需添加 `@staticmethod` — 框架会自动转换）：
-
-| 方法 | 必需 | 用途 |
-|------|------|------|
-| `serialize(data) → bytes` | ✅ 是 | 将数据编码为字节用于传输（出站） |
-| `deserialize(raw) → T` | ✅ 是 | 将字节解码为拥有所有权的 Python 对象（入站） |
-| `from_buffer(buf) → T` | ❌ 可选 | 在原始缓冲区上构建零拷贝视图（入站，持有模式） |
+Portable CRM payload 使用 `fastdb4py` 声明。CRM 签名保持逻辑类型：`fdb.I32`、`fdb.Array[...]`、`fdb.Batch[...]` 和 `@fdb.feature` 会规划成 FastDB call-db ABI；未标记的 Python 类型仍可在 Python-only prototype 路径中走 pickle，但 strict portable export/codegen 会拒绝它。
 
 ```python
-import numpy as np
+import fastdb4py as fdb
 
-@cc.transferable
-class Matrix:
-    rows: int
-    cols: int
-    data: np.ndarray
+@fdb.feature
+class Point:
+    row_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
 
-    def serialize(mat: 'Matrix') -> bytes:
-        header = struct.pack('>II', mat.rows, mat.cols)
-        return header + mat.data.tobytes()
-
-    def deserialize(raw: bytes) -> 'Matrix':
-        rows, cols = struct.unpack_from('>II', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=8).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr.copy())  # owned copy
-
-    def from_buffer(buf: memoryview) -> 'Matrix':
-        header = bytes(buf[:8])
-        rows, cols = struct.unpack('>II', header)
-        arr = np.frombuffer(buf[8:], dtype=np.float64).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr)  # zero-copy view into SHM
-```
-
-当 `from_buffer` 存在时，服务端自动使用**持有模式** — 共享内存缓冲区保持存活，使 `from_buffer` 可以返回零拷贝视图。若无 `from_buffer`，服务端使用**视图模式** — 缓冲区在 `deserialize` 完成后立即释放。
-
-### @cc.transfer — 逐方法控制
-
-在 CRM 契约方法上使用 `@cc.transfer()` 可显式指定由哪个 transferable 类型处理序列化，或覆盖缓冲区模式：
-
-```python
 @cc.crm(namespace='demo.compute', version='0.1.0')
 class Compute:
-    @cc.transfer(input=Matrix, output=Matrix, buffer='hold')
-    def transform(self, mat: Matrix) -> Matrix: ...
-
-    @cc.transfer(input=Matrix, buffer='view')  # force copy even if from_buffer exists
-    def ingest(self, mat: Matrix) -> None: ...
+    def points(self, count: fdb.I32) -> fdb.Batch[Point]: ...
 ```
 
-若不使用 `@cc.transfer`，框架会根据函数签名自动匹配已注册的 `@transferable` 类型，并根据输入类型的能力自动解析缓冲区模式。
+固定规模输出如果需要进入计划式 direct path，资源实现通过 FastDB 的位置式 call envelope 分配：
+
+```python
+batch = fdb.require(fdb.batch(Point, rows=n))
+batch.fill(row_id=ids, x=xs, y=ys)
+return batch
+```
+
+C-Two 会把 CRM 推导出的 FastDB binding 交给 FastDB；用户代码不需要写 `return_0`、参数名、物理表名或 slot metadata。
 
 ### cc.hold() — 客户端零拷贝
 
-在客户端，`cc.hold()` 请求响应缓冲区保持存活；当输出 transferable 能从 memoryview 构造 view 时，这条路径可以实现零拷贝读取。返回的 `HeldResult` 包装了值，并把保留中的原始 wire buffer 暴露为 `.buffer`，供高级用户自行解析，同时提供三层缓冲区生命周期安全网：
+在客户端，普通 FastDB CRM 调用会先把响应 payload copy 到进程自有缓冲区，再暴露逻辑 FastDB 值并立即释放 transport buffer。`cc.hold()` 显式请求保留响应缓冲区，使支持 retained view 的 FDB 输出可以零拷贝读取。返回的 `cc.Held[R]` 包装 CRM 逻辑返回值，并把保留中的原始 wire buffer 作为 `.unsafe_buffer` 暴露给高级用户。
 
 1. **显式 `.release()`** — 推荐用于同时持有多个缓冲区的复杂工作流
 2. **上下文管理器（`with`）** — 推荐用于单缓冲区作用域
 3. **`__del__` 兜底** — 最后手段，若忘记释放会触发 `ResourceWarning`
 
 ```python
-grid = cc.connect(Compute, name='compute', address='ipc://server')
+compute = cc.connect(Compute, name='compute', address='ipc://server')
 
-# Normal call — buffer released immediately after deserialize
-result = grid.transform(matrix)
+# Normal call — response payload is copied into an owned buffer.
+result = compute.points(1_000)
 
 # Option 1: Context manager — clean for single holds
-with cc.hold(grid.transform)(matrix) as held:
-    data = held.value          # zero-copy NumPy array backed by SHM
-    raw = held.buffer          # retained wire buffer, valid only inside the hold scope
-    process(data)              # read directly from shared memory
-# SHM buffer released on context exit
+with cc.hold(compute.points)(1_000) as held:
+    batch = held.value
+    raw = held.unsafe_buffer   # raw wire buffer, valid only inside the hold scope
+    process(batch.column.x)
 
 # Option 2: Explicit release — better for multiple concurrent holds
-a = cc.hold(grid.transform)(matrix_a)
-b = cc.hold(grid.transform)(matrix_b)
+a = cc.hold(compute.points)(1_000)
+b = cc.hold(compute.points)(2_000)
 try:
-    combined = np.concatenate([a.value.data, b.value.data])
-    process(combined)
+    process(a.value, b.value)
 finally:
     a.release()
     b.release()
 ```
+
+`held.value` 是普通 API，会尽量使用 FastDB checked views；`held.release()` 后，子行和列视图会 fail fast。`held.unsafe_buffer` 是原始 `memoryview` escape hatch；C-Two 可以释放 transport lease，但不能机械阻止用户从该 buffer 派生出的 NumPy/raw pointer 继续存在。需要跨越 hold 生命周期保存数据时，用 `fdb.materialize(...)` 物化。
 
 > **何时使用持有模式：** 适用于反序列化开销占主导的大型数组/列式数据。对于小载荷（< 1 MB），跟踪共享内存生命周期的开销超过拷贝成本。
 
@@ -343,41 +318,28 @@ cc.shutdown()
 
 > **适用场景：** 本地原型开发、测试、单机计算。
 
-### 多进程 — IPC 与自定义 Transferable
+### 多进程 — IPC 与 FastDB CRM
 
 独立的服务端和客户端进程，通过 Unix 域套接字 + 共享内存通信。
 
 **共享类型** (`types.py`)：
 ```python
 import c_two as cc
-import numpy as np, struct
+import fastdb4py as fdb
 
-@cc.transferable
-class Mesh:
-    n_vertices: int
-    positions: np.ndarray   # (N, 3) float64
-
-    def serialize(mesh: 'Mesh') -> bytes:
-        header = struct.pack('>I', mesh.n_vertices)
-        return header + mesh.positions.tobytes()
-
-    def deserialize(raw: bytes) -> 'Mesh':
-        (n,) = struct.unpack_from('>I', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=4).reshape(n, 3).copy()
-        return Mesh(n_vertices=n, positions=arr)
-
-    def from_buffer(buf: memoryview) -> 'Mesh':
-        header = bytes(buf[:4])
-        (n,) = struct.unpack('>I', header)
-        arr = np.frombuffer(buf[4:], dtype=np.float64).reshape(n, 3)
-        return Mesh(n_vertices=n, positions=arr)  # zero-copy view
+@fdb.feature
+class Vertex:
+    row_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
+    z: fdb.F64
 
 @cc.crm(namespace='demo.mesh', version='0.1.0')
 class MeshStore:
     @cc.read
-    def get_mesh(self) -> Mesh: ...
+    def get_vertices(self) -> fdb.Batch[Vertex]: ...
 
-    def update_positions(self, mesh: Mesh) -> int: ...
+    def update_vertices(self, vertices: fdb.Batch[Vertex]) -> int: ...
 
     @cc.on_shutdown
     def cleanup(self) -> None: ...
@@ -386,23 +348,25 @@ class MeshStore:
 **服务端** (`server.py`)：
 ```python
 import c_two as cc
-from types import MeshStore, Mesh
+import fastdb4py as fdb
+import numpy as np
+from types import MeshStore, Vertex
 
-class MeshStore:
+class MeshResource:
     def __init__(self):
-        self._mesh = Mesh(n_vertices=0, positions=np.empty((0, 3)))
+        self._vertices = fdb.require(fdb.batch(Vertex, rows=0))
 
-    def get_mesh(self) -> Mesh:
-        return self._mesh
+    def get_vertices(self) -> fdb.Batch[Vertex]:
+        return self._vertices
 
-    def update_positions(self, mesh: Mesh) -> int:
-        self._mesh = mesh
-        return mesh.n_vertices
+    def update_vertices(self, vertices: fdb.Batch[Vertex]) -> int:
+        self._vertices = fdb.materialize(vertices)
+        return len(self._vertices)
 
     def cleanup(self):
         print('MeshStore shutting down')
 
-cc.register(MeshStore, MeshStore(), name='mesh')
+cc.register(MeshStore, MeshResource(), name='mesh')
 print(cc.server_id())
 print(cc.server_address())
 cc.serve()  # blocks until interrupted
@@ -411,22 +375,33 @@ cc.serve()  # blocks until interrupted
 **客户端** (`client.py`)：
 ```python
 import c_two as cc
-from types import MeshStore, Mesh
+import fastdb4py as fdb
 import numpy as np
+from types import MeshStore, Vertex
 
 mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://<server-address>')
 
 # Upload data
-big_mesh = Mesh(n_vertices=1_000_000,
-                positions=np.random.randn(1_000_000, 3))
-mesh_store.update_positions(big_mesh)
+n = 1_000_000
+vertices = fdb.require(fdb.batch(Vertex, rows=n))
+idx = np.arange(n, dtype=np.uint32)
+vertices.fill(
+    row_id=idx,
+    x=np.random.randn(n),
+    y=np.random.randn(n),
+    z=np.random.randn(n),
+)
+mesh_store.update_vertices(vertices)
 
-# Read with hold — zero-copy SHM access
-with cc.hold(mesh_store.get_mesh)() as held:
-    positions = held.value.positions  # np.ndarray backed by SHM, no copy
-    centroid = positions.mean(axis=0)
+# Read with hold — retained FastDB view over the response buffer
+with cc.hold(mesh_store.get_vertices)() as held:
+    batch = held.value
+    centroid = np.array([
+        batch.column.x.to_numpy().mean(),
+        batch.column.y.to_numpy().mean(),
+        batch.column.z.to_numpy().mean(),
+    ])
     print(f'Centroid: {centroid}')
-# SHM released here
 
 cc.close(mesh_store)
 ```
@@ -522,8 +497,8 @@ stats = cc.hold_stats()
 
 - **CRM 契约**：使用 `@cc.crm()` 装饰的接口类。只有在此声明的方法才可被远程访问。
 - **Resource**：实现契约的普通 Python 类 — 状态 + 领域逻辑，无需装饰器。
-- **`@transferable`**：领域数据类型的自定义序列化。可选提供 `from_buffer` 实现零拷贝共享内存视图。
-- **`@cc.transfer`**：逐方法控制输入/输出 transferable 类型和缓冲区模式。
+- **FastDB payload**：使用 `fastdb4py` feature、scalar、`Array[...]` 和 `Batch[...]` 作为 portable CRM ABI。
+- **Python fallback**：普通 Python 类型可用于 Python-only prototype，但 portable export/codegen 会拒绝 pickle fallback。
 - **`@cc.read` / `@cc.write`**：并发注解 — 并行读取，独占写入。
 - **`@cc.on_shutdown`**：生命周期回调，在资源被注销时调用（不通过 RPC 暴露）。
 
@@ -537,7 +512,7 @@ stats = cc.hold_stats()
 | `ipc:///path` | Unix 域套接字 + 共享内存 | 多进程、同主机 |
 | `http://host:port` | HTTP 中继 | 跨机器、Web 兼容 |
 
-IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联帧传输，载荷字节通过共享内存交换 — 数据路径上零拷贝。当 `from_buffer` 可用时，**持有模式**会在 CRM 方法调用期间保持共享内存缓冲区存活，使 CRM 可以直接操作共享内存中的数据而无需反序列化。
+IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联帧传输，载荷字节通过共享内存交换。`cc.hold()` 可以在客户端显式保留响应缓冲区，使 FastDB checked views 直接映射在 transport buffer 上；服务端 borrowed input 只能通过 `cc.register(..., input_lifetime={...})` 显式启用。
 
 ### Rust 原生层
 
@@ -622,7 +597,7 @@ c3 contract infer mypkg.resources:GridResource \
 FastDB call-db 是 portable CRM payload ABI。Python fallback 路径使用普通 Python annotation 和 pickle，只面向本地或 Python-only IPC prototype；strict portable export/codegen 会明确拒绝它。C-Two 不再提供可选 payload registry module 或公开 codec registry。
 
 ```python
-from c_two import fastdb as fdb
+import fastdb4py as fdb
 
 @fdb.feature
 class GridAttribute:
@@ -631,7 +606,7 @@ class GridAttribute:
     activate: fdb.BOOL
 ```
 
-如果要让方法进入 portable 路径，请使用 `c_two.fastdb` alias、`Array[...]`、`Batch[...]` 和 `@fdb.feature`，让方法规划为 FastDB call-db。未标记的 Python payload 仍可在非 portable 的本地/IPC prototype 路径中走 pickle，但 strict portable export 会拒绝 pickle 和非 FastDB `PayloadAbiRef`。
+如果要让方法进入 portable 路径，请使用 `fastdb4py` scalar、`Array[...]`、`Batch[...]` 和 `@fdb.feature`，让方法规划为 FastDB call-db。未标记的 Python payload 仍可在非 portable 的本地/IPC prototype 路径中走 pickle，但 strict portable export 会拒绝 pickle 和非 FastDB `PayloadAbiRef`。
 
 ---
 
@@ -680,7 +655,7 @@ uv run pytest                      # 运行测试套件
 | 统一配置架构（Rust resolver 单一事实源） | ✅ 稳定 |
 | CI/CD 与多平台 PyPI 发布 | ✅ 稳定 |
 | 极端载荷磁盘溢出 | ✅ 稳定 |
-| 持有模式与 `from_buffer` 零拷贝 | ✅ 稳定 |
+| `cc.hold()` 与 FastDB retained views | ✅ 稳定 |
 | 共享内存驻留监控（`cc.hold_stats()`） | ✅ 稳定 |
 | 契约版本兼容协商 | 🔜 规划中 |
 | `auth_hook` 与 call metadata | 🔜 规划中 |

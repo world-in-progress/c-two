@@ -38,30 +38,31 @@
 
 End-to-end cross-process IPC benchmark using the Kostya-style coordinate schema: `row_id u32`, `x/y/z f64`, and `name STR`. Each call returns a cached coordinate table from a remote process and the client computes `sum(x + y + z)` from the received payload.
 
-| Rows | C-Two FDB normal (ms) | C-Two FDB hold (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Hold vs Ray arrays** |
-|-----:|---:|---:|---:|---:|---:|
-| 1 K | 1.55 | **1.57** | 6.39 | 0.61 | **4.1×** |
-| 10 K | 1.86 | **1.89** | 7.67 | 1.38 | **4.1×** |
-| 100 K | 5.76 | **4.88** | 8.97 | 10.31 | **1.8×** |
-| 1 M | 44.90 | **33.54** | 47.12 | 157.06 | **1.4×** |
-| 3 M | 170.20 | **96.20** | 137.21 | 621.94 | **1.4×** |
+| Rows | C-Two FDB normal (ms) | C-Two FDB require normal (ms) | C-Two FDB hold (ms) | C-Two FDB require hold (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Require hold vs Ray arrays** |
+|-----:|---:|---:|---:|---:|---:|---:|---:|
+| 1 K | 1.28 | 1.33 | 1.30 | **1.12** | 6.51 | 0.57 | **5.8×** |
+| 10 K | 1.83 | 1.27 | 1.52 | **1.26** | 7.42 | 1.24 | **5.9×** |
+| 100 K | 5.10 | 2.64 | 4.91 | **1.91** | 8.22 | 9.69 | **4.3×** |
+| 1 M | 36.39 | 12.29 | 29.85 | **8.36** | 48.59 | 130.65 | **5.8×** |
+| 3 M | 147.89 | 39.08 | 93.80 | **23.29** | 164.32 | 529.47 | **7.1×** |
 
 Row-oriented fallback paths are much slower at large sizes and are included only to show Python object materialization cost:
 
-| Rows | C-Two pickle records (ms) | Ray records (ms) | **Hold vs Ray records** |
+| Rows | C-Two pickle records (ms) | Ray records (ms) | **Require hold vs Ray records** |
 |-----:|---:|---:|---:|
-| 1 K | 1.04 | 6.74 | **4.3×** |
-| 10 K | 6.38 | 11.65 | **6.2×** |
-| 100 K | 67.34 | 57.09 | **11.7×** |
-| 1 M | 891.30 | 547.97 | **16.3×** |
+| 1 K | 0.95 | 6.23 | **5.6×** |
+| 10 K | 6.09 | 11.62 | **9.2×** |
+| 100 K | 67.25 | 56.31 | **29.5×** |
+| 1 M | 861.50 | 546.27 | **65.3×** |
 | 3 M | SKIP | SKIP | - |
 
-- **C-Two FDB normal** - copies the response payload bytes once into a process-owned buffer, then returns a FastDB owned-buffer view.
-- **C-Two FDB hold** - `cc.hold()` retains the IPC response buffer and maps FastDB views directly over it, avoiding the normal response bytes copy.
+- **C-Two FDB normal / hold** - ordinary `fdb.Batch.allocate(...)` resource code. This intentionally no longer gets a general wire-layer rewrite fast path, so it shows the cost of normal call-db repacking when the resource did not opt into a call envelope.
+- **C-Two FDB require normal** - resource code builds the return payload with `fdb.require(fdb.batch(...))`; at 3M rows this lowers normal-call p50 from 147.89 ms to 39.08 ms in this run.
+- **C-Two FDB require hold** - combines `fdb.require(...)` with `cc.hold()`, retaining the IPC response buffer and mapping FastDB views directly over it. This is the intended safe high-performance path.
 - **Ray arrays** - Ray object-store transfer of NumPy columns plus the `name` string list.
 - **Pickle arrays / records** - Python-only fallback baselines; records intentionally exercise row-oriented Python object overhead.
 
-> Apple M1 Max · C-Two: Python 3.14.3t + NumPy 2.4.4 · Ray: Python 3.12.10 + NumPy 2.4.6 + Ray 2.55.1 · See [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py), [`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py), and [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh) for methodology.
+> Apple M1 Max · measured May 27, 2026 · C-Two: Python 3.14.3 + NumPy 2.4.4 · Ray: Python 3.12 + NumPy 2.4.6 + Ray 2.55.1 · See [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py), [`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py), and [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh) for methodology.
 
 ---
 
@@ -260,7 +261,15 @@ class Grid:
 
 For Python-only resources, use ordinary Python types and dataclasses. They are convenient locally, but they are intentionally diagnosed as nonportable by contract export.
 
-For FastDB outputs, C-Two asks FastDB's generic `try_export_call_db(...)` runtime for an exact buffer export before falling back to `encode_call_db(...)`. A resource can return a logical `fdb.Batch[T]` value backed by a named fixed FastDB table, such as `Layout(Point, n, name="return_0")`, without exposing raw `bytes` in the CRM signature.
+For fixed-size FastDB outputs that should use the planned direct path, allocate through FastDB's positional call envelope:
+
+```python
+points = fdb.require(fdb.batch(Point, rows=n))
+points.fill(row_id=ids, x=xs, y=ys)
+return points
+```
+
+C-Two passes the CRM-derived FastDB binding to FastDB; user code does not spell `return_0`, parameter names, table names, or slot metadata.
 
 ### cc.hold() — Client-Side Borrowed Responses
 

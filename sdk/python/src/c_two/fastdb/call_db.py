@@ -18,6 +18,7 @@ from fastdb4py import (
     FastdbCallDbTable,
     decode_call_db,
     encode_call_db,
+    prepare_call_db,
     try_export_call_db,
     view_call_db,
 )
@@ -240,6 +241,10 @@ class FastdbCallPlan:
         if exported is not None:
             return exported
         return encode_call_db(binding, values)
+
+    def prepare_write_values(self, values: object) -> object:
+        self._validate_identity()
+        return prepare_call_db(self.fastdb_binding, values)
 
     def deserialize_values(self, data: bytes | bytearray | memoryview) -> object:
         self._validate_identity()
@@ -1125,6 +1130,11 @@ def _method_payload_binding_for(plan: FastdbCallPlan) -> object:
             return _plan.serialize_values(values)
         return _plan.serialize_values(values[0] if len(values) == 1 else values)
 
+    def prepare_write(*values, _plan=plan):
+        if _plan.direction == 'input':
+            return _plan.prepare_write_values(values)
+        return _plan.prepare_write_values(values[0] if len(values) == 1 else values)
+
     def deserialize(data, _plan=plan):
         return _plan.deserialize_values(data)
 
@@ -1138,6 +1148,7 @@ def _method_payload_binding_for(plan: FastdbCallPlan) -> object:
         kind=PayloadPlanKind.FDB,
         serialize=serialize,
         deserialize=deserialize,
+        prepare_write=prepare_write,
         payload_abi_ref=payload_abi_ref,
         payload_abi_artifacts=_plan_payload_abi_artifacts(plan),
         view_from_buffer=view_from_buffer,

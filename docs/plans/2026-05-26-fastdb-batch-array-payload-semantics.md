@@ -3,8 +3,13 @@
 > **For agentic workers:** This is a design and sequencing document. Do not implement C-Two-local FastDB storage hacks from this document; first check the sibling FastDB plan and keep the ownership boundary intact.
 
 **Date:** 2026-05-26
-**Status:** Proposed
-**Scope:** C-Two-side repair plan for FastDB-first CRM payload semantics after the Batch/Array/Table boundary discussion. This document complements `docs/plans/2026-05-25-fastdb-call-db-runtime-boundary-remediation.md` and the sibling FastDB document `docs/opt/batch-array-call-db-fast-path-design.md`.
+**Status:** Partially implemented. C-Two now consumes FastDB logical
+`Batch`/`Array` authoring values, FastDB exact export where truly slot-exact,
+and FastDB prepared call-db write plans for direct IPC SHM request/response
+payloads. Remaining semantic/performance follow-up belongs mostly in FastDB:
+direct layer section writers, object-graph slot roots, snapshot caching, and
+future arena/stub allocation.
+**Scope:** C-Two-side repair plan for FastDB-first CRM payload semantics after the Batch/Array/Table boundary discussion. This document complements `docs/plans/2026-05-25-fastdb-call-db-runtime-boundary-remediation.md`, `docs/plans/2026-05-26-fastdb-direct-shm-sink-integration.md`, and the sibling FastDB document `docs/opt/batch-array-call-db-fast-path-design.md`.
 
 ## Context
 
@@ -104,9 +109,13 @@ C-Two should not attempt the main fast path until FastDB lands the generic prere
 - logical batch/array runtime metadata distinct from storage table metadata;
 - generation-based encoded snapshot invalidation;
 - scalar array runtime/view cleanup;
-- optional encode-into-writer API after the buffer export path is stable.
+- planned direct DB build or encode-into-writer API after slot binding and buffer export are stable;
+- layer import/partial paste for compatible backed batches, so multi-slot call-db payloads can avoid per-row and per-column repack when FastDB can validate the source layer;
+- direct layer section writers for synthetic scalar tables, scalar arrays, and newly built fixed numeric batches.
 
 The sibling FastDB tracking document is `docs/opt/batch-array-call-db-fast-path-design.md`.
+
+The C-Two prepared transport integration document is `docs/plans/2026-05-26-fastdb-direct-shm-sink-integration.md`. That document covers the transport-facing side of the same work: C-Two should allocate one request or response SHM block for the full FastDB call-db payload, hand a writable destination to FastDB, and send the existing single-payload IPC coordinates after the write succeeds. C-Two must not allocate one SHM block per `Batch` or parse FastDB DB/layer metadata to implement this optimization.
 
 ## Phases
 
@@ -129,10 +138,19 @@ Re-run the Kostya-style benchmark with at least these variants:
 - current FastDB normal and hold paths;
 - FastDB exact-export hold path;
 - FastDB exact-export normal path;
+- FastDB prepared direct-SHM sink path once C-Two can consume FastDB build plans;
+- FastDB prepared direct-SHM sink plus layer import once FastDB supports layer import/partial paste;
 - old structured numeric-only custom-transferable baseline, clearly labeled as non-equivalent historical baseline;
 - Ray arrays and records.
 
-Sanity evidence after consuming FastDB exact export on 2026-05-26 with 3M `Coord` rows and 5 measured iterations: `fastdb-hold` p50 27.86 ms, `fastdb-normal` p50 37.22 ms, and `fastdb-hold-unsafe` p50 21.23 ms. This confirms the prior 90 ms class result was dominated by server-side call-db repack and that the remaining spread is mostly client view/copy and safe-column wrapper overhead. A full comparative run with Ray and historical structured-transferable baselines remains the formal Phase 4 follow-up.
+Status: implemented for the current benchmark surface. After consuming FastDB
+prepared call-db write plans and layer import, the 2026-05-26 full comparative
+run reports 3M-row p50 values of `fastdb-hold` 27.18 ms,
+`fastdb-hold-unsafe` 25.17 ms, `fastdb-normal` 61.20 ms, C-Two pickle arrays
+664.54 ms, and Ray arrays 155.97 ms. This confirms the direct-SHM sink removes
+the temporary payload-copy tier while remaining cost is split between FastDB
+DB/layer build behavior, client materialization for normal calls, and safe view
+wrapper overhead.
 
 The README should avoid claiming equivalence between historical raw ndarray hold and full FastDB CRM unless the payload schema and wire layout are actually equivalent.
 
@@ -142,6 +160,8 @@ The README should avoid claiming equivalence between historical raw ndarray hold
 - C-Two public CRM examples keep `fdb.Batch[...]` and `fdb.Array[...]` signatures.
 - C-Two does not add FastDB binary-layout parsing to transport, relay, config, scheduler, error, lease, Rust core, or CLI layers.
 - FastDB exact export can be consumed through a generic API without C-Two-specific code in FastDB.
+- Future FastDB prepared writer plans can be consumed by C-Two without C-Two parsing FastDB binary layout or exposing C-Two pool objects to FastDB.
+- Multi-slot direct IPC FastDB payloads remain one contiguous call-db backing buffer rather than becoming per-value or per-table transport buffers.
 - Benchmarks report payload shape and semantic equivalence clearly enough that historical raw ndarray results are not compared as if they were full FastDB CRM results.
 
 ## Verification

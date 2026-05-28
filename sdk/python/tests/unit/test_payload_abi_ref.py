@@ -79,6 +79,25 @@ def test_payload_binding_serializer_may_return_memoryview():
     assert binding.serialize(object()) is payload
 
 
+def test_payload_binding_may_carry_prepared_writer():
+    payload_ref = PayloadAbiRef(
+        id='org.fastdb.call-db',
+        version='1',
+        schema='fastdb.call-db.schema.v1',
+        schema_sha256='d' * 64,
+    )
+    marker = object()
+    binding = PayloadBinding(
+        kind=PayloadPlanKind.FDB,
+        serialize=lambda value: b'fallback',
+        deserialize=lambda data: data,
+        prepare_write=lambda value: marker,
+        payload_abi_ref=payload_ref,
+    )
+
+    assert binding.prepare_write(object()) is marker
+
+
 def test_portable_descriptor_rejects_pickle_only_wire_refs():
     @cc.crm(namespace='test.payload-abi-ref', version='0.1.0')
     class PickleOnlyContract:

@@ -216,6 +216,9 @@ def test_kostya_ctwo_benchmark_no_longer_uses_legacy_custom_fastdb_wrapper():
     source = (_repo_root() / 'sdk/python/benchmarks/kostya_ctwo_benchmark.py').read_text()
 
     assert 'class CoordFastdb:' not in source
+    assert 'ColumnEngine.truncate' not in source
+    assert "name='return_0'" not in source
+    assert '_make_coord_batch' in source
     assert 'cc.hold(method)' in source
 
 
