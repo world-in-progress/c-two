@@ -570,9 +570,8 @@ impl PyRustClient {
         let alloc = self
             .inner
             .pool_alloc_and_fill(data_size, |destination| {
-                write_python_payload_plan(py, plan, destination).map_err(|err| {
-                    format!("{}", err.value(py))
-                })
+                write_python_payload_plan(py, plan, destination)
+                    .map_err(|err| format!("{}", err.value(py)))
             })
             .map_err(|err| PyRuntimeError::new_err(format!("{err}")))?;
 

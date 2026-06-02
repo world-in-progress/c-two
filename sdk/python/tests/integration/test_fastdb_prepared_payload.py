@@ -29,12 +29,17 @@ class PreparedGrid:
 
 
 class PreparedGridResource:
+    def __init__(self):
+        self.require_direct_context_seen = False
+
     def swap(self, left, right):
         return right, left
 
     def require_points(self):
         values = np.arange(2048, dtype=np.float64)
         batch = fdb.require(fdb.batch(PreparedPoint, rows=len(values)))
+        envelope = getattr(batch, '_fastdb_require_envelope', None)
+        self.require_direct_context_seen = getattr(envelope, 'direct_context', None) is not None
         batch.fill(x=values)
         return batch
 
@@ -59,7 +64,8 @@ def test_fastdb_prepared_payload_roundtrips_direct_ipc(monkeypatch):
 
     monkeypatch.setattr(fdb.FastdbPreparedCallDb, 'to_bytes', fail_to_bytes)
 
-    cc.register(PreparedGrid, PreparedGridResource(), name='prepared-grid')
+    resource = PreparedGridResource()
+    cc.register(PreparedGrid, resource, name='prepared-grid')
     time.sleep(0.2)
     address = cc.server_address()
     assert address is not None
@@ -84,5 +90,6 @@ def test_fastdb_prepared_payload_roundtrips_direct_ipc(monkeypatch):
         assert isinstance(required, fdb.Batch)
         assert len(required) == 2048
         assert list(required.column.x[:3]) == [0.0, 1.0, 2.0]
+        assert resource.require_direct_context_seen is True
     finally:
         cc.close(proxy)

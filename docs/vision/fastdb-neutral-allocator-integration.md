@@ -6,13 +6,14 @@
 
 ## Purpose
 
-C-Two is FDB-first for portable CRM payloads, but FastDB must own FastDB memory layout and allocator semantics. C-Two should integrate with a neutral FastDB C++ allocator interface by providing request and response memory resources backed by C-Two's transport memory pools.
+C-Two is FDB-first for portable CRM payloads, but FastDB must own FastDB memory layout and allocator semantics. C-Two should integrate with FastDB's neutral C++ memory interfaces by providing request and response final backing resources backed by C-Two's transport memory pools.
 
-The target is not a C-Two-specific FastDB provider. The target is:
+The target is not a C-Two-specific FastDB package surface or public payload
+extension model. The target is:
 
 ```text
 C-Two call context
-    -> FastDB neutral allocator provider
+    -> FastDB neutral final backing adapter
     -> FastDB direct call-db build
     -> normal C-Two wire metadata and lease lifecycle
 ```
@@ -50,9 +51,9 @@ No C-Two transport, scheduler, registry, or native Rust code should parse FastDB
 
 ## Required Integration Shape
 
-When FastDB exposes a C++ neutral allocator interface, C-Two should implement a native allocator provider that allocates from the existing request or response pool.
+When FastDB exposes a C++ neutral final backing interface, C-Two should implement a native adapter that allocates from the existing request or response pool.
 
-The provider must support:
+The adapter must support:
 
 - allocate one contiguous block for the final FastDB call-db payload;
 - expose a writable region to FastDB only while the allocation is active;
@@ -62,7 +63,12 @@ The provider must support:
 - convert committed response allocations into existing IPC response metadata;
 - preserve existing fallback paths for HTTP/relay and unsupported FastDB shapes.
 
-The allocator provider is internal glue. It must not become a public `c_two.providers` concept.
+The final-backing adapter is internal glue. It must remain hidden from the
+public C-Two namespace and must not become a user-visible payload registry.
+
+C-Two should not initially implement FastDB build scratch memory. Scratch memory covers dynamic builder vectors, string/list packing, object graph analysis, dependency discovery, and reference fixup maps. Those are FastDB construction concerns and should remain FastDB-owned heap/default memory unless a separate future design proves that external scratch control is useful and safe.
+
+The C-Two direct path starts only after FastDB can prove the final byte layout. Known row count alone is insufficient; C-Two needs FastDB to report a complete final backing size and shape before C-Two allocates transport memory.
 
 ## Resource-Time Output Context
 
@@ -73,8 +79,9 @@ The intended flow is:
 ```text
 server dispatch enters resource call
     -> C-Two installs FastDB call allocator context
-    -> resource calls fdb.require(...)
-    -> FastDB plans and allocates through C-Two memory resource
+    -> resource calls fdb.require(...) for a supported planned fixed-columnar shape
+    -> FastDB plans final byte layout
+    -> FastDB allocates final backing through C-Two memory resource
     -> resource fills Batch/Array views
     -> resource returns logical FastDB values
     -> C-Two validates returned shape
@@ -82,6 +89,8 @@ server dispatch enters resource call
 ```
 
 If the resource returns an ordinary pre-existing `Batch`, `Array`, Python object, or object graph value that was not built in the context, C-Two should use the prepared writer or materialized fallback. It must not claim direct allocator behavior.
+
+If the resource shape requires dynamic object analysis, dynamic push, REF/list[REF] fixups, or unknown-size variable payload planning, FastDB may use its own scratch build path and C-Two must treat the result as fallback unless FastDB later provides a complete final backing plan before transport allocation.
 
 ## Client-Time Input Context
 
@@ -91,7 +100,7 @@ The intended flow is:
 
 ```text
 proxy validates CRM input binding
-    -> FastDB prepares call-db size and shape
+    -> FastDB prepares final call-db byte size and shape
     -> C-Two allocates request pool block
     -> FastDB writes directly into that block
     -> C-Two sends existing request SHM metadata
@@ -106,6 +115,7 @@ C-Two must preserve correct fallback behavior for:
 - FastDB versions without a C++ neutral allocator;
 - HTTP and relay paths, where network/relay copy is expected;
 - small payloads below the SHM threshold;
+- any payload where row count is known but final byte layout is not known;
 - object-engine dynamic push outputs;
 - object graphs that require dependency discovery or reference fixup;
 - variable-size strings/lists/geometries without a complete FastDB size plan;
@@ -114,13 +124,15 @@ C-Two must preserve correct fallback behavior for:
 
 Fallback paths should be explicit in metrics and benchmark labels. A benchmark must not call a copied prepared-sink path "direct allocator" or "zero-copy output build".
 
+The primary direct target is planned fixed columnar data from FastDB `ColumnEngine`/columnar profile. ObjectEngine is fallback by default. A future predeclared object-graph plan may be considered later, but C-Two should not drive that design and should not parse FastDB object graph internals.
+
 ## Public API Boundary
 
 C-Two should not add:
 
 - public `cc.layout(...)`;
 - public `cc.require(...)`;
-- public FastDB provider registration;
+- public FastDB payload or allocator registration;
 - public `return_0` or argument-table naming requirements;
 - C-Two-owned FastDB schema/layout specs;
 - public CRM signatures that expose C-Two buffer wrappers.
@@ -128,18 +140,18 @@ C-Two should not add:
 The public user model stays:
 
 ```python
-@cc.crm(namespace="demo.grid", version="0.1.0")
-class Grid:
-    def cells(self, n: fdb.I32) -> fdb.Batch[Cell]:
+@cc.crm(namespace="demo.geometry", version="0.1.0")
+class Geometry:
+    def vertices(self, n: fdb.I32) -> fdb.Batch[Vertex]:
         ...
 ```
 
 and resource authors use FastDB-owned APIs:
 
 ```python
-cells = fdb.require(fdb.batch(Cell, rows=n))
-cells.fill(...)
-return cells
+vertices = fdb.require(fdb.batch(Vertex, rows=n))
+vertices.fill(...)
+return vertices
 ```
 
 ## Lifetime And Safety
@@ -154,8 +166,10 @@ C-Two must not claim direct FastDB allocator integration until tests prove:
 
 - direct IPC response path installs a FastDB allocator context before resource code runs;
 - `fdb.require(...)` inside the resource allocates in the C-Two response pool;
+- C-Two is not used for FastDB dynamic scratch allocations in the initial design;
 - no `to_bytes()` or post-resource layer copy is needed for the supported direct fixed-columnar case;
 - unsupported object-engine dynamic push falls back and is labeled as fallback;
+- known-row-count but unknown-final-byte-layout payloads fall back and are labeled as fallback;
 - request direct allocation uses one request pool block for multi-slot call-db payloads;
 - failure before commit frees the transport allocation;
 - held FastDB response values remain logical `fdb.Batch[T]` / `fdb.Array[T]` values;

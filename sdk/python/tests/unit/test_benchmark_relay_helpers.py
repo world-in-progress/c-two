@@ -202,14 +202,14 @@ def test_kostya_ctwo_fastdb_variant_uses_fdb_call_db_hold_contract():
     assert method['wire']['input']['id'] == 'org.fastdb.call-db'
     assert method['wire']['output']['id'] == 'org.fastdb.call-db'
     assert 'buffer-view' in method['wire']['output']['capabilities']
-    assert module.VARIANTS['fastdb-hold'].use_hold is True
+    assert module.VARIANTS['fastdb-control-retained'].use_hold is True
 
 
-def test_kostya_ctwo_fastdb_normal_uses_owned_view_columnar_consumer():
+def test_kostya_ctwo_fastdb_control_default_uses_safe_columnar_consumer():
     module = _load_benchmark('kostya_ctwo_benchmark.py')
 
-    assert module.VARIANTS['fastdb-normal'].use_hold is False
-    assert module.VARIANTS['fastdb-normal'].consumer is module.consume_fastdb_safe
+    assert module.VARIANTS['fastdb-control-default'].use_hold is False
+    assert module.VARIANTS['fastdb-control-default'].consumer is module.consume_fastdb_safe
 
 
 def test_kostya_ctwo_benchmark_no_longer_uses_legacy_custom_fastdb_wrapper():
@@ -218,7 +218,8 @@ def test_kostya_ctwo_benchmark_no_longer_uses_legacy_custom_fastdb_wrapper():
     assert 'class CoordFastdb:' not in source
     assert 'ColumnEngine.truncate' not in source
     assert "name='return_0'" not in source
-    assert '_make_coord_batch' in source
+    assert '_make_coord_control_batch' in source
+    assert 'fdb.require(fdb.batch(' in source
     assert 'cc.hold(method)' in source
 
 

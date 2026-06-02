@@ -345,7 +345,12 @@ def _build_transfer_wrapper(
             else:
                 raise error.ClientDeserializeOutput(str(e)) from e
 
-    def crm_to_com(*args, _release_fn=None, _c2_input_buffer_mode=None):
+    def crm_to_com(
+        *args,
+        _release_fn=None,
+        _c2_input_buffer_mode=None,
+        _c2_output_allocator=None,
+    ):
         input_buffer_mode = _c2_input_buffer_mode or buffer
         if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD:
             if input_buffer_mode == 'borrowed':
@@ -373,11 +378,17 @@ def _build_transfer_wrapper(
             if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
             else None
         )
+        output_build_context = (
+            output.build_context
+            if output is not None and output.kind is PayloadPlanKind.FDB
+            else None
+        )
 
         err = None
         result = None
         stage = 'deserialize_input'
         deserialized_args: tuple[object, ...] = tuple()
+        output_context = None
 
         def release_input_buffer() -> None:
             nonlocal _release_fn
@@ -414,11 +425,21 @@ def _build_transfer_wrapper(
             if crm_method is None:
                 raise ValueError(f'Method "{method_name}" not found on resource class.')
 
+            if output_build_context is not None and _c2_output_allocator is not None:
+                output_context = output_build_context(_c2_output_allocator)
+                output_context.__enter__()
+
             stage = 'execute_function'
             result = crm_method(*deserialized_args)
             err = None
 
         except Exception as e:
+            if output_context is not None:
+                try:
+                    output_context.__exit__(type(e), e, e.__traceback__)
+                except Exception:
+                    pass
+                output_context = None
             result = None
             should_release_input = (
                 _release_fn is not None
@@ -445,7 +466,18 @@ def _build_transfer_wrapper(
         serialized_result = b''
         if err is None and result is not None and (output_prepare_writer is not None or output_serializer is not None):
             try:
-                if output_prepare_writer is not None:
+                stage = 'serialize_output'
+                context_prepare_writer = (
+                    getattr(output_context, 'prepare_write', None)
+                    if output_context is not None
+                    else None
+                )
+                if context_prepare_writer is not None:
+                    serialized_result = (
+                        context_prepare_writer(*result) if isinstance(result, tuple)
+                        else context_prepare_writer(result)
+                    )
+                elif output_prepare_writer is not None:
                     serialized_result = (
                         output_prepare_writer(*result) if isinstance(result, tuple)
                         else output_prepare_writer(result)
@@ -455,9 +487,25 @@ def _build_transfer_wrapper(
                         output_serializer(*result) if isinstance(result, tuple)
                         else output_serializer(result)
                     )
+                if output_context is not None:
+                    output_context.__exit__(None, None, None)
+                    output_context = None
             except Exception as e:
+                if output_context is not None:
+                    try:
+                        output_context.__exit__(type(e), e, e.__traceback__)
+                    except Exception:
+                        pass
+                    output_context = None
                 err = error.ResourceSerializeOutput(str(e))
                 serialized_result = b''
+
+        if output_context is not None:
+            try:
+                output_context.__exit__(None, None, None)
+            except Exception:
+                pass
+            output_context = None
 
         if _release_fn is not None and input_buffer_mode == 'borrowed':
             try:

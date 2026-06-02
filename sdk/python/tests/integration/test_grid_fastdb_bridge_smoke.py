@@ -1601,18 +1601,18 @@ def test_borrowed_input_lifetime_rejects_extra_resource_parameter(monkeypatch):
         )
 
 
-def test_grid_fastdb_normal_output_returns_owned_view_for_direct_ipc(monkeypatch):
+def test_grid_fastdb_default_output_returns_owned_view_for_direct_ipc(monkeypatch):
     GridFastdb, _GridId, NestedGrid, grid_fastdb_bridge = _load_fastdb_grid(monkeypatch)
     cc.register(
         GridFastdb,
         _make_grid_resource(NestedGrid),
-        name='grid-fastdb-normal-owned-view',
+        name='grid-fastdb-default-owned-view',
         bridge=grid_fastdb_bridge(),
     )
     address = cc.server_address()
     assert address is not None
 
-    grid = cc.connect(GridFastdb, name='grid-fastdb-normal-owned-view', address=address)
+    grid = cc.connect(GridFastdb, name='grid-fastdb-default-owned-view', address=address)
     try:
         view = grid.get_active_grid_infos()
         assert isinstance(view, fdb.Batch)
@@ -1628,18 +1628,18 @@ def test_grid_fastdb_normal_output_returns_owned_view_for_direct_ipc(monkeypatch
         cc.close(grid)
 
 
-def test_grid_fastdb_hold_returns_retained_view_for_direct_ipc(monkeypatch):
+def test_grid_fastdb_retained_response_returns_view_for_direct_ipc(monkeypatch):
     GridFastdb, _GridId, NestedGrid, grid_fastdb_bridge = _load_fastdb_grid(monkeypatch)
     cc.register(
         GridFastdb,
         _make_grid_resource(NestedGrid),
-        name='grid-fastdb-hold',
+        name='grid-fastdb-retained-response',
         bridge=grid_fastdb_bridge(),
     )
     address = cc.server_address()
     assert address is not None
 
-    grid = cc.connect(GridFastdb, name='grid-fastdb-hold', address=address)
+    grid = cc.connect(GridFastdb, name='grid-fastdb-retained-response', address=address)
     try:
         held = cc.hold(grid.get_active_grid_infos)()
         view = held.value
@@ -1661,18 +1661,18 @@ def test_grid_fastdb_hold_returns_retained_view_for_direct_ipc(monkeypatch):
         cc.close(grid)
 
 
-def test_grid_fastdb_hold_returns_view_for_explicit_http_relay(monkeypatch, start_c3_relay):
+def test_grid_fastdb_retained_response_returns_view_for_explicit_http_relay(monkeypatch, start_c3_relay):
     GridFastdb, _GridId, NestedGrid, grid_fastdb_bridge = _load_fastdb_grid(monkeypatch)
     relay = start_c3_relay()
     cc.set_relay_anchor(relay.url)
     cc.register(
         GridFastdb,
         _make_grid_resource(NestedGrid),
-        name='grid-fastdb-hold-relay',
+        name='grid-fastdb-retained-response-relay',
         bridge=grid_fastdb_bridge(),
     )
 
-    grid = cc.connect(GridFastdb, name='grid-fastdb-hold-relay', address=relay.url)
+    grid = cc.connect(GridFastdb, name='grid-fastdb-retained-response-relay', address=relay.url)
     try:
         assert grid.client._mode == 'http'  # noqa: SLF001
         with cc.hold(grid.get_active_grid_infos)() as held:

@@ -16,6 +16,9 @@ from fastdb4py import (
     FastdbCallDbFeatureDependency,
     FastdbCallDbScalarField,
     FastdbCallDbTable,
+    FastdbUnsupportedDirectBuildError,
+    build_call_db,
+    call_db_build_context,
     decode_call_db,
     encode_call_db,
     prepare_call_db,
@@ -87,6 +90,17 @@ _VALID_CALL_DB_SCALAR_KINDS = {
     *_SCALAR_KIND_BY_FIELD_TYPE.values(),
 }
 _PYTHON_BUILTIN_SCALARS = {bool, int, float, str}
+_DIRECT_CONTEXT_FIELD_KINDS = {
+    'bool',
+    'u8',
+    'u16',
+    'u32',
+    'i32',
+    'u8n',
+    'u16n',
+    'f32',
+    'f64',
+}
 
 
 @dataclass(frozen=True)
@@ -244,7 +258,30 @@ class FastdbCallPlan:
 
     def prepare_write_values(self, values: object) -> object:
         self._validate_identity()
-        return prepare_call_db(self.fastdb_binding, values)
+        binding = self.fastdb_binding
+        if _has_fastdb_require_envelope(values):
+            return prepare_call_db(binding, values)
+        exported = try_export_call_db(binding, values)
+        if exported is not None:
+            return _FastdbExistingBufferWritePlan(exported)
+        try:
+            direct_nbytes = _probe_final_backing_direct_size(binding, values)
+        except FastdbUnsupportedDirectBuildError as exc:
+            fallback_plan = prepare_call_db(binding, values)
+            return _FastdbFinalBackingWritePlan(
+                binding,
+                values,
+                direct_nbytes=None,
+                fallback_plan=fallback_plan,
+                fallback_reason=str(exc),
+            )
+        return _FastdbFinalBackingWritePlan(
+            binding,
+            values,
+            direct_nbytes=direct_nbytes,
+            fallback_plan=None,
+            fallback_reason=None,
+        )
 
     def deserialize_values(self, data: bytes | bytearray | memoryview) -> object:
         self._validate_identity()
@@ -259,6 +296,306 @@ class FastdbCallPlan:
             raise ValueError(f'{self.profile} does not support retained buffer views.')
         _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
         return view_call_db(self.fastdb_binding, data).logical_value()
+
+    @property
+    def supports_output_build_context(self) -> bool:
+        if self.direction != 'output' or self.profile != CALL_DB_COLUMNAR_PROFILE:
+            return False
+        aggregate_count = 0
+        for table in self.tables:
+            if table.kind == 'scalars':
+                if not _scalar_fields_support_direct_context(table):
+                    return False
+                continue
+            if table.kind == 'array':
+                aggregate_count += 1
+                if table.array_item is None or table.array_item.get('kind') not in _DIRECT_CONTEXT_FIELD_KINDS:
+                    return False
+                continue
+            if table.kind == 'feature':
+                if table.cardinality == 'many':
+                    aggregate_count += 1
+                elif table.cardinality != 'one':
+                    return False
+                if not _feature_table_supports_direct_context(table):
+                    return False
+                continue
+            return False
+        return aggregate_count > 0
+
+    def output_build_context(self, allocator: object) -> object:
+        if not self.supports_output_build_context:
+            raise FastdbUnsupportedDirectBuildError(
+                'FastDB output build context requires fixed columnar Batch/Array output.',
+            )
+        return _FastdbOutputBuildContext(self, allocator)
+
+
+class _FastdbOutputBuildContext:
+    def __init__(self, plan: FastdbCallPlan, native_allocator: object):
+        self._plan = plan
+        self._allocator = _FastdbResponseFinalBackingAllocator(native_allocator)
+        self._context = call_db_build_context(plan.fastdb_binding, self._allocator)
+
+    def __enter__(self) -> '_FastdbOutputBuildContext':
+        self._context.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._context.__exit__(exc_type, exc, tb)
+
+    def prepare_write(self, *values: object) -> object:
+        value = values[0] if len(values) == 1 else values
+        return build_call_db(
+            self._plan.fastdb_binding,
+            value,
+            self._allocator,
+            direct_required=True,
+        )
+
+
+class _FastdbResponseFinalBackingAllocation:
+    def __init__(self, native_allocation: object):
+        self._native_allocation = native_allocation
+
+    @property
+    def buffer(self) -> memoryview:
+        return memoryview(self._native_allocation)
+
+    def commit(self, used_size: int) -> object:
+        self._native_allocation.commit(used_size)
+        return self._native_allocation
+
+    def rollback(self) -> None:
+        self._native_allocation.rollback()
+
+
+class _FastdbResponseFinalBackingAllocator:
+    def __init__(self, native_allocator: object):
+        self._native_allocator = native_allocator
+
+    def allocate(self, nbytes: int) -> _FastdbResponseFinalBackingAllocation:
+        return _FastdbResponseFinalBackingAllocation(
+            self._native_allocator.allocate(nbytes),
+        )
+
+
+def _scalar_fields_support_direct_context(table: FastdbCallTableSpec) -> bool:
+    return all(
+        field.get('kind') in _DIRECT_CONTEXT_FIELD_KINDS
+        for field in table.scalar_fields
+    )
+
+
+def _feature_table_supports_direct_context(table: FastdbCallTableSpec) -> bool:
+    schema = table.feature_schema
+    if schema is None:
+        return False
+    return all(
+        field.get('kind') in _DIRECT_CONTEXT_FIELD_KINDS
+        for field in schema.get('fields', ())
+    )
+
+
+def _has_fastdb_require_envelope(values: object) -> bool:
+    if isinstance(values, tuple):
+        return any(_has_fastdb_require_envelope(value) for value in values)
+    return getattr(values, '_fastdb_require_envelope', None) is not None
+
+
+class _FastdbExistingBufferWritePlan:
+    def __init__(self, payload: memoryview):
+        self._payload = payload.cast('B')
+        self.direct = True
+        self.byte_length = self._payload.nbytes
+        self.nbytes = self.byte_length
+        self.build_mode = 'exported'
+        self.fallback_reason = None
+
+    def write_into(self, destination: object) -> None:
+        dst = memoryview(destination).cast('B')
+        try:
+            if dst.readonly:
+                raise TypeError('FastDB final backing destination must be writable.')
+            if dst.nbytes != self.nbytes:
+                raise ValueError(
+                    f'FastDB final backing destination size {dst.nbytes} '
+                    f'does not match planned size {self.nbytes}.',
+                )
+            dst[:] = self._payload
+        finally:
+            dst.release()
+
+    def to_bytes(self) -> bytes:
+        return self._payload.tobytes()
+
+
+class _DestinationAllocation:
+    def __init__(self, destination: object, expected_size: int):
+        self._state = 'open'
+        self.used_size: int | None = None
+        self._buffer = memoryview(destination)
+        if self._buffer.readonly:
+            self._release_buffer()
+            raise TypeError('FastDB final backing destination must be writable.')
+        actual_size = self._buffer.nbytes
+        if actual_size != expected_size:
+            self._release_buffer()
+            raise ValueError(
+                f'FastDB final backing destination size {actual_size} '
+                f'does not match planned size {expected_size}.',
+            )
+
+    @property
+    def buffer(self) -> memoryview:
+        if self._state != 'open':
+            raise RuntimeError(f'FastDB final backing allocation is {self._state}.')
+        if self._buffer is None:
+            raise RuntimeError('FastDB final backing allocation buffer is closed.')
+        return self._buffer
+
+    def commit(self, used_size: int) -> object:
+        if self._state != 'open':
+            raise RuntimeError(f'FastDB final backing allocation is {self._state}.')
+        if self._buffer is None:
+            raise RuntimeError('FastDB final backing allocation buffer is closed.')
+        if type(used_size) is not int or used_size < 0 or used_size > self._buffer.nbytes:
+            raise ValueError('used_size must fit within the FastDB final backing destination.')
+        self.used_size = used_size
+        self._state = 'committed'
+        self._release_buffer()
+        return self
+
+    def rollback(self) -> None:
+        if self._state != 'open':
+            return
+        self._state = 'rolled_back'
+        self._release_buffer()
+
+    def close(self) -> None:
+        if self._state == 'open':
+            self.rollback()
+            return
+        self._release_buffer()
+
+    def _release_buffer(self) -> None:
+        if self._buffer is None:
+            return
+        try:
+            self._buffer.release()
+        except ValueError:
+            pass
+        self._buffer = None
+
+
+class _DestinationAllocator:
+    def __init__(self, destination: object, expected_size: int):
+        self._destination = destination
+        self._expected_size = expected_size
+        self.allocation: _DestinationAllocation | None = None
+
+    def allocate(self, nbytes: int) -> _DestinationAllocation:
+        if self.allocation is not None:
+            raise RuntimeError('FastDB final backing allocator is one-shot.')
+        if nbytes != self._expected_size:
+            raise ValueError(
+                f'FastDB requested {nbytes} bytes, expected {self._expected_size}.',
+            )
+        allocation = _DestinationAllocation(self._destination, self._expected_size)
+        self.allocation = allocation
+        return allocation
+
+    def close(self) -> None:
+        if self.allocation is not None:
+            self.allocation.close()
+        self._destination = None
+
+
+class _DirectBuildProbe(Exception):
+    def __init__(self, nbytes: int):
+        super().__init__(nbytes)
+        self.nbytes = nbytes
+
+
+class _ProbeAllocator:
+    def allocate(self, nbytes: int) -> object:
+        raise _DirectBuildProbe(nbytes)
+
+
+def _probe_final_backing_direct_size(binding: FastdbCallDbBinding, values: object) -> int:
+    try:
+        build_call_db(binding, values, _ProbeAllocator(), direct_required=True)
+    except _DirectBuildProbe as probe:
+        return probe.nbytes
+    raise RuntimeError('FastDB final backing direct probe completed without requesting allocation.')
+
+
+def _plan_byte_length(plan: object) -> int:
+    value = getattr(plan, 'byte_length', None)
+    if value is None:
+        value = getattr(plan, 'nbytes')
+    return int(value)
+
+
+class _FastdbFinalBackingWritePlan:
+    def __init__(
+        self,
+        binding: FastdbCallDbBinding,
+        values: object,
+        *,
+        direct_nbytes: int | None,
+        fallback_plan: object | None,
+        fallback_reason: str | None,
+    ):
+        if direct_nbytes is None and fallback_plan is None:
+            raise ValueError('FastDB write plan requires a direct or fallback plan.')
+        self._binding = binding
+        self._values = values
+        self._direct_nbytes = direct_nbytes
+        self._fallback_plan = fallback_plan
+        self.direct = direct_nbytes is not None
+        self.byte_length = (
+            direct_nbytes
+            if direct_nbytes is not None
+            else _plan_byte_length(fallback_plan)
+        )
+        self.nbytes = self.byte_length
+        self.build_mode = (
+            'direct-final-backing'
+            if self.direct
+            else str(getattr(fallback_plan, 'build_mode', 'fallback'))
+        )
+        self.fallback_reason = (
+            None
+            if self.direct
+            else fallback_reason or getattr(fallback_plan, 'fallback_reason', None)
+        )
+
+    def write_into(self, destination: object) -> None:
+        if not self.direct:
+            self._fallback_plan.write_into(destination)  # type: ignore[union-attr]
+            return
+
+        allocator = _DestinationAllocator(destination, self.nbytes)
+        try:
+            build_call_db(
+                self._binding,
+                self._values,
+                allocator,
+                direct_required=True,
+            )
+            allocation = allocator.allocation
+            if allocation is None or allocation.used_size != self.nbytes:
+                raise RuntimeError('FastDB final backing build did not commit the planned payload size.')
+        finally:
+            allocator.close()
+
+    def to_bytes(self) -> bytes:
+        if not self.direct:
+            return self._fallback_plan.to_bytes()  # type: ignore[union-attr]
+        payload = bytearray(self.nbytes)
+        self.write_into(payload)
+        return bytes(payload)
 
 
 def plan_call_db_input(
@@ -564,6 +901,12 @@ def _ensure_object_graph_call_supported(tables: list[FastdbCallTableSpec]) -> No
 
 
 def _fastdb_runtime_table(table: FastdbCallTableSpec) -> FastdbCallDbTable:
+    dependency_features_by_hash: dict[str, type] = {}
+    if table.feature_type is not None:
+        dependency_features_by_hash = {
+            schema_sha256(export_schema(feature_type)): feature_type
+            for feature_type in _feature_dependency_types(table.feature_type)
+        }
     return FastdbCallDbTable(
         cardinality=table.cardinality,
         feature=table.feature_type,
@@ -574,6 +917,7 @@ def _fastdb_runtime_table(table: FastdbCallTableSpec) -> FastdbCallDbTable:
         ),
         feature_schema_dependencies=tuple(
             FastdbCallDbFeatureDependency(
+                feature=dependency_features_by_hash.get(schema_sha256(dependency)),
                 feature_schema_sha256=schema_sha256(dependency),
             )
             for dependency in table.feature_schema_dependencies
@@ -600,6 +944,38 @@ def _fastdb_runtime_table(table: FastdbCallTableSpec) -> FastdbCallDbTable:
         parameter=table.parameter,
         return_index=table.return_index,
         value_position=table.value_position,
+    )
+
+
+def _feature_dependency_types(feature_type: type) -> tuple[type, ...]:
+    dependencies: dict[str, type] = {}
+    visiting: set[type] = set()
+
+    def visit(current: type) -> None:
+        if current in visiting:
+            return
+        visiting.add(current)
+        schema = get_schema(current)
+        for field in schema.ref_fields:
+            visit_target(field.ref_target)
+        for field in schema.list_ref_fields:
+            visit_target(field.list_ref_target)
+        visiting.remove(current)
+
+    def visit_target(target: type | None) -> None:
+        if target is None or not is_feature(target):
+            return
+        identity = export_schema(target)['feature']['identity']
+        if identity not in dependencies:
+            dependencies[identity] = target
+            visit(target)
+
+    visit(feature_type)
+    root_identity = export_schema(feature_type)['feature']['identity']
+    dependencies.pop(root_identity, None)
+    return tuple(
+        dependencies[identity]
+        for identity in sorted(dependencies)
     )
 
 
@@ -1143,6 +1519,11 @@ def _method_payload_binding_for(plan: FastdbCallPlan) -> object:
         def view_from_buffer(data: memoryview, _plan=plan):
             return _plan.view_from_buffer(data)
 
+    build_context = None
+    if plan.supports_output_build_context:
+        def build_context(allocator: object, _plan=plan):
+            return _plan.output_build_context(allocator)
+
     suffix = f'{plan.method_name}_{plan.direction}_{payload_abi_ref["schema_sha256"][:10]}'
     binding = PayloadBinding(
         kind=PayloadPlanKind.FDB,
@@ -1152,6 +1533,7 @@ def _method_payload_binding_for(plan: FastdbCallPlan) -> object:
         payload_abi_ref=payload_abi_ref,
         payload_abi_artifacts=_plan_payload_abi_artifacts(plan),
         view_from_buffer=view_from_buffer,
+        build_context=build_context,
         label=f'FastdbC2Call{_safe_identifier(suffix)}',
     )
     _METHOD_PAYLOAD_BINDING_CACHE[key] = binding

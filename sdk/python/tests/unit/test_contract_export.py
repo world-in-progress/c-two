@@ -61,6 +61,36 @@ def test_contract_descriptor_diagnostics_report_python_only_and_non_fastdb_paths
         ('echo', 'output', 'python_only_pickle'),
     ]
 
+
+def test_contract_descriptor_diagnostics_report_mixed_fastdb_and_python_payload_mode():
+    import fastdb4py as fdb
+
+    @cc.crm(namespace='test.contract-diagnostics', version='0.1.0')
+    class MixedPayloadMode:
+        def convert(self, value: int) -> fdb.I32:
+            ...
+
+    diagnostics = cc.contract_descriptor_diagnostics(MixedPayloadMode)
+
+    assert any(
+        item['code'] == 'mixed_fastdb_python_payload_mode'
+        and item['method'] == 'convert'
+        and item['severity'] == 'warning'
+        for item in diagnostics
+    )
+
+
+def test_contract_descriptor_diagnostics_are_empty_for_fully_fastdb_portable_mode():
+    import fastdb4py as fdb
+
+    @cc.crm(namespace='test.contract-diagnostics', version='0.1.0')
+    class FastdbPortable:
+        def echo(self, value: fdb.I32) -> fdb.I32:
+            ...
+
+    assert cc.contract_descriptor_diagnostics(FastdbPortable) == []
+
+
 def test_export_contract_descriptor_returns_canonical_portable_json():
     import fastdb4py as fdb
 

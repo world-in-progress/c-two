@@ -507,11 +507,11 @@ class NativeServerBridge:
 
     def _make_dispatcher(
         self, route_name: str, slot: CRMSlot,
-    ) -> Callable[[str, int, object], object]:
+    ) -> Callable[[str, int, object, object], object]:
         """Build the Python callable passed into native route registration.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
-        held.  Signature: ``(route_name, method_idx, shm_buffer)``.
+        held.  Signature: ``(route_name, method_idx, shm_buffer, response_allocator)``.
         It reads the request via ``memoryview(shm_buffer)``, resolves the
         method, calls the resource, and returns serialized result data (or
         *None* for empty responses). Rust native code owns the response
@@ -528,6 +528,7 @@ class NativeServerBridge:
         def dispatch(
             _route_name: str, method_idx: int,
             request_buf: object,
+            response_allocator: object,
         ) -> object:
             # 1. Resolve method
             method_name = idx_to_name.get(method_idx)
@@ -559,6 +560,7 @@ class NativeServerBridge:
                         mv,
                         _release_fn=release_fn,
                         _c2_input_buffer_mode=buffer_mode,
+                        _c2_output_allocator=response_allocator,
                     )
                 finally:
                     if not released:
@@ -589,6 +591,7 @@ class NativeServerBridge:
                         mv,
                         _release_fn=release_fn,
                         _c2_input_buffer_mode=buffer_mode,
+                        _c2_output_allocator=response_allocator,
                     )
                 except Exception:
                     if not released:

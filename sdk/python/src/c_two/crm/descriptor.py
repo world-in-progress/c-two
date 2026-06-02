@@ -201,6 +201,9 @@ def contract_descriptor_diagnostics(
             )
             if diagnostic is not None:
                 diagnostics.append(diagnostic)
+        diagnostic = _fastdb_first_method_payload_mode_diagnostic(method_name, wire)
+        if diagnostic is not None:
+            diagnostics.append(diagnostic)
     return _dedupe_diagnostics(diagnostics)
 
 
@@ -766,6 +769,37 @@ def _fastdb_first_wire_diagnostic(
             ),
         }
     return None
+
+
+def _fastdb_first_method_payload_mode_diagnostic(
+    method_name: str,
+    wire: dict[str, Any],
+) -> dict[str, Any] | None:
+    modes = {
+        _fastdb_first_wire_mode(wire.get(position))
+        for position in ('input', 'output')
+    }
+    if {'fastdb_call_db', 'python_pickle'} <= modes:
+        return {
+            'code': 'mixed_fastdb_python_payload_mode',
+            'message': (
+                f'{method_name} mixes FastDB call-db and Python pickle payloads; '
+                'author the method as fully FastDB portable or keep it Python-only.'
+            ),
+            'method': method_name,
+            'severity': 'warning',
+        }
+    return None
+
+
+def _fastdb_first_wire_mode(wire_ref: dict[str, Any] | None) -> str:
+    if wire_ref is None:
+        return 'no_payload'
+    if wire_ref.get('family') == 'python-pickle-default':
+        return 'python_pickle'
+    if wire_ref.get('kind') == 'codec_ref' and wire_ref.get('id') == 'org.fastdb.call-db':
+        return 'fastdb_call_db'
+    return 'other'
 
 
 def _canonical_json(value: object) -> str:

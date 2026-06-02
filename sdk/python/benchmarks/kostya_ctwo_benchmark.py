@@ -8,15 +8,24 @@ transporting coordinate records:
 Strategies:
   * pickle-records       : list[dict] over Python pickle
   * pickle-arrays        : numpy arrays + string list over Python pickle
-  * fastdb-normal        : prepared fdb.Batch[Coord] call, owned-buffer safe columns
-  * fastdb-hold          : prepared fdb.Batch[Coord] held response, safe owner-checked columns
-  * fastdb-hold-unsafe   : prepared fdb.Batch[Coord] held response, explicit unsafe numpy views
-  * fastdb-require-*     : same FastDB CRM, but resource payload is allocated
-                           through fdb.require(fdb.batch(...))
+  * fastdb-control-*               : control path using ordinary
+                                     fdb.Batch.allocate(...), showing call-db
+                                     repack cost outside the recommended
+                                     resource output construction path
+  * fastdb-require-*               : payload built through
+                                     fdb.require(fdb.batch(...)); useful for
+                                     measuring the recommended construction
+                                     path, transport, and retained-view cost
+  * fastdb-numeric-control-*       : numeric-only control path used
+                                     to isolate string and field-layout cost
+  * fastdb-numeric-require-runtime-*:
+                                     resource builds the numeric payload each
+                                     call through fdb.require(...); useful for
+                                     measuring resource-time construction cost
 
 Run:
     C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/kostya_ctwo_benchmark.py \
-        --variant fastdb-hold --n 100000 --iters 20
+        --variant fastdb-require-retained --n 100000 --iters 20
 """
 from __future__ import annotations
 
@@ -50,6 +59,17 @@ class Coord:
 
 
 Coord.__module__ = _BENCH_SCHEMA_MODULE
+
+
+@fdb.feature
+class CoordNumeric:
+    row_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
+    z: fdb.F64
+
+
+CoordNumeric.__module__ = _BENCH_SCHEMA_MODULE
 
 
 @dataclass
@@ -94,6 +114,12 @@ class ICoordFastdb:
         ...
 
 
+@cc.crm(namespace='bench.kostya.fastdb.numeric', version='0.1.0')
+class ICoordFastdbNumeric:
+    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
+        ...
+
+
 def _coord_names(n: int) -> list[str]:
     return [f'coord_{i % 50000:05d}' for i in range(n)]
 
@@ -113,7 +139,7 @@ def _make_coord_arrays(n: int) -> CoordArrays:
     )
 
 
-def _make_coord_batch(n: int) -> fdb.Batch[Coord]:
+def _make_coord_control_batch(n: int) -> fdb.Batch[Coord]:
     idx = _coord_index(n)
     batch = fdb.Batch.allocate(Coord, n)
     batch.fill(
@@ -122,6 +148,18 @@ def _make_coord_batch(n: int) -> fdb.Batch[Coord]:
         y=idx.astype(np.float64) * 0.2,
         z=idx.astype(np.float64) * 0.3,
         name=_coord_names(n),
+    )
+    return batch
+
+
+def _make_coord_numeric_control_batch(n: int) -> fdb.Batch[CoordNumeric]:
+    idx = _coord_index(n)
+    batch = fdb.Batch.allocate(CoordNumeric, n)
+    batch.fill(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
     )
     return batch
 
@@ -135,6 +173,18 @@ def _make_coord_require_batch(n: int) -> fdb.Batch[Coord]:
         y=idx.astype(np.float64) * 0.2,
         z=idx.astype(np.float64) * 0.3,
         name=_coord_names(n),
+    )
+    return batch
+
+
+def _make_coord_numeric_require_batch(n: int) -> fdb.Batch[CoordNumeric]:
+    idx = _coord_index(n)
+    batch = fdb.require(fdb.batch(CoordNumeric, rows=n))
+    batch.fill(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
     )
     return batch
 
@@ -164,9 +214,9 @@ class CoordArraysCRM:
         return self._payload
 
 
-class CoordFastdbCRM:
+class CoordFastdbControlCRM:
     def __init__(self, n: int):
-        self._payload = _make_coord_batch(n)
+        self._payload = _make_coord_control_batch(n)
 
     def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
         return self._payload
@@ -178,6 +228,22 @@ class CoordFastdbRequireCRM:
 
     def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
         return self._payload
+
+
+class CoordFastdbNumericControlCRM:
+    def __init__(self, n: int):
+        self._payload = _make_coord_numeric_control_batch(n)
+
+    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
+        return self._payload
+
+
+class CoordFastdbNumericRequireCRM:
+    def __init__(self, n: int):
+        self._n = n
+
+    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
+        return _make_coord_numeric_require_batch(self._n)
 
 
 def consume_records(payload: CoordRecords) -> float:
@@ -246,39 +312,75 @@ VARIANTS: dict[str, VariantSpec] = {
         consumer=consume_arrays,
         use_hold=False,
     ),
-    'fastdb-normal': VariantSpec(
+    'fastdb-control-default': VariantSpec(
         contract=ICoordFastdb,
-        resource_factory=CoordFastdbCRM,
+        resource_factory=CoordFastdbControlCRM,
         consumer=consume_fastdb_safe,
         use_hold=False,
     ),
-    'fastdb-hold': VariantSpec(
+    'fastdb-control-retained': VariantSpec(
         contract=ICoordFastdb,
-        resource_factory=CoordFastdbCRM,
+        resource_factory=CoordFastdbControlCRM,
         consumer=consume_fastdb_safe,
         use_hold=True,
     ),
-    'fastdb-hold-unsafe': VariantSpec(
+    'fastdb-control-retained-unsafe': VariantSpec(
         contract=ICoordFastdb,
-        resource_factory=CoordFastdbCRM,
+        resource_factory=CoordFastdbControlCRM,
         consumer=consume_fastdb_unsafe,
         use_hold=True,
     ),
-    'fastdb-require-normal': VariantSpec(
+    'fastdb-require-default': VariantSpec(
         contract=ICoordFastdb,
         resource_factory=CoordFastdbRequireCRM,
         consumer=consume_fastdb_safe,
         use_hold=False,
     ),
-    'fastdb-require-hold': VariantSpec(
+    'fastdb-require-retained': VariantSpec(
         contract=ICoordFastdb,
         resource_factory=CoordFastdbRequireCRM,
         consumer=consume_fastdb_safe,
         use_hold=True,
     ),
-    'fastdb-require-hold-unsafe': VariantSpec(
+    'fastdb-require-retained-unsafe': VariantSpec(
         contract=ICoordFastdb,
         resource_factory=CoordFastdbRequireCRM,
+        consumer=consume_fastdb_unsafe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-control-default': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericControlCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=False,
+    ),
+    'fastdb-numeric-control-retained': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericControlCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-control-retained-unsafe': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericControlCRM,
+        consumer=consume_fastdb_unsafe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-require-runtime-default': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=False,
+    ),
+    'fastdb-numeric-require-runtime-retained': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-require-runtime-retained-unsafe': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericRequireCRM,
         consumer=consume_fastdb_unsafe,
         use_hold=True,
     ),

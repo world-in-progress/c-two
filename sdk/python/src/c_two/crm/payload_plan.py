@@ -29,6 +29,7 @@ class PayloadBinding:
     payload_abi_ref: PayloadAbiRef | dict[str, Any] | None = None
     payload_abi_artifacts: Iterable[dict[str, Any]] = ()
     view_from_buffer: Callable[[memoryview], object] | None = None
+    build_context: Callable[[object], object] | None = None
     label: str = ''
 
     def __post_init__(self) -> None:

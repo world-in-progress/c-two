@@ -27,6 +27,7 @@ use c2_server::{
     RequestData, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerRuntimeBuilder,
 };
 
+use crate::response_backing::{PyResponseFinalBackingAllocator, try_response_final_backing_meta};
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 use crate::shm_buffer::PyShmBuffer;
 use crate::writable_sink::{prepared_plan_nbytes, write_python_payload_plan};
@@ -82,8 +83,22 @@ impl CrmCallback for PyCrmCallback {
             let buf_obj = Py::new(py, shm_buf)
                 .map_err(|e| CrmError::InternalError(format!("failed to create ShmBuffer: {e}")))?;
 
-            // Call Python: dispatcher(route_name, method_idx, shm_buffer)
-            let args = (route_name, method_idx, buf_obj);
+            let response_allocator = Py::new(
+                py,
+                PyResponseFinalBackingAllocator::new(
+                    Arc::clone(&response_pool),
+                    self.shm_threshold,
+                    self.max_payload_size,
+                ),
+            )
+            .map_err(|e| {
+                CrmError::InternalError(format!(
+                    "failed to create response final backing allocator: {e}"
+                ))
+            })?;
+
+            // Call Python: dispatcher(route_name, method_idx, shm_buffer, response_allocator)
+            let args = (route_name, method_idx, buf_obj, response_allocator);
             match self.py_callable.call1(py, args) {
                 Ok(result) => parse_response_meta(
                     py,
@@ -427,6 +442,12 @@ fn parse_response_meta(
         return Ok(ResponseMeta::Empty);
     }
 
+    if let Some(meta) = try_response_final_backing_meta(result)
+        .map_err(|e| resource_output_error(format!("prepared response backing failed: {e}")))?
+    {
+        return Ok(meta);
+    }
+
     // Prepared write plan → native response selection with direct destination fill.
     if let Some(len) = prepared_plan_nbytes(result)
         .map_err(|e| resource_output_error(format!("prepared response size failed: {e}")))?
@@ -443,8 +464,9 @@ fn parse_response_meta(
             return Ok(meta);
         }
         let mut data = allocate_response_vec(len)?;
-        write_python_payload_plan(py, result, &mut data)
-            .map_err(|e| resource_output_error(format!("failed to write prepared response: {e}")))?;
+        write_python_payload_plan(py, result, &mut data).map_err(|e| {
+            resource_output_error(format!("failed to write prepared response: {e}"))
+        })?;
         return Ok(ResponseMeta::Inline(data));
     }
 

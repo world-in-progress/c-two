@@ -119,6 +119,66 @@ class FastdbPortable:
     assert method['wire']['output']['portable'] is True
 
 
+def test_fastdb_abi_distinguishes_columnar_vertices_from_object_graph_nodes():
+    import c_two as cc
+    import fastdb4py as fdb
+
+    namespace = {'cc': cc, 'fdb': fdb}
+    source = """
+@fdb.feature
+class Vertex:
+    vertex_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
+    z: fdb.F64
+
+@fdb.feature
+class Node:
+    node_id: fdb.U32
+    weight: fdb.F64
+    anchor: Vertex
+    neighbors: list[Vertex]
+
+@cc.crm(namespace='test.fastdb-abi', version='0.1.0')
+class Mesh:
+    def vertices(self) -> fdb.Batch[Vertex]:
+        ...
+
+    def nodes(self) -> fdb.Batch[Node]:
+        ...
+"""
+    exec(compile(source, '<fastdb_vertex_node_abi>', 'exec', dont_inherit=True), namespace)
+    Mesh = namespace['Mesh']
+
+    descriptor = json.loads(cc.export_contract_descriptor(Mesh))
+    methods = {method['name']: method for method in descriptor['methods']}
+
+    vertex_output = methods['vertices']['wire']['output']
+    node_output = methods['nodes']['wire']['output']
+
+    assert vertex_output['id'] == 'org.fastdb.call-db'
+    assert 'buffer-view' in vertex_output['capabilities']
+    assert node_output['id'] == 'org.fastdb.call-db'
+    assert node_output['capabilities'] == ['bytes']
+
+    vertex_binding = Mesh.vertices._output_payload_binding
+    node_binding = Mesh.nodes._output_payload_binding
+
+    assert vertex_binding.supports_retained_view is True
+    assert node_binding.supports_retained_view is False
+
+    node_artifacts = list(node_binding.payload_abi_artifacts)
+    call_schema = next(
+        artifact for artifact in node_artifacts
+        if artifact.get('schema') == 'fastdb.call-db.schema.v1'
+    )
+    assert call_schema['profile'] == 'fastdb.call.object-graph.v1'
+    node_table = call_schema['tables'][0]
+    assert node_table['feature']['name'] == 'Node'
+    assert node_table['feature_schema_dependencies']
+    assert node_table['feature_schema_dependencies'][0]['feature']['name'] == 'Vertex'
+
+
 def test_fastdb_abi_diagnostics_explain_rejected_shapes_without_extra_setup():
     import c_two as cc
     import fastdb4py as fdb
@@ -314,6 +374,78 @@ class PreparedContract:
     assert list(decoded_right.column.x) == [3.0, 4.0, 5.0]
 
 
+def test_fastdb_payload_binding_direct_writer_uses_final_backing_allocator(monkeypatch):
+    import c_two as cc
+    import fastdb4py as fdb
+    from fastdb4py import call_db as fdb_call_db
+    import numpy as np
+
+    namespace = {'cc': cc, 'fdb': fdb}
+    exec(compile("""
+@fdb.feature
+class DirectAllocatorPoint:
+    x: fdb.F64
+
+@cc.crm(namespace='test.fastdb-abi', version='0.1.0')
+class DirectAllocatorContract:
+    def points(self) -> fdb.Batch[DirectAllocatorPoint]:
+        ...
+""", '<fastdb_direct_allocator_binding>', 'exec', dont_inherit=True), namespace)
+    DirectAllocatorContract = namespace['DirectAllocatorContract']
+    DirectAllocatorPoint = namespace['DirectAllocatorPoint']
+    binding = DirectAllocatorContract.points._output_payload_binding
+
+    points = fdb.Batch.allocate(DirectAllocatorPoint, 3)
+    points.fill(x=np.array([1.0, 2.0, 3.0], dtype=np.float64))
+
+    def fail_prepared_write(self, destination):
+        raise AssertionError('C-Two direct allocator path must not use FastdbPreparedCallDb.write_into')
+
+    monkeypatch.setattr(fdb_call_db.FastdbPreparedCallDb, 'write_into', fail_prepared_write)
+
+    write_plan = binding.prepare_write(points)
+    destination = bytearray(write_plan.nbytes)
+
+    write_plan.write_into(destination)
+    decoded = binding.deserialize(destination)
+
+    assert getattr(write_plan, 'direct', False) is True
+    assert getattr(write_plan, 'build_mode', '') != 'fallback'
+    assert binding.build_context is not None
+    assert list(decoded.column.x) == [1.0, 2.0, 3.0]
+
+
+def test_fastdb_payload_binding_keeps_unsupported_direct_as_fallback():
+    import c_two as cc
+    import fastdb4py as fdb
+
+    namespace = {'cc': cc, 'fdb': fdb}
+    exec(compile("""
+@cc.crm(namespace='test.fastdb-abi', version='0.1.0')
+class FallbackStringArrayContract:
+    def values(self) -> fdb.Array[fdb.STR]:
+        ...
+""", '<fastdb_direct_allocator_fallback_binding>', 'exec', dont_inherit=True), namespace)
+    FallbackStringArrayContract = namespace['FallbackStringArrayContract']
+    binding = FallbackStringArrayContract.values._output_payload_binding
+
+    values = fdb.Array.allocate(fdb.STR, 2)
+    values.fill(['left', 'right'])
+
+    write_plan = binding.prepare_write(values)
+    destination = bytearray(write_plan.nbytes)
+
+    write_plan.write_into(destination)
+    decoded = binding.deserialize(destination)
+
+    assert getattr(write_plan, 'direct', True) is False
+    assert getattr(write_plan, 'build_mode', '') == 'fallback'
+    assert isinstance(getattr(write_plan, 'fallback_reason', None), str)
+    assert getattr(write_plan, 'fallback_reason')
+    assert binding.build_context is None
+    assert list(decoded) == ['left', 'right']
+
+
 def test_fastdb_payload_binding_prepares_require_envelope_values():
     import c_two as cc
     import fastdb4py as fdb
@@ -345,6 +477,7 @@ class RequirePreparedContract:
 
     assert binding.prepare_write is not None
     assert getattr(write_plan, 'direct', False) is True
+    assert getattr(write_plan, 'build_mode', '') == 'direct-layer-splice'
     assert list(decoded.column.x) == [10.0, 20.0, 30.0]
 
 

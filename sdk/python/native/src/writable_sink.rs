@@ -6,12 +6,21 @@ use pyo3::exceptions::{PyAttributeError, PyBufferError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-#[pyclass(name = "WritablePayloadSink", unsendable)]
+#[pyclass(name = "WritablePayloadSink")]
 pub(crate) struct PyWritablePayloadSink {
     ptr: *mut u8,
     len: usize,
     active: AtomicBool,
 }
+
+// The sink is a call-scoped buffer-protocol facade over memory owned by the
+// native request/response writer. Dropping or inspecting the Python object on
+// another thread is safe because Rust never dereferences `ptr` outside
+// `__getbuffer__`; active buffer acquisition is fenced by `active`, and
+// existing exported buffers remain the caller's unsafe responsibility until the
+// write callback returns.
+unsafe impl Send for PyWritablePayloadSink {}
+unsafe impl Sync for PyWritablePayloadSink {}
 
 impl PyWritablePayloadSink {
     fn new(ptr: *mut u8, len: usize) -> Self {
@@ -47,7 +56,9 @@ impl PyWritablePayloadSink {
             return Err(PyBufferError::new_err("writable payload sink is closed"));
         }
         if this.ptr.is_null() {
-            return Err(PyBufferError::new_err("writable payload sink has no buffer"));
+            return Err(PyBufferError::new_err(
+                "writable payload sink has no buffer",
+            ));
         }
         unsafe {
             (*view).buf = this.ptr as *mut std::os::raw::c_void;
@@ -117,9 +128,6 @@ pub(crate) fn write_python_payload_plan(
     let result = plan.call_method1("write_into", (sink_bound,));
     sink_bound.borrow().close_inner();
     result.map(|_| ()).map_err(|err| {
-        PyValueError::new_err(format!(
-            "prepared payload write failed: {}",
-            err.value(py)
-        ))
+        PyValueError::new_err(format!("prepared payload write failed: {}", err.value(py)))
     })
 }
