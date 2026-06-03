@@ -2,22 +2,33 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from fastdb4py import core
-from fastdb4py.column_engine import ColumnEngine, _get_default_table_build
+from fastdb4py import (
+    CALL_DB_CODEC_ID as FASTDB_CALL_DB_CODEC_ID,
+    CALL_DB_COLUMNAR_PROFILE as FASTDB_CALL_DB_COLUMNAR_PROFILE,
+    CALL_DB_OBJECT_GRAPH_PROFILE as FASTDB_CALL_DB_OBJECT_GRAPH_PROFILE,
+    CALL_DB_SCHEMA_VERSION as FASTDB_CALL_DB_SCHEMA_VERSION,
+    FastdbCallDbArrayItem,
+    FastdbCallDbBinding,
+    FastdbCallDbFeatureDependency,
+    FastdbCallDbScalarField,
+    FastdbCallDbTable,
+    FastdbUnsupportedDirectBuildError,
+    build_call_db,
+    call_db_build_context,
+    decode_call_db,
+    encode_call_db,
+    prepare_call_db,
+    try_export_call_db,
+    view_call_db,
+)
 from fastdb4py.decorator import feature
-from fastdb4py.object_engine import LayerState, ObjectEngine
-from fastdb4py.orm.table import Table
 from fastdb4py.registry import (
     get_schema,
     is_feature,
-    lookup_class,
-    non_native_list_storage_diagnostics,
-    raw_payload_storage_diagnostics,
 )
 from fastdb4py.schema import (
     columnar_capability,
@@ -36,15 +47,14 @@ from fastdb4py.type import (
     STR,
     WSTR,
     OriginFieldType,
-    coerce_bool_scalar,
     get_origin_type,
 )
 
-CALL_DB_SCHEMA_VERSION = 'fastdb.call-db.schema.v1'
-CALL_DB_CODEC_ID = 'org.fastdb.call-db'
+CALL_DB_SCHEMA_VERSION = FASTDB_CALL_DB_SCHEMA_VERSION
+CALL_DB_CODEC_ID = FASTDB_CALL_DB_CODEC_ID
 CALL_DB_CODEC_VERSION = '1'
-CALL_DB_COLUMNAR_PROFILE = 'fastdb.call.columnar.v1'
-CALL_DB_OBJECT_GRAPH_PROFILE = 'fastdb.call.object-graph.v1'
+CALL_DB_COLUMNAR_PROFILE = FASTDB_CALL_DB_COLUMNAR_PROFILE
+CALL_DB_OBJECT_GRAPH_PROFILE = FASTDB_CALL_DB_OBJECT_GRAPH_PROFILE
 _VALID_CALL_DB_PROFILES = {
     CALL_DB_COLUMNAR_PROFILE,
     CALL_DB_OBJECT_GRAPH_PROFILE,
@@ -80,6 +90,17 @@ _VALID_CALL_DB_SCALAR_KINDS = {
     *_SCALAR_KIND_BY_FIELD_TYPE.values(),
 }
 _PYTHON_BUILTIN_SCALARS = {bool, int, float, str}
+_DIRECT_CONTEXT_FIELD_KINDS = {
+    'bool',
+    'u8',
+    'u16',
+    'u32',
+    'i32',
+    'u8n',
+    'u16n',
+    'f32',
+    'f64',
+}
 
 
 @dataclass(frozen=True)
@@ -215,387 +236,366 @@ class FastdbCallPlan:
             raise ValueError(f'fastdb call-db plan has unsupported call-db profile {self.profile!r}.')
         _validate_crm_context(self.crm_context)
 
-    def serialize_values(self, values: object) -> bytes:
+    @property
+    def fastdb_binding(self) -> FastdbCallDbBinding:
+        """Return the generic FastDB runtime binding for this C-Two CRM plan."""
+        return FastdbCallDbBinding(
+            codec_id=CALL_DB_CODEC_ID,
+            direction=self.direction,
+            method=self.method_name,
+            profile=self.profile,
+            schema_sha256=self.schema_sha256,
+            tables=tuple(_fastdb_runtime_table(table) for table in self.tables),
+        )
+
+    def serialize_values(self, values: object) -> bytes | memoryview:
         self._validate_identity()
-        if self.profile == CALL_DB_OBJECT_GRAPH_PROFILE:
-            return self._serialize_values_object_graph(values)
-        normalized = self._normalize_values(values)
-        engine = ColumnEngine.create()
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                scalar_values = {
-                    field['name']: _coerce_scalar_value(
-                        field['kind'],
-                        normalized[table.scalar_positions[field_offset]],
-                    )
-                    for field_offset, field in enumerate(table.scalar_fields)
-                }
-                engine.push(self.scalar_feature_type(**scalar_values), table_name=table.name)
-                continue
-            if table.kind == 'array':
-                if table.feature_type is None:
-                    raise ValueError(f'array table {table.name!r} is missing runtime feature type.')
-                if table.value_position is None:
-                    raise ValueError(f'array table {table.name!r} is missing value position.')
-                items = _array_table_values(table, normalized[table.value_position])
-                if items:
-                    engine.push_many([
-                        table.feature_type(value=item)
-                        for item in items
-                    ], table_name=table.name)
-                else:
-                    _create_empty_feature_table(engine, table)
-                continue
-            if table.value_position is None:
-                raise ValueError(f'feature table {table.name!r} is missing value position.')
-            value = normalized[table.value_position]
-            if table.cardinality == 'many':
-                rows = _feature_table_rows(table, value)
-                if rows:
-                    engine.push_many(rows, table_name=table.name)
-                else:
-                    _create_empty_feature_table(engine, table)
-                continue
-            engine.push(value, table_name=table.name)
-        engine.combine()
-        chunk = engine._origin.buffer()  # noqa: SLF001
-        return chunk.to_bytes()
+        binding = self.fastdb_binding
+        exported = try_export_call_db(binding, values)
+        if exported is not None:
+            return exported
+        return encode_call_db(binding, values)
+
+    def prepare_write_values(self, values: object) -> object:
+        self._validate_identity()
+        binding = self.fastdb_binding
+        if _has_fastdb_require_envelope(values):
+            return prepare_call_db(binding, values)
+        exported = try_export_call_db(binding, values)
+        if exported is not None:
+            return _FastdbExistingBufferWritePlan(exported)
+        try:
+            direct_nbytes = _probe_final_backing_direct_size(binding, values)
+        except FastdbUnsupportedDirectBuildError as exc:
+            fallback_plan = prepare_call_db(binding, values)
+            return _FastdbFinalBackingWritePlan(
+                binding,
+                values,
+                direct_nbytes=None,
+                fallback_plan=fallback_plan,
+                fallback_reason=str(exc),
+            )
+        return _FastdbFinalBackingWritePlan(
+            binding,
+            values,
+            direct_nbytes=direct_nbytes,
+            fallback_plan=None,
+            fallback_reason=None,
+        )
 
     def deserialize_values(self, data: bytes | bytearray | memoryview) -> object:
         self._validate_identity()
         _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        if self.profile == CALL_DB_OBJECT_GRAPH_PROFILE:
-            engine = _object_engine_from_buffer(data, self.tables)
-            return self._materialize_values_object_graph(engine)
-        engine = _column_engine_from_buffer(data)
-        return self._materialize_values(engine)
+        if self.profile == CALL_DB_COLUMNAR_PROFILE:
+            return view_call_db(self.fastdb_binding, bytes(data)).logical_value()
+        return decode_call_db(self.fastdb_binding, data)
 
-    def view_from_buffer(self, data: memoryview) -> 'FastdbCallView':
+    def view_from_buffer(self, data: memoryview) -> object:
         self._validate_identity()
         if not self.supports_buffer_view:
             raise ValueError(f'{self.profile} does not support retained buffer views.')
-        if self.direction != 'output':
-            raise ValueError('call-db buffer views are only supported for output plans.')
         _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        return FastdbCallView(
-            plan=self,
-            engine=_column_engine_from_buffer(data),
-            buffer=data,
-        )
-
-    def _materialize_values(self, engine: ColumnEngine) -> object:
-        self._validate_identity()
-        values: list[Any] = [None] * _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                row = engine.table(self.scalar_feature_type, name=table.name)[0]
-                for field_offset, field in enumerate(table.scalar_fields):
-                    values[table.scalar_positions[field_offset]] = _materialize_scalar_value(
-                        field['kind'],
-                        getattr(row, field['name']),
-                    )
-                continue
-            if table.kind == 'array':
-                if table.feature_type is None:
-                    raise ValueError(f'array table {table.name!r} is missing feature type.')
-                if table.value_position is None:
-                    raise ValueError(f'array table {table.name!r} is missing value position.')
-                fastdb_table = engine.table(table.feature_type, name=table.name)
-                item_kind = _array_item_kind(table)
-                values[table.value_position] = [
-                    _materialize_scalar_value(
-                        item_kind,
-                        getattr(row, _ARRAY_VALUE_FIELD),
-                    )
-                    for row in fastdb_table
-                ]
-                continue
-            if table.feature_type is None:
-                raise ValueError(f'feature table {table.name!r} is missing feature type.')
-            if table.value_position is None:
-                raise ValueError(f'feature table {table.name!r} is missing value position.')
-            fastdb_table = engine.table(table.feature_type, name=table.name)
-            if table.cardinality == 'many':
-                values[table.value_position] = list(fastdb_table)
-            else:
-                values[table.value_position] = fastdb_table[0]
-
-        if self.direction == 'input':
-            return tuple(values)
-        if len(values) == 1:
-            return values[0]
-        return tuple(values)
-
-    def _serialize_values_object_graph(self, values: object) -> bytes:
-        self._validate_identity()
-        normalized = self._normalize_values(values)
-        engine = ObjectEngine.create()
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                scalar_values = {
-                    field['name']: _coerce_scalar_value(
-                        field['kind'],
-                        normalized[table.scalar_positions[field_offset]],
-                    )
-                    for field_offset, field in enumerate(table.scalar_fields)
-                }
-                engine.push(self.scalar_feature_type(**scalar_values))
-                continue
-            if table.value_position is None:
-                raise ValueError(f'table {table.name!r} is missing value position.')
-            value = normalized[table.value_position]
-            if table.kind == 'array':
-                if table.feature_type is None:
-                    raise ValueError(f'array table {table.name!r} is missing runtime feature type.')
-                items = _array_table_values(table, value)
-                if not items:
-                    engine._ensure_layer(table.feature_type)  # noqa: SLF001
-                    continue
-                for item in items:
-                    engine.push(table.feature_type(value=item))
-                continue
-            if table.feature_type is None:
-                raise ValueError(f'feature table {table.name!r} is missing feature type.')
-            if table.cardinality == 'many':
-                rows = _feature_table_rows(table, value)
-                if not rows:
-                    engine._ensure_layer(table.feature_type)  # noqa: SLF001
-                    continue
-                for item in rows:
-                    engine.push(item)
-                continue
-            engine.push(value)
-        engine.combine()
-        return bytes(engine._buffer)  # noqa: SLF001
-
-    def _materialize_values_object_graph(self, engine: ObjectEngine) -> object:
-        self._validate_identity()
-        values: list[Any] = [None] * _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        seen: dict[tuple[type, int], object] = {}
-        for table in self.tables:
-            if table.kind == 'scalars':
-                if self.scalar_feature_type is None:
-                    raise ValueError('scalar table is present but scalar feature type is missing.')
-                row = engine.get(self.scalar_feature_type, 0, mode='copy')
-                for field_offset, field in enumerate(table.scalar_fields):
-                    values[table.scalar_positions[field_offset]] = _materialize_scalar_value(
-                        field['kind'],
-                        getattr(row, field['name']),
-                    )
-                continue
-            if table.feature_type is None:
-                raise ValueError(f'table {table.name!r} is missing feature type.')
-            if table.value_position is None:
-                raise ValueError(f'table {table.name!r} is missing value position.')
-            if table.kind == 'array':
-                item_kind = _array_item_kind(table)
-                values[table.value_position] = [
-                    _materialize_scalar_value(
-                        item_kind,
-                        getattr(row, _ARRAY_VALUE_FIELD),
-                    )
-                    for row in engine.iter(table.feature_type, mode='copy')
-                ]
-                continue
-            if table.cardinality == 'many':
-                values[table.value_position] = [
-                    _copy_object_graph_feature(engine, table.feature_type, index, seen)
-                    for index in range(engine.count(table.feature_type))
-                ]
-            else:
-                values[table.value_position] = _copy_object_graph_feature(
-                    engine,
-                    table.feature_type,
-                    0,
-                    seen,
-                )
-
-        if self.direction == 'input':
-            return tuple(values)
-        if len(values) == 1:
-            return values[0]
-        return tuple(values)
-
-    def _normalize_values(self, values: object) -> tuple[Any, ...]:
-        self._validate_identity()
-        if self.direction == 'input':
-            if not isinstance(values, tuple):
-                raise TypeError('input call-db serialization expects a tuple of parameter values.')
-            expected = _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-            if len(values) != expected:
-                raise ValueError(f'expected {expected} input values, got {len(values)}.')
-            return values
-        expected = _value_count(self.tables, scalar_feature_type=self.scalar_feature_type)
-        if expected == 1:
-            return (values,)
-        if not isinstance(values, tuple):
-            raise TypeError('multi-value output call-db serialization expects a tuple.')
-        if len(values) != expected:
-            raise ValueError(f'expected {expected} output values, got {len(values)}.')
-        return values
-
-
-@dataclass(frozen=True)
-class FastdbCallView:
-    plan: FastdbCallPlan
-    engine: ColumnEngine
-    buffer: memoryview
-
-    def materialize(self) -> object:
-        self._ensure_alive()
-        return self.plan._materialize_values(self.engine)
-
-    def table(self, name_or_index: str | int) -> 'FastdbCallTableView':
-        self._ensure_alive()
-        table = self._feature_table(name_or_index)
-        return FastdbCallTableView(self, table)
-
-    def feature(self, name_or_index: str | int) -> Any:
-        self._ensure_alive()
-        table_view = self.table(name_or_index)
-        if table_view.spec.cardinality != 'one':
-            raise TypeError(f'feature view {table_view.spec.name!r} has cardinality {table_view.spec.cardinality!r}; use table(...) for batch outputs.')
-        if len(table_view) < 1:
-            raise IndexError(f'feature table {table_view.spec.name!r} is empty.')
-        return table_view[0]
-
-    def array(self, name_or_index: str | int) -> 'FastdbCallArrayView':
-        self._ensure_alive()
-        table = self._array_table(name_or_index)
-        return FastdbCallArrayView(self, table)
-
-    def scalar(self, name_or_index: str | int) -> object:
-        self._ensure_alive()
-        table, field = self._scalar_field(name_or_index)
-        if table.feature_type is None:
-            raise ValueError(f'scalar table {table.name!r} is missing feature type.')
-        rows = self.engine.table(table.feature_type, name=table.name)
-        if len(rows) < 1:
-            raise IndexError(f'scalar table {table.name!r} is empty.')
-        return _materialize_scalar_value(field['kind'], getattr(rows[0], field['name']))
-
-    def _feature_table(self, name_or_index: str | int) -> FastdbCallTableSpec:
-        feature_tables = [table for table in self.plan.tables if table.kind == 'feature']
-        if isinstance(name_or_index, int):
-            return feature_tables[name_or_index]
-        for table in feature_tables:
-            if table.name == name_or_index:
-                return table
-        raise KeyError(f'feature table {name_or_index!r} not found')
-
-    def _array_table(self, name_or_index: str | int) -> FastdbCallTableSpec:
-        array_tables = [table for table in self.plan.tables if table.kind == 'array']
-        if isinstance(name_or_index, int):
-            return array_tables[name_or_index]
-        for table in array_tables:
-            if table.name == name_or_index:
-                return table
-        raise KeyError(f'array table {name_or_index!r} not found')
-
-    def _scalar_field(self, name_or_index: str | int) -> tuple[FastdbCallTableSpec, dict[str, str]]:
-        scalar_fields = [
-            (table, field)
-            for table in self.plan.tables
-            if table.kind == 'scalars'
-            for field in table.scalar_fields
-        ]
-        if isinstance(name_or_index, int):
-            return scalar_fields[name_or_index]
-        for table, field in scalar_fields:
-            if field['name'] == name_or_index:
-                return table, field
-        raise KeyError(f'scalar field {name_or_index!r} not found')
-
-    def _ensure_alive(self) -> None:
-        try:
-            _ = self.buffer.nbytes
-        except ValueError as exc:
-            raise RuntimeError('FastdbCallView buffer has been released.') from exc
-
-
-@dataclass(frozen=True)
-class FastdbCallTableView:
-    call_view: FastdbCallView
-    spec: FastdbCallTableSpec
-
-    def materialize(self) -> list[Any]:
-        return list(self._table())
+        return view_call_db(self.fastdb_binding, data).logical_value()
 
     @property
-    def column(self) -> 'FastdbCallColumnView':
-        return FastdbCallColumnView(self, self._table().column)
+    def supports_output_build_context(self) -> bool:
+        if self.direction != 'output' or self.profile != CALL_DB_COLUMNAR_PROFILE:
+            return False
+        aggregate_count = 0
+        for table in self.tables:
+            if table.kind == 'scalars':
+                if not _scalar_fields_support_direct_context(table):
+                    return False
+                continue
+            if table.kind == 'array':
+                aggregate_count += 1
+                if table.array_item is None or table.array_item.get('kind') not in _DIRECT_CONTEXT_FIELD_KINDS:
+                    return False
+                continue
+            if table.kind == 'feature':
+                if table.cardinality == 'many':
+                    aggregate_count += 1
+                elif table.cardinality != 'one':
+                    return False
+                if not _feature_table_supports_direct_context(table):
+                    return False
+                continue
+            return False
+        return aggregate_count > 0
 
-    def __len__(self) -> int:
-        return len(self._table())
-
-    def __getitem__(self, index: int) -> Any:
-        return self._table()[index]
-
-    def __iter__(self):
-        table = self._table()
-        for index in range(len(table)):
-            self.call_view._ensure_alive()
-            yield table[index]
-
-    def _table(self) -> Table:
-        self.call_view._ensure_alive()
-        if self.spec.feature_type is None:
-            raise ValueError(f'feature table {self.spec.name!r} is missing feature type.')
-        return self.call_view.engine.table(self.spec.feature_type, name=self.spec.name)
+    def output_build_context(self, allocator: object) -> object:
+        if not self.supports_output_build_context:
+            raise FastdbUnsupportedDirectBuildError(
+                'FastDB output build context requires fixed columnar Batch/Array output.',
+            )
+        return _FastdbOutputBuildContext(self, allocator)
 
 
-@dataclass(frozen=True)
-class FastdbCallColumnView:
-    table_view: FastdbCallTableView
-    accessor: Any
+class _FastdbOutputBuildContext:
+    def __init__(self, plan: FastdbCallPlan, native_allocator: object):
+        self._plan = plan
+        self._allocator = _FastdbResponseFinalBackingAllocator(native_allocator)
+        self._context = call_db_build_context(plan.fastdb_binding, self._allocator)
 
-    def __getattr__(self, name: str) -> Any:
-        self.table_view.call_view._ensure_alive()
-        return getattr(self.accessor, name)
+    def __enter__(self) -> '_FastdbOutputBuildContext':
+        self._context.__enter__()
+        return self
 
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._context.__exit__(exc_type, exc, tb)
 
-@dataclass(frozen=True)
-class FastdbCallArrayView:
-    call_view: FastdbCallView
-    spec: FastdbCallTableSpec
-
-    def materialize(self) -> list[Any]:
-        item_kind = _array_item_kind(self.spec)
-        return [
-            _materialize_scalar_value(item_kind, getattr(row, _ARRAY_VALUE_FIELD))
-            for row in self._table()
-        ]
-
-    def __len__(self) -> int:
-        return len(self._table())
-
-    def __getitem__(self, index: int) -> Any:
-        return _materialize_scalar_value(
-            _array_item_kind(self.spec),
-            getattr(self._table()[index], _ARRAY_VALUE_FIELD),
+    def prepare_write(self, *values: object) -> object:
+        value = values[0] if len(values) == 1 else values
+        return build_call_db(
+            self._plan.fastdb_binding,
+            value,
+            self._allocator,
+            direct_required=True,
         )
 
-    def __iter__(self):
-        table = self._table()
-        item_kind = _array_item_kind(self.spec)
-        for index in range(len(table)):
-            self.call_view._ensure_alive()
-            yield _materialize_scalar_value(
-                item_kind,
-                getattr(table[index], _ARRAY_VALUE_FIELD),
+
+class _FastdbResponseFinalBackingAllocation:
+    def __init__(self, native_allocation: object):
+        self._native_allocation = native_allocation
+
+    @property
+    def buffer(self) -> memoryview:
+        return memoryview(self._native_allocation)
+
+    def commit(self, used_size: int) -> object:
+        self._native_allocation.commit(used_size)
+        return self._native_allocation
+
+    def rollback(self) -> None:
+        self._native_allocation.rollback()
+
+
+class _FastdbResponseFinalBackingAllocator:
+    def __init__(self, native_allocator: object):
+        self._native_allocator = native_allocator
+
+    def allocate(self, nbytes: int) -> _FastdbResponseFinalBackingAllocation:
+        return _FastdbResponseFinalBackingAllocation(
+            self._native_allocator.allocate(nbytes),
+        )
+
+
+def _scalar_fields_support_direct_context(table: FastdbCallTableSpec) -> bool:
+    return all(
+        field.get('kind') in _DIRECT_CONTEXT_FIELD_KINDS
+        for field in table.scalar_fields
+    )
+
+
+def _feature_table_supports_direct_context(table: FastdbCallTableSpec) -> bool:
+    schema = table.feature_schema
+    if schema is None:
+        return False
+    return all(
+        field.get('kind') in _DIRECT_CONTEXT_FIELD_KINDS
+        for field in schema.get('fields', ())
+    )
+
+
+def _has_fastdb_require_envelope(values: object) -> bool:
+    if isinstance(values, tuple):
+        return any(_has_fastdb_require_envelope(value) for value in values)
+    return getattr(values, '_fastdb_require_envelope', None) is not None
+
+
+class _FastdbExistingBufferWritePlan:
+    def __init__(self, payload: memoryview):
+        self._payload = payload.cast('B')
+        self.direct = True
+        self.byte_length = self._payload.nbytes
+        self.nbytes = self.byte_length
+        self.build_mode = 'exported'
+        self.fallback_reason = None
+
+    def write_into(self, destination: object) -> None:
+        dst = memoryview(destination).cast('B')
+        try:
+            if dst.readonly:
+                raise TypeError('FastDB final backing destination must be writable.')
+            if dst.nbytes != self.nbytes:
+                raise ValueError(
+                    f'FastDB final backing destination size {dst.nbytes} '
+                    f'does not match planned size {self.nbytes}.',
+                )
+            dst[:] = self._payload
+        finally:
+            dst.release()
+
+    def to_bytes(self) -> bytes:
+        return self._payload.tobytes()
+
+
+class _DestinationAllocation:
+    def __init__(self, destination: object, expected_size: int):
+        self._state = 'open'
+        self.used_size: int | None = None
+        self._buffer = memoryview(destination)
+        if self._buffer.readonly:
+            self._release_buffer()
+            raise TypeError('FastDB final backing destination must be writable.')
+        actual_size = self._buffer.nbytes
+        if actual_size != expected_size:
+            self._release_buffer()
+            raise ValueError(
+                f'FastDB final backing destination size {actual_size} '
+                f'does not match planned size {expected_size}.',
             )
 
-    def _table(self) -> Table:
-        self.call_view._ensure_alive()
-        if self.spec.feature_type is None:
-            raise ValueError(f'array table {self.spec.name!r} is missing feature type.')
-        return self.call_view.engine.table(self.spec.feature_type, name=self.spec.name)
+    @property
+    def buffer(self) -> memoryview:
+        if self._state != 'open':
+            raise RuntimeError(f'FastDB final backing allocation is {self._state}.')
+        if self._buffer is None:
+            raise RuntimeError('FastDB final backing allocation buffer is closed.')
+        return self._buffer
+
+    def commit(self, used_size: int) -> object:
+        if self._state != 'open':
+            raise RuntimeError(f'FastDB final backing allocation is {self._state}.')
+        if self._buffer is None:
+            raise RuntimeError('FastDB final backing allocation buffer is closed.')
+        if type(used_size) is not int or used_size < 0 or used_size > self._buffer.nbytes:
+            raise ValueError('used_size must fit within the FastDB final backing destination.')
+        self.used_size = used_size
+        self._state = 'committed'
+        self._release_buffer()
+        return self
+
+    def rollback(self) -> None:
+        if self._state != 'open':
+            return
+        self._state = 'rolled_back'
+        self._release_buffer()
+
+    def close(self) -> None:
+        if self._state == 'open':
+            self.rollback()
+            return
+        self._release_buffer()
+
+    def _release_buffer(self) -> None:
+        if self._buffer is None:
+            return
+        try:
+            self._buffer.release()
+        except ValueError:
+            pass
+        self._buffer = None
+
+
+class _DestinationAllocator:
+    def __init__(self, destination: object, expected_size: int):
+        self._destination = destination
+        self._expected_size = expected_size
+        self.allocation: _DestinationAllocation | None = None
+
+    def allocate(self, nbytes: int) -> _DestinationAllocation:
+        if self.allocation is not None:
+            raise RuntimeError('FastDB final backing allocator is one-shot.')
+        if nbytes != self._expected_size:
+            raise ValueError(
+                f'FastDB requested {nbytes} bytes, expected {self._expected_size}.',
+            )
+        allocation = _DestinationAllocation(self._destination, self._expected_size)
+        self.allocation = allocation
+        return allocation
+
+    def close(self) -> None:
+        if self.allocation is not None:
+            self.allocation.close()
+        self._destination = None
+
+
+class _DirectBuildProbe(Exception):
+    def __init__(self, nbytes: int):
+        super().__init__(nbytes)
+        self.nbytes = nbytes
+
+
+class _ProbeAllocator:
+    def allocate(self, nbytes: int) -> object:
+        raise _DirectBuildProbe(nbytes)
+
+
+def _probe_final_backing_direct_size(binding: FastdbCallDbBinding, values: object) -> int:
+    try:
+        build_call_db(binding, values, _ProbeAllocator(), direct_required=True)
+    except _DirectBuildProbe as probe:
+        return probe.nbytes
+    raise RuntimeError('FastDB final backing direct probe completed without requesting allocation.')
+
+
+def _plan_byte_length(plan: object) -> int:
+    value = getattr(plan, 'byte_length', None)
+    if value is None:
+        value = getattr(plan, 'nbytes')
+    return int(value)
+
+
+class _FastdbFinalBackingWritePlan:
+    def __init__(
+        self,
+        binding: FastdbCallDbBinding,
+        values: object,
+        *,
+        direct_nbytes: int | None,
+        fallback_plan: object | None,
+        fallback_reason: str | None,
+    ):
+        if direct_nbytes is None and fallback_plan is None:
+            raise ValueError('FastDB write plan requires a direct or fallback plan.')
+        self._binding = binding
+        self._values = values
+        self._direct_nbytes = direct_nbytes
+        self._fallback_plan = fallback_plan
+        self.direct = direct_nbytes is not None
+        self.byte_length = (
+            direct_nbytes
+            if direct_nbytes is not None
+            else _plan_byte_length(fallback_plan)
+        )
+        self.nbytes = self.byte_length
+        self.build_mode = (
+            'direct-final-backing'
+            if self.direct
+            else str(getattr(fallback_plan, 'build_mode', 'fallback'))
+        )
+        self.fallback_reason = (
+            None
+            if self.direct
+            else fallback_reason or getattr(fallback_plan, 'fallback_reason', None)
+        )
+
+    def write_into(self, destination: object) -> None:
+        if not self.direct:
+            self._fallback_plan.write_into(destination)  # type: ignore[union-attr]
+            return
+
+        allocator = _DestinationAllocator(destination, self.nbytes)
+        try:
+            build_call_db(
+                self._binding,
+                self._values,
+                allocator,
+                direct_required=True,
+            )
+            allocation = allocator.allocation
+            if allocation is None or allocation.used_size != self.nbytes:
+                raise RuntimeError('FastDB final backing build did not commit the planned payload size.')
+        finally:
+            allocator.close()
+
+    def to_bytes(self) -> bytes:
+        if not self.direct:
+            return self._fallback_plan.to_bytes()  # type: ignore[union-attr]
+        payload = bytearray(self.nbytes)
+        self.write_into(payload)
+        return bytes(payload)
 
 
 def plan_call_db_input(
@@ -900,6 +900,85 @@ def _ensure_object_graph_call_supported(tables: list[FastdbCallTableSpec]) -> No
             claim_layer(dependency_layer_name, f'dependency {dependency_name}', 'dependency')
 
 
+def _fastdb_runtime_table(table: FastdbCallTableSpec) -> FastdbCallDbTable:
+    dependency_features_by_hash: dict[str, type] = {}
+    if table.feature_type is not None:
+        dependency_features_by_hash = {
+            schema_sha256(export_schema(feature_type)): feature_type
+            for feature_type in _feature_dependency_types(table.feature_type)
+        }
+    return FastdbCallDbTable(
+        cardinality=table.cardinality,
+        feature=table.feature_type,
+        feature_schema_sha256=(
+            schema_sha256(table.feature_schema)
+            if table.feature_schema is not None
+            else None
+        ),
+        feature_schema_dependencies=tuple(
+            FastdbCallDbFeatureDependency(
+                feature=dependency_features_by_hash.get(schema_sha256(dependency)),
+                feature_schema_sha256=schema_sha256(dependency),
+            )
+            for dependency in table.feature_schema_dependencies
+        ),
+        fields=tuple(
+            FastdbCallDbScalarField(
+                kind=field['kind'],
+                name=field['name'],
+                parameter=field.get('parameter'),
+                value_position=table.scalar_positions[index],
+            )
+            for index, field in enumerate(table.scalar_fields)
+        ),
+        item=(
+            FastdbCallDbArrayItem(
+                kind=table.array_item['kind'],
+                name=table.array_item['name'],
+            )
+            if table.array_item is not None
+            else None
+        ),
+        kind=table.kind,
+        name=table.name,
+        parameter=table.parameter,
+        return_index=table.return_index,
+        value_position=table.value_position,
+    )
+
+
+def _feature_dependency_types(feature_type: type) -> tuple[type, ...]:
+    dependencies: dict[str, type] = {}
+    visiting: set[type] = set()
+
+    def visit(current: type) -> None:
+        if current in visiting:
+            return
+        visiting.add(current)
+        schema = get_schema(current)
+        for field in schema.ref_fields:
+            visit_target(field.ref_target)
+        for field in schema.list_ref_fields:
+            visit_target(field.list_ref_target)
+        visiting.remove(current)
+
+    def visit_target(target: type | None) -> None:
+        if target is None or not is_feature(target):
+            return
+        identity = export_schema(target)['feature']['identity']
+        if identity not in dependencies:
+            dependencies[identity] = target
+            visit(target)
+
+    visit(feature_type)
+    root_identity = export_schema(feature_type)['feature']['identity']
+    dependencies.pop(root_identity, None)
+    return tuple(
+        dependencies[identity]
+        for identity in sorted(dependencies)
+    )
+
+
 def _feature_dependency_layer_names(feature_type: type) -> tuple[tuple[str, str], ...]:
     dependencies: dict[str, tuple[str, str]] = {}
     visiting: set[type] = set()
@@ -932,240 +1011,6 @@ def _feature_dependency_layer_names(feature_type: type) -> tuple[tuple[str, str]
     )
 
 
-def _create_empty_feature_table(engine: ColumnEngine, table: FastdbCallTableSpec) -> None:
-    if table.feature_type is None:
-        raise ValueError(f'feature table {table.name!r} is missing feature type.')
-    schema = get_schema(table.feature_type)
-    diagnostics = [
-        *raw_payload_storage_diagnostics(schema),
-        *non_native_list_storage_diagnostics(schema),
-    ]
-    if diagnostics:
-        raise TypeError(
-            f"fastdb call-db cannot create a native table for "
-            f"{table.feature_type.__name__}: {'; '.join(diagnostics)}"
-        )
-    origin = engine._origin
-    mapped = Table.map_from(
-        table.feature_type,
-        _get_default_table_build(
-            origin,
-            table.name,
-            raw_payload=bool(schema.bytes_plan),
-        ),
-        origin,
-    )
-    for field in schema.fields:
-        if field.field_type == OriginFieldType.list:
-            mapped._origin.add_list_field(field.name, field.cpp_type)  # noqa: SLF001
-        else:
-            mapped._origin.add_field(field.name, field.field_type.value)  # noqa: SLF001
-    engine._table_map[table.name] = mapped  # noqa: SLF001
-    engine._table_feature_types[table.name] = table.feature_type  # noqa: SLF001
-
-
-def _array_table_values(table: FastdbCallTableSpec, value: Any) -> list[Any]:
-    if table.feature_type is None:
-        raise ValueError(f'array table {table.name!r} is missing feature type.')
-    if isinstance(value, (str, bytes, bytearray, memoryview, Mapping)) or not isinstance(value, Iterable):
-        raise TypeError(f'{table.name} expected an iterable Array[{_array_item_kind(table)}], got {type(value).__name__}.')
-    item_kind = _array_item_kind(table)
-    return [_coerce_scalar_value(item_kind, item) for item in value]
-
-
-def _feature_table_rows(table: FastdbCallTableSpec, value: Any) -> list[Any]:
-    if table.feature_type is None:
-        raise ValueError(f'feature table {table.name!r} is missing feature type.')
-    records = _table_like_records(value)
-    source = records if records is not None else value
-    if isinstance(source, (str, bytes, bytearray, memoryview, Mapping)) or not isinstance(source, Iterable):
-        raise TypeError(f'{table.name} expected an iterable Batch[{table.feature_type.__name__}], got {type(value).__name__}.')
-    return [_coerce_feature_row(table.feature_type, row) for row in source]
-
-
-def _coerce_feature_row(feature_type: type, row: Any) -> Any:
-    if isinstance(row, feature_type):
-        return row
-    values: dict[str, Any] = {}
-    for field in get_schema(feature_type).fields:
-        if isinstance(row, Mapping):
-            if field.name not in row:
-                raise KeyError(f'missing field {field.name!r} for fastdb feature {feature_type.__name__}.')
-            value = row[field.name]
-            kind = _FIELD_SCALAR_KIND_BY_FIELD_TYPE.get(field.field_type)
-            values[field.name] = _coerce_scalar_value(kind, value) if kind is not None else value
-            continue
-        if not hasattr(row, field.name):
-            raise KeyError(f'missing field {field.name!r} for fastdb feature {feature_type.__name__}.')
-        value = getattr(row, field.name)
-        kind = _FIELD_SCALAR_KIND_BY_FIELD_TYPE.get(field.field_type)
-        values[field.name] = _coerce_scalar_value(kind, value) if kind is not None else value
-    return feature_type(**values)
-
-
-def _table_like_records(value: Any) -> Iterable[Any] | None:
-    if isinstance(value, (str, bytes, bytearray, memoryview, Mapping)):
-        return None
-    to_pylist = getattr(value, 'to_pylist', None)
-    if callable(to_pylist):
-        return to_pylist()
-    to_dicts = getattr(value, 'to_dicts', None)
-    if callable(to_dicts):
-        return to_dicts()
-    to_dict = getattr(value, 'to_dict', None)
-    if not callable(to_dict):
-        return None
-    try:
-        return to_dict('records')
-    except TypeError:
-        try:
-            return to_dict(orient='records')
-        except TypeError:
-            return None
-
-
-def _column_engine_from_buffer(data: bytes | bytearray | memoryview) -> ColumnEngine:
-    engine = ColumnEngine()
-    engine._origin = core.WxDatabase.load_xbuffer(data)  # noqa: SLF001
-    engine._origin._buffer = data  # noqa: SLF001
-    return engine
-
-
-def _object_engine_from_buffer(
-    data: bytes | bytearray | memoryview,
-    tables: tuple[FastdbCallTableSpec, ...] = (),
-) -> ObjectEngine:
-    engine = ObjectEngine()
-    engine._db = core.WxDatabase.load_xbuffer(data)  # noqa: SLF001
-    engine._db._buffer = data  # noqa: SLF001
-    engine._buffer = data  # noqa: SLF001
-    engine._built = True  # noqa: SLF001
-
-    for index in range(engine._db.get_layer_count()):  # noqa: SLF001
-        layer = engine._db.get_layer(index)  # noqa: SLF001
-        registered_cls = lookup_class(layer.name())
-        if registered_cls is None:
-            continue
-        schema = get_schema(registered_cls)
-        state = LayerState(
-            cls=registered_cls,
-            schema=schema,
-            layer_idx=index,
-            row_count=layer.get_feature_count(),
-        )
-        engine._layers[registered_cls] = state  # noqa: SLF001
-        engine._layer_order.append(registered_cls)  # noqa: SLF001
-    _bind_call_plan_layers(engine, tables)
-    return engine
-
-
-def _bind_call_plan_layers(
-    engine: ObjectEngine,
-    tables: tuple[FastdbCallTableSpec, ...],
-) -> None:
-    if not tables:
-        return
-    layer_indices = {
-        engine._db.get_layer(index).name(): index  # noqa: SLF001
-        for index in range(engine._db.get_layer_count())  # noqa: SLF001
-    }
-    for table in tables:
-        if table.feature_type is None:
-            continue
-        schema = get_schema(table.feature_type)
-        layer_idx = layer_indices.get(schema.layer_name)
-        if layer_idx is None:
-            continue
-        layer = engine._db.get_layer(layer_idx)  # noqa: SLF001
-        engine._layers[table.feature_type] = LayerState(  # noqa: SLF001
-            cls=table.feature_type,
-            schema=schema,
-            layer_idx=layer_idx,
-            row_count=layer.get_feature_count(),
-        )
-        if table.feature_type not in engine._layer_order:  # noqa: SLF001
-            engine._layer_order.append(table.feature_type)  # noqa: SLF001
-
-
-def _copy_object_graph_feature(
-    engine: ObjectEngine,
-    feature_type: type,
-    row_idx: int,
-    seen: dict[tuple[type, int], object],
-) -> object:
-    key = (feature_type, row_idx)
-    existing = seen.get(key)
-    if existing is not None:
-        return existing
-
-    state = engine._layers[feature_type]  # noqa: SLF001
-    layer = engine._db.get_layer(state.layer_idx)  # noqa: SLF001
-    feature_value = layer.tryGetFeature(row_idx)
-    schema = get_schema(feature_type)
-    obj = feature_type.__new__(feature_type)
-    seen[key] = obj
-
-    from fastdb4py.reader import _read_field
-
-    for field in schema.fields:
-        if field.field_type == OriginFieldType.ref:
-            ref = feature_value.get_field_as_ref(field.field_id)
-            target_type = _target_type_from_ref(engine, ref, field.ref_target)
-            if target_type is None:
-                value = None
-            else:
-                value = _copy_object_graph_feature(
-                    engine,
-                    target_type,
-                    _decode_ref_row(ref),
-                    seen,
-                )
-        elif field.field_type == OriginFieldType.list and field.list_elem_type == OriginFieldType.ref:
-            target_type = field.list_ref_target
-            value = []
-            for index in range(feature_value.get_field_list_size(field.field_id)):
-                ref = feature_value.get_field_list_ref_at(field.field_id, index)
-                item_type = _target_type_from_ref(engine, ref, target_type)
-                if item_type is None:
-                    value.append(None)
-                else:
-                    value.append(
-                        _copy_object_graph_feature(
-                            engine,
-                            item_type,
-                            _decode_ref_row(ref),
-                            seen,
-                        ),
-                    )
-        else:
-            value = _read_field(feature_value, field)
-        obj.__dict__[field.name] = value
-    return obj
-
-
-def _target_type_from_ref(
-    engine: ObjectEngine,
-    ref: object,
-    declared_target: type | None,
-) -> type | None:
-    if ref is None:
-        return None
-    layer_idx = getattr(ref, 'ilayer', None)
-    if layer_idx is None:
-        return None
-    if declared_target is not None:
-        return declared_target
-    if 0 <= layer_idx < len(engine._layer_order):  # noqa: SLF001
-        return engine._layer_order[layer_idx]  # noqa: SLF001
-    return None
-
-
-def _decode_ref_row(ref: object) -> int:
-    low = int(getattr(ref, 'ifeature', 0))
-    high = int(getattr(ref, 'ifeatureH', 0))
-    return low | (high << 8)
-
-
 def _scalar_kind(annotation: object) -> str | None:
     if annotation is BOOL:
         return 'bool'
@@ -1190,32 +1035,6 @@ def _runtime_scalar_annotation(annotation: object) -> object:
     if field_type == OriginFieldType.bytes:
         return BYTES
     return annotation
-
-
-def _materialize_scalar_value(kind: str, value: object) -> object:
-    if kind == 'bool':
-        return coerce_bool_scalar(value)
-    return value
-
-
-def _coerce_scalar_value(kind: str, value: object) -> object:
-    if kind == 'bool':
-        return coerce_bool_scalar(value)
-    if kind in {'u8', 'u16', 'u32', 'i32', 'u8n', 'u16n'}:
-        return int(value)
-    if kind in {'f32', 'f64'}:
-        return float(value)
-    if kind in {'str', 'wstr'}:
-        return str(value)
-    if kind == 'bytes':
-        return bytes(value)
-    return value
-
-
-def _array_item_kind(table: FastdbCallTableSpec) -> str:
-    if table.array_item is None:
-        raise ValueError(f'array table {table.name!r} is missing item schema.')
-    return table.array_item['kind']
 
 
 def _is_python_builtin_scalar(annotation: object) -> bool:
@@ -1610,11 +1429,11 @@ def _is_array_annotation(annotation: object) -> bool:
     return get_origin(annotation) is Array
 
 
-_METHOD_TRANSFERABLE_CACHE: dict[tuple[str, str, str, str], type] = {}
+_METHOD_PAYLOAD_BINDING_CACHE: dict[tuple[str, str, str, str], object] = {}
 
 
 def resolve_method_payload_abi(shape: object, context: object | None = None) -> object | None:
-    """Resolve a C-Two method shape to a FastDB call-db transferable binding."""
+    """Resolve a C-Two method shape to a FastDB call-db payload binding."""
     try:
         direction = str(getattr(shape, 'direction'))
         if direction == 'input':
@@ -1637,12 +1456,7 @@ def resolve_method_payload_abi(shape: object, context: object | None = None) -> 
     except (TypeError, ValueError):
         return None
 
-    from c_two.crm._payload_abi import PayloadAbiBinding
-
-    return PayloadAbiBinding(
-        transferable=_method_transferable_for(plan),
-        payload_abi_ref=plan.payload_abi_ref,
-    )
+    return _method_payload_binding_for(plan)
 
 
 def diagnostics_for_method_payload_abi(
@@ -1673,7 +1487,7 @@ def diagnostics_for_method_payload_abi(
     return []
 
 
-def _method_transferable_for(plan: FastdbCallPlan) -> type:
+def _method_payload_binding_for(plan: FastdbCallPlan) -> object:
     payload_abi_ref = plan.payload_abi_ref
     key = (
         plan.direction,
@@ -1681,36 +1495,49 @@ def _method_transferable_for(plan: FastdbCallPlan) -> type:
         plan.profile,
         payload_abi_ref['schema_sha256'],
     )
-    cached = _METHOD_TRANSFERABLE_CACHE.get(key)
+    cached = _METHOD_PAYLOAD_BINDING_CACHE.get(key)
     if cached is not None:
         return cached
 
-    from c_two.crm.transferable import _payload_abi_ref_transferable
+    from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind
 
-    @_payload_abi_ref_transferable(payload_abi_ref=payload_abi_ref)
-    class FastdbC2CallTransferable:
-        def serialize(*values, _plan=plan) -> bytes:
-            if _plan.direction == 'input':
-                return _plan.serialize_values(values)
-            return _plan.serialize_values(values[0] if len(values) == 1 else values)
+    def serialize(*values, _plan=plan) -> bytes | memoryview:
+        if _plan.direction == 'input':
+            return _plan.serialize_values(values)
+        return _plan.serialize_values(values[0] if len(values) == 1 else values)
 
-        def deserialize(data, _plan=plan):
-            return _plan.deserialize_values(data)
+    def prepare_write(*values, _plan=plan):
+        if _plan.direction == 'input':
+            return _plan.prepare_write_values(values)
+        return _plan.prepare_write_values(values[0] if len(values) == 1 else values)
 
-        def from_buffer(data: memoryview, _plan=plan):
-            if _plan.direction == 'output' and _plan.supports_buffer_view:
-                return _plan.view_from_buffer(data)
-            return _plan.deserialize_values(data)
+    def deserialize(data, _plan=plan):
+        return _plan.deserialize_values(data)
+
+    view_from_buffer = None
+    if plan.supports_buffer_view:
+        def view_from_buffer(data: memoryview, _plan=plan):
+            return _plan.view_from_buffer(data)
+
+    build_context = None
+    if plan.supports_output_build_context:
+        def build_context(allocator: object, _plan=plan):
+            return _plan.output_build_context(allocator)
 
     suffix = f'{plan.method_name}_{plan.direction}_{payload_abi_ref["schema_sha256"][:10]}'
-    name = f'FastdbC2Call{_safe_identifier(suffix)}Transferable'
-    FastdbC2CallTransferable.__name__ = name
-    FastdbC2CallTransferable.__qualname__ = name
-    FastdbC2CallTransferable.__cc_payload_abi_artifacts__ = _plan_payload_abi_artifacts(plan)
-    if plan.direction == 'input':
-        FastdbC2CallTransferable._c2_auto_input_hold = False
-    _METHOD_TRANSFERABLE_CACHE[key] = FastdbC2CallTransferable
-    return FastdbC2CallTransferable
+    binding = PayloadBinding(
+        kind=PayloadPlanKind.FDB,
+        serialize=serialize,
+        deserialize=deserialize,
+        prepare_write=prepare_write,
+        payload_abi_ref=payload_abi_ref,
+        payload_abi_artifacts=_plan_payload_abi_artifacts(plan),
+        view_from_buffer=view_from_buffer,
+        build_context=build_context,
+        label=f'FastdbC2Call{_safe_identifier(suffix)}',
+    )
+    _METHOD_PAYLOAD_BINDING_CACHE[key] = binding
+    return binding
 
 
 def _crm_context_from_shape(shape: object, context: object | None) -> dict[str, str]:

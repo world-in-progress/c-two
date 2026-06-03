@@ -7,7 +7,8 @@ class TestHeldResultBasic:
     """HeldResult lifecycle: access, release, double-release."""
 
     def test_access_value(self):
-        from c_two.crm.transferable import HeldResult
+        from c_two.crm.transferable import Held, HeldResult
+        assert Held is HeldResult
         hr = HeldResult(42, release_cb=None)
         assert hr.value == 42
 
@@ -72,19 +73,43 @@ class TestHeldResultBasic:
         with pytest.raises(Exception):
             _ = hr.value
 
-    def test_buffer_exposes_held_memoryview_until_release(self):
+    def test_unsafe_buffer_exposes_held_memoryview_until_release(self):
         from c_two.crm.transferable import HeldResult
 
         raw = memoryview(b'abc')
         hr = HeldResult('value', release_cb=raw.release, buffer=raw)
 
+        assert bytes(hr.unsafe_buffer) == b'abc'
         assert bytes(hr.buffer) == b'abc'
         assert hr.value == 'value'
 
         hr.release()
 
         with pytest.raises(Exception):
+            _ = hr.unsafe_buffer
+        with pytest.raises(Exception):
             _ = hr.buffer
+
+    def test_release_does_not_invalidate_external_fastdb_owner_by_default(self):
+        fdb = pytest.importorskip('fastdb4py', reason='fastdb owner lifecycle requires fastdb4py')
+        from fastdb4py.column_engine import ColumnEngine
+        from c_two.crm.transferable import HeldResult
+
+        @fdb.feature
+        class Point:
+            x: fdb.F64
+
+        engine = ColumnEngine.create()
+        engine.push(Point(x=1.0), table_name='points')
+        engine.combine()
+        owner = fdb.FdbViewOwner(checked=True, writeable=False)
+        table = engine.table(Point, name='points', owner=owner, writeable=False)
+        row = table[0]
+
+        HeldResult(table, release_cb=None).release()
+
+        assert owner.alive is True
+        assert row.x == pytest.approx(1.0)
 
 
 class TestHoldFunction:

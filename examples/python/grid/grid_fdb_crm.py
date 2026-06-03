@@ -1,5 +1,5 @@
 import c_two as cc
-from c_two import fastdb as fdb
+import fastdb4py as fdb
 
 
 @fdb.feature

@@ -10,10 +10,10 @@ from typing import Any
 from ... import error
 
 
-def unpack_resource_result(result: Any) -> tuple[bytes | memoryview, bytes]:
+def unpack_resource_result(result: Any) -> tuple[bytes | bytearray | memoryview, bytes]:
     """Unpack resource ``'<-'`` result into ``(result_data, error_bytes)``.
 
-    ``result_data`` may be ``bytes`` or ``memoryview`` — the caller
+    ``result_data`` may be ``bytes`` or another buffer-like object — the caller
     decides whether to materialise.  Error bytes are always ``bytes``.
     """
     if isinstance(result, tuple):

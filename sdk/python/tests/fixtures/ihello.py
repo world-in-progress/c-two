@@ -1,29 +1,14 @@
-import pickle
+from dataclasses import dataclass
+
 import c_two as cc
 
 
-@cc.transferable(abi_id='c-two.tests.hello-data.pickle-dict.v1')
+@dataclass
 class HelloData:
-    """A simple transferable data type for testing custom serialization."""
+    """A simple Python-only data type for pickle fallback tests."""
+
     name: str
     value: int
-
-    def serialize(data: 'HelloData') -> bytes:
-        return pickle.dumps({'name': data.name, 'value': data.value})
-
-    def deserialize(data_bytes: bytes) -> 'HelloData':
-        d = pickle.loads(data_bytes)
-        return HelloData(name=d['name'], value=d['value'])
-
-
-@cc.transferable(abi_id='c-two.tests.hello-items.pickle-list-str.v1')
-class HelloItems:
-    """Transferable for list[str] used as return type of get_items."""
-    def serialize(items: list[str]) -> bytes:
-        return pickle.dumps(items)
-
-    def deserialize(data_bytes: bytes) -> list[str]:
-        return pickle.loads(data_bytes)
 
 
 @cc.crm(namespace='test.hello', version='0.1.0')
@@ -47,5 +32,5 @@ class Hello:
         ...
 
     def get_data(self, id: int) -> HelloData:
-        """Returns a custom Transferable type."""
+        """Returns a Python-only pickle fallback type."""
         ...

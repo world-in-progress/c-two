@@ -114,6 +114,47 @@ impl SyncClient {
         Ok(alloc)
     }
 
+    /// Allocate from the client SHM pool and let the caller fill the block.
+    ///
+    /// The fill callback receives exactly `data_size` bytes. On callback
+    /// failure the allocation is freed before the error is returned.
+    pub fn pool_alloc_and_fill<F>(
+        &self,
+        data_size: usize,
+        fill: F,
+    ) -> Result<PoolAllocation, IpcError>
+    where
+        F: FnOnce(&mut [u8]) -> Result<(), String>,
+    {
+        let pool_arc = self
+            .inner
+            .pool
+            .as_ref()
+            .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
+        let alloc = {
+            let mut pool = pool_arc.lock();
+            pool.alloc(data_size)
+                .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?
+        };
+        let ptr = {
+            let pool = pool_arc.lock();
+            match pool.data_ptr(&alloc) {
+                Ok(ptr) => ptr,
+                Err(e) => {
+                    drop(pool);
+                    self.pool_free(&alloc);
+                    return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
+                }
+            }
+        };
+        let destination = unsafe { std::slice::from_raw_parts_mut(ptr, data_size) };
+        if let Err(err) = fill(destination) {
+            self.pool_free(&alloc);
+            return Err(IpcError::Pool(format!("fill failed: {err}")));
+        }
+        Ok(alloc)
+    }
+
     /// Free a pool allocation (used on send failure for cleanup).
     pub fn pool_free(&self, alloc: &PoolAllocation) {
         if let Some(ref pool_arc) = self.inner.pool {

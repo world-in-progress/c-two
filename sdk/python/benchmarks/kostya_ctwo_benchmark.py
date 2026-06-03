@@ -1,255 +1,399 @@
-"""Kostya-style coordinate benchmark — c-two IPC variants.
+"""Kostya-style coordinate benchmark — C-Two IPC variants.
 
-Compares three transferable strategies for transporting a list of coordinate
-records (matches fastdb's own kostya benchmark schema: row_id, x, y, z, name).
+Compares Python pickle fallback with the current FastDB-first CRM ABI,
+prepared call-db SHM writing, and client-side ``cc.hold(...)`` model for
+transporting coordinate records:
+``row_id, x, y, z, name``.
 
 Strategies:
-  * pickle-records  : list[dict] over pickle (kostya canonical, slow)
-  * pickle-arrays   : 4 numpy arrays over pickle (numpy fast path)
-  * fastdb-hold     : fastdb ORM raw buffer + zero-copy load_xbuffer in hold mode
+  * pickle-records       : list[dict] over Python pickle
+  * pickle-arrays        : numpy arrays + string list over Python pickle
+  * fastdb-control-*               : control path using ordinary
+                                     fdb.Batch.allocate(...), showing call-db
+                                     repack cost outside the recommended
+                                     resource output construction path
+  * fastdb-require-*               : payload built through
+                                     fdb.require(fdb.batch(...)); useful for
+                                     measuring the recommended construction
+                                     path, transport, and retained-view cost
+  * fastdb-numeric-control-*       : numeric-only control path used
+                                     to isolate string and field-layout cost
+  * fastdb-numeric-require-runtime-*:
+                                     resource builds the numeric payload each
+                                     call through fdb.require(...); useful for
+                                     measuring resource-time construction cost
 
 Run:
     C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/kostya_ctwo_benchmark.py \
-        --variant fastdb-hold --n 1000000 --iters 30
+        --variant fastdb-require-retained --n 100000 --iters 20
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import multiprocessing as mp
 import os
-import pickle
 import statistics
+import sys
 import time
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
+import fastdb4py as fdb
 import numpy as np
 
 import c_two as cc
 
-BENCH_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
 
-# ---------------------------------------------------------------------------
-# fastdb is optional; only required for the fastdb-hold variant
-# ---------------------------------------------------------------------------
-try:
-    from fastdb4py import core, ORM, F64, U32, STR, Feature
-
-    class Coord(Feature):
-        row_id: U32
-        x: F64
-        y: F64
-        z: F64
-        name: STR
-
-    HAS_FASTDB = True
-except ImportError:
-    HAS_FASTDB = False
-    Coord = None  # type: ignore
+_BENCH_SCHEMA_MODULE = 'c_two_kostya_benchmark'
+sys.modules.setdefault(_BENCH_SCHEMA_MODULE, sys.modules[__name__])
 
 
-# ---------------------------------------------------------------------------
-# Transferables — one per wire-format strategy
-# ---------------------------------------------------------------------------
+@fdb.feature
+class Coord:
+    row_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
+    z: fdb.F64
+    name: fdb.STR
 
-@cc.transferable(
-    abi_schema=(
-        'c-two.bench.kostya.coord-records;'
-        f'pickle-protocol={BENCH_PICKLE_PROTOCOL};'
-        'shape=list[dict[row_id:int,x:float,y:float,z:float,name:str]]'
-    ),
-)
+
+Coord.__module__ = _BENCH_SCHEMA_MODULE
+
+
+@fdb.feature
+class CoordNumeric:
+    row_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
+    z: fdb.F64
+
+
+CoordNumeric.__module__ = _BENCH_SCHEMA_MODULE
+
+
+@dataclass
 class CoordRecords:
-    """Pickle of list[dict] — kostya canonical, brutal on per-row overhead."""
-    records: list
+    """Pickle of list[dict] — Kostya canonical, row-oriented path."""
 
-    def serialize(data: 'CoordRecords') -> bytes:
-        return pickle.dumps(data.records, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def deserialize(buf: bytes) -> 'CoordRecords':
-        return CoordRecords(records=pickle.loads(buf))
+    records: list[dict[str, object]]
 
 
-@cc.transferable(
-    abi_schema=(
-        'c-two.bench.kostya.coord-arrays;'
-        f'pickle-protocol={BENCH_PICKLE_PROTOCOL};'
-        'fields=row_id:uint32-array,x:float64-array,y:float64-array,'
-        'z:float64-array,name:list[str]'
-    ),
-)
+CoordRecords.__module__ = _BENCH_SCHEMA_MODULE
+
+
+@dataclass
 class CoordArrays:
-    """Pickle of 4 numpy arrays + 1 string list — numpy fast path."""
+    """Pickle of column arrays plus names — numpy-friendly fallback path."""
+
     row_id: np.ndarray
     x: np.ndarray
     y: np.ndarray
     z: np.ndarray
-    name: list
-
-    def serialize(data: 'CoordArrays') -> bytes:
-        return pickle.dumps(
-            (data.row_id, data.x, data.y, data.z, data.name),
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-
-    def deserialize(buf: bytes) -> 'CoordArrays':
-        row_id, x, y, z, name = pickle.loads(buf)
-        return CoordArrays(row_id=row_id, x=x, y=y, z=z, name=name)
+    name: list[str]
 
 
-if HAS_FASTDB:
-    @cc.transferable(
-        abi_schema=(
-            'c-two.bench.kostya.coord-fastdb.raw-xbuffer;'
-            'schema=row_id:uint32,x:float64,y:float64,z:float64,name:string;'
-            'layout=fastdb4py-WxDatabase-xbuffer'
-        ),
-    )
-    class CoordFastdb:
-        """Wraps a fastdb ORM and exposes its raw columnar buffer.
-
-        The whole point: ``from_buffer(memoryview)`` calls
-        ``WxDatabase.load_xbuffer`` directly on c-two's hold-mode SHM view —
-        zero copy, zero parse, just a header walk in C++.
-        """
-        orm: object  # ORM (mutable side) or memoryview-backed ORM (consumer side)
-
-        def serialize(data: 'CoordFastdb') -> bytes:
-            buf = data.orm._origin.buffer().as_array(np.uint8)
-            return bytes(buf)
-
-        def deserialize(buf: bytes) -> 'CoordFastdb':
-            db = core.WxDatabase.load_xbuffer(memoryview(buf))
-            orm = ORM()
-            orm._origin = db
-            for i in range(db.get_layer_count()):
-                tbl = db.get_layer(i)
-                if tbl.name() == '_name_':
-                    orm._named_table = tbl
-                    break
-            return CoordFastdb(orm=orm)
-
-        def from_buffer(buf: memoryview) -> 'CoordFastdb':
-            db = core.WxDatabase.load_xbuffer(buf)
-            orm = ORM()
-            orm._origin = db
-            for i in range(db.get_layer_count()):
-                tbl = db.get_layer(i)
-                if tbl.name() == '_name_':
-                    orm._named_table = tbl
-                    break
-            return CoordFastdb(orm=orm)
+CoordArrays.__module__ = _BENCH_SCHEMA_MODULE
 
 
-# ---------------------------------------------------------------------------
-# CRM contracts — one per variant (must match what server registers)
-# ---------------------------------------------------------------------------
-
-@cc.crm(namespace='bench.kostya', version='0.1.0')
+@cc.crm(namespace='bench.kostya.pickle.records', version='0.1.0')
 class ICoordRecords:
-    def echo(self, data: CoordRecords) -> CoordRecords: ...
+    def coords(self, count: int) -> CoordRecords:
+        ...
 
 
-@cc.crm(namespace='bench.kostya', version='0.1.0')
+@cc.crm(namespace='bench.kostya.pickle.arrays', version='0.1.0')
 class ICoordArrays:
-    def echo(self, data: CoordArrays) -> CoordArrays: ...
+    def coords(self, count: int) -> CoordArrays:
+        ...
 
 
-if HAS_FASTDB:
-    @cc.crm(namespace='bench.kostya', version='0.1.0')
-    class ICoordFastdb:
-        def echo(self, data: CoordFastdb) -> CoordFastdb: ...
+@cc.crm(namespace='bench.kostya.fastdb', version='0.1.0')
+class ICoordFastdb:
+    def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
+        ...
 
 
-# ---------------------------------------------------------------------------
-# CRM implementations — pre-build the payload, return on each call
-# ---------------------------------------------------------------------------
+@cc.crm(namespace='bench.kostya.fastdb.numeric', version='0.1.0')
+class ICoordFastdbNumeric:
+    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
+        ...
+
+
+def _coord_names(n: int) -> list[str]:
+    return [f'coord_{i % 50000:05d}' for i in range(n)]
+
+
+def _coord_index(n: int) -> np.ndarray:
+    return np.arange(n, dtype=np.uint32)
+
+
+def _make_coord_arrays(n: int) -> CoordArrays:
+    idx = _coord_index(n)
+    return CoordArrays(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
+        name=_coord_names(n),
+    )
+
+
+def _make_coord_control_batch(n: int) -> fdb.Batch[Coord]:
+    idx = _coord_index(n)
+    batch = fdb.Batch.allocate(Coord, n)
+    batch.fill(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
+        name=_coord_names(n),
+    )
+    return batch
+
+
+def _make_coord_numeric_control_batch(n: int) -> fdb.Batch[CoordNumeric]:
+    idx = _coord_index(n)
+    batch = fdb.Batch.allocate(CoordNumeric, n)
+    batch.fill(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
+    )
+    return batch
+
+
+def _make_coord_require_batch(n: int) -> fdb.Batch[Coord]:
+    idx = _coord_index(n)
+    batch = fdb.require(fdb.batch(Coord, rows=n))
+    batch.fill(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
+        name=_coord_names(n),
+    )
+    return batch
+
+
+def _make_coord_numeric_require_batch(n: int) -> fdb.Batch[CoordNumeric]:
+    idx = _coord_index(n)
+    batch = fdb.require(fdb.batch(CoordNumeric, rows=n))
+    batch.fill(
+        row_id=idx,
+        x=idx.astype(np.float64) * 0.1,
+        y=idx.astype(np.float64) * 0.2,
+        z=idx.astype(np.float64) * 0.3,
+    )
+    return batch
+
 
 class CoordRecordsCRM:
     def __init__(self, n: int):
         self._payload = CoordRecords(records=[
-            {'row_id': i, 'x': i * 0.1, 'y': i * 0.2, 'z': i * 0.3,
-             'name': f'coord_{i % 50000:05d}'}
+            {
+                'row_id': i,
+                'x': i * 0.1,
+                'y': i * 0.2,
+                'z': i * 0.3,
+                'name': f'coord_{i % 50000:05d}',
+            }
             for i in range(n)
         ])
 
-    def echo(self, data: CoordRecords) -> CoordRecords:
+    def coords(self, count: int) -> CoordRecords:
         return self._payload
 
 
 class CoordArraysCRM:
     def __init__(self, n: int):
-        idx = np.arange(n, dtype=np.uint32)
-        self._payload = CoordArrays(
-            row_id=idx,
-            x=idx.astype(np.float64) * 0.1,
-            y=idx.astype(np.float64) * 0.2,
-            z=idx.astype(np.float64) * 0.3,
-            name=[f'coord_{i % 50000:05d}' for i in range(n)],
-        )
+        self._payload = _make_coord_arrays(n)
 
-    def echo(self, data: CoordArrays) -> CoordArrays:
+    def coords(self, count: int) -> CoordArrays:
         return self._payload
 
 
-if HAS_FASTDB:
-    class CoordFastdbCRM:
-        def __init__(self, n: int):
-            orm = ORM.create()
-            for i in range(n):
-                f = Coord()
-                f.row_id = i
-                f.x = i * 0.1
-                f.y = i * 0.2
-                f.z = i * 0.3
-                f.name = f'coord_{i % 50000:05d}'
-                orm.push(f)
-            orm._combine()
-            self._payload = CoordFastdb(orm=orm)
+class CoordFastdbControlCRM:
+    def __init__(self, n: int):
+        self._payload = _make_coord_control_batch(n)
 
-        def echo(self, data: CoordFastdb) -> CoordFastdb:
-            return self._payload
+    def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
+        return self._payload
 
 
-# ---------------------------------------------------------------------------
-# Consumer-side aggregations — what we measure includes both transport AND
-# the cost of materializing usable values from the received representation
-# ---------------------------------------------------------------------------
+class CoordFastdbRequireCRM:
+    def __init__(self, n: int):
+        self._payload = _make_coord_require_batch(n)
+
+    def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
+        return self._payload
+
+
+class CoordFastdbNumericControlCRM:
+    def __init__(self, n: int):
+        self._payload = _make_coord_numeric_control_batch(n)
+
+    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
+        return self._payload
+
+
+class CoordFastdbNumericRequireCRM:
+    def __init__(self, n: int):
+        self._n = n
+
+    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
+        return _make_coord_numeric_require_batch(self._n)
+
 
 def consume_records(payload: CoordRecords) -> float:
-    return sum(r['x'] + r['y'] + r['z'] for r in payload.records)
+    return sum(
+        float(row['x']) + float(row['y']) + float(row['z'])
+        for row in payload.records
+    )
 
 
 def consume_arrays(payload: CoordArrays) -> float:
     return float(payload.x.sum() + payload.y.sum() + payload.z.sum())
 
 
-def consume_fastdb(payload) -> float:
-    tbl = payload.orm[Coord][Coord]
-    cx = tbl.column.x
-    cy = tbl.column.y
-    cz = tbl.column.z
-    return float(cx[:].sum() + cy[:].sum() + cz[:].sum())
+def consume_fastdb_safe(batch: fdb.Batch[Coord]) -> float:
+    column = batch.column
+    return float(
+        np.asarray(column.x).sum()
+        + np.asarray(column.y).sum()
+        + np.asarray(column.z).sum()
+    )
 
 
-# ---------------------------------------------------------------------------
-# Server / client harness
-# ---------------------------------------------------------------------------
+def consume_fastdb_unsafe(batch: fdb.Batch[Coord]) -> float:
+    column = batch.column
+    return float(
+        column.x.unsafe_numpy_view().sum()
+        + column.y.unsafe_numpy_view().sum()
+        + column.z.unsafe_numpy_view().sum()
+    )
 
-VARIANTS = {
-    'pickle-records': (ICoordRecords, CoordRecordsCRM, consume_records),
-    'pickle-arrays':  (ICoordArrays,  CoordArraysCRM,  consume_arrays),
+
+def _request_count(_n: int) -> int:
+    return 1
+
+
+def _expected_total(n: int) -> float:
+    return 0.6 * n * (n - 1) / 2
+
+
+def _assert_expected_total(total: float, n: int) -> None:
+    expected = _expected_total(n)
+    if not np.isclose(total, expected, rtol=1e-9, atol=1e-6):
+        raise AssertionError(
+            f'payload validation failed: expected aggregate {expected}, got {total}',
+        )
+
+
+@dataclass(frozen=True)
+class VariantSpec:
+    contract: type
+    resource_factory: Callable[[int], object]
+    consumer: Callable[[object], float]
+    use_hold: bool
+
+
+VARIANTS: dict[str, VariantSpec] = {
+    'pickle-records': VariantSpec(
+        contract=ICoordRecords,
+        resource_factory=CoordRecordsCRM,
+        consumer=consume_records,
+        use_hold=False,
+    ),
+    'pickle-arrays': VariantSpec(
+        contract=ICoordArrays,
+        resource_factory=CoordArraysCRM,
+        consumer=consume_arrays,
+        use_hold=False,
+    ),
+    'fastdb-control-default': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbControlCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=False,
+    ),
+    'fastdb-control-retained': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbControlCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=True,
+    ),
+    'fastdb-control-retained-unsafe': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbControlCRM,
+        consumer=consume_fastdb_unsafe,
+        use_hold=True,
+    ),
+    'fastdb-require-default': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=False,
+    ),
+    'fastdb-require-retained': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=True,
+    ),
+    'fastdb-require-retained-unsafe': VariantSpec(
+        contract=ICoordFastdb,
+        resource_factory=CoordFastdbRequireCRM,
+        consumer=consume_fastdb_unsafe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-control-default': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericControlCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=False,
+    ),
+    'fastdb-numeric-control-retained': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericControlCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-control-retained-unsafe': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericControlCRM,
+        consumer=consume_fastdb_unsafe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-require-runtime-default': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=False,
+    ),
+    'fastdb-numeric-require-runtime-retained': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericRequireCRM,
+        consumer=consume_fastdb_safe,
+        use_hold=True,
+    ),
+    'fastdb-numeric-require-runtime-retained-unsafe': VariantSpec(
+        contract=ICoordFastdbNumeric,
+        resource_factory=CoordFastdbNumericRequireCRM,
+        consumer=consume_fastdb_unsafe,
+        use_hold=True,
+    ),
 }
-if HAS_FASTDB:
-    VARIANTS['fastdb-hold'] = (ICoordFastdb, CoordFastdbCRM, consume_fastdb)
 
 
 def _server_main(variant: str, n: int, ready_path: str) -> None:
-    icrm_cls, crm_cls, _ = VARIANTS[variant]
+    spec = VARIANTS[variant]
     cc.set_server(ipc_overrides={
         'pool_segment_size': 2 * 1024 * 1024 * 1024,
         'max_pool_segments': 8,
     })
-    cc.register(icrm_cls, crm_cls(n), name='coords')
+    cc.register(spec.contract, spec.resource_factory(n), name='coords')
     addr = cc.server_address() or ''
     with open(ready_path, 'w') as f:
         f.write(addr)
@@ -268,9 +412,15 @@ def _wait_ready(ready_path: str, timeout: float = 60.0) -> str:
     raise TimeoutError(f'server not ready in {timeout}s')
 
 
-def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict:
-    icrm_cls, _, consumer = VARIANTS[variant]
+def _call_once(method, spec: VariantSpec, consumer: Callable[[object], float], request: int) -> float:
+    if spec.use_hold:
+        with cc.hold(method)(request) as held:
+            return consumer(held.value)
+    return consumer(method(request))
 
+
+def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict[str, object]:
+    spec = VARIANTS[variant]
     ready_path = f'/tmp/kostya_{variant}_{os.getpid()}_{time.time_ns()}.ready'
 
     ctx = mp.get_context('spawn')
@@ -283,20 +433,28 @@ def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict:
             'pool_segment_size': 2 * 1024 * 1024 * 1024,
             'max_pool_segments': 8,
         })
-        proxy = cc.connect(icrm_cls, name='coords', address=address)
+        proxy = cc.connect(spec.contract, name='coords', address=address)
+        method = proxy.coords
+        request = _request_count(n)
 
-        # Warmup
         for _ in range(warmup):
-            with cc.hold(proxy.echo)(_dummy_for_variant(variant, 1)) as held:
-                _ = consumer(held.value)
+            _assert_expected_total(
+                _call_once(method, spec, spec.consumer, request),
+                n,
+            )
 
-        # Measure end-to-end: call + materialize + columnar read
         total_ms: list[float] = []
-        for _ in range(iters):
-            t0 = time.perf_counter()
-            with cc.hold(proxy.echo)(_dummy_for_variant(variant, 1)) as held:
-                _ = consumer(held.value)
-            total_ms.append((time.perf_counter() - t0) * 1000)
+        gc.disable()
+        try:
+            for _ in range(iters):
+                t0 = time.perf_counter()
+                _assert_expected_total(
+                    _call_once(method, spec, spec.consumer, request),
+                    n,
+                )
+                total_ms.append((time.perf_counter() - t0) * 1000)
+        finally:
+            gc.enable()
 
         cc.close(proxy)
         cc.shutdown()
@@ -315,36 +473,19 @@ def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict:
     finally:
         proc.terminate()
         proc.join(timeout=5)
-        try: os.unlink(ready_path)
-        except FileNotFoundError: pass
+        try:
+            os.unlink(ready_path)
+        except FileNotFoundError:
+            pass
 
-
-def _dummy_for_variant(variant: str, n: int):
-    """Tiny request payload — what the client sends; server ignores it."""
-    if variant == 'pickle-records':
-        return CoordRecords(records=[{'row_id': 0, 'x': 0.0, 'y': 0.0, 'z': 0.0, 'name': 'x'}] * n)
-    if variant == 'pickle-arrays':
-        z = np.zeros(n, dtype=np.uint32)
-        zf = np.zeros(n, dtype=np.float64)
-        return CoordArrays(row_id=z, x=zf, y=zf, z=zf, name=['x'] * n)
-    if variant == 'fastdb-hold':
-        orm = ORM.create()
-        f = Coord(); f.row_id = 0; f.x = 0.0; f.y = 0.0; f.z = 0.0; f.name = 'x'
-        orm.push(f)
-        orm._combine()
-        return CoordFastdb(orm=orm)
-    raise ValueError(variant)
-
-
-# ---------------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument('--variant', choices=sorted(VARIANTS.keys()), required=True)
-    p.add_argument('--n', type=int, required=True, help='record count')
-    p.add_argument('--iters', type=int, default=30)
-    p.add_argument('--warmup', type=int, default=3)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--variant', choices=sorted(VARIANTS.keys()), required=True)
+    parser.add_argument('--n', type=int, required=True, help='record count')
+    parser.add_argument('--iters', type=int, default=30)
+    parser.add_argument('--warmup', type=int, default=3)
+    args = parser.parse_args()
 
     res = run_variant(args.variant, args.n, args.iters, args.warmup)
     print(f"\n=== c-two IPC | variant={res['variant']} N={res['n']:,} iters={res['iters']} ===")

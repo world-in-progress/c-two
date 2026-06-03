@@ -351,21 +351,22 @@ Toodle 用此 JSON：
 ```python
 # CRM 实现者（资源进程作者，少数人）
 import c_two as cc
-from fastdb4py import Feature, F64, STR
+import fastdb4py as fdb
 
-class GridAttribute(Feature):
-    values: list[F64]
-    crs: STR
+@fdb.feature
+class GridAttribute:
+    x: fdb.F64
+    y: fdb.F64
+    crs: fdb.STR
 
 @cc.crm(namespace='geo.grid', version='0.3.1')
 class Grid:
-    @cc.transfer(input=GridAttribute, output=GridAttribute, buffer='hold')
     def subdivide(self, attr: GridAttribute) -> GridAttribute: ...
 
 class NestedGrid:
     def subdivide(self, attr): ...
 
-cc.register(Grid, NestedGrid(), name='dem_30m')
+cc.register(Grid, NestedGrid(), name='dem_30m', input_lifetime={'subdivide': cc.InputLifetime.BORROWED})
 cc.serve()
 ```
 

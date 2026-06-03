@@ -20,6 +20,7 @@ import pickle
 import statistics
 import sys
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import ray
@@ -83,19 +84,12 @@ def consume_structured(arr: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# C-Two: transferable + CRM contracts (module-level for spawn pickling)
+# C-Two: Python pickle fallback CRM contracts (module-level for spawn pickling)
 # ---------------------------------------------------------------------------
 
 # --- pickle variant (separate arrays, full schema with strings) ---
 
-@cc.transferable(
-    abi_schema=(
-        'c-two.bench.unified.np-payload;'
-        f'pickle-protocol={BENCH_PICKLE_PROTOCOL};'
-        'fields=row_id:uint32-array,x:float64-array,y:float64-array,'
-        'z:float64-array,name:list'
-    ),
-)
+@dataclass
 class NpPayload:
     row_id: np.ndarray
     x: np.ndarray
@@ -128,15 +122,9 @@ class NpEchoCRM:
         return self._payload
 
 
-# --- hold variant (structured array, zero-copy via from_buffer) ---
+# --- structured array variant ---
 
-@cc.transferable(
-    abi_schema=(
-        'c-two.bench.unified.np-structured.raw;'
-        'dtype=[row_id:uint32,x:float64,y:float64,z:float64];'
-        'layout=native-byte-order-contiguous-record-array'
-    ),
-)
+@dataclass
 class NpStructured:
     arr: np.ndarray
 
@@ -152,7 +140,6 @@ class NpStructured:
 
 @cc.crm(namespace='bench.unified.hold', version='0.1.0')
 class INpHoldEcho:
-    @cc.transfer(input=NpStructured, output=NpStructured, buffer='hold')
     def echo(self, data: NpStructured) -> NpStructured: ...
 
 

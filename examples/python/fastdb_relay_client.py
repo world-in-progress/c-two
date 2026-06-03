@@ -102,8 +102,8 @@ def main() -> None:
     print(f'[FastDB Client] Active grids: {len(active)} total')
 
     with cc.hold(grid.get_active_grid_infos)() as held:
-        table = held.value.table('return_0')
-        columns = table.column
+        table = held.value
+        columns = held.value.column
         print(
             '[FastDB Client] Held active IDs: '
             f'count={len(table)}, first=({columns.level[0]}, {columns.global_id[0]})'

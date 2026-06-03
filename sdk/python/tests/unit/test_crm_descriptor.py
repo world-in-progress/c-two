@@ -16,47 +16,18 @@ def _contract_hashes(crm_class: type) -> tuple[str, str]:
     return build_contract_fingerprints(crm_class)
 
 
-def test_transferable_decorator_records_abi_declarations_and_rejects_invalid_forms():
-    @cc.transferable(abi_id='test.payload.v1')
-    class PayloadById:
-        value: int
-
-        def serialize(value: 'PayloadById') -> bytes:
-            return str(value.value).encode()
-
-        def deserialize(data: bytes) -> 'PayloadById':
-            return PayloadById(int(data))
-
-    @cc.transferable(abi_schema='{"kind":"payload","version":1}')
-    class PayloadBySchema:
-        value: int
-
-        def serialize(value: 'PayloadBySchema') -> bytes:
-            return str(value.value).encode()
-
-        def deserialize(data: bytes) -> 'PayloadBySchema':
-            return PayloadBySchema(int(data))
-
-    assert PayloadById.__cc_transferable_abi__ == {
-        'abi_id': 'test.payload.v1',
-        'abi_schema': None,
-    }
-    assert PayloadBySchema.__cc_transferable_abi__ == {
-        'abi_id': None,
-        'abi_schema': '{"kind":"payload","version":1}',
-    }
-
-    with pytest.raises(ValueError, match='either abi_id or abi_schema'):
-        cc.transferable(abi_id='one', abi_schema='two')(PayloadById)
-    with pytest.raises(ValueError, match='abi_id cannot be empty'):
-        cc.transferable(abi_id='  ')(PayloadById)
-    with pytest.raises(TypeError, match='abi_schema must be a string'):
-        cc.transferable(abi_schema=object())(PayloadById)  # type: ignore[arg-type]
+def test_top_level_custom_transferable_api_is_removed():
+    assert not hasattr(cc, 'transferable')
+    assert not hasattr(cc, 'transfer')
 
 
 def test_default_transferables_use_pinned_pickle_protocol(monkeypatch):
-    transferable_mod = importlib.import_module('c_two.crm.transferable')
-    from c_two.crm.transferable import DEFAULT_PICKLE_PROTOCOL, create_default_transferable
+    payload_plan_mod = importlib.import_module('c_two.crm.payload_plan')
+    from c_two.crm.payload_plan import (
+        DEFAULT_PICKLE_PROTOCOL,
+        python_pickle_input_binding,
+        python_pickle_output_binding,
+    )
 
     protocols: list[int | None] = []
     real_dumps = pickle.dumps
@@ -65,21 +36,22 @@ def test_default_transferables_use_pinned_pickle_protocol(monkeypatch):
         protocols.append(kwargs.get('protocol'))
         return real_dumps(value, *args, **kwargs)
 
-    monkeypatch.setattr(transferable_mod.pickle, 'dumps', record_dumps)
+    monkeypatch.setattr(payload_plan_mod.pickle, 'dumps', record_dumps)
 
     def echo(value: int) -> int:
         return value
 
-    input_transferable = create_default_transferable(echo, is_input=True)
-    output_transferable = create_default_transferable(echo, is_input=False)
+    input_binding = python_pickle_input_binding(echo)
+    output_binding = python_pickle_output_binding(echo)
 
-    assert input_transferable.serialize(1) == real_dumps(1, protocol=DEFAULT_PICKLE_PROTOCOL)
-    assert output_transferable.serialize(2) == real_dumps(2, protocol=DEFAULT_PICKLE_PROTOCOL)
+    assert input_binding.serialize(1) == real_dumps(1, protocol=DEFAULT_PICKLE_PROTOCOL)
+    assert output_binding.serialize(2) == real_dumps(2, protocol=DEFAULT_PICKLE_PROTOCOL)
     assert protocols == [DEFAULT_PICKLE_PROTOCOL, DEFAULT_PICKLE_PROTOCOL]
 
 
-def test_descriptor_uses_explicit_custom_transferable_abi_and_not_python_names():
-    @cc.transferable(abi_id='test.payload.stable.v1')
+def test_transfer_input_output_codec_overrides_are_removed_from_crm_planning():
+    from c_two.crm.transferable import transfer
+
     class StablePayload:
         value: int
 
@@ -89,60 +61,19 @@ def test_descriptor_uses_explicit_custom_transferable_abi_and_not_python_names()
         def deserialize(data: bytes) -> 'StablePayload':
             return StablePayload(int(data))
 
-    @cc.crm(namespace='test.descriptor', version='0.1.0')
-    class StableContract:
-        @cc.transfer(input=StablePayload, output=StablePayload)
-        def echo(self, value: StablePayload) -> StablePayload:
-            ...
-
-    from c_two.crm.descriptor import build_contract_descriptor
-
-    descriptor = build_contract_descriptor(StableContract)
-    encoded = repr(descriptor)
-
-    assert 'test.payload.stable.v1' in encoded
-    assert f'{StablePayload.__module__}.{StablePayload.__qualname__}' not in encoded
-    assert _contract_hashes(StableContract)[0] != _contract_hashes(StableContract)[1]
+    with pytest.raises(TypeError, match='codec overrides were removed'):
+        @cc.crm(namespace='test.descriptor', version='0.1.0')
+        class StableContract:
+            @transfer(input=StablePayload, output=StablePayload)
+            def echo(self, value: StablePayload) -> StablePayload:
+                ...
 
 
-def test_descriptor_hash_changes_when_transferable_abi_schema_changes():
-    @cc.transferable(abi_schema='{"kind":"payload","version":1}')
-    class SchemaV1:
-        value: int
+def test_transfer_buffer_hold_is_not_server_borrowing_api():
+    from c_two.crm.transferable import transfer
 
-        def serialize(value: 'SchemaV1') -> bytes:
-            return str(value.value).encode()
-
-        def deserialize(data: bytes) -> 'SchemaV1':
-            return SchemaV1(int(data))
-
-    @cc.transferable(abi_schema='{"kind":"payload","version":2}')
-    class SchemaV2:
-        value: int
-
-        def serialize(value: 'SchemaV2') -> bytes:
-            return str(value.value).encode()
-
-        def deserialize(data: bytes) -> 'SchemaV2':
-            return SchemaV2(int(data))
-
-    @cc.crm(namespace='test.descriptor', version='0.1.0')
-    class ContractV1:
-        @cc.transfer(input=SchemaV1, output=SchemaV1)
-        def echo(self, value: SchemaV1) -> SchemaV1:
-            ...
-
-    @cc.crm(namespace='test.descriptor', version='0.1.0')
-    class ContractV2:
-        @cc.transfer(input=SchemaV2, output=SchemaV2)
-        def echo(self, value: SchemaV2) -> SchemaV2:
-            ...
-
-    abi_v1, sig_v1 = _contract_hashes(ContractV1)
-    abi_v2, sig_v2 = _contract_hashes(ContractV2)
-
-    assert abi_v1 != abi_v2
-    assert sig_v1 != sig_v2
+    with pytest.raises(ValueError, match='input_lifetime'):
+        transfer(buffer='hold')
 
 
 def test_descriptor_normalizes_optional_union_and_ignores_shutdown_without_return_annotation():
@@ -218,39 +149,29 @@ def test_descriptor_rejects_non_canonical_remote_signatures(
         _contract_hashes(Broken)
 
 
-def test_descriptor_rejects_custom_hook_transferable_without_declared_abi():
-    @cc.transferable
-    class UndeclaredPayload:
-        value: int
-
-        def serialize(value: 'UndeclaredPayload') -> bytes:
-            return str(value.value).encode()
-
-        def deserialize(data: bytes) -> 'UndeclaredPayload':
-            return UndeclaredPayload(int(data))
-
-    @cc.crm(namespace='test.descriptor.reject', version='0.1.0')
-    class BadContract:
-        @cc.transfer(input=UndeclaredPayload, output=UndeclaredPayload)
-        def echo(self, value: UndeclaredPayload) -> UndeclaredPayload:
-            ...
-
-    with pytest.raises(ValueError, match='explicit ABI'):
-        _contract_hashes(BadContract)
-
-
-def test_descriptor_rejects_plain_no_hook_transferable_until_field_wire_abi_exists():
-    @cc.transferable
+def test_plain_python_annotations_are_python_pickle_fallback_not_payload_plan():
     class PlainPayload:
         value: int
 
-    @cc.crm(namespace='test.descriptor.reject', version='0.1.0')
-    class BadContract:
+    @cc.crm(namespace='test.descriptor.python-only-transferable', version='0.1.0')
+    class PythonOnlyContract:
         def echo(self, value: PlainPayload) -> PlainPayload:
             ...
 
-    with pytest.raises(ValueError, match='dataclass-field ABI'):
-        _contract_hashes(BadContract)
+    from c_two.crm.descriptor import build_contract_descriptor
+
+    descriptor = build_contract_descriptor(PythonOnlyContract)
+    method = descriptor['methods'][0]
+
+    assert method['wire']['input']['family'] == 'python-pickle-default'
+    assert method['wire']['output']['family'] == 'python-pickle-default'
+    assert method['parameters'][0]['annotation'] == {
+        'kind': 'python_type',
+        'module': __name__,
+        'name': 'PlainPayload',
+    }
+    with pytest.raises(ValueError, match='python-pickle-default'):
+        cc.export_contract_descriptor(PythonOnlyContract)
 
 
 def test_remote_surface_transferables_do_not_use_implicit_abi_declarations():
@@ -273,11 +194,10 @@ def test_remote_surface_transferables_do_not_use_implicit_abi_declarations():
     assert offenders == []
 
 
-def test_remote_crm_signatures_do_not_reference_no_abi_custom_hooks():
+def test_runtime_and_examples_do_not_reference_removed_transferable_api():
     repo = Path(__file__).resolve().parents[4]
     roots = [
-        repo / 'sdk/python/tests',
-        repo / 'sdk/python/benchmarks',
+        repo / 'sdk/python/src',
         repo / 'examples/python',
     ]
     offenders: list[str] = []
@@ -289,12 +209,6 @@ def test_remote_crm_signatures_do_not_reference_no_abi_custom_hooks():
         if isinstance(target, ast.Name):
             return target.id
         return None
-
-    def decorator_has_abi(decorator: ast.expr) -> bool:
-        return (
-            isinstance(decorator, ast.Call)
-            and any(kw.arg in {'abi_id', 'abi_schema'} for kw in decorator.keywords)
-        )
 
     def names_in_annotation(annotation: ast.expr | None) -> set[str]:
         names: set[str] = set()
@@ -324,7 +238,7 @@ def test_remote_crm_signatures_do_not_reference_no_abi_custom_hooks():
             if path.name == 'test_crm_descriptor.py':
                 continue
             tree = ast.parse(path.read_text(), filename=str(path))
-            transferables: dict[str, tuple[int, bool, bool]] = {}
+            transferables: dict[str, int] = {}
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ClassDef):
                     continue
@@ -332,19 +246,10 @@ def test_remote_crm_signatures_do_not_reference_no_abi_custom_hooks():
                     decorator_call_name(decorator): decorator
                     for decorator in node.decorator_list
                 }
-                transferable_decorator = decorators.get('cc.transferable')
-                if transferable_decorator is None:
+                removed_decorator = decorators.get('cc.' + 'transferable')
+                if removed_decorator is None:
                     continue
-                has_hooks = any(
-                    isinstance(child, ast.FunctionDef)
-                    and child.name in {'serialize', 'deserialize', 'from_buffer'}
-                    for child in node.body
-                )
-                transferables[node.name] = (
-                    node.lineno,
-                    decorator_has_abi(transferable_decorator),
-                    has_hooks,
-                )
+                transferables[node.name] = node.lineno
 
             if not transferables:
                 continue
@@ -369,11 +274,10 @@ def test_remote_crm_signatures_do_not_reference_no_abi_custom_hooks():
                     for name in referenced:
                         if name not in transferables:
                             continue
-                        line, has_abi, has_hooks = transferables[name]
-                        if has_hooks and not has_abi:
-                            offenders.append(
-                                f'{path.relative_to(repo)}:{line}: {name}',
-                            )
+                        line = transferables[name]
+                        offenders.append(
+                            f'{path.relative_to(repo)}:{line}: {name}',
+                        )
 
     assert offenders == []
 

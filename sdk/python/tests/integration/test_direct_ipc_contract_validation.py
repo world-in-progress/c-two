@@ -52,50 +52,6 @@ def _contract(attrs: dict[str, object]) -> type:
     )
 
 
-@cc.transferable(abi_id="c-two.tests.direct-ipc.payload.v1")
-class PayloadByIdV1:
-    value: int
-
-    def serialize(value: "PayloadByIdV1") -> bytes:
-        return str(value.value).encode()
-
-    def deserialize(data: bytes) -> "PayloadByIdV1":
-        return PayloadByIdV1(int(data))
-
-
-@cc.transferable(abi_id="c-two.tests.direct-ipc.payload.v2")
-class PayloadByIdV2:
-    value: int
-
-    def serialize(value: "PayloadByIdV2") -> bytes:
-        return str(value.value).encode()
-
-    def deserialize(data: bytes) -> "PayloadByIdV2":
-        return PayloadByIdV2(int(data))
-
-
-@cc.transferable(abi_schema='{"kind":"direct-ipc-payload","version":1}')
-class PayloadBySchemaV1:
-    value: int
-
-    def serialize(value: "PayloadBySchemaV1") -> bytes:
-        return str(value.value).encode()
-
-    def deserialize(data: bytes) -> "PayloadBySchemaV1":
-        return PayloadBySchemaV1(int(data))
-
-
-@cc.transferable(abi_schema='{"kind":"direct-ipc-payload","version":2}')
-class PayloadBySchemaV2:
-    value: int
-
-    def serialize(value: "PayloadBySchemaV2") -> bytes:
-        return str(value.value).encode()
-
-    def deserialize(data: bytes) -> "PayloadBySchemaV2":
-        return PayloadBySchemaV2(int(data))
-
-
 def _mismatch_cases() -> list[tuple[str, type, type]]:
     base = _contract({"echo": _method("def echo(self, value: int) -> int: ...")})
     return [
@@ -126,52 +82,6 @@ def _mismatch_cases() -> list[tuple[str, type, type]]:
             "access-mode",
             _contract({"echo": cc.read(_method("def echo(self, value: int) -> int: ..."))}),
             _contract({"echo": cc.write(_method("def echo(self, value: int) -> int: ..."))}),
-        ),
-        (
-            "transferable-abi-id",
-            _contract(
-                {
-                    "echo": cc.transfer(input=PayloadByIdV1, output=PayloadByIdV1)(
-                        _method(
-                            "def echo(self, value: PayloadByIdV1) -> PayloadByIdV1: ...",
-                            {"PayloadByIdV1": PayloadByIdV1},
-                        ),
-                    ),
-                },
-            ),
-            _contract(
-                {
-                    "echo": cc.transfer(input=PayloadByIdV2, output=PayloadByIdV2)(
-                        _method(
-                            "def echo(self, value: PayloadByIdV2) -> PayloadByIdV2: ...",
-                            {"PayloadByIdV2": PayloadByIdV2},
-                        ),
-                    ),
-                },
-            ),
-        ),
-        (
-            "transferable-abi-schema",
-            _contract(
-                {
-                    "echo": cc.transfer(input=PayloadBySchemaV1, output=PayloadBySchemaV1)(
-                        _method(
-                            "def echo(self, value: PayloadBySchemaV1) -> PayloadBySchemaV1: ...",
-                            {"PayloadBySchemaV1": PayloadBySchemaV1},
-                        ),
-                    ),
-                },
-            ),
-            _contract(
-                {
-                    "echo": cc.transfer(input=PayloadBySchemaV2, output=PayloadBySchemaV2)(
-                        _method(
-                            "def echo(self, value: PayloadBySchemaV2) -> PayloadBySchemaV2: ...",
-                            {"PayloadBySchemaV2": PayloadBySchemaV2},
-                        ),
-                    ),
-                },
-            ),
         ),
         (
             "default-annotation-shape",

@@ -19,6 +19,8 @@ mod lease_ffi;
 #[cfg(feature = "python")]
 mod mem_ffi;
 #[cfg(feature = "python")]
+mod response_backing;
+#[cfg(feature = "python")]
 mod route_concurrency_ffi;
 #[cfg(feature = "python")]
 mod runtime_session_ffi;
@@ -28,6 +30,8 @@ mod server_ffi;
 pub(crate) mod shm_buffer;
 #[cfg(feature = "python")]
 mod wire_ffi;
+#[cfg(feature = "python")]
+mod writable_sink;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -46,6 +50,7 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     http_ffi::register_module(m)?;
     lease_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;
+    response_backing::register_module(m)?;
     route_concurrency_ffi::register_module(m)?;
     runtime_session_ffi::register_module(m)?;
     server_ffi::register_module(m)?;

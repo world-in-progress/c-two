@@ -5,7 +5,7 @@
 <h1 align="center">C-Two</h1>
 
 <p align="center">
-  面向资源的 Python RPC 框架 — 将有状态的 Python 类转变为位置透明的分布式资源。
+  面向资源的 RPC runtime — 将有状态对象转变为位置透明的分布式资源。
 </p>
 
 <p align="center">
@@ -24,33 +24,47 @@
 
 ## 基本理念
 
-- **面向资源，而非服务** — C-Two 不是暴露 RPC 端点，而是让 Python 类在保持有状态、面向对象特性的同时可被远程访问。
+- **面向资源的 RPC** — C-Two 通过语言 SDK 暴露有状态 resource object。Python SDK 让 Python 类在保持面向对象特性的同时具备远程访问能力。
 
-- **从进程到数据的零拷贝** — 同进程调用完全跳过序列化。跨进程 IPC 可以保持共享内存缓冲区存活，让你直接从 SHM 读取列式数据（NumPy、Arrow 等）— 无需反序列化，无需拷贝。
+- **从进程到数据的零拷贝** — 同进程调用完全跳过序列化。跨进程 IPC 可以保持共享内存缓冲区存活，让 FastDB checked view 在调用方显式 retained response 时直接读取 SHM 上的列式数据。
 
-- **为科学计算而生** — 原生支持 Apache Arrow、NumPy 数组和大体量载荷（超过 256 MB 自动分块载荷传输）。专为计算密集型场景设计，而非微服务。
+- **为科学计算而生** — portable CRM payload 使用 FastDB；Python-only prototype 仍可使用普通 Python 值。超过 256 MB 的大体量载荷使用分块传输。runtime 面向计算工作流和有状态科学资源设计。
 
-- **Rust 驱动的传输层** — IPC 层使用 Rust buddy 分配器管理共享内存，HTTP 中继基于 Rust 实现高吞吐网络转发。
+- **Rust 驱动的 runtime core** — 共享 transport、memory、wire codec、route-contract validation、relay 和配置解析都在 Rust 中实现，让后续 SDK 复用同一套 runtime contract。
 
 ---
 
 ## 性能
 
-端到端跨进程 IPC 基准测试 — 相同的 NumPy 载荷（`row_id u32` + `x,y,z f64`），相同机器，相同聚合运算。三种传输模式对比：
+端到端跨进程 IPC 基准测试，Kostya-style 坐标 schema：`row_id u32`、`x/y/z f64`、`name STR`。每次调用从远端进程返回缓存坐标表，客户端计算 `sum(x + y + z)`。
 
-| 行数 | C-Two hold (ms) | Ray (ms) | C-Two pickle (ms) | **Hold vs Ray** |
-|-----:|---:|---:|---:|---:|
-| 1 K | **0.07** | 6.1 | 0.19 | **86×** |
-| 10 K | **0.09** | 7.1 | 0.82 | **79×** |
-| 100 K | **0.38** | 9.8 | 8.7 | **26×** |
-| 1 M | **3.7** | 58 | 150 | **15×** |
-| 3 M | **9.7** | 129 | 598 | **13×** |
+| 行数 | FDB control default (ms) | FDB recommended default (ms) | FDB control retained (ms) | FDB recommended retained (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Recommended retained vs Ray arrays** |
+|-----:|---:|---:|---:|---:|---:|---:|---:|
+| 1 K | 1.28 | 1.33 | 1.30 | **1.12** | 6.51 | 0.57 | **5.8×** |
+| 10 K | 1.83 | 1.27 | 1.52 | **1.26** | 7.42 | 1.24 | **5.9×** |
+| 100 K | 5.10 | 2.64 | 4.91 | **1.91** | 8.22 | 9.69 | **4.3×** |
+| 1 M | 36.39 | 12.29 | 29.85 | **8.36** | 48.59 | 130.65 | **5.8×** |
+| 3 M | 147.89 | 39.08 | 93.80 | **23.29** | 164.32 | 529.47 | **7.1×** |
 
-- **C-Two hold** — SHM 零拷贝，通过 `np.frombuffer` 读取；读端无序列化
-- **Ray** — 对象存储，内置 numpy 零拷贝支持（Ray 2.55）
-- **C-Two pickle** — 标准 pickle 经由 SHM 传输；展示序列化开销
+Row-oriented fallback 路径在大规模数据下明显更慢，这里只用于展示 Python object materialization 成本：
 
-> Apple M1 Max · Python 3.13 · NumPy 2.4 · 完整方法见 [`sdk/python/benchmarks/unified_numpy_benchmark.py`](sdk/python/benchmarks/unified_numpy_benchmark.py)。
+| 行数 | C-Two pickle records (ms) | Ray records (ms) | **Recommended retained vs Ray records** |
+|-----:|---:|---:|---:|
+| 1 K | 0.95 | 6.23 | **5.6×** |
+| 10 K | 6.09 | 11.62 | **9.2×** |
+| 100 K | 67.25 | 56.31 | **29.5×** |
+| 1 M | 861.50 | 546.27 | **65.3×** |
+| 3 M | SKIP | SKIP | - |
+
+- **FDB control** — 普通 `fdb.Batch.allocate(...)` 资源实现；作为 benchmark control 保留，用来展示资源输出在 CRM call envelope 外构建时的 call-db repack 成本。
+- **FDB recommended** — 资源实现使用 `fdb.require(fdb.batch(...))`；3M 行 default-call p50 从 147.89 ms 降到 39.08 ms。
+- **Default / retained** — default call 会在脱离 transport buffer 后返回 owned logical value；retained call 使用 `cc.hold(...)`，让 FastDB checked view 在 release 前直接读取 retained response buffer。
+- **Ray arrays** — Ray object store 传输 NumPy 列和 `name` 字符串列表。
+- **Pickle arrays / records** — Python-only fallback baselines；records 特意覆盖 row-oriented Python object 开销。
+
+上表中的 FastDB 行比较同一套 C-Two 资源模型内的不同构造路径：CRM contract -> resource instance -> typed client proxy。
+
+> Apple M1 Max · measured May 27, 2026 · C-Two: Python 3.14.3 + NumPy 2.4.4 · Ray: Python 3.12 + NumPy 2.4.6 + Ray 2.55.1 · 完整方法见 [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py)、[`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py) 和 [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh)。
 
 ---
 
@@ -60,69 +74,96 @@
 pip install c-two
 ```
 
-### 定义资源契约及其实现
+### 定义 FastDB-first 资源契约
 
 ```python
 import c_two as cc
+import fastdb4py as fdb
+import numpy as np
 
-# CRM 契约 — 声明哪些方法可被远程访问
-@cc.crm(namespace='demo.counter', version='0.1.0')
-class Counter:
-    def increment(self, amount: int) -> int: ...
+
+@fdb.feature
+class Vertex:
+    vertex_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
+    z: fdb.F64
+
+
+@fdb.feature
+class Node:
+    node_id: fdb.U32
+    weight: fdb.F64
+    anchor: Vertex
+    neighbors: list[Vertex]
+
+
+@cc.crm(namespace='demo.geometry', version='0.1.0')
+class Geometry:
+    @cc.read
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
+        ...
 
     @cc.read
-    def value(self) -> int: ...
+    def nodes(self) -> fdb.Batch[Node]:
+        ...
+```
 
-    def reset(self) -> int: ...
+`vertices()` 是固定规模列式路径；`nodes()` 是表达嵌套资源数据的对象图路径。
 
+### 实现资源对象
 
-# Resource — 一个实现契约的普通 Python 类
-class CounterImpl:
-    def __init__(self, initial: int = 0):
-        self._value = initial
+```python
+class GeometryResource:
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
+        n = int(count)
+        batch = fdb.require(fdb.batch(Vertex, rows=n))
+        idx = np.arange(n, dtype=np.uint32)
+        xyz = idx.astype(np.float64)
+        batch.fill(vertex_id=idx, x=xyz, y=xyz + 10.0, z=xyz + 20.0)
+        return batch
 
-    def increment(self, amount: int) -> int:
-        self._value += amount
-        return self._value
+    def nodes(self) -> fdb.Batch[Node]:
+        vertices = [
+            Vertex(vertex_id=0, x=0.0, y=10.0, z=20.0),
+            Vertex(vertex_id=1, x=1.0, y=11.0, z=21.0),
+            Vertex(vertex_id=2, x=2.0, y=12.0, z=22.0),
+        ]
 
-    def value(self) -> int:
-        return self._value
-
-    def reset(self) -> int:
-        old = self._value
-        self._value = 0
-        return old
+        batch = fdb.Batch.allocate(Node, 0)
+        batch.append(Node(
+            node_id=100,
+            weight=0.5,
+            anchor=vertices[0],
+            neighbors=[vertices[1], vertices[2]],
+        ))
+        return batch
 ```
 
 ### 本地使用（零序列化）
 
 ```python
-cc.register(Counter, CounterImpl(initial=100), name='counter')
-counter = cc.connect(Counter, name='counter')
+cc.register(Geometry, GeometryResource(), name='geometry')
 
-counter.increment(10)    # → 110
-counter.value()          # → 110
-counter.reset()          # → 110（返回旧值）
-counter.value()          # → 0
-
-cc.close(counter)
+with cc.connect(Geometry, name='geometry') as geometry:
+    vertices = geometry.vertices(1_000)
+    nodes = geometry.nodes()
 ```
 
-### 远程使用 — 相同 API，Relay 发现
+### 跨进程使用同一套客户端 API
 
 ```python
 # 服务端进程
 cc.set_relay_anchor('http://relay-host:8080')
-cc.register(Counter, CounterImpl(), name='counter')
+cc.register(Geometry, GeometryResource(), name='geometry')
 
 # 客户端进程（另一个终端）
 cc.set_relay_anchor('http://relay-host:8080')
-counter = cc.connect(Counter, name='counter')
-counter.increment(5)     # 用法完全一致
-cc.close(counter)
+with cc.connect(Geometry, name='geometry') as geometry:
+    vertices = geometry.vertices(1_000_000)
 ```
 
-> **完整可运行示例请参阅 [`examples/python/`](examples/python/) 目录。**
+同一个 CRM contract 可以用于进程内调用、IPC 调用或 relay 调用。Client code 在这些模式下都调用 typed proxy。Portable payload 使用 FastDB 类型编写；普通 Python 值可用于本地 Python-only prototype。
 
 ---
 
@@ -133,46 +174,37 @@ cc.close(counter)
 **CRM**（Core Resource Model）声明远程资源暴露*哪些*方法。使用 `@cc.crm()` 装饰，方法体为 `...`（纯接口，无实现）。
 
 ```python
-@cc.crm(namespace='demo.greeter', version='0.1.0')
-class Greeter:
-    @cc.read    # 允许并发读取
-    def greet(self, name: str) -> str: ...
+@cc.crm(namespace='demo.geometry', version='0.1.0')
+class Geometry:
+    @cc.read
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
+        ...
 
     @cc.read
-    def language(self) -> str: ...
+    def nodes(self) -> fdb.Batch[Node]:
+        ...
 ```
 
-方法可标注 `@cc.read`（允许并发访问）或保持默认的 write（独占访问）。
+方法可标注 `@cc.read`（允许并发访问）或保持默认的 write（独占访问）。Portable 方法输入输出使用 FastDB scalar alias、`fdb.Array[...]`、`fdb.Batch[...]` 和 FastDB feature class。
 
 ### Resource — 运行时实例
 
-**Resource** 是实现 CRM 契约的普通 Python 类，持有状态和领域逻辑。它**不需要**任何装饰器 — 框架通过所注册的 CRM 契约发现其方法。命名应体现 *它是什么*（`GreeterImpl`、`PostgresGreeter`、`MultilingualGreeter`），而非接口本身。
+**Resource** 是实现 CRM 契约的普通 Python 类，持有状态和领域逻辑。它无需装饰器；框架通过注册时绑定的 CRM 契约发现其方法。命名应体现领域语义，例如 `GeometryResource`。
 
-```python
-class GreeterImpl:
-    def __init__(self, lang: str = 'en'):
-        self._lang = lang
-        self._templates = {'en': 'Hello, {}!', 'zh': '你好, {}!'}
-
-    def greet(self, name: str) -> str:
-        return self._templates.get(self._lang, 'Hi, {}!').format(name)
-
-    def language(self) -> str:
-        return self._lang
-```
+上方示例中的 `GeometryResource` 就是 resource object。CRM contract 保持 FastDB-first；resource implementation 只是返回 FastDB 值的普通 Python 代码。
 
 ### Client — 消费者
 
 任何调用 `cc.connect(...)` 的代码都是 **client**（即 consumer / 应用代码）。返回的代理是位置透明的 — 无论资源运行在同进程还是远程机器，用法完全相同。
 
 ```python
-greeter = cc.connect(Greeter, name='greeter')
-greeter.greet('World')     # → '你好, World!'
-cc.close(greeter)
+geometry = cc.connect(Geometry, name='geometry')
+vertices = geometry.vertices(1_000)
+cc.close(geometry)
 
 # 或使用上下文管理器：
-with cc.connect(Greeter, name='greeter') as greeter:
-    greeter.greet('World')
+with cc.connect(Geometry, name='geometry') as geometry:
+    nodes = geometry.nodes()
 ```
 
 ### Server — 资源宿主
@@ -182,8 +214,7 @@ with cc.connect(Greeter, name='greeter') as greeter:
 ```python
 import c_two as cc
 
-cc.register(Greeter, GreeterImpl(), name='greeter')
-cc.register(Counter, CounterImpl(), name='counter')
+cc.register(Geometry, GeometryResource(), name='geometry')
 cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关闭
 ```
 
@@ -202,291 +233,109 @@ cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
 ```
 
-Python SDK 不内嵌也不启动中继服务器；请单独启动 `c3 relay`、Docker Compose 或编排系统中的中继，再通过 `C2_RELAY_ANCHOR_ADDRESS` 或 `cc.set_relay_anchor()` 让 Python 代码连接它的 relay anchor。anchor 是控制面注册和名称解析端点；远程 HTTP 调用仍会直连解析得到的 `relay_url`，只有 anchor 是 loopback/local 端点时才会选择本地 direct IPC。relay-aware 客户端会在首次调用前预检 route，并在收到结构化 stale-route 响应时重新解析路由；可通过 `C2_RELAY_ROUTE_MAX_ATTEMPTS` 调整最大 route acquisition 尝试次数（默认 `3`，有效范围 `1..=32`，`0` 按 `1` 处理）。可通过 `C2_RELAY_CALL_TIMEOUT` 调整 CRM 调用超时秒数（默认 `300`；`0` 禁用 reqwest 总超时）。可通过 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 调整 relay HTTP 和未来远程协议的 C-Two 远程载荷批大小（默认 `1048576`；最大 `134217728`）。这不是 TCP packet、HTTP/1 chunk 或 HTTP/2 DATA frame 保证。语义不明确的数据面失败不会被自动重放。relay resolve、probe 和 call 路径会拒绝 name-only lookup 和 CRM 契约不匹配，而不是回退到同名非类型化路由。
+Python SDK 将 relay 生命周期交给 `c3 relay`、Docker Compose 或编排系统。Python 代码通过 `C2_RELAY_ANCHOR_ADDRESS` 或 `cc.set_relay_anchor()` 连接 relay anchor。anchor 是控制面注册和名称解析端点；远程 HTTP 调用仍会直连解析得到的 `relay_url`，只有 anchor 是 loopback/local 端点时才会选择本地 direct IPC。relay-aware 客户端会在首次调用前预检 route，并在收到结构化 stale-route 响应时重新解析路由；可通过 `C2_RELAY_ROUTE_MAX_ATTEMPTS` 调整最大 route acquisition 尝试次数（默认 `3`，有效范围 `1..=32`，`0` 按 `1` 处理）。可通过 `C2_RELAY_CALL_TIMEOUT` 调整 CRM 调用超时秒数（默认 `300`；`0` 禁用 reqwest 总超时）。可通过 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 调整 relay HTTP 和未来远程协议的 C-Two 远程载荷批大小（默认 `1048576`；最大 `134217728`）。这个设置控制 C-Two payload batching，独立于 TCP packet、HTTP/1 chunk 或 HTTP/2 DATA frame 边界。语义不明确的数据面失败需要调用方自定义 retry policy。relay resolve、probe 和 call 路径要求 route name 与 CRM contract 同时匹配，并拒绝契约不匹配的路由。
 
 ```bash
 # 在网络可达的任意节点启动中继
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Relay HTTP 与 mesh 端点应只暴露在可信网络边界内。不要将其直接暴露到公网；生产部署应通过私有网络、防火墙、Kubernetes NetworkPolicy、service mesh 策略或 ingress 认证等基础设施限制访问。
+Relay HTTP 与 mesh 端点应只暴露在可信网络边界内。生产部署应通过私有网络、防火墙、Kubernetes NetworkPolicy、service mesh 策略或 ingress 认证等基础设施限制访问。
 
 ```python
 # 服务端 — 将资源通告给中继
 cc.set_relay_anchor('http://relay-host:8080')
-cc.register(MeshStore, MeshStoreImpl(), name='mesh')
+cc.register(Geometry, GeometryResource(), name='geometry')
 cc.serve()
 
 # 客户端 — 按路由名和 CRM 契约解析，无需显式地址
 cc.set_relay_anchor('http://relay-host:8080')
-mesh = cc.connect(MeshStore, name='mesh')
+geometry = cc.connect(Geometry, name='geometry')
 ```
 
-多个中继可以通过 gossip 协议组成**网格集群** — 网格中任意中继都能解析整个集群内注册的任何资源。详见下方的 [中继网格示例](#中继网格--多中继集群)。
+多个中继可以通过 gossip 协议组成**网格集群** — 网格中任意中继都能解析整个集群内注册的任何资源。可运行示例见 [可运行示例](#可运行示例)。
 
-> **何时需要中继？** 仅用于跨机器或按路由名与 CRM 契约发现的场景。同进程和同主机（IPC）用法完全不需要中继。
+> **何时需要中继？** 跨机器访问或按路由名与 CRM 契约发现时使用 relay。同进程和同主机 IPC 可以直接连接。
 
-### @transferable — 自定义序列化
+### FastDB-first payload
 
-对于需要跨进程传输的自定义数据类型，使用 `@cc.transferable`。未使用此装饰器时，默认使用 pickle。
+Portable CRM payload 使用 `fastdb4py` 声明。CRM 签名保持逻辑类型：`fdb.I32`、`fdb.Array[...]`、`fdb.Batch[...]` 和 `@fdb.feature` 会规划成 FastDB call-db ABI；未标记的 Python 类型可在 Python-only prototype 路径中走 pickle，strict portable export/codegen 会拒绝它。
 
-一个 transferable 类最多可定义三个静态方法（以普通方法风格编写，无需添加 `@staticmethod` — 框架会自动转换）：
+Payload ABI 位于 C-Two resource-first 架构之下。FastDB 拥有 schema、storage layout、view 和面向 allocator 的 payload 构建语义。C-Two 拥有 CRM route contract、transport、retained-buffer lease 以及 contract/codegen orchestration；runtime 的 route/relay/IPC/scheduler 层把 FastDB payload 视作 opaque ABI-backed bytes，不解析 FastDB 存储内部结构。
 
-| 方法 | 必需 | 用途 |
-|------|------|------|
-| `serialize(data) → bytes` | ✅ 是 | 将数据编码为字节用于传输（出站） |
-| `deserialize(raw) → T` | ✅ 是 | 将字节解码为拥有所有权的 Python 对象（入站） |
-| `from_buffer(buf) → T` | ❌ 可选 | 在原始缓冲区上构建零拷贝视图（入站，持有模式） |
+这里聚焦两种 FastDB CRM 形态：
+
+- `vertices() -> fdb.Batch[Vertex]`：固定规模列式 feature batch，是 retained-view、高吞吐路径。
+- `nodes() -> fdb.Batch[Node]`：包含 nested feature 和 list 的对象图 batch，仍是 portable FastDB call-db data，retained-view profile 与固定列式数据不同。
 
 ```python
-import numpy as np
+@fdb.feature
+class Vertex: ...
 
-@cc.transferable
-class Matrix:
-    rows: int
-    cols: int
-    data: np.ndarray
+@fdb.feature
+class Node:
+    anchor: Vertex
+    neighbors: list[Vertex]
 
-    def serialize(mat: 'Matrix') -> bytes:
-        header = struct.pack('>II', mat.rows, mat.cols)
-        return header + mat.data.tobytes()
-
-    def deserialize(raw: bytes) -> 'Matrix':
-        rows, cols = struct.unpack_from('>II', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=8).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr.copy())  # owned copy
-
-    def from_buffer(buf: memoryview) -> 'Matrix':
-        header = bytes(buf[:8])
-        rows, cols = struct.unpack('>II', header)
-        arr = np.frombuffer(buf[8:], dtype=np.float64).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr)  # zero-copy view into SHM
+@cc.crm(namespace='demo.geometry', version='0.1.0')
+class Geometry:
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]: ...
+    def nodes(self) -> fdb.Batch[Node]: ...
 ```
 
-当 `from_buffer` 存在时，服务端自动使用**持有模式** — 共享内存缓冲区保持存活，使 `from_buffer` 可以返回零拷贝视图。若无 `from_buffer`，服务端使用**视图模式** — 缓冲区在 `deserialize` 完成后立即释放。
+固定规模列式输出的具体写法见快速开始中的 `GeometryResource.vertices()`。
 
-### @cc.transfer — 逐方法控制
+C-Two 会把 CRM 推导出的 FastDB binding 交给 FastDB；用户代码保持在逻辑 `Batch`、`Array`、scalar 和 feature 类型层面。
 
-在 CRM 契约方法上使用 `@cc.transfer()` 可显式指定由哪个 transferable 类型处理序列化，或覆盖缓冲区模式：
-
-```python
-@cc.crm(namespace='demo.compute', version='0.1.0')
-class Compute:
-    @cc.transfer(input=Matrix, output=Matrix, buffer='hold')
-    def transform(self, mat: Matrix) -> Matrix: ...
-
-    @cc.transfer(input=Matrix, buffer='view')  # force copy even if from_buffer exists
-    def ingest(self, mat: Matrix) -> None: ...
-```
-
-若不使用 `@cc.transfer`，框架会根据函数签名自动匹配已注册的 `@transferable` 类型，并根据输入类型的能力自动解析缓冲区模式。
+Python-only resource 仍可使用普通 Python annotation 和 pickle 做本地 prototype。这类方法会被 strict contract export/codegen 诊断为 nonportable。
 
 ### cc.hold() — 客户端零拷贝
 
-在客户端，`cc.hold()` 请求响应缓冲区保持存活；当输出 transferable 能从 memoryview 构造 view 时，这条路径可以实现零拷贝读取。返回的 `HeldResult` 包装了值，并把保留中的原始 wire buffer 暴露为 `.buffer`，供高级用户自行解析，同时提供三层缓冲区生命周期安全网：
+在客户端，普通 FastDB CRM 调用会先把响应 payload copy 到进程自有缓冲区，再暴露逻辑 FastDB 值并立即释放 transport buffer。`cc.hold()` 显式请求保留响应缓冲区，使支持 retained view 的 FDB 输出可以零拷贝读取。返回的 `cc.Held[R]` 包装 CRM 逻辑返回值，并把保留中的原始 wire buffer 作为 `.unsafe_buffer` 暴露给高级用户。
 
 1. **显式 `.release()`** — 推荐用于同时持有多个缓冲区的复杂工作流
 2. **上下文管理器（`with`）** — 推荐用于单缓冲区作用域
 3. **`__del__` 兜底** — 最后手段，若忘记释放会触发 `ResourceWarning`
 
 ```python
-grid = cc.connect(Compute, name='compute', address='ipc://server')
+geometry = cc.connect(Geometry, name='geometry', address='ipc://server')
 
-# Normal call — buffer released immediately after deserialize
-result = grid.transform(matrix)
+# Normal call — transport release 后暴露 owned logical value。
+vertices = geometry.vertices(1_000_000)
 
-# Option 1: Context manager — clean for single holds
-with cc.hold(grid.transform)(matrix) as held:
-    data = held.value          # zero-copy NumPy array backed by SHM
-    raw = held.buffer          # retained wire buffer, valid only inside the hold scope
-    process(data)              # read directly from shared memory
-# SHM buffer released on context exit
-
-# Option 2: Explicit release — better for multiple concurrent holds
-a = cc.hold(grid.transform)(matrix_a)
-b = cc.hold(grid.transform)(matrix_b)
-try:
-    combined = np.concatenate([a.value.data, b.value.data])
-    process(combined)
-finally:
-    a.release()
-    b.release()
+# Retained call — columnar FastDB view 直接读取 retained response。
+with cc.hold(geometry.vertices)(1_000_000) as held:
+    vertices = held.value
+    z_mean = vertices.column.z.to_numpy().mean()
 ```
+
+`held.value` 是普通 API，会尽量使用 FastDB checked views；`held.release()` 后，子行和列视图会 fail fast。`held.unsafe_buffer` 是原始 `memoryview` escape hatch；从该 buffer 派生出的 NumPy/raw pointer 会绕过 FastDB owner check。需要跨越 hold 生命周期保存数据时，用 `fdb.materialize(...)` 物化。
+
+`nodes()` 这类对象图 response 仍是 portable FastDB payload。当前 runtime 会返回 materialized logical values，并且没有 retained columnar `held.unsafe_buffer`。
 
 > **何时使用持有模式：** 适用于反序列化开销占主导的大型数组/列式数据。对于小载荷（< 1 MB），跟踪共享内存生命周期的开销超过拷贝成本。
 
 ---
 
-## 使用示例
+### InputLifetime — 服务端 borrowed input
 
-### 单进程 — 线程偏好模式
+服务端 FastDB input 默认会在调用 resource method 前物化。只有当 resource method 的 FDB input 签名和 CRM 一致，并且明确准备把参数当作 call-scoped borrowed data 处理时，才使用 `input_lifetime={...}`。
 
-当 `cc.connect()` 目标是同进程中注册的 CRM 时，代理直接调用方法，**零序列化开销**。
+`cc.InputLifetime.BORROWED` 只适用于支持 buffer-view 的 FDB payload。它与 `bridge.input` 分开使用；调用结束后仍需保留的数据必须先用 `fastdb4py.materialize(value)` 或 `value.to_owned()` 拷贝。旧的 transfer/hold 装饰器不参与这个 registration policy。
 
-```python
-import c_two as cc
+---
 
-cc.register(Greeter, Greeter(lang='en'), name='greeter')
-cc.register(Counter, Counter(initial=100), name='counter')
+## 可运行示例
 
-greeter = cc.connect(Greeter, name='greeter')
-counter = cc.connect(Counter, name='counter')
+快速开始已经展示完整 authoring pattern。仓库中的 examples 提供可直接运行的进程布局：
 
-print(greeter.greet('World'))    # → Hello, World!
-print(counter.value())           # → 100
-counter.increment(10)
-
-cc.close(greeter)
-cc.close(counter)
-cc.shutdown()
-```
-
-> **适用场景：** 本地原型开发、测试、单机计算。
-
-### 多进程 — IPC 与自定义 Transferable
-
-独立的服务端和客户端进程，通过 Unix 域套接字 + 共享内存通信。
-
-**共享类型** (`types.py`)：
-```python
-import c_two as cc
-import numpy as np, struct
-
-@cc.transferable
-class Mesh:
-    n_vertices: int
-    positions: np.ndarray   # (N, 3) float64
-
-    def serialize(mesh: 'Mesh') -> bytes:
-        header = struct.pack('>I', mesh.n_vertices)
-        return header + mesh.positions.tobytes()
-
-    def deserialize(raw: bytes) -> 'Mesh':
-        (n,) = struct.unpack_from('>I', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=4).reshape(n, 3).copy()
-        return Mesh(n_vertices=n, positions=arr)
-
-    def from_buffer(buf: memoryview) -> 'Mesh':
-        header = bytes(buf[:4])
-        (n,) = struct.unpack('>I', header)
-        arr = np.frombuffer(buf[4:], dtype=np.float64).reshape(n, 3)
-        return Mesh(n_vertices=n, positions=arr)  # zero-copy view
-
-@cc.crm(namespace='demo.mesh', version='0.1.0')
-class MeshStore:
-    @cc.read
-    def get_mesh(self) -> Mesh: ...
-
-    def update_positions(self, mesh: Mesh) -> int: ...
-
-    @cc.on_shutdown
-    def cleanup(self) -> None: ...
-```
-
-**服务端** (`server.py`)：
-```python
-import c_two as cc
-from types import MeshStore, Mesh
-
-class MeshStore:
-    def __init__(self):
-        self._mesh = Mesh(n_vertices=0, positions=np.empty((0, 3)))
-
-    def get_mesh(self) -> Mesh:
-        return self._mesh
-
-    def update_positions(self, mesh: Mesh) -> int:
-        self._mesh = mesh
-        return mesh.n_vertices
-
-    def cleanup(self):
-        print('MeshStore shutting down')
-
-cc.register(MeshStore, MeshStore(), name='mesh')
-print(cc.server_id())
-print(cc.server_address())
-cc.serve()  # blocks until interrupted
-```
-
-**客户端** (`client.py`)：
-```python
-import c_two as cc
-from types import MeshStore, Mesh
-import numpy as np
-
-mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://<server-address>')
-
-# Upload data
-big_mesh = Mesh(n_vertices=1_000_000,
-                positions=np.random.randn(1_000_000, 3))
-mesh_store.update_positions(big_mesh)
-
-# Read with hold — zero-copy SHM access
-with cc.hold(mesh_store.get_mesh)() as held:
-    positions = held.value.positions  # np.ndarray backed by SHM, no copy
-    centroid = positions.mean(axis=0)
-    print(f'Centroid: {centroid}')
-# SHM released here
-
-cc.close(mesh_store)
-```
-
-> **适用场景：** 同主机多进程、Worker 隔离、高吞吐本地 IPC。
-
-### 跨机器 — HTTP 中继
-
-HTTP 中继将网络请求桥接到运行在 IPC 上的 CRM 进程。CRM 进程向中继注册，客户端通过**路由名加预期 CRM 契约**发现资源。CRM tag 和契约哈希可以避免 relay mesh 中存在旧路由或同名其他资源时发生误配。
-
-**CRM 服务端** (`resource.py`)：
-```python
-import c_two as cc
-
-cc.set_relay_anchor('http://relay-host:8080')
-cc.register(MeshStore, MeshStore(), name='mesh')
-cc.serve()  # 阻塞，直到 Ctrl-C
-```
-
-**中继** — 通过 `c3` CLI 启动：
-```bash
-# 绑定地址可通过 CLI 参数、环境变量 C2_RELAY_BIND 或 .env 文件配置
-c3 relay --bind 0.0.0.0:8080
-```
-
-Relay HTTP 只应暴露在可信部署边界内。中继 mesh 协议依赖基础设施层访问控制，不应被直接放到公网可达的位置。
-
-**客户端** (`client.py`)：
-```python
-import c_two as cc
-
-cc.set_relay_anchor('http://relay-host:8080')
-mesh = cc.connect(MeshStore, name='mesh')  # 中继解析名称
-mesh.get_mesh()
-cc.close(mesh)
-```
-
-> **适用场景：** 网络可访问的服务、Web 集成、跨机器部署。
-
-### 中继网格 — 多中继集群
-
-多个中继组成**网格网络**，通过 gossip 协议自动传播路由。CRM 向本地中继注册，客户端可跨整个集群发现资源。
-
-```bash
-# 启动中继 A（seeds 指向对等中继实现自动加入）
-c3 relay --bind 0.0.0.0:8080 --relay-id relay-a \
-    --advertise-url http://relay-a:8080 --seeds http://relay-b:8080
-
-# 启动中继 B
-c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
-    --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
-```
-
-Mesh peer 端点（`/_peer/*`）会接收来自已配置 peer 的路由 gossip，应与 relay HTTP API 一样由可信网络边界保护。
-
-CRM 进程向本地中继注册，网格自动传播路由。客户端可通过网格中的**任意**中继连接。
-
-> **适用场景：** 多节点集群、高可用、地理分布部署。
-
-> **完整可运行的网格示例请参阅 [`examples/python/relay_mesh/`](examples/python/relay_mesh/) 目录。**
+| 场景 | 入口 |
+| --- | --- |
+| 同进程本地调用 | [`examples/python/local.py`](examples/python/local.py) |
+| Direct IPC resource/client | [`examples/python/ipc_resource.py`](examples/python/ipc_resource.py), [`examples/python/ipc_client.py`](examples/python/ipc_client.py) |
+| FastDB CRM 与 relay client | [`examples/python/fastdb_relay_resource.py`](examples/python/fastdb_relay_resource.py), [`examples/python/fastdb_relay_client.py`](examples/python/fastdb_relay_client.py) |
+| Relay mesh | [`examples/python/relay_mesh/`](examples/python/relay_mesh/) |
+| FastDB bridge 示例 | [`examples/python/grid/`](examples/python/grid/) |
 
 ### 服务端监控
 
@@ -501,9 +350,9 @@ stats = cc.hold_stats()
 
 ## 架构
 
-**C-Two 的设计哲学不是定义服务，而是赋能资源。**
+**C-Two 围绕 resource 组织分布式程序。**
 
-在科学计算中，封装复杂状态和领域特定操作的资源需要被组织为内聚的单元。我们称描述这些资源的契约为 **核心资源模型（CRM）**。应用程序更关心的是 *如何与资源交互*，而非 *资源在哪里*。C-Two 提供位置透明和统一的资源访问，使任何 **client** 都能像访问本地对象一样与资源交互。
+在科学计算中，封装复杂状态和领域特定操作的资源需要被组织为内聚的单元。我们称描述这些资源的契约为 **核心资源模型（CRM）**。应用程序以 *如何与资源交互* 为中心，同时由 C-Two 处理资源所在位置带来的访问差异。C-Two 提供位置透明和统一的资源访问，使任何 **client** 都能像访问本地对象一样与资源交互。
 
 <p align="center">
   <img src="docs/images/architecture.png" alt="C-Two 架构图" width="100%">
@@ -511,10 +360,11 @@ stats = cc.hold_stats()
 
 ### 客户端层
 
-调用 `cc.connect(...)` 消费资源的任何代码。返回的代理提供完整的类型安全和位置透明性 — 客户端不需要知道（也不关心）资源运行在哪里。
+调用 `cc.connect(...)` 消费资源的任何代码。返回的代理提供完整的类型安全和位置透明性，client code 可以在不跟踪进程或机器位置的情况下使用 resource。
 
 - `cc.connect(CRMClass, name='...', address='...')` 返回类型化的 CRM 代理
 - 代理支持上下文管理：`with cc.connect(...) as x:` 自动关闭
+- 对 IPC 与 relay 路径，SDK 从 CRM class 推导 expected route contract，native 层在调用前校验 route name、CRM tag、ABI hash 和 signature hash。
 
 ### 资源层
 
@@ -522,10 +372,10 @@ stats = cc.hold_stats()
 
 - **CRM 契约**：使用 `@cc.crm()` 装饰的接口类。只有在此声明的方法才可被远程访问。
 - **Resource**：实现契约的普通 Python 类 — 状态 + 领域逻辑，无需装饰器。
-- **`@transferable`**：领域数据类型的自定义序列化。可选提供 `from_buffer` 实现零拷贝共享内存视图。
-- **`@cc.transfer`**：逐方法控制输入/输出 transferable 类型和缓冲区模式。
+- **FastDB payload**：使用 `fastdb4py` feature、scalar、`Array[...]` 和 `Batch[...]` 作为 portable CRM ABI。
+- **Python fallback**：普通 Python 类型可用于 Python-only prototype，但 portable export/codegen 会拒绝 pickle fallback。
 - **`@cc.read` / `@cc.write`**：并发注解 — 并行读取，独占写入。
-- **`@cc.on_shutdown`**：生命周期回调，在资源被注销时调用（不通过 RPC 暴露）。
+- **`@cc.on_shutdown`**：生命周期回调，在资源被注销时调用；它位于 RPC surface 之外。
 
 ### 传输层
 
@@ -537,14 +387,15 @@ stats = cc.hold_stats()
 | `ipc:///path` | Unix 域套接字 + 共享内存 | 多进程、同主机 |
 | `http://host:port` | HTTP 中继 | 跨机器、Web 兼容 |
 
-IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联帧传输，载荷字节通过共享内存交换 — 数据路径上零拷贝。当 `from_buffer` 可用时，**持有模式**会在 CRM 方法调用期间保持共享内存缓冲区存活，使 CRM 可以直接操作共享内存中的数据而无需反序列化。
+IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联帧传输，载荷字节通过共享内存交换。`cc.hold()` 可以在客户端显式保留响应缓冲区，使 FastDB checked views 直接映射在 transport buffer 上；服务端 borrowed input 只能通过 `cc.register(..., input_lifetime={...})` 显式启用。
 
 ### Rust 原生层
 
-性能关键组件使用 Rust 实现，通过 [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) 编译为 Python 扩展：
+核心 runtime 是语言中立的 Rust，SDK 绑定到同一套 core contract。性能关键组件通过 [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) 暴露给 Python：
 
-Rust 工作空间包含 7 个 crate，按 4 层架构组织（基础层 → 协议层 → 传输层 → 桥接层）：
+Rust 工作空间包含 9 个 core crates，按 4 层组织（foundation → protocol → transport → runtime），Python PyO3 extension 位于 `sdk/python/native/`：
 
+- **Contract Core (`c2-contract`)** — 语言中立的 CRM route contract validation 和 canonical descriptor hashing。
 - **伙伴分配器** — IPC 传输的零系统调用共享内存分配。跨进程，快速路径上无锁。
 - **线协议** — 帧编码、分块组装和分块注册表，管理大载荷的生命周期。
 - **HTTP 中继** — 基于 [axum](https://github.com/tokio-rs/axum) 的高吞吐网关，桥接 HTTP 到 IPC。处理连接池和请求多路复用。
@@ -557,81 +408,71 @@ Rust 扩展在 `pip install c-two`（从预编译 wheel）或 `uv sync`（从源
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
 ```
 
-源码 checkout 开发时可以通过 `python tools/dev/c3_tool.py --build --link` 链接本地开发二进制；正式 CLI 产物由独立的 CLI release 流水线负责，不归属于任何单一语言 SDK。
+源码 checkout 开发时可以通过 `python tools/dev/c3_tool.py --build --link` 链接本地开发二进制；正式 CLI 产物由独立的 CLI release 流水线负责。
 
 Portable CRM descriptor 可以从 Python CRM 类导出，并在作为 codegen 输入前交给 Rust CLI 校验：
 
 ```bash
-uv run python -m c_two.cli.contract export mypkg.contracts:Grid --out grid.contract.json
-c3 contract artifacts mypkg.contracts:Grid --python .venv/bin/python --out grid.payload-abi-artifacts.json
-c3 contract diagnose mypkg.contracts:Grid --python .venv/bin/python --pretty
-c3 contract export mypkg.contracts:Grid --python .venv/bin/python --out grid.contract.json
-c3 contract validate grid.contract.json
+uv run python -m c_two.cli.contract export mypkg.contracts:Geometry --out geometry.contract.json
+c3 contract artifacts mypkg.contracts:Geometry --python .venv/bin/python --out geometry.payload-abi-artifacts.json
+c3 contract diagnose mypkg.contracts:Geometry --python .venv/bin/python --pretty
+c3 contract export mypkg.contracts:Geometry --python .venv/bin/python --out geometry.contract.json
+c3 contract validate geometry.contract.json
 ```
 
-`c3 contract diagnose` 会在严格跨语言工作流失败前报告 fastdb-first portability warning，例如 Python-only pickle fallback 或非 FastDB 的 `PayloadAbiRef`；Rust CLI 写出 diagnostics 前会要求 Python diagnostics 是 JSON object array。`c3 contract artifacts` 导出 FastDB ABI sidecar descriptor，例如 `fastdb.call-db.schema.v1` 以及 root/dependency `fastdb.schema.v1` 对象，但 C-Two runtime 的 route/relay/IPC/scheduler/lease 层不解析 FastDB 存储内部结构。把这个 artifact bundle 直接交给 C-Two codegen 的 `--fastdb-schema` 和 `--fastdb-out`：
+`c3 contract diagnose` 会在严格跨语言工作流失败前报告 fastdb-first portability warning，例如 Python-only pickle fallback 或非 FastDB 的 `PayloadAbiRef`；Rust CLI 写出 diagnostics 前会要求 Python diagnostics 是 JSON object array。`c3 contract artifacts` 导出 FastDB ABI sidecar descriptor，例如 `fastdb.call-db.schema.v1` 以及 root/dependency `fastdb.schema.v1` 对象；C-Two runtime 的 route/relay/IPC/scheduler/lease 层继续把 FastDB 存储内部结构视为 opaque。把这个 artifact bundle 直接交给 C-Two codegen 的 `--fastdb-schema` 和 `--fastdb-out`：
 
 ```bash
 c3 contract codegen typescript \
-  grid.contract.json \
-  --out grid.client.ts \
-  --fastdb-schema grid.payload-abi-artifacts.json \
-  --fastdb-out grid.fastdb.ts
+  geometry.contract.json \
+  --out geometry.client.ts \
+  --fastdb-schema geometry.payload-abi-artifacts.json \
+  --fastdb-out geometry.fastdb.ts
 ```
 
 通过校验的 descriptor 可以生成 TypeScript client。FastDB-backed payload 会生成 method wire specs、route fingerprints、codec transport factory、显式 relay URL 的 `createHttpRelayEncodedTransport(...)`，以及带 contract-scoped relay resolve、完整 contract-key route cache、current-route preference、payload-limit guardrail、stale-route invalidation/re-resolve、resolve transport-error/5xx retry、data-plane transport-error classification、`maxAttempts`、`routeCacheTtlMs`、`callTimeoutMs`、`resolveTimeoutMs`、HTTP option/base URL/fetch/header 构造期校验和 C-Two expected-contract 保留 header 保护的 `createRelayAwareHttpEncodedTransport(...)`。如果 CI 需要在所有 FastDB ABI requirement 都有 generated TypeScript 支持前失败，可以使用 `--strict-codecs`：
 
 ```bash
-c3 contract codegen typescript grid.contract.json --out grid.client.ts
-c3 contract codegen typescript grid.contract.json --strict-codecs
+c3 contract codegen typescript geometry.contract.json --out geometry.client.ts
+c3 contract codegen typescript geometry.contract.json --strict-codecs
 ```
 
-对于资源优先项目，`infer` 可以从显式选择的 Python 资源方法构造 CRM 投影 descriptor。推断不会自动暴露所有 public 方法，并且 fastdb-first portable 工作流仍要求每个被选择的方法 payload 解析为 FastDB call-db `PayloadAbiRef` 或无 payload。Python-native primitive/container 适合 Python-only prototype，但它们会回退到 `python-pickle-default` 并被 portable export 拒绝；显式的非 FastDB `PayloadAbiRef` 只作为内部诊断场景存在，不是公开扩展路径。可以先用 `c3 contract infer --diagnose` 查看 inferred projection 上的 diagnostics，再用 `c3 contract infer --artifacts` 从同一 inferred projection 导出 FastDB ABI artifacts 给 C-Two codegen 使用，最后导出 portable descriptor：
+对于资源优先项目，`infer` 可以从显式选择的 Python 资源方法构造 CRM 投影 descriptor。推断只暴露被选择的方法，并且 fastdb-first portable 工作流要求每个被选择的方法 payload 解析为 FastDB call-db `PayloadAbiRef` 或无 payload。Python-native primitive/container 适合 Python-only prototype；它们会回退到 `python-pickle-default` 并被 portable export 拒绝。显式的非 FastDB `PayloadAbiRef` 属于内部诊断场景。可以先用 `c3 contract infer --diagnose` 查看 inferred projection 上的 diagnostics，再用 `c3 contract infer --artifacts` 从同一 inferred projection 导出 FastDB ABI artifacts 给 C-Two codegen 使用，最后导出 portable descriptor：
 
 ```bash
-c3 contract infer mypkg.resources:GridResource \
+c3 contract infer mypkg.resources:GeometryResource \
   --python .venv/bin/python \
-  --namespace mypkg.grid \
+  --namespace mypkg.geometry \
   --version 0.1.0 \
-  --name Grid \
-  --method get_schema \
-  --method subdivide_grids \
+  --name Geometry \
+  --method vertices \
+  --method nodes \
   --diagnose \
   --pretty
 
-c3 contract infer mypkg.resources:GridResource \
+c3 contract infer mypkg.resources:GeometryResource \
   --python .venv/bin/python \
-  --namespace mypkg.grid \
+  --namespace mypkg.geometry \
   --version 0.1.0 \
-  --name Grid \
-  --method get_schema \
-  --method subdivide_grids \
+  --name Geometry \
+  --method vertices \
+  --method nodes \
   --artifacts \
-  --out grid.payload-abi-artifacts.json
+  --out geometry.payload-abi-artifacts.json
 
-c3 contract infer mypkg.resources:GridResource \
+c3 contract infer mypkg.resources:GeometryResource \
   --python .venv/bin/python \
-  --namespace mypkg.grid \
+  --namespace mypkg.geometry \
   --version 0.1.0 \
-  --name Grid \
-  --method get_schema \
-  --method subdivide_grids \
-  --out grid.contract.json
+  --name Geometry \
+  --method vertices \
+  --method nodes \
+  --out geometry.contract.json
 ```
 
-FastDB call-db 是 portable CRM payload ABI。Python fallback 路径使用普通 Python annotation 和 pickle，只面向本地或 Python-only IPC prototype；strict portable export/codegen 会明确拒绝它。C-Two 不再提供可选 payload registry module 或公开 codec registry。
+FastDB call-db 是 portable CRM payload ABI。Python fallback 路径使用普通 Python annotation 和 pickle，只面向本地或 Python-only IPC prototype；strict portable export/codegen 会明确拒绝它。公开包 surface 省略可选 payload registry module 和公开 codec registry。
 
-```python
-from c_two import fastdb as fdb
-
-@fdb.feature
-class GridAttribute:
-    level: fdb.I32
-    global_id: fdb.I32
-    activate: fdb.BOOL
-```
-
-如果要让方法进入 portable 路径，请使用 `c_two.fastdb` alias、`Array[...]`、`Batch[...]` 和 `@fdb.feature`，让方法规划为 FastDB call-db。未标记的 Python payload 仍可在非 portable 的本地/IPC prototype 路径中走 pickle，但 strict portable export 会拒绝 pickle 和非 FastDB `PayloadAbiRef`。
+如果要让方法进入 portable 路径，请使用 `fastdb4py` scalar、`Array[...]`、`Batch[...]` 和 FastDB feature class，让方法规划为 FastDB call-db。未标记的 Python payload 仍可在非 portable 的本地/IPC prototype 路径中通过 pickle 使用；strict portable export 会拒绝 pickle 和非 FastDB `PayloadAbiRef`。扩展 schema 代码位于可运行 FastDB 示例中。
 
 ---
 
@@ -660,6 +501,10 @@ uv sync                            # 安装依赖 + 编译 Rust 扩展
 uv sync --group examples           # 安装示例依赖（pandas、pyarrow）
 python tools/dev/c3_tool.py --build --link  # 在源码检出中构建并链接原生 c3 CLI
 uv run pytest                      # 运行测试套件
+
+# Python 3.10 compatibility check. 下游 Taichi 等栈仍可能固定在 3.10。
+uv python install 3.10
+uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
 ```
 
 > 需要 [uv](https://github.com/astral-sh/uv) 和 Rust 工具链。
@@ -668,7 +513,7 @@ uv run pytest                      # 运行测试套件
 
 ## 路线图
 
-| 功能 | 状态 |
+| 能力 | 状态 |
 |------|------|
 | 核心 RPC 框架（CRM + Resource + Client） | ✅ 稳定 |
 | IPC 传输 + SHM 伙伴分配器 | ✅ 稳定 |
@@ -680,7 +525,7 @@ uv run pytest                      # 运行测试套件
 | 统一配置架构（Rust resolver 单一事实源） | ✅ 稳定 |
 | CI/CD 与多平台 PyPI 发布 | ✅ 稳定 |
 | 极端载荷磁盘溢出 | ✅ 稳定 |
-| 持有模式与 `from_buffer` 零拷贝 | ✅ 稳定 |
+| `cc.hold()` 与 FastDB retained views | ✅ 稳定 |
 | 共享内存驻留监控（`cc.hold_stats()`） | ✅ 稳定 |
 | 契约版本兼容协商 | 🔜 规划中 |
 | `auth_hook` 与 call metadata | 🔜 规划中 |

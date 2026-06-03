@@ -14,6 +14,7 @@ use crate::relay::authority::{RouteAuthority, RouteCommand};
 use crate::relay::peer::{
     DigestEntry, PeerEnvelope, PeerMessage, ValidatedDigestDiffEntry, validate_route_state_envelope,
 };
+use crate::relay::route_table::TombstoneGcEntry;
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
 use crate::relay::url::peer_endpoint_url;
@@ -101,10 +102,26 @@ async fn tombstone_gc_loop(state: Arc<RelayState>, cancel: CancellationToken) {
 
         let retention = tombstone_retention(&state);
         let removed = state.gc_tombstones(retention);
-        if removed > 0 {
-            eprintln!("[relay] GC removed {removed} route tombstones");
+        for tombstone in &removed {
+            eprintln!("{}", tombstone_gc_detail_line(tombstone));
+        }
+        if !removed.is_empty() {
+            eprintln!("[relay] GC removed {} route tombstones", removed.len());
         }
     }
+}
+
+fn tombstone_gc_detail_line(removed: &TombstoneGcEntry) -> String {
+    let tombstone = &removed.tombstone;
+    let server_id = tombstone.server_id.as_deref().unwrap_or("<none>");
+    format!(
+        "[relay] GC removed route tombstone: name={} relay_id={} server_id={} removed_at={} reason={}",
+        tombstone.name,
+        tombstone.relay_id,
+        server_id,
+        tombstone.removed_at,
+        removed.reason.as_str()
+    )
 }
 
 fn tombstone_retention(state: &RelayState) -> Duration {
@@ -117,6 +134,35 @@ fn tombstone_retention(state: &RelayState) -> Duration {
         .checked_mul(rounds)
         .unwrap_or(Duration::MAX);
     MIN_RETENTION.max(anti_entropy_window)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::route_table::{TombstoneGcEntry, TombstoneGcReason};
+
+    #[test]
+    fn tombstone_gc_log_message_names_removed_route() {
+        let removed = TombstoneGcEntry {
+            tombstone: RouteTombstone {
+                name: "grid".into(),
+                relay_id: "relay-a".into(),
+                removed_at: 2000.0,
+                server_id: Some("server-grid".into()),
+                observed_at: std::time::Instant::now(),
+            },
+            reason: TombstoneGcReason::RetentionExpired,
+        };
+
+        let line = tombstone_gc_detail_line(&removed);
+
+        assert!(line.contains("[relay] GC removed route tombstone:"));
+        assert!(line.contains("name=grid"));
+        assert!(line.contains("relay_id=relay-a"));
+        assert!(line.contains("server_id=server-grid"));
+        assert!(line.contains("removed_at=2000"));
+        assert!(line.contains("reason=retention-expired"));
+    }
 }
 
 /// Detect failed peers: Alive→Suspect→Dead with route removal.

@@ -24,11 +24,11 @@
 
 ## Basic Idea
 
-- **Resources, not services** — C-Two does not expose RPC endpoints. It exposes stateful resource objects through language SDKs. The Python SDK makes Python classes remotely accessible while preserving their object-oriented nature.
+- **Resource-oriented RPC** — C-Two exposes stateful resource objects through language SDKs. The Python SDK makes Python classes remotely accessible while preserving their object-oriented nature.
 
-- **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting you read columnar data (NumPy, Arrow, …) directly from SHM — no deserialization, no copies.
+- **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting FastDB checked views read columnar data directly from SHM when the caller explicitly retains the response.
 
-- **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked payload transfer for data beyond 256 MB). Designed for computational workloads, not microservices.
+- **Built for scientific workloads** — Portable CRM payloads use FastDB; Python-only prototypes can still use ordinary Python values. Large payloads use chunked transfer for data beyond 256 MB. The runtime is designed for computational workflows and stateful scientific resources.
 
 - **Rust-powered core** — Shared transport, memory, wire codec, route-contract validation, relay, and configuration live in Rust so future SDKs reuse one runtime contract.
 
@@ -36,21 +36,35 @@
 
 ## Performance
 
-End-to-end cross-process IPC benchmark — same NumPy payload (`row_id u32` + `x,y,z f64`), same machine, same aggregation. Three transport modes compared:
+End-to-end cross-process IPC benchmark using the Kostya-style coordinate schema: `row_id u32`, `x/y/z f64`, and `name STR`. Each call returns a cached coordinate table from a remote process and the client computes `sum(x + y + z)` from the received payload.
 
-| Rows | C-Two hold (ms) | Ray (ms) | C-Two pickle (ms) | **Hold vs Ray** |
-|-----:|---:|---:|---:|---:|
-| 1 K | **0.07** | 6.1 | 0.19 | **86×** |
-| 10 K | **0.09** | 7.1 | 0.82 | **79×** |
-| 100 K | **0.38** | 9.8 | 8.7 | **26×** |
-| 1 M | **3.7** | 58 | 150 | **15×** |
-| 3 M | **9.7** | 129 | 598 | **13×** |
+| Rows | FDB control default (ms) | FDB recommended default (ms) | FDB control retained (ms) | FDB recommended retained (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Recommended retained vs Ray arrays** |
+|-----:|---:|---:|---:|---:|---:|---:|---:|
+| 1 K | 1.28 | 1.33 | 1.30 | **1.12** | 6.51 | 0.57 | **5.8×** |
+| 10 K | 1.83 | 1.27 | 1.52 | **1.26** | 7.42 | 1.24 | **5.9×** |
+| 100 K | 5.10 | 2.64 | 4.91 | **1.91** | 8.22 | 9.69 | **4.3×** |
+| 1 M | 36.39 | 12.29 | 29.85 | **8.36** | 48.59 | 130.65 | **5.8×** |
+| 3 M | 147.89 | 39.08 | 93.80 | **23.29** | 164.32 | 529.47 | **7.1×** |
 
-- **C-Two hold** — SHM zero-copy via `np.frombuffer`; no serialization on read
-- **Ray** — object store with zero-copy numpy support (Ray 2.55)
-- **C-Two pickle** — standard pickle over SHM; included to show serialization cost
+Row-oriented fallback paths are much slower at large sizes and are included only to show Python object materialization cost:
 
-> Apple M1 Max · Python 3.13 · NumPy 2.4 · See [`sdk/python/benchmarks/unified_numpy_benchmark.py`](sdk/python/benchmarks/unified_numpy_benchmark.py) for full methodology.
+| Rows | C-Two pickle records (ms) | Ray records (ms) | **Recommended retained vs Ray records** |
+|-----:|---:|---:|---:|
+| 1 K | 0.95 | 6.23 | **5.6×** |
+| 10 K | 6.09 | 11.62 | **9.2×** |
+| 100 K | 67.25 | 56.31 | **29.5×** |
+| 1 M | 861.50 | 546.27 | **65.3×** |
+| 3 M | SKIP | SKIP | - |
+
+- **FDB control** - ordinary `fdb.Batch.allocate(...)` resource code. It is kept as a benchmark control to show call-db repacking cost when resource output is built outside the CRM call envelope.
+- **FDB recommended** - resource code builds the return payload with `fdb.require(fdb.batch(...))`; at 3M rows this lowers default-call p50 from 147.89 ms to 39.08 ms in this run.
+- **Default / retained** - default calls return owned logical values after detaching from the transport buffer. Retained calls use `cc.hold(...)` so FastDB checked views can read from the retained response buffer until release.
+- **Ray arrays** - Ray object-store transfer of NumPy columns plus the `name` string list.
+- **Pickle arrays / records** - Python-only fallback baselines; records intentionally exercise row-oriented Python object overhead.
+
+The FastDB rows above compare construction paths inside the same C-Two resource model: CRM contract -> resource instance -> typed client proxy.
+
+> Apple M1 Max · measured May 27, 2026 · C-Two: Python 3.14.3 + NumPy 2.4.4 · Ray: Python 3.12 + NumPy 2.4.6 + Ray 2.55.1 · See [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py), [`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py), and [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh) for methodology.
 
 ---
 
@@ -60,69 +74,100 @@ End-to-end cross-process IPC benchmark — same NumPy payload (`row_id u32` + `x
 pip install c-two
 ```
 
-### Define a resource contract and its implementation
+### Define a FastDB-first resource contract
 
 ```python
 import c_two as cc
+import fastdb4py as fdb
+import numpy as np
 
-# CRM contract — declares which methods are remotely accessible
-@cc.crm(namespace='demo.counter', version='0.1.0')
-class Counter:
-    def increment(self, amount: int) -> int: ...
+
+@fdb.feature
+class Vertex:
+    vertex_id: fdb.U32
+    x: fdb.F64
+    y: fdb.F64
+    z: fdb.F64
+
+
+@fdb.feature
+class Node:
+    node_id: fdb.U32
+    weight: fdb.F64
+    anchor: Vertex
+    neighbors: list[Vertex]
+
+
+@cc.crm(namespace='demo.geometry', version='0.1.0')
+class Geometry:
+    @cc.read
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
+        ...
 
     @cc.read
-    def value(self) -> int: ...
+    def nodes(self) -> fdb.Batch[Node]:
+        ...
+```
 
-    def reset(self) -> int: ...
+`vertices()` is the fixed-size columnar path. `nodes()` is the object-graph path
+for nested resource data.
 
+### Implement the resource object
 
-# Resource — a plain Python class implementing the contract
-class CounterImpl:
-    def __init__(self, initial: int = 0):
-        self._value = initial
+```python
+class GeometryResource:
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
+        n = int(count)
+        batch = fdb.require(fdb.batch(Vertex, rows=n))
+        idx = np.arange(n, dtype=np.uint32)
+        xyz = idx.astype(np.float64)
+        batch.fill(vertex_id=idx, x=xyz, y=xyz + 10.0, z=xyz + 20.0)
+        return batch
 
-    def increment(self, amount: int) -> int:
-        self._value += amount
-        return self._value
+    def nodes(self) -> fdb.Batch[Node]:
+        vertices = [
+            Vertex(vertex_id=0, x=0.0, y=10.0, z=20.0),
+            Vertex(vertex_id=1, x=1.0, y=11.0, z=21.0),
+            Vertex(vertex_id=2, x=2.0, y=12.0, z=22.0),
+        ]
 
-    def value(self) -> int:
-        return self._value
-
-    def reset(self) -> int:
-        old = self._value
-        self._value = 0
-        return old
+        batch = fdb.Batch.allocate(Node, 0)
+        batch.append(Node(
+            node_id=100,
+            weight=0.5,
+            anchor=vertices[0],
+            neighbors=[vertices[1], vertices[2]],
+        ))
+        return batch
 ```
 
 ### Use it locally (zero serialization)
 
 ```python
-cc.register(Counter, CounterImpl(initial=100), name='counter')
-counter = cc.connect(Counter, name='counter')
+cc.register(Geometry, GeometryResource(), name='geometry')
 
-counter.increment(10)    # → 110
-counter.value()          # → 110
-counter.reset()          # → 110 (returns old value)
-counter.value()          # → 0
-
-cc.close(counter)
+with cc.connect(Geometry, name='geometry') as geometry:
+    vertices = geometry.vertices(1_000)
+    nodes = geometry.nodes()
 ```
 
-### Or remotely — same API, relay discovery
+### Use the same client API across processes
 
 ```python
 # Server process
 cc.set_relay_anchor('http://relay-host:8080')
-cc.register(Counter, CounterImpl(), name='counter')
+cc.register(Geometry, GeometryResource(), name='geometry')
 
 # Client process (separate terminal)
 cc.set_relay_anchor('http://relay-host:8080')
-counter = cc.connect(Counter, name='counter')
-counter.increment(5)     # works identically
-cc.close(counter)
+with cc.connect(Geometry, name='geometry') as geometry:
+    vertices = geometry.vertices(1_000_000)
 ```
 
-> **See [`examples/python/`](examples/python/) for complete runnable demos.**
+The same CRM contract can be used in-process, over IPC, or through a relay.
+Client code calls the typed proxy in each mode. Portable payloads are authored
+with FastDB types; ordinary Python values are available for local Python-only
+prototypes.
 
 ---
 
@@ -133,46 +178,37 @@ cc.close(counter)
 A **CRM** (Core Resource Model) declares *which* methods a remote resource exposes. It's decorated with `@cc.crm()`, and method bodies are `...` (pure interface — no implementation).
 
 ```python
-@cc.crm(namespace='demo.greeter', version='0.1.0')
-class Greeter:
-    @cc.read                              # concurrent reads allowed
-    def greet(self, name: str) -> str: ...
+@cc.crm(namespace='demo.geometry', version='0.1.0')
+class Geometry:
+    @cc.read
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
+        ...
 
     @cc.read
-    def language(self) -> str: ...
+    def nodes(self) -> fdb.Batch[Node]:
+        ...
 ```
 
-Methods can be annotated with `@cc.read` (concurrent access allowed) or left as default write (exclusive access).
+Methods can be annotated with `@cc.read` (concurrent access allowed) or left as default write (exclusive access). Portable method inputs and outputs use FastDB scalar aliases, `fdb.Array[...]`, `fdb.Batch[...]`, and FastDB feature classes.
 
 ### Resource — Runtime Instance
 
-A **resource** is a plain Python class that implements a CRM contract. It holds state and domain logic. It is **not** decorated — the framework discovers its methods through the CRM contract it was registered under. Name the class by what it *is* (`GreeterImpl`, `PostgresGreeter`, `MultilingualGreeter`), not the interface.
+A **resource** is a plain Python class that implements a CRM contract. It holds state and domain logic. No decorator is required; the framework discovers its methods through the CRM contract it was registered under. Use domain names such as `GeometryResource`.
 
-```python
-class GreeterImpl:
-    def __init__(self, lang: str = 'en'):
-        self._lang = lang
-        self._templates = {'en': 'Hello, {}!', 'zh': '你好, {}!'}
-
-    def greet(self, name: str) -> str:
-        return self._templates.get(self._lang, 'Hi, {}!').format(name)
-
-    def language(self) -> str:
-        return self._lang
-```
+In the example above, `GeometryResource` is the resource object. The CRM contract stays FastDB-first; the resource implementation is just ordinary Python code that returns FastDB values.
 
 ### Client — Consumer
 
 Anything that calls `cc.connect(...)` is a **client** (or consumer / application code). The returned proxy is location-transparent — it works the same whether the resource lives in the same process or on a remote machine.
 
 ```python
-greeter = cc.connect(Greeter, name='greeter')
-greeter.greet('World')     # → 'Hello, World!'
-cc.close(greeter)
+geometry = cc.connect(Geometry, name='geometry')
+vertices = geometry.vertices(1_000)
+cc.close(geometry)
 
 # Or with context manager:
-with cc.connect(Greeter, name='greeter') as greeter:
-    greeter.greet('World')
+with cc.connect(Geometry, name='geometry') as geometry:
+    nodes = geometry.nodes()
 ```
 
 ### Server — Resource Host
@@ -182,8 +218,7 @@ A **server** is any process that calls `cc.register(...)` to host one or more re
 ```python
 import c_two as cc
 
-cc.register(Greeter, GreeterImpl(), name='greeter')
-cc.register(Counter, CounterImpl(), name='counter')
+cc.register(Geometry, GeometryResource(), name='geometry')
 cc.serve()                                     # blocks; Ctrl-C triggers graceful shutdown
 ```
 
@@ -202,291 +237,105 @@ The `c3` command is C-Two's cross-language native CLI. From a source checkout, b
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
 ```
 
-The Python SDK does not embed or start the relay server; start `c3 relay`, Docker Compose, or your orchestrator separately, then point Python code at its relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is the control-plane registration/name-resolution endpoint. Remote HTTP calls still go directly to the resolved route's `relay_url`; local direct IPC is used only when the anchor endpoint is loopback/local. Relay-aware clients preflight routes before the first call and re-resolve structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds (default `300`; `0` disables the reqwest total timeout). Set `C2_REMOTE_PAYLOAD_CHUNK_SIZE` to tune C-Two remote payload batching for relay HTTP and future remote protocols (default `1048576`; max `134217728`). This is not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee. Ambiguous data-plane failures are not replayed. Relay resolve, probe, and call paths reject name-only lookups and CRM contract mismatches instead of falling back to an untyped route with the same name.
+The Python SDK leaves relay lifecycle to `c3 relay`, Docker Compose, or your orchestrator. Point Python code at the relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is the control-plane registration/name-resolution endpoint. Remote HTTP calls still go directly to the resolved route's `relay_url`; local direct IPC is used only when the anchor endpoint is loopback/local. Relay-aware clients preflight routes before the first call and re-resolve structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds (default `300`; `0` disables the reqwest total timeout). Set `C2_REMOTE_PAYLOAD_CHUNK_SIZE` to tune C-Two remote payload batching for relay HTTP and future remote protocols (default `1048576`; max `134217728`). This setting controls C-Two payload batching, separate from TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame boundaries. Ambiguous data-plane failures require caller-level retry policy. Relay resolve, probe, and call paths require route name plus CRM contract and reject mismatches.
 
 ```bash
 # Start a relay anywhere reachable on your network
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Relay HTTP and mesh endpoints are intended for a trusted network boundary. Do not expose them directly to the public internet; production deployments should restrict access with infrastructure such as private networking, firewalls, Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
+Relay HTTP and mesh endpoints are intended for a trusted network boundary. Production deployments should restrict access with infrastructure such as private networking, firewalls, Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
 
 ```python
 # Server side — announce resources to the relay
 cc.set_relay_anchor('http://relay-host:8080')
-cc.register(MeshStore, MeshStoreImpl(), name='mesh')
+cc.register(Geometry, GeometryResource(), name='geometry')
 cc.serve()
 
-# Client side — resolve by name plus the MeshStore CRM contract, no address needed
+# Client side — resolve by name plus the Geometry CRM contract, no address needed
 cc.set_relay_anchor('http://relay-host:8080')
-mesh = cc.connect(MeshStore, name='mesh')
+geometry = cc.connect(Geometry, name='geometry')
 ```
 
-Multiple relays can form a **mesh cluster** via gossip — any relay can resolve any resource registered anywhere in the mesh. See the [Relay Mesh example](#relay-mesh--multi-relay-clusters) below.
+Multiple relays can form a **mesh cluster** via gossip — any relay can resolve any resource registered anywhere in the mesh. The runnable example is listed in [Runnable Examples](#runnable-examples).
 
-> **When do I need a relay?** Only for cross-machine or name-and-contract-based discovery. Same-process and same-host (IPC) usage work without any relay.
+> **When do I need a relay?** Use a relay for cross-machine or name-and-contract-based discovery. Same-process and same-host IPC usage can connect directly.
 
-### @transferable — Custom Serialization
+### Payload Model — FastDB First
 
-For custom data types that need to cross the wire, use `@cc.transferable`. Without it, pickle is used as fallback.
+C-Two CRM payload planning has three internal outcomes: `FDB`, `PYTHON_PICKLE`, and `NO_PAYLOAD`. Portable, cross-language contracts use FastDB call-db payload ABI refs derived from `fastdb4py` annotations. Plain Python annotations run through Python pickle fallback for Python-only prototyping; strict portable export rejects those methods.
 
-A transferable class defines up to three static methods (written without `@staticmethod` — the framework adds it automatically):
+The payload ABI sits below C-Two's resource-first architecture. FastDB owns schema, storage layout, views, and allocator-facing payload construction. C-Two owns CRM route contracts, transport, retained-buffer leases, and contract/codegen orchestration, while runtime route/relay/IPC/scheduler layers treat FastDB payloads as opaque ABI-backed bytes.
 
-| Method | Required | Purpose |
-|--------|----------|---------|
-| `serialize(data) → bytes` | ✅ Yes | Encode data for wire transfer (outbound) |
-| `deserialize(raw) → T` | ✅ Yes | Decode wire bytes into an owned Python object (inbound) |
-| `from_buffer(buf) → T` | ❌ Optional | Build a zero-copy view over the raw buffer (inbound, hold mode) |
+The two important FastDB CRM shapes are the same two used in the quick start:
+
+- `vertices() -> fdb.Batch[Vertex]`: a fixed-size columnar feature batch. This is the retained-view, high-throughput path.
+- `nodes() -> fdb.Batch[Node]`: an object-graph batch with nested features and lists. This is portable FastDB call-db data with a different retained-view profile from fixed columnar data.
 
 ```python
-import numpy as np
+@fdb.feature
+class Vertex: ...
 
-@cc.transferable
-class Matrix:
-    rows: int
-    cols: int
-    data: np.ndarray
+@fdb.feature
+class Node:
+    anchor: Vertex
+    neighbors: list[Vertex]
 
-    def serialize(mat: 'Matrix') -> bytes:
-        header = struct.pack('>II', mat.rows, mat.cols)
-        return header + mat.data.tobytes()
-
-    def deserialize(raw: bytes) -> 'Matrix':
-        rows, cols = struct.unpack_from('>II', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=8).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr.copy())  # owned copy
-
-    def from_buffer(buf: memoryview) -> 'Matrix':
-        header = bytes(buf[:8])
-        rows, cols = struct.unpack('>II', header)
-        arr = np.frombuffer(buf[8:], dtype=np.float64).reshape(rows, cols)
-        return Matrix(rows=rows, cols=cols, data=arr)  # zero-copy view into SHM
+@cc.crm(namespace='demo.geometry', version='0.1.0')
+class Geometry:
+    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]: ...
+    def nodes(self) -> fdb.Batch[Node]: ...
 ```
 
-When `from_buffer` is present, the server automatically uses **hold mode** — the SHM buffer stays alive so `from_buffer` can return a zero-copy view. Without `from_buffer`, the server uses **view mode** — the buffer is released immediately after `deserialize`.
+C-Two passes the CRM-derived FastDB binding to FastDB; user code stays at logical `Batch`, `Array`, scalar, and feature types.
 
-### @cc.transfer — Per-Method Control
+Python-only resources may still use ordinary Python annotations and pickle for local prototypes. Those methods are intentionally diagnosed as nonportable by strict contract export/codegen.
 
-Use `@cc.transfer()` on CRM contract methods to explicitly specify which transferable type handles serialization, or to override the buffer mode:
+### cc.hold() — Client-Side Borrowed Responses
 
-```python
-@cc.crm(namespace='demo.compute', version='0.1.0')
-class Compute:
-    @cc.transfer(input=Matrix, output=Matrix, buffer='hold')
-    def transform(self, mat: Matrix) -> Matrix: ...
-
-    @cc.transfer(input=Matrix, buffer='view')  # force copy even if from_buffer exists
-    def ingest(self, mat: Matrix) -> None: ...
-```
-
-Without `@cc.transfer`, the framework automatically matches registered `@transferable` types by function signature and resolves the buffer mode from the input type's capabilities.
-
-### cc.hold() — Client-Side Zero-Copy
-
-On the client side, `cc.hold()` requests that the response buffer remain alive, enabling zero-copy reads when the output transferable can build a view from a memoryview. The returned `HeldResult` wraps the value, exposes the retained raw wire buffer as `.buffer` for advanced user parsing, and provides a three-layer safety net for buffer lifecycle:
+On the client side, normal FastDB CRM calls copy the response payload into an owned local buffer before exposing the logical FastDB value, then release the transport buffer immediately. `cc.hold()` explicitly requests that the transport response buffer remain alive, enabling zero-copy reads when an FDB output payload supports retained views. The returned `cc.Held[R]` wraps the CRM logical return value, exposes the retained raw wire buffer as `.unsafe_buffer` for advanced use, and provides a three-layer safety net for buffer lifecycle:
 
 1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
 2. **Context manager (`with`)** — recommended for single-buffer scopes
 3. **`__del__` fallback** — last resort, emits `ResourceWarning` if you forget to release
 
 ```python
-grid = cc.connect(Compute, name='compute', address='ipc://server')
+geometry = cc.connect(Geometry, name='geometry', address='ipc://server')
 
-# Normal call — buffer released immediately after deserialize
-result = grid.transform(matrix)
+# Normal call — exposes an owned logical value after transport release.
+vertices = geometry.vertices(1_000_000)
 
-# Option 1: Context manager — clean for single holds
-with cc.hold(grid.transform)(matrix) as held:
-    data = held.value          # zero-copy NumPy array backed by SHM
-    raw = held.buffer          # retained wire buffer, valid only inside the hold scope
-    process(data)              # read directly from shared memory
-# SHM buffer released on context exit
-
-# Option 2: Explicit release — better for multiple concurrent holds
-a = cc.hold(grid.transform)(matrix_a)
-b = cc.hold(grid.transform)(matrix_b)
-try:
-    combined = np.concatenate([a.value.data, b.value.data])
-    process(combined)
-finally:
-    a.release()
-    b.release()
+# Retained call — columnar FastDB views read from the retained response.
+with cc.hold(geometry.vertices)(1_000_000) as held:
+    vertices = held.value
+    z_mean = vertices.column.z.to_numpy().mean()
 ```
 
 > **When to use hold mode:** Large array/columnar data where deserialization dominates cost. For small payloads (< 1 MB), the overhead of tracking SHM lifecycle exceeds the copy cost.
 
+`held.value` is the normal API. It uses FastDB checked views where possible, so child rows and columns fail fast after `held.release()`. `held.unsafe_buffer` is a raw `memoryview` escape hatch; raw NumPy arrays or other pointers derived from that buffer bypass FastDB owner checks. Materialize values with `fdb.materialize(...)` before storing them beyond the hold scope.
+
+Object-graph responses such as `nodes()` are portable FastDB payloads. The current runtime returns them as materialized logical values without retained columnar `held.unsafe_buffer`.
+
 ---
 
-## Examples
+### InputLifetime — Server-Side Borrowed Inputs
 
-### Single Process — Thread Preference
+On the server side, FastDB inputs are materialized by default before the resource method is called. Use `cc.register(..., input_lifetime={...})` only when the resource method has the same FDB input signature as the CRM and is prepared to treat a buffer-view input as call-scoped borrowed data.
 
-When `cc.connect()` targets a CRM registered in the same process, the proxy calls methods directly with **zero serialization overhead**.
+`cc.InputLifetime.BORROWED` is valid only for FDB payloads with buffer-view support. Use it separately from `bridge.input`; copy any data retained after the method returns with `fastdb4py.materialize(value)` or `value.to_owned()`.
 
-```python
-import c_two as cc
+## Runnable Examples
 
-cc.register(Greeter, GreeterImpl(lang='en'), name='greeter')
-cc.register(Counter, CounterImpl(initial=100), name='counter')
+The quick start above shows the end-to-end authoring pattern. The repository examples provide runnable process layouts:
 
-greeter = cc.connect(Greeter, name='greeter')
-counter = cc.connect(Counter, name='counter')
-
-print(greeter.greet('World'))    # → Hello, World!
-print(counter.value())           # → 100
-counter.increment(10)
-
-cc.close(greeter)
-cc.close(counter)
-cc.shutdown()
-```
-
-> **Best for:** local prototyping, testing, single-machine computation.
-
-### Multi-Process IPC — with Custom Transferable
-
-Separate server and client processes communicating over Unix domain sockets with shared memory.
-
-**Shared types** (`types.py`):
-```python
-import c_two as cc
-import numpy as np, struct
-
-@cc.transferable
-class Mesh:
-    n_vertices: int
-    positions: np.ndarray   # (N, 3) float64
-
-    def serialize(mesh: 'Mesh') -> bytes:
-        header = struct.pack('>I', mesh.n_vertices)
-        return header + mesh.positions.tobytes()
-
-    def deserialize(raw: bytes) -> 'Mesh':
-        (n,) = struct.unpack_from('>I', raw)
-        arr = np.frombuffer(raw, dtype=np.float64, offset=4).reshape(n, 3).copy()
-        return Mesh(n_vertices=n, positions=arr)
-
-    def from_buffer(buf: memoryview) -> 'Mesh':
-        header = bytes(buf[:4])
-        (n,) = struct.unpack('>I', header)
-        arr = np.frombuffer(buf[4:], dtype=np.float64).reshape(n, 3)
-        return Mesh(n_vertices=n, positions=arr)  # zero-copy view
-
-@cc.crm(namespace='demo.mesh', version='0.1.0')
-class MeshStore:
-    @cc.read
-    def get_mesh(self) -> Mesh: ...
-
-    def update_positions(self, mesh: Mesh) -> int: ...
-
-    @cc.on_shutdown
-    def cleanup(self) -> None: ...
-```
-
-**Server** (`server.py`):
-```python
-import c_two as cc
-from types import MeshStore, Mesh
-
-class MeshStoreImpl:
-    def __init__(self):
-        self._mesh = Mesh(n_vertices=0, positions=np.empty((0, 3)))
-
-    def get_mesh(self) -> Mesh:
-        return self._mesh
-
-    def update_positions(self, mesh: Mesh) -> int:
-        self._mesh = mesh
-        return mesh.n_vertices
-
-    def cleanup(self):
-        print('MeshStore shutting down')
-
-cc.register(MeshStore, MeshStoreImpl(), name='mesh')
-print(cc.server_id())
-print(cc.server_address())
-cc.serve()  # blocks until interrupted
-```
-
-**Client** (`client.py`):
-```python
-import c_two as cc
-from types import MeshStore, Mesh
-import numpy as np
-
-mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://<server-address>')
-
-# Upload data
-big_mesh = Mesh(n_vertices=1_000_000,
-                positions=np.random.randn(1_000_000, 3))
-mesh_store.update_positions(big_mesh)
-
-# Read with hold — zero-copy SHM access
-with cc.hold(mesh_store.get_mesh)() as held:
-    positions = held.value.positions  # np.ndarray backed by SHM, no copy
-    centroid = positions.mean(axis=0)
-    print(f'Centroid: {centroid}')
-# SHM released here
-
-cc.close(mesh_store)
-```
-
-> **Best for:** multi-process on same host, worker isolation, high-throughput local IPC.
-
-### Cross-Machine — HTTP Relay
-
-An HTTP relay bridges network requests to CRM processes running on IPC. CRM processes register with the relay, and clients discover resources by **route name plus expected CRM contract**. The CRM tag and contract hashes prevent accidental or stale matches when a relay mesh contains an old route or another resource with the same name.
-
-**CRM Server** (`resource.py`):
-```python
-import c_two as cc
-
-cc.set_relay_anchor('http://relay-host:8080')
-cc.register(MeshStore, MeshStoreImpl(), name='mesh')
-cc.serve()  # blocks until Ctrl-C
-```
-
-**Relay** — start via the `c3` CLI:
-```bash
-# Bind address from CLI flag, env var C2_RELAY_BIND, or .env file
-c3 relay --bind 0.0.0.0:8080
-```
-
-Expose relay HTTP only inside a trusted deployment boundary. The relay mesh protocol assumes infrastructure-level access control, not public internet reachability.
-
-**Client** (`client.py`):
-```python
-import c_two as cc
-
-cc.set_relay_anchor('http://relay-host:8080')
-mesh = cc.connect(MeshStore, name='mesh')  # relay resolves the name
-mesh.get_mesh()
-cc.close(mesh)
-```
-
-> **Best for:** network-accessible services, web integration, cross-machine deployment.
-
-### Relay Mesh — Multi-Relay Clusters
-
-Multiple relays form a **mesh network** with gossip-based route propagation. CRMs register with their local relay; clients discover resources across the entire cluster.
-
-```bash
-# Start relay A (seeds point to peer relays for auto-join)
-c3 relay --bind 0.0.0.0:8080 --relay-id relay-a \
-    --advertise-url http://relay-a:8080 --seeds http://relay-b:8080
-
-# Start relay B
-c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
-    --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
-```
-
-Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and must be protected by the same trusted network boundary as the relay HTTP API.
-
-CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh using the same CRM class and route name.
-
-> **Best for:** multi-node clusters, high availability, geographic distribution.
-
-> **See [`examples/python/relay_mesh/`](examples/python/relay_mesh/) for a complete runnable mesh demo.**
+| Scenario | Entry points |
+| --- | --- |
+| Same-process local call | [`examples/python/local.py`](examples/python/local.py) |
+| Direct IPC resource/client | [`examples/python/ipc_resource.py`](examples/python/ipc_resource.py), [`examples/python/ipc_client.py`](examples/python/ipc_client.py) |
+| FastDB CRM and relay client | [`examples/python/fastdb_relay_resource.py`](examples/python/fastdb_relay_resource.py), [`examples/python/fastdb_relay_client.py`](examples/python/fastdb_relay_client.py) |
+| Relay mesh | [`examples/python/relay_mesh/`](examples/python/relay_mesh/) |
+| FastDB bridge examples | [`examples/python/grid/`](examples/python/grid/) |
 
 ### Server-Side Monitoring
 
@@ -501,7 +350,7 @@ stats = cc.hold_stats()
 
 ## Architecture
 
-**The design philosophy of C-Two is not to define services, but to empower resources.**
+**C-Two organizes distributed programs around resources.**
 
 In scientific computation, resources encapsulating complex state and domain-specific operations need to be organized into cohesive units. We call the contracts describing these resources **Core Resource Models (CRMs)**. Applications care more about *how to interact* with resources than *where they are located*. C-Two provides location transparency and uniform resource access, so any **client** can interact with a resource as if it were a local object.
 
@@ -511,7 +360,7 @@ In scientific computation, resources encapsulating complex state and domain-spec
 
 ### Client Layer
 
-Any code that calls `cc.connect(...)` to consume a resource. The returned proxy provides full type safety and location transparency — clients don't know (or care) where the resource is running.
+Any code that calls `cc.connect(...)` consumes a resource. The returned proxy provides full type safety and location transparency, so client code can use the resource without tracking its process or machine placement.
 
 - `cc.connect(CRMClass, name='...', address='...')` returns a typed CRM proxy
 - The proxy supports context management: `with cc.connect(...) as x:` auto-closes
@@ -522,11 +371,11 @@ Any code that calls `cc.connect(...)` to consume a resource. The returned proxy 
 Server-side stateful instances exposed through standardized CRM contracts.
 
 - **CRM contract**: Interface class decorated with `@cc.crm()`. Only methods declared here are remotely accessible.
-- **Resource**: Plain Python class implementing the contract — state + domain logic. Not decorated.
-- **`@transferable`**: Custom serialization for domain data types. Optionally provides `from_buffer` for zero-copy SHM views.
-- **`@cc.transfer`**: Per-method control over input/output transferable types and buffer mode.
+- **Resource**: Plain Python class implementing the contract — state + domain logic, with no decorator required.
+- **FDB payloads**: Portable CRM payloads are derived from `fastdb4py` annotations and represented as FastDB call-db payload ABI refs.
+- **Python pickle fallback**: Plain Python types remain usable for Python-only prototyping, but strict portable export rejects them.
 - **`@cc.read` / `@cc.write`**: Concurrency annotations — parallel reads, exclusive writes.
-- **`@cc.on_shutdown`**: Lifecycle callback invoked when a resource is unregistered (not exposed via RPC).
+- **`@cc.on_shutdown`**: Lifecycle callback invoked when a resource is unregistered; it stays outside the RPC surface.
 
 ### Transport Layer
 
@@ -538,11 +387,11 @@ Protocol-agnostic communication with automatic protocol detection based on addre
 | `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
 | `http://host:port` | HTTP relay | Cross-machine, web-compatible |
 
-The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory — zero-copy on the data path. When `from_buffer` is available, **hold mode** keeps the SHM buffer alive across the CRM method call, enabling the CRM to operate directly on shared memory without deserialization.
+The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory. Normal FastDB calls detach from transport buffers before returning to user code; `cc.hold()` and `cc.InputLifetime.BORROWED` are the explicit lifetime controls for retained response buffers and call-scoped borrowed request buffers.
 
 ### Rust Native Layer
 
-The core runtime is language-neutral Rust; SDKs bind to the same core contracts rather than reimplement transport behavior. Performance-critical components are implemented in Rust and exposed to Python through a native extension built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
+The core runtime is language-neutral Rust, and SDKs bind to the same core contracts. Performance-critical components are implemented in Rust and exposed to Python through a native extension built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
 
 The Rust workspace contains 9 core crates organized in 4 layers (foundation → protocol → transport → runtime), plus the Python PyO3 extension under `sdk/python/native/`:
 
@@ -559,81 +408,71 @@ The `c3` command is distributed as a native CLI binary and built from the root `
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
 ```
 
-Source checkouts can link a local development binary with `python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned by the CLI release pipeline rather than by any language SDK.
+Source checkouts can link a local development binary with `python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned by the CLI release pipeline.
 
 Portable CRM descriptors can be exported from Python CRM classes and validated by the Rust CLI before they are used as codegen input:
 
 ```bash
-uv run python -m c_two.cli.contract export mypkg.contracts:Grid --out grid.contract.json
-c3 contract artifacts mypkg.contracts:Grid --python .venv/bin/python --out grid.payload-abi-artifacts.json
-c3 contract diagnose mypkg.contracts:Grid --python .venv/bin/python --pretty
-c3 contract export mypkg.contracts:Grid --python .venv/bin/python --out grid.contract.json
-c3 contract validate grid.contract.json
+uv run python -m c_two.cli.contract export mypkg.contracts:Geometry --out geometry.contract.json
+c3 contract artifacts mypkg.contracts:Geometry --python .venv/bin/python --out geometry.payload-abi-artifacts.json
+c3 contract diagnose mypkg.contracts:Geometry --python .venv/bin/python --pretty
+c3 contract export mypkg.contracts:Geometry --python .venv/bin/python --out geometry.contract.json
+c3 contract validate geometry.contract.json
 ```
 
-`c3 contract diagnose` reports fastdb-first portability warnings such as Python-only pickle fallback or a non-FastDB `PayloadAbiRef` before strict cross-language workflows fail, and the Rust CLI requires Python diagnostics to be a JSON array of objects before writing them. `c3 contract artifacts` exports FastDB ABI sidecar descriptors such as `fastdb.call-db.schema.v1` and root/dependency `fastdb.schema.v1` objects without making C-Two runtime route/relay/IPC/scheduler/lease layers parse FastDB storage internals. Feed that artifact bundle directly to C-Two codegen with `--fastdb-schema` and `--fastdb-out`:
+`c3 contract diagnose` reports fastdb-first portability warnings such as Python-only pickle fallback or a non-FastDB `PayloadAbiRef` before strict cross-language workflows fail, and the Rust CLI requires Python diagnostics to be a JSON array of objects before writing them. `c3 contract artifacts` exports FastDB ABI sidecar descriptors such as `fastdb.call-db.schema.v1` and root/dependency `fastdb.schema.v1` objects; C-Two runtime route/relay/IPC/scheduler/lease layers continue to treat FastDB storage internals as opaque. Feed that artifact bundle directly to C-Two codegen with `--fastdb-schema` and `--fastdb-out`:
 
 ```bash
 c3 contract codegen typescript \
-  grid.contract.json \
-  --out grid.client.ts \
-  --fastdb-schema grid.payload-abi-artifacts.json \
-  --fastdb-out grid.fastdb.ts
+  geometry.contract.json \
+  --out geometry.client.ts \
+  --fastdb-schema geometry.payload-abi-artifacts.json \
+  --fastdb-out geometry.fastdb.ts
 ```
 
 Validated descriptors can generate TypeScript clients. FastDB-backed payloads are emitted with method wire specs, route fingerprints, a codec transport factory, `createHttpRelayEncodedTransport(...)` for explicit relay URLs, and `createRelayAwareHttpEncodedTransport(...)` for contract-scoped relay resolve with a contract-keyed route cache, current-route preference, payload-limit guardrails, stale-route invalidation/re-resolve, resolve transport-error/5xx retry, data-plane transport-error classification, `maxAttempts`, `routeCacheTtlMs`, `callTimeoutMs`, `resolveTimeoutMs`, construction-time HTTP option/base URL/fetch/header validation, and reserved C-Two expected-contract header protection. Use `--strict-codecs` when CI should fail until every FastDB ABI requirement has generated TypeScript support:
 
 ```bash
-c3 contract codegen typescript grid.contract.json --out grid.client.ts
-c3 contract codegen typescript grid.contract.json --strict-codecs
+c3 contract codegen typescript geometry.contract.json --out geometry.client.ts
+c3 contract codegen typescript geometry.contract.json --strict-codecs
 ```
 
-For resource-first projects, `infer` can build a CRM projection descriptor from explicitly selected Python resource methods. Inference does not expose all public methods, and fastdb-first portable workflows still require every selected method payload to resolve to a FastDB call-db `PayloadAbiRef` or no payload. Python-native primitives and containers are useful for Python-only prototypes, but they fall back to `python-pickle-default` and are rejected by portable export; explicit non-FastDB `PayloadAbiRef` values are internal diagnostic cases, not a public extension path. Use `c3 contract infer --diagnose` to inspect those diagnostics before exporting, and `c3 contract infer --artifacts` to export FastDB ABI artifacts from the same inferred projection for C-Two codegen.
+For resource-first projects, `infer` can build a CRM projection descriptor from explicitly selected Python resource methods. Inference exposes only selected methods, and fastdb-first portable workflows require every selected method payload to resolve to a FastDB call-db `PayloadAbiRef` or no payload. Python-native primitives and containers are useful for Python-only prototypes; they fall back to `python-pickle-default` and are rejected by portable export. Explicit non-FastDB `PayloadAbiRef` values are internal diagnostic cases. Use `c3 contract infer --diagnose` to inspect those diagnostics before exporting, and `c3 contract infer --artifacts` to export FastDB ABI artifacts from the same inferred projection for C-Two codegen.
 
 ```bash
-c3 contract infer mypkg.resources:GridResource \
+c3 contract infer mypkg.resources:GeometryResource \
   --python .venv/bin/python \
-  --namespace mypkg.grid \
+  --namespace mypkg.geometry \
   --version 0.1.0 \
-  --name Grid \
-  --method get_schema \
-  --method subdivide_grids \
+  --name Geometry \
+  --method vertices \
+  --method nodes \
   --diagnose \
   --pretty
 
-c3 contract infer mypkg.resources:GridResource \
+c3 contract infer mypkg.resources:GeometryResource \
   --python .venv/bin/python \
-  --namespace mypkg.grid \
+  --namespace mypkg.geometry \
   --version 0.1.0 \
-  --name Grid \
-  --method get_schema \
-  --method subdivide_grids \
+  --name Geometry \
+  --method vertices \
+  --method nodes \
   --artifacts \
-  --out grid.payload-abi-artifacts.json
+  --out geometry.payload-abi-artifacts.json
 
-c3 contract infer mypkg.resources:GridResource \
+c3 contract infer mypkg.resources:GeometryResource \
   --python .venv/bin/python \
-  --namespace mypkg.grid \
+  --namespace mypkg.geometry \
   --version 0.1.0 \
-  --name Grid \
-  --method get_schema \
-  --method subdivide_grids \
-  --out grid.contract.json
+  --name Geometry \
+  --method vertices \
+  --method nodes \
+  --out geometry.contract.json
 ```
 
-FastDB call-db is the portable CRM payload ABI. The Python fallback path uses ordinary Python annotations and pickle for local or Python-only IPC prototypes; it is intentionally rejected by strict portable export/codegen. C-Two no longer ships optional payload registry modules or a public codec registry.
+FastDB call-db is the portable CRM payload ABI. The Python fallback path uses ordinary Python annotations and pickle for local or Python-only IPC prototypes; strict portable export/codegen rejects it. The public package surface omits optional payload registry modules and a public codec registry.
 
-```python
-from c_two import fastdb as fdb
-
-@fdb.feature
-class GridAttribute:
-    level: fdb.I32
-    global_id: fdb.I32
-    activate: fdb.BOOL
-```
-
-To move a method onto the portable path, use `c_two.fastdb` aliases, `Array[...]`, `Batch[...]`, and `@fdb.feature` so the method plans as FastDB call-db. Unmarked Python payloads can still use pickle in non-portable local/IPC prototype paths, but strict portable export rejects pickle and non-FastDB `PayloadAbiRef` values.
+To move a method onto the portable path, use `fastdb4py` scalar aliases, `Array[...]`, `Batch[...]`, and FastDB feature classes so the method plans as FastDB call-db. Unmarked Python payloads remain available in non-portable local/IPC prototype paths through pickle; strict portable export rejects pickle and non-FastDB `PayloadAbiRef` values. Extended schema code lives in the runnable FastDB examples.
 
 ---
 
@@ -675,8 +514,8 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 
 ## Roadmap
 
-| Feature | Status |
-|---------|--------|
+| Capability | Status |
+|------------|--------|
 | Core RPC framework (CRM + Resource + Client) | ✅ Stable |
 | IPC transport with SHM buddy allocator | ✅ Stable |
 | HTTP relay (Rust-powered) | ✅ Stable |
@@ -687,7 +526,7 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | Unified config architecture (Rust resolver SSOT) | ✅ Stable |
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
 | Disk spill for extreme payloads | ✅ Stable |
-| Hold mode with `from_buffer` zero-copy | ✅ Stable |
+| FastDB held response views through `cc.hold()` | ✅ Stable |
 | SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
 | Contract version compatibility negotiation | 🔜 Planned |
 | `auth_hook` + call metadata | 🔜 Planned |

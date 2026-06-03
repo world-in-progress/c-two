@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -20,6 +22,7 @@ def _load_benchmark(script_name: str) -> ModuleType:
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -187,6 +190,37 @@ def test_benchmark_results_are_local_only_artifacts():
     ]
 
     assert tracked_paths == ['sdk/python/benchmarks/results/.gitkeep']
+
+
+def test_kostya_ctwo_fastdb_variant_uses_fdb_call_db_hold_contract():
+    module = _load_benchmark('kostya_ctwo_benchmark.py')
+    import c_two as cc
+
+    descriptor = json.loads(cc.export_contract_descriptor(module.ICoordFastdb))
+    method = next(item for item in descriptor['methods'] if item['name'] == 'coords')
+
+    assert method['wire']['input']['id'] == 'org.fastdb.call-db'
+    assert method['wire']['output']['id'] == 'org.fastdb.call-db'
+    assert 'buffer-view' in method['wire']['output']['capabilities']
+    assert module.VARIANTS['fastdb-control-retained'].use_hold is True
+
+
+def test_kostya_ctwo_fastdb_control_default_uses_safe_columnar_consumer():
+    module = _load_benchmark('kostya_ctwo_benchmark.py')
+
+    assert module.VARIANTS['fastdb-control-default'].use_hold is False
+    assert module.VARIANTS['fastdb-control-default'].consumer is module.consume_fastdb_safe
+
+
+def test_kostya_ctwo_benchmark_no_longer_uses_legacy_custom_fastdb_wrapper():
+    source = (_repo_root() / 'sdk/python/benchmarks/kostya_ctwo_benchmark.py').read_text()
+
+    assert 'class CoordFastdb:' not in source
+    assert 'ColumnEngine.truncate' not in source
+    assert "name='return_0'" not in source
+    assert '_make_coord_control_batch' in source
+    assert 'fdb.require(fdb.batch(' in source
+    assert 'cc.hold(method)' in source
 
 
 def test_three_mode_dict_echo_contract_is_descriptor_safe():

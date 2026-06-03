@@ -52,6 +52,11 @@ from c_two.error import (
     RegistryUnavailable,
 )
 from .client.proxy import CRMProxy
+from .input_lifetime import (
+    InputLifetimeLike,
+    normalize_input_lifetime_map,
+    validate_input_lifetime_resource_contract,
+)
 from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
 
@@ -243,6 +248,7 @@ class _ProcessRegistry:
         name: str,
         concurrency: ConcurrencyConfig | None = None,
         bridge: dict[str, ResourceBridge] | None = None,
+        input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
     ) -> str:
         """Register a CRM, making it available via :func:`connect`.
 
@@ -270,13 +276,24 @@ class _ProcessRegistry:
             The *name* string (echoed back for convenience).
         """
         crm_contract_identity(crm_class)
+        method_names = rpc_method_names(crm_class)
         method_bridge_map = normalize_bridge_map(
             bridge,
-            method_names=rpc_method_names(crm_class),
+            method_names=method_names,
+        )
+        input_lifetime_map = normalize_input_lifetime_map(
+            input_lifetime,
+            method_names=method_names,
         )
         validate_resource_conformance(
             crm_class,
             crm_instance,
+            bridge=method_bridge_map,
+        )
+        validate_input_lifetime_resource_contract(
+            crm_class,
+            crm_instance,
+            input_lifetime_map,
             bridge=method_bridge_map,
         )
         with self._lock:
@@ -302,6 +319,7 @@ class _ProcessRegistry:
                     concurrency,
                     name=name,
                     bridge=method_bridge_map,
+                    input_lifetime=input_lifetime_map,
                     runtime_session=self._runtime_session,
                     relay_anchor_address=None,
                 )
@@ -719,6 +737,7 @@ def register(
     name: str,
     concurrency: ConcurrencyConfig | None = None,
     bridge: dict[str, ResourceBridge] | None = None,
+    input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
 ) -> str:
     """Register a CRM in the current process.
 
@@ -730,6 +749,7 @@ def register(
         name=name,
         concurrency=concurrency,
         bridge=bridge,
+        input_lifetime=input_lifetime,
     )
 
 

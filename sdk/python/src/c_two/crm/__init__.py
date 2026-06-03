@@ -12,4 +12,5 @@ from .descriptor import (
 from .infer import infer_crm_from_resource
 from .methods import rpc_method_names
 from .template import generate_crm_template
-from .transferable import DEFAULT_PICKLE_PROTOCOL, transfer, hold, HeldResult
+from .payload_plan import DEFAULT_PICKLE_PROTOCOL
+from .transferable import hold, Held, HeldResult

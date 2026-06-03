@@ -62,42 +62,37 @@ def test_contract_descriptor_diagnostics_report_python_only_and_non_fastdb_paths
     ]
 
 
-def test_contract_descriptor_diagnostics_warn_for_non_fastdb_portable_payload_abi_refs():
-    from c_two.crm._payload_abi import PayloadAbiRef
-    from c_two.crm.transferable import _payload_abi_ref_transferable
-
-    payload_ref = PayloadAbiRef(id='org.example.custom', version='1', schema_sha256='c' * 64)
-
-    @_payload_abi_ref_transferable(payload_abi_ref=payload_ref)
-    class PayloadWire:
-        value: int
-
-        def serialize(value: 'PayloadWire') -> bytes:
-            return str(value.value).encode()
-
-        def deserialize(data: bytes) -> 'PayloadWire':
-            return PayloadWire(int(bytes(data)))
+def test_contract_descriptor_diagnostics_report_mixed_fastdb_and_python_payload_mode():
+    import fastdb4py as fdb
 
     @cc.crm(namespace='test.contract-diagnostics', version='0.1.0')
-    class CustomPayloadAbi:
-        @cc.transfer(input=PayloadWire, output=PayloadWire)
-        def echo(self, value: PayloadWire) -> PayloadWire:
+    class MixedPayloadMode:
+        def convert(self, value: int) -> fdb.I32:
             ...
 
-    diagnostics = cc.contract_descriptor_diagnostics(CustomPayloadAbi)
+    diagnostics = cc.contract_descriptor_diagnostics(MixedPayloadMode)
 
-    assert [
-        (item['method'], item['position'], item['code'], item['payload_abi_id'])
+    assert any(
+        item['code'] == 'mixed_fastdb_python_payload_mode'
+        and item['method'] == 'convert'
+        and item['severity'] == 'warning'
         for item in diagnostics
-    ] == [
-        ('echo', 'input', 'non_fastdb_portable_payload_abi', 'org.example.custom'),
-        ('echo', 'output', 'non_fastdb_portable_payload_abi', 'org.example.custom'),
-    ]
-    assert all(item['severity'] == 'warning' for item in diagnostics)
+    )
+
+
+def test_contract_descriptor_diagnostics_are_empty_for_fully_fastdb_portable_mode():
+    import fastdb4py as fdb
+
+    @cc.crm(namespace='test.contract-diagnostics', version='0.1.0')
+    class FastdbPortable:
+        def echo(self, value: fdb.I32) -> fdb.I32:
+            ...
+
+    assert cc.contract_descriptor_diagnostics(FastdbPortable) == []
 
 
 def test_export_contract_descriptor_returns_canonical_portable_json():
-    from c_two import fastdb as fdb
+    import fastdb4py as fdb
 
     @cc.crm(namespace='test.contract-export', version='0.1.0')
     class Portable:
@@ -119,66 +114,6 @@ def test_export_contract_descriptor_returns_canonical_portable_json():
     assert descriptor['methods'][0]['wire']['input']['id'] == 'org.fastdb.call-db'
     assert descriptor['methods'][0]['wire']['output']['id'] == 'org.fastdb.call-db'
     assert 'python-pickle-default' not in exported
-
-
-def test_export_contract_payload_abi_artifacts_dedupes_transferable_artifacts():
-    from c_two.crm._payload_abi import PayloadAbiRef
-    from c_two.crm.transferable import _payload_abi_ref_transferable
-
-    payload_ref = PayloadAbiRef(
-        id='org.example.artifact',
-        version='1',
-        schema='example.schema.v1',
-        schema_sha256='b' * 64,
-    )
-    artifact = {
-        'fields': [{'name': 'value', 'type': 'i32'}],
-        'schema': 'example.schema.v1',
-        'type': 'Payload',
-    }
-
-    @_payload_abi_ref_transferable(payload_abi_ref=payload_ref)
-    class PayloadWire:
-        value: int
-
-        def serialize(value: 'PayloadWire') -> bytes:
-            return str(value.value).encode()
-
-        def deserialize(data: bytes) -> 'PayloadWire':
-            return PayloadWire(int(bytes(data)))
-
-    PayloadWire.__cc_payload_abi_artifacts__ = (artifact,)
-
-    @cc.crm(namespace='test.contract-artifacts', version='0.1.0')
-    class Portable:
-        @cc.transfer(input=PayloadWire, output=PayloadWire)
-        def echo(self, value: PayloadWire) -> PayloadWire:
-            ...
-
-    artifacts = json.loads(cc.export_contract_payload_abi_artifacts(Portable))
-
-    assert artifacts == [artifact]
-
-
-def test_export_contract_descriptor_rejects_legacy_custom_abi_after_native_validation():
-    @cc.transferable(abi_id='org.example.legacy.raw.v1')
-    class LegacyPayload:
-        value: int
-
-        def serialize(value: 'LegacyPayload') -> bytes:
-            return b''
-
-        def deserialize(data: bytes) -> 'LegacyPayload':
-            return LegacyPayload(1)
-
-    @cc.crm(namespace='test.contract-export', version='0.1.0')
-    class LegacyPortable:
-        @cc.transfer(input=LegacyPayload, output=LegacyPayload)
-        def echo(self, value: LegacyPayload) -> LegacyPayload:
-            ...
-
-    with pytest.raises(ValueError, match='PayloadAbiRef'):
-        cc.export_contract_descriptor(LegacyPortable)
 
 
 def test_contract_export_cli_writes_descriptor(tmp_path, monkeypatch):
@@ -204,40 +139,6 @@ def test_contract_export_cli_writes_descriptor(tmp_path, monkeypatch):
     assert descriptor['schema'] == 'c-two.contract.v1'
     assert descriptor['crm']['name'] == 'Ping'
     assert descriptor['methods'][0]['name'] == 'ping'
-
-
-def test_contract_artifacts_cli_writes_payload_abi_artifacts(tmp_path, monkeypatch):
-    module_path = tmp_path / 'artifact_contract_module.py'
-    module_path.write_text(
-        '\n'.join([
-            'import c_two as cc',
-            'from c_two.crm._payload_abi import PayloadAbiRef',
-            'from c_two.crm.transferable import _payload_abi_ref_transferable',
-            'payload_ref = PayloadAbiRef(id="org.example.artifact", version="1", schema="example.schema.v1", schema_sha256="c" * 64)',
-            '@_payload_abi_ref_transferable(payload_abi_ref=payload_ref)',
-            'class PayloadWire:',
-            '    def serialize(value: "PayloadWire") -> bytes:',
-            '        return b""',
-            '    def deserialize(data: bytes) -> "PayloadWire":',
-            '        return PayloadWire()',
-            'PayloadWire.__cc_payload_abi_artifacts__ = ({"schema": "example.schema.v1", "type": "Payload"},)',
-            '@cc.crm(namespace="test.contract-artifacts-cli", version="0.1.0")',
-            'class Ping:',
-            '    @cc.transfer(input=PayloadWire, output=PayloadWire)',
-            '    def ping(self) -> PayloadWire:',
-            '        ...',
-            '',
-        ]),
-    )
-    out_path = tmp_path / 'artifacts.json'
-    monkeypatch.syspath_prepend(str(tmp_path))
-
-    from c_two.cli.contract import main
-
-    assert main(['artifacts', 'artifact_contract_module:Ping', '--out', str(out_path)]) == 0
-    artifacts = json.loads(out_path.read_text())
-
-    assert artifacts == [{'schema': 'example.schema.v1', 'type': 'Payload'}]
 
 
 def test_contract_diagnose_cli_writes_fastdb_first_diagnostics(tmp_path, monkeypatch):
@@ -268,43 +169,4 @@ def test_contract_diagnose_cli_writes_fastdb_first_diagnostics(tmp_path, monkeyp
         ('echo', 'output', 'fastdb_call_db_not_planned'),
         ('echo', 'input', 'python_only_pickle'),
         ('echo', 'output', 'python_only_pickle'),
-    ]
-
-
-def test_contract_diagnose_cli_writes_non_fastdb_payload_abi_diagnostics(tmp_path, monkeypatch):
-    module_path = tmp_path / 'non_fastdb_payload_abi_diagnostic_module.py'
-    module_path.write_text(
-        '\n'.join([
-            'import c_two as cc',
-            'from c_two.crm._payload_abi import PayloadAbiRef',
-            'from c_two.crm.transferable import _payload_abi_ref_transferable',
-            'payload_ref = PayloadAbiRef(id="org.example.cli-custom", version="1", schema_sha256="d" * 64)',
-            '@_payload_abi_ref_transferable(payload_abi_ref=payload_ref)',
-            'class PayloadWire:',
-            '    def serialize(value: "PayloadWire") -> bytes:',
-            '        return b""',
-            '    def deserialize(data: bytes) -> "PayloadWire":',
-            '        return PayloadWire()',
-            '@cc.crm(namespace="test.contract-diagnose-cli", version="0.1.0")',
-            'class CustomPayloadAbi:',
-            '    @cc.transfer(input=PayloadWire, output=PayloadWire)',
-            '    def echo(self, value: PayloadWire) -> PayloadWire:',
-            '        ...',
-            '',
-        ]),
-    )
-    out_path = tmp_path / 'diagnostics.json'
-    monkeypatch.syspath_prepend(str(tmp_path))
-
-    from c_two.cli.contract import main
-
-    assert main(['diagnose', 'non_fastdb_payload_abi_diagnostic_module:CustomPayloadAbi', '--out', str(out_path)]) == 0
-    diagnostics = json.loads(out_path.read_text())
-
-    assert [
-        (item['method'], item['position'], item['code'], item['payload_abi_id'])
-        for item in diagnostics
-    ] == [
-        ('echo', 'input', 'non_fastdb_portable_payload_abi', 'org.example.cli-custom'),
-        ('echo', 'output', 'non_fastdb_portable_payload_abi', 'org.example.cli-custom'),
     ]

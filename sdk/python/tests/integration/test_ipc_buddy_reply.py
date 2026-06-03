@@ -102,8 +102,8 @@ class TestBuddyReply:
         assert result == data
         cc.close(proxy)
 
-    def test_copy_mode_custom_transferable(self):
-        """Custom @cc.transferable (copy mode default) works through IPC."""
+    def test_pickle_large_payload(self):
+        """Python pickle fallback works for large payloads through IPC."""
         proxy = self._setup_ipc()
         data = b'C' * (1024 * 1024)  # 1MB
         result = proxy.echo(data)

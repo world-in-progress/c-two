@@ -26,6 +26,27 @@ pub struct RouteTable {
     next_timestamp: f64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TombstoneGcEntry {
+    pub tombstone: RouteTombstone,
+    pub reason: TombstoneGcReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TombstoneGcReason {
+    ReplacedByActiveRoute,
+    RetentionExpired,
+}
+
+impl TombstoneGcReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplacedByActiveRoute => "replaced-by-active-route",
+            Self::RetentionExpired => "retention-expired",
+        }
+    }
+}
+
 impl RouteTable {
     pub fn new(relay_id: String) -> Self {
         Self {
@@ -373,16 +394,30 @@ impl RouteTable {
             .collect()
     }
 
-    pub fn gc_tombstones(&mut self, retention: Duration) -> usize {
+    pub fn gc_tombstones(&mut self, retention: Duration) -> Vec<TombstoneGcEntry> {
         let now = Instant::now();
-        let before = self.tombstones.len();
-        self.tombstones.retain(|key, tombstone| {
-            if self.routes.contains_key(key) {
-                return false;
+        let expired: Vec<_> = self
+            .tombstones
+            .iter()
+            .filter_map(|(key, tombstone)| {
+                let reason = if self.routes.contains_key(key) {
+                    TombstoneGcReason::ReplacedByActiveRoute
+                } else if now.duration_since(tombstone.observed_at) >= retention {
+                    TombstoneGcReason::RetentionExpired
+                } else {
+                    return None;
+                };
+                Some((key.clone(), reason))
+            })
+            .collect();
+
+        let mut removed = Vec::with_capacity(expired.len());
+        for (key, reason) in expired {
+            if let Some(tombstone) = self.tombstones.remove(&key) {
+                removed.push(TombstoneGcEntry { tombstone, reason });
             }
-            now.duration_since(tombstone.observed_at) < retention
-        });
-        before - self.tombstones.len()
+        }
+        removed
     }
 
     // -- Peer operations --
@@ -2005,7 +2040,12 @@ mod tests {
             observed_at: Instant::now(),
         });
 
-        assert_eq!(rt.gc_tombstones(Duration::from_secs(0)), 1);
+        let removed = rt.gc_tombstones(Duration::from_secs(0));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].tombstone.name, "grid");
+        assert_eq!(removed[0].tombstone.relay_id, "relay-a");
+        assert_eq!(removed[0].tombstone.server_id, None);
+        assert_eq!(removed[0].reason, TombstoneGcReason::RetentionExpired);
         assert!(rt.list_tombstones().is_empty());
     }
 }

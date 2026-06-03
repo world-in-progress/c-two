@@ -189,7 +189,7 @@ class CRMProxy:
         """Native retained-buffer lease tracker for this process session."""
         return self._lease_tracker
 
-    def call(self, method_name: str, data: bytes | None = None) -> bytes:
+    def call(self, method_name: str, data: bytes | bytearray | memoryview | None = None) -> bytes:
         """Send a serialized CRM call (IPC or HTTP mode).
 
         Raises :class:`NotImplementedError` in thread-local mode — use
@@ -211,6 +211,33 @@ class CRMProxy:
                 raise
         raise NotImplementedError(
             'call() not available in thread-local mode; use call_direct()',
+        )
+
+    def call_prepared(self, method_name: str, plan: object) -> bytes:
+        """Send a prepared payload plan when the underlying transport supports it."""
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
+        if self._mode == 'ipc':
+            call_prepared = getattr(self._client, 'call_prepared', None)
+            if callable(call_prepared):
+                try:
+                    return call_prepared(method_name, plan)
+                except Exception as exc:
+                    error_bytes = getattr(exc, 'error_bytes', None)
+                    if error_bytes is not None:
+                        from ...error import CCError
+                        cc_err = CCError.deserialize(memoryview(error_bytes))
+                        if cc_err is not None:
+                            raise cc_err from exc
+                    raise
+        if self._mode in ('ipc', 'http'):
+            to_bytes = getattr(plan, 'to_bytes', None)
+            if not callable(to_bytes):
+                raise TypeError('prepared payload plan must define to_bytes() for fallback calls')
+            return self.call(method_name, to_bytes())
+        raise NotImplementedError(
+            'call_prepared() not available in thread-local mode; use call_direct()',
         )
 
     def call_direct(self, method_name: str, args: tuple) -> Any:

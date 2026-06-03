@@ -4,7 +4,7 @@ Compares cc.connect() in two modes:
   - Thread-local (same process, zero serialization)
   - IPC (full serialize + SHM + UDS, 2GB buddy pool via cc.set_server / cc.set_client)
 
-Uses @transferable Payload wrapper to avoid the raw bytes fast-path.
+Uses a small Python dataclass payload; IPC uses Python pickle fallback.
 100 rounds per size, P50 latency.
 
 Usage:
@@ -17,24 +17,19 @@ import math
 import os
 import statistics
 import time
+from dataclasses import dataclass
 
 import c_two as cc
 from c_two.transport.client.util import _socket_path_from_address
 
 
 # ---------------------------------------------------------------------------
-# Benchmark CRM — Payload wrapper avoids bytes fast-path
+# Benchmark CRM
 # ---------------------------------------------------------------------------
 
-@cc.transferable(abi_id='c-two.bench.thread-ipc.payload.raw-bytes.v1')
+@dataclass
 class Payload:
     data: bytes
-
-    def serialize(p: 'Payload') -> bytes:
-        return p.data
-
-    def deserialize(raw: bytes) -> 'Payload':
-        return Payload(data=bytes(raw) if isinstance(raw, memoryview) else raw)
 
 
 @cc.crm(namespace='bench.thread_ipc', version='0.1.0')
