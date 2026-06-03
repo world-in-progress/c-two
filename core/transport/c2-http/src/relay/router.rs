@@ -529,7 +529,13 @@ async fn handle_register(
         Ok(value) => value,
         Err(response) => return response,
     };
+    eprintln!(
+        "[relay] Register request: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} prepare_only={prepare_only}"
+    );
     if prepare_only && registration_token.is_none() {
+        eprintln!(
+            "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=missing_registration_token"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -543,6 +549,9 @@ async fn handle_register(
     if let Err(ControlError::InvalidServerInstanceId { reason }) =
         RouteAuthority::new(&state).validate_server_instance_id(&server_instance_id)
     {
+        eprintln!(
+            "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+        );
         return (StatusCode::BAD_REQUEST, reason).into_response();
     }
 
@@ -555,6 +564,9 @@ async fn handle_register(
         Ok(RegisterPreparation::DuplicateAlive { existing_address })
         | Err(ControlError::AddressMismatch { existing_address })
         | Err(ControlError::DuplicateRoute { existing_address }) => {
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=duplicate existing_address={existing_address}"
+            );
             return duplicate_route_response(&name, &existing_address);
         }
         Err(ControlError::InvalidName { reason })
@@ -562,9 +574,15 @@ async fn handle_register(
         | Err(ControlError::InvalidServerInstanceId { reason })
         | Err(ControlError::InvalidAddress { reason })
         | Err(ControlError::ContractMismatch { reason }) => {
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+            );
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=owner_not_replaceable"
+            );
             return (StatusCode::CONFLICT, "Route owner is not replaceable").into_response();
         }
     };
@@ -574,6 +592,9 @@ async fn handle_register(
         let mut c = match connect_ipc_for_register(&address).await {
             Ok(client) => client,
             Err(e) => {
+                eprintln!(
+                    "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=connect_failed error={e}"
+                );
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
@@ -585,6 +606,9 @@ async fn handle_register(
             && c.server_instance_id() == Some(server_instance_id.as_str());
         if !identity_matches {
             close_client(c);
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} reason=identity_mismatch"
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
@@ -609,6 +633,9 @@ async fn handle_register(
                         Ok(contract) => contract,
                         Err(ControlError::ContractMismatch { reason }) => {
                             close_client(c);
+                            eprintln!(
+                                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                            );
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(serde_json::json!({ "error": reason })),
@@ -617,6 +644,9 @@ async fn handle_register(
                         }
                         Err(ControlError::NotFound) => {
                             close_client(c);
+                            eprintln!(
+                                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
+                            );
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(serde_json::json!({
@@ -632,6 +662,9 @@ async fn handle_register(
                 } else {
                     if !prepare_only {
                         close_client(c);
+                        eprintln!(
+                            "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=pending_route_not_committed"
+                        );
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({
@@ -643,6 +676,9 @@ async fn handle_register(
                     }
                     let Some(registration_token) = registration_token.as_deref() else {
                         close_client(c);
+                        eprintln!(
+                            "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=missing_registration_token"
+                        );
                         return (
                             StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({
@@ -668,6 +704,9 @@ async fn handle_register(
                         Ok(contract) => contract,
                         Err(ControlError::ContractMismatch { reason }) => {
                             close_client(c);
+                            eprintln!(
+                                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                            );
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(serde_json::json!({ "error": reason })),
@@ -676,6 +715,9 @@ async fn handle_register(
                         }
                         Err(ControlError::NotFound) => {
                             close_client(c);
+                            eprintln!(
+                                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=pending_route_not_attested"
+                            );
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(serde_json::json!({
@@ -694,6 +736,9 @@ async fn handle_register(
                 Ok(contract) => contract,
                 Err(ControlError::NotFound) => {
                     close_client(c);
+                    eprintln!(
+                        "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
+                    );
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({
@@ -704,6 +749,9 @@ async fn handle_register(
                 }
                 Err(ControlError::ContractMismatch { reason }) => {
                     close_client(c);
+                    eprintln!(
+                        "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                    );
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({ "error": reason })),
@@ -715,6 +763,10 @@ async fn handle_register(
         };
         if contract.max_payload_size != max_payload_size {
             close_client(c);
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=max_payload_size_mismatch claimed={max_payload_size} got={}",
+                contract.max_payload_size
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -739,6 +791,9 @@ async fn handle_register(
 
     if prepare_only {
         close_arc_client(client);
+        eprintln!(
+            "[relay] Register prepared: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} crm={crm_ns}/{crm_name}/{crm_ver}"
+        );
         return (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -757,10 +812,16 @@ async fn handle_register(
         Err(ControlError::DuplicateRoute { existing_address })
         | Err(ControlError::AddressMismatch { existing_address }) => {
             close_arc_client(client);
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=duplicate existing_address={existing_address}"
+            );
             return duplicate_route_response(&name, &existing_address);
         }
         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
             close_arc_client(client);
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=owner_not_replaceable"
+            );
             return (StatusCode::CONFLICT, "Route owner is not replaceable").into_response();
         }
         Err(ControlError::InvalidName { reason })
@@ -769,11 +830,13 @@ async fn handle_register(
         | Err(ControlError::InvalidAddress { reason })
         | Err(ControlError::ContractMismatch { reason }) => {
             close_arc_client(client);
+            eprintln!(
+                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+            );
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
     };
 
-    let commit_client = client.clone();
     let entry = match state.commit_register_upstream(
         name.clone(),
         server_id,
@@ -785,12 +848,34 @@ async fn handle_register(
         abi_hash,
         signature_hash,
         max_payload_size,
-        commit_client,
         replacement,
     ) {
-        RegisterCommitResult::Registered { entry } => entry,
+        RegisterCommitResult::Registered { entry } => {
+            close_arc_client(client);
+            eprintln!(
+                "[relay] Register committed: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
+                entry.name,
+                entry.server_id.as_deref().unwrap_or(""),
+                entry.server_instance_id.as_deref().unwrap_or(""),
+                entry.ipc_address.as_deref().unwrap_or(""),
+                entry.crm_ns,
+                entry.crm_name,
+                entry.crm_ver
+            );
+            entry
+        }
         RegisterCommitResult::SameOwner { entry } => {
             close_arc_client(client);
+            eprintln!(
+                "[relay] Register same-owner: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
+                entry.name,
+                entry.server_id.as_deref().unwrap_or(""),
+                entry.server_instance_id.as_deref().unwrap_or(""),
+                entry.ipc_address.as_deref().unwrap_or(""),
+                entry.crm_ns,
+                entry.crm_name,
+                entry.crm_ver
+            );
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"registered": entry.name})),
@@ -800,10 +885,14 @@ async fn handle_register(
         RegisterCommitResult::Duplicate { existing_address }
         | RegisterCommitResult::ConflictingOwner { existing_address } => {
             close_arc_client(client);
+            eprintln!(
+                "[relay] Register rejected: name={name} reason=duplicate existing_address={existing_address}"
+            );
             return duplicate_route_response(&name, &existing_address);
         }
         RegisterCommitResult::Invalid { reason } => {
             close_arc_client(client);
+            eprintln!("[relay] Register rejected: name={name} reason={reason}");
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
     };
@@ -844,10 +933,12 @@ async fn handle_unregister(
         Some(id) => id.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"server_id\"").into_response(),
     };
+    eprintln!("[relay] Unregister request: name={name} server_id={server_id}");
 
     if let Err(ControlError::InvalidServerId { reason }) =
         RouteAuthority::new(&state).validate_server_id(&server_id)
     {
+        eprintln!("[relay] Unregister rejected: name={name} server_id={server_id} reason={reason}");
         return (StatusCode::BAD_REQUEST, reason).into_response();
     }
 
@@ -863,6 +954,11 @@ async fn handle_unregister(
             }
 
             broadcast_route_withdraw(&state, &entry, removed_at);
+            eprintln!(
+                "[relay] Unregister removed: name={} server_id={} removed_at={removed_at}",
+                entry.name,
+                entry.server_id.as_deref().unwrap_or("")
+            );
 
             (
                 StatusCode::OK,
@@ -870,24 +966,37 @@ async fn handle_unregister(
             )
                 .into_response()
         }
-        crate::relay::state::UnregisterResult::AlreadyRemoved => (
-            StatusCode::OK,
-            Json(serde_json::json!({"unregistered": name})),
-        )
-            .into_response(),
-        crate::relay::state::UnregisterResult::OwnerMismatch => (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "OwnerMismatch",
-                "name": name,
-            })),
-        )
-            .into_response(),
-        crate::relay::state::UnregisterResult::NotFound => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Route name not registered: '{name}'")})),
-        )
-            .into_response(),
+        crate::relay::state::UnregisterResult::AlreadyRemoved => {
+            eprintln!("[relay] Unregister already removed: name={name} server_id={server_id}");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"unregistered": name})),
+            )
+                .into_response()
+        }
+        crate::relay::state::UnregisterResult::OwnerMismatch => {
+            eprintln!(
+                "[relay] Unregister rejected: name={name} server_id={server_id} reason=owner_mismatch"
+            );
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "OwnerMismatch",
+                    "name": name,
+                })),
+            )
+                .into_response()
+        }
+        crate::relay::state::UnregisterResult::NotFound => {
+            eprintln!(
+                "[relay] Unregister rejected: name={name} server_id={server_id} reason=not_found"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Route name not registered: '{name}'")})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1290,14 +1399,39 @@ async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> Req
             address,
             error,
         }) => {
-            eprintln!("[relay] Failed to acquire upstream '{route_name}' at {address}: {error}");
-            remove_unreachable_route(&state, &route);
+            let error_kind = upstream_acquire_error_kind(&error);
+            eprintln!(
+                "[relay] Failed to acquire upstream '{route_name}' at {address} ({error_kind}): {error}"
+            );
+            if should_withdraw_unreachable_route(&error) {
+                remove_unreachable_route(&state, &route);
+            }
             match error {
                 c2_ipc::IpcError::RouteNotFound(_) => RequestClient::NotFound,
                 _ => RequestClient::Unreachable,
             }
         }
     }
+}
+
+fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
+    match error {
+        c2_ipc::IpcError::Io(_) => "io",
+        c2_ipc::IpcError::Config(_) => "config",
+        c2_ipc::IpcError::Decode(_) => "decode",
+        c2_ipc::IpcError::Handshake(_) => "handshake",
+        c2_ipc::IpcError::RouteNotFound(_) => "route-missing",
+        c2_ipc::IpcError::CrmError(_) => "crm-error",
+        c2_ipc::IpcError::Closed => "closed",
+        c2_ipc::IpcError::Pool(_) => "pool",
+    }
+}
+
+fn should_withdraw_unreachable_route(error: &c2_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        c2_ipc::IpcError::Handshake(_) | c2_ipc::IpcError::RouteNotFound(_)
+    )
 }
 
 fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry) {
@@ -1329,7 +1463,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
-    use c2_ipc::{ClientIpcConfig, IpcClient};
+    use c2_ipc::ClientIpcConfig;
     use c2_server::{
         ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
         SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
@@ -1467,6 +1601,43 @@ mod tests {
             confirm < commit,
             "relay commit must consume only post-attestation final proof"
         );
+    }
+
+    #[test]
+    fn http_control_plane_logs_register_and_unregister_events() {
+        let source = include_str!("router.rs");
+        let register_body =
+            source_between(source, "async fn handle_register", "fn close_arc_client")
+                .expect("handle_register body should be found");
+        let unregister_body = source_between(
+            source,
+            "async fn handle_unregister",
+            "async fn handle_list_routes",
+        )
+        .expect("handle_unregister body should be found");
+
+        for expected in [
+            "[relay] Register request:",
+            "[relay] Register committed:",
+            "[relay] Register same-owner:",
+            "[relay] Register rejected:",
+        ] {
+            assert!(
+                register_body.contains(expected),
+                "HTTP register path must log diagnostic event: {expected}"
+            );
+        }
+        for expected in [
+            "[relay] Unregister request:",
+            "[relay] Unregister removed:",
+            "[relay] Unregister already removed:",
+            "[relay] Unregister rejected:",
+        ] {
+            assert!(
+                unregister_body.contains(expected),
+                "HTTP unregister path must log diagnostic event: {expected}"
+            );
+        }
     }
 
     #[test]
@@ -2100,7 +2271,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            Arc::new(IpcClient::new("ipc://grid")),
             None,
         );
 
@@ -2476,8 +2646,6 @@ mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let original_client = Arc::new(IpcClient::new(&address));
-        original_client.force_connected(true);
         match state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
@@ -2489,7 +2657,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            original_client,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -2534,7 +2701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_unreachable_upstream_removes_stale_local_route() {
+    async fn call_generic_io_unreachable_upstream_keeps_local_route() {
         let state = test_state();
 
         assert_eq!(
@@ -2542,8 +2709,6 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
 
-        let stale_client = Arc::new(IpcClient::new("ipc://missing-grid"));
-        stale_client.force_connected(false);
         state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
@@ -2555,7 +2720,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            stale_client,
             None,
         );
 
@@ -2571,7 +2735,68 @@ mod tests {
             .await,
             StatusCode::BAD_GATEWAY
         );
-        assert!(state.resolve("grid").is_empty());
+        assert_eq!(
+            state.resolve("grid").len(),
+            1,
+            "generic IPC I/O errors must not withdraw a route"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_route_missing_on_expected_owner_removes_local_route() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_route_missing_expected_owner_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_identity_and_contracts(
+            &address,
+            "server-grid",
+            "inst-grid",
+            &[(
+                "other",
+                TEST_CRM_NS,
+                TEST_CRM_NAME,
+                TEST_CRM_VER,
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
+        )
+        .await;
+
+        state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "inst-grid".into(),
+            address,
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            None,
+        );
+
+        assert_eq!(
+            post_call_with_expected_crm_tag(
+                state.clone(),
+                "grid",
+                "step",
+                TEST_CRM_NS,
+                TEST_CRM_NAME,
+                TEST_CRM_VER,
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            state.resolve("grid").is_empty(),
+            "connected owner route-missing is semantic withdrawal evidence"
+        );
+
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -2910,9 +3135,6 @@ mod tests {
         route_name: &str,
         new_address: &str,
     ) {
-        let mut new_client = IpcClient::new(new_address);
-        new_client.connect().await.unwrap();
-        let new_client = Arc::new(new_client);
         let state_for_hook = state;
         let route_for_hook = route_name.to_string();
         let new_address_for_hook = new_address.to_string();
@@ -2935,7 +3157,6 @@ mod tests {
                 TEST_ABI_HASH.to_string(),
                 TEST_SIGNATURE_HASH.to_string(),
                 1024,
-                new_client,
                 None,
             ) {
                 RegisterCommitResult::Registered { .. }
@@ -3270,7 +3491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_unreachable_upstream_removes_stale_local_route() {
+    async fn probe_generic_io_unreachable_upstream_keeps_local_route() {
         let state = test_state();
         let stale_address = format!(
             "ipc://relay_probe_stale_{}_{}",
@@ -3291,10 +3512,10 @@ mod tests {
             get_probe(state.clone(), "grid").await,
             StatusCode::BAD_GATEWAY
         );
-        assert!(state.local_route("grid").is_none());
+        assert!(state.local_route("grid").is_some());
         assert_eq!(
             get_probe(state.clone(), "grid").await,
-            StatusCode::NOT_FOUND
+            StatusCode::BAD_GATEWAY
         );
     }
 

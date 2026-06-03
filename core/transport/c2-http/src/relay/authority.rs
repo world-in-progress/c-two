@@ -329,7 +329,6 @@ pub(crate) enum RouteCommand {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
-        client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     },
     UnregisterLocal {
@@ -599,7 +598,6 @@ impl<'a> RouteAuthority<'a> {
                 abi_hash,
                 signature_hash,
                 max_payload_size,
-                client,
                 replacement,
             } => self.register_local(
                 name,
@@ -612,7 +610,6 @@ impl<'a> RouteAuthority<'a> {
                 abi_hash,
                 signature_hash,
                 max_payload_size,
-                client,
                 replacement,
             ),
             RouteCommand::UnregisterLocal { name, server_id } => {
@@ -647,7 +644,6 @@ impl<'a> RouteAuthority<'a> {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
-        client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     ) -> Result<RouteCommandResult, ControlError> {
         self.validate_route_name(&name)?;
@@ -745,13 +741,10 @@ impl<'a> RouteAuthority<'a> {
         let old_client = if let Some(token) = replacement {
             let token_existing_address = token.existing_address.clone();
             let evidence: OwnerReplacementEvidence = token.evidence;
-            match self.state.replace_if_owner_token(
-                &name,
-                &token.token,
-                address.clone(),
-                client.clone(),
-                evidence,
-            ) {
+            match self
+                .state
+                .replace_if_owner_token(&name, &token.token, address.clone(), evidence)
+            {
                 Ok(old_client) => old_client,
                 Err(OwnerReplaceError::StaleToken | OwnerReplaceError::NotReplaceable) => {
                     return Err(ControlError::DuplicateRoute {
@@ -760,7 +753,7 @@ impl<'a> RouteAuthority<'a> {
                 }
             }
         } else {
-            self.state.insert_connection(name.clone(), address, client);
+            self.state.insert_owner_slot(name.clone(), address);
             None
         };
         route_table.register_prevalidated_route(entry.clone());
@@ -781,7 +774,9 @@ impl<'a> RouteAuthority<'a> {
             CachedClient::Ready { address, .. } => Err(ControlError::DuplicateRoute {
                 existing_address: address,
             }),
-            CachedClient::Evicted { address } | CachedClient::Disconnected { address } => {
+            CachedClient::OwnerOnly { address }
+            | CachedClient::Evicted { address }
+            | CachedClient::Disconnected { address } => {
                 let Some(token) = self.state.owner_token(name) else {
                     return Err(ControlError::DuplicateRoute {
                         existing_address: address,

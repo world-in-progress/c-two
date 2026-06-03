@@ -75,15 +75,15 @@ def test_c_two_python_package_declares_fastdb_dependency():
 
     dependencies = pyproject['project']['dependencies']
 
-    assert 'fastdb4py>=0.1.21' in dependencies
+    assert 'fastdb4py>=0.1.22' in dependencies
 
 
-def test_c_two_workspace_uses_sibling_fastdb_for_local_integration():
+def test_c_two_workspace_uses_published_fastdb_dependency():
     pyproject = tomllib.loads((_repo_root() / 'pyproject.toml').read_text())
 
     sources = pyproject.get('tool', {}).get('uv', {}).get('sources', {})
 
-    assert sources['fastdb4py'] == {'path': '../fastdb', 'editable': True}
+    assert 'fastdb4py' not in sources
 
 
 def test_fastdb_abi_plans_portable_descriptor_without_extra_setup():

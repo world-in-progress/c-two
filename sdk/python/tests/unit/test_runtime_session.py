@@ -766,6 +766,34 @@ def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None
     )
 
 
+def test_relay_ipc_unavailable_reason_is_logged_before_http_fallback() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+    connect_body = source.split('fn connect_via_relay(', 1)[1].split(
+        'fn shutdown_ipc_clients(',
+        1,
+    )[0]
+    acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
+        'fn acquire_relay_http_client(',
+        1,
+    )[0]
+
+    assert 'RelayIpcUnavailableReason::PoolAcquire' in source
+    assert 'RelayIpcUnavailableReason::IdentityMismatch' in source
+    assert 'RelayIpcUnavailableReason::RouteMissing' in source
+    assert 'Err(RelayIpcConnectError::Unavailable(reason))' in connect_body
+    assert 'eprintln!' in connect_body
+    assert (
+        connect_body.find('eprintln!')
+        < connect_body.find('acquire_relay_http_client')
+    )
+    assert 'RelayIpcUnavailable::pool_acquire' in acquire_body
+    assert 'RelayIpcUnavailable::identity_mismatch' in acquire_body
+    assert 'RelayIpcUnavailable::route_missing' in acquire_body
+
+
 def test_relay_ipc_identity_boundary_is_native_owned() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     registry_source = (

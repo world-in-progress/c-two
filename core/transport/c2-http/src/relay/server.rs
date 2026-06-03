@@ -416,7 +416,13 @@ impl RelayServer {
                     address,
                     reply,
                 } => {
+                    eprintln!(
+                        "[relay] Register command: name={name} server_id={server_id} address={address}"
+                    );
                     if let Err(err) = validate_register_command(&state, &name, &server_id) {
+                        eprintln!(
+                            "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={err}"
+                        );
                         let _ = reply.send(Err(err));
                         continue;
                     }
@@ -427,6 +433,9 @@ impl RelayServer {
                         Ok(replacement) => replacement,
                         Err(ControlError::AddressMismatch { .. })
                         | Err(ControlError::DuplicateRoute { .. }) => {
+                            eprintln!(
+                                "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=duplicate"
+                            );
                             let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
                             continue;
                         }
@@ -435,10 +444,16 @@ impl RelayServer {
                         | Err(ControlError::InvalidServerInstanceId { reason })
                         | Err(ControlError::InvalidAddress { reason })
                         | Err(ControlError::ContractMismatch { reason }) => {
+                            eprintln!(
+                                "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                            );
                             let _ = reply.send(Err(RelayControlError::Other(reason)));
                             continue;
                         }
                         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
+                            eprintln!(
+                                "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=owner_not_replaceable"
+                            );
                             let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
                             continue;
                         }
@@ -452,6 +467,9 @@ impl RelayServer {
                                     client.server_id() == Some(server_id.as_str());
                                 if !server_identity_matches {
                                     close_client(client);
+                                    eprintln!(
+                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=identity_mismatch"
+                                    );
                                     let _ = reply.send(Err(RelayControlError::Other(format!(
                                         "IPC server identity mismatch for upstream '{name}'"
                                     ))));
@@ -461,6 +479,9 @@ impl RelayServer {
                                     client.server_instance_id().map(ToOwned::to_owned)
                                 else {
                                     close_client(client);
+                                    eprintln!(
+                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=missing_server_instance_id"
+                                    );
                                     let _ = reply.send(Err(RelayControlError::Other(format!(
                                         "IPC server identity mismatch for upstream '{name}'"
                                     ))));
@@ -471,11 +492,17 @@ impl RelayServer {
                                         .validate_server_instance_id(&server_instance_id)
                                 {
                                     close_client(client);
+                                    eprintln!(
+                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                                    );
                                     let _ = reply.send(Err(RelayControlError::Other(reason)));
                                     continue;
                                 }
                                 if !client.has_route(&name) {
                                     close_client(client);
+                                    eprintln!(
+                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
+                                    );
                                     let _ = reply.send(Err(RelayControlError::Other(format!(
                                         "IPC upstream at {address} does not export route '{name}'"
                                     ))));
@@ -488,12 +515,18 @@ impl RelayServer {
                                         Ok(contract) => contract,
                                         Err(ControlError::ContractMismatch { reason }) => {
                                             close_client(client);
+                                            eprintln!(
+                                                "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                                            );
                                             let _ =
                                                 reply.send(Err(RelayControlError::Other(reason)));
                                             continue;
                                         }
                                         Err(ControlError::NotFound) => {
                                             close_client(client);
+                                            eprintln!(
+                                                "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
+                                            );
                                             let _ = reply.send(Err(RelayControlError::Other(
                                                 format!(
                                                     "IPC upstream at {address} does not export route '{name}'"
@@ -519,6 +552,9 @@ impl RelayServer {
                                         tokio::spawn(
                                             async move { close_client.close_shared().await },
                                         );
+                                        eprintln!(
+                                            "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=duplicate"
+                                        );
                                         let _ = reply
                                             .send(Err(RelayControlError::DuplicateRoute { name }));
                                         continue;
@@ -531,6 +567,9 @@ impl RelayServer {
                                         let close_client = client.clone();
                                         tokio::spawn(
                                             async move { close_client.close_shared().await },
+                                        );
+                                        eprintln!(
+                                            "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
                                         );
                                         let _ = reply.send(Err(RelayControlError::Other(reason)));
                                         continue;
@@ -547,29 +586,58 @@ impl RelayServer {
                                     contract.abi_hash,
                                     contract.signature_hash,
                                     contract.max_payload_size,
-                                    client.clone(),
                                     replacement,
                                 ) {
                                     RegisterCommitResult::Registered { entry } => {
+                                        tokio::spawn(async move { client.close_shared().await });
+                                        eprintln!(
+                                            "[relay] Register command committed: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
+                                            entry.name,
+                                            entry.server_id.as_deref().unwrap_or(""),
+                                            entry.server_instance_id.as_deref().unwrap_or(""),
+                                            entry.ipc_address.as_deref().unwrap_or(""),
+                                            entry.crm_ns,
+                                            entry.crm_name,
+                                            entry.crm_ver
+                                        );
                                         broadcast_route_announce(&state, &entry);
                                         Ok(())
                                     }
-                                    RegisterCommitResult::SameOwner { .. } => {
+                                    RegisterCommitResult::SameOwner { entry } => {
                                         tokio::spawn(async move { client.close_shared().await });
+                                        eprintln!(
+                                            "[relay] Register command same-owner: name={} server_id={} server_instance_id={} address={} crm={}/{}/{}",
+                                            entry.name,
+                                            entry.server_id.as_deref().unwrap_or(""),
+                                            entry.server_instance_id.as_deref().unwrap_or(""),
+                                            entry.ipc_address.as_deref().unwrap_or(""),
+                                            entry.crm_ns,
+                                            entry.crm_name,
+                                            entry.crm_ver
+                                        );
                                         Ok(())
                                     }
                                     RegisterCommitResult::Duplicate { .. }
                                     | RegisterCommitResult::ConflictingOwner { .. } => {
                                         tokio::spawn(async move { client.close_shared().await });
+                                        eprintln!(
+                                            "[relay] Register command rejected: name={name} reason=duplicate"
+                                        );
                                         Err(RelayControlError::DuplicateRoute { name })
                                     }
                                     RegisterCommitResult::Invalid { reason } => {
                                         tokio::spawn(async move { client.close_shared().await });
+                                        eprintln!(
+                                            "[relay] Register command rejected: name={name} reason={reason}"
+                                        );
                                         Err(RelayControlError::Other(reason))
                                     }
                                 }
                             }
                             Err(e) => {
+                                eprintln!(
+                                    "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=connect_failed error={e}"
+                                );
                                 Err(RelayControlError::Other(format!("Failed to connect: {e}")))
                             }
                         }
@@ -580,28 +648,46 @@ impl RelayServer {
                     name,
                     server_id,
                     reply,
-                } => match state.unregister_upstream(&name, &server_id) {
-                    UnregisterResult::Removed {
-                        entry,
-                        removed_at,
-                        client,
-                    } => {
-                        if let Some(arc_client) = client {
-                            tokio::spawn(async move { arc_client.close_shared().await });
+                } => {
+                    eprintln!("[relay] Unregister command: name={name} server_id={server_id}");
+                    match state.unregister_upstream(&name, &server_id) {
+                        UnregisterResult::Removed {
+                            entry,
+                            removed_at,
+                            client,
+                        } => {
+                            if let Some(arc_client) = client {
+                                tokio::spawn(async move { arc_client.close_shared().await });
+                            }
+                            eprintln!(
+                                "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at}",
+                                entry.name,
+                                entry.server_id.as_deref().unwrap_or("")
+                            );
+                            broadcast_route_withdraw(&state, &entry, removed_at);
+                            let _ = reply.send(Ok(()));
                         }
-                        broadcast_route_withdraw(&state, &entry, removed_at);
-                        let _ = reply.send(Ok(()));
+                        UnregisterResult::AlreadyRemoved => {
+                            eprintln!(
+                                "[relay] Unregister command already removed: name={name} server_id={server_id}"
+                            );
+                            let _ = reply.send(Ok(()));
+                        }
+                        UnregisterResult::OwnerMismatch => {
+                            eprintln!(
+                                "[relay] Unregister command rejected: name={name} server_id={server_id} reason=owner_mismatch"
+                            );
+                            let _ =
+                                reply.send(Err(format!("Server id does not own route: '{name}'")));
+                        }
+                        UnregisterResult::NotFound => {
+                            eprintln!(
+                                "[relay] Unregister command rejected: name={name} server_id={server_id} reason=not_found"
+                            );
+                            let _ = reply.send(Err(format!("Route name not registered: '{name}'")));
+                        }
                     }
-                    UnregisterResult::AlreadyRemoved => {
-                        let _ = reply.send(Ok(()));
-                    }
-                    UnregisterResult::OwnerMismatch => {
-                        let _ = reply.send(Err(format!("Server id does not own route: '{name}'")));
-                    }
-                    UnregisterResult::NotFound => {
-                        let _ = reply.send(Err(format!("Route name not registered: '{name}'")));
-                    }
-                },
+                }
                 Command::ListRoutes { reply } => {
                     let routes: Vec<(String, String)> = state
                         .list_routes()
@@ -694,6 +780,46 @@ mod tests {
             confirm < commit,
             "relay commit must consume only post-attestation final proof"
         );
+    }
+
+    #[test]
+    fn command_control_plane_logs_register_and_unregister_events() {
+        let source = include_str!("server.rs");
+        let register_body = source_between(
+            source,
+            "Command::RegisterUpstream {\n                    name,",
+            "Command::UnregisterUpstream",
+        )
+        .expect("RegisterUpstream command branch should be found");
+        let unregister_body = source_between(
+            source,
+            "Command::UnregisterUpstream {\n                    name,",
+            "Command::ListRoutes",
+        )
+        .expect("UnregisterUpstream command branch should be found");
+
+        for expected in [
+            "[relay] Register command:",
+            "[relay] Register command committed:",
+            "[relay] Register command same-owner:",
+            "[relay] Register command rejected:",
+        ] {
+            assert!(
+                register_body.contains(expected),
+                "command register path must log diagnostic event: {expected}"
+            );
+        }
+        for expected in [
+            "[relay] Unregister command:",
+            "[relay] Unregister command removed:",
+            "[relay] Unregister command already removed:",
+            "[relay] Unregister command rejected:",
+        ] {
+            assert!(
+                unregister_body.contains(expected),
+                "command unregister path must log diagnostic event: {expected}"
+            );
+        }
     }
 
     impl RecordingDisseminator {
@@ -1011,8 +1137,6 @@ mod tests {
             ..RelayConfig::default()
         });
         let address = unique_ipc_address("same_owner_contract_mismatch");
-        let original_client = Arc::new(c2_ipc::IpcClient::new(&address));
-        original_client.force_connected(true);
         match state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
@@ -1024,7 +1148,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            original_client,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}

@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use pyo3::exceptions::{PyKeyError, PyLookupError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,7 +48,102 @@ enum RelayConnectedInner {
 enum RelayIpcConnectError {
     Config(PyErr),
     ContractMismatch(PyErr),
-    Unavailable,
+    Unavailable(RelayIpcUnavailable),
+}
+
+#[derive(Debug)]
+struct RelayIpcUnavailable {
+    address: String,
+    route_name: String,
+    reason: RelayIpcUnavailableReason,
+}
+
+#[derive(Debug)]
+enum RelayIpcUnavailableReason {
+    PoolAcquire {
+        error: String,
+    },
+    IdentityMismatch {
+        expected_server_id: String,
+        expected_server_instance_id: String,
+        actual_server_id: Option<String>,
+        actual_server_instance_id: Option<String>,
+    },
+    RouteMissing {
+        route_name: String,
+    },
+}
+
+impl RelayIpcUnavailable {
+    fn pool_acquire(address: &str, route_name: &str, error: IpcError) -> Self {
+        Self {
+            address: address.to_string(),
+            route_name: route_name.to_string(),
+            reason: RelayIpcUnavailableReason::PoolAcquire {
+                error: error.to_string(),
+            },
+        }
+    }
+
+    fn identity_mismatch(
+        address: &str,
+        route_name: &str,
+        expected_server_id: &str,
+        expected_server_instance_id: &str,
+        actual_server_id: Option<String>,
+        actual_server_instance_id: Option<String>,
+    ) -> Self {
+        Self {
+            address: address.to_string(),
+            route_name: route_name.to_string(),
+            reason: RelayIpcUnavailableReason::IdentityMismatch {
+                expected_server_id: expected_server_id.to_string(),
+                expected_server_instance_id: expected_server_instance_id.to_string(),
+                actual_server_id,
+                actual_server_instance_id,
+            },
+        }
+    }
+
+    fn route_missing(address: &str, route_name: &str) -> Self {
+        Self {
+            address: address.to_string(),
+            route_name: route_name.to_string(),
+            reason: RelayIpcUnavailableReason::RouteMissing {
+                route_name: route_name.to_string(),
+            },
+        }
+    }
+}
+
+impl fmt::Display for RelayIpcUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "route '{}' at {} unavailable: {}",
+            self.route_name, self.address, self.reason
+        )
+    }
+}
+
+impl fmt::Display for RelayIpcUnavailableReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoolAcquire { error } => write!(f, "pool acquire failed: {error}"),
+            Self::IdentityMismatch {
+                expected_server_id,
+                expected_server_instance_id,
+                actual_server_id,
+                actual_server_instance_id,
+            } => write!(
+                f,
+                "identity mismatch: expected {expected_server_id}/{expected_server_instance_id}, got {}/{}",
+                actual_server_id.as_deref().unwrap_or("<missing>"),
+                actual_server_instance_id.as_deref().unwrap_or("<missing>")
+            ),
+            Self::RouteMissing { route_name } => write!(f, "route missing: {route_name}"),
+        }
+    }
 }
 
 #[pyclass(name = "RelayConnectedClient", frozen)]
@@ -743,14 +839,19 @@ impl PyRuntimeSession {
                     }),
                     Err(RelayIpcConnectError::Config(err)) => Err(err),
                     Err(RelayIpcConnectError::ContractMismatch(err)) => Err(err),
-                    Err(RelayIpcConnectError::Unavailable) => self.acquire_relay_http_client(
-                        py,
-                        use_proxy,
-                        max_attempts,
-                        call_timeout_secs,
-                        remote_payload_chunk_size,
-                        expected,
-                    ),
+                    Err(RelayIpcConnectError::Unavailable(reason)) => {
+                        eprintln!(
+                            "[c-two] Relay-resolved local IPC acquire failed; falling back to HTTP relay: {reason}"
+                        );
+                        self.acquire_relay_http_client(
+                            py,
+                            use_proxy,
+                            max_attempts,
+                            call_timeout_secs,
+                            remote_payload_chunk_size,
+                            expected,
+                        )
+                    }
                 }
             }
             RelayResolvedConnection::Http { client, relay_url } => Ok(PyRelayConnectedClient {
@@ -799,16 +900,34 @@ impl PyRuntimeSession {
             Err(IpcError::Config(message)) => {
                 return Err(RelayIpcConnectError::Config(PyValueError::new_err(message)));
             }
-            Err(_) => return Err(RelayIpcConnectError::Unavailable),
+            Err(err) => {
+                return Err(RelayIpcConnectError::Unavailable(
+                    RelayIpcUnavailable::pool_acquire(&addr, &expected.route_name, err),
+                ));
+            }
         };
 
-        let identity_matches = client.server_identity().is_some_and(|identity| {
+        let actual_identity = client.server_identity();
+        let identity_matches = actual_identity.as_ref().is_some_and(|identity| {
             identity.server_id == expected_server_id
                 && identity.server_instance_id == expected_server_instance_id
         });
         if !identity_matches {
             pool.release(&addr);
-            return Err(RelayIpcConnectError::Unavailable);
+            return Err(RelayIpcConnectError::Unavailable(
+                RelayIpcUnavailable::identity_mismatch(
+                    &addr,
+                    &expected.route_name,
+                    expected_server_id,
+                    expected_server_instance_id,
+                    actual_identity
+                        .as_ref()
+                        .map(|identity| identity.server_id.clone()),
+                    actual_identity
+                        .as_ref()
+                        .map(|identity| identity.server_instance_id.clone()),
+                ),
+            ));
         }
 
         if !client
@@ -817,7 +936,9 @@ impl PyRuntimeSession {
             .any(|registered| registered == expected.route_name)
         {
             pool.release(&addr);
-            return Err(RelayIpcConnectError::Unavailable);
+            return Err(RelayIpcConnectError::Unavailable(
+                RelayIpcUnavailable::route_missing(&addr, &expected.route_name),
+            ));
         }
         if let Err(err) = client.validate_route_contract(expected) {
             pool.release(&addr);

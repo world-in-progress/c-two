@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,11 +9,30 @@ use c2_ipc::IpcClient;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+const RECONNECT_MAX_ATTEMPTS: usize = 2;
+const RECONNECT_RETRY_DELAY_MS: u64 = 10;
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn is_retryable_connect_error(error: &c2_ipc::IpcError) -> bool {
+    let c2_ipc::IpcError::Io(error) = error else {
+        return false;
+    };
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::NotFound
+            | ErrorKind::TimedOut
+    )
 }
 
 /// A single route/address upstream slot.
@@ -34,6 +54,7 @@ struct SlotInner {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlotState {
+    OwnerOnly,
     Ready,
     Evicted,
     Disconnected,
@@ -57,6 +78,7 @@ pub struct UpstreamLease {
 
 pub enum CachedClient {
     Ready { address: String },
+    OwnerOnly { address: String },
     Evicted { address: String },
     Disconnected { address: String },
     Missing,
@@ -140,10 +162,24 @@ impl ConnectionPool {
         let Some(slot) = self.slot(name) else {
             return Err(AcquireError::NotFound);
         };
-        slot.acquire_with(connector).await
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match slot.clone().acquire_with(&connector).await {
+                Ok(lease) => return Ok(lease),
+                Err(AcquireError::Unreachable { error, .. })
+                    if attempts < RECONNECT_MAX_ATTEMPTS && is_retryable_connect_error(&error) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(RECONNECT_RETRY_DELAY_MS)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Insert a pre-connected client for a route name.
+    #[cfg(test)]
     pub fn insert(&self, name: String, address: String, client: Arc<IpcClient>) {
         let mut inner = self.inner.lock();
         let owner_generation = next_owner_generation(&mut inner);
@@ -153,6 +189,28 @@ impl ConnectionPool {
                 address,
                 Some(client),
                 SlotState::Ready,
+                owner_generation,
+                self.owner_lease_deadline(),
+            )),
+        );
+        drop(inner);
+        if let Some(old_slot) = old_slot {
+            if let Some(client) = old_slot.retire() {
+                close_replaced_client(client);
+            }
+        }
+    }
+
+    /// Insert route owner metadata without attaching a relay data-plane client.
+    pub fn insert_owner(&self, name: String, address: String) {
+        let mut inner = self.inner.lock();
+        let owner_generation = next_owner_generation(&mut inner);
+        let old_slot = inner.entries.insert(
+            name,
+            Arc::new(UpstreamSlot::new(
+                address,
+                None,
+                SlotState::OwnerOnly,
                 owner_generation,
                 self.owner_lease_deadline(),
             )),
@@ -276,7 +334,6 @@ impl ConnectionPool {
         name: &str,
         token: &OwnerToken,
         new_address: String,
-        new_client: Arc<IpcClient>,
         evidence: OwnerReplacementEvidence,
     ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
         let evidence: OwnerReplacementEvidence = evidence;
@@ -311,8 +368,8 @@ impl ConnectionPool {
             name.to_string(),
             Arc::new(UpstreamSlot::new(
                 new_address,
-                Some(new_client),
-                SlotState::Ready,
+                None,
+                SlotState::OwnerOnly,
                 owner_generation,
                 self.owner_lease_deadline(),
             )),
@@ -379,6 +436,10 @@ impl UpstreamSlot {
                 let mut inner = self.inner.lock();
                 match inner.state {
                     SlotState::Retired => return Err(AcquireError::NotFound),
+                    SlotState::OwnerOnly => {
+                        inner.state = SlotState::Reconnecting;
+                        Some(inner.address.clone())
+                    }
                     SlotState::Ready => {
                         if let Some(client) = inner.client.clone() {
                             if client.is_connected() {
@@ -454,6 +515,9 @@ impl UpstreamSlot {
     fn lookup(&self) -> CachedClient {
         let mut inner = self.inner.lock();
         match inner.state {
+            SlotState::OwnerOnly => CachedClient::OwnerOnly {
+                address: inner.address.clone(),
+            },
             SlotState::Ready => match &inner.client {
                 Some(client) if client.is_connected() => CachedClient::Ready {
                     address: inner.address.clone(),
@@ -659,7 +723,10 @@ fn replacement_evidence_allows_locked(
 
 impl SlotState {
     fn is_replaceable(self) -> bool {
-        matches!(self, SlotState::Evicted | SlotState::Disconnected)
+        matches!(
+            self,
+            SlotState::OwnerOnly | SlotState::Evicted | SlotState::Disconnected
+        )
     }
 }
 
@@ -717,6 +784,19 @@ mod tests {
     }
 
     #[test]
+    fn insert_owner_only_slot_is_not_idle_evictable() {
+        let pool = ConnectionPool::new();
+        pool.insert_owner("grid".into(), "ipc://test".into());
+
+        assert!(matches!(
+            pool.lookup("grid"),
+            CachedClient::OwnerOnly { .. }
+        ));
+        assert!(pool.idle_entries(0).is_empty());
+        assert!(pool.evict_idle(0).is_empty());
+    }
+
+    #[test]
     fn lookup_distinguishes_ready_evicted_disconnected_and_missing() {
         let pool = ConnectionPool::new();
         let ready = Arc::new(IpcClient::new("ipc://ready"));
@@ -752,6 +832,34 @@ mod tests {
             _ => panic!("disconnected connection should be explicit"),
         }
         assert!(matches!(pool.lookup("missing"), CachedClient::Missing));
+    }
+
+    #[tokio::test]
+    async fn owner_only_slot_acquires_data_plane_client_lazily() {
+        let pool = Arc::new(ConnectionPool::new());
+        pool.insert_owner("grid".into(), "ipc://lazy".into());
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let lease = pool
+            .acquire_with("grid", {
+                let attempts = attempts.clone();
+                move |address| {
+                    let attempts = attempts.clone();
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        let client = Arc::new(IpcClient::new(&address));
+                        client.force_connected(true);
+                        Ok(client)
+                    }
+                }
+            })
+            .await
+            .expect("owner-only slot should connect on first data-plane acquire");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(lease.client().is_connected());
+        drop(lease);
+        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
@@ -1070,13 +1178,10 @@ mod tests {
         assert!(token.slot.inner.lock().owner_lease_deadline.is_none());
         pool.evict("grid");
 
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
-        replacement.force_connected(true);
         let result = pool.replace_if_owner_token(
             "grid",
             &pool.owner_token("grid").unwrap(),
             "ipc://replacement".to_string(),
-            replacement,
             OwnerReplacementEvidence::ConfirmedDead,
         );
 
@@ -1097,13 +1202,10 @@ mod tests {
         let lease = pool.begin_request_for_test("grid").unwrap();
         lease.client().force_connected(false);
 
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
-        replacement.force_connected(true);
         let result = pool.replace_if_owner_token(
             "grid",
             &token,
             "ipc://replacement".to_string(),
-            replacement,
             OwnerReplacementEvidence::ConfirmedDead,
         );
 
@@ -1153,6 +1255,41 @@ mod tests {
                 .iter()
                 .all(|lease| Arc::ptr_eq(&first, &lease.client()))
         );
+    }
+
+    #[tokio::test]
+    async fn acquire_after_eviction_retries_one_transient_connector_error() {
+        let pool = Arc::new(ConnectionPool::new());
+        let client = Arc::new(IpcClient::new("ipc://flaky"));
+        client.force_connected(true);
+        pool.insert("grid".into(), "ipc://flaky".into(), client);
+        pool.evict("grid");
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let lease = pool
+            .acquire_with("grid", {
+                let attempts = attempts.clone();
+                move |address| {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            return Err(c2_ipc::IpcError::Io(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "peer reset during idle reconnect",
+                            )));
+                        }
+                        let client = Arc::new(IpcClient::new(&address));
+                        client.force_connected(true);
+                        Ok(client)
+                    }
+                }
+            })
+            .await
+            .expect("transient reconnect reset should be retried");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(lease.client().is_connected());
     }
 
     #[tokio::test]

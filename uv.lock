@@ -42,14 +42,14 @@ wheels = [
 
 [[package]]
 name = "c-two"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "sdk/python" }
 dependencies = [
     { name = "fastdb4py" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "fastdb4py", editable = "../fastdb" }]
+requires-dist = [{ name = "fastdb4py", specifier = ">=0.1.22" }]
 
 [[package]]
 name = "c-two-workspace"
@@ -256,21 +256,44 @@ wheels = [
 
 [[package]]
 name = "fastdb4py"
-version = "0.1.21"
-source = { editable = "../fastdb" }
+version = "0.1.22"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "numpy" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pyarrow", specifier = ">=23.0.1" },
-    { name = "pytest", specifier = ">=9.0.1" },
-    { name = "setuptools", specifier = ">=42" },
+sdist = { url = "https://files.pythonhosted.org/packages/13/39/85e41fde03b68a51974b1d12ca99d1c98a7706b76aa50383e3c547a7c84e/fastdb4py-0.1.22.tar.gz", hash = "sha256:68c41b035dd2750e10c0c65f8ba8d0d6353f50a2e819ab1188594bcf9cf13100", size = 681457, upload-time = "2026-06-03T07:53:22.263Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/76/88756c727fbd9f909c89979dd9bfaffb1151d9b7ebe9025b6857df5c355d/fastdb4py-0.1.22-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:ecf4bf6efac3c41c3483a506acccfd06fe3edc83f8dca026ce9fc1326e41c616", size = 670116, upload-time = "2026-06-03T07:52:41.608Z" },
+    { url = "https://files.pythonhosted.org/packages/79/12/b87584633c5a3011df29016c58f949ffdd05edf95a02977d569ffc8f6ba7/fastdb4py-0.1.22-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:95115372f70fd72d4cf5c5cb4e4984223af9dbc7f8d214c25af0c854bcfeb2e2", size = 607785, upload-time = "2026-06-03T07:52:43.056Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/4f/f02dc298e5d8a234a58b0c8e1df0f1e880a3c6e384efe0be064ce26ef817/fastdb4py-0.1.22-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:860c05b9c40a0b4652e4c16e769d4f23a8ffc46c7b13370f15debbd2468297d9", size = 737272, upload-time = "2026-06-03T07:52:44.526Z" },
+    { url = "https://files.pythonhosted.org/packages/16/c5/1d123cc72c384eb8330858bb4e933ba9542f4bc51e45f7206bce15488699/fastdb4py-0.1.22-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:671d49faeb52eaa64960188f39c771ac89d1bde4485fea5f801b43dfc974114b", size = 765634, upload-time = "2026-06-03T07:52:45.989Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/40/abe6866c4ca3ce59fb01b8c6ad637a6c62cbfa0320fa78576174f6d59058/fastdb4py-0.1.22-cp310-cp310-win_amd64.whl", hash = "sha256:29ebe5eb73747120a509eef48e9f5fe302c8feffa4435f2241c36da0c17f5656", size = 288375, upload-time = "2026-06-03T07:52:47.186Z" },
+    { url = "https://files.pythonhosted.org/packages/94/f0/70d7028842e7729b1c33713ef4040e0617b04364019dedb6416987de724b/fastdb4py-0.1.22-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:4cea40ece98c6b50bacc428e8ffe784354fedc96a15b548396c9c2b14479397d", size = 670111, upload-time = "2026-06-03T07:52:48.388Z" },
+    { url = "https://files.pythonhosted.org/packages/34/31/9cf08bbb19c88a7b471260f0f4bb046b9979967178d36eaecedc57ac72d4/fastdb4py-0.1.22-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d6e09ded759fa6f05a51b0a22510bcf8aab5b9372339dc59a14a746c15b5581d", size = 607780, upload-time = "2026-06-03T07:52:49.681Z" },
+    { url = "https://files.pythonhosted.org/packages/53/77/3f4a326f0f0a6f07b90dc376f70ea14c87bde46cf5ac09d02c41076e9f67/fastdb4py-0.1.22-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bc33c476194e66bb5929ff54489276278c2d8473e99e22e0f6e6cb529c485918", size = 737141, upload-time = "2026-06-03T07:52:51.232Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/2d/72708a0eba05e35beabd080f492d6bec19c1178d67bfa412d06f4522f6de/fastdb4py-0.1.22-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:70833b3a280fe8f0a99e6065ffa23ec7957a53c5470a74524318aebcb9d16e75", size = 765556, upload-time = "2026-06-03T07:52:52.482Z" },
+    { url = "https://files.pythonhosted.org/packages/13/3f/726a0d66cda8a8bbcc7eb6179d26af7a35fb767e2a3d18361def92b7077f/fastdb4py-0.1.22-cp311-cp311-win_amd64.whl", hash = "sha256:f9c4fd567012147f288e7200317239ff6b995618a601adcec72e4645f0414633", size = 288249, upload-time = "2026-06-03T07:52:53.593Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/ee/8cdb8f90df8495df6b1fc481cbe570861788e6c53c3d4488523598139e2c/fastdb4py-0.1.22-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:a878d37fcbcef6cf346090d282cf752c2b907da0462ed5629f0c74d793704edf", size = 667728, upload-time = "2026-06-03T07:52:54.77Z" },
+    { url = "https://files.pythonhosted.org/packages/02/50/d113aa74b1c9237ac5fffbc97d22551661f775d0a8b3de0b664b9d1ec125/fastdb4py-0.1.22-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:1aa896d7cbdff20b794114df9b326c91ff9bfbc2afa10e84c4f47e659db49614", size = 608517, upload-time = "2026-06-03T07:52:56.072Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/b0/15c723523fa00fad3f70d740b10681a290627462fb2a0e2270bcc74a0810/fastdb4py-0.1.22-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:cc604d685505e5b43ff8c45ea5511ede4c0d18f0c057a174b831572e52debff5", size = 737684, upload-time = "2026-06-03T07:52:57.492Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/7e/3755d80ed669c06c1ae10d61c3dfa86e3db0914858a9ca8d7da63e128f1c/fastdb4py-0.1.22-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4da536dcbbec5bf00c1172dfc499f4905b62932c57dbe3f7002c22c4deffba98", size = 767316, upload-time = "2026-06-03T07:52:58.812Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/8f/62e33b6fe1e0d9ec4adaa5ed54ff8d59953e10942ad113b3fcd9b3bc71e6/fastdb4py-0.1.22-cp312-cp312-win_amd64.whl", hash = "sha256:5b17de0740c155496ec8c7bfc577bf89a67ee07e997049568fe6667a340d64d1", size = 289386, upload-time = "2026-06-03T07:52:59.932Z" },
+    { url = "https://files.pythonhosted.org/packages/29/d7/b0255acbb8244e040342afc54f9a26ee17585fb85b2f0543b06a930030f9/fastdb4py-0.1.22-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:e6dc0d9c3f364e2a07cb487286b343893afbc6563862160bb61f0622e756a458", size = 667308, upload-time = "2026-06-03T07:53:01.1Z" },
+    { url = "https://files.pythonhosted.org/packages/08/1e/ac37b7c0b849bc776fecbbc224007ac138cc259d8c22f57f5b457db7fa32/fastdb4py-0.1.22-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:6182aab4960a4e7bb6b86276bed9ec7fb92883ed1a24d3aea287fc16c74c73a1", size = 607987, upload-time = "2026-06-03T07:53:02.421Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/59/0d9eb2ecd101d30502ac8853e57b9d3111be35a0b4d5bc596c29ed7e9e4d/fastdb4py-0.1.22-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:700af70cefe4e3053d60a8ed59855660f8a765d32a0046277109c25bb078641b", size = 737145, upload-time = "2026-06-03T07:53:03.654Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/c6/4d4a4a0557e5b32e8e5649388a4092481d33fcca953ceaf2b583feb095ac/fastdb4py-0.1.22-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5cd3500fcc6a59ed243e0c29d57574a3529d1a9a54ae1c6a74219816aa6d0bc5", size = 766670, upload-time = "2026-06-03T07:53:04.894Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/e7/ffb59e58b9ae68cb693c27d990d18ca5d35d08c302582cea69d65e13e8cf/fastdb4py-0.1.22-cp313-cp313-win_amd64.whl", hash = "sha256:f30feab3ad01a128a96bf21c11b30539b5169860533d8aaff8e384cdb64115e0", size = 288935, upload-time = "2026-06-03T07:53:06.116Z" },
+    { url = "https://files.pythonhosted.org/packages/16/f7/e727c0d93a8ce3d9c1949d7ddb5d0177034bb4a0d032d1cf375d41dde49a/fastdb4py-0.1.22-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:0004eed504515bab4fbca2722e2aeb46c13db5823114756911ab09bacc0915bb", size = 668105, upload-time = "2026-06-03T07:53:07.681Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/56/e14fc083bf24b837b16f624c08140dbbc28fdd9b1870aae3128fc26a2bab/fastdb4py-0.1.22-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:bf0d4cea1dc7d2ff87fff7e7b5baaed0eedc13a5376a9ade17b7193bd508fac4", size = 608045, upload-time = "2026-06-03T07:53:09.051Z" },
+    { url = "https://files.pythonhosted.org/packages/70/94/6c7f5ace9aa31d222f9ee7a51efecc0cf94c2373da589b846211db9f837d/fastdb4py-0.1.22-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c0fcedafe54bd64ec9e4578fd1460d15cbdfcc705daaecae61e10b11b710b1b5", size = 738043, upload-time = "2026-06-03T07:53:10.63Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/ab/9829aa20ac5628fccffeda56b6e592b04ca4701a3ed43fc8ca9ac62d6cf5/fastdb4py-0.1.22-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bd3d3d1ce2131bc09c44012ccfdc5ff51ed76cb7c3380b269ac2c08495d66ad5", size = 766479, upload-time = "2026-06-03T07:53:12.102Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/20/46ee35a895f173fbcd01727e20e47ccf1060e557326f9162024486155f58/fastdb4py-0.1.22-cp314-cp314-win_amd64.whl", hash = "sha256:5711f778f9d3ba9eab5697bf197f7a5a1b63cf5e0bac7ead788e3f83d94f13ae", size = 294452, upload-time = "2026-06-03T07:53:13.49Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/a5/770c75b5e46339078138d53a3f652c7907d75685aeec72cecea5e286d696/fastdb4py-0.1.22-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:74fd6140b734e1b2139d729a032695da1e527275452e68574b6c1bdc62bd8406", size = 672625, upload-time = "2026-06-03T07:53:14.77Z" },
+    { url = "https://files.pythonhosted.org/packages/df/3d/5522cbc9592107dbf8e490bb6067a9ba35f3f7b0d34244ad72e7a116934d/fastdb4py-0.1.22-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:64aca6a7dbd9432b5655bc6d61c1a94411b93babc95d2c74ece7825fedd6e587", size = 611236, upload-time = "2026-06-03T07:53:15.949Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/0b/86a077bae890dbbab63240d61fb46ac0d1a77eeda67d846b7d1f77eb3204/fastdb4py-0.1.22-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ab097a01248086b2a7a04ff5c7e25e9219fda7f4771e44e06ff50f5c6a4fa089", size = 735640, upload-time = "2026-06-03T07:53:17.375Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/d6/1e0101f65f5eeb3cab08d2f7647f1e84f108f7a704441b60e10e145a7db1/fastdb4py-0.1.22-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6ea9ac05b769675dbfc8028c14933564ce6929dca2397cf4a915e733340db8b3", size = 759542, upload-time = "2026-06-03T07:53:19.125Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/8e/3d4ace99ca63c41e022a338766b0e9317633ba9ee9826434712b4eab36c9/fastdb4py-0.1.22-cp314-cp314t-win_amd64.whl", hash = "sha256:d40f86d1348bda23b64809541dfba94a6b38022dea474721659db7336b7104fd", size = 303204, upload-time = "2026-06-03T07:53:20.876Z" },
 ]
 
 [[package]]

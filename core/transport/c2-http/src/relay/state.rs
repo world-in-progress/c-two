@@ -20,7 +20,7 @@ use crate::relay::conn_pool::{
     AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerReplaceError,
     OwnerReplacementEvidence, OwnerToken, UpstreamLease,
 };
-use crate::relay::route_table::RouteTable;
+use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
 
 pub struct RelayState {
@@ -105,7 +105,6 @@ impl RelayState {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
-        client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     ) -> RegisterCommitResult {
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
@@ -119,7 +118,6 @@ impl RelayState {
             abi_hash,
             signature_hash,
             max_payload_size,
-            client,
             replacement,
         }) {
             Ok(RouteCommandResult::Registered { entry }) => {
@@ -358,19 +356,18 @@ impl RelayState {
         name: &str,
         token: &OwnerToken,
         new_address: String,
-        new_client: Arc<IpcClient>,
         evidence: OwnerReplacementEvidence,
     ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
         self.conn_pool
-            .replace_if_owner_token(name, token, new_address, new_client, evidence)
+            .replace_if_owner_token(name, token, new_address, evidence)
     }
 
     pub(crate) fn connection_lookup(&self, name: &str) -> CachedClient {
         self.conn_pool.lookup(name)
     }
 
-    pub(crate) fn insert_connection(&self, name: String, address: String, client: Arc<IpcClient>) {
-        self.conn_pool.insert(name, address, client);
+    pub(crate) fn insert_owner_slot(&self, name: String, address: String) {
+        self.conn_pool.insert_owner(name, address);
     }
 
     pub(crate) fn remove_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
@@ -467,7 +464,7 @@ impl RelayState {
             .authoritative_missing_tombstone(name, relay_id)
     }
 
-    pub(crate) fn gc_tombstones(&self, retention: std::time::Duration) -> usize {
+    pub(crate) fn gc_tombstones(&self, retention: std::time::Duration) -> Vec<TombstoneGcEntry> {
         self.route_table.write().gc_tombstones(retention)
     }
 
@@ -572,7 +569,7 @@ mod tests {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
-        client: Arc<IpcClient>,
+        _client: Arc<IpcClient>,
     ) -> RouteEntry {
         match state.commit_register_upstream(
             name.to_string(),
@@ -585,7 +582,6 @@ mod tests {
             abi_hash.to_string(),
             signature_hash.to_string(),
             1024,
-            client,
             None,
         ) {
             RegisterCommitResult::Registered { entry }
@@ -700,7 +696,6 @@ mod tests {
     #[test]
     fn local_commit_rejects_invalid_crm_tag_without_fake_duplicate() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
 
         let result = state.commit_register_upstream(
             "grid".into(),
@@ -713,7 +708,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            client,
             None,
         );
 
@@ -726,7 +720,6 @@ mod tests {
     #[test]
     fn local_commit_rejects_invalid_ipc_address_without_fake_duplicate() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://../escape"));
 
         let result = state.commit_register_upstream(
             "grid".into(),
@@ -739,7 +732,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            client,
             None,
         );
 
@@ -761,6 +753,34 @@ mod tests {
             state.list_routes()[0].server_id.as_deref(),
             Some("server-grid")
         );
+    }
+
+    #[test]
+    fn local_registration_does_not_create_idle_data_plane_client() {
+        let state = RelayState::new(test_config(), null_disseminator());
+
+        match state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://grid".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result"),
+        }
+
+        assert!(
+            state.evict_idle(0).is_empty(),
+            "route registration must not attach a relay data-plane client"
+        );
+        assert_eq!(state.resolve("grid").len(), 1);
     }
 
     #[test]
@@ -959,7 +979,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            first,
             None,
         );
         assert!(matches!(
@@ -978,7 +997,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            second,
             None,
         );
         assert!(matches!(
@@ -1012,7 +1030,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            racer,
             None,
         );
         assert!(matches!(
@@ -1033,7 +1050,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            candidate,
             None,
         );
 
@@ -1082,7 +1098,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            replacement,
             Some(replacement_proof),
         );
 
@@ -1133,7 +1148,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            stale_replacement,
             Some(replacement_proof),
         );
 
@@ -1187,7 +1201,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            same_owner,
             None,
         );
         assert!(matches!(
@@ -1208,7 +1221,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            replacement,
             Some(replacement_proof),
         );
 
@@ -1261,7 +1273,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            replacement,
             Some(replacement_proof),
         );
 
@@ -1396,7 +1407,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            replacement,
             Some(replacement_proof),
         );
 
@@ -1432,8 +1442,6 @@ mod tests {
         );
         state.evict_connection("grid");
 
-        let ignored = Arc::new(IpcClient::new("ipc://grid"));
-        ignored.force_connected(true);
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
@@ -1445,14 +1453,13 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            ignored,
             None,
         );
 
         assert!(matches!(result, RegisterCommitResult::SameOwner { .. }));
         assert!(matches!(
             state.conn_pool.lookup("grid"),
-            CachedClient::Evicted { .. }
+            CachedClient::OwnerOnly { .. }
         ));
     }
 
@@ -1463,8 +1470,6 @@ mod tests {
         original.force_connected(true);
         register_local(&state, "grid", "server-grid", "ipc://grid", original);
 
-        let changed = Arc::new(IpcClient::new("ipc://grid"));
-        changed.force_connected(true);
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
@@ -1476,7 +1481,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            changed,
             None,
         );
 
@@ -1492,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn same_server_new_instance_refreshes_local_route_and_client() {
+    fn same_server_new_instance_refreshes_local_route_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
         let original = Arc::new(IpcClient::new("ipc://grid"));
         original.force_connected(true);
@@ -1515,8 +1519,6 @@ mod tests {
             Ok(crate::relay::authority::RegisterPreflight::Available { .. })
         ));
 
-        let replacement = Arc::new(IpcClient::new("ipc://grid"));
-        replacement.force_connected(true);
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
@@ -1528,7 +1530,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            replacement,
             None,
         );
 
@@ -1540,7 +1541,7 @@ mod tests {
         );
         assert!(matches!(
             state.conn_pool.lookup("grid"),
-            CachedClient::Ready { .. }
+            CachedClient::OwnerOnly { .. }
         ));
     }
 
@@ -1564,7 +1565,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            moved,
             None,
         );
 
@@ -1628,7 +1628,6 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            replacement,
             None,
         );
 
