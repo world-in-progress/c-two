@@ -24,7 +24,7 @@ jobs:
       ci: ${{ steps.filter.outputs.ci }}
       workflow_policy: ${{ steps.filter.outputs.workflow_policy }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dorny/paths-filter@v4
         if: github.event_name == 'pull_request'
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     name: core
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     name: cli
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -103,7 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     name: workflow policy
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -136,7 +136,7 @@ jobs:
         python: ["3.12", "3.14t"]
     name: test (py${{ matrix.python }})
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Skip full Python tests for unrelated changes
         if: github.event_name != 'merge_group' && needs.changes.outputs.sdk != 'true' && needs.changes.outputs.core != 'true' && needs.changes.outputs.ci != 'true'
