@@ -179,7 +179,7 @@ def test_contract_infer_cli_writes_descriptor(tmp_path, monkeypatch):
     ]) == 0
     descriptor = json.loads(out_path.read_text())
 
-    assert descriptor['schema'] == 'c-two.contract.v1'
+    assert descriptor['schema'] == 'c-two.contract.v2'
     assert descriptor['crm']['name'] == 'ResourceCRM'
     assert descriptor['methods'][0]['name'] == 'ping'
 
@@ -220,8 +220,6 @@ def test_contract_infer_cli_writes_python_only_diagnostics(tmp_path, monkeypatch
         (item['method'], item['position'], item['code'])
         for item in diagnostics
     ] == [
-        ('echo', 'input', 'fastdb_call_db_not_planned'),
-        ('echo', 'output', 'fastdb_call_db_not_planned'),
         ('echo', 'input', 'python_only_pickle'),
         ('echo', 'output', 'python_only_pickle'),
     ]

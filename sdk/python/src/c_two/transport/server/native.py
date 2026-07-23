@@ -85,11 +85,12 @@ class CRMSlot:
                 if lifetime is InputLifetime.BORROWED:
                     binding = getattr(method, '_input_payload_binding', None)
                     if (
-                        getattr(binding, 'kind', None) is not PayloadPlanKind.FDB
-                        or getattr(binding, 'view_from_buffer', None) is None
+                        getattr(binding, 'kind', None) is not PayloadPlanKind.FASTDB
+                        or not getattr(binding, 'supports_scoped_owner', False)
                     ):
                         raise ValueError(
-                            f'input_lifetime BORROWED for {name!r} requires a buffer-view FDB input payload',
+                            f'input_lifetime BORROWED for {name!r} requires '
+                            'an explicit FastDB Payload input binding',
                         )
                     buffer_mode = 'borrowed'
                 elif lifetime is InputLifetime.MATERIALIZED:

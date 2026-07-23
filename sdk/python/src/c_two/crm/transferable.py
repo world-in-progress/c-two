@@ -1,41 +1,37 @@
 from __future__ import annotations
+
 import inspect
 import sys
 import warnings
 from functools import wraps
-from typing import get_type_hints, Any, Callable, Generic, ParamSpec, TypeVar, Type
+from typing import Any, Callable, Generic, ParamSpec, TypeVar, get_type_hints
 
 from .. import error
-from ._payload_abi import (
-    MethodPayloadAbiShape,
-    MethodParameterShape,
-)
 from .payload_plan import (
-    DEFAULT_PICKLE_PROTOCOL,
     PayloadBinding,
     PayloadPlanKind,
+    fastdb_payload_binding,
     no_payload_binding,
     python_pickle_input_binding,
     python_pickle_output_binding,
 )
 
-
-R = TypeVar('R')
-P = ParamSpec('P')
+R = TypeVar("R")
+P = ParamSpec("P")
 
 
 class HeldResult(Generic[R]):
-    """Wraps a method return value with explicit SHM lifecycle control.
+    """A result whose C-Two lease must be released explicitly."""
 
-    Three-layer safety net:
-    1. Explicit .release() — preferred
-    2. Context manager (__enter__/__exit__) — recommended
-    3. __del__ fallback — last resort with warning
-    """
+    __slots__ = ("_value", "_release_cb", "_invalidate_cb", "_released", "_buffer")
 
-    __slots__ = ('_value', '_release_cb', '_invalidate_cb', '_released', '_buffer')
-
-    def __init__(self, value, release_cb=None, buffer=None, invalidate_cb=None):
+    def __init__(
+        self,
+        value: R,
+        release_cb: Callable[[], None] | None = None,
+        buffer: memoryview | None = None,
+        invalidate_cb: Callable[[R], None] | None = None,
+    ) -> None:
         self._value = value
         self._release_cb = release_cb
         self._invalidate_cb = invalidate_cb
@@ -43,136 +39,130 @@ class HeldResult(Generic[R]):
         self._released = False
 
     @property
-    def value(self):
+    def value(self) -> R:
         if self._released:
             raise RuntimeError("SHM released — value no longer accessible")
         return self._value
 
     @property
-    def buffer(self):
-        return self.unsafe_buffer
-
-    @property
-    def unsafe_buffer(self):
+    def unsafe_buffer(self) -> memoryview:
         if self._released:
             raise RuntimeError("SHM released — buffer no longer accessible")
         if self._buffer is None:
             raise RuntimeError("HeldResult has no retained buffer")
         return self._buffer
 
-    def release(self):
-        if not self._released:
-            self._released = True
-            cb = self._release_cb
-            self._release_cb = None
-            invalidate_cb = self._invalidate_cb
-            self._invalidate_cb = None
-            value = self._value
-            if invalidate_cb is not None:
-                try:
-                    invalidate_cb(value)
-                except Exception:
-                    pass
-            self._value = None
-            try:
-                if cb is not None:
-                    try:
-                        cb()
-                    except Exception:
-                        pass
-            finally:
-                self._buffer = None
+    def release(self) -> None:
+        if self._released:
+            return
 
-    def __enter__(self):
+        self._released = True
+        release_cb = self._release_cb
+        invalidate_cb = self._invalidate_cb
+        value = self._value
+        self._release_cb = None
+        self._invalidate_cb = None
+        self._value = None  # type: ignore[assignment]
+
+        first_error: BaseException | None = None
+        if invalidate_cb is not None:
+            try:
+                invalidate_cb(value)
+            except BaseException as exc:
+                first_error = exc
+        try:
+            if release_cb is not None:
+                release_cb()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        finally:
+            self._buffer = None
+
+        if first_error is not None:
+            raise first_error
+
+    def __enter__(self) -> HeldResult[R]:
         return self
 
-    def __exit__(self, *args):
-        self.release()
-
-    def __del__(self, _is_finalizing=sys.is_finalizing, _warn=warnings.warn):
-        # NOTE: _is_finalizing and _warn are bound as default args at class
-        # definition time so they survive late interpreter teardown.
-        if getattr(self, '_released', True):
-            return
-        if _is_finalizing():
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        try:
             self.release()
+        except BaseException:
+            if exc_type is None:
+                raise
+
+    def __del__(
+        self,
+        _is_finalizing=sys.is_finalizing,
+        _warn=warnings.warn,
+    ) -> None:
+        if getattr(self, "_released", True):
             return
-        _warn(
-            "HeldResult was garbage-collected without release() — "
-            "potential SHM leak. Use 'with cc.hold(...)' or call .release().",
-            ResourceWarning,
-            stacklevel=2,
-        )
-        self.release()
+        if not _is_finalizing():
+            _warn(
+                "HeldResult was garbage-collected without release() — "
+                "potential SHM leak. Use 'with cc.hold(...)' or call .release().",
+                ResourceWarning,
+                stacklevel=2,
+            )
+        try:
+            self.release()
+        except BaseException:
+            pass
 
 
 Held = HeldResult
 
 
-def _invalidate_fastdb_value(value: object) -> None:
-    if value is None:
-        return
-    try:
-        from fastdb4py import invalidate as fastdb_invalidate
-    except Exception:
-        return
-    try:
-        fastdb_invalidate(value)
-    except Exception:
-        pass
-
-
 def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]:
-    """Wrap a CRM bound method to hold SHM on the response.
+    """Retain one remote response lease until the returned owner is released."""
 
-    Usage: ``cc.hold(proxy.method)(args)`` — single-shot pattern.
-    Returns a callable that injects ``_c2_buffer='hold'`` into kwargs.
-    """
     if not callable(method):
         raise TypeError(
-            f"cc.hold() requires a callable, got {type(method).__name__}"
+            f"cc.hold() requires a callable, got {type(method).__name__}",
         )
-    self_obj = getattr(method, '__self__', None)
-    name = getattr(method, '__name__', None)
+    self_obj = getattr(method, "__self__", None)
+    name = getattr(method, "__name__", None)
     if self_obj is None or name is None:
         raise TypeError(
             "cc.hold() requires a bound CRM method, "
-            "e.g. cc.hold(grid.compute)"
+            "e.g. cc.hold(grid.compute)",
         )
 
     @wraps(method)
     def wrapper(*args, **kwargs):
-        kwargs['_c2_buffer'] = 'hold'
+        kwargs["_c2_buffer"] = "hold"
         return getattr(self_obj, name)(*args, **kwargs)
 
     return wrapper
 
 
-_VALID_TRANSFER_BUFFERS = frozenset(('view',))
+_VALID_TRANSFER_BUFFERS = frozenset(("view",))
+
 
 def transfer(*, input=None, output=None, buffer=None):
-    """Metadata-only buffer policy decorator for CRM methods."""
-    if input is not None or output is not None:
-        raise TypeError(
-            '@cc.transfer input/output codec overrides were removed; '
-            'use FDB annotations for portable CRM payloads or Python pickle '
-            'fallback for Python-only methods.',
-        )
-    if buffer == 'hold':
+    """Bind explicit nested FastDB specs to a portable CRM method."""
+
+    if buffer == "hold":
         raise ValueError(
-            "server-side borrowed input is controlled by "
+            "server-side scoped input is controlled by "
             "cc.register(..., input_lifetime=...), not @cc.transfer(buffer='hold')",
         )
     if buffer is not None and buffer not in _VALID_TRANSFER_BUFFERS:
         raise ValueError(
-            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, got {buffer!r}"
+            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, "
+            f"got {buffer!r}",
         )
 
     def decorator(func):
         func.__cc_transfer__ = {
-            'buffer': buffer,
+            "input": input,
+            "output": output,
+            "buffer": buffer,
         }
-        return func  # NO wrapping
+        return func
+
     return decorator
 
 
@@ -180,170 +170,161 @@ def _build_transfer_wrapper(
     func,
     input: PayloadBinding | None = None,
     output: PayloadBinding | None = None,
-    buffer='view',
-    payload_abi_context=None,
+    buffer: str = "view",
 ):
-    """Build the com_to_crm / crm_to_com / transfer_wrapper closure.
+    """Build the client/resource closure over opaque payload bytes."""
 
-    This is the runtime transfer closure. It consumes internal payload bindings,
-    not user-authored custom codec classes.
-    """
     method_name = func.__name__
+    method_signature = inspect.signature(func)
 
     def com_to_crm(*args, _c2_buffer=None):
-        stage = 'call_crm'
+        stage = "call_crm"
+        output_hook = "deserialize"
         input_serializer = (
             input.serialize
             if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
             else None
         )
-        input_prepare_writer = (
-            input.prepare_write
-            if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
+        output_decoder = (
+            output.deserialize
+            if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
             else None
         )
-        if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD:
-            if _c2_buffer == 'hold' and output.view_from_buffer is not None:
-                output_fn = output.view_from_buffer
-                output_hook = 'retained_view'
-                output_retains_buffer = True
-            else:
-                output_fn = output.deserialize
-                output_hook = 'deserialize'
-                output_retains_buffer = False
-        else:
-            output_fn = None
-            output_hook = None
-            output_retains_buffer = False
+        retained_owner = (
+            _c2_buffer == "hold"
+            and output is not None
+            and output.supports_scoped_owner
+        )
 
         try:
             if len(args) < 1:
-                raise ValueError('Instance method requires self, but only get one argument.')
+                raise ValueError(
+                    "Instance method requires self, but no instance was provided.",
+                )
 
             crm = args[0]
             client = crm.client
             request = args[1:] if len(args) > 1 else None
-            # Thread fast path — skip all serialization/deserialization
-            if getattr(client, 'supports_direct_call', False):
-                stage = 'execute_direct'
+
+            if getattr(client, "supports_direct_call", False):
+                stage = "execute_direct"
                 result = client.call_direct(method_name, request or ())
-                if _c2_buffer == 'hold':
-                    return HeldResult(result, None)
+                if _c2_buffer == "hold":
+                    return HeldResult(result)
                 return result
 
-            # Standard cross-process path
-            stage = 'serialize_input'
-            prepared_args = (
-                input_prepare_writer(*request)
-                if (
-                    request is not None
-                    and input_prepare_writer is not None
-                    and callable(getattr(client, 'call_prepared', None))
-                )
+            stage = "serialize_input"
+            serialized_args = (
+                input_serializer(*request)
+                if request is not None and input_serializer is not None
                 else None
             )
 
-            stage = 'call_crm'
-            if prepared_args is not None:
-                response = client.call_prepared(method_name, prepared_args)
-            else:
-                serialized_args = input_serializer(*request) if (request is not None and input_serializer is not None) else None
-                response = client.call(method_name, serialized_args)
+            stage = "call_crm"
+            response = client.call(method_name, serialized_args)
 
-            stage = 'deserialize_output'
-            if not output_fn:
-                if hasattr(response, 'release'):
-                    response.release()
-                if _c2_buffer == 'hold':
-                    return HeldResult(None, None)
+            stage = "deserialize_output"
+            if output_decoder is None:
+                _release_response(response)
+                if _c2_buffer == "hold":
+                    return HeldResult(None)
                 return None
 
-            if hasattr(response, 'release'):
-                mv = memoryview(response)
-                if _c2_buffer == 'hold' and output_retains_buffer:
+            if hasattr(response, "release"):
+                view = memoryview(response)
+                if retained_owner:
+                    output_hook = "scoped_owner"
+                    result_ready = False
                     try:
-                        result = output_fn(mv)
-                        if hasattr(response, 'track_retained'):
-                            tracker = getattr(client, 'lease_tracker', None)
+                        result = output_decoder(view)
+                        result_ready = True
+                        if hasattr(response, "track_retained"):
+                            tracker = getattr(client, "lease_tracker", None)
                             if tracker is not None:
-                                route_name = getattr(client, 'route_name', '')
                                 response.track_retained(
                                     tracker,
-                                    route_name,
+                                    getattr(client, "route_name", ""),
                                     method_name,
-                                    'client_response',
+                                    "client_response",
                                 )
-                    except Exception as exc:
-                        mv.release()
-                        try:
-                            response.release()
-                        except Exception:
-                            pass
-                        if output_hook == 'retained_view':
-                            raise error.ClientOutputFromBuffer(str(exc)) from exc
+                    except BaseException as exc:
+                        if (
+                            result_ready
+                            and output is not None
+                            and output.invalidate is not None
+                        ):
+                            _cleanup_preserving_primary(
+                                exc,
+                                lambda: output.invalidate(result),
+                            )
+                        _cleanup_preserving_primary(
+                            exc,
+                            lambda: _release_view_and_response(view, response),
+                        )
                         raise
 
-                    def release_cb():
-                        mv.release()
-                        try:
-                            response.release()
-                        except Exception:
-                            pass
+                    def release_cb() -> None:
+                        _release_view_and_response(view, response)
+
                     return HeldResult(
                         result,
                         release_cb,
-                        buffer=mv,
-                        invalidate_cb=_invalidate_fastdb_value,
+                        buffer=view,
+                        invalidate_cb=output.invalidate,
                     )
-                else:
-                    try:
-                        result = output_fn(mv)
-                        if isinstance(result, memoryview):
-                            result = bytes(result)
-                    finally:
-                        mv.release()
-                        response.release()
-                    if _c2_buffer == 'hold':
-                        return HeldResult(result, None)
-                    return result
+
+                try:
+                    result = output_decoder(view)
+                except BaseException as exc:
+                    _cleanup_preserving_primary(
+                        exc,
+                        lambda: _release_view_and_response(view, response),
+                    )
+                    raise
+                try:
+                    _release_view_and_response(view, response)
+                except BaseException as exc:
+                    if output is not None and output.invalidate is not None:
+                        _cleanup_preserving_primary(
+                            exc,
+                            lambda: output.invalidate(result),
+                        )
+                    raise
+            elif retained_owner:
+                output_hook = "scoped_owner"
+                view = memoryview(response)
+                try:
+                    result = output_decoder(view)
+                except BaseException as exc:
+                    _cleanup_preserving_primary(exc, view.release)
+                    raise
+
+                return HeldResult(
+                    result,
+                    view.release,
+                    buffer=view,
+                    invalidate_cb=output.invalidate,
+                )
             else:
-                if _c2_buffer == 'hold' and output_retains_buffer:
-                    mv = memoryview(response)
-                    try:
-                        result = output_fn(mv)
-                    except Exception as exc:
-                        mv.release()
-                        if output_hook == 'retained_view':
-                            raise error.ClientOutputFromBuffer(str(exc)) from exc
-                        raise
+                result = output_decoder(response)
 
-                    def release_cb():
-                        mv.release()
-
-                    return HeldResult(
-                        result,
-                        release_cb,
-                        buffer=mv,
-                        invalidate_cb=_invalidate_fastdb_value,
-                    )
-                result = output_fn(response)
-                if _c2_buffer == 'hold':
-                    return HeldResult(result, None)
-                return result
+            if _c2_buffer == "hold":
+                return HeldResult(result)
+            return result
 
         except error.CCBaseError:
             raise
-        except Exception as e:
-            if stage == 'serialize_input':
-                raise error.ClientSerializeInput(str(e)) from e
-            elif stage == 'call_crm':
-                raise error.ClientCallResource(str(e)) from e
-            elif stage == 'execute_direct':
-                raise error.ResourceExecuteFunction(str(e)) from e
-            elif output_hook == 'retained_view':
-                raise error.ClientOutputFromBuffer(str(e)) from e
-            else:
-                raise error.ClientDeserializeOutput(str(e)) from e
+        except Exception as exc:
+            details = _cause_details(exc)
+            if stage == "serialize_input":
+                raise error.ClientSerializeInput(str(exc), details=details) from exc
+            if stage == "call_crm":
+                raise error.ClientCallResource(str(exc), details=details) from exc
+            if stage == "execute_direct":
+                raise error.ResourceExecuteFunction(str(exc), details=details) from exc
+            if output_hook == "scoped_owner":
+                raise error.ClientOutputFromBuffer(str(exc), details=details) from exc
+            raise error.ClientDeserializeOutput(str(exc), details=details) from exc
 
     def crm_to_com(
         *args,
@@ -351,396 +332,339 @@ def _build_transfer_wrapper(
         _c2_input_buffer_mode=None,
         _c2_output_allocator=None,
     ):
+        del _c2_output_allocator
         input_buffer_mode = _c2_input_buffer_mode or buffer
-        if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD:
-            if input_buffer_mode == 'borrowed':
-                input_hook = 'retained_view'
-                if input.kind is PayloadPlanKind.FDB and input.view_from_buffer is not None:
-                    input_fn = input.view_from_buffer
-                else:
-                    def input_fn(_request):
-                        raise ValueError(
-                            'borrowed input requires a buffer-view FDB input payload',
-                        )
-            else:
-                input_fn = input.deserialize
-                input_hook = 'deserialize'
-        else:
-            input_fn = None
-            input_hook = None
+        input_decoder = (
+            input.deserialize
+            if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
+            else None
+        )
         output_serializer = (
             output.serialize
             if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
             else None
         )
-        output_prepare_writer = (
-            output.prepare_write
-            if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        output_build_context = (
-            output.build_context
-            if output is not None and output.kind is PayloadPlanKind.FDB
-            else None
-        )
+        input_hook = "deserialize"
+        if input_buffer_mode == "borrowed":
+            input_hook = "scoped_owner"
+            if input is None or not input.supports_scoped_owner:
+                def input_decoder(_request):
+                    raise ValueError(
+                        "borrowed input requires an explicit FastDB Payload binding",
+                    )
 
         err = None
         result = None
-        stage = 'deserialize_input'
-        deserialized_args: tuple[object, ...] = tuple()
-        output_context = None
+        stage = "deserialize_input"
+        deserialized_args: tuple[object, ...] = ()
 
         def release_input_buffer() -> None:
             nonlocal _release_fn
-            if input_buffer_mode == 'borrowed':
-                _invalidate_fastdb_value(deserialized_args)
+            first_error: BaseException | None = None
+            if (
+                input_buffer_mode == "borrowed"
+                and input is not None
+                and input.invalidate is not None
+            ):
+                for value in deserialized_args:
+                    try:
+                        input.invalidate(value)
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
             if _release_fn is not None:
+                release_fn = _release_fn
+                _release_fn = None
                 try:
-                    _release_fn()
-                finally:
-                    _release_fn = None
+                    release_fn()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
 
         try:
             if len(args) < 1:
-                raise ValueError('Instance method requires self, but only get one argument.')
+                raise ValueError(
+                    "Instance method requires self, but no instance was provided.",
+                )
 
             contract = args[0]
-            crm = contract.resource
+            resource = contract.resource
             request = args[1] if len(args) > 1 else None
 
-            if request is not None and input_fn is not None:
-                if input_buffer_mode == 'view':
-                    deserialized_args = input_fn(request)
+            if input_decoder is not None:
+                decoded = input_decoder(request)
+                deserialized_args = decoded if isinstance(decoded, tuple) else (decoded,)
+                if input_buffer_mode != "borrowed":
                     release_input_buffer()
-                else:  # borrowed
-                    deserialized_args = input_fn(request)
             else:
-                deserialized_args = tuple()
+                deserialized_args = ()
                 release_input_buffer()
 
-            if not isinstance(deserialized_args, tuple):
-                deserialized_args = (deserialized_args,)
+            resource_method = getattr(resource, method_name, None)
+            if resource_method is None:
+                raise ValueError(
+                    f'Method "{method_name}" not found on resource class.',
+                )
 
-            crm_method = getattr(crm, method_name, None)
-            if crm_method is None:
-                raise ValueError(f'Method "{method_name}" not found on resource class.')
-
-            if output_build_context is not None and _c2_output_allocator is not None:
-                output_context = output_build_context(_c2_output_allocator)
-                output_context.__enter__()
-
-            stage = 'execute_function'
-            result = crm_method(*deserialized_args)
-            err = None
-
-        except Exception as e:
-            if output_context is not None:
-                try:
-                    output_context.__exit__(type(e), e, e.__traceback__)
-                except Exception:
-                    pass
-                output_context = None
+            stage = "execute_function"
+            result = resource_method(*deserialized_args)
+        except Exception as exc:
             result = None
-            should_release_input = (
-                _release_fn is not None
-                and (
-                    input_buffer_mode in ('view', 'borrowed')
-                    or stage == 'deserialize_input'
-                )
-            )
-            if should_release_input:
+            if _release_fn is not None:
                 try:
                     release_input_buffer()
                 except Exception:
                     pass
-            if stage == 'deserialize_input':
-                if input_hook == 'retained_view':
-                    err = error.ResourceInputFromBuffer(str(e))
+            details = _cause_details(exc)
+            if stage == "deserialize_input":
+                if input_hook == "scoped_owner":
+                    err = error.ResourceInputFromBuffer(
+                        str(exc),
+                        details=details,
+                    )
                 else:
-                    err = error.ResourceDeserializeInput(str(e))
-            elif stage == 'execute_function':
-                err = error.ResourceExecuteFunction(str(e))
+                    err = error.ResourceDeserializeInput(
+                        str(exc),
+                        details=details,
+                    )
+            elif stage == "execute_function":
+                err = error.ResourceExecuteFunction(str(exc), details=details)
             else:
-                err = error.ResourceSerializeOutput(str(e))
+                err = error.ResourceSerializeOutput(str(exc), details=details)
 
-        serialized_result = b''
-        if err is None and result is not None and (output_prepare_writer is not None or output_serializer is not None):
+        serialized_result = b""
+        if err is None and output_serializer is not None:
             try:
-                stage = 'serialize_output'
-                context_prepare_writer = (
-                    getattr(output_context, 'prepare_write', None)
-                    if output_context is not None
-                    else None
+                stage = "serialize_output"
+                serialized_result = output_serializer(result)
+            except Exception as exc:
+                err = error.ResourceSerializeOutput(
+                    str(exc),
+                    details=_cause_details(exc),
                 )
-                if context_prepare_writer is not None:
-                    serialized_result = (
-                        context_prepare_writer(*result) if isinstance(result, tuple)
-                        else context_prepare_writer(result)
-                    )
-                elif output_prepare_writer is not None:
-                    serialized_result = (
-                        output_prepare_writer(*result) if isinstance(result, tuple)
-                        else output_prepare_writer(result)
-                    )
-                else:
-                    serialized_result = (
-                        output_serializer(*result) if isinstance(result, tuple)
-                        else output_serializer(result)
-                    )
-                if output_context is not None:
-                    output_context.__exit__(None, None, None)
-                    output_context = None
-            except Exception as e:
-                if output_context is not None:
-                    try:
-                        output_context.__exit__(type(e), e, e.__traceback__)
-                    except Exception:
-                        pass
-                    output_context = None
-                err = error.ResourceSerializeOutput(str(e))
-                serialized_result = b''
+                serialized_result = b""
 
-        if output_context is not None:
-            try:
-                output_context.__exit__(None, None, None)
-            except Exception:
-                pass
-            output_context = None
-
-        if _release_fn is not None and input_buffer_mode == 'borrowed':
+        if _release_fn is not None:
             try:
                 release_input_buffer()
-            except Exception:
-                pass
+            except Exception as exc:
+                if err is None:
+                    err = error.ResourceInputFromBuffer(
+                        str(exc),
+                        details=_cause_details(exc),
+                    )
+                    serialized_result = b""
 
-        serialized_error = error.CCError.serialize(err)
-        return (serialized_error, serialized_result)
+        return error.CCError.serialize(err), serialized_result
 
     @wraps(func)
     def transfer_wrapper(*args, **kwargs):
         if not args:
-            raise ValueError('No arguments provided to determine direction.')
+            raise ValueError("No arguments provided to determine direction.")
 
         crm = args[0]
-        if not hasattr(crm, 'direction'):
-            raise AttributeError('The CRM instance does not have a "direction" attribute.')
+        if not hasattr(crm, "direction"):
+            raise AttributeError(
+                'The CRM instance does not have a "direction" attribute.',
+            )
 
-        if crm.direction == '->':
-            _c2_buffer = kwargs.pop('_c2_buffer', None)
-            return com_to_crm(*args, _c2_buffer=_c2_buffer)
-        elif crm.direction == '<-':
+        if crm.direction == "->":
+            c2_buffer = kwargs.pop("_c2_buffer", None)
+            bound = method_signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            if bound.kwargs:
+                names = ", ".join(sorted(bound.kwargs))
+                raise TypeError(
+                    f"{method_name} cannot transport keyword-only arguments: "
+                    f"{names}.",
+                )
+            return com_to_crm(
+                *bound.args,
+                _c2_buffer=c2_buffer,
+            )
+        if crm.direction == "<-":
             return crm_to_com(*args, **kwargs)
-        else:
-            raise ValueError(f'Invalid direction value: {crm.direction}. Expected "->" or "<-".')
+        raise ValueError(
+            f"Invalid direction value: {crm.direction}. Expected '->' or '<-'.",
+        )
 
     transfer_wrapper._input_buffer_mode = buffer
     transfer_wrapper._input_payload_binding = input
     transfer_wrapper._output_payload_binding = output
-    transfer_wrapper._payload_abi_context = dict(payload_abi_context or {})
     return transfer_wrapper
 
-def auto_transfer(func=None, *, input=None, output=None, buffer=None, payload_abi_context=None):
-    """Auto-wrap a CRM method with FDB/pickle/no-payload planning."""
-    if input is not None or output is not None:
-        raise TypeError(
-            '@cc.transfer input/output codec overrides were removed; '
-            'use FDB annotations for portable CRM payloads or rely on '
-            'Python pickle fallback for Python-only methods.',
-        )
-    if buffer == 'hold':
+
+def auto_transfer(func=None, *, input=None, output=None, buffer=None):
+    """Wrap a CRM method with explicit FastDB, pickle, or no-payload bindings."""
+
+    if buffer == "hold":
         raise ValueError(
-            "server-side borrowed input is controlled by "
+            "server-side scoped input is controlled by "
             "cc.register(..., input_lifetime=...), not buffer='hold'",
         )
     if buffer is not None and buffer not in _VALID_TRANSFER_BUFFERS:
         raise ValueError(
-            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, got {buffer!r}",
+            f"buffer must be None or one of {sorted(_VALID_TRANSFER_BUFFERS)}, "
+            f"got {buffer!r}",
         )
 
-    def create_wrapper(func):
-        base_payload_abi_context = dict(payload_abi_context or {})
-        base_payload_abi_context.setdefault('method_name', func.__name__)
+    def create_wrapper(target):
+        parameters = _rpc_parameters(target)
+        hints = _resolved_hints(target)
+        payload_type = _payload_type()
 
-        func_params = _extract_func_params(func)
-        is_empty_input = len(func_params) == 0
-        input_binding: PayloadBinding = no_payload_binding()
-        input_method_payload_abi_aggregate = False
-        if not is_empty_input:
-            shape = _method_payload_abi_shape(
-                base_payload_abi_context,
-                func,
-                'input',
-                parameters=func_params,
-            )
-            resolution_context = _payload_abi_resolution_context(
-                base_payload_abi_context,
-                func,
-                'input',
-            )
-            resolved_input = _resolve_fastdb_method_payload_abi(shape, resolution_context)
-            if resolved_input is not None:
-                input_binding = resolved_input
-                input_method_payload_abi_aggregate = True
-            else:
-                input_binding = python_pickle_input_binding(func)
-
-        try:
-            type_hints = get_type_hints(func)
-        except (NameError, ValueError, TypeError):
-            type_hints = {}
-
-        output_binding: PayloadBinding = no_payload_binding()
-        output_method_payload_abi_aggregate = False
-        if 'return' in type_hints:
-            return_type = type_hints['return']
-            if return_type is None or return_type is type(None):
-                output_binding = no_payload_binding()
-            else:
-                shape = _method_payload_abi_shape(
-                    base_payload_abi_context,
-                    func,
-                    'output',
-                    return_annotation=return_type,
+        if input is not None:
+            if len(parameters) != 1:
+                raise TypeError(
+                    f"{target.__name__} input binding requires exactly one "
+                    "fastdb4py.payload.Payload parameter.",
                 )
-                resolution_context = _payload_abi_resolution_context(
-                    base_payload_abi_context,
-                    func,
-                    'output',
+            parameter = parameters[0]
+            if parameter.kind not in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }:
+                raise TypeError(
+                    f"{target.__name__}.{parameter.name} must be positional "
+                    "for a portable Payload binding.",
                 )
-                resolved_output = _resolve_fastdb_method_payload_abi(shape, resolution_context)
-                if resolved_output is not None:
-                    output_binding = resolved_output
-                    output_method_payload_abi_aggregate = True
-                else:
-                    output_binding = python_pickle_output_binding(func)
+            if hints.get(parameter.name) is not payload_type:
+                raise TypeError(
+                    f"{target.__name__}.{parameter.name} must be annotated as "
+                    "fastdb4py.payload.Payload for an explicit input binding.",
+                )
+            if parameter.default is not inspect.Parameter.empty:
+                raise TypeError(
+                    f"{target.__name__}.{parameter.name} cannot define a default "
+                    "for a portable Payload binding.",
+                )
+            input_binding = fastdb_payload_binding(
+                input,
+                label=f"{target.__name__}.input",
+            )
+        elif not parameters:
+            input_binding = no_payload_binding()
+        else:
+            if any(hints.get(parameter.name) is payload_type for parameter in parameters):
+                raise TypeError(
+                    f"{target.__name__} uses fastdb4py.payload.Payload input "
+                    "without @cc.transfer(input=...).",
+                )
+            input_binding = python_pickle_input_binding(target)
 
-        effective_buffer = buffer or 'view'
+        return_annotation = hints.get("return", inspect.Signature.empty)
+        if output is not None:
+            if return_annotation is not payload_type:
+                raise TypeError(
+                    f"{target.__name__} must return "
+                    "fastdb4py.payload.Payload for an explicit output binding.",
+                )
+            output_binding = fastdb_payload_binding(
+                output,
+                label=f"{target.__name__}.output",
+            )
+        elif return_annotation in (None, type(None), inspect.Signature.empty):
+            output_binding = no_payload_binding()
+        else:
+            if return_annotation is payload_type:
+                raise TypeError(
+                    f"{target.__name__} returns fastdb4py.payload.Payload "
+                    "without @cc.transfer(output=...).",
+                )
+            output_binding = python_pickle_output_binding(target)
 
-        wrapped_func = _build_transfer_wrapper(
-            func,
+        return _build_transfer_wrapper(
+            target,
             input=input_binding,
             output=output_binding,
-            buffer=effective_buffer,
-            payload_abi_context=base_payload_abi_context,
+            buffer=buffer or "view",
         )
-        wrapped_func._input_method_payload_abi_aggregate = input_method_payload_abi_aggregate
-        wrapped_func._output_method_payload_abi_aggregate = output_method_payload_abi_aggregate
-        return wrapped_func
 
     if func is None:
         return create_wrapper
-    else:
-        if not callable(func):
-            raise TypeError("@auto_transfer requires a callable function or parentheses.")
-        return create_wrapper(func)
+    if not callable(func):
+        raise TypeError("@auto_transfer requires a callable or parentheses.")
+    return create_wrapper(func)
 
-# Helpers #########################################################################
 
-def _resolve_fastdb_method_payload_abi(
-    shape: MethodPayloadAbiShape,
-    context: dict[str, Any],
-) -> PayloadBinding | None:
+def _rpc_parameters(func: Callable[..., object]) -> list[inspect.Parameter]:
     try:
-        from c_two.fastdb.call_db import resolve_method_payload_abi
-    except ImportError:
-        return None
-    binding = resolve_method_payload_abi(shape, context)
-    if binding is None:
-        return None
-    if not isinstance(binding, PayloadBinding):
-        raise TypeError('FastDB method payload ABI resolver returned a non-PayloadBinding value.')
-    return binding
-
-
-def _payload_abi_resolution_context(
-    base_context: dict[str, Any],
-    func: Callable,
-    position: str,
-) -> dict[str, Any]:
-    context = dict(base_context)
-    context['function'] = func
-    context['position'] = position
-    context.setdefault('method_name', func.__name__)
-    return context
-
-
-def _method_payload_abi_shape(
-    base_context: dict[str, Any],
-    func: Callable,
-    direction: str,
-    *,
-    parameters: list[tuple[str, type, Any]] | None = None,
-    return_annotation: object | None = None,
-) -> MethodPayloadAbiShape:
-    return MethodPayloadAbiShape(
-        method_name=str(base_context.get('method_name') or func.__name__),
-        direction=direction,
-        crm_namespace=base_context.get('crm_namespace'),
-        crm_name=base_context.get('crm_name'),
-        crm_version=base_context.get('crm_version'),
-        parameters=(
-            _extract_method_parameter_shapes(func)
-            if parameters is not None
-            else ()
-        ),
-        return_annotation=return_annotation,
-    )
-
-
-def _extract_method_parameter_shapes(
-    func: Callable,
-) -> tuple[MethodParameterShape, ...]:
-    try:
-        sig = inspect.signature(func)
-    except (ValueError, TypeError):
-        return ()
-    try:
-        type_hints = get_type_hints(func)
-    except (NameError, ValueError, TypeError):
-        type_hints = {}
-
-    shapes = []
-    for index, (name, param) in enumerate(sig.parameters.items()):
-        if index == 0 and name in ('self', 'cls'):
-            continue
-        annotation = type_hints.get(name, param.annotation)
-        if annotation is inspect.Parameter.empty:
-            annotation = Any
-        shapes.append(
-            MethodParameterShape(
-                name=name,
-                annotation=annotation,
-                default=param.default,
-                kind=param.kind.name,
-            )
-        )
-    return tuple(shapes)
-
-
-def _extract_func_params(func: Callable) -> list[tuple[str, type, Any]]:
-    """
-    Extract input parameters from a function signature using pure inspect.
-
-    Returns a list of (name, annotation, default) tuples, skipping 'self'/'cls'.
-    Returns an empty list if the function has no parameters (beyond self/cls)
-    or if the signature cannot be determined.
-    """
-    try:
-        sig = inspect.signature(func)
-    except (ValueError, TypeError):
+        parameters = list(inspect.signature(func).parameters.values())
+    except (TypeError, ValueError):
         return []
-    try:
-        type_hints = get_type_hints(func)
-    except (NameError, ValueError, TypeError):
-        type_hints = {}
+    if parameters and parameters[0].name in {"self", "cls"}:
+        parameters = parameters[1:]
+    return parameters
 
-    params = []
-    for i, (name, param) in enumerate(sig.parameters.items()):
-        if i == 0 and name in ('self', 'cls'):
-            continue
-        annotation = type_hints.get(name, param.annotation)
-        if annotation is inspect.Parameter.empty:
-            annotation = Any
-        default = param.default if param.default is not inspect.Parameter.empty else ...
-        params.append((name, annotation, default))
-    return params
+
+def _resolved_hints(func: Callable[..., object]) -> dict[str, Any]:
+    try:
+        return get_type_hints(func, include_extras=True)
+    except (NameError, TypeError, ValueError):
+        return dict(getattr(func, "__annotations__", {}))
+
+
+def _payload_type():
+    from fastdb4py.payload import Payload
+
+    return Payload
+
+
+def _release_response(response: object) -> None:
+    release = getattr(response, "release", None)
+    if callable(release):
+        release()
+
+
+def _release_view_and_response(view: memoryview, response: object) -> None:
+    first_error: BaseException | None = None
+    try:
+        view.release()
+    except BaseException as exc:
+        first_error = exc
+    try:
+        _release_response(response)
+    except BaseException as exc:
+        if first_error is None:
+            first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def _cleanup_preserving_primary(
+    primary: BaseException,
+    cleanup: Callable[[], None],
+) -> None:
+    try:
+        cleanup()
+    except BaseException as cleanup_error:
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            add_note(
+                "C-Two cleanup also failed with "
+                f"{type(cleanup_error).__name__}: {cleanup_error}",
+            )
+
+
+def _cause_details(exc: BaseException) -> dict[str, str]:
+    from fastdb4py.payload import PayloadError
+
+    if not isinstance(exc, PayloadError):
+        return {}
+
+    fields: dict[str, str] = {}
+    for source, target in (
+        ("code", "fastdb_code"),
+        ("symbol", "fastdb_symbol"),
+        ("path", "fastdb_path"),
+        ("message", "fastdb_message"),
+        ("details_json", "fastdb_details_json"),
+    ):
+        value = getattr(exc, source, None)
+        if value is not None:
+            fields[target] = str(value)
+    if fields:
+        fields["cause_owner"] = "fastdb"
+    return fields

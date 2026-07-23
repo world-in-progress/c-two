@@ -78,16 +78,9 @@ def test_python_codegen_non_fastdb_errors_have_explicit_empty_cause_fields() -> 
     assert "unsupported contract codegen target" in error.message
 
 
-def test_generated_python_project_imports_with_fastdb_source(
+def test_generated_python_project_imports_with_installed_fastdb_projection(
     tmp_path: Path,
 ) -> None:
-    repository = Path(__file__).parents[4]
-    fastdb = repository.parent / "fastdb"
-    python = fastdb / ".venv" / "bin" / "python"
-    fastdb_source = fastdb / "python"
-    if not python.is_file() or not (fastdb_source / "fastdb4py" / "payload").is_dir():
-        pytest.skip("sibling FastDB Python source environment is unavailable")
-
     generated = cc.compile_contract_artifacts(FIXTURE.read_bytes(), target="python")
     for artifact in generated.artifacts:
         output = tmp_path / artifact.relative_path
@@ -96,12 +89,10 @@ def test_generated_python_project_imports_with_fastdb_source(
 
     generated_source = tmp_path / "python"
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = os.pathsep.join(
-        [str(fastdb_source), str(generated_source)]
-    )
+    environment["PYTHONPATH"] = str(generated_source)
     completed = subprocess.run(
         [
-            str(python),
+            sys.executable,
             "-c",
             (
                 "import c_two_contract as contract; "

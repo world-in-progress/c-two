@@ -16,9 +16,10 @@ def _contract_hashes(crm_class: type) -> tuple[str, str]:
     return build_contract_fingerprints(crm_class)
 
 
-def test_top_level_custom_transferable_api_is_removed():
+def test_top_level_exposes_only_explicit_transfer_api():
     assert not hasattr(cc, 'transferable')
-    assert not hasattr(cc, 'transfer')
+    assert callable(cc.transfer)
+    assert 'transfer' in cc.__all__
 
 
 def test_default_transferables_use_pinned_pickle_protocol(monkeypatch):
@@ -49,7 +50,7 @@ def test_default_transferables_use_pinned_pickle_protocol(monkeypatch):
     assert protocols == [DEFAULT_PICKLE_PROTOCOL, DEFAULT_PICKLE_PROTOCOL]
 
 
-def test_transfer_input_output_codec_overrides_are_removed_from_crm_planning():
+def test_transfer_rejects_arbitrary_custom_codec_types():
     from c_two.crm.transferable import transfer
 
     class StablePayload:
@@ -61,7 +62,7 @@ def test_transfer_input_output_codec_overrides_are_removed_from_crm_planning():
         def deserialize(data: bytes) -> 'StablePayload':
             return StablePayload(int(data))
 
-    with pytest.raises(TypeError, match='codec overrides were removed'):
+    with pytest.raises(TypeError, match='fastdb4py.payload.Payload'):
         @cc.crm(namespace='test.descriptor', version='0.1.0')
         class StableContract:
             @transfer(input=StablePayload, output=StablePayload)

@@ -124,4 +124,7 @@ def _stub_from_method(source: Any, crm_name: str, method_name: str) -> Any:
     _stub.__signature__ = sig
     if hasattr(source, _METHOD_ACCESS_ATTR):
         setattr(_stub, _METHOD_ACCESS_ATTR, getattr(source, _METHOD_ACCESS_ATTR))
+    transfer_config = getattr(source, '__cc_transfer__', None)
+    if transfer_config is not None:
+        setattr(_stub, '__cc_transfer__', dict(transfer_config))
     return _stub

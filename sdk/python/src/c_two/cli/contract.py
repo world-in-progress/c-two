@@ -9,7 +9,6 @@ from typing import Sequence
 
 from c_two.crm.descriptor import (
     contract_descriptor_diagnostics,
-    export_contract_payload_abi_artifacts,
     export_contract_descriptor,
 )
 from c_two.crm.infer import infer_crm_from_resource
@@ -19,15 +18,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == 'artifacts':
-            contract = _load_contract(args.target)
-            payload = export_contract_payload_abi_artifacts(
-                contract,
-                methods=args.method or None,
-                pretty=args.pretty,
-            )
-            _write_payload(payload, args.out)
-            return 0
         if args.command == 'diagnose':
             contract = _load_contract(args.target)
             payload = json_payload(
@@ -57,13 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 name=args.name,
                 methods=args.method,
             )
-            if args.artifacts:
-                payload = export_contract_payload_abi_artifacts(
-                    contract,
-                    methods=args.method,
-                    pretty=args.pretty,
-                )
-            elif args.diagnose:
+            if args.diagnose:
                 payload = json_payload(
                     contract_descriptor_diagnostics(
                         contract,
@@ -89,11 +73,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='python -m c_two.cli.contract')
     subparsers = parser.add_subparsers(dest='command', required=True)
-    artifacts = subparsers.add_parser('artifacts')
-    artifacts.add_argument('target', help='Python CRM class target as module:ClassName')
-    artifacts.add_argument('--method', action='append', default=[], help='Limit artifacts to one CRM method; repeatable')
-    artifacts.add_argument('--out', help='Write payload ABI artifact JSON to this file instead of stdout')
-    artifacts.add_argument('--pretty', action='store_true', help='Pretty-print payload ABI artifact JSON')
     diagnose = subparsers.add_parser('diagnose')
     diagnose.add_argument('target', help='Python CRM class target as module:ClassName')
     diagnose.add_argument('--method', action='append', default=[], help='Limit diagnostics to one CRM method; repeatable')
@@ -110,11 +89,9 @@ def _parser() -> argparse.ArgumentParser:
     infer.add_argument('--version', required=True, help='CRM version for the inferred projection')
     infer.add_argument('--name', help='CRM class name for the inferred projection')
     infer.add_argument('--method', action='append', required=True, help='Public resource method to expose; repeatable')
-    infer_mode = infer.add_mutually_exclusive_group()
-    infer_mode.add_argument('--diagnose', action='store_true', help='Write portability diagnostics for the inferred projection instead of exporting a portable descriptor')
-    infer_mode.add_argument('--artifacts', action='store_true', help='Write payload ABI artifacts for the inferred projection instead of exporting a portable descriptor')
-    infer.add_argument('--out', help='Write descriptor, diagnostics, or payload ABI artifact JSON to this file instead of stdout')
-    infer.add_argument('--pretty', action='store_true', help='Pretty-print descriptor, diagnostics, or payload ABI artifact JSON')
+    infer.add_argument('--diagnose', action='store_true', help='Write portability diagnostics for the inferred projection instead of exporting a portable descriptor')
+    infer.add_argument('--out', help='Write descriptor or diagnostics JSON to this file instead of stdout')
+    infer.add_argument('--pretty', action='store_true', help='Pretty-print descriptor or diagnostics JSON')
     return parser
 
 

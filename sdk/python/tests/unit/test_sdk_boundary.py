@@ -139,20 +139,17 @@ def test_top_level_exposes_contract_projection_tools():
     import c_two as cc
     from c_two.crm.descriptor import (
         contract_descriptor_diagnostics,
-        export_contract_payload_abi_artifacts,
         export_contract_descriptor,
         export_contract_release_ref,
     )
     from c_two.crm.infer import infer_crm_from_resource
 
     assert cc.contract_descriptor_diagnostics is contract_descriptor_diagnostics
-    assert cc.export_contract_payload_abi_artifacts is export_contract_payload_abi_artifacts
     assert cc.export_contract_descriptor is export_contract_descriptor
     assert cc.export_contract_release_ref is export_contract_release_ref
     assert cc.infer_crm_from_resource is infer_crm_from_resource
     assert {
         'contract_descriptor_diagnostics',
-        'export_contract_payload_abi_artifacts',
         'export_contract_descriptor',
         'export_contract_release_ref',
         'infer_crm_from_resource',
