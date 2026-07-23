@@ -104,7 +104,11 @@ name = "c2-codegen"
 version = "0.1.0"
 dependencies = [
  "c2-contract",
+ "fastdb",
+ "rustix",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -340,6 +344,17 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "fastdb"
+version = "0.1.22"
+dependencies = [
+ "fastdb-sys",
+]
+
+[[package]]
+name = "fastdb-sys"
+version = "0.1.22"
 
 [[package]]
 name = "fastrand"

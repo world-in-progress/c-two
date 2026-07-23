@@ -202,7 +202,7 @@ For every ordered input/output binding, `c2-codegen`:
 
 1. reads the `NestedFastDbSpec` canonical JSON bytes;
 2. calls `fastdb::CompiledSpec::compile(...)`;
-3. reads Core canonical JSON, SHA-256, profile/capabilities, and manifest;
+3. reads Core canonical JSON, SHA-256, capabilities, and manifest; the Core-owned canonical JSON/manifest carry the profile without a C-Two name mapping;
 4. invokes Core codegen for the selected target;
 5. copies each owned artifact out of the Core `ArtifactSet`;
 6. verifies the artifact SHA-256 against the returned bytes;
@@ -248,9 +248,14 @@ Every artifact path must:
 - contain no backslash, NUL, control character, drive prefix, URI prefix, or leading slash;
 - use portable ASCII segment characters `[A-Za-z0-9._-]`;
 - avoid Windows reserved device names and trailing dot/space;
+- avoid full-path and file/directory-prefix collisions after ASCII case folding;
 - remain within the documented per-segment and total byte limits.
 
 The composer rejects duplicate paths even if bytes are identical. It also rejects file/directory prefix conflicts such as `a` with `a/b`, and it recomputes every SHA-256 before accepting the record. Final artifacts are sorted lexicographically by normalized path.
+
+Paths are limited to 1,024 bytes and individual segments to 255 bytes. Provenance owner/source fields are limited to 1,024 UTF-8 bytes each. The default final-set admission limit is 4,096 regular-file artifacts and 256 MiB of aggregate artifact bytes; Rust callers may choose stricter limits. FastDB Core codegen retains its own independently enforced options and limits.
+
+The current artifact model publishes regular files only. `kind` describes artifact content; it does not carry executable bits, ownership, extended attributes, hard links, or symbolic links.
 
 ### 8.3 Deterministic layout
 
@@ -284,6 +289,8 @@ The library publishes a complete artifact set into a newly created destination t
 6. remove staging state on failure.
 
 The first slice intentionally does not merge into an existing source tree. Incremental merge would permit stale files, partial updates, and symlink traversal unless it also owns a prior manifest and rollback protocol. Higher-level project generators can compose all concerns into a fresh tree and then decide how to adopt it. Existing-tree replacement remains an Issue with explicit exit criteria rather than an unsafe shortcut.
+
+This is an atomic-visibility guarantee under a stable caller-controlled parent directory, not a crash-durability or hostile-parent-filesystem claim. Files are synchronized before the final no-replace rename, but the first slice does not synchronize every created directory and the destination parent, nor does it defend against another actor replacing parent path components during publication. Those stronger filesystem guarantees remain explicit Issue work.
 
 ## 9. Codegen and SDK Surfaces
 
