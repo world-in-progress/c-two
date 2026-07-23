@@ -70,7 +70,19 @@ fn delegates_nested_specs_to_core_and_deduplicates_by_core_identity() {
         .map(|artifact| artifact.relative_path())
         .collect::<Vec<_>>();
     assert_eq!(payload_paths.len(), 1);
-    assert_eq!(set.artifacts().len(), 4);
+    assert_eq!(
+        set.artifacts()
+            .iter()
+            .map(|artifact| artifact.relative_path())
+            .collect::<Vec<_>>(),
+        vec![
+            "metadata/composition-manifest.json",
+            "metadata/contract-release-ref.json",
+            "metadata/contract.json",
+            "rust/c_two_contract.rs",
+            payload_paths[0],
+        ],
+    );
     for artifact in set.artifacts() {
         assert_eq!(artifact.sha256(), &digest(artifact.bytes()));
     }
@@ -105,7 +117,7 @@ fn all_supported_targets_use_their_own_deterministic_payload_subtree() {
 }
 
 #[test]
-fn no_payload_contract_produces_only_owner_metadata() {
+fn no_payload_contract_produces_metadata_and_a_real_target_module() {
     let mut value: serde_json::Value = serde_json::from_str(DESCRIPTOR).unwrap();
     value["methods"].as_array_mut().unwrap().truncate(1);
     let fingerprints =
@@ -121,7 +133,18 @@ fn no_payload_contract_produces_only_owner_metadata() {
         &ContractCodegenOptions::default(),
     )
     .unwrap();
-    assert_eq!(set.artifacts().len(), 3);
+    assert_eq!(
+        set.artifacts()
+            .iter()
+            .map(|artifact| artifact.relative_path())
+            .collect::<Vec<_>>(),
+        vec![
+            "metadata/composition-manifest.json",
+            "metadata/contract-release-ref.json",
+            "metadata/contract.json",
+            "rust/c_two_contract.rs",
+        ],
+    );
     let manifest: serde_json::Value = serde_json::from_slice(
         set.get("metadata/composition-manifest.json")
             .unwrap()

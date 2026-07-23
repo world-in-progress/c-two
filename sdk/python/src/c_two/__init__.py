@@ -4,6 +4,13 @@ __version__ = version('c-two')
 
 from . import error
 from .config import BaseIPCOverrides, ClientIPCOverrides, ServerIPCOverrides
+from .codegen import (
+    ContractArtifact,
+    ContractArtifactSet,
+    ContractCodegenError,
+    ContractCodegenTarget,
+    compile_contract_artifacts,
+)
 from .crm.bridge import ResourceBridge, bridge
 from .crm.descriptor import (
     contract_descriptor_diagnostics,
@@ -39,6 +46,11 @@ __all__ = [
     'BaseIPCOverrides',
     'ClientIPCOverrides',
     'ServerIPCOverrides',
+    'ContractArtifact',
+    'ContractArtifactSet',
+    'ContractCodegenError',
+    'ContractCodegenTarget',
+    'compile_contract_artifacts',
     'ResourceBridge',
     'bridge',
     'contract_descriptor_diagnostics',

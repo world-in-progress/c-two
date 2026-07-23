@@ -1,9 +1,10 @@
 use crate::{
     ArtifactComposer, ArtifactKind, ArtifactLimits, ArtifactProvenance, CodegenError,
     ContractArtifact, ContractArtifactSet, fastdb_error, lower_hex,
+    targets::{TargetMethod, render_target_artifacts},
 };
 use c2_contract::{
-    BindingDirection, ContractRelease, NestedFastDbSpec, ValidatedContractDescriptor,
+    BindingDirection, ContractRelease, MethodAccess, NestedFastDbSpec, ValidatedContractDescriptor,
 };
 use fastdb::{
     ArtifactKind as FastDbArtifactKind, Capabilities, CodegenOptions as FastDbCodegenOptions,
@@ -65,6 +66,14 @@ struct PayloadFact {
     artifacts: Vec<PayloadArtifactFact>,
 }
 
+struct MethodFact {
+    index: usize,
+    name: String,
+    access: MethodAccess,
+    input_sha256: Option<String>,
+    output_sha256: Option<String>,
+}
+
 pub fn compile_contract_artifacts(
     descriptor_json: &[u8],
     target: ContractCodegenTarget,
@@ -74,107 +83,70 @@ pub fn compile_contract_artifacts(
     let release = ContractRelease::from_descriptor_json(descriptor_json)?;
     let release_ref_json = release.reference().to_canonical_json()?;
     let mut bindings = Vec::new();
+    let mut methods = Vec::new();
     let mut payloads = BTreeMap::<String, PayloadFact>::new();
     let mut payload_artifacts = Vec::new();
 
-    for method in descriptor.methods() {
-        for nested in [method.input(), method.output()].into_iter().flatten() {
-            let compiled = compile_nested(nested)?;
-            let digest = compiled
-                .sha256()
-                .map_err(|error| fastdb_error(nested.outer_path(), error))?;
-            let digest_hex = lower_hex(&digest);
-            let canonical_json = compiled
-                .canonical_json()
-                .map_err(|error| fastdb_error(nested.outer_path(), error))?;
-            let calculated: [u8; 32] = Sha256::digest(&canonical_json).into();
-            if calculated != digest {
-                return Err(CodegenError::FastDbCanonicalDigestMismatch {
-                    binding_path: nested.outer_path().to_string(),
-                    expected: digest_hex,
-                    actual: lower_hex(&calculated),
-                });
-            }
-            let manifest_json = compiled
-                .manifest_json()
-                .map_err(|error| fastdb_error(nested.outer_path(), error))?;
-            let capabilities = compiled
-                .capabilities()
-                .map_err(|error| fastdb_error(nested.outer_path(), error))?;
-
+    for (index, method) in descriptor.methods().iter().enumerate() {
+        let input_sha256 = method
+            .input()
+            .map(|nested| {
+                compile_binding(
+                    nested,
+                    target,
+                    options,
+                    &mut payloads,
+                    &mut payload_artifacts,
+                )
+            })
+            .transpose()?;
+        if let (Some(nested), Some(digest)) = (method.input(), input_sha256.as_ref()) {
             bindings.push(BindingFact {
                 outer_path: nested.outer_path().to_string(),
                 direction: nested.direction(),
-                fastdb_sha256: digest_hex.clone(),
+                fastdb_sha256: digest.clone(),
             });
-
-            if let Some(existing) = payloads.get(&digest_hex) {
-                if existing.canonical_json != canonical_json
-                    || existing.manifest_json != manifest_json
-                    || existing.capabilities != capabilities
-                {
-                    return Err(CodegenError::FastDbIdentityConflict {
-                        sha256: digest_hex,
-                        first_binding_path: existing.first_binding_path.clone(),
-                        second_binding_path: nested.outer_path().to_string(),
-                    });
-                }
-                continue;
-            }
-
-            let generated = compiled
-                .generate(target.fastdb_target(), &options.fastdb_codegen)
-                .map_err(|error| fastdb_error(nested.outer_path(), error))?;
-            let count = generated
-                .len()
-                .map_err(|error| fastdb_error(nested.outer_path(), error))?;
-            let mut artifact_facts = Vec::new();
-            for index in 0..count {
-                let artifact = generated
-                    .artifact(index)
-                    .map_err(|error| fastdb_error(nested.outer_path(), error))?;
-                let kind = match artifact.kind {
-                    FastDbArtifactKind::Source => ArtifactKind::Source,
-                };
-                let final_path = format!(
-                    "{}/payloads/{}/{}",
-                    target.as_str(),
-                    digest_hex,
-                    artifact.relative_path
-                );
-                let provenance = ArtifactProvenance::new(
-                    "fastdb-core",
-                    format!("{}#{digest_hex}", nested.outer_path()),
-                )?;
-                let composed = ContractArtifact::from_claimed_parts(
-                    final_path.clone(),
-                    kind,
-                    artifact.bytes,
-                    artifact.sha256,
-                    provenance,
-                )?;
-                artifact_facts.push(PayloadArtifactFact {
-                    final_path,
-                    core_path: artifact.relative_path,
-                    kind,
-                    sha256: composed.sha256_hex(),
-                });
-                payload_artifacts.push(composed);
-            }
-            artifact_facts.sort_unstable_by(|left, right| left.final_path.cmp(&right.final_path));
-            payloads.insert(
-                digest_hex,
-                PayloadFact {
-                    first_binding_path: nested.outer_path().to_string(),
-                    canonical_json,
-                    manifest_json,
-                    capabilities,
-                    artifacts: artifact_facts,
-                },
-            );
         }
+
+        let output_sha256 = method
+            .output()
+            .map(|nested| {
+                compile_binding(
+                    nested,
+                    target,
+                    options,
+                    &mut payloads,
+                    &mut payload_artifacts,
+                )
+            })
+            .transpose()?;
+        if let (Some(nested), Some(digest)) = (method.output(), output_sha256.as_ref()) {
+            bindings.push(BindingFact {
+                outer_path: nested.outer_path().to_string(),
+                direction: nested.direction(),
+                fastdb_sha256: digest.clone(),
+            });
+        }
+        methods.push(MethodFact {
+            index,
+            name: method.name().to_string(),
+            access: method.access(),
+            input_sha256,
+            output_sha256,
+        });
     }
 
+    let target_methods = methods
+        .iter()
+        .map(|method| TargetMethod {
+            index: method.index,
+            name: &method.name,
+            access: method.access,
+            input_sha256: method.input_sha256.as_deref(),
+            output_sha256: method.output_sha256.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    let target_artifacts = render_target_artifacts(target, &descriptor, &target_methods)?;
     let contract_artifact = ContractArtifact::new(
         "metadata/contract.json",
         ArtifactKind::Metadata,
@@ -198,9 +170,107 @@ pub fn compile_contract_artifacts(
     let mut composer = ArtifactComposer::new(options.artifact_limits);
     composer.push(contract_artifact);
     composer.push(release_ref_artifact);
+    composer.extend(target_artifacts);
     composer.extend(payload_artifacts);
     composer.push(manifest_artifact);
     composer.finish()
+}
+
+fn compile_binding(
+    nested: &NestedFastDbSpec,
+    target: ContractCodegenTarget,
+    options: &ContractCodegenOptions,
+    payloads: &mut BTreeMap<String, PayloadFact>,
+    payload_artifacts: &mut Vec<ContractArtifact>,
+) -> Result<String, CodegenError> {
+    let compiled = compile_nested(nested)?;
+    let digest = compiled
+        .sha256()
+        .map_err(|error| fastdb_error(nested.outer_path(), error))?;
+    let digest_hex = lower_hex(&digest);
+    let canonical_json = compiled
+        .canonical_json()
+        .map_err(|error| fastdb_error(nested.outer_path(), error))?;
+    let calculated: [u8; 32] = Sha256::digest(&canonical_json).into();
+    if calculated != digest {
+        return Err(CodegenError::FastDbCanonicalDigestMismatch {
+            binding_path: nested.outer_path().to_string(),
+            expected: digest_hex,
+            actual: lower_hex(&calculated),
+        });
+    }
+    let manifest_json = compiled
+        .manifest_json()
+        .map_err(|error| fastdb_error(nested.outer_path(), error))?;
+    let capabilities = compiled
+        .capabilities()
+        .map_err(|error| fastdb_error(nested.outer_path(), error))?;
+
+    if let Some(existing) = payloads.get(&digest_hex) {
+        if existing.canonical_json != canonical_json
+            || existing.manifest_json != manifest_json
+            || existing.capabilities != capabilities
+        {
+            return Err(CodegenError::FastDbIdentityConflict {
+                sha256: digest_hex,
+                first_binding_path: existing.first_binding_path.clone(),
+                second_binding_path: nested.outer_path().to_string(),
+            });
+        }
+        return Ok(digest_hex);
+    }
+
+    let generated = compiled
+        .generate(target.fastdb_target(), &options.fastdb_codegen)
+        .map_err(|error| fastdb_error(nested.outer_path(), error))?;
+    let count = generated
+        .len()
+        .map_err(|error| fastdb_error(nested.outer_path(), error))?;
+    let mut artifact_facts = Vec::new();
+    for index in 0..count {
+        let artifact = generated
+            .artifact(index)
+            .map_err(|error| fastdb_error(nested.outer_path(), error))?;
+        let kind = match artifact.kind {
+            FastDbArtifactKind::Source => ArtifactKind::Source,
+        };
+        let final_path = format!(
+            "{}/payloads/{}/{}",
+            target.as_str(),
+            digest_hex,
+            artifact.relative_path
+        );
+        let provenance = ArtifactProvenance::new(
+            "fastdb-core",
+            format!("{}#{digest_hex}", nested.outer_path()),
+        )?;
+        let composed = ContractArtifact::from_claimed_parts(
+            final_path.clone(),
+            kind,
+            artifact.bytes,
+            artifact.sha256,
+            provenance,
+        )?;
+        artifact_facts.push(PayloadArtifactFact {
+            final_path,
+            core_path: artifact.relative_path,
+            kind,
+            sha256: composed.sha256_hex(),
+        });
+        payload_artifacts.push(composed);
+    }
+    artifact_facts.sort_unstable_by(|left, right| left.final_path.cmp(&right.final_path));
+    payloads.insert(
+        digest_hex.clone(),
+        PayloadFact {
+            first_binding_path: nested.outer_path().to_string(),
+            canonical_json,
+            manifest_json,
+            capabilities,
+            artifacts: artifact_facts,
+        },
+    );
+    Ok(digest_hex)
 }
 
 fn compile_nested(nested: &NestedFastDbSpec) -> Result<CompiledSpec, CodegenError> {

@@ -2,17 +2,14 @@
 
 mod artifact;
 mod compile;
-mod legacy_typescript;
 mod publish;
+mod targets;
 
 pub use artifact::{
     ArtifactComposer, ArtifactKind, ArtifactLimits, ArtifactProvenance, ContractArtifact,
     ContractArtifactSet,
 };
 pub use compile::{ContractCodegenOptions, ContractCodegenTarget, compile_contract_artifacts};
-pub use legacy_typescript::{
-    CodegenError as LegacyTypeScriptCodegenError, TypeScriptOptions, generate_typescript_client,
-};
 
 use std::path::PathBuf;
 use thiserror::Error;

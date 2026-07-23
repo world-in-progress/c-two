@@ -14,6 +14,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 c2-config = { path = "../../../core/foundation/c2-config" }
+c2-codegen = { path = "../../../core/foundation/c2-codegen" }
 c2-contract = { path = "../../../core/foundation/c2-contract" }
 c2-error = { path = "../../../core/foundation/c2-error" }
 c2-mem = { path = "../../../core/foundation/c2-mem" }

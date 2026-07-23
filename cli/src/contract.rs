@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 #[derive(Debug, Args)]
@@ -23,7 +24,7 @@ pub enum ContractCommand {
     Infer(PythonInferArgs),
     /// Derive a route-independent release reference from a portable descriptor.
     ReleaseRef(ReleaseRefArgs),
-    /// Validate a portable c-two.contract.v1 descriptor.
+    /// Validate a portable c-two.contract.v2 descriptor.
     Validate(ValidateArgs),
 }
 
@@ -89,29 +90,21 @@ pub struct PythonArtifactsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CodegenCommand {
-    /// Generate a TypeScript client and optional C-Two FastDB helpers.
-    Typescript(TypeScriptCodegenArgs),
+    /// Generate a Rust contract project tree.
+    Rust(CodegenTargetArgs),
+    /// Generate a Python contract project tree.
+    Python(CodegenTargetArgs),
+    /// Generate a TypeScript contract project tree.
+    Typescript(CodegenTargetArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct TypeScriptCodegenArgs {
+pub struct CodegenTargetArgs {
     /// Descriptor JSON path, or "-" to read from stdin.
     pub path: String,
-    /// Write generated TypeScript to this file instead of stdout.
+    /// Publish the complete generated artifact tree at this absent destination.
     #[arg(long)]
-    pub out: Option<String>,
-    /// Fail when the descriptor references codecs without built-in TypeScript support.
-    #[arg(long)]
-    pub strict_codecs: bool,
-    /// FastDB schema descriptor JSON file or artifact bundle for C-Two FastDB helper generation; repeatable.
-    #[arg(long = "fastdb-schema")]
-    pub fastdb_schemas: Vec<String>,
-    /// Write generated C-Two FastDB TypeScript helpers to this file.
-    #[arg(long = "fastdb-out")]
-    pub fastdb_out: Option<String>,
-    /// Python executable used for C-Two FastDB helper generation. Defaults to C2_PYTHON or python3.
-    #[arg(long)]
-    pub python: Option<String>,
+    pub out_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -222,7 +215,7 @@ fn validate(path: &str) -> Result<()> {
     let digest = c2_contract::contract_descriptor_sha256_hex(payload.as_bytes())
         .map_err(|err| anyhow!("{err}"))?;
     let label = if path == "-" { "stdin" } else { path };
-    println!("{label}: valid c-two.contract.v1 sha256={digest}");
+    println!("{label}: valid c-two.contract.v2 sha256={digest}");
     Ok(())
 }
 
@@ -247,69 +240,21 @@ fn release_ref(args: ReleaseRefArgs) -> Result<()> {
 }
 
 fn codegen(args: CodegenArgs) -> Result<()> {
-    match args.command {
-        CodegenCommand::Typescript(args) => codegen_typescript(args),
-    }
-}
-
-fn codegen_typescript(args: TypeScriptCodegenArgs) -> Result<()> {
-    if args.fastdb_out.is_some() && args.fastdb_schemas.is_empty() {
-        return Err(anyhow!(
-            "--fastdb-out requires at least one --fastdb-schema"
-        ));
-    }
-    if !args.fastdb_schemas.is_empty() && args.fastdb_out.is_none() {
-        return Err(anyhow!("--fastdb-schema requires --fastdb-out"));
-    }
-    if !args.fastdb_schemas.is_empty() && args.path == "-" {
-        return Err(anyhow!(
-            "--fastdb-schema requires a descriptor file path, not stdin"
-        ));
-    }
+    let (target, args) = match args.command {
+        CodegenCommand::Rust(args) => (c2_codegen::ContractCodegenTarget::Rust, args),
+        CodegenCommand::Python(args) => (c2_codegen::ContractCodegenTarget::Python, args),
+        CodegenCommand::Typescript(args) => (c2_codegen::ContractCodegenTarget::TypeScript, args),
+    };
     let payload = read_payload(&args.path)?;
-    let generated = c2_codegen::generate_typescript_client(
+    let artifacts = c2_codegen::compile_contract_artifacts(
         payload.as_bytes(),
-        c2_codegen::TypeScriptOptions {
-            strict_codecs: args.strict_codecs,
-        },
+        target,
+        &c2_codegen::ContractCodegenOptions::default(),
     )
-    .map_err(|err| anyhow!("{err}"))?;
-    write_payload(&generated, args.out.as_deref())?;
-    if let Some(fastdb_out) = args.fastdb_out.as_deref() {
-        run_python_fastdb_typescript(
-            args.python.as_deref(),
-            &args.path,
-            fastdb_out,
-            &args.fastdb_schemas,
-        )?;
-    }
-    Ok(())
-}
-
-fn run_python_fastdb_typescript(
-    python: Option<&str>,
-    contract_path: &str,
-    output_path: &str,
-    schema_paths: &[String],
-) -> Result<()> {
-    let mut py_args = vec![
-        "-m".to_string(),
-        "c_two.fastdb.typescript".to_string(),
-        contract_path.to_string(),
-        output_path.to_string(),
-    ];
-    for schema_path in schema_paths {
-        py_args.push("--schema".to_string());
-        py_args.push(schema_path.clone());
-    }
-    let payload = run_python_contract(python, &py_args)?;
-    if !payload.trim().is_empty() {
-        return Err(anyhow!(
-            "C-Two FastDB TypeScript helper generation wrote unexpected stdout: {}",
-            payload.trim()
-        ));
-    }
-    Ok(())
+    .map_err(|error| anyhow!("{error}"))?;
+    artifacts
+        .publish_new_tree(&args.out_dir)
+        .map_err(|error| anyhow!("{error}"))
 }
 
 fn export(args: PythonExportArgs) -> Result<()> {
