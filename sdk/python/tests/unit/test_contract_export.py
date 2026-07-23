@@ -125,6 +125,7 @@ def test_native_release_projection_matches_shared_golden_vectors():
     from c_two._native import (
         canonicalize_portable_contract_descriptor,
         contract_release_ref_json,
+        derive_portable_contract_fingerprints,
     )
 
     fixture_dir = _repo_root() / 'tests' / 'fixtures' / 'contracts'
@@ -134,6 +135,10 @@ def test_native_release_projection_matches_shared_golden_vectors():
 
     assert canonicalize_portable_contract_descriptor(descriptor) == canonical
     assert contract_release_ref_json(descriptor) == reference
+    assert derive_portable_contract_fingerprints(descriptor) == (
+        'bec2fee73f9a2476c311de20e40e584d0c7ff6bcadd38c0b4fe3e683ec2540fe',
+        'c4cd2cf04caa63f12f702868524787c95c4f5bc00a7c7212bd1f807b32647940',
+    )
 
 
 def test_export_contract_release_ref_is_rust_derived_and_route_independent():

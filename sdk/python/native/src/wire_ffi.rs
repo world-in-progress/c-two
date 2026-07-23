@@ -558,6 +558,18 @@ fn validate_portable_contract_descriptor(payload: &[u8]) -> PyResult<()> {
 }
 
 #[pyfunction]
+fn derive_portable_contract_fingerprints(payload: &[u8]) -> PyResult<(String, String)> {
+    c2_contract::derive_contract_fingerprints_json(payload)
+        .map(|fingerprints| {
+            (
+                fingerprints.abi_hash().to_string(),
+                fingerprints.signature_hash().to_string(),
+            )
+        })
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+#[pyfunction]
 fn canonicalize_portable_contract_descriptor(payload: &[u8]) -> PyResult<String> {
     c2_contract::ContractRelease::from_descriptor_json(payload)
         .map(|release| release.canonical_descriptor_json().to_string())
@@ -612,6 +624,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(contract_descriptor_sha256_hex, m)?)?;
     m.add_function(wrap_pyfunction!(validate_portable_contract_descriptor, m)?)?;
+    m.add_function(wrap_pyfunction!(derive_portable_contract_fingerprints, m)?)?;
     m.add_function(wrap_pyfunction!(
         canonicalize_portable_contract_descriptor,
         m

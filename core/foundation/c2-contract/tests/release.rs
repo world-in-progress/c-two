@@ -1,13 +1,22 @@
 use c2_contract::{
     CONTRACT_RELEASE_REF_SCHEMA, ContractError, ContractRelease, ContractReleaseRef,
-    ContractReleaseRefField,
+    ContractReleaseRefField, derive_contract_fingerprints_json,
 };
 
 const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
 const REFERENCE: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.ref.json");
-const DIGEST: &str = "cfe58b74b47efd2a866120cce103049c68284dde2cf66cfb95cce920ad9c9867";
+const DIGEST: &str = "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3";
+
+fn with_derived_fingerprints(mut value: serde_json::Value) -> String {
+    let fingerprints = derive_contract_fingerprints_json(value.to_string().as_bytes()).unwrap();
+    value["fingerprints"]["abi_hash"] =
+        serde_json::Value::String(fingerprints.abi_hash().to_string());
+    value["fingerprints"]["signature_hash"] =
+        serde_json::Value::String(fingerprints.signature_hash().to_string());
+    value.to_string()
+}
 
 #[test]
 fn release_derives_the_golden_route_independent_reference() {
@@ -15,7 +24,7 @@ fn release_derives_the_golden_route_independent_reference() {
     let reference = release.reference();
 
     assert_eq!(reference.schema(), CONTRACT_RELEASE_REF_SCHEMA);
-    assert_eq!(reference.contract_schema(), "c-two.contract.v1");
+    assert_eq!(reference.contract_schema(), "c-two.contract.v2");
     assert_eq!(reference.crm_namespace(), "test.contract-release");
     assert_eq!(reference.crm_name(), "Portable");
     assert_eq!(reference.crm_version(), "0.1.0");
@@ -93,8 +102,8 @@ fn verification_identifies_each_mismatch_field() {
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes()).unwrap();
     for (actual, expected, field) in [
         (
-            "c-two.contract.v1",
             "c-two.contract.v2",
+            "c-two.contract.v1",
             ContractReleaseRefField::ContractSchema,
         ),
         (
@@ -135,11 +144,11 @@ fn release_projects_runtime_contract_only_after_route_is_supplied() {
     assert_eq!(expected.crm_ver, "0.1.0");
     assert_eq!(
         expected.abi_hash,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "bec2fee73f9a2476c311de20e40e584d0c7ff6bcadd38c0b4fe3e683ec2540fe"
     );
     assert_eq!(
         expected.signature_hash,
-        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        "c4cd2cf04caa63f12f702868524787c95c4f5bc00a7c7212bd1f807b32647940"
     );
 }
 
@@ -216,7 +225,9 @@ fn release_rejects_invalid_runtime_route_text() {
 #[test]
 fn descriptor_mutation_changes_the_derived_reference_digest() {
     let original = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes()).unwrap();
-    let changed = DESCRIPTOR.replace("\"name\": \"ping\"", "\"name\": \"health\"");
+    let mut changed: serde_json::Value = serde_json::from_str(DESCRIPTOR).unwrap();
+    changed["methods"][0]["name"] = serde_json::json!("health");
+    let changed = with_derived_fingerprints(changed);
     let changed = ContractRelease::from_descriptor_json(changed.as_bytes()).unwrap();
 
     assert_ne!(
@@ -229,18 +240,18 @@ fn descriptor_mutation_changes_the_derived_reference_digest() {
 fn no_payload_descriptor_is_a_valid_release() {
     let mut no_payload: serde_json::Value = serde_json::from_str(DESCRIPTOR).unwrap();
     no_payload["methods"].as_array_mut().unwrap().truncate(1);
+    let no_payload = with_derived_fingerprints(no_payload);
 
-    ContractRelease::from_descriptor_json(no_payload.to_string().as_bytes()).unwrap();
+    ContractRelease::from_descriptor_json(no_payload.as_bytes()).unwrap();
 }
 
 #[test]
-fn fastdb_codec_identity_remains_opaque_but_digest_covered() {
+fn fastdb_nested_value_remains_opaque_but_digest_covered() {
     let original = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes()).unwrap();
-    let changed = DESCRIPTOR.replacen(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        1,
-    );
+    let mut changed: serde_json::Value = serde_json::from_str(DESCRIPTOR).unwrap();
+    changed["methods"][1]["bindings"]["input"]["spec"]["entries"][0]["type"]["kind"] =
+        serde_json::json!("wstr");
+    let changed = with_derived_fingerprints(changed);
     let changed = ContractRelease::from_descriptor_json(changed.as_bytes()).unwrap();
 
     assert_ne!(original.descriptor_sha256(), changed.descriptor_sha256());

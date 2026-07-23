@@ -1,10 +1,90 @@
 use crate::{
-    CONTRACT_HASH_HEX_BYTES, ContractDescriptorDigest, ContractError, MAX_WIRE_TEXT_BYTES,
-    PORTABLE_CONTRACT_SCHEMA, validate_contract_text_field, validate_crm_tag,
+    CONTRACT_HASH_HEX_BYTES, ContractDescriptorDigest, ContractError, ContractFingerprintField,
+    PORTABLE_CONTRACT_SCHEMA, validate_contract_text_field,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+
+const CONTRACT_ABI_SCHEMA: &str = "c-two.contract-abi.v2";
+const CONTRACT_SIGNATURE_SCHEMA: &str = "c-two.contract-signature.v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MethodAccess {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingDirection {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedFastDbSpec {
+    direction: BindingDirection,
+    outer_path: String,
+    canonical_json: String,
+}
+
+impl NestedFastDbSpec {
+    pub fn direction(&self) -> BindingDirection {
+        self.direction
+    }
+
+    pub fn outer_path(&self) -> &str {
+        &self.outer_path
+    }
+
+    /// Returns deterministic C-Two extraction bytes for the opaque nested JSON
+    /// value. FastDB Core remains authoritative for FastDB canonicalization.
+    pub fn canonical_json(&self) -> &str {
+        &self.canonical_json
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedMethodDescriptor {
+    name: String,
+    access: MethodAccess,
+    input: Option<NestedFastDbSpec>,
+    output: Option<NestedFastDbSpec>,
+}
+
+impl ValidatedMethodDescriptor {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn access(&self) -> MethodAccess {
+        self.access
+    }
+
+    pub fn input(&self) -> Option<&NestedFastDbSpec> {
+        self.input.as_ref()
+    }
+
+    pub fn output(&self) -> Option<&NestedFastDbSpec> {
+        self.output.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractFingerprints {
+    abi_hash: String,
+    signature_hash: String,
+}
+
+impl ContractFingerprints {
+    pub fn abi_hash(&self) -> &str {
+        &self.abi_hash
+    }
+
+    pub fn signature_hash(&self) -> &str {
+        &self.signature_hash
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedContractDescriptor {
@@ -15,40 +95,39 @@ pub struct ValidatedContractDescriptor {
     crm_version: String,
     abi_hash: String,
     signature_hash: String,
+    methods: Vec<ValidatedMethodDescriptor>,
     descriptor_sha256: ContractDescriptorDigest,
 }
 
 impl ValidatedContractDescriptor {
     pub fn from_json(json_bytes: &[u8]) -> Result<Self, ContractError> {
-        let value: Value = serde_json::from_slice(json_bytes)
-            .map_err(|error| ContractError::InvalidJson(error.to_string()))?;
-        validate_portable_contract_descriptor_value(&value)?;
+        let value = parse_json(json_bytes)?;
+        let parsed = parse_outer_descriptor(&value)?;
+        let derived = derive_contract_fingerprints_value(&value, &parsed)?;
+        verify_fingerprint(
+            ContractFingerprintField::AbiHash,
+            &parsed.abi_hash,
+            derived.abi_hash(),
+        )?;
+        verify_fingerprint(
+            ContractFingerprintField::SignatureHash,
+            &parsed.signature_hash,
+            derived.signature_hash(),
+        )?;
 
         let canonical_json = canonical_json(&value);
-        let root = object_at(&value, "$")?;
-        let crm = object_at(required(root, "$", "crm")?, "$.crm")?;
-        let fingerprints = object_at(required(root, "$", "fingerprints")?, "$.fingerprints")?;
         let descriptor_sha256 =
             ContractDescriptorDigest::parse(sha256_hex(canonical_json.as_bytes()))?;
 
         Ok(Self {
             canonical_json,
-            contract_schema: string_at(required(root, "$", "schema")?, "$.schema")?.to_string(),
-            crm_namespace: string_at(required(crm, "$.crm", "namespace")?, "$.crm.namespace")?
-                .to_string(),
-            crm_name: string_at(required(crm, "$.crm", "name")?, "$.crm.name")?.to_string(),
-            crm_version: string_at(required(crm, "$.crm", "version")?, "$.crm.version")?
-                .to_string(),
-            abi_hash: string_at(
-                required(fingerprints, "$.fingerprints", "abi_hash")?,
-                "$.fingerprints.abi_hash",
-            )?
-            .to_string(),
-            signature_hash: string_at(
-                required(fingerprints, "$.fingerprints", "signature_hash")?,
-                "$.fingerprints.signature_hash",
-            )?
-            .to_string(),
+            contract_schema: PORTABLE_CONTRACT_SCHEMA.to_string(),
+            crm_namespace: parsed.crm_namespace,
+            crm_name: parsed.crm_name,
+            crm_version: parsed.crm_version,
+            abi_hash: derived.abi_hash,
+            signature_hash: derived.signature_hash,
+            methods: parsed.methods,
             descriptor_sha256,
         })
     }
@@ -81,14 +160,34 @@ impl ValidatedContractDescriptor {
         &self.signature_hash
     }
 
+    pub fn methods(&self) -> &[ValidatedMethodDescriptor] {
+        &self.methods
+    }
+
     pub fn descriptor_sha256(&self) -> &ContractDescriptorDigest {
         &self.descriptor_sha256
     }
 }
 
+struct ParsedOuterDescriptor {
+    crm_namespace: String,
+    crm_name: String,
+    crm_version: String,
+    abi_hash: String,
+    signature_hash: String,
+    methods: Vec<ValidatedMethodDescriptor>,
+}
+
+pub fn derive_contract_fingerprints_json(
+    json_bytes: &[u8],
+) -> Result<ContractFingerprints, ContractError> {
+    let value = parse_json(json_bytes)?;
+    let parsed = parse_outer_descriptor(&value)?;
+    derive_contract_fingerprints_value(&value, &parsed)
+}
+
 pub fn contract_descriptor_sha256_hex(json_bytes: &[u8]) -> Result<String, ContractError> {
-    let value: Value = serde_json::from_slice(json_bytes)
-        .map_err(|err| ContractError::InvalidJson(err.to_string()))?;
+    let value = parse_json(json_bytes)?;
     Ok(sha256_hex(canonical_json(&value).as_bytes()))
 }
 
@@ -97,6 +196,16 @@ pub fn validate_portable_contract_descriptor_json(json_bytes: &[u8]) -> Result<(
 }
 
 pub fn validate_portable_contract_descriptor_value(value: &Value) -> Result<(), ContractError> {
+    let canonical = canonical_json(value);
+    ValidatedContractDescriptor::from_json(canonical.as_bytes()).map(|_| ())
+}
+
+fn parse_json(json_bytes: &[u8]) -> Result<Value, ContractError> {
+    serde_json::from_slice(json_bytes)
+        .map_err(|error| ContractError::InvalidJson(error.to_string()))
+}
+
+fn parse_outer_descriptor(value: &Value) -> Result<ParsedOuterDescriptor, ContractError> {
     let root = object_at(value, "$")?;
     ensure_keys(root, "$", &["schema", "crm", "fingerprints", "methods"])?;
     let schema = string_at(required(root, "$", "schema")?, "$.schema")?;
@@ -107,97 +216,155 @@ pub fn validate_portable_contract_descriptor_value(value: &Value) -> Result<(), 
         ));
     }
 
-    let crm_path = "$.crm";
-    let crm = object_at(required(root, "$", "crm")?, crm_path)?;
-    ensure_keys(crm, crm_path, &["namespace", "name", "version"])?;
-    let crm_ns = string_at(required(crm, crm_path, "namespace")?, "$.crm.namespace")?;
-    let crm_name = string_at(required(crm, crm_path, "name")?, "$.crm.name")?;
-    let crm_ver = string_at(required(crm, crm_path, "version")?, "$.crm.version")?;
-    validate_crm_tag(crm_ns, crm_name, crm_ver)?;
-
-    validate_fingerprints(required(root, "$", "fingerprints")?, "$.fingerprints")?;
-
-    let methods = array_at(required(root, "$", "methods")?, "$.methods")?;
-    let mut method_names = BTreeSet::new();
-    for (index, method) in methods.iter().enumerate() {
-        let method_path = format!("$.methods[{index}]");
-        validate_method_descriptor(method, &method_path, &mut method_names)?;
-    }
-    Ok(())
-}
-
-fn validate_fingerprints(value: &Value, path: &str) -> Result<(), ContractError> {
-    let object = object_at(value, path)?;
-    ensure_keys(object, path, &["abi_hash", "signature_hash"])?;
-    let abi_hash_path = format!("{path}.abi_hash");
-    let abi_hash = string_at(required(object, path, "abi_hash")?, &abi_hash_path)?;
-    validate_hash_text(&abi_hash_path, abi_hash)?;
-    let signature_hash_path = format!("{path}.signature_hash");
-    let signature_hash = string_at(
-        required(object, path, "signature_hash")?,
-        &signature_hash_path,
+    let crm = object_at(required(root, "$", "crm")?, "$.crm")?;
+    ensure_keys(crm, "$.crm", &["namespace", "name", "version"])?;
+    let crm_namespace = validated_text(
+        crm,
+        "$.crm",
+        "namespace",
+        "$.crm.namespace",
+        "crm namespace",
     )?;
-    validate_hash_text(&signature_hash_path, signature_hash)
+    let crm_name = validated_text(crm, "$.crm", "name", "$.crm.name", "crm name")?;
+    let crm_version = validated_text(crm, "$.crm", "version", "$.crm.version", "crm version")?;
+
+    let fingerprints = object_at(required(root, "$", "fingerprints")?, "$.fingerprints")?;
+    ensure_keys(
+        fingerprints,
+        "$.fingerprints",
+        &["abi_hash", "signature_hash"],
+    )?;
+    let abi_hash = fingerprint_text(fingerprints, "abi_hash", "$.fingerprints.abi_hash")?;
+    let signature_hash = fingerprint_text(
+        fingerprints,
+        "signature_hash",
+        "$.fingerprints.signature_hash",
+    )?;
+
+    let method_values = array_at(required(root, "$", "methods")?, "$.methods")?;
+    let mut method_names = BTreeSet::new();
+    let mut methods = Vec::with_capacity(method_values.len());
+    for (index, method) in method_values.iter().enumerate() {
+        let path = format!("$.methods[{index}]");
+        methods.push(parse_method_descriptor(method, &path, &mut method_names)?);
+    }
+
+    Ok(ParsedOuterDescriptor {
+        crm_namespace,
+        crm_name,
+        crm_version,
+        abi_hash,
+        signature_hash,
+        methods,
+    })
 }
 
-fn validate_method_descriptor(
+fn parse_method_descriptor(
     value: &Value,
     path: &str,
     method_names: &mut BTreeSet<String>,
-) -> Result<(), ContractError> {
+) -> Result<ValidatedMethodDescriptor, ContractError> {
     let object = object_at(value, path)?;
     ensure_keys(
         object,
         path,
-        &["access", "buffer", "name", "parameters", "return", "wire"],
+        &["access", "name", "parameters", "return", "bindings"],
     )?;
+
     let name_path = format!("{path}.name");
-    let name = string_at(required(object, path, "name")?, &name_path)?;
-    validate_contract_text_field("method name", name)?;
-    if !method_names.insert(name.to_string()) {
+    let name = validated_text(object, path, "name", &name_path, "method name")?;
+    if !method_names.insert(name.clone()) {
         return Err(invalid(path, format!("duplicate method name {name:?}")));
     }
 
     let access_path = format!("{path}.access");
-    let access = string_at(required(object, path, "access")?, &access_path)?;
-    if !matches!(access, "read" | "write") {
-        return Err(invalid(access_path, "access must be \"read\" or \"write\""));
-    }
+    let access = match string_at(required(object, path, "access")?, &access_path)? {
+        "read" => MethodAccess::Read,
+        "write" => MethodAccess::Write,
+        _ => {
+            return Err(invalid(access_path, "access must be \"read\" or \"write\""));
+        }
+    };
 
-    let buffer_path = format!("{path}.buffer");
-    validate_buffer(required(object, path, "buffer")?, &buffer_path)?;
-
-    let params_path = format!("{path}.parameters");
-    let parameters = array_at(required(object, path, "parameters")?, &params_path)?;
-    let mut param_names = BTreeSet::new();
-    for (index, param) in parameters.iter().enumerate() {
-        let param_path = format!("{params_path}[{index}]");
-        validate_parameter_descriptor(param, &param_path, &mut param_names)?;
+    let parameters_path = format!("{path}.parameters");
+    let parameters = array_at(required(object, path, "parameters")?, &parameters_path)?;
+    let mut parameter_names = BTreeSet::new();
+    for (index, parameter) in parameters.iter().enumerate() {
+        validate_payload_parameter(
+            parameter,
+            &format!("{parameters_path}[{index}]"),
+            &mut parameter_names,
+        )?;
     }
 
     let return_path = format!("{path}.return");
-    validate_annotation(required(object, path, "return")?, &return_path)?;
+    let return_kind = validate_return(required(object, path, "return")?, &return_path)?;
 
-    let wire_path = format!("{path}.wire");
-    let wire = object_at(required(object, path, "wire")?, &wire_path)?;
-    let input_path = format!("{wire_path}.input");
-    validate_wire_ref(required(wire, &wire_path, "input")?, &input_path)?;
-    let output_path = format!("{wire_path}.output");
-    validate_wire_ref(required(wire, &wire_path, "output")?, &output_path)?;
-    Ok(())
+    let bindings_path = format!("{path}.bindings");
+    let bindings = object_at(required(object, path, "bindings")?, &bindings_path)?;
+    ensure_keys(bindings, &bindings_path, &["input", "output"])?;
+    let input = parse_binding(
+        required(bindings, &bindings_path, "input")?,
+        &format!("{bindings_path}.input"),
+        BindingDirection::Input,
+    )?;
+    let output = parse_binding(
+        required(bindings, &bindings_path, "output")?,
+        &format!("{bindings_path}.output"),
+        BindingDirection::Output,
+    )?;
+
+    match input {
+        None if !parameters.is_empty() => {
+            return Err(invalid(
+                parameters_path,
+                "null input binding requires zero parameters",
+            ));
+        }
+        Some(_) if parameters.len() != 1 => {
+            return Err(invalid(
+                parameters_path,
+                "FastDB input binding requires exactly one payload parameter",
+            ));
+        }
+        _ => {}
+    }
+
+    match (output.is_some(), return_kind) {
+        (false, ReturnKind::Payload) => {
+            return Err(invalid(
+                return_path,
+                "null output binding requires return kind \"none\"",
+            ));
+        }
+        (true, ReturnKind::None) => {
+            return Err(invalid(
+                return_path,
+                "FastDB output binding requires return kind \"payload\"",
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(ValidatedMethodDescriptor {
+        name,
+        access,
+        input,
+        output,
+    })
 }
 
-fn validate_parameter_descriptor(
+fn validate_payload_parameter(
     value: &Value,
     path: &str,
-    param_names: &mut BTreeSet<String>,
+    parameter_names: &mut BTreeSet<String>,
 ) -> Result<(), ContractError> {
     let object = object_at(value, path)?;
-    ensure_keys(object, path, &["default", "kind", "name", "type"])?;
+    ensure_keys(object, path, &["name", "kind", "default", "type"])?;
+
     let name_path = format!("{path}.name");
-    let name = string_at(required(object, path, "name")?, &name_path)?;
-    validate_contract_text_field("parameter name", name)?;
-    if !param_names.insert(name.to_string()) {
+    let name = validated_text(object, path, "name", &name_path, "parameter name")?;
+    if !parameter_names.insert(name.clone()) {
         return Err(invalid(path, format!("duplicate parameter name {name:?}")));
     }
 
@@ -213,229 +380,176 @@ fn validate_parameter_descriptor(
         ));
     }
 
-    let default_path = format!("{path}.default");
-    validate_default(required(object, path, "default")?, &default_path)?;
-    let type_path = format!("{path}.type");
-    validate_annotation(required(object, path, "type")?, &type_path)
+    validate_single_kind_object(
+        required(object, path, "default")?,
+        &format!("{path}.default"),
+        "missing",
+    )?;
+    validate_single_kind_object(
+        required(object, path, "type")?,
+        &format!("{path}.type"),
+        "payload",
+    )
 }
 
-fn validate_default(value: &Value, path: &str) -> Result<(), ContractError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnKind {
+    None,
+    Payload,
+}
+
+fn validate_return(value: &Value, path: &str) -> Result<ReturnKind, ContractError> {
     let object = object_at(value, path)?;
+    ensure_keys(object, path, &["kind"])?;
     let kind_path = format!("{path}.kind");
-    let kind = string_at(required(object, path, "kind")?, &kind_path)?;
-    match kind {
-        "missing" => {
-            ensure_keys(object, path, &["kind"])?;
-            Ok(())
-        }
-        "json_scalar" => {
-            ensure_keys(object, path, &["kind", "value"])?;
-            let value_path = format!("{path}.value");
-            let default_value = required(object, path, "value")?;
-            if matches!(
-                default_value,
-                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
-            ) {
-                Ok(())
-            } else {
-                Err(invalid(
-                    value_path,
-                    "json_scalar default must be null, bool, number, or string",
-                ))
-            }
-        }
+    match string_at(required(object, path, "kind")?, &kind_path)? {
+        "none" => Ok(ReturnKind::None),
+        "payload" => Ok(ReturnKind::Payload),
         _ => Err(invalid(
             kind_path,
-            "default kind must be missing or json_scalar",
+            "return kind must be \"none\" or \"payload\"",
         )),
     }
 }
 
-fn validate_annotation(value: &Value, path: &str) -> Result<(), ContractError> {
+fn validate_single_kind_object(
+    value: &Value,
+    path: &str,
+    expected: &'static str,
+) -> Result<(), ContractError> {
     let object = object_at(value, path)?;
+    ensure_keys(object, path, &["kind"])?;
     let kind_path = format!("{path}.kind");
-    let kind = string_at(required(object, path, "kind")?, &kind_path)?;
-    match kind {
-        "none" => {
-            ensure_keys(object, path, &["kind"])?;
-            Ok(())
-        }
-        "primitive" => {
-            ensure_keys(object, path, &["kind", "name"])?;
-            let name_path = format!("{path}.name");
-            let name = string_at(required(object, path, "name")?, &name_path)?;
-            if matches!(
-                name,
-                "bool" | "int" | "float" | "str" | "bytes" | "memoryview" | "bytearray"
-            ) {
-                Ok(())
-            } else {
-                Err(invalid(
-                    name_path,
-                    format!("unsupported primitive {name:?}"),
-                ))
-            }
-        }
-        "list" => {
-            ensure_keys(object, path, &["item", "kind"])?;
-            let item_path = format!("{path}.item");
-            validate_annotation(required(object, path, "item")?, &item_path)
-        }
-        "dict" => {
-            ensure_keys(object, path, &["key", "kind", "value"])?;
-            let key_path = format!("{path}.key");
-            validate_annotation(required(object, path, "key")?, &key_path)?;
-            let value_path = format!("{path}.value");
-            validate_annotation(required(object, path, "value")?, &value_path)
-        }
-        "tuple_variadic" => {
-            ensure_keys(object, path, &["item", "kind"])?;
-            let item_path = format!("{path}.item");
-            validate_annotation(required(object, path, "item")?, &item_path)
-        }
-        "tuple" => {
-            ensure_keys(object, path, &["items", "kind"])?;
-            let items_path = format!("{path}.items");
-            let items = array_at(required(object, path, "items")?, &items_path)?;
-            if items.is_empty() {
-                return Err(invalid(items_path, "tuple items cannot be empty"));
-            }
-            for (index, item) in items.iter().enumerate() {
-                validate_annotation(item, &format!("{items_path}[{index}]"))?;
-            }
-            Ok(())
-        }
-        "union" => {
-            ensure_keys(object, path, &["items", "kind"])?;
-            let items_path = format!("{path}.items");
-            let items = array_at(required(object, path, "items")?, &items_path)?;
-            if items.is_empty() {
-                return Err(invalid(items_path, "union items cannot be empty"));
-            }
-            for (index, item) in items.iter().enumerate() {
-                validate_annotation(item, &format!("{items_path}[{index}]"))?;
-            }
-            Ok(())
-        }
-        "codec" => {
-            ensure_keys(object, path, &["codec", "kind"])?;
-            let codec_path = format!("{path}.codec");
-            validate_codec_ref(required(object, path, "codec")?, &codec_path)
-        }
-        "transferable" => {
-            ensure_keys(object, path, &["abi_ref", "kind"])?;
-            let abi_path = format!("{path}.abi_ref");
-            validate_wire_ref(required(object, path, "abi_ref")?, &abi_path)
-        }
-        _ => Err(invalid(
-            kind_path,
-            format!("unsupported annotation kind {kind:?}"),
-        )),
-    }
-}
-
-fn validate_wire_ref(value: &Value, path: &str) -> Result<(), ContractError> {
-    if value.is_null() {
-        return Ok(());
-    }
-    if value
-        .get("family")
-        .and_then(Value::as_str)
-        .is_some_and(|family| family == "python-pickle-default")
-    {
-        return Err(invalid(path, "python-pickle-default is not portable"));
-    }
-    let object = object_at(value, path)?;
-    let kind_path = format!("{path}.kind");
-    let kind = string_at(required(object, path, "kind")?, &kind_path)?;
-    if kind != "codec_ref" {
-        return Err(invalid(
-            kind_path,
-            "portable wire refs must use kind \"codec_ref\"",
-        ));
-    }
-    validate_codec_ref(value, path)
-}
-
-fn validate_codec_ref(value: &Value, path: &str) -> Result<(), ContractError> {
-    let object = object_at(value, path)?;
-    let kind_path = format!("{path}.kind");
-    let kind = string_at(required(object, path, "kind")?, &kind_path)?;
-    if kind != "codec_ref" {
-        return Err(invalid(kind_path, "codec ref kind must be \"codec_ref\""));
-    }
-    ensure_keys(
-        object,
-        path,
-        &[
-            "capabilities",
-            "id",
-            "kind",
-            "media_type",
-            "portable",
-            "schema",
-            "schema_sha256",
-            "version",
-        ],
-    )?;
-
-    validate_identity_value(required(object, path, "id")?, &format!("{path}.id"))?;
-    validate_identity_value(
-        required(object, path, "version")?,
-        &format!("{path}.version"),
-    )?;
-    if let Some(schema) = object.get("schema") {
-        validate_identity_value(schema, &format!("{path}.schema"))?;
-    }
-    if let Some(media_type) = object.get("media_type") {
-        validate_identity_value(media_type, &format!("{path}.media_type"))?;
-    }
-    if let Some(schema_sha256) = object.get("schema_sha256") {
-        let sha_path = format!("{path}.schema_sha256");
-        let value = string_at(schema_sha256, &sha_path)?;
-        validate_hash_text(&sha_path, value)?;
-    }
-
-    let portable_path = format!("{path}.portable");
-    let portable = required(object, path, "portable")?
-        .as_bool()
-        .ok_or_else(|| invalid(&portable_path, "portable must be a boolean"))?;
-    if !portable {
-        return Err(invalid(
-            portable_path,
-            "portable codec refs must set portable=true",
-        ));
-    }
-
-    if let Some(capabilities) = object.get("capabilities") {
-        let capabilities_path = format!("{path}.capabilities");
-        let items = array_at(capabilities, &capabilities_path)?;
-        let mut seen = BTreeSet::new();
-        for (index, capability) in items.iter().enumerate() {
-            let capability_path = format!("{capabilities_path}[{index}]");
-            let value = string_at(capability, &capability_path)?;
-            validate_capability_text(&capability_path, value)?;
-            if !seen.insert(value.to_string()) {
-                return Err(invalid(
-                    capability_path,
-                    format!("duplicate capability {value:?}"),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_buffer(value: &Value, path: &str) -> Result<(), ContractError> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let value = string_at(value, path)?;
-    if matches!(value, "view" | "hold") {
+    let actual = string_at(required(object, path, "kind")?, &kind_path)?;
+    if actual == expected {
         Ok(())
     } else {
-        Err(invalid(path, "buffer must be null, \"view\", or \"hold\""))
+        Err(invalid(
+            kind_path,
+            format!("expected kind {expected:?}, got {actual:?}"),
+        ))
     }
+}
+
+fn parse_binding(
+    value: &Value,
+    path: &str,
+    direction: BindingDirection,
+) -> Result<Option<NestedFastDbSpec>, ContractError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let object = object_at(value, path)?;
+    ensure_keys(object, path, &["kind", "spec"])?;
+    let kind_path = format!("{path}.kind");
+    let kind = string_at(required(object, path, "kind")?, &kind_path)?;
+    if kind != "fastdb" {
+        return Err(invalid(kind_path, "binding kind must be \"fastdb\""));
+    }
+
+    let spec_path = format!("{path}.spec");
+    let spec = required(object, path, "spec")?;
+    Ok(Some(NestedFastDbSpec {
+        direction,
+        outer_path: spec_path,
+        canonical_json: canonical_json(spec),
+    }))
+}
+
+fn derive_contract_fingerprints_value(
+    value: &Value,
+    parsed: &ParsedOuterDescriptor,
+) -> Result<ContractFingerprints, ContractError> {
+    let root = object_at(value, "$")?;
+    let crm = required(root, "$", "crm")?.clone();
+    let methods = array_at(required(root, "$", "methods")?, "$.methods")?;
+
+    let abi_methods = methods
+        .iter()
+        .enumerate()
+        .map(|(index, method)| {
+            let path = format!("$.methods[{index}]");
+            let object = object_at(method, &path)?;
+            Ok(serde_json::json!({
+                "name": required(object, &path, "name")?.clone(),
+                "bindings": required(object, &path, "bindings")?.clone(),
+            }))
+        })
+        .collect::<Result<Vec<_>, ContractError>>()?;
+    let signature_methods = methods
+        .iter()
+        .enumerate()
+        .map(|(index, method)| {
+            let path = format!("$.methods[{index}]");
+            let object = object_at(method, &path)?;
+            Ok(serde_json::json!({
+                "name": required(object, &path, "name")?.clone(),
+                "access": required(object, &path, "access")?.clone(),
+                "parameters": required(object, &path, "parameters")?.clone(),
+                "return": required(object, &path, "return")?.clone(),
+            }))
+        })
+        .collect::<Result<Vec<_>, ContractError>>()?;
+
+    let abi_projection = serde_json::json!({
+        "schema": CONTRACT_ABI_SCHEMA,
+        "crm": crm.clone(),
+        "methods": abi_methods,
+    });
+    let signature_projection = serde_json::json!({
+        "schema": CONTRACT_SIGNATURE_SCHEMA,
+        "crm": crm,
+        "methods": signature_methods,
+    });
+
+    // Parsing already validated the complete outer shape. Reading a field from
+    // `parsed` here makes that ordering explicit and prevents this function
+    // from becoming a second, weaker descriptor parser.
+    debug_assert_eq!(parsed.methods.len(), methods.len());
+
+    Ok(ContractFingerprints {
+        abi_hash: sha256_hex(canonical_json(&abi_projection).as_bytes()),
+        signature_hash: sha256_hex(canonical_json(&signature_projection).as_bytes()),
+    })
+}
+
+fn verify_fingerprint(
+    field: ContractFingerprintField,
+    supplied: &str,
+    derived: &str,
+) -> Result<(), ContractError> {
+    if supplied == derived {
+        Ok(())
+    } else {
+        Err(ContractError::FingerprintMismatch {
+            field,
+            expected: derived.to_string(),
+            actual: supplied.to_string(),
+        })
+    }
+}
+
+fn fingerprint_text(
+    object: &serde_json::Map<String, Value>,
+    key: &'static str,
+    path: &str,
+) -> Result<String, ContractError> {
+    let value = string_at(required(object, "$.fingerprints", key)?, path)?;
+    validate_hash_text(path, value)?;
+    Ok(value.to_string())
+}
+
+fn validated_text(
+    object: &serde_json::Map<String, Value>,
+    object_path: &str,
+    key: &'static str,
+    path: &str,
+    field: &'static str,
+) -> Result<String, ContractError> {
+    let value = string_at(required(object, object_path, key)?, path)?;
+    validate_contract_text_field(field, value).map_err(|error| invalid(path, error.to_string()))?;
+    Ok(value.to_string())
 }
 
 fn required<'a>(
@@ -485,68 +599,11 @@ fn string_at<'a>(value: &'a Value, path: &str) -> Result<&'a str, ContractError>
         .ok_or_else(|| invalid(path, "expected string"))
 }
 
-fn validate_identity_value(value: &Value, path: &str) -> Result<(), ContractError> {
-    let value = string_at(value, path)?;
-    if value.is_empty() {
-        return Err(invalid(path, "cannot be empty"));
-    }
-    if value.len() > MAX_WIRE_TEXT_BYTES {
-        return Err(invalid(
-            path,
-            format!("cannot exceed {MAX_WIRE_TEXT_BYTES} bytes: {}", value.len()),
-        ));
-    }
-    if value.trim() != value {
-        return Err(invalid(
-            path,
-            "cannot contain leading or trailing whitespace",
-        ));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(invalid(path, "cannot contain control characters"));
-    }
-    let mut chars = value.chars();
-    if !chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric()) {
-        return Err(invalid(path, "must start with an ASCII letter or digit"));
-    }
-    if !chars
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '/' | '+' | '-'))
-    {
-        return Err(invalid(path, "contains unsupported characters"));
-    }
-    Ok(())
-}
-
-fn validate_capability_text(path: &str, value: &str) -> Result<(), ContractError> {
-    if value.is_empty() {
-        return Err(invalid(path, "capability cannot be empty"));
-    }
-    if value.trim() != value {
-        return Err(invalid(
-            path,
-            "capability cannot contain leading or trailing whitespace",
-        ));
-    }
-    let mut chars = value.chars();
-    if !chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric()) {
-        return Err(invalid(
-            path,
-            "capability must start with an ASCII letter or digit",
-        ));
-    }
-    if !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-')) {
-        return Err(invalid(path, "capability contains unsupported characters"));
-    }
-    Ok(())
-}
-
 fn validate_hash_text(path: &str, value: &str) -> Result<(), ContractError> {
-    if value.len() != CONTRACT_HASH_HEX_BYTES {
-        return Err(invalid(path, "must be exactly 64 lowercase hex bytes"));
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    if value.len() != CONTRACT_HASH_HEX_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     {
         return Err(invalid(path, "must be exactly 64 lowercase hex bytes"));
     }
@@ -572,9 +629,8 @@ pub(crate) fn canonical_json(value: &Value) -> String {
             format!("[{body}]")
         }
         Value::Object(map) => {
-            // serde_json's `preserve_order` feature can be enabled by a
-            // downstream crate through Cargo feature unification. Canonical
-            // identity must not depend on that dependency-graph choice.
+            // Canonical identity cannot depend on serde_json's preserve_order
+            // feature being unified into the downstream dependency graph.
             let mut entries = map.iter().collect::<Vec<_>>();
             entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
             let body = entries

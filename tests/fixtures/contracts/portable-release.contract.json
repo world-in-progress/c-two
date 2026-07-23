@@ -1,76 +1,64 @@
 {
-  "schema": "c-two.contract.v1",
+  "schema": "c-two.contract.v2",
   "crm": {
     "namespace": "test.contract-release",
     "name": "Portable",
     "version": "0.1.0"
   },
   "fingerprints": {
-    "abi_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    "signature_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    "abi_hash": "bec2fee73f9a2476c311de20e40e584d0c7ff6bcadd38c0b4fe3e683ec2540fe",
+    "signature_hash": "c4cd2cf04caa63f12f702868524787c95c4f5bc00a7c7212bd1f807b32647940"
   },
   "methods": [
     {
       "access": "read",
-      "buffer": "view",
       "name": "ping",
       "parameters": [],
       "return": {"kind": "none"},
-      "wire": {"input": null, "output": null}
+      "bindings": {"input": null, "output": null}
     },
     {
       "access": "write",
-      "buffer": "view",
       "name": "echo",
       "parameters": [
         {
-          "name": "value",
+          "name": "payload",
           "kind": "POSITIONAL_OR_KEYWORD",
           "default": {"kind": "missing"},
-          "type": {
-            "kind": "codec",
-            "codec": {
-              "kind": "codec_ref",
-              "id": "org.fastdb.call-db",
-              "version": "1",
-              "schema": "fastdb.call-db.schema.v1",
-              "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-              "capabilities": ["bytes", "buffer-view"],
-              "portable": true
-            }
-          }
+          "type": {"kind": "payload"}
         }
       ],
-      "return": {
-        "kind": "codec",
-        "codec": {
-          "kind": "codec_ref",
-          "id": "org.fastdb.call-db",
-          "version": "1",
-          "schema": "fastdb.call-db.schema.v1",
-          "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "capabilities": ["bytes", "buffer-view"],
-          "portable": true
-        }
-      },
-      "wire": {
+      "return": {"kind": "payload"},
+      "bindings": {
         "input": {
-          "kind": "codec_ref",
-          "id": "org.fastdb.call-db",
-          "version": "1",
-          "schema": "fastdb.call-db.schema.v1",
-          "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "capabilities": ["bytes", "buffer-view"],
-          "portable": true
+          "kind": "fastdb",
+          "spec": {
+            "schema": "fastdb.payload.v1",
+            "profile": "record.v1",
+            "entries": [
+              {
+                "id": "value",
+                "cardinality": "one",
+                "type": {"kind": "str", "nullable": true}
+              }
+            ],
+            "components": []
+          }
         },
         "output": {
-          "kind": "codec_ref",
-          "id": "org.fastdb.call-db",
-          "version": "1",
-          "schema": "fastdb.call-db.schema.v1",
-          "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "capabilities": ["bytes", "buffer-view"],
-          "portable": true
+          "kind": "fastdb",
+          "spec": {
+            "schema": "fastdb.payload.v1",
+            "profile": "record.v1",
+            "entries": [
+              {
+                "id": "value",
+                "cardinality": "one",
+                "type": {"kind": "str", "nullable": true}
+              }
+            ],
+            "components": []
+          }
         }
       }
     }

@@ -1,1 +1,1 @@
-{"contract_schema":"c-two.contract.v1","crm":{"name":"Portable","namespace":"test.contract-release","version":"0.1.0"},"descriptor_sha256":"cfe58b74b47efd2a866120cce103049c68284dde2cf66cfb95cce920ad9c9867","schema":"c-two.contract-release-ref.v1"}
+{"contract_schema":"c-two.contract.v2","crm":{"name":"Portable","namespace":"test.contract-release","version":"0.1.0"},"descriptor_sha256":"d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3","schema":"c-two.contract-release-ref.v1"}
