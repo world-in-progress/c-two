@@ -178,14 +178,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-c2-config = {{ path = {_path_dependency(REPOSITORY / "core/foundation/c2-config")} }}
-c2-contract = {{ path = {_path_dependency(REPOSITORY / "core/foundation/c2-contract")} }}
-c2-ipc = {{ path = {_path_dependency(REPOSITORY / "core/transport/c2-ipc")} }}
-c2-mem = {{ path = {_path_dependency(REPOSITORY / "core/foundation/c2-mem")} }}
-c2-server = {{ path = {_path_dependency(REPOSITORY / "core/transport/c2-server")} }}
+c-two = {{ version = "0.1.0", path = {_path_dependency(REPOSITORY / "sdk/rust")} }}
 fastdb = {{ path = {_path_dependency(FASTDB_REPOSITORY / "bindings/rust/fastdb")} }}
-parking_lot = "0.12"
-tokio = {{ version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }}
 """
     (work / "Cargo.toml").write_text(manifest, encoding="utf-8")
 

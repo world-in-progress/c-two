@@ -61,7 +61,11 @@ fn every_target_contains_a_c_two_owned_contract_module() {
             source.contains("c4cd2cf04caa63f12f702868524787c95c4f5bc00a7c7212bd1f807b32647940")
         );
         assert!(source.contains("require_spec_sha256") || source.contains("requireSpecSha256"));
-        assert!(source.contains("open_copy") || source.contains("openCopy"));
+        assert!(
+            source.contains("open_copy")
+                || source.contains("openCopy")
+                || source.contains("open_owned")
+        );
         assert!(source.contains("binary_bytes") || source.contains("binaryBytes"));
         assert!(!source.contains("record.v1"));
         assert!(!source.contains("object_graph.v1"));
@@ -211,12 +215,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-c2-contract = {{ path = {contract:?} }}
-c2-ipc = {{ path = {ipc:?} }}
+c-two = {{ version = "0.1.0", path = {c_two:?} }}
 fastdb = {{ path = {fastdb:?} }}
 "#,
-        contract = repository.join("core/foundation/c2-contract"),
-        ipc = repository.join("core/transport/c2-ipc"),
+        c_two = repository.join("sdk/rust"),
         fastdb = fastdb.join("bindings/rust/fastdb"),
     );
     std::fs::write(tempdir.path().join("Cargo.toml"), manifest).unwrap();

@@ -1,76 +1,16 @@
-use c2_config::{BaseIpcConfig, ClientIpcConfig, ServerIpcConfig};
-use c2_ipc::{IpcError, SyncClient};
-use c2_mem::{MemPool, PoolConfig};
-use c2_server::{
-    AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta,
-    RouteBuildSpec, SchedulerLimits, Server,
-};
+use c_two::{Connect, Error as CTwoError, HostOptions, Runtime, RuntimeOptions};
 use fastdb::{
     BuildPolicy, Builder, CompiledSpec, GraphIdentity, Payload, PayloadError, View, ViewKind,
 };
-use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::error::Error;
 use std::io::Write;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 #[path = "../generated/rust/c_two_contract.rs"]
 mod contract;
 
 const RECORD_SPEC: &[u8] = include_bytes!("../fixtures/record-all-types.source.json");
 const GRAPH_SPEC: &[u8] = include_bytes!("../fixtures/graph-all-values.source.json");
-
-fn small_base_config() -> BaseIpcConfig {
-    BaseIpcConfig {
-        pool_segment_size: 1024 * 1024,
-        max_pool_segments: 1,
-        max_pool_memory: 1024 * 1024,
-        reassembly_segment_size: 1024 * 1024,
-        reassembly_max_segments: 1,
-        max_total_chunks: 32,
-        chunk_gc_interval_secs: 1.0,
-        chunk_threshold_ratio: 0.9,
-        chunk_assembler_timeout_secs: 10.0,
-        max_reassembly_bytes: 16 * 1024 * 1024,
-        chunk_size: 64 * 1024,
-        ..BaseIpcConfig::default()
-    }
-}
-
-fn client_config() -> ClientIpcConfig {
-    ClientIpcConfig {
-        base: small_base_config(),
-        shm_threshold: 1,
-    }
-}
-
-fn server_config() -> ServerIpcConfig {
-    ServerIpcConfig {
-        base: small_base_config(),
-        shm_threshold: 1,
-        max_frame_size: 16 * 1024 * 1024,
-        max_payload_size: 16 * 1024 * 1024,
-        max_pending_requests: 32,
-        max_execution_workers: 4,
-        pool_decay_seconds: 1.0,
-        heartbeat_interval_secs: 0.0,
-        heartbeat_timeout_secs: 5.0,
-    }
-}
-
-fn client_pool() -> Arc<Mutex<MemPool>> {
-    Arc::new(Mutex::new(MemPool::new(PoolConfig {
-        segment_size: 1024 * 1024,
-        min_block_size: 4096,
-        max_segments: 1,
-        max_dedicated_segments: 2,
-        dedicated_crash_timeout_secs: 5.0,
-        buddy_idle_decay_secs: 1.0,
-        spill_threshold: 0.8,
-        spill_dir: std::env::temp_dir().join("c_two_portable_interop_spill"),
-    })))
-}
 
 fn build_record_payload() -> Result<Payload, PayloadError> {
     let spec = CompiledSpec::compile(RECORD_SPEC)?;
@@ -108,7 +48,10 @@ fn build_record_payload() -> Result<Payload, PayloadError> {
         .value_u8(0xff)?
         .value_list_begin(1)?
         .value_u8(7)?;
-    Ok(builder.freeze()?.execute(BuildPolicy::AllowStaging)?.payload)
+    Ok(builder
+        .freeze()?
+        .execute(BuildPolicy::AllowStaging)?
+        .payload)
 }
 
 fn build_graph_payload() -> Result<Payload, PayloadError> {
@@ -159,7 +102,10 @@ fn build_graph_payload() -> Result<Payload, PayloadError> {
         .value_u16n_bits(0xbff0_0000_0000_0000)?
         .value_u16n_bits(0)?
         .value_u16n_bits(0x3ff0_0000_0000_0000)?;
-    Ok(builder.freeze()?.execute(BuildPolicy::AllowStaging)?.payload)
+    Ok(builder
+        .freeze()?
+        .execute(BuildPolicy::AllowStaging)?
+        .payload)
 }
 
 fn inspect_record_payload(payload: &Payload) -> Result<(View, View), PayloadError> {
@@ -179,10 +125,7 @@ fn inspect_record_payload(payload: &Payload) -> Result<(View, View), PayloadErro
     {
         let wide = root.field(10)?;
         let access = wide.acquire()?;
-        assert_eq!(
-            access.wstr()?,
-            &[0xfeff, 0x0041, 0, 0xd83c, 0xdf0d, 0x03a9]
-        );
+        assert_eq!(access.wstr()?, &[0xfeff, 0x0041, 0, 0xd83c, 0xdf0d, 0x03a9]);
     }
     {
         let opaque = root.field(11)?;
@@ -263,10 +206,7 @@ fn require_invalidated(view: &View) -> Result<(), PayloadError> {
 
 fn require_record_detached(detached: &View) -> Result<(), PayloadError> {
     assert_eq!(detached.field(1)?.get_u8()?, 0xab);
-    assert_eq!(
-        detached.field(9)?.acquire()?.str()?,
-        "\u{feff}A\0B"
-    );
+    assert_eq!(detached.field(9)?.acquire()?.str()?, "\u{feff}A\0B");
     Ok(())
 }
 
@@ -297,8 +237,21 @@ fn inspect_materialize_invalidate_graph(payload: &Payload) -> Result<(), Payload
     require_graph_detached(&detached)
 }
 
-fn crm_internal(context: &str, error: impl std::fmt::Display) -> CrmError {
-    CrmError::InternalError(format!("{context}: {error}"))
+fn inspect_borrowed_record(payload: &Payload) -> Result<(), PayloadError> {
+    let (_root, detached) = inspect_record_payload(payload)?;
+    require_record_detached(&detached)
+}
+
+fn inspect_borrowed_graph(payload: &Payload) -> Result<(), PayloadError> {
+    let (_root, detached) = inspect_graph_payload(payload)?;
+    require_graph_detached(&detached)
+}
+
+fn service_payload_error(error: PayloadError) -> CTwoError {
+    CTwoError::Semantic(c_two::generated::fastdb_adapter_error(
+        c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,
+        error,
+    ))
 }
 
 #[derive(Default)]
@@ -312,123 +265,59 @@ struct PortableHost {
     counts: Arc<Mutex<CallCounts>>,
 }
 
-impl CrmCallback for PortableHost {
-    fn invoke(
-        &self,
-        _route_name: &str,
-        method_idx: u16,
-        request: RequestData,
-        _response_pool: Arc<parking_lot::RwLock<MemPool>>,
-    ) -> Result<ResponseMeta, CrmError> {
-        let bytes = c2_server::RequestLease::new(request)
-            .into_owned_bytes()
-            .map_err(|error| crm_internal("materialize request", error))?;
-        let method = contract::METHODS
-            .get(usize::from(method_idx))
-            .ok_or_else(|| crm_internal("dispatch", format!("unknown method index {method_idx}")))?;
-        match method.name {
-            "graph_roundtrip" => {
-                let input = contract::decode_method_0_graph_roundtrip_input(&bytes)
-                    .map_err(|error| crm_internal("decode graph input", error))?;
-                inspect_materialize_invalidate_graph(&input)
-                    .map_err(|error| crm_internal("inspect graph input", error))?;
-                let output = build_graph_payload()
-                    .map_err(|error| crm_internal("build graph output", error))?;
-                let encoded = contract::encode_method_0_graph_roundtrip_output(&output)
-                    .map_err(|error| crm_internal("encode graph output", error))?;
-                self.counts.lock().graph += 1;
-                Ok(ResponseMeta::Inline(encoded))
-            }
-            "ping" => {
-                contract::decode_method_1_ping_input(&bytes)
-                    .map_err(|error| crm_internal("decode ping input", error))?;
-                assert!(contract::encode_method_1_ping_output().is_empty());
-                self.counts.lock().ping += 1;
-                Ok(ResponseMeta::Empty)
-            }
-            "record_roundtrip" => {
-                let input = contract::decode_method_2_record_roundtrip_input(&bytes)
-                    .map_err(|error| crm_internal("decode record input", error))?;
-                inspect_materialize_invalidate_record(&input)
-                    .map_err(|error| crm_internal("inspect record input", error))?;
-                let output = build_record_payload()
-                    .map_err(|error| crm_internal("build record output", error))?;
-                let encoded = contract::encode_method_2_record_roundtrip_output(&output)
-                    .map_err(|error| crm_internal("encode record output", error))?;
-                self.counts.lock().record += 1;
-                Ok(ResponseMeta::Inline(encoded))
-            }
-            name => Err(crm_internal("dispatch", format!("unknown method {name:?}"))),
-        }
+impl contract::Service for PortableHost {
+    fn method_0_graph_roundtrip(&self, input: &Payload) -> Result<Payload, CTwoError> {
+        inspect_borrowed_graph(input).map_err(service_payload_error)?;
+        let output = build_graph_payload().map_err(service_payload_error)?;
+        self.counts.lock().expect("call counts").graph += 1;
+        Ok(output)
+    }
+
+    fn method_1_ping(&self) -> Result<(), CTwoError> {
+        self.counts.lock().expect("call counts").ping += 1;
+        Ok(())
+    }
+
+    fn method_2_record_roundtrip(&self, input: &Payload) -> Result<Payload, CTwoError> {
+        inspect_borrowed_record(input).map_err(service_payload_error)?;
+        let output = build_record_payload().map_err(service_payload_error)?;
+        self.counts.lock().expect("call counts").record += 1;
+        Ok(output)
     }
 }
 
-async fn register_route(
-    server: &Server,
-    route_name: &str,
-    callback: Arc<dyn CrmCallback>,
-) -> Result<(), Box<dyn Error>> {
-    let mut access_map = HashMap::new();
-    for method in contract::METHODS {
-        access_map.insert(
-            u16::try_from(method.index)?,
-            match method.access {
-                "read" => AccessLevel::Read,
-                "write" => AccessLevel::Write,
-                other => return Err(format!("unsupported generated access {other:?}").into()),
-            },
-        );
-    }
-    let built = server.build_route(
-        RouteBuildSpec {
-            name: route_name.to_string(),
-            crm_ns: contract::CRM_NAMESPACE.to_string(),
-            crm_name: contract::CRM_NAME.to_string(),
-            crm_ver: contract::CRM_VERSION.to_string(),
-            abi_hash: contract::ABI_HASH.to_string(),
-            signature_hash: contract::SIGNATURE_HASH.to_string(),
-            method_names: contract::METHODS
-                .iter()
-                .map(|method| method.name.to_string())
-                .collect(),
-            access_map,
-            concurrency_mode: ConcurrencyMode::ReadParallel,
-            limits: SchedulerLimits::default(),
-        },
-        callback,
-    )?;
-    let reservation = server.reserve_route(built).await?;
-    server.commit_reserved_route(reservation).await?;
-    Ok(())
-}
-
-async fn run_host(address: &str, route_name: &str) -> Result<(), Box<dyn Error>> {
+fn run_host(address: &str, route_name: &str) -> Result<(), Box<dyn Error>> {
+    let server_id = address
+        .strip_prefix("ipc://")
+        .ok_or("Rust host address must use ipc://")?;
+    let runtime = Runtime::new(RuntimeOptions {
+        server_id: Some(server_id.to_string()),
+        use_process_relay_anchor: false,
+        ..RuntimeOptions::default()
+    })?;
+    let host = runtime.host(HostOptions::default().without_relay())?;
     let counts = Arc::new(Mutex::new(CallCounts::default()));
-    let server = Arc::new(Server::new(address, server_config())?);
-    register_route(
-        &server,
+    let mut registration = host.register(contract::service_definition(
         route_name,
-        Arc::new(PortableHost {
+        PortableHost {
             counts: Arc::clone(&counts),
-        }),
-    )
-    .await?;
-    server.begin_start_attempt()?;
-    let running = Arc::clone(&server);
-    let run_task = tokio::spawn(async move { running.run().await });
-    server.wait_until_ready(Duration::from_secs(10)).await?;
-    println!("READY {address}");
+        },
+    )?)?;
+    let actual_address = runtime
+        .server_address()
+        .ok_or("missing Rust host address")?;
+    if actual_address != address {
+        return Err(format!("expected host address {address:?}, got {actual_address:?}").into());
+    }
+    println!("READY {actual_address}");
     std::io::stdout().flush()?;
 
-    tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)
-    })
-    .await??;
-    server.shutdown_and_wait(Duration::from_secs(10)).await?;
-    run_task.await??;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    registration.close()?;
+    drop(host);
 
-    let counts = counts.lock();
+    let counts = counts.lock().expect("call counts");
     println!(
         "RUST_HOST_RECEIPT {{\"graph\":{},\"ping\":{},\"record\":{}}}",
         counts.graph, counts.ping, counts.record
@@ -438,40 +327,64 @@ async fn run_host(address: &str, route_name: &str) -> Result<(), Box<dyn Error>>
 }
 
 fn run_client(address: &str, route_name: &str, label: &str) -> Result<(), Box<dyn Error>> {
-    let mut transport = SyncClient::connect(address, Some(client_pool()), client_config())?;
+    let runtime = Runtime::new(RuntimeOptions {
+        use_process_relay_anchor: false,
+        ..RuntimeOptions::default()
+    })?;
     let mut wrong = contract::expected_route(route_name)?;
     wrong.abi_hash = "0".repeat(64);
-    match transport.acquire_route(&wrong) {
-        Err(IpcError::ContractMismatch(_)) => {}
+    match runtime.connect(
+        wrong,
+        Connect::DirectIpc {
+            address: address.to_string(),
+        },
+    ) {
+        Err(CTwoError::Semantic(error))
+            if error.code == c_two::generated::ErrorCode::ContractMismatch => {}
         Err(error) => return Err(format!("wrong route failed through wrong owner: {error}").into()),
         Ok(_) => return Err("wrong route contract unexpectedly acquired".into()),
     }
 
-    {
-        let client = contract::ContractClient::acquire(&transport, route_name)?;
-        let graph = build_graph_payload()?;
-        let graph_response = client.method_0_graph_roundtrip(&graph)?;
-        inspect_materialize_invalidate_graph(&graph_response)?;
+    let core_client = runtime.connect(
+        contract::expected_route(route_name)?,
+        Connect::DirectIpc {
+            address: address.to_string(),
+        },
+    )?;
+    let client = contract::ContractClient::new(core_client)?;
+    let graph = build_graph_payload()?;
+    let graph_response = client.method_0_graph_roundtrip(&graph)?;
+    inspect_materialize_invalidate_graph(&graph_response)?;
 
-        client.method_1_ping()?;
+    client.method_1_ping()?;
 
-        let record = build_record_payload()?;
-        let record_response = client.method_2_record_roundtrip(&record)?;
-        inspect_materialize_invalidate_record(&record_response)?;
+    let record = build_record_payload()?;
+    let record_response = client.method_2_record_roundtrip(&record)?;
+    inspect_materialize_invalidate_record(&record_response)?;
 
-        match client.method_2_record_roundtrip(&graph) {
-            Err(contract::ContractCallError::Payload(error)) => {
-                assert_eq!(error.symbol(), "DIGEST_MISMATCH");
-                assert_eq!(error.path(), "/payload/spec_sha256");
-            }
-            Err(error) => {
-                return Err(format!("digest mismatch failed through wrong owner: {error}").into());
-            }
-            Ok(_) => return Err("wrong FastDB payload digest unexpectedly succeeded".into()),
+    match client.method_2_record_roundtrip(&graph) {
+        Err(CTwoError::Semantic(error)) => {
+            assert_eq!(
+                error.code,
+                c_two::generated::ErrorCode::ClientInputSerializing
+            );
+            assert_eq!(
+                error.details.get("fastdb_symbol").map(String::as_str),
+                Some("DIGEST_MISMATCH")
+            );
+            assert_eq!(
+                error.details.get("fastdb_path").map(String::as_str),
+                Some("/payload/spec_sha256")
+            );
         }
+        Err(error) => {
+            return Err(format!("digest mismatch failed through wrong owner: {error}").into());
+        }
+        Ok(_) => return Err("wrong FastDB payload digest unexpectedly succeeded".into()),
     }
-    transport.close();
-    println!("RUST_CLIENT_RECEIPT {{\"label\":{label:?},\"graph\":1,\"ping\":1,\"record\":1,\"route_mismatch\":1,\"digest_mismatch\":1}}");
+    println!(
+        "RUST_CLIENT_RECEIPT {{\"label\":{label:?},\"graph\":1,\"ping\":1,\"record\":1,\"route_mismatch\":1,\"digest_mismatch\":1}}"
+    );
     println!("OK rust-client {label}");
     Ok(())
 }
@@ -482,11 +395,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let address = args.next().ok_or("missing IPC address")?;
     let route_name = args.next().ok_or("missing route name")?;
     match mode.as_str() {
-        "host" => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()?
-            .block_on(run_host(&address, &route_name)),
+        "host" => run_host(&address, &route_name),
         "client" => {
             let label = args.next().ok_or("missing client label")?;
             run_client(&address, &route_name, &label)

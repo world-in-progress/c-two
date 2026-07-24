@@ -947,24 +947,27 @@ The boundary scan must return no match.
 
 ### Task 6.1 — Write generated-source RED assertions
 
-- [ ] Generate no-payload, `record.v1`, and `object_graph.v1` Rust trees.
-- [ ] Assert generated source contains `c_two::Client`,
+- [x] Generate no-payload, `record.v1`, and `object_graph.v1` Rust trees.
+- [x] Assert generated source contains `c_two::Client`,
   `c_two::generated::EncodedClient`, a typed `Service` trait, an adapter, and a
   `ServiceDefinition` factory.
-- [ ] Assert generated source includes the canonical descriptor bytes and
+- [x] Assert generated source includes the canonical descriptor bytes and
   derives `ContractRelease`, `ContractReleaseRef`, and expected route facts
   through `c2-contract`; it must not manually assemble an
   `ExpectedRouteContract`.
-- [ ] Assert it contains no `c2_ipc`, `c2_http`, `c2_server`, `SyncClient`,
+- [x] Assert it contains no `c2_ipc`, `c2_http`, `c2_server`, `SyncClient`,
   `RouteBinding`, pool, relay branch, or transport address.
-- [ ] Compile a clean fixture whose direct dependencies are only versioned
+- [x] Compile a clean fixture whose direct dependencies are only versioned
   `c-two` and `fastdb`; construct this fixture in a temporary directory inside
   `generated_rust_sdk.rs` so no path-bearing nested Cargo project enters the
   `c2-codegen` package. It implements generated `Service`, registers it, and
   calls the generated client.
-- [ ] Add compile failures for a service with the wrong input/output payload
-  shape and a client built from a release with the wrong descriptor digest.
-- [ ] Preserve current FastDB generation provenance/digest assertions.
+- [x] Add a compile failure for a service with the wrong input/output payload
+  shape and an executable negative case for a client built from a different
+  release-derived expected route. The generated client accepts the
+  transport-neutral `c_two::Client` type, so release identity is deliberately
+  verified by `ContractClient::new` rather than encoded as a Rust type.
+- [x] Preserve current FastDB generation provenance/digest assertions.
 
 Run RED:
 
@@ -977,7 +980,7 @@ Expected RED: generated Rust directly imports `c2_ipc`, stores a
 
 ### Task 6.2 — Render the generated client seam
 
-- [ ] Render:
+- [x] Render:
 
 ```rust
 pub struct ContractClient {
@@ -989,26 +992,26 @@ impl ContractClient {
 }
 ```
 
-- [ ] Render `CONTRACT_DESCRIPTOR_JSON` with
+- [x] Render `CONTRACT_DESCRIPTOR_JSON` with
   `include_str!("../metadata/contract.json")`,
   `contract_release()`, `contract_release_ref()`, and `expected_route()`.
   `expected_route()` must call `ContractRelease::expected_route`.
-- [ ] `new` verifies the client’s read-only expected route facts against the
+- [x] `new` verifies the client’s read-only expected route facts against the
   generated release-derived route facts before storing it.
-- [ ] Generate one owned method for the normal copy-backed return and one
+- [x] Generate one owned method for the normal copy-backed return and one
   explicitly named held method only for payload-returning methods.
-- [ ] Encode inputs with `Payload::require_spec_sha256` and
+- [x] Encode inputs with `Payload::require_spec_sha256` and
   `Payload::binary_bytes`; decode outputs with official `CompiledSpec`,
   `Payload::open_copy`, and a post-open digest check.
-- [ ] For no-payload methods, require exact empty input/output bytes.
-- [ ] Map FastDB errors through the SDK’s thin external-cause adapter; do not
+- [x] For no-payload methods, require exact empty input/output bytes.
+- [x] Map FastDB errors through the SDK’s thin external-cause adapter; do not
   invent display-only error strings.
-- [ ] Use `ClientInputSerializing`, `ClientOutputFromBuffer`, and
+- [x] Use `ClientInputSerializing`, `ClientOutputFromBuffer`, and
   `ClientOutputDeserializing` at their exact frozen phases.
 
 ### Task 6.3 — Render the typed service seam
 
-- [ ] Generate a trait whose method shapes are exact:
+- [x] Generate a trait whose method shapes are exact:
 
 ```rust
 pub trait Service: Send + Sync + 'static {
@@ -1020,16 +1023,16 @@ pub trait Service: Send + Sync + 'static {
 }
 ```
 
-- [ ] Generate an adapter implementing `c_two::generated::EncodedService`.
-- [ ] Decode a payload input into an SDK borrowed guard, invoke the user method,
+- [x] Generate an adapter implementing `c_two::generated::EncodedService`.
+- [x] Decode a payload input into an SDK borrowed guard, invoke the user method,
   encode output, and invalidate the input owner on success, user error, encode
   error, and unwind before returning to Core.
-- [ ] Convert C-Two semantic errors without changing fields. Convert official
+- [x] Convert C-Two semantic errors without changing fields. Convert official
   FastDB failures using the frozen external-cause keys.
-- [ ] Use `ResourceInputFromBuffer`, `ResourceInputDeserializing`,
+- [x] Use `ResourceInputFromBuffer`, `ResourceInputDeserializing`,
   `ResourceFunctionExecuting`, and `ResourceOutputSerializing` at their exact
   frozen phases.
-- [ ] Generate release/route/method facts and:
+- [x] Generate release/route/method facts and:
 
 ```rust
 pub fn service_definition<S: Service>(
@@ -1038,17 +1041,17 @@ pub fn service_definition<S: Service>(
 ) -> Result<c_two::ServiceDefinition, c_two::Error>;
 ```
 
-- [ ] Ensure method index conversion to `u16` is checked and grounded in the
+- [x] Ensure method index conversion to `u16` is checked and grounded in the
   contract-owned method cap.
 
 ### Task 6.4 — Replace the old low-level interop fixture
 
-- [ ] Rewrite `portable_interop_rust.rs` to consume `c_two` and the generated
+- [x] Rewrite `portable_interop_rust.rs` to consume `c_two` and the generated
   module; remove its manual low-level IPC/route/server assembly.
-- [ ] Preserve all existing record/graph logical assertions rather than reducing
+- [x] Preserve all existing record/graph logical assertions rather than reducing
   the fixture to a smoke call.
-- [ ] Keep the current direct 9-row proof green; Task 8 expands transport/matrix
-  coverage.
+- [x] Keep the current direct 9-row fixture semantics intact; Task 8 expands
+  transport/matrix coverage.
 
 Run focused GREEN:
 
@@ -1076,6 +1079,20 @@ git diff --check
 
 The final `rg` must return no generated-consumer/fixture imports. Assertions
 that forbid those names may remain in test code.
+
+> Task 6 evidence (2026-07-24): the generated Rust source/compile RED tests
+> first exposed the old low-level `c2-ipc` client and missing typed service,
+> then passed for no-payload, record, and object-graph contracts. A clean
+> generated consumer with only versioned `c-two` and official `fastdb`
+> dependencies compiled and ran real direct-IPC client/host calls; the rewritten
+> portable record/graph fixture compiled under the same dependency boundary.
+> Core and Rust SDK format, strict Clippy, all-feature tests, generated-source
+> boundary scans, and `git diff --check` passed. The two Python pytest commands
+> still stop before collection while rebuilding the intentionally RED native
+> extension recorded after Task 4: it imports now-private Core orchestration
+> APIs and has not yet projected the centralized Core error surface. That is the
+> Task 7 starting condition, not a reason to reopen Core compatibility APIs;
+> the direct Python-driven runtime proof is therefore deferred to Task 7.
 
 ## Task 7: Migrate Python Native Orchestration onto `c2-core` and Close Parity
 

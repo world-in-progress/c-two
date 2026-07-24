@@ -54,135 +54,175 @@ fn render_rust(descriptor: &ValidatedContractDescriptor, methods: &[TargetMethod
     render_rust_contract_facts(&mut output, descriptor, methods);
     output.push_str(
         r#"
-#[derive(Debug)]
-pub enum ContractCallError {
-    Contract(c2_contract::ContractError),
-    Transport(c2_ipc::IpcError),
-    Payload(fastdb::PayloadError),
-    Response(String),
-    UnexpectedPayload {
-        method: &'static str,
-        direction: &'static str,
-        actual_bytes: usize,
-    },
+pub fn contract_release() -> Result<c_two::ContractRelease, c_two::Error> {
+    Ok(c_two::ContractRelease::from_descriptor_json(
+        CONTRACT_DESCRIPTOR_JSON.as_bytes(),
+    )?)
 }
 
-impl std::fmt::Display for ContractCallError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Contract(error) => write!(formatter, "contract error: {error}"),
-            Self::Transport(error) => write!(formatter, "transport error: {error}"),
-            Self::Payload(error) => write!(formatter, "FastDB payload error: {error}"),
-            Self::Response(error) => write!(formatter, "response materialization error: {error}"),
-            Self::UnexpectedPayload {
-                method,
-                direction,
-                actual_bytes,
-            } => write!(
-                formatter,
-                "method {method:?} has no {direction} payload but received {actual_bytes} byte(s)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ContractCallError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Contract(error) => Some(error),
-            Self::Transport(error) => Some(error),
-            Self::Payload(error) => Some(error),
-            Self::Response(_) | Self::UnexpectedPayload { .. } => None,
-        }
-    }
-}
-
-impl From<c2_contract::ContractError> for ContractCallError {
-    fn from(error: c2_contract::ContractError) -> Self {
-        Self::Contract(error)
-    }
-}
-
-impl From<c2_ipc::IpcError> for ContractCallError {
-    fn from(error: c2_ipc::IpcError) -> Self {
-        Self::Transport(error)
-    }
-}
-
-impl From<fastdb::PayloadError> for ContractCallError {
-    fn from(error: fastdb::PayloadError) -> Self {
-        Self::Payload(error)
-    }
+pub fn contract_release_ref() -> Result<c_two::ContractReleaseRef, c_two::Error> {
+    Ok(contract_release()?.reference())
 }
 
 pub fn expected_route(
     route_name: impl Into<String>,
-) -> Result<c2_contract::ExpectedRouteContract, c2_contract::ContractError> {
-    let expected = c2_contract::ExpectedRouteContract {
-        route_name: route_name.into(),
-        crm_ns: CRM_NAMESPACE.to_string(),
-        crm_name: CRM_NAME.to_string(),
-        crm_ver: CRM_VERSION.to_string(),
-        abi_hash: ABI_HASH.to_string(),
-        signature_hash: SIGNATURE_HASH.to_string(),
-    };
-    c2_contract::validate_expected_route_contract(&expected)?;
-    Ok(expected)
+) -> Result<c_two::ExpectedRouteContract, c_two::Error> {
+    Ok(contract_release()?.expected_route(route_name)?)
 }
 
-pub struct ContractClient<'a> {
-    client: &'a c2_ipc::SyncClient,
-    binding: c2_ipc::RouteBinding,
+pub struct ContractClient {
+    client: c_two::Client,
 }
 
-impl<'a> ContractClient<'a> {
-    pub fn acquire(
-        client: &'a c2_ipc::SyncClient,
-        route_name: impl Into<String>,
-    ) -> Result<Self, ContractCallError> {
-        let expected = expected_route(route_name)?;
-        let binding = client.acquire_route(&expected)?;
-        Ok(Self { client, binding })
+impl ContractClient {
+    pub fn new(client: c_two::Client) -> Result<Self, c_two::Error> {
+        let expected = expected_route(client.expected_route().route_name.clone())?;
+        if client.expected_route() != &expected {
+            return Err(c_two::ContractError::InvalidDescriptor {
+                path: "$.client.expected_route".to_string(),
+                message: format!(
+                    "client route facts do not match generated release {}: expected {:?}, got {:?}",
+                    DESCRIPTOR_SHA256,
+                    expected,
+                    client.expected_route(),
+                ),
+            }
+            .into());
+        }
+        Ok(Self { client })
     }
 
-    pub fn binding(&self) -> &c2_ipc::RouteBinding {
-        &self.binding
-    }
-
-    fn response_bytes(
-        &self,
-        response: c2_ipc::ResponseData,
-    ) -> Result<Vec<u8>, ContractCallError> {
-        response
-            .into_bytes_with_pool(
-                &self.client.server_pool_arc(),
-                &self.client.reassembly_pool_arc(),
-            )
-            .map_err(ContractCallError::Response)
+    pub fn expected_route(&self) -> &c_two::ExpectedRouteContract {
+        self.client.expected_route()
     }
 "#,
     );
     for method in methods {
         render_rust_client_method(&mut output, method);
     }
-    output.push_str("}\n\n");
+    output.push_str("}\n\npub trait Service: Send + Sync + 'static {\n");
+    for method in methods {
+        render_rust_service_trait_method(&mut output, method);
+    }
+    output.push_str(
+        r#"}
+
+struct ServiceAdapter<S> {
+    service: S,
+}
+
+impl<S: Service> ServiceAdapter<S> {
+    fn invoke_checked(
+        &self,
+        method_index: u16,
+        request: &[u8],
+    ) -> Result<Vec<u8>, c_two::generated::C2Error> {
+        match method_index {
+"#,
+    );
+    for method in methods {
+        render_rust_service_dispatch_arm(&mut output, method);
+    }
+    output.push_str(
+        r#"            other => Err(c_two::generated::C2Error::new(
+                c_two::generated::ErrorCode::ProtocolViolation,
+                format!("unknown generated method index {other}"),
+            )),
+        }
+    }
+}
+
+impl<S: Service> c_two::generated::EncodedService for ServiceAdapter<S> {
+    fn invoke(
+        &self,
+        method_index: u16,
+        request: &[u8],
+    ) -> Result<Vec<u8>, c_two::generated::C2Error> {
+        let method_name = METHODS
+            .get(usize::from(method_index))
+            .map(|method| method.name)
+            .unwrap_or("<unknown>");
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.invoke_checked(method_index, request)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(c_two::generated::normalize_adapter_failure(
+                c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,
+                c_two::generated::AdapterFailure::Local {
+                    message: format!("service method {method_name:?} panicked"),
+                    details: std::collections::BTreeMap::from([
+                        ("method".to_string(), method_name.to_string()),
+                        ("method_index".to_string(), method_index.to_string()),
+                    ]),
+                },
+            )),
+        }
+    }
+}
+
+pub fn service_definition<S: Service>(
+    route_name: impl Into<String>,
+    service: S,
+) -> Result<c_two::ServiceDefinition, c_two::Error> {
+    let release = contract_release()?;
+    let release_ref = contract_release_ref()?;
+    let methods = METHODS
+        .iter()
+        .map(|method| -> Result<c_two::generated::MethodDefinition, c_two::Error> {
+            let index = u16::try_from(method.index).map_err(|_| {
+                c_two::ContractError::InvalidDescriptor {
+                    path: "$.methods".to_string(),
+                    message: format!(
+                        "generated method index {} exceeds the C-Two wire capacity",
+                        method.index,
+                    ),
+                }
+            })?;
+            Ok(c_two::generated::MethodDefinition {
+                index,
+                name: method.name,
+                access: method.access,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    c_two::ServiceDefinition::new(
+        &release,
+        release_ref,
+        route_name,
+        methods,
+        std::sync::Arc::new(ServiceAdapter { service }),
+    )
+}
+
+"#,
+    );
     for method in methods {
         render_rust_payload_adapters(&mut output, method);
     }
     output.push_str(
         r#"fn require_empty_payload(
+    phase: c_two::generated::AdapterFailurePhase,
     method: &'static str,
     direction: &'static str,
     bytes: &[u8],
-) -> Result<(), ContractCallError> {
+) -> Result<(), c_two::generated::C2Error> {
     if bytes.is_empty() {
         Ok(())
     } else {
-        Err(ContractCallError::UnexpectedPayload {
-            method,
-            direction,
-            actual_bytes: bytes.len(),
-        })
+        Err(c_two::generated::normalize_adapter_failure(
+            phase,
+            c_two::generated::AdapterFailure::Local {
+                message: format!(
+                    "method {method:?} has no {direction} payload but received {} byte(s)",
+                    bytes.len(),
+                ),
+                details: std::collections::BTreeMap::from([
+                    ("actual_bytes".to_string(), bytes.len().to_string()),
+                    ("direction".to_string(), direction.to_string()),
+                    ("method".to_string(), method.to_string()),
+                ]),
+            },
+        ))
     }
 }
 "#,
@@ -196,7 +236,8 @@ fn render_rust_contract_facts(
     methods: &[TargetMethod<'_>],
 ) {
     output.push_str(&format!(
-        "pub const CONTRACT_SCHEMA: &str = {};\n\
+        "pub const CONTRACT_DESCRIPTOR_JSON: &str = include_str!(\"../metadata/contract.json\");\n\
+         pub const CONTRACT_SCHEMA: &str = {};\n\
          pub const CRM_NAMESPACE: &str = {};\n\
          pub const CRM_NAME: &str = {};\n\
          pub const CRM_VERSION: &str = {};\n\
@@ -216,7 +257,7 @@ fn render_rust_contract_facts(
          pub struct MethodBinding {\n\
          \x20   pub index: usize,\n\
          \x20   pub name: &'static str,\n\
-         \x20   pub access: &'static str,\n\
+         \x20   pub access: c_two::generated::MethodAccess,\n\
          \x20   pub input_sha256: Option<&'static str>,\n\
          \x20   pub output_sha256: Option<&'static str>,\n\
          }\n\n\
@@ -227,7 +268,7 @@ fn render_rust_contract_facts(
             "    MethodBinding {{ index: {}, name: {}, access: {}, input_sha256: {}, output_sha256: {} }},\n",
             method.index,
             quoted(method.name),
-            quoted(access_name(method.access)),
+            rust_method_access(method.access),
             rust_option(method.input_sha256),
             rust_option(method.output_sha256),
         ));
@@ -253,61 +294,255 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
         format!("encode_{symbol}_input()")
     };
     output.push_str(&format!(
-        "\n    pub fn {symbol}(&self{parameter}) -> Result<{return_type}, ContractCallError> {{\n\
+        "\n    pub fn {symbol}(&self{parameter}) -> Result<{return_type}, c_two::Error> {{\n\
          \x20       let request = {request};\n\
-         \x20       let response = self.client.call_bound(&self.binding, {}, &request)?;\n\
-         \x20       let response = self.response_bytes(response)?;\n\
-         \x20       Ok(decode_{symbol}_output(&response)?)\n\
+         \x20       let response = c_two::generated::EncodedClient::call_owned(\n\
+         \x20           &self.client,\n\
+         \x20           {},\n\
+         \x20           &request,\n\
+         \x20       )?;\n\
+         \x20       decode_{symbol}_output(&response)\n\
          \x20   }}\n",
         quoted(method.name),
     ));
+    if method.output_sha256.is_some() {
+        output.push_str(&format!(
+            "\n    pub fn hold_{symbol}(\n\
+             \x20       &self{parameter},\n\
+             \x20   ) -> Result<c_two::Held<fastdb::Payload>, c_two::Error> {{\n\
+             \x20       let request = {request};\n\
+             \x20       let response = c_two::generated::EncodedClient::call_held(\n\
+             \x20           &self.client,\n\
+             \x20           {},\n\
+             \x20           &request,\n\
+             \x20       )?;\n\
+             \x20       decode_{symbol}_output_held(response)\n\
+             \x20   }}\n",
+            quoted(method.name),
+        ));
+    }
+}
+
+fn render_rust_service_trait_method(output: &mut String, method: &TargetMethod<'_>) {
+    let symbol = method_symbol(method.index, method.name);
+    let parameter = if method.input_sha256.is_some() {
+        ", input: &fastdb::Payload"
+    } else {
+        ""
+    };
+    let return_type = if method.output_sha256.is_some() {
+        "fastdb::Payload"
+    } else {
+        "()"
+    };
+    output.push_str(&format!(
+        "    fn {symbol}(&self{parameter}) -> Result<{return_type}, c_two::Error>;\n"
+    ));
+}
+
+fn render_rust_service_dispatch_arm(output: &mut String, method: &TargetMethod<'_>) {
+    let symbol = method_symbol(method.index, method.name);
+    output.push_str(&format!("            {} => {{\n", method.index));
+    if method.input_sha256.is_some() {
+        output.push_str(&format!(
+            "                let input = decode_{symbol}_input_borrowed(request)?;\n\
+             \x20               let output = self\n\
+             \x20                   .service\n\
+             \x20                   .{symbol}(input.payload())\n\
+             \x20                   .map_err(|error| {{\n\
+             \x20                       c_two::generated::adapter_error(\n\
+             \x20                           c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,\n\
+             \x20                           error,\n\
+             \x20                       )\n\
+             \x20                   }})?;\n"
+        ));
+    } else {
+        output.push_str(&format!(
+            "                decode_{symbol}_input(request)?;\n\
+             \x20               let output = self\n\
+             \x20                   .service\n\
+             \x20                   .{symbol}()\n\
+             \x20                   .map_err(|error| {{\n\
+             \x20                       c_two::generated::adapter_error(\n\
+             \x20                           c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,\n\
+             \x20                           error,\n\
+             \x20                       )\n\
+             \x20                   }})?;\n"
+        ));
+    }
+    if method.output_sha256.is_some() {
+        output.push_str(&format!(
+            "                encode_{symbol}_output(&output)\n"
+        ));
+    } else {
+        output.push_str(&format!(
+            "                let () = output;\n\
+             \x20               Ok(encode_{symbol}_output())\n"
+        ));
+    }
+    output.push_str("            }\n");
 }
 
 fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) {
     let symbol = method_symbol(method.index, method.name);
-    render_rust_direction(output, &symbol, method.name, "input", method.input_sha256);
-    render_rust_direction(output, &symbol, method.name, "output", method.output_sha256);
-}
-
-fn render_rust_direction(
-    output: &mut String,
-    symbol: &str,
-    method_name: &str,
-    direction: &'static str,
-    digest: Option<&str>,
-) {
-    if let Some(digest) = digest {
+    if let Some(digest) = method.input_sha256 {
         output.push_str(&format!(
-            "\npub fn encode_{symbol}_{direction}(\n\
+            "pub fn encode_{symbol}_input(\n\
              \x20   payload: &fastdb::Payload,\n\
-             ) -> Result<Vec<u8>, fastdb::PayloadError> {{\n\
-             \x20   payload.require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)?;\n\
-             \x20   payload.binary_bytes()\n\
+             ) -> Result<Vec<u8>, c_two::Error> {{\n\
+             \x20   payload\n\
+             \x20       .require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+             \x20       .map_err(|error| c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ClientInputSerializing,\n\
+             \x20           error,\n\
+             \x20       )))?;\n\
+             \x20   payload.binary_bytes().map_err(|error| {{\n\
+             \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ClientInputSerializing,\n\
+             \x20           error,\n\
+             \x20       ))\n\
+             \x20   }})\n\
              }}\n\n\
-             pub fn decode_{symbol}_{direction}(\n\
+             fn decode_{symbol}_input_borrowed(\n\
              \x20   bytes: &[u8],\n\
-             ) -> Result<fastdb::Payload, fastdb::PayloadError> {{\n\
-             \x20   let spec = payload_{digest}::compile_spec()?;\n\
-             \x20   let payload = fastdb::Payload::open_copy(\n\
-             \x20       &spec,\n\
-             \x20       bytes,\n\
-             \x20       &fastdb::OpenOptions::default(),\n\
-             \x20   )?;\n\
-             \x20   payload.require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)?;\n\
-             \x20   Ok(payload)\n\
-             }}\n"
+             ) -> Result<c_two::generated::BorrowedPayload, c_two::generated::C2Error> {{\n\
+             \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
+             \x20       c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ResourceInputFromBuffer,\n\
+             \x20           error,\n\
+             \x20       )\n\
+             \x20   }})?;\n\
+             \x20   let input = c_two::generated::open_borrowed(&spec, bytes).map_err(|error| {{\n\
+             \x20       c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ResourceInputFromBuffer,\n\
+             \x20           error,\n\
+             \x20       )\n\
+             \x20   }})?;\n\
+             \x20   input\n\
+             \x20       .payload()\n\
+             \x20       .require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+             \x20       .map_err(|error| {{\n\
+             \x20           c_two::generated::fastdb_adapter_error(\n\
+             \x20               c_two::generated::AdapterFailurePhase::ResourceInputDeserializing,\n\
+             \x20               error,\n\
+             \x20           )\n\
+             \x20       }})?;\n\
+             \x20   Ok(input)\n\
+             }}\n\n"
         ));
     } else {
         output.push_str(&format!(
-            "\npub fn encode_{symbol}_{direction}() -> Vec<u8> {{\n\
+            "pub fn encode_{symbol}_input() -> Vec<u8> {{\n\
              \x20   Vec::new()\n\
              }}\n\n\
-             pub fn decode_{symbol}_{direction}(\n\
+             fn decode_{symbol}_input(\n\
              \x20   bytes: &[u8],\n\
-             ) -> Result<(), ContractCallError> {{\n\
-             \x20   require_empty_payload({}, {direction:?}, bytes)\n\
-             }}\n",
-            quoted(method_name),
+             ) -> Result<(), c_two::generated::C2Error> {{\n\
+             \x20   require_empty_payload(\n\
+             \x20       c_two::generated::AdapterFailurePhase::ResourceInputDeserializing,\n\
+             \x20       {},\n\
+             \x20       \"input\",\n\
+             \x20       bytes,\n\
+             \x20   )\n\
+             }}\n\n",
+            quoted(method.name),
+        ));
+    }
+
+    if let Some(digest) = method.output_sha256 {
+        output.push_str(&format!(
+            "pub fn decode_{symbol}_output(\n\
+             \x20   bytes: &[u8],\n\
+             ) -> Result<fastdb::Payload, c_two::Error> {{\n\
+             \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
+             \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+             \x20           error,\n\
+             \x20       ))\n\
+             \x20   }})?;\n\
+             \x20   let payload = c_two::generated::open_owned(&spec, bytes).map_err(|error| {{\n\
+             \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+             \x20           error,\n\
+             \x20       ))\n\
+             \x20   }})?;\n\
+             \x20   payload\n\
+             \x20       .require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+             \x20       .map_err(|error| {{\n\
+             \x20           c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+             \x20               c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,\n\
+             \x20               error,\n\
+             \x20           ))\n\
+             \x20       }})?;\n\
+             \x20   Ok(payload)\n\
+             }}\n\n\
+             pub fn decode_{symbol}_output_held(\n\
+             \x20   response: c_two::generated::HeldResponse,\n\
+             ) -> Result<c_two::Held<fastdb::Payload>, c_two::Error> {{\n\
+             \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
+             \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+             \x20           error,\n\
+             \x20       ))\n\
+             \x20   }})?;\n\
+             \x20   let mut held = c_two::generated::open_held(&spec, response).map_err(|error| {{\n\
+             \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+             \x20           error,\n\
+             \x20       ))\n\
+             \x20   }})?;\n\
+             \x20   let Some(payload) = held.value() else {{\n\
+             \x20       return Err(c_two::ContractError::InvalidDescriptor {{\n\
+             \x20           path: \"$.held\".to_string(),\n\
+             \x20           message: \"new held payload was already released\".to_string(),\n\
+             \x20       }}.into());\n\
+             \x20   }};\n\
+             \x20   if let Err(error) =\n\
+             \x20       payload.require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+             \x20   {{\n\
+             \x20       let semantic = c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,\n\
+             \x20           error,\n\
+             \x20       );\n\
+             \x20       let _ = held.release();\n\
+             \x20       return Err(c_two::Error::Semantic(semantic));\n\
+             \x20   }}\n\
+             \x20   Ok(held)\n\
+             }}\n\n\
+             fn encode_{symbol}_output(\n\
+             \x20   payload: &fastdb::Payload,\n\
+             ) -> Result<Vec<u8>, c_two::generated::C2Error> {{\n\
+             \x20   payload\n\
+             \x20       .require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+             \x20       .map_err(|error| {{\n\
+             \x20           c_two::generated::fastdb_adapter_error(\n\
+             \x20               c_two::generated::AdapterFailurePhase::ResourceOutputSerializing,\n\
+             \x20               error,\n\
+             \x20           )\n\
+             \x20       }})?;\n\
+             \x20   payload.binary_bytes().map_err(|error| {{\n\
+             \x20       c_two::generated::fastdb_adapter_error(\n\
+             \x20           c_two::generated::AdapterFailurePhase::ResourceOutputSerializing,\n\
+             \x20           error,\n\
+             \x20       )\n\
+             \x20   }})\n\
+             }}\n\n"
+        ));
+    } else {
+        output.push_str(&format!(
+            "pub fn decode_{symbol}_output(bytes: &[u8]) -> Result<(), c_two::Error> {{\n\
+             \x20   require_empty_payload(\n\
+             \x20       c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,\n\
+             \x20       {},\n\
+             \x20       \"output\",\n\
+             \x20       bytes,\n\
+             \x20   )\n\
+             \x20   .map_err(c_two::Error::Semantic)\n\
+             }}\n\n\
+             fn encode_{symbol}_output() -> Vec<u8> {{\n\
+             \x20   Vec::new()\n\
+             }}\n\n",
+            quoted(method.name),
         ));
     }
 }
@@ -730,6 +965,13 @@ fn access_name(access: MethodAccess) -> &'static str {
     match access {
         MethodAccess::Read => "read",
         MethodAccess::Write => "write",
+    }
+}
+
+fn rust_method_access(access: MethodAccess) -> &'static str {
+    match access {
+        MethodAccess::Read => "c_two::generated::MethodAccess::Read",
+        MethodAccess::Write => "c_two::generated::MethodAccess::Write",
     }
 }
 
