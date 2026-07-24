@@ -45,6 +45,11 @@ uv run pytest sdk/python/tests/unit/test_held_result.py::TestHeldResultBasic::te
 # Rust core tests
 cargo test --manifest-path core/Cargo.toml --workspace
 
+# Opt-in compiled Rust/Python portable-payload interoperability proof
+C2_RUN_PORTABLE_INTEROP=1 C2_RELAY_ANCHOR_ADDRESS= \
+  uv run pytest sdk/python/tests/integration/test_portable_payload_cross_language.py \
+  -q --timeout=300 -s
+
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
@@ -87,12 +92,13 @@ Path: `sdk/python/src/c_two/crm/`
 - CRM contracts are interface classes decorated with `@cc.crm(namespace='...', version='...')`.
 - Only methods in the contract are exposed remotely.
 - CRM route contracts are identified by route name plus the CRM namespace, CRM name, CRM version, ABI hash, and signature hash. Python may compute the descriptor/fingerprints from the CRM class, but Rust `c2-contract` validates the complete expected route contract at IPC and relay boundaries.
-- A persistent CRM contract release is a Rust-validated `ContractReleaseRef` derived from canonical `c-two.contract.v1` content. It never contains a route name. `ExpectedRouteContract` is derived later from a validated release plus a runtime route name.
+- A persistent CRM contract release is a Rust-validated `ContractReleaseRef` derived from canonical `c-two.contract.v2` content. It never contains a route name. `ExpectedRouteContract` is derived later from a validated release plus a runtime route name.
 - Resource implementations are plain Python classes and are not decorated.
-- Portable FastDB CRM payloads are inferred from `fastdb4py` annotations and represented by `PayloadAbiRef` values. Python-only fallback values use pickle and must not be treated as portable schema/codegen inputs.
-- FastDB retained response views are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
+- Portable methods declare zero or one input and zero or one output with `@cc.transfer(input=FASTDB_SPEC, output=FASTDB_SPEC)`. Their Python parameter and return type is `fastdb4py.payload.Payload`; C-Two embeds each nested specification as an opaque JSON value and delegates it to FastDB Core.
+- Python-only fallback values use pickle and must not be treated as portable descriptor or codegen inputs.
+- FastDB retained response owners are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
 - CRM methods can use `@cc.read` or `@cc.write`; writes are the default.
-- `@cc.transfer(input=..., output=...)`, `@cc.transferable`, and `@cc.transfer(buffer='hold')` are obsolete for the FDB-first path and must not be reintroduced as codec or lifetime selection mechanisms.
+- `@cc.transfer(input=..., output=...)` is the only portable FastDB binding authoring surface. `@cc.transferable` and `@cc.transfer(buffer='hold')` are obsolete and must not be reintroduced as codec or lifetime selection mechanisms.
 - `@on_shutdown` marks one public method as a shutdown callback. It is not exposed through RPC.
 
 ### Client Layer
@@ -186,7 +192,8 @@ Paths: `core/`, `sdk/python/native/`
 
 | Layer | Crate | Purpose |
 | --- | --- | --- |
-| foundation | `c2-contract` | Route contract validation and canonical descriptor hashing |
+| foundation | `c2-contract` | `c-two.contract.v2` validation, canonical descriptor hashing, release identity, and opaque nested-spec extraction |
+| foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and new-tree publication |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
 | foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
@@ -251,30 +258,39 @@ class Grid:
 
 ### FastDB CRM Pattern
 
-Author portable FDB-first CRM value types with `fastdb4py`, not `c_two.fastdb`. Keep `c_two.fastdb` for C-Two-owned integration helpers such as bridge derivation, call-db planning, and TypeScript helper generation.
+Author the nested payload specification with FastDB's `fastdb.payload.v1` schema and bind it explicitly with `@cc.transfer(...)`. The method surface carries one `fastdb4py.payload.Payload` envelope; C-Two must not infer payload structure from annotations or add a second FastDB helper module.
 
 ```python
 import c_two as cc
-import fastdb4py as fdb
+from fastdb4py.payload import Payload
 
-@fdb.feature
-class GridCell:
-    global_id: fdb.I32
-    level: fdb.I32
+CELL_SPEC = {
+    "schema": "fastdb.payload.v1",
+    "profile": "record.v1",
+    "entries": [
+        {
+            "id": "value",
+            "cardinality": "one",
+            "type": {"kind": "u8", "nullable": False},
+        },
+    ],
+    "components": [],
+}
 
 @cc.crm(namespace='demo.grid', version='0.1.0')
 class Grid:
-    def get_cells(self, ids: fdb.Array[fdb.I32]) -> fdb.Batch[GridCell]:
+    @cc.transfer(input=CELL_SPEC, output=CELL_SPEC)
+    def echo(self, payload: Payload) -> Payload:
         ...
 ```
 
-`@cc.transfer(input=..., output=...)`, `@cc.transferable`, and `@cc.transfer(buffer='hold')` are not the portable FDB-first authoring path. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
+FastDB Core is the sole authority for nested parsing, canonical identity, digest, binary layout, build/open/view/materialize/invalidate behavior, and payload-only codegen. C-Two validates only the outer contract and binding relationship. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
 
 ### Hold Mode Pattern
 
 `cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It returns `HeldResult` with `.value`, `.unsafe_buffer`, and `.release()`. Safety layers are explicit release, context manager, and `__del__` fallback.
 
-Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For FastDB call-db payloads, `held.value` is the logical CRM return value such as `fdb.Batch[T]`, `fdb.Array[T]`, a single feature, a scalar, or a tuple of those values; do not expose the internal call-db envelope as the public held API. `held.unsafe_buffer` is a raw `memoryview` escape hatch for advanced users and cannot mechanically invalidate raw NumPy or pointer aliases created from it; normal code should use checked FastDB views from `held.value` and call `fdb.materialize(...)` before storing data beyond the hold scope.
+Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For a portable method, `held.value` is a FastDB `Payload` owner. Releasing the hold invalidates that owner and its checked views before releasing the C-Two lease. The proven receive path is copy-backed; hold is a lifetime contract, not proof of direct response-SHM construction or zero-copy decoding. `held.unsafe_buffer` is a raw `memoryview` escape hatch for advanced users and cannot mechanically invalidate raw NumPy or pointer aliases created from it; normal code should use FastDB checked views and materialize values before storing them beyond the hold scope.
 
 ```python
 with cc.hold(proxy.method)(args) as held:
@@ -291,7 +307,7 @@ finally:
 
 ### FastDB View Lifetime Boundary
 
-FastDB can enforce stale-use detection only at the FastDB view layer. In FastDB 0.1.18, checked `FdbViewOwner` instances track alive state and generation; `fdb.invalidate(...)` recursively finds owners through FastDB-managed containers and invalidates table, row, checked numeric column, string column, and bytes column views. C-Two must bind held responses and borrowed inputs to checked read-only owners, invalidate them before releasing the transport buffer, and use `fdb.materialize(...)` / `.to_owned()` when data must outlive the lease.
+FastDB can enforce stale-use detection only through its public `Payload` owner and checked-view contract. C-Two must invalidate held responses and borrowed inputs before releasing the associated transport lease. Values that must outlive that lease must be materialized through the official FastDB API.
 
 FastDB cannot reliably invalidate every raw pointer a user deliberately extracts from a view. In particular, unsafe NumPy access can produce an ndarray or pointer that no longer consults the FastDB owner on later reads. Treat such APIs as explicit unsafe escapes: tests should assert normal FastDB view invalidation after release, but do not claim that a leaked raw NumPy pointer can be made mechanically impossible in Python.
 
@@ -404,6 +420,7 @@ Requires Python 3.10 or newer. Keep Python 3.10 compatibility intentional: downs
 - Do not treat the Python SDK as the reference implementation for generic runtime behavior. If behavior is language-neutral, prefer a Rust-core owner with thin SDK facades.
 - Preserve direct IPC as relay-independent. If touching registration, client routing, or runtime session code, include checks for explicit `ipc://` connections with relay unset or unavailable.
 - Preserve zero-copy boundaries. If touching wire, SHM, scheduler, or native callback code, include checks that large SHM-backed payloads are not converted to Python `bytes` on the remote IPC path.
+- Do not turn a transport-level SHM proof into a FastDB direct-backing claim. The current portable receive adapters are copy-backed; stronger wording requires resource-time construction into the final C-Two backing, truthful FastDB direct/staged reports, and Rust/Python proof.
 - For bug fixes and behavior changes, add or update focused tests first when feasible, then implement the correct production-grade code change needed to satisfy the verified behavior; do not use phase boundaries to justify temporary shims or lower-quality shortcuts.
 - When work is split into phases, treat the split as sequencing only. Write the phase boundaries, exit criteria, and follow-up items into the plan document before implementation, keep that plan updated as the authoritative record, and finish each phase with docs that make the remaining work explicit.
 - Do not revert unrelated user changes in a dirty worktree.

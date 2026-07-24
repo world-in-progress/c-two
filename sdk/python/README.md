@@ -13,6 +13,13 @@ Prerequisites:
 - Python 3.14.3t when testing free-threading support
 - Rust toolchain
 - `uv`
+- the audited compatible FastDB source checkout at `../fastdb`
+
+The complete portable-payload integration is currently proven only against
+that sibling FastDB checkout. The corresponding immutable Rust, Python, and
+TypeScript packages have not yet been released, so a registry-only environment
+cannot reproduce this development branch. See
+[`contract-release-deferred-capabilities.md`](../../docs/issues/contract-release-deferred-capabilities.md).
 
 Install dependencies and build the Python native extension. This also compiles
 the required Rust core crates; no separate Rust prebuild step is needed:

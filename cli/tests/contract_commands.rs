@@ -212,12 +212,32 @@ fn contract_help_lists_descriptor_commands() {
     cmd.args(["contract", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("artifacts"))
         .stdout(predicate::str::contains("codegen"))
         .stdout(predicate::str::contains("diagnose"))
         .stdout(predicate::str::contains("export"))
         .stdout(predicate::str::contains("infer"))
         .stdout(predicate::str::contains("validate"));
+}
+
+#[test]
+fn contract_help_omits_removed_sidecar_artifact_commands() {
+    let mut contract = Command::cargo_bin("c3").unwrap();
+    let output = contract.args(["contract", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("artifacts")),
+        "{stdout}",
+    );
+
+    let mut infer = Command::cargo_bin("c3").unwrap();
+    infer
+        .args(["contract", "infer", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--artifacts").not());
 }
 
 #[test]
@@ -227,32 +247,6 @@ fn contract_help_lists_release_ref() {
         .assert()
         .success()
         .stdout(predicate::str::contains("release-ref"));
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_artifacts_wraps_python_without_contract_validation() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let artifacts = r#"[{"schema":"example.schema.v1","type":"Payload"}]"#;
-    let python = fake_python(&tempdir, artifacts);
-    let output = tempdir.path().join("payload-abi-artifacts.json");
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "artifacts",
-        "example.contracts:Grid",
-        "--python",
-        python.executable(),
-        "--out",
-        output.to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::is_empty());
-
-    assert_eq!(std::fs::read_to_string(output).unwrap().trim(), artifacts);
 }
 
 #[cfg(unix)]
@@ -560,130 +554,6 @@ fn contract_infer_diagnose_rejects_non_object_diagnostics() {
     .failure()
     .stderr(predicate::str::contains(
         "diagnostic output must be a JSON array of objects",
-    ));
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_artifacts_wraps_python_and_validates_artifact_shape() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let artifacts = r#"[{"schema":"example.schema.v1","type":"Payload"}]"#;
-    let python =
-        fake_python_requiring_arg(&tempdir, "--artifacts", artifacts, &valid_contract_json());
-    let output = tempdir.path().join("inferred.payload-abi-artifacts.json");
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--name",
-        "Grid",
-        "--method",
-        "echo",
-        "--artifacts",
-        "--out",
-        output.to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::is_empty());
-
-    assert_eq!(std::fs::read_to_string(output).unwrap().trim(), artifacts);
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_artifacts_rejects_non_array_python_output() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let python = fake_python(&tempdir, r#"{"schema":"example.schema.v1"}"#);
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--method",
-        "echo",
-        "--artifacts",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains(
-        "payload ABI artifact output must be a JSON array",
-    ));
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_artifacts_rejects_non_object_artifacts() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let python = fake_python(&tempdir, r#"["payload-abi-artifact"]"#);
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--method",
-        "echo",
-        "--artifacts",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains(
-        "payload ABI artifact output must be a JSON array of objects",
-    ));
-}
-
-#[cfg(unix)]
-#[test]
-fn contract_infer_rejects_conflicting_artifact_and_diagnostic_modes() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let python = fake_python(&tempdir, "[]");
-
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("PYTHONPATH", python.pythonpath());
-    cmd.args([
-        "contract",
-        "infer",
-        "example.resources:GridResource",
-        "--python",
-        python.executable(),
-        "--namespace",
-        "example.grid",
-        "--version",
-        "0.1.0",
-        "--method",
-        "echo",
-        "--diagnose",
-        "--artifacts",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains(
-        "--diagnose and --artifacts cannot be used together",
     ));
 }
 

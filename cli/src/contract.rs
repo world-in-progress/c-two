@@ -12,11 +12,9 @@ pub struct ContractArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ContractCommand {
-    /// Export payload ABI artifact descriptors from a Python CRM class.
-    Artifacts(PythonArtifactsArgs),
     /// Generate SDK artifacts from a portable descriptor.
     Codegen(CodegenArgs),
-    /// Report fastdb-first portability diagnostics for a Python CRM class.
+    /// Report portable-contract diagnostics for a Python CRM class.
     Diagnose(PythonDiagnoseArgs),
     /// Export a portable descriptor from a Python CRM class.
     Export(PythonExportArgs),
@@ -66,24 +64,6 @@ pub struct PythonDiagnoseArgs {
     #[arg(long)]
     pub out: Option<String>,
     /// Pretty-print diagnostics JSON.
-    #[arg(long)]
-    pub pretty: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct PythonArtifactsArgs {
-    /// Python CRM class target as module:ClassName.
-    pub target: String,
-    /// Python executable used for import/reflection. Defaults to C2_PYTHON or python3.
-    #[arg(long)]
-    pub python: Option<String>,
-    /// Limit artifacts to one CRM method; repeatable.
-    #[arg(long = "method")]
-    pub methods: Vec<String>,
-    /// Write payload ABI artifact JSON to this file instead of stdout.
-    #[arg(long)]
-    pub out: Option<String>,
-    /// Pretty-print payload ABI artifact JSON.
     #[arg(long)]
     pub pretty: bool,
 }
@@ -147,20 +127,16 @@ pub struct PythonInferArgs {
     /// Write portability diagnostics for the inferred projection instead of exporting a portable descriptor.
     #[arg(long)]
     pub diagnose: bool,
-    /// Write payload ABI artifacts for the inferred projection instead of exporting a portable descriptor.
-    #[arg(long)]
-    pub artifacts: bool,
-    /// Write descriptor, diagnostics, or payload ABI artifact JSON to this file instead of stdout.
+    /// Write descriptor or diagnostics JSON to this file instead of stdout.
     #[arg(long)]
     pub out: Option<String>,
-    /// Pretty-print descriptor, diagnostics, or payload ABI artifact JSON.
+    /// Pretty-print descriptor or diagnostics JSON.
     #[arg(long)]
     pub pretty: bool,
 }
 
 pub fn run(args: ContractArgs) -> Result<()> {
     match args.command {
-        ContractCommand::Artifacts(args) => artifacts(args),
         ContractCommand::Codegen(args) => codegen(args),
         ContractCommand::Diagnose(args) => diagnose(args),
         ContractCommand::Export(args) => export(args),
@@ -168,25 +144,6 @@ pub fn run(args: ContractArgs) -> Result<()> {
         ContractCommand::ReleaseRef(args) => release_ref(args),
         ContractCommand::Validate(args) => validate(&args.path),
     }
-}
-
-fn artifacts(args: PythonArtifactsArgs) -> Result<()> {
-    let mut py_args = vec![
-        "-m".to_string(),
-        "c_two.cli.contract".to_string(),
-        "artifacts".to_string(),
-        args.target,
-    ];
-    for method in args.methods {
-        py_args.push("--method".to_string());
-        py_args.push(method);
-    }
-    if args.pretty {
-        py_args.push("--pretty".to_string());
-    }
-    let payload = run_python_contract(args.python.as_deref(), &py_args)?;
-    validate_artifact_payload(&payload)?;
-    write_payload(&payload, args.out.as_deref())
 }
 
 fn diagnose(args: PythonDiagnoseArgs) -> Result<()> {
@@ -277,11 +234,6 @@ fn export(args: PythonExportArgs) -> Result<()> {
 }
 
 fn infer(args: PythonInferArgs) -> Result<()> {
-    if args.diagnose && args.artifacts {
-        return Err(anyhow!(
-            "--diagnose and --artifacts cannot be used together"
-        ));
-    }
     let mut py_args = vec![
         "-m".to_string(),
         "c_two.cli.contract".to_string(),
@@ -303,16 +255,11 @@ fn infer(args: PythonInferArgs) -> Result<()> {
     if args.diagnose {
         py_args.push("--diagnose".to_string());
     }
-    if args.artifacts {
-        py_args.push("--artifacts".to_string());
-    }
     if args.pretty {
         py_args.push("--pretty".to_string());
     }
     let payload = run_python_contract(args.python.as_deref(), &py_args)?;
-    if args.artifacts {
-        validate_artifact_payload(&payload)?;
-    } else if args.diagnose {
+    if args.diagnose {
         validate_diagnostic_payload(&payload)?;
     } else {
         validate_descriptor_payload(&payload)?;
@@ -348,18 +295,6 @@ fn run_python_contract(python: Option<&str>, args: &[String]) -> Result<String> 
 fn validate_descriptor_payload(payload: &str) -> Result<()> {
     c2_contract::validate_portable_contract_descriptor_json(payload.as_bytes())
         .map_err(|err| anyhow!("{err}"))
-}
-
-fn validate_artifact_payload(payload: &str) -> Result<()> {
-    let parsed: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|err| anyhow!("payload ABI artifact output is not valid JSON: {err}"))?;
-    match parsed {
-        serde_json::Value::Array(items) if items.iter().all(|item| item.is_object()) => Ok(()),
-        serde_json::Value::Array(_) => Err(anyhow!(
-            "payload ABI artifact output must be a JSON array of objects"
-        )),
-        _ => Err(anyhow!("payload ABI artifact output must be a JSON array")),
-    }
 }
 
 fn validate_diagnostic_payload(payload: &str) -> Result<()> {

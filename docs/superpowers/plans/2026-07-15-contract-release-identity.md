@@ -1,5 +1,7 @@
 # Contract Release Identity Implementation Plan
 
+> **Historical foundation / partially superseded:** The route-independent release-identity mechanism remains current, but the descriptor shape and implementation sequence below predate `c-two.contract.v2`. Use the [`2026-07-24 design`](../specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](./2026-07-24-portable-payload-contract-composition.md) for current work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a route-independent, content-addressed C-Two CRM contract release identity with one Rust authority and matching Rust CLI/Python projections.

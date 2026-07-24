@@ -6,6 +6,20 @@
 **Consumed FastDB freeze:** `6b9d0a55f27bb22fd13f867f321db821f21e777c`
 **Execution rule:** Each task uses a retained `.superpowers/sdd/c-two-task-<n>-brief.md`, true RED, focused GREEN, affected broad gates, a scoped local commit, and two-pass primary-agent review before the next task.
 
+## Execution Record
+
+| Slice | Local commit | Result |
+| --- | --- | --- |
+| Design | `646684d` | Portable contract/composition authority frozen. |
+| Task 1 | `66b7892` | Nested `c-two.contract.v2` and release identity. |
+| Task 2 | `0ae97a0` | FastDB delegation and deterministic artifact composition. |
+| Task 3 | `ab04afc` | `c3`, Python native, and Rust/Python/TypeScript artifact projections. |
+| Task 4 | `ba17b35` | Explicit `Payload` runtime owners and legacy integration removal. |
+| Task 5 | `524f9b7` | Real Rust/Python/Rust payload-bearing interoperability proof. |
+| Task 6 | Closure commit containing this record | Current guidance clean cut, repository gates, final audit, and local closure evidence. The exact immutable hash is recorded in the retained Task 6 report after commit creation. |
+
+All hashes above are C-Two-local. No version, push, tag, publication, or release action is part of this plan.
+
 ## Task 1: Freeze the v2 Outer Contract
 
 **Files:** `core/foundation/c2-contract/**`, shared contract fixtures, focused Rust tests, Python native contract projection tests, contract release docs/Issue.

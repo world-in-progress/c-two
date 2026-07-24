@@ -10,9 +10,20 @@ Rust `c2-contract` now validates and canonicalizes `c-two.contract.v2`, derives 
 
 Rust `c2-codegen` now delegates every opaque nested value to the official FastDB Rust projection, preserves structured Core errors, verifies Core identity and artifact hashes, deduplicates codegen by Core digest, and composes deterministic Rust/Python/TypeScript payload subtrees with C-Two-owned release metadata and target modules. Its generic composer rejects nonportable, case-colliding, duplicate, and file/directory-conflicting paths, bounds inventory/bytes, and atomically publishes a complete new regular-file tree to an absent destination. `c3` publishes that same set for all three targets; the Python native extension projects it in memory with structured errors; generated Rust compiles, generated Python imports against a locally built wheel from the audited FastDB source, and generated TypeScript type-checks while retaining C-Two's HTTP/relay/IPC/SHM transport surface.
 
-The Python runtime now exposes only an explicit `@cc.transfer(input=..., output=...)` portable boundary whose value is `fastdb4py.payload.Payload`. FastDB Core compiles the nested value and owns its canonical identity, digest guard, binary open, views, materialization, and invalidation. C-Two transports opaque binary bytes, opens copy-backed receive owners, invalidates held outputs before releasing their response lease, invalidates borrowed resource inputs before releasing the request lease, and preserves FastDB code, symbol, path, message, and details in C-Two errors. The old call-db inference, sidecar, bridge, public exports, tests, examples, and active benchmark variants are removed.
+The Python runtime now exposes only an explicit `@cc.transfer(input=..., output=...)` portable boundary whose value is `fastdb4py.payload.Payload`. FastDB Core compiles the nested value and owns its canonical identity, digest guard, binary open, views, materialization, and invalidation. C-Two transports opaque binary bytes, opens copy-backed receive owners, invalidates held outputs before releasing their response lease, invalidates borrowed resource inputs before releasing the request lease, and preserves FastDB code, symbol, path, message, and details in C-Two errors. The old call-db inference, sidecar, bridge, public exports, tests, examples, and active benchmark variants are removed. The Rust CLI also removes the stale `contract artifacts` subcommand and `contract infer --artifacts` flag rather than forwarding to Python entry points that no longer exist.
 
 The recorded runtime proof now generates deterministic Rust and Python contract artifacts through the shared authority path, compiles one real Rust client/host harness against public C-Two Core and official FastDB Rust crates, and imports the generated Python client against official `fastdb4py.payload`. Rust client → Python resource, Python generated client → Rust resource, and Rust generated client → Rust resource all pass for record, object-graph, and no-payload methods. The proof covers `str`, `wstr`, bytes, nested lists, null/empty values, shared references, nullable references, self/mutual cycles, materialization, route mismatch, FastDB digest mismatch, held-output invalidation, borrowed-input invalidation, and Rust checked-view invalidation. The Rust host deliberately uses a copy-backed `RequestData::into_owned_bytes` path; its SHM and reassembly-handle copies are bounds-checked by `c2-mem` before transport storage is released.
+
+## Closed in the Portable Composition Slice
+
+| Capability | Evidence |
+| --- | --- |
+| v2 outer contract and route-independent release identity | C-Two commit `66b7892`; Rust owns validation, canonicalization, fingerprints, nested extraction, release/ref verification, and Python projection. |
+| Core delegation and artifact composition | C-Two commit `0ae97a0`; FastDB commit `6b9d0a55f27bb22fd13f867f321db821f21e777c`; nested values are delegated unchanged and artifacts are hash/path/collision checked. |
+| Rust/Python/TypeScript codegen entry points | C-Two commit `ab04afc`; `c3` and Python consume one in-memory Rust composition path, with generated Rust compile, Python import, and TypeScript type-check proof. |
+| Explicit Python portable runtime and clean authority cut | C-Two commit `ba17b35`; `Payload` is the only portable envelope, pickle is Python-only, and former integration modules/surfaces are absent. |
+| Rust/Python payload-bearing interoperability and lifetime | C-Two commit `524f9b7`; record, graph, no-payload, mismatch, held/borrowed invalidation, and Rust checked-view behavior run through public C-Two/FastDB APIs. |
+| Current-guidance and stale-CLI cleanup | Task 6 closure change; README/AGENTS/roadmap/vision point to the v2 authority, historical documents are marked, and stale sidecar-oriented Rust CLI commands are removed. Exact closure commit and final gate counts are recorded in the retained Task 6 report. |
 
 ## Open Capabilities
 
@@ -38,6 +49,35 @@ The recorded runtime proof now generates deterministic Rust and Python contract 
 | Core strict-Clippy baseline | On Rust 1.91, `cargo clippy --manifest-path core/Cargo.toml -p c2-server --all-targets -- -D warnings` is blocked first by 4 existing `c2-config` diagnostics. Repeating with `--no-deps` exposes 14 existing `c2-server` diagnostics in scheduler/server code and tests. The Task 5 `c2-mem`, connection, and dispatcher additions contribute none. | Repairing counter loops, nested conditions, large error representation, high-arity functions, and test initializers is a separate behavior-preserving core cleanup; incidental edits would obscure the portable-payload runtime proof. | Task 5 passes functional Rust gates but cannot claim the core strict-Clippy gate is green on this toolchain. | C-Two | Resolve or narrowly justify every diagnostic without changing transport behavior, run the complete Rust/Python suites, and make the exact strict-Clippy command pass without blanket suppression. |
 | Python native strict-Clippy baseline | On Rust 1.91, `cargo clippy --manifest-path sdk/python/native/Cargo.toml --all-targets -- -D warnings` currently reports 43 diagnostics in existing transport/memory/runtime FFI modules; the new `codegen_ffi.rs` contributes none, `cargo check --all-features` passes, and the diagnostics include PyO3 functions whose argument counts mirror the current Python API as well as representation and mechanical lint findings. | Resolving the full set safely requires a separately reviewed FFI cleanup rather than broad `allow` attributes or incidental API/representation changes inside contract codegen. | Task 3 can prove its new native projection but cannot claim the repository-wide native strict-Clippy gate is green on this toolchain. | C-Two | Refactor or narrowly justify every reported site without changing Python behavior, run native tests across supported Python versions, and make the exact strict-Clippy command pass with no blanket suppression. |
 | Hosted verification and release | This goal performs local verification only and explicitly forbids version bump, push, tag, publish, and release. | Hosted runners and release credentials are external actions and are not implied by local readiness. | Local evidence must not be reported as a published release or hosted pass. | Repository release owners | Hosted CI passes the frozen commits, then separately authorized version/push/tag/publish/release steps complete with immutable provenance. |
+
+## Dependency Matrix
+
+Capability names below correspond exactly to the open rows above. A dependency
+is a prerequisite or collaborating owner surface, not permission for C-Two to
+reimplement it locally.
+
+| Capability | Dependencies |
+| --- | --- |
+| Contract compatibility | Frozen v2 exact-identity semantics plus an accepted cross-language contract-evolution policy. |
+| Resolver and storage | A consumer-owned catalog/deployment resolver that can return descriptor bytes by immutable identity. |
+| Signature and trust | An Authority-owned identity, key-distribution, policy, and revocation model. |
+| Outer descriptor admission limits | Agreed outer-document defaults aligned with transport capacity and one Rust/Python/CLI projection. |
+| Complete Rust SDK | The proven lower-level Rust crates, a stable HTTP/relay/discovery/lifecycle facade, and capability parity with Python. |
+| FastDB Rust package distribution | An authorized FastDB release channel and immutable distribution of the audited Core plus official Rust crates. |
+| FastDB Python/TypeScript package distribution | Authorized immutable FastDB Python/TypeScript packages and clean-environment consumer gates. |
+| Python portable binding shape | An accepted outer-contract invocation design and equivalent thread/IPC/relay behavior across generated SDKs. |
+| Python-only pickle fallback | An explicit C-Two compatibility decision and maintained nonportable diagnostics. |
+| Explicit portable-payload performance benchmark | The public Task 5 harness plus a reviewed workload, environment, warm-up, copy/direct/staged, and statistical protocol. |
+| Raw retained-buffer escape | A revocable abstraction supported by every declared Python/NumPy/native buffer consumer; otherwise the Python buffer protocol remains the limiting dependency. |
+| Direct final-backing construction | Public FastDB external-backing/build APIs and C-Two resource-time builder integration in both Rust and Python. |
+| TypeScript opaque response allocators | A versioned byte-visible C-Two response-owner interface plus the public FastDB external-backing contract. |
+| Existing-tree artifact update | A prior-manifest ownership protocol, user-edit detection, complete staging/rollback, and cross-platform path/symlink tests. |
+| Crash-durable or hostile-parent publication | Platform directory-handle/no-follow operations, directory synchronization support, and fault/race test infrastructure. |
+| Non-regular artifact metadata | A real producer requirement plus an accepted cross-platform mode/link representation and publication contract. |
+| C-Two C++ SDK/codegen | A real C-Two C++ route/transport/lifecycle SDK that can consume FastDB's existing C++ payload artifacts. |
+| Core strict-Clippy baseline | Behavior-preserving cleanup across `c2-config`/`c2-server` and complete core/Python transport regression gates. |
+| Python native strict-Clippy baseline | Separately reviewed PyO3/FFI cleanup and regression across supported Python runtimes. |
+| Hosted verification and release | Hosted CI infrastructure, release-owner authorization, credentials, and immutable provenance tooling. |
 
 ## Guardrail
 

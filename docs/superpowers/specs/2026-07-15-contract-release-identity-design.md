@@ -1,5 +1,7 @@
 # C-Two Contract Release Identity Design
 
+> **Historical foundation / partially superseded:** The route-independent release-identity mechanism remains current, but the descriptor shape below predates `c-two.contract.v2`. Use the [`2026-07-24 design`](./2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../plans/2026-07-24-portable-payload-contract-composition.md) for current work.
+
 **Date:** 2026-07-15
 **Status:** Approved for implementation planning
 **Scope:** Route-independent CRM contract release identity in C-Two, with Rust authority and Rust CLI/Python projections

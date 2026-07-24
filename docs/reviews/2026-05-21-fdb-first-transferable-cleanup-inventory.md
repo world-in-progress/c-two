@@ -1,5 +1,7 @@
 # FDB-First Transferable Cleanup Inventory
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 > Date: 2026-05-21
 > Scope: Review the current Python CRM transfer path before introducing a neutral authoring schema and schema-to-CRM code generation.
 > Status: Evidence inventory and cleanup recommendation only. This file does not change runtime behavior.

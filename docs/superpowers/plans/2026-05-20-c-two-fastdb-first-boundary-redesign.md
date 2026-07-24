@@ -1,5 +1,7 @@
 # C-Two FastDB-First Boundary Redesign Implementation Plan
 
+> **Historical / superseded:** Retained as implementation evidence only. The current authority is the [`2026-07-24 design`](../specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](./2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Move the FastDB-backed portable CRM contract integration into C-Two, make FastDB call-db the first-class C-Two portable payload ABI, and clean FastDB back to generic schema/storage/serialization/runtime ownership.

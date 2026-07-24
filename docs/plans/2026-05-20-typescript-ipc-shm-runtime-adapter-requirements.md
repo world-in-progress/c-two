@@ -1,5 +1,7 @@
 # TypeScript IPC SHM Runtime Adapter Requirements
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). Transport evidence below may remain useful, but its payload API names and composition assumptions are not current guidance.
+
 > **Status:** Phase 145 requirement freeze
 > **Date:** 2026-05-20
 > **Scope:** Define the runtime adapter requirements for generated TypeScript IPC SHM beyond the dedicated-only Node/POSIX helper.

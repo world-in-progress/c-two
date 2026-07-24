@@ -1,5 +1,7 @@
 # C-Two FastDB-First Contract Boundary Redesign
 
+> **Historical / superseded:** Retained as implementation evidence only. The current authority is the [`2026-07-24 design`](./2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 **Date:** 2026-05-20
 **Status:** Draft for review
 **Scope:** Redesign the C-Two/FastDB boundary so FastDB is the first-class portable payload ABI for C-Two contracts, while C-Two owns the contract integration and FastDB remains the storage/serialization/runtime substrate.

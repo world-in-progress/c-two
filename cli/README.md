@@ -9,6 +9,7 @@
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
 - `c3 registry list-routes` lists resource names registered with a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
+- `c3 contract` validates/releases `c-two.contract.v2` descriptors and composes complete Rust, Python, or TypeScript project trees.
 
 ## Build and install for development
 
@@ -41,6 +42,30 @@ Run the binary without linking it by using Cargo directly:
 cargo run --manifest-path cli/Cargo.toml -- --help
 cargo run --manifest-path cli/Cargo.toml -- relay --help
 ```
+
+## Portable contracts
+
+Python CRM classes can export an explicit `c-two.contract.v2` descriptor. The Rust CLI validates that outer contract, derives a route-independent release reference, and delegates each opaque nested FastDB specification to the official FastDB Core projection:
+
+```bash
+c3 contract export mypkg.contracts:Echo \
+  --python .venv/bin/python \
+  --out echo.contract.json
+c3 contract validate echo.contract.json
+c3 contract release-ref echo.contract.json --out echo.release-ref.json
+```
+
+Generate one complete project tree at an absent destination:
+
+```bash
+c3 contract codegen rust echo.contract.json --out-dir generated-rust
+c3 contract codegen python echo.contract.json --out-dir generated-python
+c3 contract codegen typescript echo.contract.json --out-dir generated-typescript
+```
+
+The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
+
+`c3 contract diagnose` and `c3 contract infer ... --diagnose` report methods that remain Python-only. Portable payload structure is authored explicitly with `@cc.transfer(...)`; inference does not synthesize it from domain annotations.
 
 ## Configuration
 

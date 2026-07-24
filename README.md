@@ -26,7 +26,7 @@
 
 - **Resource-oriented RPC** — C-Two exposes stateful resource objects through language SDKs. The Python SDK makes Python classes remotely accessible while preserving their object-oriented nature.
 
-- **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting FastDB checked views read columnar data directly from SHM when the caller explicitly retains the response.
+- **Explicit transport and payload lifetimes** — Same-process calls skip serialization. Cross-process IPC can use shared memory for transport, while the current portable FastDB receive path opens an owned copy and uses checked owner/view invalidation. Direct construction into the final response backing is not claimed.
 
 - **Built for scientific workloads** — Portable CRM payloads use FastDB; Python-only prototypes can still use ordinary Python values. Large payloads use chunked transfer for data beyond 256 MB. The runtime is designed for computational workflows and stateful scientific resources.
 
@@ -36,138 +36,97 @@
 
 ## Performance
 
-End-to-end cross-process IPC benchmark using the Kostya-style coordinate schema: `row_id u32`, `x/y/z f64`, and `name STR`. Each call returns a cached coordinate table from a remote process and the client computes `sum(x + y + z)` from the received payload.
+The portable-payload foundation currently has correctness, deterministic codegen, lifetime, and real Rust/Python interoperability proof. It does **not** yet have a reviewed throughput benchmark for the explicit `Payload` API, retained owners, or direct/staged backing.
 
-| Rows | FDB control default (ms) | FDB recommended default (ms) | FDB control retained (ms) | FDB recommended retained (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Recommended retained vs Ray arrays** |
-|-----:|---:|---:|---:|---:|---:|---:|---:|
-| 1 K | 1.28 | 1.33 | 1.30 | **1.12** | 6.51 | 0.57 | **5.8×** |
-| 10 K | 1.83 | 1.27 | 1.52 | **1.26** | 7.42 | 1.24 | **5.9×** |
-| 100 K | 5.10 | 2.64 | 4.91 | **1.91** | 8.22 | 9.69 | **4.3×** |
-| 1 M | 36.39 | 12.29 | 29.85 | **8.36** | 48.59 | 130.65 | **5.8×** |
-| 3 M | 147.89 | 39.08 | 93.80 | **23.29** | 164.32 | 529.47 | **7.1×** |
-
-Row-oriented fallback paths are much slower at large sizes and are included only to show Python object materialization cost:
-
-| Rows | C-Two pickle records (ms) | Ray records (ms) | **Recommended retained vs Ray records** |
-|-----:|---:|---:|---:|
-| 1 K | 0.95 | 6.23 | **5.6×** |
-| 10 K | 6.09 | 11.62 | **9.2×** |
-| 100 K | 67.25 | 56.31 | **29.5×** |
-| 1 M | 861.50 | 546.27 | **65.3×** |
-| 3 M | SKIP | SKIP | - |
-
-- **FDB control** - ordinary `fdb.Batch.allocate(...)` resource code. It is kept as a benchmark control to show call-db repacking cost when resource output is built outside the CRM call envelope.
-- **FDB recommended** - resource code builds the return payload with `fdb.require(fdb.batch(...))`; at 3M rows this lowers default-call p50 from 147.89 ms to 39.08 ms in this run.
-- **Default / retained** - default calls return owned logical values after detaching from the transport buffer. Retained calls use `cc.hold(...)` so FastDB checked views can read from the retained response buffer until release.
-- **Ray arrays** - Ray object-store transfer of NumPy columns plus the `name` string list.
-- **Pickle arrays / records** - Python-only fallback baselines; records intentionally exercise row-oriented Python object overhead.
-
-The FastDB rows above compare construction paths inside the same C-Two resource model: CRM contract -> resource instance -> typed client proxy.
-
-> Apple M1 Max · measured May 27, 2026 · C-Two: Python 3.14.3 + NumPy 2.4.4 · Ray: Python 3.12 + NumPy 2.4.6 + Ray 2.55.1 · See [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py), [`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py), and [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh) for methodology.
+The tracked Kostya benchmark keeps Python-only `pickle-records` and `pickle-arrays` baselines. Results produced by the removed annotation-inferred FastDB integration are historical and are not valid performance claims for the current architecture. A reproducible portable-payload benchmark, including honest copy/direct/staged labels and environment/statistical reporting, remains an explicit [deferred capability](docs/issues/contract-release-deferred-capabilities.md).
 
 ---
 
 ## Quick Start
 
-```bash
-pip install c-two
-```
+> **Development-branch requirement:** The portable-payload example below is
+> proven from this source checkout against the audited sibling FastDB checkout
+> at `../fastdb`. The currently published packages do not yet contain this
+> complete integration, so `pip install c-two` alone cannot run this example.
+> See [Development Setup](#development-setup) and the
+> [deferred-capabilities issue](docs/issues/contract-release-deferred-capabilities.md).
 
-### Define a FastDB-first resource contract
+### Define an explicit portable-payload contract
 
 ```python
+import json
+
 import c_two as cc
-import fastdb4py as fdb
-import numpy as np
+from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload
 
 
-@fdb.feature
-class Vertex:
-    vertex_id: fdb.U32
-    x: fdb.F64
-    y: fdb.F64
-    z: fdb.F64
+VALUE_SPEC = {
+    "schema": "fastdb.payload.v1",
+    "profile": "record.v1",
+    "entries": [
+        {
+            "id": "value",
+            "cardinality": "one",
+            "type": {"kind": "u8", "nullable": False},
+        },
+    ],
+    "components": [],
+}
 
 
-@fdb.feature
-class Node:
-    node_id: fdb.U32
-    weight: fdb.F64
-    anchor: Vertex
-    neighbors: list[Vertex]
-
-
-@cc.crm(namespace='demo.geometry', version='0.1.0')
-class Geometry:
-    @cc.read
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
+@cc.crm(namespace="demo.payload", version="0.1.0")
+class Echo:
+    @cc.transfer(input=VALUE_SPEC, output=VALUE_SPEC)
+    def echo(self, payload: Payload) -> Payload:
         ...
 
-    @cc.read
-    def nodes(self) -> fdb.Batch[Node]:
+    def ping(self) -> None:
         ...
 ```
 
-`vertices()` is the fixed-size columnar path. `nodes()` is the object-graph path
-for nested resource data.
+`c-two.contract.v2` embeds `VALUE_SPEC` as an opaque nested JSON value. C-Two owns the outer method/binding contract and delegates the nested value unchanged to FastDB Core, which owns validation, canonical identity, binary/runtime behavior, and payload-only codegen.
 
-### Implement the resource object
-
-```python
-class GeometryResource:
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
-        n = int(count)
-        batch = fdb.require(fdb.batch(Vertex, rows=n))
-        idx = np.arange(n, dtype=np.uint32)
-        xyz = idx.astype(np.float64)
-        batch.fill(vertex_id=idx, x=xyz, y=xyz + 10.0, z=xyz + 20.0)
-        return batch
-
-    def nodes(self) -> fdb.Batch[Node]:
-        vertices = [
-            Vertex(vertex_id=0, x=0.0, y=10.0, z=20.0),
-            Vertex(vertex_id=1, x=1.0, y=11.0, z=21.0),
-            Vertex(vertex_id=2, x=2.0, y=12.0, z=22.0),
-        ]
-
-        batch = fdb.Batch.allocate(Node, 0)
-        batch.append(Node(
-            node_id=100,
-            weight=0.5,
-            anchor=vertices[0],
-            neighbors=[vertices[1], vertices[2]],
-        ))
-        return batch
-```
-
-### Use it locally (zero serialization)
+### Build and use a payload
 
 ```python
-cc.register(Geometry, GeometryResource(), name='geometry')
+def build_value(value: int) -> Payload:
+    spec = CompiledSpec.compile(json.dumps(VALUE_SPEC).encode())
+    builder = Builder.create(spec)
+    builder.entry_begin(0, 1).value_u8(value)
+    plan = builder.freeze()
+    builder.close()
+    try:
+        return plan.execute(BuildPolicy.ALLOW_STAGING).payload
+    finally:
+        plan.close()
+        spec.close()
 
-with cc.connect(Geometry, name='geometry') as geometry:
-    vertices = geometry.vertices(1_000)
-    nodes = geometry.nodes()
+
+class EchoResource:
+    def echo(self, payload: Payload) -> Payload:
+        return payload
+
+    def ping(self) -> None:
+        return None
+
+
+cc.register(Echo, EchoResource(), name="echo")
+source = build_value(7)
+try:
+    with cc.connect(Echo, name="echo") as echo:
+        result = echo.echo(source)
+        result.close()
+        assert echo.ping() is None
+finally:
+    source.close()
+    cc.shutdown()
 ```
 
-### Use the same client API across processes
+This minimal same-process run assumes no relay anchor. If the checkout's
+`.env` configures one and no relay is running, launch the script with
+`C2_RELAY_ANCHOR_ADDRESS=` so registration remains local.
 
-```python
-# Server process
-cc.set_relay_anchor('http://relay-host:8080')
-cc.register(Geometry, GeometryResource(), name='geometry')
-
-# Client process (separate terminal)
-cc.set_relay_anchor('http://relay-host:8080')
-with cc.connect(Geometry, name='geometry') as geometry:
-    vertices = geometry.vertices(1_000_000)
-```
-
-The same CRM contract can be used in-process, over IPC, or through a relay.
-Client code calls the typed proxy in each mode. Portable payloads are authored
-with FastDB types; ordinary Python values are available for local Python-only
-prototypes.
+The same CRM contract is used in-process, over IPC, or through a relay. Ordinary methods without an explicit portable binding can still use pickle for Python-only prototypes, but portable export and codegen reject them.
 
 ---
 
@@ -178,37 +137,34 @@ prototypes.
 A **CRM** (Core Resource Model) declares *which* methods a remote resource exposes. It's decorated with `@cc.crm()`, and method bodies are `...` (pure interface — no implementation).
 
 ```python
-@cc.crm(namespace='demo.geometry', version='0.1.0')
-class Geometry:
-    @cc.read
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
-        ...
-
-    @cc.read
-    def nodes(self) -> fdb.Batch[Node]:
+@cc.crm(namespace="demo.payload", version="0.1.0")
+class Echo:
+    @cc.transfer(input=VALUE_SPEC, output=VALUE_SPEC)
+    def echo(self, payload: Payload) -> Payload:
         ...
 ```
 
-Methods can be annotated with `@cc.read` (concurrent access allowed) or left as default write (exclusive access). Portable method inputs and outputs use FastDB scalar aliases, `fdb.Array[...]`, `fdb.Batch[...]`, and FastDB feature classes.
+Methods can be annotated with `@cc.read` (concurrent access allowed) or left as default write (exclusive access). A portable method declares its nested FastDB input/output specification explicitly with `@cc.transfer(...)` and carries zero or one `Payload` envelope in each direction.
 
 ### Resource — Runtime Instance
 
-A **resource** is a plain Python class that implements a CRM contract. It holds state and domain logic. No decorator is required; the framework discovers its methods through the CRM contract it was registered under. Use domain names such as `GeometryResource`.
+A **resource** is a plain Python class that implements a CRM contract. It holds state and domain logic. No decorator is required; the framework discovers its methods through the CRM contract it was registered under. Use domain names such as `EchoResource`.
 
-In the example above, `GeometryResource` is the resource object. The CRM contract stays FastDB-first; the resource implementation is just ordinary Python code that returns FastDB values.
+In the example above, `EchoResource` is the resource object. The CRM contract fixes the portable payload boundary; the resource implementation receives and returns official FastDB `Payload` owners.
 
 ### Client — Consumer
 
 Anything that calls `cc.connect(...)` is a **client** (or consumer / application code). The returned proxy is location-transparent — it works the same whether the resource lives in the same process or on a remote machine.
 
 ```python
-geometry = cc.connect(Geometry, name='geometry')
-vertices = geometry.vertices(1_000)
-cc.close(geometry)
+echo = cc.connect(Echo, name="echo")
+result = echo.echo(source)
+result.close()
+cc.close(echo)
 
 # Or with context manager:
-with cc.connect(Geometry, name='geometry') as geometry:
-    nodes = geometry.nodes()
+with cc.connect(Echo, name="echo") as echo:
+    assert echo.ping() is None
 ```
 
 ### Server — Resource Host
@@ -218,7 +174,7 @@ A **server** is any process that calls `cc.register(...)` to host one or more re
 ```python
 import c_two as cc
 
-cc.register(Geometry, GeometryResource(), name='geometry')
+cc.register(Echo, EchoResource(), name="echo")
 cc.serve()                                     # blocks; Ctrl-C triggers graceful shutdown
 ```
 
@@ -249,12 +205,12 @@ Relay HTTP and mesh endpoints are intended for a trusted network boundary. Produ
 ```python
 # Server side — announce resources to the relay
 cc.set_relay_anchor('http://relay-host:8080')
-cc.register(Geometry, GeometryResource(), name='geometry')
+cc.register(Echo, EchoResource(), name='echo')
 cc.serve()
 
-# Client side — resolve by name plus the Geometry CRM contract, no address needed
+# Client side — resolve by name plus the Echo CRM contract, no address needed
 cc.set_relay_anchor('http://relay-host:8080')
-geometry = cc.connect(Geometry, name='geometry')
+echo = cc.connect(Echo, name='echo')
 ```
 
 Multiple relays can form a **mesh cluster** via gossip — any relay can resolve any resource registered anywhere in the mesh. The runnable example is listed in [Runnable Examples](#runnable-examples).
@@ -263,11 +219,11 @@ Multiple relays can form a **mesh cluster** via gossip — any relay can resolve
 
 ### Contract Releases — Persistent Identity
 
-A runtime route identifies one active resource instance; it is not a durable CRM contract release. C-Two derives a route-independent `ContractReleaseRef` from the canonical validated `c-two.contract.v1` descriptor so catalogs and lockfiles can retain exact contract identity before a route exists and after it disappears.
+A runtime route identifies one active resource instance; it is not a durable CRM contract release. C-Two derives a route-independent `ContractReleaseRef` from the canonical validated `c-two.contract.v2` descriptor so catalogs and lockfiles can retain exact contract identity before a route exists and after it disappears.
 
 ```python
-descriptor = cc.export_contract_descriptor(Geometry)
-release_ref = cc.export_contract_release_ref(Geometry)
+descriptor = cc.export_contract_descriptor(Echo)
+release_ref = cc.export_contract_release_ref(Echo)
 ```
 
 The language-neutral Rust CLI produces the same reference directly from descriptor JSON without starting Python:
@@ -278,69 +234,54 @@ c3 contract release-ref contract.json
 
 The reference contains the descriptor schema, CRM namespace/name/version, and canonical descriptor SHA-256; it deliberately contains no route. The digest proves content identity and integrity, not publisher identity, authorization, revocation status, or trust. C-Two does not provide a contract registry, storage location, or resolver: a consumer must resolve descriptor bytes through its own catalog or deployment layer, reconstruct and verify the `ContractRelease`, and only then add a runtime route name. See the [deferred-capabilities issue](docs/issues/contract-release-deferred-capabilities.md) for the explicit compatibility, trust, Rust SDK, and FastDB Rust-runtime boundaries.
 
-### Payload Model — FastDB First
+### Payload Model — Explicit FastDB Delegation
 
-C-Two CRM payload planning has three internal outcomes: `FDB`, `PYTHON_PICKLE`, and `NO_PAYLOAD`. Portable, cross-language contracts use FastDB call-db payload ABI refs derived from `fastdb4py` annotations. Plain Python annotations run through Python pickle fallback for Python-only prototyping; strict portable export rejects those methods.
+Portable methods use an explicit nested `fastdb.payload.v1` specification and the official `fastdb4py.payload.Payload` owner. `c-two.contract.v2` is a super-schema: it owns CRM methods, parameters, return shape, and input/output binding relationships, while each binding's `spec` remains an opaque JSON value until FastDB Core compiles it.
 
-The payload ABI sits below C-Two's resource-first architecture. FastDB owns schema, storage layout, views, and allocator-facing payload construction. C-Two owns CRM route contracts, transport, retained-buffer leases, and contract/codegen orchestration, while runtime route/relay/IPC/scheduler layers treat FastDB payloads as opaque ABI-backed bytes.
+FastDB Core is the sole authority for nested schema/profile/type meaning, canonical bytes and digest, binary layout, builders, record/object-graph views, materialization, invalidation, and payload-only C++/Rust/Python/TypeScript codegen. C-Two owns route and release identity, transport, scheduler/lease lifecycle, generated CRM adapters, and final multi-owner artifact composition. It never reproduces FastDB's parser or runtime.
 
-The two important FastDB CRM shapes are the same two used in the quick start:
-
-- `vertices() -> fdb.Batch[Vertex]`: a fixed-size columnar feature batch. This is the retained-view, high-throughput path.
-- `nodes() -> fdb.Batch[Node]`: an object-graph batch with nested features and lists. This is portable FastDB call-db data with a different retained-view profile from fixed columnar data.
+A portable method carries exactly zero or one payload envelope in each direction:
 
 ```python
-@fdb.feature
-class Vertex: ...
-
-@fdb.feature
-class Node:
-    anchor: Vertex
-    neighbors: list[Vertex]
-
-@cc.crm(namespace='demo.geometry', version='0.1.0')
-class Geometry:
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]: ...
-    def nodes(self) -> fdb.Batch[Node]: ...
+@cc.crm(namespace="demo.payload", version="0.1.0")
+class Echo:
+    @cc.transfer(input=VALUE_SPEC, output=VALUE_SPEC)
+    def echo(self, payload: Payload) -> Payload: ...
 ```
 
-C-Two passes the CRM-derived FastDB binding to FastDB; user code stays at logical `Batch`, `Array`, scalar, and feature types.
+Python-only resources may still use ordinary Python annotations and pickle for local prototypes. Those methods are intentionally diagnosed as nonportable and rejected by portable descriptor export/codegen.
 
-Python-only resources may still use ordinary Python annotations and pickle for local prototypes. Those methods are intentionally diagnosed as nonportable by strict contract export/codegen.
+### cc.hold() — Client-Side Retained Ownership
 
-### cc.hold() — Client-Side Borrowed Responses
-
-On the client side, normal FastDB CRM calls copy the response payload into an owned local buffer before exposing the logical FastDB value, then release the transport buffer immediately. `cc.hold()` explicitly requests that the transport response buffer remain alive, enabling zero-copy reads when an FDB output payload supports retained views. The returned `cc.Held[R]` wraps the CRM logical return value, exposes the retained raw wire buffer as `.unsafe_buffer` for advanced use, and provides a three-layer safety net for buffer lifecycle:
+On the client side, the proven portable receive path opens a copy-backed FastDB `Payload`. `cc.hold()` retains the C-Two response lease together with that payload owner and guarantees that `held.release()` invalidates the FastDB owner and its checked views before releasing the lease. This is a lifetime guarantee, not a claim that FastDB built or views data directly in the response SHM. The returned `cc.Held[Payload]` also exposes the retained raw wire buffer as `.unsafe_buffer` for advanced use and provides a three-layer safety net:
 
 1. **Explicit `.release()`** — preferred for complex workflows holding multiple buffers
 2. **Context manager (`with`)** — recommended for single-buffer scopes
 3. **`__del__` fallback** — last resort, emits `ResourceWarning` if you forget to release
 
 ```python
-geometry = cc.connect(Geometry, name='geometry', address='ipc://server')
+echo = cc.connect(Echo, name='echo', address='ipc://server')
 
-# Normal call — exposes an owned logical value after transport release.
-vertices = geometry.vertices(1_000_000)
+# Normal call — returns an owned Payload.
+result = echo.echo(source)
 
-# Retained call — columnar FastDB views read from the retained response.
-with cc.hold(geometry.vertices)(1_000_000) as held:
-    vertices = held.value
-    z_mean = vertices.column.z.to_numpy().mean()
+# Retained call — checked views remain valid until release.
+with cc.hold(echo.echo)(source) as held:
+    payload = held.value
+    with payload.entry_view(0) as values:
+        with values.at(0) as value:
+            assert value.get_u8() == 7
 ```
 
-> **When to use hold mode:** Large array/columnar data where deserialization dominates cost. For small payloads (< 1 MB), the overhead of tracking SHM lifecycle exceeds the copy cost.
-
-`held.value` is the normal API. It uses FastDB checked views where possible, so child rows and columns fail fast after `held.release()`. `held.unsafe_buffer` is a raw `memoryview` escape hatch; raw NumPy arrays or other pointers derived from that buffer bypass FastDB owner checks. Materialize values with `fdb.materialize(...)` before storing them beyond the hold scope.
-
-Object-graph responses such as `nodes()` are portable FastDB payloads. The current runtime returns them as materialized logical values without retained columnar `held.unsafe_buffer`.
+`held.value` is the normal API. FastDB checked views fail after `held.release()`. `held.unsafe_buffer` is a raw `memoryview` escape hatch; raw NumPy arrays or pointers derived from that buffer bypass FastDB owner checks and cannot be revoked mechanically. Materialize through FastDB before retaining logical values beyond the hold scope.
 
 ---
 
 ### InputLifetime — Server-Side Borrowed Inputs
 
-On the server side, FastDB inputs are materialized by default before the resource method is called. Use `cc.register(..., input_lifetime={...})` only when the resource method has the same FDB input signature as the CRM and is prepared to treat a buffer-view input as call-scoped borrowed data.
+On the server side, portable inputs are owned by default. `cc.InputLifetime.BORROWED` is an explicit call-scoped lifetime policy for a resource method whose CRM signature accepts `Payload`; C-Two invalidates that payload and its checked views before releasing the request lease when the call returns or raises.
 
-`cc.InputLifetime.BORROWED` is valid only for FDB payloads with buffer-view support. Use it separately from `bridge.input`; copy any data retained after the method returns with `fastdb4py.materialize(value)` or `value.to_owned()`.
+Do not retain a borrowed payload or checked view after the method returns. Materialize the needed FastDB value while the call is active. Raw pointer or buffer aliases remain explicitly unsafe.
 
 ## Runnable Examples
 
@@ -350,13 +291,14 @@ The quick start above shows the end-to-end authoring pattern. The repository exa
 | --- | --- |
 | Same-process local call | [`examples/python/local.py`](examples/python/local.py) |
 | Direct IPC resource/client | [`examples/python/ipc_resource.py`](examples/python/ipc_resource.py), [`examples/python/ipc_client.py`](examples/python/ipc_client.py) |
-| FastDB CRM and relay client | [`examples/python/fastdb_relay_resource.py`](examples/python/fastdb_relay_resource.py), [`examples/python/fastdb_relay_client.py`](examples/python/fastdb_relay_client.py) |
 | Relay mesh | [`examples/python/relay_mesh/`](examples/python/relay_mesh/) |
-| FastDB bridge examples | [`examples/python/grid/`](examples/python/grid/) |
+| Python-only grid prototype | [`examples/python/grid/`](examples/python/grid/) |
+| Portable payload runtime and lifetime proof | [`sdk/python/tests/integration/test_portable_payload_runtime.py`](sdk/python/tests/integration/test_portable_payload_runtime.py) |
+| Rust/Python generated-artifact interoperability proof | [`sdk/python/tests/integration/test_portable_payload_cross_language.py`](sdk/python/tests/integration/test_portable_payload_cross_language.py) |
 
 ### Server-Side Monitoring
 
-Use `cc.hold_stats()` to monitor SHM buffers held by resource methods in hold mode:
+Use `cc.hold_stats()` to monitor retained response-buffer leases:
 
 ```python
 stats = cc.hold_stats()
@@ -389,7 +331,7 @@ Server-side stateful instances exposed through standardized CRM contracts.
 
 - **CRM contract**: Interface class decorated with `@cc.crm()`. Only methods declared here are remotely accessible.
 - **Resource**: Plain Python class implementing the contract — state + domain logic, with no decorator required.
-- **FDB payloads**: Portable CRM payloads are derived from `fastdb4py` annotations and represented as FastDB call-db payload ABI refs.
+- **Portable payloads**: `@cc.transfer(...)` binds one explicit nested FastDB specification to a `fastdb4py.payload.Payload` input and/or output.
 - **Python pickle fallback**: Plain Python types remain usable for Python-only prototyping, but strict portable export rejects them.
 - **`@cc.read` / `@cc.write`**: Concurrency annotations — parallel reads, exclusive writes.
 - **`@cc.on_shutdown`**: Lifecycle callback invoked when a resource is unregistered; it stays outside the RPC surface.
@@ -404,20 +346,24 @@ Protocol-agnostic communication with automatic protocol detection based on addre
 | `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
 | `http://host:port` | HTTP relay | Cross-machine, web-compatible |
 
-The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes are exchanged via shared memory. Normal FastDB calls detach from transport buffers before returning to user code; `cc.hold()` and `cc.InputLifetime.BORROWED` are the explicit lifetime controls for retained response buffers and call-scoped borrowed request buffers.
+The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes can be exchanged via shared memory. The current portable FastDB receive path is copy-backed. `cc.hold()` and `cc.InputLifetime.BORROWED` provide explicit invalidation/lease boundaries without implying direct FastDB construction in transport memory.
 
 ### Rust Native Layer
 
 The core runtime is language-neutral Rust, and SDKs bind to the same core contracts. Performance-critical components are implemented in Rust and exposed to Python through a native extension built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
 
-The Rust workspace contains 9 core crates organized in 4 layers (foundation → protocol → transport → runtime), plus the Python PyO3 extension under `sdk/python/native/`:
+The Rust workspace is organized in four layers (foundation → protocol → transport → runtime), plus the Python PyO3 extension under `sdk/python/native/`:
 
-- **Contract Core (`c2-contract`)** — Language-neutral CRM route contract validation and canonical descriptor hashing.
+- **Contract Core (`c2-contract`)** — Language-neutral `c-two.contract.v2` validation, canonical descriptor hashing, release identity, and opaque nested-spec extraction.
+- **Contract Codegen (`c2-codegen`)** — Delegates nested specs to the official FastDB Rust projection, verifies returned artifacts, composes C-Two and FastDB outputs deterministically, and publishes a complete new tree.
 - **Buddy Allocator** — Zero-syscall shared memory allocation for the IPC transport. Cross-process, lock-free on the fast path.
 - **Wire Protocol** — Frame encoding, chunk assembly, and chunk registry for large-payload lifecycle management.
 - **HTTP Relay** — High-throughput [axum](https://github.com/tokio-rs/axum)-based gateway bridging HTTP to IPC. Handles connection pooling and request multiplexing.
 
-The Rust extension is compiled automatically during `pip install c-two` (from pre-built wheels) or `uv sync` (from source).
+The released Rust extension is installed by `pip install c-two` from a
+pre-built wheel, or built from source by `uv sync`. This does not override the
+portable-package distribution limitation above: the complete v2/FastDB
+integration is currently source-checkout-only.
 
 The `c3` command is distributed as a native CLI binary and built from the root `cli/` package. Install released binaries with:
 
@@ -431,65 +377,35 @@ Portable CRM descriptors can be exported from Python CRM classes and validated b
 
 ```bash
 uv run python -m c_two.cli.contract export mypkg.contracts:Geometry --out geometry.contract.json
-c3 contract artifacts mypkg.contracts:Geometry --python .venv/bin/python --out geometry.payload-abi-artifacts.json
 c3 contract diagnose mypkg.contracts:Geometry --python .venv/bin/python --pretty
 c3 contract export mypkg.contracts:Geometry --python .venv/bin/python --out geometry.contract.json
 c3 contract validate geometry.contract.json
+c3 contract release-ref geometry.contract.json --out geometry.release-ref.json
 ```
 
-`c3 contract diagnose` reports fastdb-first portability warnings such as Python-only pickle fallback or a non-FastDB `PayloadAbiRef` before strict cross-language workflows fail, and the Rust CLI requires Python diagnostics to be a JSON array of objects before writing them. `c3 contract artifacts` exports FastDB ABI sidecar descriptors such as `fastdb.call-db.schema.v1` and root/dependency `fastdb.schema.v1` objects; C-Two runtime route/relay/IPC/scheduler/lease layers continue to treat FastDB storage internals as opaque. Feed that artifact bundle directly to C-Two codegen with `--fastdb-schema` and `--fastdb-out`:
+`c3 contract diagnose` reports Python-only pickle methods before portable export fails, and the Rust CLI validates diagnostic output before writing it. The validated v2 descriptor already contains each nested FastDB specification; there is no separate sidecar or second payload-schema input. Generate a complete fresh project tree for one supported C-Two target:
 
 ```bash
-c3 contract codegen typescript \
-  geometry.contract.json \
-  --out geometry.client.ts \
-  --fastdb-schema geometry.payload-abi-artifacts.json \
-  --fastdb-out geometry.fastdb.ts
+c3 contract codegen rust geometry.contract.json --out-dir generated-rust
+c3 contract codegen python geometry.contract.json --out-dir generated-python
+c3 contract codegen typescript geometry.contract.json --out-dir generated-typescript
 ```
 
-Validated descriptors can generate TypeScript clients. FastDB-backed payloads are emitted with method wire specs, route fingerprints, a codec transport factory, `createHttpRelayEncodedTransport(...)` for explicit relay URLs, and `createRelayAwareHttpEncodedTransport(...)` for contract-scoped relay resolve with a contract-keyed route cache, current-route preference, payload-limit guardrails, stale-route invalidation/re-resolve, resolve transport-error/5xx retry, data-plane transport-error classification, `maxAttempts`, `routeCacheTtlMs`, `callTimeoutMs`, `resolveTimeoutMs`, construction-time HTTP option/base URL/fetch/header validation, and reserved C-Two expected-contract header protection. Use `--strict-codecs` when CI should fail until every FastDB ABI requirement has generated TypeScript support:
+Each destination must be absent. Generation first validates the outer contract, delegates every nested value to FastDB Core, verifies hashes and paths, then publishes one deterministic tree containing:
 
-```bash
-c3 contract codegen typescript geometry.contract.json --out geometry.client.ts
-c3 contract codegen typescript geometry.contract.json --strict-codecs
+- `metadata/contract.json`
+- `metadata/contract-release-ref.json`
+- `metadata/composition-manifest.json`
+- the target-specific C-Two contract module
+- FastDB Core-owned payload modules under binding-specific `payloads/` paths
+
+Python can consume the same in-memory authority path:
+
+```python
+artifacts = cc.compile_contract_artifacts(descriptor, target="rust")
 ```
 
-For resource-first projects, `infer` can build a CRM projection descriptor from explicitly selected Python resource methods. Inference exposes only selected methods, and fastdb-first portable workflows require every selected method payload to resolve to a FastDB call-db `PayloadAbiRef` or no payload. Python-native primitives and containers are useful for Python-only prototypes; they fall back to `python-pickle-default` and are rejected by portable export. Explicit non-FastDB `PayloadAbiRef` values are internal diagnostic cases. Use `c3 contract infer --diagnose` to inspect those diagnostics before exporting, and `c3 contract infer --artifacts` to export FastDB ABI artifacts from the same inferred projection for C-Two codegen.
-
-```bash
-c3 contract infer mypkg.resources:GeometryResource \
-  --python .venv/bin/python \
-  --namespace mypkg.geometry \
-  --version 0.1.0 \
-  --name Geometry \
-  --method vertices \
-  --method nodes \
-  --diagnose \
-  --pretty
-
-c3 contract infer mypkg.resources:GeometryResource \
-  --python .venv/bin/python \
-  --namespace mypkg.geometry \
-  --version 0.1.0 \
-  --name Geometry \
-  --method vertices \
-  --method nodes \
-  --artifacts \
-  --out geometry.payload-abi-artifacts.json
-
-c3 contract infer mypkg.resources:GeometryResource \
-  --python .venv/bin/python \
-  --namespace mypkg.geometry \
-  --version 0.1.0 \
-  --name Geometry \
-  --method vertices \
-  --method nodes \
-  --out geometry.contract.json
-```
-
-FastDB call-db is the portable CRM payload ABI. The Python fallback path uses ordinary Python annotations and pickle for local or Python-only IPC prototypes; strict portable export/codegen rejects it. The public package surface omits optional payload registry modules and a public codec registry.
-
-To move a method onto the portable path, use `fastdb4py` scalar aliases, `Array[...]`, `Batch[...]`, and FastDB feature classes so the method plans as FastDB call-db. Unmarked Python payloads remain available in non-portable local/IPC prototype paths through pickle; strict portable export rejects pickle and non-FastDB `PayloadAbiRef` values. Extended schema code lives in the runnable FastDB examples.
+For resource-first projects, `c3 contract infer ... --diagnose` can expose why selected ordinary Python methods remain Python-only. A portable contract is authored explicitly with `@cc.transfer(...)`; inference does not synthesize FastDB structures from domain annotations.
 
 ---
 
@@ -501,7 +417,13 @@ To move a method onto the portable path, use `fastdb4py` scalar aliases, `Array[
 pip install c-two
 ```
 
+This installs the latest published C-Two runtime. It does not yet provide the
+complete portable-payload surface documented above; do not treat a successful
+registry install as evidence that the audited development-branch integration is
+available.
+
 Pre-built wheels are available for:
+
 - **Linux**: x86_64, aarch64
 - **macOS**: Apple Silicon (aarch64), Intel (x86_64)
 - **Python**: 3.10, 3.11, 3.12, 3.13, 3.14, 3.14t (free-threading)
@@ -513,6 +435,8 @@ If no pre-built wheel is available for your platform, pip will build from source
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
+# Place the audited compatible FastDB source checkout at ../fastdb.
+# The exact locally proven revision is recorded in the deferred-capabilities issue.
 cp .env.example .env               # configure environment (optional)
 uv sync                            # install dependencies + compile Rust extensions
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)
@@ -543,9 +467,11 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | Unified config architecture (Rust resolver SSOT) | ✅ Stable |
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
 | Disk spill for extreme payloads | ✅ Stable |
-| FastDB held response views through `cc.hold()` | ✅ Stable |
+| `c-two.contract.v2` + Core-owned artifact composition | ✅ Proven locally |
+| FastDB owner/view invalidation through `cc.hold()` | ✅ Proven locally |
 | SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
 | Route-independent contract release identity | ✅ Stable |
+| Immutable portable-package distribution | 🔜 Planned |
 | Contract version compatibility negotiation | 🔜 Planned |
 | `auth_hook` + call metadata | 🔜 Planned |
 | Dry-run hooks | 🔜 Planned |

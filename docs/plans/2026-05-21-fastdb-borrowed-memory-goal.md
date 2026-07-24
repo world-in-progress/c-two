@@ -1,5 +1,7 @@
 # Goal: FastDB Borrowed Memory Semantics
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 ## Objective
 Complete the C-Two and FastDB memory ownership redesign for FDB-first CRM payloads. Defer all benchmark work. Focus only on functional semantics, public APIs, implementation, tests, and docs for materialized values, client held responses, and explicit server-side borrowed input.
 
