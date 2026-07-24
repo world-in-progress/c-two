@@ -3,14 +3,19 @@
 use std::fmt;
 use thiserror::Error;
 
+mod admission;
 mod descriptor;
 mod release;
 
+pub use admission::{
+    ContractLimitMetric, ContractLimits, ContractLimitsProfile, MAX_CONTRACT_METHODS,
+    descriptor_admission_count_for_current_thread,
+};
 pub use descriptor::{
     BindingDirection, ContractFingerprints, MethodAccess, NestedFastDbSpec,
     ValidatedContractDescriptor, ValidatedMethodDescriptor, contract_descriptor_sha256_hex,
-    derive_contract_fingerprints_json, validate_portable_contract_descriptor_json,
-    validate_portable_contract_descriptor_value,
+    contract_descriptor_sha256_hex_with_limits, derive_contract_fingerprints_json,
+    derive_contract_fingerprints_json_with_limits, validate_portable_contract_descriptor_json,
 };
 pub use release::{
     CONTRACT_RELEASE_REF_SCHEMA, ContractDescriptorDigest, ContractRelease, ContractReleaseRef,
@@ -66,6 +71,16 @@ pub enum ContractError {
     InvalidHash { field: &'static str },
     #[error("contract descriptor must be valid JSON: {0}")]
     InvalidJson(String),
+    #[error(
+        "contract admission limit exceeded for {metric:?} at {path}: profile={profile:?}, limit={limit}, observed={observed}"
+    )]
+    LimitExceeded {
+        profile: ContractLimitsProfile,
+        metric: ContractLimitMetric,
+        limit: u64,
+        observed: u64,
+        path: String,
+    },
     #[error("contract descriptor invalid at {path}: {message}")]
     InvalidDescriptor { path: String, message: String },
     #[error("contract fingerprint mismatch at {field}: expected {expected:?}, got {actual:?}")]

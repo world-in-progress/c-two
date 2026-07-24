@@ -271,22 +271,23 @@ even when invalidation fails and returns a typed combined lifecycle error.
 
 ### Task 1.1 — Write the hostile RED corpus
 
-- [ ] Add exact-boundary tests for source bytes `16 MiB`, values `1_000_000`,
+- [x] Add exact-boundary tests for source bytes `16 MiB`, values `1_000_000`,
   root depth `1`, maximum depth `128`, methods `256`, and cumulative nested
   FastDB extraction bytes `16 MiB`.
-- [ ] Add one-over tests for every metric. Assert the exact
+- [x] Add one-over tests for every metric. Assert the exact
   `profile`, `metric`, `limit`, `observed`, and JSON path.
-- [ ] Count the root and every object value/array element; do not count object
+- [x] Count the root and every object value/array element; do not count object
   keys. Include arrays and objects that distinguish those rules.
-- [ ] Count identical nested FastDB bindings once per occurrence even though
+- [x] Count identical nested FastDB bindings once per occurrence even though
   codegen later deduplicates by digest.
-- [ ] Test checked-add overflow and a `u64` limit that cannot convert to
-  `usize`.
-- [ ] Feed a deeply nested hostile descriptor and prove rejection occurs in the
+- [x] Test checked-add overflow and a `u64` policy limit that cannot be
+  represented as a Rust allocation length (including `usize` conversion on
+  narrower targets).
+- [x] Feed a deeply nested hostile descriptor and prove rejection occurs in the
   bounded visitor, not after a `serde_json::Value` has been built.
-- [ ] Apply source/value/depth limits to `ContractReleaseRef`; assert method and
+- [x] Apply source/value/depth limits to `ContractReleaseRef`; assert method and
   nested-byte metrics are not consulted for a release reference.
-- [ ] Add an instrumentation-only parser counter proving CLI validate,
+- [x] Add an instrumentation-only parser counter proving CLI validate,
   release-ref, codegen, and Python codegen each admit descriptor bytes once.
 
 Run RED:
@@ -300,7 +301,7 @@ not exist; the hostile-depth probe reaches the old unbounded parse.
 
 ### Task 1.2 — Implement the bounded visitor
 
-- [ ] Define the single default table in `admission.rs`:
+- [x] Define the single default table in `admission.rs`:
 
 ```rust
 pub const MAX_CONTRACT_METHODS: usize = 256;
@@ -312,14 +313,14 @@ impl Default for ContractLimits {
 }
 ```
 
-- [ ] Add the direct `serde = "1"` dependency required by
+- [x] Add the direct `serde = "1"` dependency required by
   `DeserializeSeed`/`Visitor`; do not depend on a second JSON library.
-- [ ] Implement a `serde::de::DeserializeSeed`/`Visitor` that checks source size
+- [x] Implement a `serde::de::DeserializeSeed`/`Visitor` that checks source size
   before parsing, increments the value count before constructing each value,
   carries root depth `1`, and derives array/object child paths.
-- [ ] Store limits as checked `u64` policy values and validate every conversion
+- [x] Store limits as checked `u64` policy values and validate every conversion
   before parsing. Use checked addition for values and nested-byte totals.
-- [ ] Add:
+- [x] Add:
 
 ```rust
 ContractError::LimitExceeded {
@@ -331,28 +332,28 @@ ContractError::LimitExceeded {
 }
 ```
 
-- [ ] Reject `methods.len()` before allocating the method result vector or
+- [x] Reject `methods.len()` before allocating the method result vector or
   iterating method descriptors.
-- [ ] Canonicalize each opaque nested FastDB JSON value, add its byte length for
+- [x] Canonicalize each opaque nested FastDB JSON value, add its byte length for
   every binding occurrence, and check the cumulative total before returning
   `NestedFastDbSpec`.
-- [ ] Make `ValidatedContractDescriptor::from_json` and
+- [x] Make `ValidatedContractDescriptor::from_json` and
   `ContractRelease::from_descriptor_json` delegate to V1 bounded admission;
   add the explicit `*_with_limits` constructors and `ContractRelease::descriptor`.
-- [ ] Make `derive_contract_fingerprints_json` and
+- [x] Make `derive_contract_fingerprints_json` and
   `contract_descriptor_sha256_hex` delegate to V1-bounded variants so
   descriptor-authoring/fingerprint workflows cannot retain an unbounded parser.
-- [ ] Remove the public `validate_portable_contract_descriptor_value(&Value)`
+- [x] Remove the public `validate_portable_contract_descriptor_value(&Value)`
   escape. Internal code that already owns a `Value` must serialize it and enter
   the same bounded byte admission path.
-- [ ] Make `ContractReleaseRef::from_json(bytes)` delegate to
+- [x] Make `ContractReleaseRef::from_json(bytes)` delegate to
   `ContractReleaseRef::from_json_with_limits(bytes, ContractLimits::default())`.
-- [ ] Move the hard method authority from `c2-wire` to
+- [x] Move the hard method authority from `c2-wire` to
   `c2_contract::MAX_CONTRACT_METHODS`; remove the local `MAX_METHODS = 256`.
 
 ### Task 1.3 — Remove duplicate descriptor parsing
 
-- [ ] Clean-cut codegen to accept the admitted release:
+- [x] Clean-cut codegen to accept the admitted release:
 
 ```rust
 pub fn compile_contract_artifacts(
@@ -362,14 +363,14 @@ pub fn compile_contract_artifacts(
 ) -> Result<ContractArtifactSet, CodegenError>;
 ```
 
-- [ ] Use `release.descriptor()` throughout `compile.rs`; do not parse the
+- [x] Use `release.descriptor()` throughout `compile.rs`; do not parse the
   descriptor bytes again.
-- [ ] In CLI `validate`, `release-ref`, and `codegen`, construct exactly one
+- [x] In CLI `validate`, `release-ref`, and `codegen`, construct exactly one
   `ContractRelease` and derive digest/reference/artifacts from it.
-- [ ] In Python native codegen, admit bytes once outside `py.detach`, move the
+- [x] In Python native codegen, admit bytes once outside `py.detach`, move the
   admitted release into the detached closure, and project the same typed
   `LimitExceeded` fields.
-- [ ] Remove or make crate-private any JSON helper that allows CLI/Python/
+- [x] Remove or make crate-private any JSON helper that allows CLI/Python/
   codegen to bypass the bounded `ContractRelease` path.
 
 Run focused GREEN:
@@ -396,12 +397,12 @@ git diff --check
 
 Review before commit:
 
-- [ ] Search for every `serde_json::from_slice`/`from_str` that consumes an
+- [x] Search for every `serde_json::from_slice`/`from_str` that consumes an
   external contract descriptor or release reference and prove it is behind
   bounded admission.
-- [ ] Search for literal `256` in contract/wire method-capacity code and prove
+- [x] Search for literal `256` in contract/wire method-capacity code and prove
   only tests/default declaration retain it.
-- [ ] Prove limit policy is absent from canonical descriptor bytes and digests.
+- [x] Prove limit policy is absent from canonical descriptor bytes and digests.
 
 ## Task 2: Clean-Cut `c2-runtime` into `c2-core` and Centralize Errors
 

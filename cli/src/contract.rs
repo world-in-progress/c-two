@@ -167,10 +167,8 @@ fn diagnose(args: PythonDiagnoseArgs) -> Result<()> {
 
 fn validate(path: &str) -> Result<()> {
     let payload = read_payload(path)?;
-    c2_contract::validate_portable_contract_descriptor_json(payload.as_bytes())
-        .map_err(|err| anyhow!("{err}"))?;
-    let digest = c2_contract::contract_descriptor_sha256_hex(payload.as_bytes())
-        .map_err(|err| anyhow!("{err}"))?;
+    let release = admit_contract_once(payload.as_bytes())?;
+    let digest = release.descriptor_sha256();
     let label = if path == "-" { "stdin" } else { path };
     println!("{label}: valid c-two.contract.v2 sha256={digest}");
     Ok(())
@@ -178,8 +176,7 @@ fn validate(path: &str) -> Result<()> {
 
 fn release_ref(args: ReleaseRefArgs) -> Result<()> {
     let payload = read_payload(&args.path)?;
-    let release = c2_contract::ContractRelease::from_descriptor_json(payload.as_bytes())
-        .map_err(|error| anyhow!("{error}"))?;
+    let release = admit_contract_once(payload.as_bytes())?;
     let compact = release
         .reference()
         .to_canonical_json()
@@ -203,8 +200,9 @@ fn codegen(args: CodegenArgs) -> Result<()> {
         CodegenCommand::Typescript(args) => (c2_codegen::ContractCodegenTarget::TypeScript, args),
     };
     let payload = read_payload(&args.path)?;
+    let release = admit_contract_once(payload.as_bytes())?;
     let artifacts = c2_codegen::compile_contract_artifacts(
-        payload.as_bytes(),
+        &release,
         target,
         &c2_codegen::ContractCodegenOptions::default(),
     )
@@ -212,6 +210,22 @@ fn codegen(args: CodegenArgs) -> Result<()> {
     artifacts
         .publish_new_tree(&args.out_dir)
         .map_err(|error| anyhow!("{error}"))
+}
+
+fn admit_contract_once(payload: &[u8]) -> Result<c2_contract::ContractRelease> {
+    #[cfg(debug_assertions)]
+    let before = c2_contract::descriptor_admission_count_for_current_thread();
+    let release = c2_contract::ContractRelease::from_descriptor_json(payload);
+    #[cfg(debug_assertions)]
+    {
+        let after = c2_contract::descriptor_admission_count_for_current_thread();
+        debug_assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "a CLI descriptor operation must enter ContractRelease admission exactly once"
+        );
+    }
+    release.map_err(|error| anyhow!("{error}"))
 }
 
 fn export(args: PythonExportArgs) -> Result<()> {

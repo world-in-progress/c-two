@@ -951,56 +951,50 @@ impl PyRuntimeSession {
                 RelayResolvedConnection::Ipc {
                     client: relay_client,
                     candidate,
-                } => {
-                    match self.acquire_relay_ipc_client(
-                        py,
-                        &candidate,
-                        &expected,
-                    ) {
-                        Ok((client, binding)) => {
-                            return Ok(PyRelayConnectedClient {
-                                mode: "ipc".to_string(),
-                                target: candidate.address,
-                                route_name: expected.route_name.clone(),
-                                inner: RelayConnectedInner::Ipc {
-                                    client,
-                                    binding,
-                                    pool: self.pool.inner,
-                                },
-                                closed: Mutex::new(false),
-                            });
-                        }
-                        Err(RelayIpcConnectError::Config(err)) => return Err(err),
-                        Err(RelayIpcConnectError::ContractMismatch(message)) => {
-                            return Err(relay_ipc_contract_mismatch_to_py(&expected, &message));
-                        }
-                        Err(RelayIpcConnectError::Unavailable(reason)) => {
-                            eprintln!(
-                                "[c-two] Relay-resolved local IPC acquire failed; fallback denied unless a distinct route is available: {reason}"
-                            );
-                            let failed_candidate = candidate.clone();
-                            failed_local_ipc_candidates.push(candidate);
-                            let failed = failed_local_ipc_candidates.clone();
-                            let next_target = match py.detach(move || {
-                                RuntimeSession::resolve_relay_connection_after_local_ipc_failures(
-                                    relay_client,
-                                    &failed,
-                                )
-                            }) {
-                                Ok(target) => target,
-                                Err(err) if runtime_error_is_fallback_denied(&err) => {
-                                    return Err(relay_ipc_fallback_denied_to_py(
-                                        &reason,
-                                        &failed_candidate,
-                                    ));
-                                }
-                                Err(err) => return Err(runtime_error_to_py(err)),
-                            };
-                            target = next_target;
-                            continue;
-                        }
+                } => match self.acquire_relay_ipc_client(py, &candidate, &expected) {
+                    Ok((client, binding)) => {
+                        return Ok(PyRelayConnectedClient {
+                            mode: "ipc".to_string(),
+                            target: candidate.address,
+                            route_name: expected.route_name.clone(),
+                            inner: RelayConnectedInner::Ipc {
+                                client,
+                                binding,
+                                pool: self.pool.inner,
+                            },
+                            closed: Mutex::new(false),
+                        });
                     }
-                }
+                    Err(RelayIpcConnectError::Config(err)) => return Err(err),
+                    Err(RelayIpcConnectError::ContractMismatch(message)) => {
+                        return Err(relay_ipc_contract_mismatch_to_py(&expected, &message));
+                    }
+                    Err(RelayIpcConnectError::Unavailable(reason)) => {
+                        eprintln!(
+                            "[c-two] Relay-resolved local IPC acquire failed; fallback denied unless a distinct route is available: {reason}"
+                        );
+                        let failed_candidate = candidate.clone();
+                        failed_local_ipc_candidates.push(candidate);
+                        let failed = failed_local_ipc_candidates.clone();
+                        let next_target = match py.detach(move || {
+                            RuntimeSession::resolve_relay_connection_after_local_ipc_failures(
+                                relay_client,
+                                &failed,
+                            )
+                        }) {
+                            Ok(target) => target,
+                            Err(err) if runtime_error_is_fallback_denied(&err) => {
+                                return Err(relay_ipc_fallback_denied_to_py(
+                                    &reason,
+                                    &failed_candidate,
+                                ));
+                            }
+                            Err(err) => return Err(runtime_error_to_py(err)),
+                        };
+                        target = next_target;
+                        continue;
+                    }
+                },
                 RelayResolvedConnection::Http { client, relay_url } => {
                     return Ok(PyRelayConnectedClient {
                         mode: "http".to_string(),

@@ -1,9 +1,21 @@
-use c2_codegen::{ContractCodegenOptions, ContractCodegenTarget, compile_contract_artifacts};
+use c2_codegen::{
+    CodegenError, ContractArtifactSet, ContractCodegenOptions, ContractCodegenTarget,
+    compile_contract_artifacts as compile_admitted_contract_artifacts,
+};
 use std::path::Path;
 use std::process::Command;
 
 const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
+
+fn compile_contract_artifacts(
+    descriptor_json: &[u8],
+    target: ContractCodegenTarget,
+    options: &ContractCodegenOptions,
+) -> Result<ContractArtifactSet, CodegenError> {
+    let release = c2_contract::ContractRelease::from_descriptor_json(descriptor_json)?;
+    compile_admitted_contract_artifacts(&release, target, options)
+}
 
 fn descriptor_with_method_names(first: &str, second: &str) -> String {
     let mut descriptor: serde_json::Value = serde_json::from_str(DESCRIPTOR).unwrap();

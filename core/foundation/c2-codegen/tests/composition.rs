@@ -1,6 +1,7 @@
 use c2_codegen::{
     ArtifactComposer, ArtifactKind, ArtifactLimits, ArtifactProvenance, CodegenError,
-    ContractArtifact, ContractCodegenOptions, ContractCodegenTarget, compile_contract_artifacts,
+    ContractArtifact, ContractArtifactSet, ContractCodegenOptions, ContractCodegenTarget,
+    compile_contract_artifacts as compile_admitted_contract_artifacts,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -8,6 +9,15 @@ use std::sync::{Arc, Barrier};
 
 const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
+
+fn compile_contract_artifacts(
+    descriptor_json: &[u8],
+    target: ContractCodegenTarget,
+    options: &ContractCodegenOptions,
+) -> Result<ContractArtifactSet, CodegenError> {
+    let release = c2_contract::ContractRelease::from_descriptor_json(descriptor_json)?;
+    compile_admitted_contract_artifacts(&release, target, options)
+}
 
 fn provenance() -> ArtifactProvenance {
     ArtifactProvenance::new("test", "fixture").unwrap()
@@ -28,6 +38,27 @@ fn descriptor_with_nested_spec(spec: serde_json::Value) -> String {
     value["fingerprints"]["signature_hash"] =
         serde_json::Value::String(fingerprints.signature_hash().to_string());
     value.to_string()
+}
+
+#[test]
+fn codegen_reuses_one_admitted_release_without_reparsing_descriptor_bytes() {
+    let before = c2_contract::descriptor_admission_count_for_current_thread();
+    let release = c2_contract::ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes())
+        .expect("fixture must admit");
+    let admitted = c2_contract::descriptor_admission_count_for_current_thread();
+    assert_eq!(admitted.saturating_sub(before), 1);
+
+    compile_admitted_contract_artifacts(
+        &release,
+        ContractCodegenTarget::Rust,
+        &ContractCodegenOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        c2_contract::descriptor_admission_count_for_current_thread(),
+        admitted,
+        "codegen must consume the admitted release rather than parsing bytes again"
+    );
 }
 
 #[test]

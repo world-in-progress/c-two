@@ -62,6 +62,10 @@ def test_python_codegen_preserves_structured_fastdb_error_fields() -> None:
     assert isinstance(error.path, str) and error.path
     assert isinstance(error.message, str) and error.message
     assert isinstance(json.loads(error.details_json), dict)
+    assert error.profile is None
+    assert error.metric is None
+    assert error.limit is None
+    assert error.observed is None
 
 
 def test_python_codegen_non_fastdb_errors_have_explicit_empty_cause_fields() -> None:
@@ -74,8 +78,39 @@ def test_python_codegen_non_fastdb_errors_have_explicit_empty_cause_fields() -> 
     assert error.symbol is None
     assert error.path is None
     assert error.details_json is None
+    assert error.profile is None
+    assert error.metric is None
+    assert error.limit is None
+    assert error.observed is None
     assert error.message == str(error)
     assert "unsupported contract codegen target" in error.message
+
+
+def test_python_codegen_projects_typed_contract_admission_fields() -> None:
+    descriptor = json.loads(FIXTURE.read_text())
+    template = descriptor["methods"][0]
+    descriptor["methods"] = [
+        {**template, "name": f"method_{index:03}"}
+        for index in range(257)
+    ]
+
+    with pytest.raises(cc.ContractCodegenError) as caught:
+        cc.compile_contract_artifacts(
+            json.dumps(descriptor, separators=(",", ":")).encode(),
+            target="python",
+        )
+
+    error = caught.value
+    assert error.binding_path is None
+    assert error.code is None
+    assert error.symbol is None
+    assert error.details_json is None
+    assert error.profile == "v1"
+    assert error.metric == "methods"
+    assert error.limit == 256
+    assert error.observed == 257
+    assert error.path == "$.methods"
+    assert error.message == str(error)
 
 
 def test_generated_python_project_imports_with_installed_fastdb_projection(

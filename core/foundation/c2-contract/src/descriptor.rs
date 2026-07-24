@@ -1,6 +1,11 @@
 use crate::{
     CONTRACT_HASH_HEX_BYTES, ContractDescriptorDigest, ContractError, ContractFingerprintField,
-    PORTABLE_CONTRACT_SCHEMA, validate_contract_text_field,
+    ContractLimitMetric, ContractLimits, PORTABLE_CONTRACT_SCHEMA,
+    admission::{
+        JsonDocumentKind, checked_observed_add, parse_bounded_json, record_descriptor_admission,
+        usize_to_u64, validate_descriptor_limit_configuration,
+    },
+    validate_contract_text_field,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -101,8 +106,17 @@ pub struct ValidatedContractDescriptor {
 
 impl ValidatedContractDescriptor {
     pub fn from_json(json_bytes: &[u8]) -> Result<Self, ContractError> {
-        let value = parse_json(json_bytes)?;
-        let parsed = parse_outer_descriptor(&value)?;
+        Self::from_json_with_limits(json_bytes, ContractLimits::default())
+    }
+
+    pub fn from_json_with_limits(
+        json_bytes: &[u8],
+        limits: ContractLimits,
+    ) -> Result<Self, ContractError> {
+        record_descriptor_admission();
+        validate_descriptor_limit_configuration(limits)?;
+        let value = parse_bounded_json(json_bytes, limits, JsonDocumentKind::ContractDescriptor)?;
+        let parsed = parse_outer_descriptor(&value, limits)?;
         let derived = derive_contract_fingerprints_value(&value, &parsed)?;
         verify_fingerprint(
             ContractFingerprintField::AbiHash,
@@ -181,13 +195,28 @@ struct ParsedOuterDescriptor {
 pub fn derive_contract_fingerprints_json(
     json_bytes: &[u8],
 ) -> Result<ContractFingerprints, ContractError> {
-    let value = parse_json(json_bytes)?;
-    let parsed = parse_outer_descriptor(&value)?;
+    derive_contract_fingerprints_json_with_limits(json_bytes, ContractLimits::default())
+}
+
+pub fn derive_contract_fingerprints_json_with_limits(
+    json_bytes: &[u8],
+    limits: ContractLimits,
+) -> Result<ContractFingerprints, ContractError> {
+    validate_descriptor_limit_configuration(limits)?;
+    let value = parse_bounded_json(json_bytes, limits, JsonDocumentKind::ContractDescriptor)?;
+    let parsed = parse_outer_descriptor(&value, limits)?;
     derive_contract_fingerprints_value(&value, &parsed)
 }
 
 pub fn contract_descriptor_sha256_hex(json_bytes: &[u8]) -> Result<String, ContractError> {
-    let value = parse_json(json_bytes)?;
+    contract_descriptor_sha256_hex_with_limits(json_bytes, ContractLimits::default())
+}
+
+pub fn contract_descriptor_sha256_hex_with_limits(
+    json_bytes: &[u8],
+    limits: ContractLimits,
+) -> Result<String, ContractError> {
+    let value = parse_bounded_json(json_bytes, limits, JsonDocumentKind::ContractDescriptor)?;
     Ok(sha256_hex(canonical_json(&value).as_bytes()))
 }
 
@@ -195,17 +224,10 @@ pub fn validate_portable_contract_descriptor_json(json_bytes: &[u8]) -> Result<(
     ValidatedContractDescriptor::from_json(json_bytes).map(|_| ())
 }
 
-pub fn validate_portable_contract_descriptor_value(value: &Value) -> Result<(), ContractError> {
-    let canonical = canonical_json(value);
-    ValidatedContractDescriptor::from_json(canonical.as_bytes()).map(|_| ())
-}
-
-fn parse_json(json_bytes: &[u8]) -> Result<Value, ContractError> {
-    serde_json::from_slice(json_bytes)
-        .map_err(|error| ContractError::InvalidJson(error.to_string()))
-}
-
-fn parse_outer_descriptor(value: &Value) -> Result<ParsedOuterDescriptor, ContractError> {
+fn parse_outer_descriptor(
+    value: &Value,
+    limits: ContractLimits,
+) -> Result<ParsedOuterDescriptor, ContractError> {
     let root = object_at(value, "$")?;
     ensure_keys(root, "$", &["schema", "crm", "fingerprints", "methods"])?;
     let schema = string_at(required(root, "$", "schema")?, "$.schema")?;
@@ -242,11 +264,28 @@ fn parse_outer_descriptor(value: &Value) -> Result<ParsedOuterDescriptor, Contra
     )?;
 
     let method_values = array_at(required(root, "$", "methods")?, "$.methods")?;
+    let method_count = usize_to_u64(method_values.len());
+    if method_count > limits.max_methods() {
+        return Err(ContractError::LimitExceeded {
+            profile: limits.profile(),
+            metric: ContractLimitMetric::Methods,
+            limit: limits.max_methods(),
+            observed: method_count,
+            path: "$.methods".to_string(),
+        });
+    }
     let mut method_names = BTreeSet::new();
     let mut methods = Vec::with_capacity(method_values.len());
+    let mut nested_fastdb_bytes = 0;
     for (index, method) in method_values.iter().enumerate() {
         let path = format!("$.methods[{index}]");
-        methods.push(parse_method_descriptor(method, &path, &mut method_names)?);
+        methods.push(parse_method_descriptor(
+            method,
+            &path,
+            &mut method_names,
+            limits,
+            &mut nested_fastdb_bytes,
+        )?);
     }
 
     Ok(ParsedOuterDescriptor {
@@ -263,6 +302,8 @@ fn parse_method_descriptor(
     value: &Value,
     path: &str,
     method_names: &mut BTreeSet<String>,
+    limits: ContractLimits,
+    nested_fastdb_bytes: &mut u64,
 ) -> Result<ValidatedMethodDescriptor, ContractError> {
     let object = object_at(value, path)?;
     ensure_keys(
@@ -307,11 +348,15 @@ fn parse_method_descriptor(
         required(bindings, &bindings_path, "input")?,
         &format!("{bindings_path}.input"),
         BindingDirection::Input,
+        limits,
+        nested_fastdb_bytes,
     )?;
     let output = parse_binding(
         required(bindings, &bindings_path, "output")?,
         &format!("{bindings_path}.output"),
         BindingDirection::Output,
+        limits,
+        nested_fastdb_bytes,
     )?;
 
     match input {
@@ -435,6 +480,8 @@ fn parse_binding(
     value: &Value,
     path: &str,
     direction: BindingDirection,
+    limits: ContractLimits,
+    nested_fastdb_bytes: &mut u64,
 ) -> Result<Option<NestedFastDbSpec>, ContractError> {
     if value.is_null() {
         return Ok(None);
@@ -450,10 +497,19 @@ fn parse_binding(
 
     let spec_path = format!("{path}.spec");
     let spec = required(object, path, "spec")?;
+    let canonical_json = canonical_json(spec);
+    *nested_fastdb_bytes = checked_observed_add(
+        limits,
+        ContractLimitMetric::NestedFastDbBytes,
+        limits.max_nested_fastdb_bytes(),
+        *nested_fastdb_bytes,
+        usize_to_u64(canonical_json.len()),
+        &spec_path,
+    )?;
     Ok(Some(NestedFastDbSpec {
         direction,
         outer_path: spec_path,
-        canonical_json: canonical_json(spec),
+        canonical_json,
     }))
 }
 

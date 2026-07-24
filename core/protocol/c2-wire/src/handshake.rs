@@ -54,7 +54,7 @@ pub const CAP_CHUNKED: u16 = 1 << 2;
 
 pub const MAX_SEGMENTS: usize = 16;
 pub const MAX_ROUTES: usize = 64;
-pub const MAX_METHODS: usize = 256;
+pub const MAX_METHODS: usize = c2_contract::MAX_CONTRACT_METHODS;
 const MAX_HANDSHAKE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
 
 // ── Data types ───────────────────────────────────────────────────────────

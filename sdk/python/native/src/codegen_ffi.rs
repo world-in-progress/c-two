@@ -1,6 +1,7 @@
 use c2_codegen::{
     CodegenError, ContractCodegenOptions, ContractCodegenTarget, compile_contract_artifacts,
 };
+use c2_contract::{ContractError, ContractRelease};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
@@ -18,10 +19,22 @@ fn compile_contract_artifacts_projection(
     target: &str,
 ) -> PyResult<Py<PyAny>> {
     let target = parse_target(py, target)?;
-    let descriptor_json = descriptor_json.to_vec();
+    #[cfg(debug_assertions)]
+    let before = c2_contract::descriptor_admission_count_for_current_thread();
+    let release = ContractRelease::from_descriptor_json(descriptor_json);
+    #[cfg(debug_assertions)]
+    {
+        let after = c2_contract::descriptor_admission_count_for_current_thread();
+        debug_assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "Python codegen must enter ContractRelease admission exactly once"
+        );
+    }
+    let release = release.map_err(|error| codegen_error(py, CodegenError::Contract(error)))?;
     let artifacts = py
         .detach(move || {
-            compile_contract_artifacts(&descriptor_json, target, &ContractCodegenOptions::default())
+            compile_contract_artifacts(&release, target, &ContractCodegenOptions::default())
         })
         .map_err(|error| codegen_error(py, error))?;
 
@@ -53,7 +66,7 @@ fn parse_target(py: Python<'_>, target: &str) -> PyResult<ContractCodegenTarget>
             format!(
                 "unsupported contract codegen target {target:?}; expected rust, python, or typescript"
             ),
-            None,
+            ErrorFields::None,
         )),
     }
 }
@@ -61,6 +74,23 @@ fn parse_target(py: Python<'_>, target: &str) -> PyResult<ContractCodegenTarget>
 fn codegen_error(py: Python<'_>, error: CodegenError) -> PyErr {
     let message = error.to_string();
     match error {
+        CodegenError::Contract(ContractError::LimitExceeded {
+            profile,
+            metric,
+            limit,
+            observed,
+            path,
+        }) => public_error(
+            py,
+            message,
+            ErrorFields::Admission {
+                profile: profile.as_str(),
+                metric: metric.as_str(),
+                limit,
+                observed,
+                path,
+            },
+        ),
         CodegenError::FastDb {
             binding_path,
             code,
@@ -71,7 +101,7 @@ fn codegen_error(py: Python<'_>, error: CodegenError) -> PyErr {
         } => public_error(
             py,
             message,
-            Some(FastDbErrorFields {
+            ErrorFields::FastDb(FastDbErrorFields {
                 binding_path,
                 code,
                 symbol,
@@ -80,7 +110,7 @@ fn codegen_error(py: Python<'_>, error: CodegenError) -> PyErr {
                 details_json,
             }),
         ),
-        _ => public_error(py, message, None),
+        _ => public_error(py, message, ErrorFields::None),
     }
 }
 
@@ -93,29 +123,62 @@ struct FastDbErrorFields {
     details_json: String,
 }
 
-fn public_error(
-    py: Python<'_>,
-    display_message: String,
-    fields: Option<FastDbErrorFields>,
-) -> PyErr {
+enum ErrorFields {
+    None,
+    FastDb(FastDbErrorFields),
+    Admission {
+        profile: &'static str,
+        metric: &'static str,
+        limit: u64,
+        observed: u64,
+        path: String,
+    },
+}
+
+fn public_error(py: Python<'_>, display_message: String, fields: ErrorFields) -> PyErr {
     let error = PyErr::new::<ContractCodegenError, _>(display_message.clone());
     let value = error.value(py);
-    let set_result = if let Some(fields) = fields {
+    let set_common_empty = || {
         value
+            .setattr("binding_path", py.None())
+            .and_then(|()| value.setattr("code", py.None()))
+            .and_then(|()| value.setattr("symbol", py.None()))
+            .and_then(|()| value.setattr("details_json", py.None()))
+    };
+    let set_admission_empty = || {
+        value
+            .setattr("profile", py.None())
+            .and_then(|()| value.setattr("metric", py.None()))
+            .and_then(|()| value.setattr("limit", py.None()))
+            .and_then(|()| value.setattr("observed", py.None()))
+    };
+    let set_result = match fields {
+        ErrorFields::FastDb(fields) => value
             .setattr("binding_path", fields.binding_path)
             .and_then(|()| value.setattr("code", fields.code))
             .and_then(|()| value.setattr("symbol", fields.symbol))
             .and_then(|()| value.setattr("path", fields.path))
             .and_then(|()| value.setattr("message", fields.message))
             .and_then(|()| value.setattr("details_json", fields.details_json))
-    } else {
-        value
-            .setattr("binding_path", py.None())
-            .and_then(|()| value.setattr("code", py.None()))
-            .and_then(|()| value.setattr("symbol", py.None()))
+            .and_then(|()| set_admission_empty()),
+        ErrorFields::Admission {
+            profile,
+            metric,
+            limit,
+            observed,
+            path,
+        } => set_common_empty()
+            .and_then(|()| value.setattr("profile", profile))
+            .and_then(|()| value.setattr("metric", metric))
+            .and_then(|()| value.setattr("limit", limit))
+            .and_then(|()| value.setattr("observed", observed))
+            .and_then(|()| value.setattr("path", path))
+            .and_then(|()| value.setattr("message", display_message)),
+        ErrorFields::None => set_common_empty()
+            .and_then(|()| set_admission_empty())
             .and_then(|()| value.setattr("path", py.None()))
             .and_then(|()| value.setattr("message", display_message))
-            .and_then(|()| value.setattr("details_json", py.None()))
+            .and_then(|()| value.setattr("details_json", py.None())),
     };
     match set_result {
         Ok(()) => error,

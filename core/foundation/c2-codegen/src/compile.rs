@@ -3,9 +3,7 @@ use crate::{
     ContractArtifact, ContractArtifactSet, fastdb_error, lower_hex,
     targets::{TargetMethod, render_target_artifacts},
 };
-use c2_contract::{
-    BindingDirection, ContractRelease, MethodAccess, NestedFastDbSpec, ValidatedContractDescriptor,
-};
+use c2_contract::{BindingDirection, ContractRelease, MethodAccess, NestedFastDbSpec};
 use fastdb::{
     ArtifactKind as FastDbArtifactKind, Capabilities, CodegenOptions as FastDbCodegenOptions,
     CodegenTarget as FastDbCodegenTarget, CompiledSpec,
@@ -75,12 +73,11 @@ struct MethodFact {
 }
 
 pub fn compile_contract_artifacts(
-    descriptor_json: &[u8],
+    release: &ContractRelease,
     target: ContractCodegenTarget,
     options: &ContractCodegenOptions,
 ) -> Result<ContractArtifactSet, CodegenError> {
-    let descriptor = ValidatedContractDescriptor::from_json(descriptor_json)?;
-    let release = ContractRelease::from_descriptor_json(descriptor_json)?;
+    let descriptor = release.descriptor();
     let release_ref_json = release.reference().to_canonical_json()?;
     let mut bindings = Vec::new();
     let mut methods = Vec::new();
@@ -146,7 +143,7 @@ pub fn compile_contract_artifacts(
             output_sha256: method.output_sha256.as_deref(),
         })
         .collect::<Vec<_>>();
-    let target_artifacts = render_target_artifacts(target, &descriptor, &target_methods)?;
+    let target_artifacts = render_target_artifacts(target, descriptor, &target_methods)?;
     let contract_artifact = ContractArtifact::new(
         "metadata/contract.json",
         ArtifactKind::Metadata,
