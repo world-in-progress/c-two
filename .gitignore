@@ -84,6 +84,8 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+# The standalone Rust SDK lockfile is local-candidate evidence and is tracked.
+!sdk/rust/Cargo.lock
 
 # Jupyter Notebook
 .ipynb_checkpoints

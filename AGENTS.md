@@ -45,6 +45,11 @@ uv run pytest sdk/python/tests/unit/test_held_result.py::TestHeldResultBasic::te
 # Rust core tests
 cargo test --manifest-path core/Cargo.toml --workspace
 
+# User-facing Rust SDK, including real route-bound examples
+cargo test --manifest-path sdk/rust/Cargo.toml --all-features
+cargo run --manifest-path sdk/rust/Cargo.toml --example client
+cargo run --manifest-path sdk/rust/Cargo.toml --example host
+
 # Opt-in compiled Rust/Python portable-payload interoperability proof
 C2_RUN_PORTABLE_INTEROP=1 C2_RELAY_ANCHOR_ADDRESS= \
   uv run pytest sdk/python/tests/integration/test_portable_payload_cross_language.py \
@@ -83,7 +88,9 @@ UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ANCHOR_ADDRESS= uv run --python 3.10
 
 ## Architecture
 
-C-Two has a language-neutral Rust core and language SDKs. Python is the current SDK surface, not the canonical home for generic runtime mechanisms. The Python SDK owns Python domain logic, CRM contracts, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust owns shared transport, memory, wire codec, CRM route contract validation and fingerprints, route concurrency enforcement and state, HTTP relay, and configuration resolution. PyO3/maturin bridges Rust into Python as `c_two._native`.
+C-Two has a language-neutral Rust core and user-facing Rust and Python SDKs. Neither SDK is the canonical home for generic runtime mechanisms. The Rust SDK at `sdk/rust` is package `c-two`, imported as `c_two`, and is a thin facade over Core plus generated typed clients/services. The Python SDK owns Python domain logic, CRM authoring, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust Core owns shared transport, memory, wire codec, CRM route contract validation and fingerprints, route concurrency enforcement and state, HTTP relay, and configuration resolution. PyO3/maturin projects that Core into Python as `c_two._native`.
+
+The Rust SDK may depend on the official `fastdb` Rust binding to adapt portable payloads, but `c2-core` must remain payload-owner-neutral. Rust users continue to name `fastdb::Payload`; do not re-export it under a C-Two semantic namespace. Rust and Python must expose the same portable route, payload, error, and lifetime capabilities even when their language-level syntax differs.
 
 ### CRM Layer
 
@@ -202,6 +209,7 @@ Paths: `core/`, `sdk/python/native/`
 | transport | `c2-server` | Tokio UDS server with per-connection state and peer SHM lazy-open |
 | transport | `c2-http` | HTTP client, relay-aware client, and HTTP relay server behind `relay` feature |
 | runtime | `c2-core` | Language-neutral runtime, route transactions, client pools, relay projection, and error normalization |
+| sdk/rust | `c-two` / `c_two` | User-facing Rust facade, FastDB adapter, and checked held/borrowed owners |
 | sdk/python/native | `c2-python-native` | PyO3 bindings for `c_two._native` |
 
 Memory subsystem:
@@ -239,11 +247,23 @@ Relay-aware clients use `C2_RELAY_ROUTE_MAX_ATTEMPTS` to cap route acquisition a
 
 ### Import Style
 
-Import the package as `c_two` and alias it as `cc`:
+Python imports the package as `c_two` and commonly aliases it as `cc`:
 
 ```python
 import c_two as cc
 ```
+
+Rust users import the user-facing package as `c_two`, not by a Core or
+transport crate name:
+
+```rust
+use c_two::{Connect, ContractRelease, Runtime};
+use fastdb::Payload;
+```
+
+Generated Rust modules may use the hidden `c_two::generated` seam. Ordinary
+application code must not assemble `c2-ipc`, `c2-http`, `c2-server`,
+`SyncClient`, or route bindings directly.
 
 ### CRM Contract Pattern
 

@@ -816,7 +816,7 @@ Review before commit:
 
 ### Task 5.1 — Write public API and parity RED tests
 
-- [ ] A clean external test crate can import only:
+- [x] A clean external test crate can import only:
 
 ```rust
 use c_two::{
@@ -825,19 +825,19 @@ use c_two::{
 };
 ```
 
-- [ ] Assert `cargo metadata` reports package `c-two`, library target `c_two`,
+- [x] Assert `cargo metadata` reports package `c-two`, library target `c_two`,
   version `0.1.0`, and `publish = []`/false.
-- [ ] Compile-fail direct imports of `c2_ipc`, `c2_http`, `c2_server`,
+- [x] Compile-fail direct imports of `c2_ipc`, `c2_http`, `c2_server`,
   `SyncClient`, and `RouteBinding` from the SDK surface.
-- [ ] Compile-fail an external implementation of the sealed
+- [x] Compile-fail an external implementation of the sealed
   `EncodedClient`.
-- [ ] Exercise direct IPC, explicit relay, and relay-aware clients through the
+- [x] Exercise direct IPC, explicit relay, and relay-aware clients through the
   same `c_two::Client`.
-- [ ] Exercise host registration through `c_two::Runtime::host`; user code must
+- [x] Exercise host registration through `c_two::Runtime::host`; user code must
   not assemble a low-level server or callback.
-- [ ] Assert Rust `Error::Semantic` preserves exactly the same C2 error fields
+- [x] Assert Rust `Error::Semantic` preserves exactly the same C2 error fields
   as the Python fixture.
-- [ ] Assert Rust FastDB cause projection writes the six frozen outer keys from
+- [x] Assert Rust FastDB cause projection writes the six frozen outer keys from
   the official `fastdb::PayloadError`.
 
 Run RED:
@@ -850,7 +850,7 @@ Expected RED: `sdk/rust` does not exist.
 
 ### Task 5.2 — Implement the thin SDK facade
 
-- [ ] Add the exact package manifest:
+- [x] Add the exact package manifest:
 
 ```toml
 [package]
@@ -869,28 +869,28 @@ c2-error = { version = "0.1.0", path = "../../core/foundation/c2-error" }
 fastdb = { version = "0.1.22", path = "../../../fastdb/bindings/rust/fastdb" }
 ```
 
-- [ ] Re-export stable contract/Core types; do not duplicate their state,
+- [x] Re-export stable contract/Core types; do not duplicate their state,
   defaults, or error registries.
-- [ ] Keep the generated-call interface under `c_two::generated` with
+- [x] Keep the generated-call interface under `c_two::generated` with
   `#[doc(hidden)]`; re-export the sealed Core trait, route/service definition,
   held response, and external-cause projection needed by generated modules.
-- [ ] Implement a thin FastDB error adapter that only reads official
+- [x] Implement a thin FastDB error adapter that only reads official
   `PayloadError` fields and calls the Core external-cause helper.
-- [ ] Do not re-export FastDB types under a C-Two semantic namespace; generated
+- [x] Do not re-export FastDB types under a C-Two semantic namespace; generated
   and user code continues to name `fastdb::Payload`.
 
 ### Task 5.3 — Implement `Held<Payload>` and borrowed guard
 
-- [ ] `Held<fastdb::Payload>` stores the official payload and a Core
+- [x] `Held<fastdb::Payload>` stores the official payload and a Core
   `HeldResponse`; its constructor is crate-private/generated-only.
-- [ ] `Held::release()` calls Core `invalidate_then_release`, clears both owners,
+- [x] `Held::release()` calls Core `invalidate_then_release`, clears both owners,
   and is idempotent.
-- [ ] `Drop` executes the same order once. Because Drop cannot return an error,
+- [x] `Drop` executes the same order once. Because Drop cannot return an error,
   explicit `release` is the auditable path and Drop is best-effort.
-- [ ] Add a generated-facing borrowed payload guard whose Drop invalidates the
+- [x] Add a generated-facing borrowed payload guard whose Drop invalidates the
   FastDB owner. It must be constructed inside the encoded service call so it
   drops before Core releases `RequestLease`.
-- [ ] Keep all receive paths copy-backed. Do not call or introduce
+- [x] Keep all receive paths copy-backed. Do not call or introduce
   `open_external`, direct final backing, or raw transport-pointer ownership.
 
 Run focused GREEN:
@@ -917,6 +917,13 @@ git diff --check
 ```
 
 The boundary scan must return no match.
+
+> Task 5 evidence (2026-07-24): the public API RED test first failed against
+> the empty SDK facade, then passed with package `c-two` / library `c_two`.
+> Focused SDK format, strict Clippy, all-feature tests, both real route-bound
+> examples, Core workspace strict Clippy/tests, the legacy-name scan, and an
+> additional SDK implementation scan forbidding transport crates and
+> `open_external` all passed.
 
 ## Task 6: Generate Transport-Neutral Rust Clients and Typed Rust Services
 

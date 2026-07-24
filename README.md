@@ -130,6 +130,39 @@ The same CRM contract is used in-process, over IPC, or through a relay. Ordinary
 
 ---
 
+## Rust SDK (Local Candidate)
+
+The user-facing Rust SDK lives at `sdk/rust`:
+
+```text
+Cargo package: c-two
+Rust import:   c_two
+version:       0.1.0
+publish:       false
+```
+
+It reuses the language-neutral `c2-core` client and host for direct IPC,
+explicit relay, and relay-aware calls. Portable values remain official
+`fastdb::Payload` owners; C-Two does not rename or reimplement FastDB
+semantics. Owned, held, and generated-service input paths are copy-backed.
+Held response release invalidates the FastDB owner before releasing its C-Two
+lease.
+
+This is local source-checkout evidence, not a crates.io release. The current
+examples exercise the generated implementation seam directly while the next
+Phase 0B slice replaces the old transport-coupled Rust generator with typed
+`c_two` clients and services:
+
+```bash
+cargo test --manifest-path sdk/rust/Cargo.toml --all-features
+cargo run --manifest-path sdk/rust/Cargo.toml --example client
+cargo run --manifest-path sdk/rust/Cargo.toml --example host
+```
+
+See [`sdk/rust/README.md`](sdk/rust/README.md) for the ownership boundary.
+
+---
+
 ## Core Concepts
 
 ### CRM — Contract
