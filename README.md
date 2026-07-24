@@ -44,12 +44,7 @@ The tracked Kostya benchmark keeps Python-only `pickle-records` and `pickle-arra
 
 ## Quick Start
 
-> **Development-branch requirement:** The portable-payload example below is
-> proven from this source checkout against the audited sibling FastDB checkout
-> at `../fastdb`. The currently published packages do not yet contain this
-> complete integration, so `pip install c-two` alone cannot run this example.
-> See [Development Setup](#development-setup) and the
-> [deferred-capabilities issue](docs/issues/contract-release-deferred-capabilities.md).
+> **Local-candidate requirement:** The portable-payload example below is proven from C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02` against FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487`. The complete candidate passes isolated archive-only consumers, but these bytes are not published packages, so `pip install c-two` alone cannot run this development-branch integration. See the [local-candidate report](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md), [Development Setup](#development-setup), and the [deferred-capabilities issue](docs/issues/contract-release-deferred-capabilities.md).
 
 ### Define an explicit portable-payload contract
 
@@ -141,17 +136,11 @@ version:       0.1.0
 publish:       false
 ```
 
-It reuses the language-neutral `c2-core` client and host for direct IPC,
-explicit relay, and relay-aware calls. Portable values remain official
-`fastdb::Payload` owners; C-Two does not rename or reimplement FastDB
-semantics. Owned, held, and generated-service input paths are copy-backed.
-Held response release invalidates the FastDB owner before releasing its C-Two
-lease.
+It reuses the language-neutral `c2-core` client and host for direct IPC, explicit relay, and relay-aware calls. Portable values remain official `fastdb::Payload` owners; C-Two does not rename or reimplement FastDB semantics. Owned, held, and generated-service input paths are copy-backed. Held response release invalidates the FastDB owner before releasing its C-Two lease.
 
-This is local source-checkout evidence, not a crates.io release. The current
-examples exercise the generated implementation seam directly while the next
-Phase 0B slice replaces the old transport-coupled Rust generator with typed
-`c_two` clients and services:
+Generated Rust artifacts now target the supported `c_two` seam and expose typed clients, service traits, and registration helpers without assembling low-level transport crates. The same no-payload, record, object-graph, contract, route, error, and lifetime capabilities are projected through Python; the checked-in [12-row parity receipt](docs/reports/evidence/sdk-capability-parity.v1.json) makes the one intentional Python-only pickle/thread-local difference explicit.
+
+This is a complete local candidate, not a crates.io release. Its version-only Rust package, CPython 3.10/current wheels, and Node tarballs pass isolated consumers outside the source and sibling checkouts:
 
 ```bash
 cargo test --manifest-path sdk/rust/Cargo.toml --all-features
@@ -160,6 +149,7 @@ cargo run --manifest-path sdk/rust/Cargo.toml --example host
 ```
 
 See [`sdk/rust/README.md`](sdk/rust/README.md) for the ownership boundary.
+See the [candidate report](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md) for exact commits, artifact hashes, the 18/18 Rust/Python matrix, 12/12 generated TypeScript Node matrix, and remaining release limits.
 
 ---
 
@@ -450,10 +440,7 @@ For resource-first projects, `c3 contract infer ... --diagnose` can expose why s
 pip install c-two
 ```
 
-This installs the latest published C-Two runtime. It does not yet provide the
-complete portable-payload surface documented above; do not treat a successful
-registry install as evidence that the audited development-branch integration is
-available.
+This installs the latest published C-Two runtime. It does not yet provide the complete portable-payload surface documented above; do not treat a successful registry install as evidence that the audited local candidate is available.
 
 Pre-built wheels are available for:
 
@@ -468,8 +455,10 @@ If no pre-built wheel is available for your platform, pip will build from source
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
-# Place the audited compatible FastDB source checkout at ../fastdb.
-# The exact locally proven revision is recorded in the deferred-capabilities issue.
+# Place FastDB implementation commit
+# 7eb74734926bd8fe911229eee9744a6dd8172487 at ../fastdb.
+# C-Two implementation commit
+# bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02 is the audited package input.
 cp .env.example .env               # configure environment (optional)
 uv sync                            # install dependencies + compile Rust extensions
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)
@@ -501,6 +490,12 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
 | Disk spill for extreme payloads | ✅ Stable |
 | `c-two.contract.v2` + Core-owned artifact composition | ✅ Proven locally |
+| Language-neutral `c2-core` route/transport/lifecycle authority | ✅ Proven locally |
+| Supported `c-two` / `c_two` Rust SDK with generated clients/services | ✅ Proven locally |
+| Rust/Python exact portable capability parity | ✅ Proven locally |
+| 18/18 Rust/Python direct/relay candidate matrix | ✅ Proven locally |
+| 12/12 generated TypeScript Node real-call matrix | ✅ Proven locally |
+| Isolated Rust/Python/Node local package closure | ✅ Proven locally |
 | FastDB owner/view invalidation through `cc.hold()` | ✅ Proven locally |
 | SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
 | Route-independent contract release identity | ✅ Stable |
@@ -511,7 +506,7 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | Async interfaces | 🔜 Planned |
 | Adaptive memory lifecycle policy | 🔜 Planned |
 | Streaming RPC / pipeline semantics | 🔜 Planned |
-| Cross-language clients (Rust first, TypeScript later) | 🔮 Future |
+| Publishable TypeScript SDK and browser runtime | 🔮 Future |
 | Global discovery & namespace governance | 🔮 Future |
 
 See the [current roadmap](docs/roadmap.md) for details. Historical roadmap notes remain archived under `docs/plans/`.

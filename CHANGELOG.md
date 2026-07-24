@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Added the supported Rust SDK at `sdk/rust` as Cargo package `c-two`, imported as `c_two`, with direct IPC, explicit relay, relay-aware clients, hosts, generated typed clients/services, structured errors, and checked FastDB lifetime adapters at parity with Python.
+- Added bounded `ContractLimits`, the shared language-neutral `c2-core` client/host/runtime facade, exact 18-row Rust/Python direct/relay proof, and exact 12-row generated TypeScript Node real-call proof.
+- Added a canonical 42-artifact local release-candidate manifest plus isolated version-only Rust, no-index CPython 3.10/current, and tarball-only Node consumer receipts.
+
+### Changed
+
+- Python now projects shared route, transport, retry, error-normalization, lease-ordering, and lifecycle behavior through `c2-core` instead of retaining a second SDK-local authority.
+- Rust code generation now targets the supported `c_two` seam rather than asking users to assemble low-level transport crates.
+
+### Release status
+
+- The candidate is local and unpublished. Its exact package-input commits are C-Two `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02` and FastDB `7eb74734926bd8fe911229eee9744a6dd8172487`; no version bump, push, tag, hosted pass, publication, or release is implied.
+- Official immutable distribution, browser runtime, C++ SDK, streaming, compatibility ranges, trust/signature/revocation, post-dispatch retry/deduplication, and Toodle consumption remain open.
+
 ## [0.4.7] — 2026-04-22
 
 ### Fixed

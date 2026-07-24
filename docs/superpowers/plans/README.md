@@ -1,6 +1,6 @@
 > **目录规则**
 >
-> 本目录按日期保存实施计划。当前权威为 [`2026-07-24 portable-payload contract composition plan`](./2026-07-24-portable-payload-contract-composition.md)、其后续 [`2026-07-24 Rust SDK and portable-payload local release candidate plan`](./2026-07-24-rust-sdk-portable-payload-local-release-candidate.md)，以及 [`docs/roadmap.md`](../../roadmap.md) 明确指向的后续文档；更早文档是历史档案，并可能反映旧术语体系（ICRM / Component / I-prefix / `@cc.runtime.connect` 等）。
+> 本目录按日期保存实施计划。当前权威为 [`2026-07-24 portable-payload contract composition plan`](./2026-07-24-portable-payload-contract-composition.md)、其后续 [`2026-07-24 Rust SDK and portable-payload local release candidate plan`](./2026-07-24-rust-sdk-portable-payload-local-release-candidate.md)、对应的 [`local release candidate closure report`](../../reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md)，以及 [`docs/roadmap.md`](../../roadmap.md) 明确指向的后续文档；更早文档是历史档案，并可能反映旧术语体系（ICRM / Component / I-prefix / `@cc.runtime.connect` 等）。该 plan 已完成本地候选实现与验证；官方 immutable distribution、hosted verification 与 Toodle consumption 仍在 owner issue 中保持开放。
 > 这些术语在 v0.x **Terminology Cleanup** 之后已变更：
 >
 > - `ICRM` / `@cc.icrm` → `CRM 契约` / `@cc.crm`

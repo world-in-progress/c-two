@@ -5,8 +5,10 @@ Last reviewed and ordered: 2026-07-24.
 This is the maintained roadmap for C-Two's 0.x line. Current portable-payload authority is:
 
 1. [`2026-07-24 portable-payload contract composition design`](./superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md)
-2. [`2026-07-24 implementation plan`](./superpowers/plans/2026-07-24-portable-payload-contract-composition.md)
-3. [`contract-release deferred capabilities`](./issues/contract-release-deferred-capabilities.md)
+2. [`2026-07-24 Rust SDK and local-candidate design`](./superpowers/specs/2026-07-24-rust-sdk-portable-payload-local-release-candidate-design.md)
+3. [`2026-07-24 Rust SDK and local-candidate implementation plan`](./superpowers/plans/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md)
+4. [`2026-07-24 local-candidate closure report`](./reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md)
+5. [`contract-release deferred capabilities`](./issues/contract-release-deferred-capabilities.md)
 
 Documents under `docs/plans/`, `docs/reviews/`, and older `docs/superpowers/` dates are retained evidence. They are not current authority unless this roadmap explicitly says otherwise.
 
@@ -28,12 +30,16 @@ Documents under `docs/plans/`, `docs/reviews/`, and older `docs/superpowers/` da
 | Contract release identity | Rust `c2-contract` validates and canonicalizes `c-two.contract.v2`, derives exact route-independent `ContractReleaseRef` values, verifies resolved descriptor bytes, and adds a route name only when deriving `ExpectedRouteContract`. |
 | Portable payload contract | A method declares zero or one input and zero or one output with `@cc.transfer(...)`; its nested `fastdb.payload.v1` value is opaque to C-Two and compiled by FastDB Core. |
 | Artifact composition | Rust `c2-codegen` delegates nested specifications, preserves structured FastDB errors, verifies identity and hashes, composes C-Two plus FastDB artifacts deterministically, and atomically publishes a complete new regular-file tree at an absent destination. |
-| Language projections | Python exposes the v2 authoring/runtime/codegen facade. Generated Rust and Python artifacts compile/import and run in real bidirectional payload calls. Generated TypeScript retains the existing C-Two transport surface and type-checks with Core-owned FastDB payload artifacts. |
-| Runtime payload proof | Record, object-graph, and no-payload calls pass across Rust client → Python resource, Python client → Rust resource, and Rust client → Rust resource. The proof covers scalar/`str`/`wstr`/bytes/list/null values, sharing/cycles, materialization, structured mismatch errors, and checked invalidation. |
+| Shared runtime authority | Language-neutral `c2-core` is the single owner of route selection, client/host calls, retry classification, error normalization, transport lease ordering, and runtime lifecycle. Rust and Python are projections; Python retains only Python-specific authoring/invocation glue and its explicitly nonportable pickle/thread-local path. |
+| Language projections | The supported Rust user package is `c-two` / `c_two`; generated Rust targets that facade. Python projects the same Core through PyO3. Generated TypeScript runs against real Rust/Python hosts under Node while browser runtime remains unverified. |
+| Runtime payload proof | The candidate receipt contains exactly 18/18 passing no-payload, record, and object-graph rows across Rust client → Python host, Python client → Rust host, and Rust client → Rust host over direct IPC and explicit relay. It covers scalar/`str`/`wstr`/bytes/list/null values, sharing/cycles, materialization, structured mismatch errors, and checked invalidation. |
+| Generated TypeScript proof | The candidate receipt contains exactly 12/12 passing Node rows across direct IPC, explicit relay, relay-aware verified local IPC, and relay-aware HTTP with real `c3`, Rust/Python hosts, package tarballs, route/path observations, lifetime negatives, and non-replay checks. |
+| Bounded admission and strict gates | Versioned `ContractLimits` bounds outer contract input before unbounded work. Core and Python native pass strict Clippy without blanket suppression, followed by complete language and repository gates. |
+| Local package closure | One canonical 42-artifact manifest binds FastDB and C-Two implementation commits. Version-only Rust, no-index CPython 3.10/current, and tarball-only Node consumers pass outside sibling/source checkouts. |
 | Honest backing boundary | The proven Rust and Python receive adapters are copy-backed. `cc.hold()` and borrowed-input policy enforce owner/lease invalidation; they do not prove direct construction in final response shared memory. |
 | Python-only prototype path | Ordinary Python methods without an explicit portable binding may still use pickle locally. Portable descriptor export/codegen rejects them with diagnostics. |
 
-The local portable foundation consumes audited FastDB commit `6b9d0a55f27bb22fd13f867f321db821f21e777c`. FastDB package metadata remains 0.1.22, its Rust crates remain unpublished, and no FastDB version, push, tag, publication, or release is implied by this roadmap.
+The local candidate consumes FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487` from C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02`. FastDB package metadata remains 0.1.22/0.0.3 and C-Two candidate metadata remains 0.1.0/0.5.1 without publication. Source commit plus SHA-256 identifies these local bytes; no version, push, tag, hosted pass, publication, or release is implied by this roadmap.
 
 ## Ordered Product Work
 
@@ -41,16 +47,15 @@ Start at the first incomplete item whose prerequisites and authorization are ava
 
 | Order | Workstream | Why it comes here | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Immutable FastDB package distribution | The current integration relies on an audited sibling checkout/local wheel and cannot be reproduced from registries alone. | Authorized FastDB Rust/Python/TypeScript artifacts are immutable and fetchable; C-Two pins them and passes clean-environment package, codegen, runtime, and interoperability gates. |
-| 2 | Complete Rust SDK | The real Rust proof currently composes lower-level public crates rather than one supported ergonomic facade. | One supported Rust SDK covers the proven IPC client/host plus HTTP/relay, discovery, lifecycle, contract operations, examples, and cross-language tests without capabilities unavailable to Python. |
-| 3 | Contract compatibility | Exact release matching is the safety floor; semver/range rules need stable release content first. | Rust-owned rules reject ambiguity and ABI-incompatible matches and project identical behavior across SDKs. |
-| 4 | Call metadata and admission hooks | Upper layers need a transport-consistent mechanism for identity and policy decisions, but C-Two must not own policy. | Thread-local, IPC, and relay calls carry bounded metadata; hooks can accept/reject calls; downstream systems remain the policy authority. |
-| 5 | Dry-run mechanism | Impact analysis depends on the same explicit metadata/admission boundary. | Dry-run semantics state what is evaluated, which side effects are forbidden, and how unsupported methods fail. |
-| 6 | Async unary API | Async should extend one stable unary contract instead of creating a second protocol. | Supported SDKs provide async proxy/context-manager behavior over the same route, error, payload, and lifetime semantics. |
-| 7 | Telemetry, backpressure, and adaptive memory lifecycle | Streaming amplifies cancellation and retention risks. | Rust owns bounded telemetry and policy for pools, dedicated segments, chunks, queues, and cancellation; SDKs remain thin facades. |
-| 8 | Streaming RPC | Existing chunking is byte transport, not a user-visible stream. | Stream identity, frames, ordering, cancellation, errors, backpressure, and resource release are specified and proven end to end. |
-| 9 | Publishable TypeScript SDK/runtime | The generated transport foundation exists, but packaging and browser/Node boundaries are incomplete. | A supported package consumes the same contract/release/payload identities and proves its declared Node/browser lifetime and transport matrix. |
-| 10 | Discovery and namespace governance | Relay mesh propagates live routes; broad search is an admin/governance concern. | A separate discovery surface returns candidate metadata while ordinary calls remain exact contract-scoped and never fall back to name-only admission. |
+| 1 | Official immutable FastDB and C-Two package distribution | Local archive-only consumers are complete, but the exact artifacts are not published or hosted. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
+| 2 | Contract compatibility | Exact release matching is the safety floor; semver/range rules need stable official release content first. | Rust-owned rules reject ambiguity and ABI-incompatible matches and project identical behavior across SDKs. |
+| 3 | Call metadata and admission hooks | Upper layers need a transport-consistent mechanism for identity and policy decisions, but C-Two must not own policy. | Thread-local, IPC, and relay calls carry bounded metadata; hooks can accept/reject calls; downstream systems remain the policy authority. |
+| 4 | Dry-run mechanism | Impact analysis depends on the same explicit metadata/admission boundary. | Dry-run semantics state what is evaluated, which side effects are forbidden, and how unsupported methods fail. |
+| 5 | Async unary API | Async should extend one stable unary contract instead of creating a second protocol. | Supported SDKs provide async proxy/context-manager behavior over the same route, error, payload, and lifetime semantics. |
+| 6 | Telemetry, backpressure, and adaptive memory lifecycle | Streaming amplifies cancellation and retention risks. | Rust owns bounded telemetry and policy for pools, dedicated segments, chunks, queues, and cancellation; SDKs remain thin facades. |
+| 7 | Streaming RPC | Existing chunking is byte transport, not a user-visible stream. | Stream identity, frames, ordering, cancellation, errors, backpressure, and resource release are specified and proven end to end. |
+| 8 | Publishable TypeScript SDK/runtime | The generated Node proof exists, but official packaging and browser boundaries remain incomplete. | A supported package consumes the same contract/release/payload identities and proves its declared Node/browser lifetime and transport matrix. |
+| 9 | Discovery and namespace governance | Relay mesh propagates live routes; broad search is an admin/governance concern. | A separate discovery surface returns candidate metadata while ordinary calls remain exact contract-scoped and never fall back to name-only admission. |
 
 ## Parallel Performance and Hardening Tracks
 
@@ -60,9 +65,7 @@ These tracks must not be smuggled into unrelated feature work or used to oversta
 | --- | --- | --- |
 | Direct final backing | Resource-time construction into final C-Two backing is not implemented across Rust and Python. | A public FastDB backing adapter reports direct/staged behavior truthfully, avoids post-build repacking on the proven path, and passes fallback/lifetime tests in both SDKs. |
 | Portable-payload benchmark | The current suite has correctness proof but no reviewed explicit-`Payload` throughput claim. | A reproducible benchmark records workload, environment, distributions, copy/direct/staged facts, and retained-owner behavior. |
-| Outer descriptor limits | FastDB limits nested values, while C-Two has no versioned caller-configurable outer-document limits. | A Rust-owned `ContractLimits` API bounds source, structure, methods, and extracted nested bytes across Rust/Python/CLI. |
 | Artifact publication hardening | Publication is new-tree-only and not a power-loss or hostile-parent durability receipt. | A versioned prior-manifest/update protocol and platform-specific durable/no-follow publication pass fault and race tests. |
-| Strict Clippy baselines | Existing core/native warnings prevent repository-wide `-D warnings` claims. | Resolve or narrowly justify every diagnostic without blanket suppression and rerun complete functional gates. |
 
 Every active limit, reason, impact, owner, dependency, and executable closure criterion lives in the [deferred-capabilities issue](./issues/contract-release-deferred-capabilities.md).
 
@@ -80,7 +83,9 @@ Every active limit, reason, impact, owner, dependency, and executable closure cr
 | Document | How to use it now |
 | --- | --- |
 | [`2026-07-24 portable-payload contract composition design`](./superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) | Current owner and architecture contract. |
-| [`2026-07-24 implementation plan`](./superpowers/plans/2026-07-24-portable-payload-contract-composition.md) | Current implementation and verification sequence. |
+| [`2026-07-24 Rust SDK and local-candidate design`](./superpowers/specs/2026-07-24-rust-sdk-portable-payload-local-release-candidate-design.md) | Current continuation that freezes Core/SDK parity, candidate packaging, and executable closure. |
+| [`2026-07-24 Rust SDK and local-candidate plan`](./superpowers/plans/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md) | Completed implementation and verification sequence for the local candidate. |
+| [`2026-07-24 local-candidate closure report`](./reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md) | Exact commits, hashes, receipts, claim strength, and open external actions. |
 | [`cross-language contract architecture`](./vision/cross-language-contract-codec-architecture.md) | Short current boundary summary. |
 | [`endgame architecture`](./vision/endgame-architecture.md) | Long-term C-Two/Toodle/domain boundary. |
 | [`c-two-rpc-v2 roadmap archive`](./plans/c-two-rpc-v2-roadmap.md) | Historical context only. |

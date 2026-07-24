@@ -89,9 +89,17 @@ Tests use `pytest` with a 30-second per-test timeout. Tests live under `sdk/pyth
 UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ANCHOR_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
 ```
 
+## Local Release-Candidate Evidence
+
+The complete Phase 0B upstream local candidate is recorded in [`docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md`](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md). Package inputs are C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02` and FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487`; later documentation-only commits are never artifact source commits.
+
+The retained canonical manifest and receipts under `docs/reports/evidence/` prove 42 exact artifacts, 4/4 isolated Rust/Python/Node consumers, 18/18 Rust/Python direct/relay rows, 12/12 generated TypeScript Node rows, and the 12-row SDK parity inventory. They are evidence records only. Do not add package archives, local registries, wheelhouses, native libraries, generated trees, or build outputs to Git.
+
+Official immutable FastDB/C-Two distribution, hosted verification, browser runtime, C++ C-Two SDK, compatibility ranges, trust/signature/revocation, streaming, post-dispatch retry/deduplication, and Toodle consumption remain open. Never infer a registry release or hosted pass from the local candidate.
+
 ## Architecture
 
-C-Two has a language-neutral Rust core and user-facing Rust and Python SDKs. Neither SDK is the canonical home for generic runtime mechanisms. The Rust SDK at `sdk/rust` is package `c-two`, imported as `c_two`, and is a thin facade over Core plus generated typed clients/services. The Python SDK owns Python domain logic, CRM authoring, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust Core owns shared transport, memory, wire codec, CRM route contract validation and fingerprints, route concurrency enforcement and state, HTTP relay, and configuration resolution. PyO3/maturin projects that Core into Python as `c_two._native`.
+C-Two has a language-neutral Rust core and user-facing Rust and Python SDKs. Neither SDK is the canonical home for generic runtime mechanisms. The Rust SDK at `sdk/rust` is package `c-two`, imported as `c_two`, and is a thin facade over Core plus generated typed clients/services. The Python SDK owns Python domain logic, CRM authoring, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust `c2-core` is the single shared owner of route selection, client/host calls, retry classification, error normalization, transport lease ordering, and runtime lifecycle; the lower Core crates own memory, wire, contract, relay, and configuration mechanisms. PyO3/maturin projects that same Core into Python as `c_two._native`.
 
 The Rust SDK may depend on the official `fastdb` Rust binding to adapt portable payloads, but `c2-core` must remain payload-owner-neutral. Rust users continue to name `fastdb::Payload`; do not re-export it under a C-Two semantic namespace. Rust and Python must expose the same portable route, payload, error, and lifetime capabilities even when their language-level syntax differs.
 
@@ -444,6 +452,7 @@ Requires Python 3.10 or newer. Keep Python 3.10 compatibility intentional: downs
 - Preserve direct IPC as relay-independent. If touching registration, client routing, or runtime session code, include checks for explicit `ipc://` connections with relay unset or unavailable.
 - Preserve zero-copy boundaries. If touching wire, SHM, scheduler, or native callback code, include checks that large SHM-backed payloads are not converted to Python `bytes` on the remote IPC path.
 - Do not turn a transport-level SHM proof into a FastDB direct-backing claim. The current portable receive adapters are copy-backed; stronger wording requires resource-time construction into the final C-Two backing, truthful FastDB direct/staged reports, and Rust/Python proof.
+- Keep local-candidate truth separate from official release truth. Reused version metadata identifies an artifact only together with its source commit and SHA-256; do not substitute registry packages for the retained candidate or call documentation-only commits package inputs.
 - For bug fixes and behavior changes, add or update focused tests first when feasible, then implement the correct production-grade code change needed to satisfy the verified behavior; do not use phase boundaries to justify temporary shims or lower-quality shortcuts.
 - When work is split into phases, treat the split as sequencing only. Write the phase boundaries, exit criteria, and follow-up items into the plan document before implementation, keep that plan updated as the authoritative record, and finish each phase with docs that make the remaining work explicit.
 - Do not revert unrelated user changes in a dirty worktree.
