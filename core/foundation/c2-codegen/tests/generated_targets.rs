@@ -351,6 +351,12 @@ fn generated_typescript_payload_lifecycle_is_failure_safe() {
         r#"export const events: string[];
 export function setFailInvalidate(value: boolean): void;
 export function setFailResponseRequire(value: boolean): void;
+export class PayloadError extends Error {
+  readonly code: number;
+  readonly symbol: string;
+  readonly path: string;
+  readonly detailsJson: string;
+}
 export class CompiledSpec {
   static compile(source: Uint8Array): CompiledSpec;
 }
@@ -387,6 +393,16 @@ export function setFailInvalidate(value) {
 }
 export function setFailResponseRequire(value) {
   failResponseRequire = value;
+}
+export class PayloadError extends Error {
+  constructor(code, symbol, path, message, detailsJson) {
+    super(message);
+    this.name = "PayloadError";
+    this.code = code;
+    this.symbol = symbol;
+    this.path = path;
+    this.detailsJson = detailsJson;
+  }
 }
 export class CompiledSpec {
   static compile(_source) {

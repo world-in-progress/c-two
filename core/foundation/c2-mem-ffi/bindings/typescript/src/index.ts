@@ -132,6 +132,15 @@ export interface C2MemFfiNodeNativeLoadOptions {
   readonly addonPath?: string;
 }
 
+export interface C2MemFfiResponsePoolFactory {
+  createResponsePool(config: C2MemFfiPoolConfig): Promise<C2MemFfiNativeBuddyResponsePool>;
+}
+
+export interface C2MemFfiNodeRuntime {
+  readonly connect: C2NodeIpcConnect;
+  readonly responsePoolFactory: C2MemFfiResponsePoolFactory;
+}
+
 export interface C2NodeIpcConnection {
   write(data: Uint8Array): MaybePromise<void>;
   readExactly(byteLength: number): MaybePromise<Uint8Array>;
@@ -193,6 +202,25 @@ export function loadBundledC2MemFfiNodeNativeSymbols<Handle = unknown>(
   options: C2MemFfiNodeNativeLoadOptions = {},
 ): C2MemFfiNodeNativeSymbols<Handle> {
   return loadC2MemFfiNodeNativeSymbols(resolveBundledC2MemFfiNodeNativeLibraryPath(), options);
+}
+
+export function createBundledC2MemFfiNodeRuntime(
+  options: C2MemFfiNodeNativeLoadOptions = {},
+): C2MemFfiNodeRuntime {
+  const { responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
+  return Object.freeze({
+    connect: createNodeIpcConnect(),
+    responsePoolFactory: Object.freeze({
+      async createResponsePool(
+        config: C2MemFfiPoolConfig,
+      ): Promise<C2MemFfiNativeBuddyResponsePool> {
+        return await createC2MemFfiResponsePoolFromSymbols(
+          responseSymbols,
+          config,
+        );
+      },
+    }),
+  });
 }
 
 export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2NodeIpcConnect {

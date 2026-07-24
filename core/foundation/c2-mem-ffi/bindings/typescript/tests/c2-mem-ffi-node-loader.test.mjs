@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import {
   C2_MEM_FFI_ABI_VERSION,
+  createBundledC2MemFfiNodeRuntime,
   createC2MemFfiRequestPoolFromSymbols,
   createC2MemFfiResponsePoolFromSymbols,
   loadBundledC2MemFfiNodeNativeSymbols,
@@ -99,6 +100,41 @@ test('c2-mem-ffi Node native loader composes real request and response pools', a
   assert.deepEqual(Array.from(destination), Array.from(payload));
   await responsePool.release(block);
 
+  await responsePool.close?.();
+  await fakeServerPool.close?.();
+});
+
+test('bundled Node runtime exposes generated-transport compatible IPC support', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('c2-mem-ffi Node runtime requires POSIX dlopen and SHM');
+    return;
+  }
+  const { requestSymbols } = loadBundledC2MemFfiNodeNativeSymbols();
+  const fakeServerPool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
+    prefix: '/cc2snode3',
+    segmentSize: 65536,
+    maxSegments: 1,
+    minBlockSize: 4096,
+  });
+  const runtime = createBundledC2MemFfiNodeRuntime();
+  assert.equal(typeof runtime.connect, 'function');
+  assert.equal(
+    typeof runtime.responsePoolFactory.createResponsePool,
+    'function',
+  );
+  const responsePool = await runtime.responsePoolFactory.createResponsePool({
+    prefix: '/cc2snode3',
+    segmentSize: 65536,
+    maxSegments: 1,
+    minBlockSize: 4096,
+  });
+  const payload = new Uint8Array([6, 5, 4]);
+  const block = await fakeServerPool.write(payload);
+  await fakeServerPool.forgetConsumed(block);
+  const destination = new Uint8Array(payload.byteLength);
+  await responsePool.read(block, destination);
+  assert.deepEqual(Array.from(destination), Array.from(payload));
+  await responsePool.release(block);
   await responsePool.close?.();
   await fakeServerPool.close?.();
 });

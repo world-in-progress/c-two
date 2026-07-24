@@ -742,7 +742,7 @@ fn render_typescript(
     let mut output = String::from(
         "// generated-by: c-two.contract.codegen.v2\n\
          // payload-semantics-owner: fastdb-core\n\
-         import { Payload } from 'fastdb4ts/payload';\n",
+         import { Payload, PayloadError } from 'fastdb4ts/payload';\n",
     );
     for digest in payload_digests(methods) {
         output.push_str(&format!(
@@ -751,6 +751,54 @@ fn render_typescript(
     }
     output.push('\n');
     output.push_str(TYPESCRIPT_TRANSPORT_SOURCE);
+    output.push_str(
+        r#"
+
+export interface C2FastDbCauseFields {
+  readonly cause_owner: "fastdb";
+  readonly fastdb_code: string;
+  readonly fastdb_details_json: string;
+  readonly fastdb_message: string;
+  readonly fastdb_path: string;
+  readonly fastdb_symbol: string;
+}
+
+export class C2PayloadAdapterError extends Error {
+  constructor(
+    readonly details: C2FastDbCauseFields,
+    readonly cause: PayloadError,
+  ) {
+    super(`C-Two FastDB payload adapter failed: ${cause.message}`);
+    this.name = "C2PayloadAdapterError";
+    Object.setPrototypeOf(this, C2PayloadAdapterError.prototype);
+  }
+}
+
+export function projectFastDbCause(error: PayloadError): C2FastDbCauseFields {
+  if (!(error instanceof PayloadError)) {
+    throw new TypeError("error must be a fastdb4ts PayloadError");
+  }
+  return Object.freeze({
+    cause_owner: "fastdb",
+    fastdb_code: error.code.toString(),
+    fastdb_details_json: error.detailsJson,
+    fastdb_message: error.message,
+    fastdb_path: error.path,
+    fastdb_symbol: error.symbol,
+  });
+}
+
+function normalizeFastDbPayloadError(error: unknown): unknown {
+  if (!(error instanceof PayloadError)) {
+    return error;
+  }
+  return new C2PayloadAdapterError(
+    projectFastDbCause(error),
+    error,
+  );
+}
+"#,
+    );
     output.push_str(&format!(
         "\n\nexport const CONTRACT: C2ContractIdentity = {{\n\
          \x20 schema: 'c-two.contract.v2',\n\
@@ -923,20 +971,25 @@ fn render_typescript_direction(
     if let Some(digest) = digest {
         output.push_str(&format!(
             "export function encode_{symbol}_{direction}(payload: Payload): Uint8Array {{\n\
-             \x20 payload.requireSpecSha256(payload_{digest}.payloadSha256());\n\
-             \x20 return payload.binaryBytes();\n\
+             \x20 try {{\n\
+             \x20   payload.requireSpecSha256(payload_{digest}.payloadSha256());\n\
+             \x20   return payload.binaryBytes();\n\
+             \x20 }} catch (error) {{\n\
+             \x20   throw normalizeFastDbPayloadError(error);\n\
+             \x20 }}\n\
              }}\n\n\
              export function decode_{symbol}_{direction}(data: Uint8Array): Payload {{\n\
-             \x20 const payload = Payload.openCopy(payload_{digest}.compileSpec(), data);\n\
+             \x20 let payload: Payload | undefined;\n\
              \x20 try {{\n\
+             \x20   payload = Payload.openCopy(payload_{digest}.compileSpec(), data);\n\
              \x20   payload.requireSpecSha256(payload_{digest}.payloadSha256());\n\
              \x20   return payload;\n\
              \x20 }} catch (error) {{\n\
              \x20   try {{\n\
-             \x20     payload.dispose();\n\
+             \x20     payload?.dispose();\n\
              \x20   }} catch {{\n\
              \x20   }}\n\
-             \x20   throw error;\n\
+             \x20   throw normalizeFastDbPayloadError(error);\n\
              \x20 }}\n\
              }}\n\n"
         ));

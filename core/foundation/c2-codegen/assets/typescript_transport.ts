@@ -21,6 +21,35 @@ export interface C2HeldResult<T> {
 
 export type C2ByteArray = Uint8Array & { readonly buffer: ArrayBufferLike };
 
+export type C2ObservedPath =
+  | "DirectIpc"
+  | "ExplicitRelay"
+  | "RelayAwareLocalIpc"
+  | "RelayAwareHttp";
+
+export interface C2RouteToken {
+  readonly routeUid: string;
+  readonly routeRevision: number;
+}
+
+export interface C2ServerIdentity {
+  readonly serverId: string;
+  readonly serverInstanceId: string;
+}
+
+export interface C2TransportObservation extends C2RouteToken {
+  readonly path: C2ObservedPath;
+  readonly routeName: string;
+  readonly requests: number;
+  readonly responses: number;
+  readonly relayUrl?: string;
+  readonly ipcAddress?: string;
+  readonly serverId?: string;
+  readonly serverInstanceId?: string;
+}
+
+export type C2TransportObserver = (observation: C2TransportObservation) => void;
+
 export interface C2EncodedClientTransport {
   call(routeName: string, contract: C2ContractIdentity, method: string, payload: C2ByteArray): Promise<C2ResponsePayload>;
 }
@@ -31,6 +60,7 @@ export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload =
 
 export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport {
   call(routeName: string, contract: C2ContractIdentity, method: string, payload: C2ByteArray): Promise<Payload>;
+  close(): Promise<void>;
 }
 
 export interface C2IpcConnection {
@@ -216,9 +246,14 @@ export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2Byt
   readonly requestShmWriter?: C2IpcRequestShmWriter;
   readonly requestShmThreshold?: number;
   readonly requestChunkSize?: number;
+  readonly expectedServerIdentity?: C2ServerIdentity;
+  readonly expectedRouteToken?: C2RouteToken;
+  readonly observationPath?: "DirectIpc" | "RelayAwareLocalIpc";
+  readonly observe?: C2TransportObserver;
 }
 
 export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2EncodedClientTransport {
+  prepare(routeName: string, contract: C2ContractIdentity): Promise<void>;
   call(routeName: string, contract: C2ContractIdentity, method: string, payload: C2ByteArray): Promise<Payload>;
   close(): Promise<void>;
 }
@@ -279,20 +314,27 @@ export interface C2HttpRelayTransportOptions<Payload extends C2ResponsePayload =
   readonly fetch?: C2Fetch;
   readonly headers?: Readonly<Record<string, string>>;
   readonly callTimeoutMs?: number;
+  readonly resolveTimeoutMs?: number;
   readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;
   readonly responsePayloadUnknownLengthStrategy?: C2ResponsePayloadUnknownLengthStrategy;
   readonly responsePayloadUnknownLengthMaxBytes?: number;
+  readonly observe?: C2TransportObserver;
 }
 
 export interface C2RelayAwareHttpTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> extends C2HttpRelayTransportOptions<Payload> {
   readonly maxAttempts?: number;
   readonly routeCacheTtlMs?: number;
-  readonly resolveTimeoutMs?: number;
+  readonly ipc?: C2IpcTransportOptions<Payload>;
 }
 
 interface C2RelayRouteInfo {
   readonly name: string;
   readonly relayUrl: string;
+  readonly routeUid: string;
+  readonly routeRevision: number;
+  readonly ipcAddress?: string;
+  readonly serverId?: string;
+  readonly serverInstanceId?: string;
   readonly crmNs: string;
   readonly crmName: string;
   readonly crmVer: string;
@@ -329,6 +371,7 @@ interface C2IpcHandshake {
   readonly shmPrefix: string;
   readonly shmSegments: readonly C2IpcShmSegment[];
   readonly capabilityFlags: number;
+  readonly serverIdentity: C2ServerIdentity;
   readonly routes: readonly C2IpcRouteInfo[];
 }
 
@@ -410,9 +453,15 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   const requestShmWriter = normalizeIpcRequestShmWriter(options.requestShmWriter, "C-Two IPC requestShmWriter");
   const requestShmThreshold = normalizeIpcRequestShmThreshold(options.requestShmThreshold, "C-Two IPC requestShmThreshold");
   const requestChunkSize = normalizeIpcRequestChunkSize(options.requestChunkSize, "C-Two IPC requestChunkSize");
+  const expectedServerIdentity = normalizeExpectedServerIdentity(options.expectedServerIdentity, "C-Two IPC expectedServerIdentity");
+  const expectedRouteToken = normalizeExpectedRouteToken(options.expectedRouteToken, "C-Two IPC expectedRouteToken");
+  const observationPath = normalizeIpcObservationPath(options.observationPath);
+  const observe = normalizeTransportObserver(options.observe, "C-Two IPC observe");
   let connectionPromise: Promise<C2IpcOpenConnection> | undefined;
   let nextRequestId = 1;
   let callChain: Promise<void> = Promise.resolve();
+  let requests = 0;
+  let responses = 0;
 
   const openConnection = (): Promise<C2IpcOpenConnection> => {
     if (connectionPromise === undefined) {
@@ -424,15 +473,29 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     return connectionPromise;
   };
 
+  const prepareRoute = async (
+    routeName: string,
+    contract: C2ContractIdentity,
+  ): Promise<{ readonly open: C2IpcOpenConnection; readonly route: C2IpcRouteInfo }> => {
+    requireRouteNamePathValue(routeName);
+    const routeContract = requireRouteContractIdentity(contract);
+    const open = await openConnection();
+    requireExpectedServerIdentity(open.handshake.serverIdentity, expectedServerIdentity);
+    const route = findMatchingIpcRoute(open.handshake.routes, routeName, routeContract);
+    requireExpectedRouteToken(route, expectedRouteToken);
+    return { open, route };
+  };
+
   return {
+    async prepare(routeName: string, contract: C2ContractIdentity): Promise<void> {
+      await prepareRoute(routeName, contract);
+    },
+
     async call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload> {
       const run = async (): Promise<Payload> => {
-        requireRouteNamePathValue(routeName);
         requireMethodPathValue(method);
         const requestPayload = requireUint8Array(payload, "payload");
-        const routeContract = requireRouteContractIdentity(contract);
-        const open = await openConnection();
-        const route = findMatchingIpcRoute(open.handshake.routes, routeName, routeContract);
+        const { open, route } = await prepareRoute(routeName, contract);
         if (requestPayload.byteLength > route.maxPayloadSize) {
           throw new C2IpcTransportError(`C-Two IPC route ${routeName} payload ${requestPayload.byteLength} exceeds max_payload_size ${route.maxPayloadSize}.`);
         }
@@ -442,6 +505,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         let requestShmBlock: C2IpcRequestShmBlock | undefined;
         try {
           requestShmBlock = await writeIpcCallRequestFrames(open.connection, BigInt(requestId), open.handshake, route, methodInfo.index, requestPayload, requestShmWriter, requestShmThreshold, requestChunkSize);
+          requests += 1;
         } catch (error) {
           connectionPromise = undefined;
           if (error instanceof C2IpcTransportError) {
@@ -478,7 +542,18 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
               throw new C2IpcTransportError("C-Two IPC SHM success reply control contains unexpected inline payload bytes.");
             }
             responseValue = await readIpcShmSuccessPayload(open.handshake, buddy, responsePayloadAllocator, responseShmReader);
-            return responseValue;
+            responses += 1;
+            return observeTransportResponse(responseValue, observe, {
+              path: observationPath,
+              routeName,
+              routeUid: route.routeUid,
+              routeRevision: route.routeRevision,
+              ipcAddress: address,
+              serverId: open.handshake.serverIdentity.serverId,
+              serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
+              requests,
+              responses,
+            });
           }
           if (reply.kind === "error") {
             throw new C2CrmMethodError(reply.payload);
@@ -497,7 +572,18 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
           }
           try {
             responseValue = copyResponsePayloadToAllocator(chunkedPayload, responsePayloadAllocator);
-            return responseValue;
+            responses += 1;
+            return observeTransportResponse(responseValue, observe, {
+              path: observationPath,
+              routeName,
+              routeUid: route.routeUid,
+              routeRevision: route.routeRevision,
+              ipcAddress: address,
+              serverId: open.handshake.serverIdentity.serverId,
+              serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
+              requests,
+              responses,
+            });
           } catch (error) {
             throw new C2IpcTransportError(`C-Two IPC responsePayloadAllocator failed: ${String(error)}`);
           }
@@ -506,7 +592,18 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         if (reply.kind === "success") {
           try {
             responseValue = copyResponsePayloadToAllocator(reply.payload, responsePayloadAllocator);
-            return responseValue;
+            responses += 1;
+            return observeTransportResponse(responseValue, observe, {
+              path: observationPath,
+              routeName,
+              routeUid: route.routeUid,
+              routeRevision: route.routeRevision,
+              ipcAddress: address,
+              serverId: open.handshake.serverIdentity.serverId,
+              serverInstanceId: open.handshake.serverIdentity.serverInstanceId,
+              requests,
+              responses,
+            });
           } catch (error) {
             throw new C2IpcTransportError(`C-Two IPC responsePayloadAllocator failed: ${String(error)}`);
           }
@@ -556,6 +653,7 @@ export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayloa
   const fetchImpl = normalizeFetch(normalizedOptions.fetch, "C-Two HTTP relay fetch") ?? globalFetch();
   const headers = normalizeHttpHeaders(normalizedOptions.headers, "C-Two HTTP relay headers");
   const callTimeoutMs = normalizeTimeoutMs(normalizedOptions.callTimeoutMs, "C-Two HTTP relay callTimeoutMs", 300_000);
+  const resolveTimeoutMs = normalizeTimeoutMs(normalizedOptions.resolveTimeoutMs, "C-Two HTTP relay resolveTimeoutMs", 5_000);
   const responsePayloadAllocator = normalizeResponsePayloadAllocator(normalizedOptions.responsePayloadAllocator, "C-Two HTTP relay responsePayloadAllocator");
   const responsePayloadUnknownLengthStrategy = normalizeResponsePayloadUnknownLengthStrategy(
     normalizedOptions.responsePayloadUnknownLengthStrategy,
@@ -565,53 +663,84 @@ export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayloa
     normalizedOptions.responsePayloadUnknownLengthMaxBytes,
     "C-Two HTTP relay responsePayloadUnknownLengthMaxBytes",
   );
+  const observe = normalizeTransportObserver(normalizedOptions.observe, "C-Two HTTP relay observe");
+  let requests = 0;
+  let responses = 0;
   return {
     async call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload> {
       requireRouteNamePathValue(routeName);
       requireMethodPathValue(method);
       const requestPayload = requireUint8Array(payload, "payload");
       const routeContract = requireRouteContractIdentity(contract);
-      return await fetchWithTimeout(async (signal) => {
-        let response: C2FetchResponse;
+      const routes = await resolveRelayRoutes(
+        fetchImpl,
+        normalizedBaseUrl,
+        routeName,
+        routeContract,
+        headers,
+        resolveTimeoutMs,
+      );
+      if (routes.length === 0) {
+        throw resourceNotFoundError(routeName);
+      }
+      let route: C2RelayRouteInfo | undefined;
+      let lastPreparationError: unknown;
+      for (const candidate of routes) {
+        if (requestPayload.byteLength > candidate.maxPayloadSize) {
+          lastPreparationError = payloadTooLargeError(
+            routeName,
+            requestPayload.byteLength,
+            candidate.maxPayloadSize,
+          );
+          continue;
+        }
         try {
-          response = await fetchImpl(`${normalizedBaseUrl}/${encodePathSegment(routeName)}/${encodePathSegment(method)}`, {
-            method: "POST",
-            headers: requestHeadersForRouteContract(headers, routeContract),
-            body: requestPayload,
-            signal,
-          });
+          await probeResolvedHttpRoute(
+            fetchImpl,
+            candidate.relayUrl,
+            routeName,
+            routeContract,
+            candidate,
+            headers,
+            resolveTimeoutMs,
+          );
+          route = candidate;
+          break;
         } catch (error) {
-          throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${String(error)}`);
+          lastPreparationError = error;
         }
-        if (response.status === 200) {
-          try {
-            return await readHttpSuccessResponsePayload(
-              response,
-              responsePayloadAllocator,
-              responsePayloadUnknownLengthStrategy,
-              responsePayloadUnknownLengthMaxBytes,
-            );
-          } catch (error) {
-            throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
-          }
+      }
+      if (route === undefined) {
+        if (lastPreparationError instanceof Error) {
+          throw lastPreparationError;
         }
-        if (response.status === 500) {
-          let errorPayload: Uint8Array;
-          try {
-            errorPayload = await readHttpArrayBufferResponsePayload(response);
-          } catch (error) {
-            throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
-          }
-          throw new C2CrmMethodError(errorPayload);
-        }
-        let body = "";
-        try {
-          body = await readHttpTextResponseBody(response);
-        } catch (error) {
-          throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
-        }
-        throw new C2HttpRelayError(response.status, body);
-      }, callTimeoutMs, "C-Two HTTP relay call");
+        throw resourceNotFoundError(routeName);
+      }
+      requests += 1;
+      const response = await callResolvedHttpRoute(
+        fetchImpl,
+        route.relayUrl,
+        routeName,
+        routeContract,
+        route,
+        method,
+        requestPayload,
+        headers,
+        callTimeoutMs,
+        responsePayloadAllocator,
+        responsePayloadUnknownLengthStrategy,
+        responsePayloadUnknownLengthMaxBytes,
+      );
+      responses += 1;
+      return observeTransportResponse(response, observe, {
+        path: "ExplicitRelay",
+        routeName,
+        routeUid: route.routeUid,
+        routeRevision: route.routeRevision,
+        relayUrl: route.relayUrl,
+        requests,
+        responses,
+      });
     },
   };
 }
@@ -634,8 +763,12 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
     normalizedOptions.responsePayloadUnknownLengthMaxBytes,
     "C-Two relay-aware HTTP responsePayloadUnknownLengthMaxBytes",
   );
+  const observe = normalizeTransportObserver(normalizedOptions.observe, "C-Two relay-aware HTTP observe");
+  const ipcOptions = normalizeRelayAwareIpcOptions(normalizedOptions.ipc);
   const routeCache = new Map<string, C2RelayRouteCacheEntry>();
   const currentRelayByCacheKey = new Map<string, string>();
+  let requests = 0;
+  let responses = 0;
   return {
     async call(routeName: string, contract: C2ContractIdentity, method: string, payload: Uint8Array): Promise<Payload> {
       requireRouteNamePathValue(routeName);
@@ -645,6 +778,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
       const cacheKey = relayRouteCacheKey(routeName, routeContract);
       let lastError: unknown;
       const excludedRoutes = new Set<string>();
+      const excludedLocalRouteTokens = new Set<string>();
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         let routes: readonly C2RelayRouteInfo[];
         try {
@@ -667,14 +801,73 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
           throw error;
         }
         if (routes.length === 0) {
-          throw new C2HttpRelayError(404, JSON.stringify({ error: "ResourceNotFound", route: routeName }));
+          throw resourceNotFoundError(routeName);
         }
-        const orderedRoutes = orderRelayRoutes(routes, currentRelayByCacheKey.get(cacheKey), excludedRoutes);
+        const localRoute = selectLocalIpcRoute(
+          routes,
+          normalizedAnchorUrl,
+          ipcOptions,
+          excludedLocalRouteTokens,
+        );
+        if (localRoute !== undefined && ipcOptions !== undefined) {
+          const localTokenKey = routeTokenKey(localRoute);
+          const localTransport = createIpcEncodedTransport<Payload>(
+            localRoute.ipcAddress as string,
+            {
+              ...ipcOptions,
+              expectedServerIdentity: {
+                serverId: localRoute.serverId as string,
+                serverInstanceId: localRoute.serverInstanceId as string,
+              },
+              expectedRouteToken: {
+                routeUid: localRoute.routeUid,
+                routeRevision: localRoute.routeRevision,
+              },
+              observationPath: "RelayAwareLocalIpc",
+              observe,
+            },
+          );
+          try {
+            await localTransport.prepare(routeName, routeContract);
+          } catch (error) {
+            lastError = error;
+            excludedLocalRouteTokens.add(localTokenKey);
+            invalidateRelayRouteCache(routeCache, cacheKey);
+            try {
+              await localTransport.close();
+            } catch (closeError) {
+              throw new C2IpcTransportError(
+                `C-Two relay-aware local IPC preparation failed and cleanup also failed: ${String(closeError)}`,
+              );
+            }
+            const distinctRoutes = routes.filter(
+              (route) => routeTokenKey(route) !== localTokenKey,
+            );
+            if (distinctRoutes.length === 0) {
+              throw samePathFallbackDeniedError(routeName, localRoute);
+            }
+            continue;
+          }
+          return await callPreparedLocalIpcAndClose(
+            localTransport,
+            routeName,
+            routeContract,
+            method,
+            requestPayload,
+          );
+        }
+        const httpRoutes = routes.filter(
+          (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
+        );
+        if (httpRoutes.length === 0 && excludedLocalRouteTokens.size > 0) {
+          throw samePathFallbackDeniedError(routeName, routes[0]);
+        }
+        const orderedRoutes = orderRelayRoutes(httpRoutes, currentRelayByCacheKey.get(cacheKey), excludedRoutes);
         if (orderedRoutes.length === 0) {
           if (lastError instanceof Error) {
             throw lastError;
           }
-          throw new C2HttpRelayError(404, JSON.stringify({ error: "ResourceNotFound", route: routeName }));
+          throw resourceNotFoundError(routeName);
         }
         let staleRoute = false;
         for (const route of orderedRoutes) {
@@ -684,16 +877,41 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
             continue;
           }
           try {
-            const result = await createHttpRelayEncodedTransport(relayUrl, {
-              fetch: fetchImpl,
+            await probeResolvedHttpRoute(
+              fetchImpl,
+              relayUrl,
+              routeName,
+              routeContract,
+              route,
+              headers,
+              resolveTimeoutMs,
+            );
+            requests += 1;
+            const result = await callResolvedHttpRoute(
+              fetchImpl,
+              relayUrl,
+              routeName,
+              routeContract,
+              route,
+              method,
+              requestPayload,
               headers,
               callTimeoutMs,
               responsePayloadAllocator,
               responsePayloadUnknownLengthStrategy,
               responsePayloadUnknownLengthMaxBytes,
-            }).call(routeName, routeContract, method, requestPayload);
+            );
+            responses += 1;
             currentRelayByCacheKey.set(cacheKey, relayUrl);
-            return result;
+            return observeTransportResponse(result, observe, {
+              path: "RelayAwareHttp",
+              routeName,
+              routeUid: route.routeUid,
+              routeRevision: route.routeRevision,
+              relayUrl,
+              requests,
+              responses,
+            });
           } catch (error) {
             lastError = error;
             if (!isRetryableRouteError(error)) {
@@ -716,7 +934,12 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
       if (lastError instanceof Error) {
         throw lastError;
       }
-      throw new C2HttpRelayError(404, JSON.stringify({ error: "ResourceNotFound", route: routeName }));
+      throw resourceNotFoundError(routeName);
+    },
+
+    async close(): Promise<void> {
+      routeCache.clear();
+      currentRelayByCacheKey.clear();
     },
   };
 }
@@ -2315,8 +2538,11 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     shmSegments.push({ name, size });
   }
   const capabilityFlags = readU16("capability flags");
-  readText("server_id");
-  readText("server_instance_id");
+  const serverId = readText("server_id");
+  const serverInstanceId = readText("server_instance_id");
+  if (serverId.length === 0 || serverInstanceId.length === 0) {
+    throw new C2IpcTransportError("C-Two IPC handshake is missing server identity.");
+  }
   const routeCount = readU16("route count");
   const routes: C2IpcRouteInfo[] = [];
   for (let routeIndex = 0; routeIndex < routeCount; routeIndex += 1) {
@@ -2367,7 +2593,13 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
   if (offset !== payload.byteLength) {
     throw new C2IpcTransportError("C-Two IPC handshake contains trailing bytes.");
   }
-  return { shmPrefix, shmSegments, capabilityFlags, routes };
+  return {
+    shmPrefix,
+    shmSegments,
+    capabilityFlags,
+    serverIdentity: { serverId, serverInstanceId },
+    routes,
+  };
 }
 
 function findMatchingIpcRoute(routes: readonly C2IpcRouteInfo[], routeName: string, contract: C2RouteContractIdentity): C2IpcRouteInfo {
@@ -3136,6 +3368,8 @@ const C2_RESERVED_HTTP_HEADER_NAMES = new Set([
   "x-c2-expected-crm-ver",
   "x-c2-expected-abi-hash",
   "x-c2-expected-signature-hash",
+  "x-c2-route-uid",
+  "x-c2-route-revision",
 ]);
 const C2_MAX_RESPONSE_PAYLOAD_BYTES = 2_147_483_647;
 const C2_MAX_WIRE_TEXT_BYTES = 255;
@@ -3233,6 +3467,360 @@ function requestHeadersForRouteContract(customHeaders: Readonly<Record<string, s
   headers["x-c2-expected-abi-hash"] = routeContract.abiHash;
   headers["x-c2-expected-signature-hash"] = routeContract.signatureHash;
   return headers;
+}
+
+function requestHeadersForResolvedRoute(
+  customHeaders: Readonly<Record<string, string>>,
+  routeContract: C2RouteContractIdentity,
+  route: C2RouteToken,
+): Readonly<Record<string, string>> {
+  const headers = {
+    ...requestHeadersForRouteContract(customHeaders, routeContract),
+  } as Record<string, string>;
+  headers["x-c2-route-uid"] = route.routeUid;
+  headers["x-c2-route-revision"] = route.routeRevision.toString();
+  return headers;
+}
+
+async function probeResolvedHttpRoute(
+  fetchImpl: C2Fetch,
+  relayUrl: string,
+  routeName: string,
+  routeContract: C2RouteContractIdentity,
+  route: C2RelayRouteInfo,
+  headers: Readonly<Record<string, string>>,
+  timeoutMs: number,
+): Promise<void> {
+  await fetchWithTimeout(async (signal) => {
+    let response: C2FetchResponse;
+    try {
+      response = await fetchImpl(
+        `${relayUrl}/_probe/${encodePathSegment(routeName)}`,
+        {
+          method: "GET",
+          headers: requestHeadersForResolvedRoute(headers, routeContract, route),
+          signal,
+        },
+      );
+    } catch (error) {
+      throw new C2HttpTransportError(`C-Two HTTP relay probe fetch failed: ${String(error)}`);
+    }
+    if (response.status === 200) {
+      return;
+    }
+    let body = "";
+    try {
+      body = await readHttpTextResponseBody(response);
+    } catch (error) {
+      throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`);
+    }
+    throw new C2HttpRelayError(response.status, body);
+  }, timeoutMs, "C-Two HTTP relay probe");
+}
+
+async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
+  fetchImpl: C2Fetch,
+  relayUrl: string,
+  routeName: string,
+  routeContract: C2RouteContractIdentity,
+  route: C2RelayRouteInfo,
+  method: string,
+  requestPayload: Uint8Array,
+  headers: Readonly<Record<string, string>>,
+  callTimeoutMs: number,
+  responsePayloadAllocator: C2ResponsePayloadAllocator<Payload> | undefined,
+  responsePayloadUnknownLengthStrategy: C2ResponsePayloadUnknownLengthStrategy,
+  responsePayloadUnknownLengthMaxBytes: number,
+): Promise<Payload> {
+  return await fetchWithTimeout(async (signal) => {
+    let response: C2FetchResponse;
+    try {
+      response = await fetchImpl(
+        `${relayUrl}/${encodePathSegment(routeName)}/${encodePathSegment(method)}`,
+        {
+          method: "POST",
+          headers: requestHeadersForResolvedRoute(headers, routeContract, route),
+          body: requestPayload,
+          signal,
+        },
+      );
+    } catch (error) {
+      throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${String(error)}`);
+    }
+    if (response.status === 200) {
+      try {
+        return await readHttpSuccessResponsePayload(
+          response,
+          responsePayloadAllocator,
+          responsePayloadUnknownLengthStrategy,
+          responsePayloadUnknownLengthMaxBytes,
+        );
+      } catch (error) {
+        throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+      }
+    }
+    if (response.status === 500) {
+      let errorPayload: Uint8Array;
+      try {
+        errorPayload = await readHttpArrayBufferResponsePayload(response);
+      } catch (error) {
+        throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+      }
+      throw new C2CrmMethodError(errorPayload);
+    }
+    let body = "";
+    try {
+      body = await readHttpTextResponseBody(response);
+    } catch (error) {
+      throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+    }
+    throw new C2HttpRelayError(response.status, body);
+  }, callTimeoutMs, "C-Two HTTP relay call");
+}
+
+async function callPreparedLocalIpcAndClose<Payload extends C2ResponsePayload>(
+  transport: C2IpcEncodedTransport<Payload>,
+  routeName: string,
+  contract: C2ContractIdentity,
+  method: string,
+  requestPayload: C2ByteArray,
+): Promise<Payload> {
+  let response: Payload;
+  try {
+    response = await transport.call(routeName, contract, method, requestPayload);
+  } catch (error) {
+    try {
+      await transport.close();
+    } catch {
+    }
+    throw error;
+  }
+  try {
+    await transport.close();
+  } catch (error) {
+    tryReleaseResponsePayload(response);
+    throw error;
+  }
+  return response;
+}
+
+function observeTransportResponse<Payload extends C2ResponsePayload>(
+  response: Payload,
+  observe: C2TransportObserver | undefined,
+  observation: C2TransportObservation,
+): Payload {
+  if (observe === undefined) {
+    return response;
+  }
+  try {
+    observe(Object.freeze({ ...observation }));
+    return response;
+  } catch (error) {
+    tryReleaseResponsePayload(response);
+    throw error;
+  }
+}
+
+function normalizeTransportObserver(
+  value: C2TransportObserver | undefined,
+  label: string,
+): C2TransportObserver | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "function") {
+    throw new Error(`${label} must be a function.`);
+  }
+  return value;
+}
+
+function normalizeExpectedServerIdentity(
+  value: C2ServerIdentity | undefined,
+  label: string,
+): C2ServerIdentity | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`${label} must be an object.`);
+  }
+  const serverId = requireNonEmptyText(value.serverId, `${label}.serverId`);
+  const serverInstanceId = requireNonEmptyText(
+    value.serverInstanceId,
+    `${label}.serverInstanceId`,
+  );
+  return Object.freeze({ serverId, serverInstanceId });
+}
+
+function normalizeExpectedRouteToken(
+  value: C2RouteToken | undefined,
+  label: string,
+): C2RouteToken | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`${label} must be an object.`);
+  }
+  const routeUid = requireNonEmptyText(value.routeUid, `${label}.routeUid`);
+  if (!Number.isSafeInteger(value.routeRevision) || value.routeRevision <= 0) {
+    throw new Error(`${label}.routeRevision must be a positive safe integer.`);
+  }
+  return Object.freeze({ routeUid, routeRevision: value.routeRevision });
+}
+
+function normalizeIpcObservationPath(
+  value: C2IpcTransportOptions<C2ResponsePayload>["observationPath"],
+): "DirectIpc" | "RelayAwareLocalIpc" {
+  if (value === undefined) {
+    return "DirectIpc";
+  }
+  if (value !== "DirectIpc" && value !== "RelayAwareLocalIpc") {
+    throw new Error('C-Two IPC observationPath must be "DirectIpc" or "RelayAwareLocalIpc".');
+  }
+  return value;
+}
+
+function normalizeRelayAwareIpcOptions<Payload extends C2ResponsePayload>(
+  value: C2IpcTransportOptions<Payload> | undefined,
+): C2IpcTransportOptions<Payload> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("C-Two relay-aware ipc options must be an object.");
+  }
+  normalizeIpcConnect(value, "C-Two relay-aware ipc options");
+  if (
+    value.expectedServerIdentity !== undefined ||
+    value.expectedRouteToken !== undefined ||
+    value.observationPath !== undefined ||
+    value.observe !== undefined
+  ) {
+    throw new Error(
+      "C-Two relay-aware ipc expected route facts and observation are owned by relay resolution.",
+    );
+  }
+  return value;
+}
+
+function requireExpectedServerIdentity(
+  actual: C2ServerIdentity,
+  expected: C2ServerIdentity | undefined,
+): void {
+  if (
+    expected !== undefined &&
+    (
+      actual.serverId !== expected.serverId ||
+      actual.serverInstanceId !== expected.serverInstanceId
+    )
+  ) {
+    throw new C2IpcTransportError(
+      `C-Two IPC server identity mismatch: expected ${expected.serverId}/${expected.serverInstanceId}, got ${actual.serverId}/${actual.serverInstanceId}.`,
+    );
+  }
+}
+
+function requireExpectedRouteToken(
+  actual: C2IpcRouteInfo,
+  expected: C2RouteToken | undefined,
+): void {
+  if (
+    expected !== undefined &&
+    (
+      actual.routeUid !== expected.routeUid ||
+      actual.routeRevision !== expected.routeRevision
+    )
+  ) {
+    throw new C2IpcTransportError(
+      `C-Two IPC route token mismatch: expected ${expected.routeUid}/${expected.routeRevision}, got ${actual.routeUid}/${actual.routeRevision}.`,
+    );
+  }
+}
+
+function requireNonEmptyText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function selectLocalIpcRoute<Payload extends C2ResponsePayload>(
+  routes: readonly C2RelayRouteInfo[],
+  anchorUrl: string,
+  ipcOptions: C2IpcTransportOptions<Payload> | undefined,
+  excludedRouteTokens: ReadonlySet<string>,
+): C2RelayRouteInfo | undefined {
+  if (ipcOptions === undefined || !relayAnchorAllowsLocalIpc(anchorUrl)) {
+    return undefined;
+  }
+  return routes.find(
+    (route) =>
+      route.ipcAddress !== undefined &&
+      route.serverId !== undefined &&
+      route.serverInstanceId !== undefined &&
+      !excludedRouteTokens.has(routeTokenKey(route)),
+  );
+}
+
+function relayAnchorAllowsLocalIpc(anchorUrl: string): boolean {
+  const hostname = new URL(anchorUrl).hostname.toLowerCase();
+  return (
+    hostname === "localhost" ||
+    hostname.startsWith("127.") ||
+    hostname === "::1" ||
+    hostname === "[::1]"
+  );
+}
+
+function routeTokenKey(route: C2RouteToken): string {
+  return JSON.stringify([route.routeUid, route.routeRevision]);
+}
+
+function samePathFallbackDeniedError(
+  routeName: string,
+  route: C2RelayRouteInfo,
+): C2HttpRelayError {
+  return new C2HttpRelayError(
+    409,
+    canonicalRelayErrorBody({
+      code: 714,
+      name: "FallbackDenied",
+      message: "same-path fallback denied after verified local IPC failure",
+      details: {
+        route: routeName,
+        route_uid: route.routeUid,
+        route_revision: route.routeRevision.toString(),
+      },
+    }),
+  );
+}
+
+function resourceNotFoundError(routeName: string): C2HttpRelayError {
+  return new C2HttpRelayError(
+    404,
+    canonicalRelayErrorBody({
+      code: 701,
+      name: "ResourceNotFound",
+      message: `route not found: ${routeName}`,
+      details: { route: routeName },
+    }),
+  );
+}
+
+function canonicalRelayErrorBody(error: {
+  readonly code: number;
+  readonly name: string;
+  readonly message: string;
+  readonly details: Readonly<Record<string, string>>;
+}): string {
+  return JSON.stringify({
+    version: 1,
+    code: error.code,
+    name: error.name,
+    message: error.message,
+    details: error.details,
+  });
 }
 
 function normalizeRelayMaxAttempts(value: number | undefined): number {
@@ -3443,12 +4031,28 @@ function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInf
     throw new Error(`C-Two relay resolve route ${index} is not an object.`);
   }
   const item = route as Record<string, unknown>;
+  const ipcAddress = optionalStringField(item, "ipc_address", index);
+  const serverId = optionalStringField(item, "server_id", index);
+  const serverInstanceId = optionalStringField(item, "server_instance_id", index);
+  const localFactCount = [ipcAddress, serverId, serverInstanceId].filter(
+    (value) => value !== undefined,
+  ).length;
+  if (localFactCount !== 0 && localFactCount !== 3) {
+    throw new Error(
+      `C-Two relay resolve route ${index} must provide ipc_address, server_id, and server_instance_id together.`,
+    );
+  }
   return {
     name: stringField(item, "name", index),
     relayUrl: normalizeRelayBaseUrl(
       stringField(item, "relay_url", index),
       `C-Two relay resolve route ${index} relay_url`,
     ),
+    routeUid: stringField(item, "route_uid", index),
+    routeRevision: numberField(item, "route_revision", index),
+    ipcAddress,
+    serverId,
+    serverInstanceId,
     crmNs: stringField(item, "crm_ns", index),
     crmName: stringField(item, "crm_name", index),
     crmVer: stringField(item, "crm_ver", index),
@@ -3488,6 +4092,17 @@ function stringField(item: Record<string, unknown>, field: string, index: number
   return value;
 }
 
+function optionalStringField(item: Record<string, unknown>, field: string, index: number): string | undefined {
+  const value = item[field];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`C-Two relay resolve route ${index} has invalid optional string field ${field}.`);
+  }
+  return value;
+}
+
 function numberField(item: Record<string, unknown>, field: string, index: number): number {
   const value = item[field];
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
@@ -3504,23 +4119,51 @@ function isRetryableResolveError(error: unknown): boolean {
 }
 
 function isRetryableRouteError(error: unknown): boolean {
-  if (error instanceof C2HttpRelayError) {
-    if (error.status === 404 && relayErrorIs(error.body, "ResourceNotFound")) {
-      return true;
-    }
-    if (error.status === 502 && relayErrorIs(error.body, "UpstreamUnavailable")) {
-      return true;
-    }
+  if (!(error instanceof C2HttpRelayError)) {
+    return false;
   }
-  return false;
+  const canonical = parseCanonicalRelayError(error.body);
+  if (canonical === undefined) {
+    return false;
+  }
+  if (error.status === 404 && canonical.name === "ResourceNotFound") {
+    return true;
+  }
+  if (error.status === 409 && canonical.name === "RouteStale") {
+    return true;
+  }
+  return (
+    error.status === 502 &&
+    canonical.name === "ResourceUnavailable" &&
+    canonical.details.dispatch_phase === "pre_dispatch"
+  );
 }
 
-function relayErrorIs(body: string, expected: string): boolean {
+function parseCanonicalRelayError(
+  body: string,
+): { readonly name: string; readonly details: Readonly<Record<string, unknown>> } | undefined {
   try {
-    const parsed = JSON.parse(body) as { error?: unknown };
-    return parsed.error === expected;
+    const parsed = JSON.parse(body) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.name !== "string") {
+      return undefined;
+    }
+    if (
+      typeof record.details !== "object" ||
+      record.details === null ||
+      Array.isArray(record.details)
+    ) {
+      return undefined;
+    }
+    return {
+      name: record.name,
+      details: record.details as Readonly<Record<string, unknown>>,
+    };
   } catch {
-    return false;
+    return undefined;
   }
 }
 

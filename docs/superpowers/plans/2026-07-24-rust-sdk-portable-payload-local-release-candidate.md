@@ -1537,16 +1537,16 @@ Observed Task 8 evidence:
 
 ### Task 9.1 — Write transport-contract RED tests
 
-- [ ] Assert generated Node code declares and executes direct IPC, explicit
+- [x] Assert generated Node code declares and executes direct IPC, explicit
   relay, and relay-aware modes.
-- [ ] Assert direct IPC reaches a real route-bound host.
-- [ ] Assert explicit relay reaches a real `c3 relay` data-plane counter and
+- [x] Assert direct IPC reaches a real route-bound host.
+- [x] Assert explicit relay reaches a real `c3 relay` data-plane counter and
   cannot shortcut to local IPC.
-- [ ] Assert relay-aware records either verified local IPC or HTTP relay
+- [x] Assert relay-aware records either verified local IPC or HTTP relay
   selection and denies same-path fallback.
-- [ ] Use at least one generated Rust host and one generated Python host across
+- [x] Use at least one generated Rust host and one generated Python host across
   the TypeScript suite.
-- [ ] Reject a test double/simulated transport as evidence.
+- [x] Reject a test double/simulated transport as evidence.
 
 Run RED:
 
@@ -1561,22 +1561,22 @@ lifecycle evidence; real host calls and path receipts are absent.
 
 ### Task 9.2 — Close real payload and ownership behavior
 
-- [ ] Generate all TypeScript artifacts through `c3` from the same no-payload,
+- [x] Generate all TypeScript artifacts through `c3` from the same no-payload,
   record, and graph descriptors used by the matrix.
-- [ ] Load payload semantics only through the public installed
+- [x] Load payload semantics only through the public installed
   `fastdb4ts/payload` API.
-- [ ] Execute no-payload, record, and graph calls over all three declared
+- [x] Execute no-payload, record, and graph calls over all three declared
   connection modes. Spread Rust/Python hosts across the suite so both execute.
-- [ ] Prove wrong FastDB digest is structurally rejected with the frozen outer
+- [x] Prove wrong FastDB digest is structurally rejected with the frozen outer
   cause fields.
-- [ ] Prove response close/release is idempotent, checked views fail after
+- [x] Prove response close/release is idempotent, checked views fail after
   invalidation, and materialized values survive.
-- [ ] Feed an opaque response allocator without a public byte-visible view;
+- [x] Feed an opaque response allocator without a public byte-visible view;
   assert C-Two rejects and releases it instead of reading provider-private
   fields.
-- [ ] Record Node version, platform, package hashes, descriptor/release/spec
+- [x] Record Node version, platform, package hashes, descriptor/release/spec
   hashes, observed path, route facts, logical result, and cleanup status.
-- [ ] Mark browser runtime explicitly unverified; do not add browser support
+- [x] Mark browser runtime explicitly unverified; do not add browser support
   wording to current docs.
 
 ### Task 9.3 — Run source-stage real calls
@@ -1608,11 +1608,65 @@ git diff --check
 
 Review before commit:
 
-- [ ] Inspect counters proving relay calls traversed relay and local-aware calls
+- [x] Inspect counters proving relay calls traversed relay and local-aware calls
   traversed IPC.
-- [ ] Verify installed FastDB public methods, not private fields, own all
+- [x] Verify installed FastDB public methods, not private fields, own all
   payload behavior.
-- [ ] Verify receipt claims Node on the audited platform only.
+- [x] Verify receipt claims Node on the audited platform only.
+
+Observed Task 9 evidence:
+
+- The initial transport-contract RED found that generated TypeScript had no
+  auditable path observations, route-token-bound HTTP preparation, verified
+  relay-aware local facts, real Node host calls, or strict receipt. A later
+  controlled RED also proved that explicit relay incorrectly sent probe/call
+  traffic to the resolution anchor and that canonical pre-dispatch errors were
+  not recognized.
+- The final controlled transport suite passes five tests. It compiles generated
+  TypeScript with the audited compiler, proves resolve-anchor/data-plane
+  separation, token-bound probe/call headers, complete local IPC
+  identity/token verification, same-route fallback denial, pre-dispatch-only
+  route reselection, and one-call behavior for `dispatch_uncertain`.
+- The source-stage real-call suite passes 13 tests: all 12 exact rows
+  (`no-payload`, `record-v1`, and `object-graph-v1` × direct IPC, explicit
+  relay, relay-aware local IPC, and relay-aware HTTP) plus strict receipt
+  creation. Every row runs generated code from real `c3`, locally packed
+  `fastdb4ts` and `@c-two/c2-mem-ffi`, and a real Rust or Python host. No
+  simulated transport contributes receipt evidence.
+- The strict receipt validator passes 14 tests and freezes row order, host/path
+  assignment, call counts, package and descriptor hashes, release/spec facts,
+  the exact six-field FastDB digest cause on
+  `record-v1__direct-ipc`, exactly-one opaque allocator release on
+  `object-graph-v1__relay-aware-http`, audited Node platform, explicit browser
+  `unverified`, canonical JSON, and cleanup.
+- The development receipt at
+  `target/local-rc/typescript-real-call-receipt.v1.json` has SHA-256
+  `abf77a49de3338ef4cd6ecd1ea3fa7d94c286ae7f68ec77c59e73300d30028a6`.
+  It records Node `v25.8.1` on `darwin/arm64`,
+  `fastdb4ts` tarball SHA-256
+  `219fcda8ae71ff97a8ddc0cf11a1edf6c2d7299b5371c32195f5bbd781080a9a`,
+  `@c-two/c2-mem-ffi` tarball SHA-256
+  `15c8c341ba8b29bd4d68b4b55d8ecfcde90806a0a0ea6a87c54ae05bcb2a3125`,
+  and source-built `c3` SHA-256
+  `2b048ddd036197125b078df3f91016689b92c6b6e18fe28acc5b555973cba317`.
+  These remain development inputs; Task 11 replaces them with
+  manifest-bound candidate evidence.
+- The Node/POSIX package passes 28 tests, strict typecheck, and a clean tarball
+  install/typecheck/native-lifecycle `pack:check`. Its existing private package
+  manifest already had the correct runtime inventory and build hooks, so no
+  gratuitous manifest edit was made. The new high-level runtime composes the
+  native loader and therefore is tested in the loader suite rather than
+  duplicating low-level binding tests.
+- `c2-codegen` format, strict Clippy, all unit/integration/doc tests, and the
+  combined TypeScript real-call/Python codegen suite pass. FastDB remains clean
+  at frozen commit
+  `6b9d0a55f27bb22fd13f867f321db821f21e777c`; its real Wasm/TypeScript payload
+  tests passed during the source-stage build.
+- Owner-issue review records the remaining browser-runtime, typed cross-SDK
+  dispatch-phase, and JavaScript-safe route-revision limitations, the opaque
+  allocator boundary, and the distinction between development package hashes
+  and Task 11 candidate provenance. Process/socket inspection found no
+  surviving host, relay, Node, or TypeScript IPC residue.
 
 ## Task 10: Make FastDB’s Own Package Boundary Produce a Local Candidate
 
