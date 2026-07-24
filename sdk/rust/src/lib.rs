@@ -13,8 +13,11 @@ pub use c2_contract::{
     ExpectedRouteContract,
 };
 pub use c2_core::{
-    Client, Connect, Host, HostOptions, ObservedPath, PathCounters, Registration, Runtime,
-    RuntimeIdentity, RuntimeOptions, ServiceDefinition,
+    Client, Connect, DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, Host, HostOptions,
+    ObservedPath, PathCounters, Registration, RouteConcurrency, RouteConcurrencyError,
+    RouteConcurrencyGuard, RouteConcurrencySnapshot, Runtime, RuntimeIdentity, RuntimeOptions,
+    ServiceConcurrencyMode, ServiceDefinition, direct_ipc_socket_path, ping_direct_ipc,
+    shutdown_direct_ipc,
 };
 pub use error::Error;
 pub use held::Held;

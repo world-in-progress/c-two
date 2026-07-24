@@ -57,20 +57,14 @@ def _http_post(url: str, body: dict) -> urllib.request.Request:
     )
 
 
-def _server_instance_id_for(route_name: str, address: str) -> str:
+def _server_instance_id_for(address: str) -> str:
     registry = _ProcessRegistry.get()
-    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
-        address,
-        route_name,
-        *MESH_CONTRACT.native_args(),
-    )
-    try:
-        instance_id = client.server_instance_id
-        assert isinstance(instance_id, str)
-        assert instance_id
-        return instance_id
-    finally:
-        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
+    identity = dict(registry._runtime_session.ensure_server())  # noqa: SLF001
+    assert identity["ipc_address"] == address
+    instance_id = identity["server_instance_id"]
+    assert isinstance(instance_id, str)
+    assert instance_id
+    return instance_id
 
 
 def _register_body(name: str, server_id: str) -> dict[str, object]:
@@ -80,7 +74,7 @@ def _register_body(name: str, server_id: str) -> dict[str, object]:
     actual_server_id = cc.server_id()
     assert address is not None
     assert actual_server_id == server_id
-    server_instance_id = _server_instance_id_for(name, address)
+    server_instance_id = _server_instance_id_for(address)
     return {
         "name": name,
         "server_id": server_id,

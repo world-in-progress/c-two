@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -36,6 +37,13 @@ OTHER_SPEC = {
     ],
     "components": [],
 }
+
+FASTDB_DIGEST_MISMATCH_CAUSE = json.loads(
+    (
+        Path(__file__).resolve().parents[4]
+        / "tests/fixtures/fastdb-digest-mismatch-cause.json"
+    ).read_text(),
+)
 
 
 def build_payload(spec_value: object, value: int = 7) -> Payload:
@@ -430,13 +438,7 @@ def test_fastdb_cause_fields_survive_client_input_error_wrapping() -> None:
     finally:
         wrong.close()
 
-    assert raised.value.details["cause_owner"] == "fastdb"
-    assert raised.value.details["fastdb_code"] == "3006"
-    assert raised.value.details["fastdb_symbol"] == "DIGEST_MISMATCH"
-    assert raised.value.details["fastdb_path"] == "/payload/spec_sha256"
-    assert json.loads(raised.value.details["fastdb_details_json"])[
-        "reason"
-    ] == "spec_digest_mismatch"
+    assert raised.value.details == FASTDB_DIGEST_MISMATCH_CAUSE
 
 
 def test_missing_payload_is_classified_at_resource_deserialize_boundary() -> None:

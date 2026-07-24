@@ -255,22 +255,32 @@ def _build_transfer_wrapper(
                         ):
                             _cleanup_preserving_primary(
                                 exc,
-                                lambda: output.invalidate(result),
+                                lambda: _invalidate_and_release_held_response(
+                                    view,
+                                    response,
+                                    output.invalidate,
+                                    result,
+                                ),
                             )
-                        _cleanup_preserving_primary(
-                            exc,
-                            lambda: _release_view_and_response(view, response),
-                        )
+                        else:
+                            _cleanup_preserving_primary(
+                                exc,
+                                lambda: _release_view_and_response(view, response),
+                            )
                         raise
 
                     def release_cb() -> None:
-                        _release_view_and_response(view, response)
+                        _invalidate_and_release_held_response(
+                            view,
+                            response,
+                            output.invalidate,
+                            result,
+                        )
 
                     return HeldResult(
                         result,
                         release_cb,
                         buffer=view,
-                        invalidate_cb=output.invalidate,
                     )
 
                 try:
@@ -629,6 +639,41 @@ def _release_view_and_response(view: memoryview, response: object) -> None:
     except BaseException as exc:
         if first_error is None:
             first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
+def _invalidate_and_release_held_response(
+    view: memoryview,
+    response: object,
+    invalidator: Callable[[object], None],
+    value: object,
+) -> None:
+    first_error: BaseException | None = None
+    try:
+        view.release()
+    except BaseException as exc:
+        first_error = exc
+
+    core_release = getattr(response, "invalidate_then_release", None)
+    if callable(core_release):
+        try:
+            core_release(invalidator, value)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    else:
+        try:
+            invalidator(value)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        try:
+            _release_response(response)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+
     if first_error is not None:
         raise first_error
 

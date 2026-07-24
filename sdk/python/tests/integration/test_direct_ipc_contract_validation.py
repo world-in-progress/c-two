@@ -132,7 +132,7 @@ def test_explicit_direct_ipc_rejects_same_tag_contract_fingerprint_mismatch_with
     address = cc.server_address()
     assert address is not None
 
-    cc.set_relay_anchor("http://127.0.0.1:9")
+    settings.relay_anchor_address = "http://127.0.0.1:9"
 
     with pytest.raises(RuntimeError, match="CRM contract mismatch"):
         cc.connect(client_contract, name="grid", address=address)
@@ -146,7 +146,7 @@ def test_direct_ipc_connect_succeeds_with_bad_relay_setting_when_contract_matche
     address = cc.server_address()
     assert address is not None
 
-    cc.set_relay_anchor("http://127.0.0.1:9")
+    settings.relay_anchor_address = "http://127.0.0.1:9"
 
     proxy = cc.connect(contract, name="grid", address=address)
     try:
@@ -184,20 +184,11 @@ def test_runtime_session_rejects_direct_ipc_expected_contract_missing_or_malform
 
 
 def test_direct_ipc_route_contract_projection_includes_abi_and_signature_hashes():
-    from c_two._native import RustClientPool
-
     contract = _contract({"echo": _method("def echo(self, value: str) -> str: ...")})
     expected = crm_contract(contract)
     cc.register(contract, CountingResource(), name="grid")
     address = cc.server_address()
     assert address is not None
-
-    pool = RustClientPool.instance()
-    raw_client = pool.acquire(address)
-    try:
-        assert raw_client.route_contract("grid") == ("grid", *expected.native_args())
-    finally:
-        pool.release(address)
 
     session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
     bound_client = session.acquire_ipc_client(
@@ -207,9 +198,10 @@ def test_direct_ipc_route_contract_projection_includes_abi_and_signature_hashes(
     )
     try:
         assert bound_client.route_name == "grid"
-        assert bound_client.route_contract("grid") == ("grid", *expected.native_args())
+        assert bound_client.observed_path == "direct_ipc"
+        assert not hasattr(bound_client, "route_contract")
     finally:
-        session.release_ipc_client(address)
+        bound_client.close()
 
 
 def test_route_bound_native_ipc_client_cannot_dispatch_an_alternate_route_name():

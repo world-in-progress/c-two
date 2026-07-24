@@ -270,7 +270,7 @@ impl PyShmBuffer {
             (*view).readonly = 1;
             (*view).itemsize = 1;
             (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
-                b"B\0".as_ptr() as *mut std::os::raw::c_char
+                c"B".as_ptr().cast_mut()
             } else {
                 std::ptr::null_mut()
             };

@@ -39,12 +39,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         [
             MethodDefinition {
                 index: 0,
-                name: "ping",
+                name: "ping".to_string(),
                 access: MethodAccess::Read,
             },
             MethodDefinition {
                 index: 1,
-                name: "echo",
+                name: "echo".to_string(),
                 access: MethodAccess::Write,
             },
         ],

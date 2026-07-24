@@ -1,0 +1,8 @@
+{
+  "cause_owner": "fastdb",
+  "fastdb_code": "3006",
+  "fastdb_details_json": "{\"actual\":\"1a6444b96fce6f7be651b3c865db574563f287c3ac9144af71b20b6a517cfb3a\",\"expected\":\"7926cb8bda4c35f3cddcc28e6f9105331d7e46864ad1eb7bf03abedbcd8c7d8c\",\"reason\":\"spec_digest_mismatch\"}",
+  "fastdb_message": "Portable payload spec digest does not match",
+  "fastdb_path": "/payload/spec_sha256",
+  "fastdb_symbol": "DIGEST_MISMATCH"
+}

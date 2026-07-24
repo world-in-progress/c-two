@@ -3,8 +3,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
@@ -28,6 +28,7 @@ const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct Echo;
 
@@ -65,12 +66,12 @@ fn definition(route_name: &str) -> ServiceDefinition {
         [
             MethodDefinition {
                 index: 0,
-                name: "ping",
+                name: "ping".to_string(),
                 access: MethodAccess::Read,
             },
             MethodDefinition {
                 index: 1,
-                name: "echo",
+                name: "echo".to_string(),
                 access: MethodAccess::Write,
             },
         ],
@@ -85,6 +86,33 @@ fn runtime_options(server_id: String, relay_url: Option<String>) -> RuntimeOptio
         relay_anchor_address: relay_url,
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
+    }
+}
+
+fn with_invalid_relay_proxy_env(test: impl FnOnce()) {
+    let _guard = ENV_LOCK.lock().expect("environment lock");
+    let previous_env_file = std::env::var_os("C2_ENV_FILE");
+    let previous_proxy = std::env::var_os("C2_RELAY_USE_PROXY");
+    // SAFETY: this test owns the process-local environment lock and restores
+    // both values before releasing it.
+    unsafe {
+        std::env::set_var("C2_ENV_FILE", "");
+        std::env::set_var("C2_RELAY_USE_PROXY", "not-a-bool");
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+    // SAFETY: restoration happens while holding the same process-local lock.
+    unsafe {
+        match previous_env_file {
+            Some(value) => std::env::set_var("C2_ENV_FILE", value),
+            None => std::env::remove_var("C2_ENV_FILE"),
+        }
+        match previous_proxy {
+            Some(value) => std::env::set_var("C2_RELAY_USE_PROXY", value),
+            None => std::env::remove_var("C2_RELAY_USE_PROXY"),
+        }
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -389,6 +417,27 @@ fn local_candidate(
         signature_hash: expected.signature_hash.clone(),
         max_payload_size: 1024 * 1024,
     }
+}
+
+#[test]
+fn relay_aware_connect_without_anchor_ignores_proxy_configuration() {
+    with_invalid_relay_proxy_env(|| {
+        let route_name = unique_name("missing-relay");
+        let expected = release()
+            .expected_route(route_name)
+            .expect("expected route");
+        let runtime = Runtime::new(runtime_options(unique_name("no-relay"), None))
+            .expect("runtime without relay");
+
+        let error = runtime
+            .connect(expected, Connect::RelayAware)
+            .expect_err("relay-aware connect requires an anchor");
+
+        assert!(matches!(
+            error,
+            Error::Lifecycle(c2_core::LifecycleError::MissingRelayAddress)
+        ));
+    });
 }
 
 #[test]
@@ -928,12 +977,12 @@ fn service_error_is_not_replayed() {
         [
             MethodDefinition {
                 index: 0,
-                name: "ping",
+                name: "ping".to_string(),
                 access: MethodAccess::Read,
             },
             MethodDefinition {
                 index: 1,
-                name: "echo",
+                name: "echo".to_string(),
                 access: MethodAccess::Write,
             },
         ],

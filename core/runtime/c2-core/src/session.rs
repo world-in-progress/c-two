@@ -304,8 +304,12 @@ impl Runtime {
         Ok(client)
     }
 
-    pub(crate) fn release_ipc_client(&self, address: &str) {
-        c2_ipc::ClientPool::instance().release(address);
+    pub(crate) fn release_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
+        c2_ipc::ClientPool::instance().release_if_same(address, client);
+    }
+
+    pub(crate) fn discard_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
+        c2_ipc::ClientPool::instance().discard_if_same(address, client);
     }
 
     pub(crate) fn client_ipc_config(&self) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
@@ -850,13 +854,15 @@ impl Runtime {
 
     pub(crate) fn resolve_relay_connection(
         &self,
+        relay_anchor_address: &str,
         expected: ExpectedRouteContract,
         relay_use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
     ) -> Result<RelayResolvedConnection, LifecycleError> {
-        let projection = self.relay_projection(relay_use_proxy)?;
+        let projection =
+            self.relay_projection_for_address(relay_anchor_address, relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
             Arc::clone(&projection.control),
             expected,
@@ -921,13 +927,6 @@ impl Runtime {
         if let Some(projection) = self.state.lock().relay_projection.as_ref() {
             projection.control.clear_cache();
         }
-    }
-
-    fn relay_projection(&self, relay_use_proxy: bool) -> Result<RelayProjection, LifecycleError> {
-        let relay_anchor_address = self
-            .effective_relay_anchor_address()?
-            .ok_or(LifecycleError::MissingRelayAddress)?;
-        self.relay_projection_for_address(&relay_anchor_address, relay_use_proxy)
     }
 
     fn relay_projection_for_address(
@@ -1292,6 +1291,7 @@ mod tests {
     fn relay_anchor_address_override_is_canonicalized_and_clear_cache_is_safe() {
         let session = Runtime::new(RuntimeOptions {
             relay_anchor_address: Some(" http://relay.test/ ".to_string()),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1339,6 +1339,7 @@ mod tests {
     fn unregister_missing_route_reports_missing_route() {
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("missing-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1354,6 +1355,7 @@ mod tests {
         let route_name = unique_route_name("crm-contract-mismatch");
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("crm-contract-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1376,6 +1378,7 @@ mod tests {
         let route_name = unique_route_name("access-map-mismatch");
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("access-map-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1396,7 +1399,11 @@ mod tests {
     #[test]
     fn unregister_without_relay_does_not_publish_lazy_identity() {
         let route_name = unique_route_name("no-relay-unregister");
-        let session = Runtime::new(RuntimeOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
         let server = test_server("no-relay-unregister-server");
         register_dummy(&server, &route_name);
 
@@ -1417,6 +1424,7 @@ mod tests {
         let route_name = unique_route_name("relay-fail-route");
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-fail-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1449,6 +1457,7 @@ mod tests {
         let route_name = unique_route_name("relay-commit-gate");
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-commit-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1528,6 +1537,7 @@ mod tests {
         let route_name = unique_route_name("relay-final-fail");
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-final-fail-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1607,6 +1617,7 @@ mod tests {
         let route_name = unique_route_name("relay-publish-gate");
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-publish-gate-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1688,6 +1699,7 @@ mod tests {
         let second = unique_route_name("shutdown-b");
         let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("shutdown-session")),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1725,6 +1737,7 @@ mod tests {
         let session = Arc::new(
             Runtime::new(RuntimeOptions {
                 server_id: Some(unique_route_name("shutdown-close-session")),
+                use_process_relay_anchor: false,
                 ..Default::default()
             })
             .expect("session"),
@@ -1788,7 +1801,11 @@ mod tests {
     #[test]
     fn shutdown_without_relay_does_not_publish_lazy_identity() {
         let route_name = unique_route_name("shutdown-no-relay");
-        let session = Runtime::new(RuntimeOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
         let server = test_server("shutdown-no-relay-server");
         register_dummy(&server, &route_name);
 
@@ -1830,7 +1847,11 @@ mod tests {
     #[test]
     fn shutdown_records_relay_config_resolution_errors() {
         let route_name = unique_route_name("shutdown-relay-config");
-        let session = Runtime::new(RuntimeOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
         session.force_relay_config_error_for_test("forced relay config failure");
         let server = test_server("shutdown-relay-config-server");
         register_dummy(&server, &route_name);
@@ -1859,6 +1880,7 @@ mod tests {
         let route_name = unique_route_name("shutdown-relay-cleanup-config");
         let session = Runtime::new(RuntimeOptions {
             relay_anchor_address: Some("http://127.0.0.1:9".to_string()),
+            use_process_relay_anchor: false,
             ..Default::default()
         })
         .expect("session");
@@ -1889,7 +1911,11 @@ mod tests {
     #[test]
     fn shutdown_runtime_construction_failure_reports_error_without_signalling_server() {
         let route_name = unique_route_name("shutdown-runtime-fail");
-        let session = Runtime::new(RuntimeOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
         let server = test_server("shutdown-runtime-fail-server");
         register_dummy(&server, &route_name);
 
@@ -1941,7 +1967,11 @@ mod tests {
     #[test]
     fn shutdown_consumes_recorded_direct_shutdown_route_outcomes() {
         let route_name = unique_route_name("direct-shutdown-record");
-        let session = Runtime::new(RuntimeOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
         let server = test_server("direct-shutdown-record-server");
         register_dummy(&server, &route_name);
 

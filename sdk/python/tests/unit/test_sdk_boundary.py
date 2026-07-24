@@ -361,7 +361,7 @@ def test_python_server_bridge_does_not_own_readiness_polling():
     assert offenders == []
 
     start_source = inspect.getsource(NativeServerBridge.start)
-    assert "start_and_wait" in start_source
+    assert "ensure_host_started" in start_source
 
     shutdown_source = inspect.getsource(NativeServerBridge.shutdown)
     assert "if self.is_started()" not in shutdown_source
@@ -414,9 +414,7 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     runtime_session = (native_root / "runtime_session_ffi.rs").read_text(
         encoding="utf-8",
     )
-    server_ffi = (native_root / "server_ffi.rs").read_text(encoding="utf-8")
-    client_ffi = (native_root / "client_ffi.rs").read_text(encoding="utf-8")
-    http_ffi = (native_root / "http_ffi.rs").read_text(encoding="utf-8")
+    core_ffi = (native_root / "core_ffi.rs").read_text(encoding="utf-8")
 
     forbidden_defaults = [
         'route_name=""',
@@ -434,15 +432,18 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     default_offenders = [
         needle
         for needle in forbidden_defaults
-        if needle in runtime_session or needle in server_ffi
+        if needle in runtime_session
     ]
     assert default_offenders == []
 
-    assert "CRM calls require a route-bound client" in client_ffi
-    assert "CRM calls require a route-bound relay-aware client" in http_ffi
+    for removed in ("client_ffi.rs", "http_ffi.rs", "server_ffi.rs"):
+        assert not (native_root / removed).exists()
+    assert "Connect::DirectIpc" in runtime_session
+    assert "Connect::ExplicitRelay" in runtime_session
+    assert "Connect::RelayAware" in runtime_session
+    assert ".call_held(method_name, &request)" in core_ffi
     old_call_signature = "fn call<'py>(\n        &self,\n        py: Python<'py>,\n        route_name: &str,"
-    assert old_call_signature not in client_ffi
-    assert old_call_signature not in http_ffi
+    assert old_call_signature not in core_ffi
     assert old_call_signature not in runtime_session
 
 
@@ -518,12 +519,12 @@ def test_python_server_dispatcher_does_not_own_response_allocation():
     assert offenders == []
 
 
-def test_native_server_response_parser_does_not_accept_shm_coordinate_tuples():
+def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
     root = Path(__file__).resolve().parents[4]
-    server_ffi = root / "sdk" / "python" / "native" / "src" / "server_ffi.rs"
-    source = server_ffi.read_text(encoding="utf-8")
-    start = source.index("fn parse_response_meta")
-    end = source.index("// ---------------------------------------------------------------------------", start)
+    core_ffi = root / "sdk" / "python" / "native" / "src" / "core_ffi.rs"
+    source = core_ffi.read_text(encoding="utf-8")
+    start = source.index("fn materialize_python_bytes")
+    end = source.index("fn python_error_to_c2", start)
     parser_source = source[start:end]
 
     forbidden = [
@@ -536,6 +537,7 @@ def test_native_server_response_parser_does_not_accept_shm_coordinate_tuples():
     ]
     offenders = [needle for needle in forbidden if needle in parser_source]
     assert offenders == []
+    assert "write_python_payload_plan" in parser_source
 
 
 def test_prepared_payload_detection_requires_write_into_before_nbytes():
@@ -604,31 +606,28 @@ def test_python_native_does_not_expose_legacy_shutdown_signal_payloads():
 
 def test_python_native_server_bridge_does_not_expose_public_bool_unit_lifecycle_bypass():
     root = Path(__file__).resolve().parents[4]
+    native_root = root / "sdk" / "python" / "native" / "src"
     bridge_source = (
         root / "sdk" / "python" / "src" / "c_two" / "transport" / "server" / "native.py"
     ).read_text(encoding="utf-8")
-    native_source = (
-        root / "sdk" / "python" / "native" / "src" / "server_ffi.rs"
-    ).read_text(encoding="utf-8")
     runtime_session_source = (
-        root / "sdk" / "python" / "native" / "src" / "runtime_session_ffi.rs"
+        native_root / "runtime_session_ffi.rs"
     ).read_text(encoding="utf-8")
 
-    assert "fn shutdown(" not in native_source
-    assert "fn unregister_route(" not in native_source
-    assert "fn register_route(" not in native_source
-    assert "unregister_route_blocking" not in native_source
-    assert "fn _shutdown_runtime_barrier(" not in native_source
-    assert "shutdown_runtime_barrier_blocking" in native_source
+    assert not (native_root / "server_ffi.rs").exists()
     assert "self._rust_server.register_route(" not in bridge_source
     assert "self._rust_server.shutdown()" not in bridge_source
     assert "self._rust_server._shutdown_runtime_barrier()" not in bridge_source
-    assert "shutdown_runtime_barrier_blocking(py, timeout)" in runtime_session_source
+    assert "runtime_session.register_route(" in bridge_source
+    assert "runtime_session.shutdown(" in bridge_source
+    assert "host.register(definition)" in runtime_session_source
+    assert "registration.close()" in runtime_session_source
+    assert "Host::shutdown" in runtime_session_source
     assert "outcome.get('removed_routes')" not in bridge_source
     assert "_close_outcome_is_hook_safe" in bridge_source
 
 
-def test_python_native_server_ffi_does_not_build_tokio_runtime_directly():
+def test_python_native_does_not_build_transport_runtime_directly():
     root = Path(__file__).resolve().parents[4]
     native_root = root / "sdk" / "python" / "native" / "src"
     direct_builder_uses: list[str] = []
@@ -639,22 +638,23 @@ def test_python_native_server_ffi_does_not_build_tokio_runtime_directly():
             direct_builder_uses.append(path.relative_to(root).as_posix())
 
     assert direct_builder_uses == []
-
-    server_ffi = (native_root / "server_ffi.rs").read_text(encoding="utf-8")
-    assert "ServerRuntimeBuilder::build(" in server_ffi
+    cargo = (native_root.parent / "Cargo.toml").read_text(encoding="utf-8")
+    assert "c2-server" not in cargo
+    assert "c2-http" not in cargo
+    assert "c2-ipc" not in cargo
 
 
 def test_python_native_server_start_wait_uses_core_responsive_fence():
     root = Path(__file__).resolve().parents[4]
-    server_ffi = (
-        root / "sdk" / "python" / "native" / "src" / "server_ffi.rs"
+    core_host = (
+        root / "core" / "runtime" / "c2-core" / "src" / "host.rs"
     ).read_text(encoding="utf-8")
     core_server = (
         root / "core" / "transport" / "c2-server" / "src" / "server.rs"
     ).read_text(encoding="utf-8")
 
-    assert "wait_until_responsive(timeout)" in server_ffi
-    assert "wait_until_ready(timeout)" not in server_ffi.split("fn start_runtime_and_wait", 1)[1]
+    assert "wait_until_responsive(options.startup_timeout)" in core_host
+    assert "wait_until_ready(options.startup_timeout)" not in core_host
     assert "pub async fn wait_until_responsive(&self, timeout: Duration)" in core_server
 
 
@@ -714,17 +714,17 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
     assert "valid_nonempty_identity" not in source
 
 
-def test_relay_control_client_does_not_expose_name_only_resolve_to_python():
+def test_relay_control_client_is_not_exposed_to_python_native():
     root = Path(__file__).resolve().parents[4]
-    http_ffi = root / "sdk" / "python" / "native" / "src" / "http_ffi.rs"
-    source = http_ffi.read_text(encoding="utf-8")
-    start = source.index("impl PyRustRelayControlClient")
-    end = source.index("fn py_http_error", start)
-    control_client_impl = source[start:end]
+    native_root = root / "sdk" / "python" / "native" / "src"
+    native_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in native_root.glob("*.rs")
+    )
 
-    assert "fn resolve(&self" not in control_client_impl
-    assert "inner.resolve(&name)" not in control_client_impl
-    assert "registration_token" not in control_client_impl
+    assert not (native_root / "http_ffi.rs").exists()
+    assert "PyRustRelayControlClient" not in native_source
+    assert "RelayControlClient" not in native_source
 
 
 def test_relay_skip_ipc_validation_is_not_a_production_surface():

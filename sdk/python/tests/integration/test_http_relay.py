@@ -1,7 +1,7 @@
 """Integration tests for the HTTP relay chain.
 
-Tests the full pipeline: route-bound relay-aware client -> standalone c3 relay
--> RustClient -> Server -> CRM.
+Tests the full pipeline: Core route-bound client -> standalone c3 relay
+-> Core host -> Python CRM.
 
 Also tests ``cc.connect(address='http://...')`` end-to-end through the native
 relay-aware explicit HTTP projection.
@@ -19,7 +19,6 @@ import c_two as cc
 from c_two.config.settings import settings
 from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.error import ResourceNotFound
-from c_two._native import RustHttpClientPool
 from c_two.crm.contract import crm_contract
 from c_two.transport.registry import _ProcessRegistry
 
@@ -30,16 +29,6 @@ from tests.fixtures.counter import Counter, CounterImpl
 DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
 
 
-def _acquire_http(url: str):
-    """Acquire a RustHttpClient from the singleton pool."""
-    return RustHttpClientPool.instance().acquire(url)
-
-
-def _release_http(url: str):
-    """Release a RustHttpClient reference back to the pool."""
-    RustHttpClientPool.instance().release(url)
-
-
 def _server_instance_id_for(
     registry: _ProcessRegistry,
     address: str,
@@ -47,20 +36,14 @@ def _server_instance_id_for(
     route_name: str = 'hello',
     crm_class: type = Hello,
 ) -> str:
-    """Read the IPC server instance identity from the native handshake."""
-    expected = crm_contract(crm_class)
-    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
-        address,
-        route_name,
-        *expected.native_args(),
-    )
-    try:
-        instance_id = client.server_instance_id
-        assert isinstance(instance_id, str)
-        assert instance_id
-        return instance_id
-    finally:
-        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
+    """Read the identity owned by the same Core runtime as the host."""
+    del route_name, crm_class
+    identity = registry._runtime_session.ensure_server()  # noqa: SLF001
+    assert identity["ipc_address"] == address
+    instance_id = identity["server_instance_id"]
+    assert isinstance(instance_id, str)
+    assert instance_id
+    return instance_id
 
 
 def _expected_contract_headers(crm_class: type = Hello) -> dict[str, str]:
@@ -185,14 +168,9 @@ class TestHttpRelayFullChain:
     def test_health_endpoint(self, relay_stack):
         """GET /health returns OK."""
         relay_url, _ = relay_stack
-        client = _acquire_http(relay_url)
-        try:
-            health = client.health()
-            assert health is True
-            with pytest.raises(RuntimeError, match='route-bound relay-aware client'):
-                client.call('greeting', b'')
-        finally:
-            _release_http(relay_url)
+        with httpx.Client(trust_env=False, timeout=5.0) as client:
+            response = client.get(f"{relay_url}/health")
+        assert response.status_code == 200
 
     def test_concurrent_http_calls(self, relay_stack):
         """Multiple threads calling through HTTP relay."""
@@ -306,17 +284,14 @@ class TestCcConnectHttp:
     def test_connect_http_close_closes_relay_aware_client(self, relay_stack):
         """cc.close closes the relay-aware explicit HTTP client."""
         relay_url, _ = relay_stack
-        registry = _ProcessRegistry.get()
 
         crm = cc.connect(Hello, name='hello', address=relay_url)
         native_client = crm.client._client  # noqa: SLF001
         assert native_client.mode == 'http'
-        assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
         cc.close(crm)
-        with pytest.raises(RuntimeError, match='closed'):
+        with pytest.raises(Exception, match='closed'):
             native_client.call('greeting', b'')
-        assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
     def test_connect_http_with_slash_in_name(self, start_c3_relay):
         """CRM names containing '/' (toodle-style resource paths) work over HTTP relay.
@@ -542,12 +517,10 @@ class TestRelayControlPlane:
     """Test the relay control-plane endpoints (/_register, /_unregister, /_routes)."""
 
     def test_native_control_client_does_not_expose_name_only_resolve(self, start_c3_relay):
-        from c_two._native import RustRelayControlClient
+        from c_two import _native
 
-        relay = start_c3_relay()
-        client = RustRelayControlClient(relay.url)
-
-        assert not hasattr(client, 'resolve')
+        start_c3_relay()
+        assert not hasattr(_native, 'RustRelayControlClient')
 
     def test_register_via_http_control(self, start_c3_relay):
         """POST /_register adds an upstream and allows calls."""

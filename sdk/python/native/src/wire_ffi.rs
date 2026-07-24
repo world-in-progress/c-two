@@ -70,6 +70,7 @@ pub struct PyRouteInfo {
 impl PyRouteInfo {
     #[new]
     #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size, route_uid, route_revision))]
+    #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         name: String,
         methods: Vec<Py<PyMethodEntry>>,
@@ -235,6 +236,7 @@ fn decode_frame(body: &[u8]) -> PyResult<(u64, u32, Vec<u8>)> {
 
 #[pyfunction]
 #[pyo3(signature = (route_name, route_uid, observed_route_revision, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, method_idx))]
+#[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
 fn encode_call_control(
     route_name: &str,
     route_uid: &str,
@@ -263,11 +265,7 @@ fn encode_call_control(
 ///
 /// Returns `(route_name, route_uid, observed_route_revision, crm_ns, crm_name,
 /// crm_ver, abi_hash, signature_hash, method_idx, bytes_consumed)`.
-#[pyfunction]
-fn decode_call_control(
-    data: &[u8],
-    offset: usize,
-) -> PyResult<(
+type DecodedCallControlParts = (
     String,
     String,
     u64,
@@ -278,7 +276,10 @@ fn decode_call_control(
     String,
     u16,
     usize,
-)> {
+);
+
+#[pyfunction]
+fn decode_call_control(data: &[u8], offset: usize) -> PyResult<DecodedCallControlParts> {
     let (ctrl, consumed) =
         c2_wire::control::decode_call_control(data, offset).map_err(decode_err)?;
     Ok((

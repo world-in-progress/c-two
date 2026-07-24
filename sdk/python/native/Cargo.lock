@@ -156,15 +156,11 @@ dependencies = [
  "c2-contract",
  "c2-core",
  "c2-error",
- "c2-http",
- "c2-ipc",
  "c2-mem",
- "c2-server",
  "c2-wire",
  "parking_lot",
  "pyo3",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

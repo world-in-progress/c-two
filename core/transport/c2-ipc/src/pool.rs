@@ -201,6 +201,43 @@ impl ClientPool {
         }
     }
 
+    /// Release one reference only when the pool still contains the acquired client.
+    ///
+    /// This identity check prevents a late drop from an evicted connection
+    /// decrementing the reference count of a replacement at the same address.
+    pub fn release_if_same(&self, address: &str, observed: &Arc<SyncClient>) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(address) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&entry.client, observed) {
+            return false;
+        }
+        if entry.ref_count == 0 {
+            return false;
+        }
+        entry.ref_count -= 1;
+        if entry.ref_count == 0 {
+            entry.last_release = Some(Instant::now());
+        }
+        true
+    }
+
+    /// Remove one observed unusable client without evicting a racing replacement.
+    ///
+    /// Callers must use this only after a pre-dispatch operation proves that
+    /// the exact acquired connection can no longer serve requests.
+    pub fn discard_if_same(&self, address: &str, observed: &Arc<SyncClient>) -> bool {
+        let mut entries = self.entries.lock();
+        let is_same = entries
+            .get(address)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.client, observed));
+        if is_same {
+            entries.remove(address);
+        }
+        is_same
+    }
+
     /// Sweep expired entries that have been unreferenced longer than
     /// `grace_period`. Call this periodically from SDK bindings or before
     /// acquire.
@@ -464,6 +501,50 @@ mod tests {
         // Should not panic or underflow.
         pool.release(addr);
         assert_eq!(pool.refcount(addr), 0);
+    }
+
+    #[test]
+    fn discard_if_same_removes_only_the_observed_stale_client() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let address = "ipc://stale";
+        let observed = Arc::new(make_disconnected_client());
+        let raced_replacement = Arc::new(make_disconnected_client());
+
+        pool.entries.lock().insert(
+            address.to_string(),
+            PoolEntry {
+                client: Arc::clone(&observed),
+                ref_count: 1,
+                last_release: None,
+            },
+        );
+
+        assert!(!pool.discard_if_same(address, &raced_replacement));
+        assert!(pool.has_client(address));
+        assert!(pool.discard_if_same(address, &observed));
+        assert!(!pool.has_client(address));
+    }
+
+    #[test]
+    fn release_if_same_cannot_decrement_a_racing_replacement() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let address = "ipc://replacement";
+        let observed = Arc::new(make_disconnected_client());
+        let replacement = Arc::new(make_disconnected_client());
+
+        pool.entries.lock().insert(
+            address.to_string(),
+            PoolEntry {
+                client: Arc::clone(&replacement),
+                ref_count: 1,
+                last_release: None,
+            },
+        );
+
+        assert!(!pool.release_if_same(address, &observed));
+        assert_eq!(pool.refcount(address), 1);
+        assert!(pool.release_if_same(address, &replacement));
+        assert_eq!(pool.refcount(address), 0);
     }
 
     #[test]

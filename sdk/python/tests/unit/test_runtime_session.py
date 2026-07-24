@@ -195,10 +195,9 @@ def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -
         cc.shutdown()
 
 
-def test_shutdown_records_bad_relay_env_file_and_closes_server(
+def test_shutdown_ignores_late_bad_relay_env_file_and_closes_server(
     monkeypatch,
     tmp_path,
-    caplog,
 ) -> None:
     import c_two as cc
     from c_two.config import settings
@@ -223,23 +222,16 @@ def test_shutdown_records_bad_relay_env_file_and_closes_server(
 
         monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
         monkeypatch.setenv('C2_ENV_FILE', str(bad_env_dir))
-        with caplog.at_level(logging.INFO):
-            cc.shutdown()
+        cc.shutdown()
 
         assert cc.server_address() is None
-        assert any(
-            'Relay unreachable during shutdown unregister of bad-shutdown-env' in record.message
-            and 'env file' in record.message
-            for record in caplog.records
-        )
     finally:
         settings.relay_anchor_address = previous
         cc.shutdown()
 
 
-def test_shutdown_records_bad_relay_proxy_env_and_closes_server(
+def test_shutdown_ignores_late_bad_relay_proxy_env_and_closes_server(
     monkeypatch,
-    caplog,
 ) -> None:
     import c_two as cc
     from c_two.config import settings
@@ -264,15 +256,9 @@ def test_shutdown_records_bad_relay_proxy_env_and_closes_server(
 
         settings.relay_anchor_address = 'http://127.0.0.1:9'
         monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
-        with caplog.at_level(logging.INFO):
-            cc.shutdown()
+        cc.shutdown()
 
         assert cc.server_address() is None
-        assert any(
-            'Relay unreachable during shutdown unregister of bad-shutdown-proxy' in record.message
-            and 'C2_RELAY_USE_PROXY' in record.message
-            for record in caplog.records
-        )
     finally:
         settings.relay_anchor_address = previous
         cc.shutdown()
@@ -342,19 +328,20 @@ def test_registry_does_not_construct_server_directly() -> None:
     assert 'server = Server(' not in source
 
 
-def test_native_runtime_session_register_errors_expose_structured_failure_attrs() -> None:
+def test_core_error_projection_exposes_structured_registration_failure_attrs() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     source = (
-        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+        repo_root / 'sdk/python/native/src/core_error_ffi.rs'
     ).read_text(encoding='utf-8')
 
+    assert 'LifecycleError::RegisterFailure(failure)' in source
     assert 'registration_failure' in source
-    assert 'setattr("rollback"' in source
-    assert 'setattr("relay_cleanup_error"' in source
+    assert 'set_attr(value, "rollback"' in source
+    assert 'set_attr(value, "relay_cleanup_error"' in source
+    assert 'register_failure_to_dict' in source
     assert 'relay_cleanup_error_to_dict' in source
     assert 'route_close_outcome_to_dict(py, rollback)' in source
     assert 'registration_rollback_to_dict' not in source
-    assert 'RegisterFailure(' in source
 
 
 def test_registry_does_not_own_direct_ipc_client_pool() -> None:
@@ -742,24 +729,22 @@ def test_set_server_after_client_only_connect_preserves_client_freeze() -> None:
         cc.shutdown()
 
 
-def test_runtime_session_shutdown_drains_explicit_http_pool(monkeypatch) -> None:
+def test_runtime_session_exposes_no_language_owned_http_pool(monkeypatch) -> None:
     from c_two._native import RuntimeSession
 
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'false')
     session = RuntimeSession()
-    relay_url = 'http://127.0.0.1:9'
 
-    session.acquire_http_client(relay_url)
-    assert session.http_client_refcount(relay_url) == 1
+    assert not hasattr(session, 'acquire_http_client')
+    assert not hasattr(session, 'release_http_client')
+    assert not hasattr(session, 'http_client_refcount')
 
-    outcome = dict(session.shutdown(None, route_names=[]))
+    outcome = dict(session.shutdown(route_names=[]))
 
-    assert outcome['http_clients_drained'] is True
     assert outcome['route_outcomes'] == []
     assert outcome['route_close_error'] is None
     assert outcome['runtime_barrier_error'] is None
-    assert session.http_client_refcount(relay_url) == 0
 
 
 def test_set_relay_anchor_blank_clears_native_override() -> None:
@@ -781,82 +766,6 @@ def test_set_relay_anchor_blank_clears_native_override() -> None:
         registry.shutdown()
 
 
-def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
-    repo_root = Path(__file__).resolve().parents[4]
-    source = (
-        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
-    ).read_text(encoding='utf-8')
-    acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
-        'fn expected_route_contract(',
-        1,
-    )[0]
-
-    assert 'candidate: &RelayLocalIpcCandidate' in acquire_body
-    assert 'candidate.server_id' in acquire_body
-    assert 'candidate.server_instance_id' in acquire_body
-    assert 'candidate.route_uid' in acquire_body
-    assert 'candidate.route_revision' in acquire_body
-    identity_checks = [
-        pos for needle in ('server_identity()', 'server_instance_id()')
-        if (pos := acquire_body.find(needle)) >= 0
-    ]
-    assert identity_checks
-    acquire_pos = acquire_body.find('acquire_route_token(&expected')
-    assert acquire_pos >= 0
-    assert min(identity_checks) < acquire_pos
-    assert 'acquire_route(&expected)' not in acquire_body
-    assert 'route_names()' not in acquire_body
-
-
-def test_relay_ipc_unavailable_does_not_directly_fallback_to_same_http_relay() -> None:
-    repo_root = Path(__file__).resolve().parents[4]
-    source = (
-        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
-    ).read_text(encoding='utf-8')
-    connect_body = source.split('fn connect_via_relay(', 1)[1].split(
-        'fn shutdown_ipc_clients(',
-        1,
-    )[0]
-
-    assert 'RelayIpcConnectError::Unavailable' in connect_body
-    unavailable_branch = connect_body.split(
-        'Err(RelayIpcConnectError::Unavailable(reason)) => {',
-        1,
-    )[1].split('RelayResolvedConnection::Http', 1)[0]
-    assert 'acquire_relay_http_client' not in unavailable_branch
-    assert 'resolve_relay_connection_after_local_ipc_failures' in unavailable_branch
-
-
-def test_relay_ipc_unavailable_reason_is_reported_before_fallback_denial() -> None:
-    repo_root = Path(__file__).resolve().parents[4]
-    source = (
-        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
-    ).read_text(encoding='utf-8')
-    connect_body = source.split('fn connect_via_relay(', 1)[1].split(
-        'fn shutdown_ipc_clients(',
-        1,
-    )[0]
-    acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
-        'fn expected_route_contract(',
-        1,
-    )[0]
-
-    assert 'RelayIpcUnavailableReason::PoolAcquire' in source
-    assert 'RelayIpcUnavailableReason::IdentityMismatch' in source
-    assert 'RelayIpcUnavailableReason::RouteMissing' in source
-    assert 'Err(RelayIpcConnectError::Unavailable(reason))' in connect_body
-    assert 'eprintln!' in connect_body
-    assert 'falling back to HTTP relay' not in connect_body
-    assert 'fallback denied' in connect_body.lower()
-    assert 'direct_ipc_failure' in source
-    assert 'direct_ipc_failure_kind' in source
-    assert 'route_uid' in source
-    assert 'route_revision' in source
-    assert 'RelayIpcUnavailable::pool_acquire' in acquire_body
-    assert 'RelayIpcUnavailable::identity_mismatch' in acquire_body
-    assert 'RelayIpcUnavailable::route_missing' in acquire_body
-
-
 def test_registry_restores_native_error_bytes_before_wrapping() -> None:
     from c_two.error import CCError, FallbackDenied
     from c_two.transport.registry import _cc_error_from_native_exception
@@ -871,28 +780,3 @@ def test_registry_restores_native_error_bytes_before_wrapping() -> None:
 
     assert isinstance(restored, FallbackDenied)
     assert restored.details == {'route': 'grid'}
-
-
-def test_relay_ipc_contract_mismatch_uses_cc_error_envelope() -> None:
-    repo_root = Path(__file__).resolve().parents[4]
-    source = (
-        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
-    ).read_text(encoding='utf-8')
-
-    assert 'RelayIpcConnectError::ContractMismatch' in source
-    assert 'relay_ipc_contract_mismatch_to_py' in source
-    assert 'ErrorCode::ContractMismatch' in source
-
-
-def test_relay_ipc_identity_boundary_is_native_owned() -> None:
-    repo_root = Path(__file__).resolve().parents[4]
-    registry_source = (
-        repo_root / 'sdk/python/src/c_two/transport/registry.py'
-    ).read_text(encoding='utf-8')
-    native_source = (
-        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
-    ).read_text(encoding='utf-8')
-
-    assert 'server_instance_id' not in registry_source
-    assert 'candidate.server_instance_id' in native_source
-    assert 'acquire_route(&expected)' in native_source

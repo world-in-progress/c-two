@@ -51,6 +51,7 @@ impl PyPoolConfig {
         spill_threshold = 0.8,
         spill_dir = String::from("/tmp/c_two_spill/"),
     ))]
+    #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         segment_size: usize,
         min_block_size: usize,
@@ -74,7 +75,7 @@ impl PyPoolConfig {
         }
         validate_duration_secs("dedicated_crash_timeout_secs", dedicated_crash_timeout_secs)?;
         validate_duration_secs("buddy_idle_decay_secs", buddy_idle_decay_secs)?;
-        if spill_threshold < 0.0 || spill_threshold > 1.0 || spill_threshold.is_nan() {
+        if !(0.0..=1.0).contains(&spill_threshold) || spill_threshold.is_nan() {
             return Err(PyValueError::new_err(
                 "spill_threshold must be in [0.0, 1.0]",
             ));
@@ -242,10 +243,8 @@ impl PyMemPool {
     /// directly into the SHM block — zero intermediate copies.
     fn alloc_ptr(&self, size: usize) -> PyResult<(PyPoolAlloc, usize)> {
         let mut pool = self.pool.write();
-        let alloc = pool.alloc(size).map_err(|e| PyRuntimeError::new_err(e))?;
-        let ptr = pool
-            .data_ptr(&alloc)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+        let alloc = pool.alloc(size).map_err(PyRuntimeError::new_err)?;
+        let ptr = pool.data_ptr(&alloc).map_err(PyRuntimeError::new_err)?;
         Ok((PyPoolAlloc::from(alloc), ptr as usize))
     }
 
@@ -256,7 +255,7 @@ impl PyMemPool {
         let pool = self.pool.read();
         let ptr = pool
             .data_ptr_at(seg_idx, offset, is_dedicated)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(PyRuntimeError::new_err)?;
         Ok(ptr as usize)
     }
 
@@ -266,7 +265,7 @@ impl PyMemPool {
         let mut pool = self.pool.write();
         pool.alloc(size)
             .map(PyPoolAlloc::from)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(PyRuntimeError::new_err)
     }
 
     /// Free a previously allocated block.
@@ -279,7 +278,7 @@ impl PyMemPool {
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
         };
-        pool.free(&pa).map_err(|e| PyRuntimeError::new_err(e))?;
+        pool.free(&pa).map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 
@@ -293,7 +292,7 @@ impl PyMemPool {
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
         };
-        let ptr = pool.data_ptr(&pa).map_err(|e| PyRuntimeError::new_err(e))?;
+        let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         if data.len() > alloc.actual_size as usize {
             return Err(PyValueError::new_err("data exceeds allocation size"));
         }
@@ -318,7 +317,7 @@ impl PyMemPool {
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
         };
-        let ptr = pool.data_ptr(&pa).map_err(|e| PyRuntimeError::new_err(e))?;
+        let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         if size > alloc.actual_size as usize {
             return Err(PyValueError::new_err("read size exceeds allocation"));
         }
@@ -342,14 +341,14 @@ impl PyMemPool {
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
         };
-        let ptr = pool.data_ptr(&pa).map_err(|e| PyRuntimeError::new_err(e))?;
+        let ptr = pool.data_ptr(&pa).map_err(PyRuntimeError::new_err)?;
         let len = data.len_bytes();
         if len > alloc.actual_size as usize {
             return Err(PyValueError::new_err("buffer exceeds allocation size"));
         }
         // Copy from Python buffer to SHM.
         unsafe {
-            data.copy_to_slice(py, &mut std::slice::from_raw_parts_mut(ptr, len))?;
+            data.copy_to_slice(py, std::slice::from_raw_parts_mut(ptr, len))?;
         }
         Ok(())
     }
@@ -369,7 +368,7 @@ impl PyMemPool {
         let pool = self.pool.read();
         let ptr = pool
             .data_ptr_at(seg_idx, offset, is_dedicated)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(PyRuntimeError::new_err)?;
         let slice = unsafe { std::slice::from_raw_parts(ptr, size) };
         Ok(PyBytes::new(py, slice))
     }
@@ -389,7 +388,7 @@ impl PyMemPool {
         let mut pool = self.pool.write();
         let _ = pool
             .free_at(seg_idx, offset, data_size, is_dedicated)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(PyRuntimeError::new_err)?;
         Ok(())
     }
 
@@ -452,7 +451,7 @@ impl PyMemPool {
         let pool = self.pool.read();
         let (ptr, size) = pool
             .seg_data_info(seg_idx)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+            .map_err(PyRuntimeError::new_err)?;
         Ok((ptr as usize, size))
     }
 
@@ -460,7 +459,7 @@ impl PyMemPool {
     fn open_segment(&self, name: &str, size: usize) -> PyResult<usize> {
         let mut pool = self.pool.write();
         pool.open_segment(name, size)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(PyRuntimeError::new_err)
     }
 
     /// Destroy the pool and all its SHM segments.
@@ -623,7 +622,7 @@ impl PyChunkAssembler {
                 512,           // TODO: pass from config
                 8 * (1 << 30), // TODO: pass from config
             )
-            .map_err(|e| PyRuntimeError::new_err(e))?
+            .map_err(PyRuntimeError::new_err)?
         };
         Ok(Self {
             state: Mutex::new(AssemblerInner {
@@ -677,7 +676,7 @@ impl PyChunkAssembler {
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
         let pool = inner.pool.read();
         asm.feed_chunk(&pool, chunk_idx, data)
-            .map_err(|e| PyRuntimeError::new_err(e))
+            .map_err(PyRuntimeError::new_err)
     }
 
     #[getter]
@@ -703,7 +702,7 @@ impl PyChunkAssembler {
             .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
-        let handle = asm.finish().map_err(|e| PyRuntimeError::new_err(e))?;
+        let handle = asm.finish().map_err(PyRuntimeError::new_err)?;
         Ok(PyMemHandle {
             state: Mutex::new(MemHandleInner {
                 handle: Some(handle),

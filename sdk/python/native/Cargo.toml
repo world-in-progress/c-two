@@ -19,11 +19,7 @@ c2-contract = { path = "../../../core/foundation/c2-contract" }
 c2-error = { path = "../../../core/foundation/c2-error" }
 c2-mem = { path = "../../../core/foundation/c2-mem" }
 c2-wire = { path = "../../../core/protocol/c2-wire" }
-c2-http = { path = "../../../core/transport/c2-http" }
-c2-ipc = { path = "../../../core/transport/c2-ipc" }
 c2-core = { path = "../../../core/runtime/c2-core" }
-c2-server = { path = "../../../core/transport/c2-server" }
 parking_lot = "0.12"
 pyo3 = { version = "0.29", optional = true }
-tokio = { version = "1", features = ["full"] }
 serde_json = "1"

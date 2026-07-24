@@ -207,7 +207,7 @@ def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("active")}'
     first = _hello_server(address)
-    second = _hello_server(address, name='hello2')
+    second = Server(bind_address=address)
     try:
         first.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True
@@ -215,7 +215,7 @@ def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
             RuntimeError,
             match='active listener|address already in use|failed to start',
         ):
-            second.start(timeout=1.0)
+            second.register_crm(Hello, HelloImpl(), name='hello2')
         assert ping(address, timeout=0.5) is True
     finally:
         try:
@@ -419,7 +419,7 @@ def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("retry_failed_start")}'
     first = _hello_server(address)
-    second = _hello_server(address, name='hello2')
+    second = Server(bind_address=address)
     try:
         first.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True
@@ -428,7 +428,7 @@ def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
             RuntimeError,
             match='active listener|address already in use|failed to start',
         ):
-            second.start(timeout=1.0)
+            second.register_crm(Hello, HelloImpl(), name='hello2')
 
         first.shutdown()
         deadline = time.monotonic() + 5.0
@@ -439,6 +439,7 @@ def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
         else:
             pytest.fail('first server still responds after shutdown')
 
+        second.register_crm(Hello, HelloImpl(), name='hello2')
         second.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True
     finally:

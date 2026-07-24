@@ -6,22 +6,25 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use c2_contract::{
-    ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract, MethodAccess,
+    ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract,
+    MAX_CONTRACT_METHODS, MethodAccess, PORTABLE_CONTRACT_SCHEMA, validate_contract_text_field,
+    validate_expected_route_contract,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_server::{
     AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease, ResponseMeta,
-    RouteBuildSpec, SchedulerLimits, Server, ServerIdentity, ServerRuntimeBuilder,
+    RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
+    SchedulerSnapshot, Server, ServerIdentity, ServerRuntimeBuilder,
 };
 
 use crate::outcome::RuntimeRouteSpec;
 use crate::{Error, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome};
 
 /// One generated method entry validated against an admitted release.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodDefinition {
     pub index: u16,
-    pub name: &'static str,
+    pub name: String,
     pub access: MethodAccess,
 }
 
@@ -30,12 +33,158 @@ pub trait EncodedService: Send + Sync + 'static {
     fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error>;
 }
 
+/// Language-neutral execution policy shared by remote dispatch and any
+/// same-process SDK projection of a registered route.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ServiceConcurrencyMode {
+    Parallel,
+    Exclusive,
+    #[default]
+    ReadParallel,
+}
+
+impl ServiceConcurrencyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parallel => "parallel",
+            Self::Exclusive => "exclusive",
+            Self::ReadParallel => "read_parallel",
+        }
+    }
+}
+
+impl From<ServiceConcurrencyMode> for ConcurrencyMode {
+    fn from(mode: ServiceConcurrencyMode) -> Self {
+        match mode {
+            ServiceConcurrencyMode::Parallel => Self::Parallel,
+            ServiceConcurrencyMode::Exclusive => Self::Exclusive,
+            ServiceConcurrencyMode::ReadParallel => Self::ReadParallel,
+        }
+    }
+}
+
+impl From<ConcurrencyMode> for ServiceConcurrencyMode {
+    fn from(mode: ConcurrencyMode) -> Self {
+        match mode {
+            ConcurrencyMode::Parallel => Self::Parallel,
+            ConcurrencyMode::Exclusive => Self::Exclusive,
+            ConcurrencyMode::ReadParallel => Self::ReadParallel,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteConcurrencySnapshot {
+    pub mode: ServiceConcurrencyMode,
+    pub max_pending: Option<usize>,
+    pub max_workers: Option<usize>,
+    pub pending: usize,
+    pub active_workers: usize,
+    pub closed: bool,
+    pub is_unconstrained: bool,
+}
+
+impl From<SchedulerSnapshot> for RouteConcurrencySnapshot {
+    fn from(snapshot: SchedulerSnapshot) -> Self {
+        Self {
+            mode: snapshot.mode.into(),
+            max_pending: snapshot.max_pending,
+            max_workers: snapshot.max_workers,
+            pending: snapshot.pending,
+            active_workers: snapshot.active_workers,
+            closed: snapshot.closed,
+            is_unconstrained: snapshot.is_unconstrained,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteConcurrencyError {
+    Closed,
+    Capacity { field: &'static str, limit: usize },
+}
+
+impl fmt::Display for RouteConcurrencyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => formatter.write_str("route closed"),
+            Self::Capacity { field, limit } => {
+                write!(
+                    formatter,
+                    "route concurrency capacity exceeded: {field}={limit}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RouteConcurrencyError {}
+
+impl From<SchedulerAcquireError> for RouteConcurrencyError {
+    fn from(error: SchedulerAcquireError) -> Self {
+        match error {
+            SchedulerAcquireError::Closed => Self::Closed,
+            SchedulerAcquireError::Capacity { field, limit } => Self::Capacity { field, limit },
+        }
+    }
+}
+
+/// Cloneable projection of the exact scheduler used by remote route dispatch.
+#[derive(Clone)]
+pub struct RouteConcurrency {
+    inner: RouteConcurrencyHandle,
+}
+
+impl fmt::Debug for RouteConcurrency {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteConcurrency")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
+}
+
+impl RouteConcurrency {
+    pub fn snapshot(&self) -> RouteConcurrencySnapshot {
+        self.inner.snapshot().into()
+    }
+
+    pub fn blocking_acquire(
+        &self,
+        method_index: u16,
+    ) -> Result<RouteConcurrencyGuard, RouteConcurrencyError> {
+        self.inner
+            .blocking_acquire(method_index)
+            .map(|inner| RouteConcurrencyGuard { _inner: inner })
+            .map_err(RouteConcurrencyError::from)
+    }
+
+    pub fn is_unconstrained(&self) -> bool {
+        self.inner.is_unconstrained()
+    }
+}
+
+pub struct RouteConcurrencyGuard {
+    _inner: SchedulerGuard,
+}
+
+impl fmt::Debug for RouteConcurrencyGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteConcurrencyGuard")
+            .finish_non_exhaustive()
+    }
+}
+
 /// A release-verified route definition ready for Core registration.
 pub struct ServiceDefinition {
     release_ref: ContractReleaseRef,
     expected: ExpectedRouteContract,
     methods: Arc<[MethodDefinition]>,
     service: Arc<dyn EncodedService>,
+    concurrency_mode: ServiceConcurrencyMode,
+    max_pending: Option<usize>,
+    max_workers: Option<usize>,
 }
 
 impl fmt::Debug for ServiceDefinition {
@@ -45,6 +194,9 @@ impl fmt::Debug for ServiceDefinition {
             .field("release_ref", &self.release_ref)
             .field("expected", &self.expected)
             .field("methods", &self.methods)
+            .field("concurrency_mode", &self.concurrency_mode)
+            .field("max_pending", &self.max_pending)
+            .field("max_workers", &self.max_workers)
             .finish_non_exhaustive()
     }
 }
@@ -119,7 +271,88 @@ impl ServiceDefinition {
             expected,
             methods: methods.into(),
             service,
+            concurrency_mode: ServiceConcurrencyMode::default(),
+            max_pending: None,
+            max_workers: None,
         })
+    }
+
+    /// Construct an explicitly nonportable language service.
+    ///
+    /// This path exists for language-local behaviors such as Python pickle. It
+    /// requires a release reference whose schema is not the portable
+    /// `c-two.contract.v2` schema and therefore cannot masquerade as a portable
+    /// generated service.
+    #[doc(hidden)]
+    pub fn new_nonportable<I>(
+        release_ref: ContractReleaseRef,
+        expected: ExpectedRouteContract,
+        methods: I,
+        service: Arc<dyn EncodedService>,
+    ) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = MethodDefinition>,
+    {
+        validate_expected_route_contract(&expected)?;
+        if release_ref.contract_schema() == PORTABLE_CONTRACT_SCHEMA {
+            return Err(method_contract_error(
+                "$.contract_schema",
+                "portable services must be constructed from an admitted ContractRelease"
+                    .to_string(),
+            ));
+        }
+        for (path, reference, route) in [
+            (
+                "$.crm.namespace",
+                release_ref.crm_namespace(),
+                expected.crm_ns.as_str(),
+            ),
+            (
+                "$.crm.name",
+                release_ref.crm_name(),
+                expected.crm_name.as_str(),
+            ),
+            (
+                "$.crm.version",
+                release_ref.crm_version(),
+                expected.crm_ver.as_str(),
+            ),
+        ] {
+            if reference != route {
+                return Err(method_contract_error(
+                    path,
+                    format!(
+                        "nonportable release reference value {reference:?} does not match route value {route:?}"
+                    ),
+                ));
+            }
+        }
+
+        let methods = methods.into_iter().collect::<Vec<_>>();
+        validate_nonportable_methods(&methods)?;
+        Ok(Self {
+            release_ref,
+            expected,
+            methods: methods.into(),
+            service,
+            concurrency_mode: ServiceConcurrencyMode::default(),
+            max_pending: None,
+            max_workers: None,
+        })
+    }
+
+    pub fn with_concurrency(
+        mut self,
+        mode: ServiceConcurrencyMode,
+        max_pending: Option<usize>,
+        max_workers: Option<usize>,
+    ) -> Result<Self, Error> {
+        SchedulerLimits::try_from_usize(max_pending, max_workers)
+            .map_err(|message| method_contract_error("$.concurrency", message))?;
+        self.concurrency_mode = mode;
+        self.max_pending = max_pending;
+        self.max_workers = max_workers;
+        Ok(self)
     }
 
     pub fn release_ref(&self) -> &ContractReleaseRef {
@@ -133,6 +366,44 @@ impl ServiceDefinition {
     pub fn methods(&self) -> &[MethodDefinition] {
         &self.methods
     }
+}
+
+fn validate_nonportable_methods(methods: &[MethodDefinition]) -> Result<(), Error> {
+    if methods.len() > MAX_CONTRACT_METHODS {
+        return Err(method_contract_error(
+            "$.methods",
+            format!(
+                "service defines {} methods but the contract cap is {MAX_CONTRACT_METHODS}",
+                methods.len()
+            ),
+        ));
+    }
+    let mut names = HashSet::new();
+    for (position, method) in methods.iter().enumerate() {
+        let expected_index = u16::try_from(position).map_err(|_| {
+            method_contract_error(
+                "$.methods",
+                "method index exceeds the C-Two wire capacity".to_string(),
+            )
+        })?;
+        if method.index != expected_index {
+            return Err(method_contract_error(
+                &format!("$.methods[{position}].index"),
+                format!(
+                    "expected positional index {expected_index}, got {}",
+                    method.index
+                ),
+            ));
+        }
+        validate_contract_text_field("method name", &method.name)?;
+        if !names.insert(method.name.as_str()) {
+            return Err(method_contract_error(
+                &format!("$.methods[{position}].name"),
+                format!("duplicate method name {:?}", method.name),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn method_contract_error(path: &str, message: String) -> Error {
@@ -298,6 +569,9 @@ impl Host {
             .server
             .build_route(route_spec, callback)
             .map_err(|error| LifecycleError::Server(error.to_string()))?;
+        let route_concurrency = RouteConcurrency {
+            inner: route.route_handle(),
+        };
         let outcome = self.inner.runtime.register_route(
             &self.inner.server,
             route,
@@ -311,6 +585,7 @@ impl Host {
             route_name,
             register_outcome: outcome,
             close_outcome: None,
+            route_concurrency,
         })
     }
 
@@ -326,6 +601,7 @@ pub struct Registration {
     route_name: String,
     register_outcome: RegisterOutcome,
     close_outcome: Option<UnregisterOutcome>,
+    route_concurrency: RouteConcurrency,
 }
 
 impl fmt::Debug for Registration {
@@ -350,6 +626,10 @@ impl Registration {
 
     pub fn is_closed(&self) -> bool {
         self.close_outcome.is_some()
+    }
+
+    pub fn route_concurrency(&self) -> RouteConcurrency {
+        self.route_concurrency.clone()
     }
 
     pub fn close(&mut self) -> Result<UnregisterOutcome, Error> {
@@ -453,7 +733,8 @@ fn route_specs(
         })
         .collect::<HashMap<_, _>>();
     let route = &definition.expected;
-    let limits = SchedulerLimits::default();
+    let limits = SchedulerLimits::try_from_usize(definition.max_pending, definition.max_workers)
+        .map_err(|message| method_contract_error("$.concurrency", message))?;
     let route_spec = RouteBuildSpec {
         name: route.route_name.clone(),
         crm_ns: route.crm_ns.clone(),
@@ -463,7 +744,7 @@ fn route_specs(
         signature_hash: route.signature_hash.clone(),
         method_names: method_names.clone(),
         access_map: access_map.clone(),
-        concurrency_mode: ConcurrencyMode::ReadParallel,
+        concurrency_mode: definition.concurrency_mode.into(),
         limits,
     };
     let runtime_spec = RuntimeRouteSpec {
@@ -475,7 +756,7 @@ fn route_specs(
         signature_hash: route.signature_hash.clone(),
         method_names,
         access_map,
-        concurrency_mode: ConcurrencyMode::ReadParallel,
+        concurrency_mode: definition.concurrency_mode.into(),
         max_pending: limits.max_pending.map(usize::from),
         max_workers: limits.max_workers.map(usize::from),
     };

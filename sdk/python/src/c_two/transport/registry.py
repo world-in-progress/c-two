@@ -86,6 +86,10 @@ def _is_crm_contract_mismatch(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "CRM contract mismatch" in str(exc)
 
 
+def _is_missing_relay_address(exc: BaseException) -> bool:
+    return getattr(exc, 'lifecycle_kind', None) == 'missing_relay_address'
+
+
 def _cc_error_from_native_exception(exc: BaseException) -> CCError | None:
     error_bytes = getattr(exc, "error_bytes", None)
     if error_bytes is None:
@@ -344,12 +348,18 @@ class _ProcessRegistry:
                 if created_server:
                     server = self._server
                     self._server = None
-                    self._runtime_session.clear_server_identity()
                     if server is not None:
                         try:
                             server.shutdown()
                         except Exception:
                             log.warning('Error shutting down Server after failed register', exc_info=True)
+                    try:
+                        self._runtime_session.clear_server_identity()
+                    except Exception:
+                        log.warning(
+                            'Error clearing Core identity after failed register',
+                            exc_info=True,
+                        )
                 raise
 
         log.debug('Registered CRM %s at %s', name, server_address)
@@ -444,7 +454,7 @@ class _ProcessRegistry:
             proxy = CRMProxy.ipc(
                 client,
                 name,
-                on_terminate=lambda addr=address: self._runtime_session.release_ipc_client(addr),
+                on_terminate=client.close,
                 lease_tracker=lease_tracker,
             )
         else:
@@ -459,6 +469,11 @@ class _ProcessRegistry:
                     raise
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
                     raise cc_err from exc
+                if _is_missing_relay_address(exc):
+                    raise LookupError(
+                        f'Name {name!r} is not registered locally '
+                        f'and no address was provided',
+                    ) from exc
                 status = _relay_control_error_status(exc)
                 if status == 404:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc
@@ -557,8 +572,6 @@ class _ProcessRegistry:
             self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
             self._server = None
 
-        runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
-
         if server is not None:
             try:
                 outcome = server.shutdown(
@@ -571,7 +584,6 @@ class _ProcessRegistry:
         else:
             try:
                 outcome = dict(runtime_session.shutdown(
-                    None,
                     route_names=[],
                     relay_anchor_address=None,
                 ))
@@ -599,7 +611,6 @@ class _ProcessRegistry:
                     message,
                 )
 
-        self._runtime_session.shutdown_http_clients()
     # ------------------------------------------------------------------
     # Serve (daemon mode)
     # ------------------------------------------------------------------

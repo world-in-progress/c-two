@@ -318,21 +318,25 @@ class TestRegisterConnect:
         finally:
             cc.close(old_crm)
 
-    def test_raw_ipc_client_rejects_unbound_crm_call(self):
-        from c_two._native import RustClientPool
+    def test_python_native_exposes_only_route_bound_core_client(self):
+        from c_two import _native
 
         cc.register(Hello, HelloImpl(), name='hello')
         addr = cc.server_address()
         assert addr is not None
 
-        pool = RustClientPool.instance()
-        client = pool.acquire(addr)
+        assert not hasattr(_native, 'RustClientPool')
+        assert not hasattr(_native, 'RustClient')
+        crm = cc.connect(Hello, name='hello', address=addr)
         try:
-            assert 'hello' in client.route_names()
-            with pytest.raises(RuntimeError, match='route-bound client'):
-                client.call('greeting', b'')
+            client = crm.client._client  # noqa: SLF001
+            assert isinstance(client, _native.CoreClient)
+            assert client.route_name == 'hello'
+            raw_call = getattr(client, 'call')
+            with pytest.raises(TypeError):
+                raw_call('hello', 'greeting', b'')
         finally:
-            pool.release(addr)
+            cc.close(crm)
 
     def test_close_terminates_proxy(self):
         cc.register(Hello, HelloImpl(), name='hello')
@@ -556,12 +560,17 @@ class TestErrors:
         finally:
             settings.relay_anchor_address = previous_relay
 
-    def test_failed_relay_registration_leaves_existing_route_usable(self):
+    def test_failed_relay_registration_leaves_existing_route_usable(
+        self,
+        start_c3_relay,
+    ):
         registry = _ProcessRegistry.get()
         previous_relay = settings.relay_anchor_address
+        relay = start_c3_relay()
         try:
+            registry.set_relay_anchor(relay.url)
             cc.register(Hello, HelloImpl(), name='hello')
-            registry.set_relay_anchor('http://127.0.0.1:9')
+            relay.stop()
             with pytest.raises(Exception, match='relay_prepare'):
                 registry.register(Counter, CounterImpl(), name='counter')
 

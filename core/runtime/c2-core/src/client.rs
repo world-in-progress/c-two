@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::ErrorKind;
 use std::sync::Arc;
 
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
@@ -10,6 +11,8 @@ use crate::{
     Error, HeldResponse, LifecycleError, Runtime, TransportPhase, normalize_http_error,
     normalize_ipc_error,
 };
+
+const STALE_POOL_RECONNECT_ATTEMPTS: usize = 2;
 
 /// Closed connection-mode selection for a route-bound Core client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +90,7 @@ struct PooledIpcClient {
 
 impl Drop for PooledIpcClient {
     fn drop(&mut self) {
-        self.runtime.release_ipc_client(&self.address);
+        self.runtime.release_ipc_client(&self.address, &self.client);
     }
 }
 
@@ -232,22 +235,32 @@ impl Runtime {
         address: &str,
         expected: &ExpectedRouteContract,
     ) -> Result<PooledIpcClient, Error> {
-        let client = self
-            .acquire_ipc_client(address)
-            .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
-        let binding = match client.acquire_route(expected) {
-            Ok(binding) => binding,
-            Err(error) => {
-                self.release_ipc_client(address);
-                return Err(normalize_ipc_error(error, TransportPhase::PreDispatch));
+        for attempt in 0..STALE_POOL_RECONNECT_ATTEMPTS {
+            let client = self
+                .acquire_ipc_client(address)
+                .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+            match client.acquire_route(expected) {
+                Ok(binding) => {
+                    return Ok(PooledIpcClient {
+                        runtime: self.clone(),
+                        address: address.to_string(),
+                        client,
+                        binding,
+                    });
+                }
+                Err(error)
+                    if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS
+                        && is_stale_pooled_session_error(&error) =>
+                {
+                    self.discard_ipc_client(address, &client);
+                }
+                Err(error) => {
+                    self.release_ipc_client(address, &client);
+                    return Err(normalize_ipc_error(error, TransportPhase::PreDispatch));
+                }
             }
-        };
-        Ok(PooledIpcClient {
-            runtime: self.clone(),
-            address: address.to_string(),
-            client,
-            binding,
-        })
+        }
+        unreachable!("stale pooled direct IPC retry loop must return")
     }
 
     fn acquire_relay_ipc(
@@ -255,58 +268,75 @@ impl Runtime {
         candidate: &RelayLocalIpcCandidate,
         expected: &ExpectedRouteContract,
     ) -> Result<PooledIpcClient, Error> {
-        let client = self
-            .acquire_ipc_client(&candidate.address)
-            .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+        for attempt in 0..STALE_POOL_RECONNECT_ATTEMPTS {
+            let client = self
+                .acquire_ipc_client(&candidate.address)
+                .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
 
-        let actual = client.server_identity();
-        if !actual.as_ref().is_some_and(|identity| {
-            identity.server_id == candidate.server_id
-                && identity.server_instance_id == candidate.server_instance_id
-        }) {
-            let (actual_server_id, actual_server_instance_id) = actual
-                .map(|identity| {
-                    (
-                        identity.server_id.clone(),
-                        identity.server_instance_id.clone(),
-                    )
-                })
-                .unwrap_or_else(|| ("<missing>".to_string(), "<missing>".to_string()));
-            self.release_ipc_client(&candidate.address);
-            return Err(normalize_ipc_error(
-                c2_ipc::IpcError::IdentityMismatch {
-                    expected_server_id: candidate.server_id.clone(),
-                    expected_server_instance_id: candidate.server_instance_id.clone(),
-                    actual_server_id,
-                    actual_server_instance_id,
-                },
-                TransportPhase::PreDispatch,
-            ));
-        }
-
-        let binding = match client.acquire_route_token(
-            expected,
-            &candidate.route_uid,
-            candidate.route_revision,
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                self.release_ipc_client(&candidate.address);
-                return Err(normalize_ipc_error(error, TransportPhase::PreDispatch));
+            let actual = client.server_identity();
+            if !actual.as_ref().is_some_and(|identity| {
+                identity.server_id == candidate.server_id
+                    && identity.server_instance_id == candidate.server_instance_id
+            }) {
+                let (actual_server_id, actual_server_instance_id) = actual
+                    .map(|identity| {
+                        (
+                            identity.server_id.clone(),
+                            identity.server_instance_id.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| ("<missing>".to_string(), "<missing>".to_string()));
+                self.discard_ipc_client(&candidate.address, &client);
+                if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS {
+                    continue;
+                }
+                return Err(normalize_ipc_error(
+                    c2_ipc::IpcError::IdentityMismatch {
+                        expected_server_id: candidate.server_id.clone(),
+                        expected_server_instance_id: candidate.server_instance_id.clone(),
+                        actual_server_id,
+                        actual_server_instance_id,
+                    },
+                    TransportPhase::PreDispatch,
+                ));
             }
-        };
-        Ok(PooledIpcClient {
-            runtime: self.clone(),
-            address: candidate.address.clone(),
-            client,
-            binding,
-        })
+
+            match client.acquire_route_token(
+                expected,
+                &candidate.route_uid,
+                candidate.route_revision,
+            ) {
+                Ok(binding) => {
+                    return Ok(PooledIpcClient {
+                        runtime: self.clone(),
+                        address: candidate.address.clone(),
+                        client,
+                        binding,
+                    });
+                }
+                Err(error)
+                    if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS
+                        && is_stale_pooled_session_error(&error) =>
+                {
+                    self.discard_ipc_client(&candidate.address, &client);
+                }
+                Err(error) => {
+                    self.release_ipc_client(&candidate.address, &client);
+                    return Err(normalize_ipc_error(error, TransportPhase::PreDispatch));
+                }
+            }
+        }
+        unreachable!("stale pooled relay IPC retry loop must return")
     }
 
     fn connect_relay_aware(&self, expected: ExpectedRouteContract) -> Result<Client, Error> {
+        let relay_anchor_address = self
+            .effective_relay_anchor_address()?
+            .ok_or(LifecycleError::MissingRelayAddress)?;
         let settings = self.relay_client_settings()?;
         let resolved = self
             .resolve_relay_connection(
+                &relay_anchor_address,
                 expected.clone(),
                 settings.use_proxy,
                 settings.max_attempts,
@@ -353,6 +383,21 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+fn is_stale_pooled_session_error(error: &c2_ipc::IpcError) -> bool {
+    match error {
+        c2_ipc::IpcError::Closed => true,
+        c2_ipc::IpcError::Io(io_error) => matches!(
+            io_error.kind(),
+            ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::NotConnected
+        ),
+        _ => false,
     }
 }
 

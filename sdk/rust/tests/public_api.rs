@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
@@ -11,9 +11,10 @@ use c_two::generated::{
 };
 use c_two::{
     Connect, ContractLimits, ContractRelease, ContractReleaseRef, Error, HostOptions, Runtime,
-    RuntimeOptions,
+    RuntimeOptions, ServiceConcurrencyMode,
 };
 use c2_http::relay::{RelayConfig, RelayServer};
+use fastdb::{BuildPolicy, Builder, CompiledSpec};
 
 const DESCRIPTOR: &str = r#"{
   "schema": "c-two.contract.v2",
@@ -82,6 +83,32 @@ const DESCRIPTOR: &str = r#"{
   ]
 }"#;
 
+const FASTDB_RECORD_U8_SPEC: &[u8] = br#"{
+  "schema": "fastdb.payload.v1",
+  "profile": "record.v1",
+  "entries": [
+    {
+      "id": "value",
+      "cardinality": "one",
+      "type": {"kind": "u8", "nullable": false}
+    }
+  ],
+  "components": []
+}"#;
+
+const FASTDB_RECORD_U16_SPEC: &[u8] = br#"{
+  "schema": "fastdb.payload.v1",
+  "profile": "record.v1",
+  "entries": [
+    {
+      "id": "value",
+      "cardinality": "one",
+      "type": {"kind": "u16", "nullable": false}
+    }
+  ],
+  "components": []
+}"#;
+
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Echo;
@@ -132,12 +159,12 @@ fn definition(route_name: &str) -> ServiceDefinition {
         [
             MethodDefinition {
                 index: 0,
-                name: "ping",
+                name: "ping".to_string(),
                 access: MethodAccess::Read,
             },
             MethodDefinition {
                 index: 1,
-                name: "echo",
+                name: "echo".to_string(),
                 access: MethodAccess::Write,
             },
         ],
@@ -272,6 +299,41 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
 }
 
 #[test]
+fn registration_projects_the_core_owned_route_concurrency() {
+    let runtime = Runtime::new(RuntimeOptions {
+        server_id: Some(unique_name("rust-sdk-concurrency")),
+        use_process_relay_anchor: false,
+        ..RuntimeOptions::default()
+    })
+    .expect("runtime");
+    let host = runtime
+        .host(HostOptions::default().without_relay())
+        .expect("host");
+    let route_name = unique_name("concurrency");
+    let mut registration = host
+        .register(
+            definition(&route_name)
+                .with_concurrency(ServiceConcurrencyMode::Exclusive, Some(3), Some(1))
+                .expect("concurrency policy"),
+        )
+        .expect("route registration");
+    let concurrency = registration.route_concurrency();
+    let snapshot = concurrency.snapshot();
+    assert_eq!(snapshot.mode, ServiceConcurrencyMode::Exclusive);
+    assert_eq!(snapshot.max_pending, Some(3));
+    assert_eq!(snapshot.max_workers, Some(1));
+    assert!(!snapshot.closed);
+
+    let guard = concurrency
+        .blocking_acquire(0)
+        .expect("same-process route guard");
+    assert_eq!(concurrency.snapshot().active_workers, 1);
+    drop(guard);
+    registration.close().expect("registration cleanup");
+    assert!(concurrency.snapshot().closed);
+}
+
+#[test]
 fn semantic_error_fields_match_the_cross_language_fixture_shape() {
     let runtime = Runtime::new(RuntimeOptions {
         server_id: Some(unique_name("semantic")),
@@ -317,26 +379,33 @@ fn semantic_error_fields_match_the_cross_language_fixture_shape() {
 
 #[test]
 fn official_fastdb_error_projects_only_the_six_frozen_outer_keys() {
-    let error = fastdb::CompiledSpec::compile(b"{}")
-        .expect_err("invalid official FastDB spec must return PayloadError");
+    let expected_spec =
+        CompiledSpec::compile(FASTDB_RECORD_U8_SPEC).expect("compile expected FastDB spec");
+    let actual_spec =
+        CompiledSpec::compile(FASTDB_RECORD_U16_SPEC).expect("compile actual FastDB spec");
+    let mut builder = Builder::create(&actual_spec).expect("create mismatched payload builder");
+    builder
+        .entry_begin(0, 1)
+        .expect("begin mismatched value")
+        .value_u16(7)
+        .expect("write mismatched value");
+    let payload = builder
+        .freeze()
+        .expect("freeze mismatched payload")
+        .execute(BuildPolicy::AllowStaging)
+        .expect("build mismatched payload")
+        .payload;
+    let expected_digest = expected_spec.sha256().expect("expected spec digest");
+    let error = payload
+        .require_spec_sha256(&expected_digest)
+        .expect_err("mismatched official FastDB payload must fail");
     let details = fastdb_cause_details(&error);
-    assert_eq!(
-        details.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "cause_owner",
-            "fastdb_code",
-            "fastdb_details_json",
-            "fastdb_message",
-            "fastdb_path",
-            "fastdb_symbol",
-        ])
-    );
-    assert_eq!(details["cause_owner"], "fastdb");
-    assert_eq!(details["fastdb_code"], error.code().to_string());
-    assert_eq!(details["fastdb_symbol"], error.symbol());
-    assert_eq!(details["fastdb_path"], error.path());
-    assert_eq!(details["fastdb_message"], error.message());
-    assert_eq!(details["fastdb_details_json"], error.details_json());
+    let expected: BTreeMap<String, String> = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/fastdb-digest-mismatch-cause.json"
+    ))
+    .expect("shared FastDB cause vector");
+
+    assert_eq!(details, expected);
 }
 
 #[test]

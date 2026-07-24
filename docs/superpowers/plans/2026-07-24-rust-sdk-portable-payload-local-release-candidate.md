@@ -1139,21 +1139,21 @@ that forbid those names may remain in test code.
 
 ### Task 7.1 — Write parity and ownership RED tests
 
-- [ ] Generate a machine-readable capability table from Rust and Python and
+- [x] Generate a machine-readable capability table from Rust and Python and
   compare exact support for descriptor/release identity, direct IPC, explicit
   relay, relay-aware selection, typed client/service, no-payload/record/graph,
   owned/held/borrowed lifetime, C2 errors, and FastDB causes.
-- [ ] Explicitly mark Python pickle/thread-local invocation as Python-only and
+- [x] Explicitly mark Python pickle/thread-local invocation as Python-only and
   nonportable; do not require Rust to copy it.
-- [ ] For identical direct/relay failures, assert Rust `Error::Semantic` and
+- [x] For identical direct/relay failures, assert Rust `Error::Semantic` and
   Python exception expose the same code/name/message/details.
-- [ ] Assert the six FastDB outer-cause fields are byte-for-byte equal across
+- [x] Assert the six FastDB outer-cause fields are byte-for-byte equal across
   generated Rust and Python adapter failures.
-- [ ] Assert Python direct, explicit relay, and relay-aware calls are delegated
+- [x] Assert Python direct, explicit relay, and relay-aware calls are delegated
   through Core path counters, with no Python-native fallback loop.
-- [ ] Assert owned, held, and borrowed event order matches the Rust evidence,
+- [x] Assert owned, held, and borrowed event order matches the Rust evidence,
   including invalidation failure and early-return paths.
-- [ ] Add source-boundary tests rejecting orchestration imports/identifiers from
+- [x] Add source-boundary tests rejecting orchestration imports/identifiers from
   Python native:
   `ClientPool`, `SyncClient`, `RouteBinding`, `RelayAwareHttpClient`,
   `RelayIpcConnectError`, and independent fallback decision functions.
@@ -1172,49 +1172,49 @@ relay fallback state machine, error parsing, and release sequencing.
 
 ### Task 7.2 — Reduce PyO3 to a language bridge
 
-- [ ] Make `RuntimeSession` a PyO3 projection over `Arc<c2_core::Runtime>`.
+- [x] Make `RuntimeSession` a PyO3 projection over `Arc<c2_core::Runtime>`.
   Keeping the Python class spelling does not create a Rust compatibility alias.
-- [ ] Replace separate direct/HTTP/relay-connected inner enums with one
+- [x] Replace separate direct/HTTP/relay-connected inner enums with one
   `c2_core::Client`.
-- [ ] Retain current high-level Python behavior while routing direct IPC,
+- [x] Retain current high-level Python behavior while routing direct IPC,
   explicit relay, relay-aware selection, calls, registration, close, and
   shutdown through Core.
-- [ ] Implement a Python callback bridge as `c2_core::EncodedService`. It enters
+- [x] Implement a Python callback bridge as `c2_core::EncodedService`. It enters
   Python, invokes the generated/Python adapter, and returns opaque bytes or an
   existing `C2Error`.
-- [ ] Use Core `HeldResponse::invalidate_then_release` from Python held-result
+- [x] Use Core `HeldResponse::invalidate_then_release` from Python held-result
   release/finalization. Do not retain a separate Python-native ordering state
   machine.
-- [ ] Remove HTTP C2 envelope parsing, same-path fallback detection, contract/
+- [x] Remove HTTP C2 envelope parsing, same-path fallback detection, contract/
   identity terminal classification, and IPC/HTTP pool ownership from the
   native binding.
-- [ ] Remove direct `c2-ipc`, `c2-http`, and `c2-server` normal dependencies
+- [x] Remove direct `c2-ipc`, `c2-http`, and `c2-server` normal dependencies
   from `sdk/python/native/Cargo.toml` once no language bridge code needs them.
   `c2-wire`/`c2-mem` may remain only for explicit low-level compatibility
   modules whose source-boundary test proves they do not orchestrate calls.
-- [ ] Preserve high-level Python public exceptions while sourcing their semantic
+- [x] Preserve high-level Python public exceptions while sourcing their semantic
   fields and local category from `c2_core::Error`.
 
 ### Task 7.3 — Close all 43 current native strict-Clippy findings
 
-- [ ] Replace manual `b"B\0"` pointers with C string literals in
+- [x] Replace manual `b"B\0"` pointers with C string literals in
   `client_ffi.rs`, `response_backing.rs`, `shm_buffer.rs`, and
   `writable_sink.rs`.
-- [ ] Use struct update syntax for pool/runtime config initialization.
-- [ ] Replace redundant `map_err` closures and the needless mutable-slice
+- [x] Use struct update syntax for pool/runtime config initialization.
+- [x] Replace redundant `map_err` closures and the needless mutable-slice
   borrow in `mem_ffi.rs`; use `RangeInclusive::contains` for the spill threshold.
-- [ ] Collapse the nested error-byte cast in `server_ffi.rs`.
-- [ ] Box/remove the current large relay-connected variants by replacing them
+- [x] Collapse the nested error-byte cast in `server_ffi.rs`.
+- [x] Box/remove the current large relay-connected variants by replacing them
   with `c2_core::Client`; do not merely silence `large_enum_variant` or
   `result_large_err`.
-- [ ] Introduce a named decoded-call-control struct/type instead of the complex
+- [x] Introduce a named decoded-call-control struct/type instead of the complex
   return tuple in `wire_ffi.rs`.
-- [ ] For PyO3 constructors/methods whose Python-call signature legitimately
+- [x] For PyO3 constructors/methods whose Python-call signature legitimately
   exceeds seven arguments, place a narrow
   `#[allow(clippy::too_many_arguments)]` on that one FFI function with the
   adjacent reason “PyO3 signature is the existing Python call boundary”.
   Do not apply module/crate-wide allows.
-- [ ] Remove any finding whose code disappeared during Core migration rather
+- [x] Remove any finding whose code disappeared during Core migration rather
   than preserving dead wrappers to make lint cleanup mechanical.
 
 Run focused GREEN:
@@ -1236,7 +1236,7 @@ cargo test --manifest-path core/Cargo.toml --workspace --all-features
 cargo check --manifest-path sdk/python/native/Cargo.toml --all-targets
 cargo clippy --manifest-path sdk/python/native/Cargo.toml --all-targets --no-deps -- -D warnings
 uv run pytest sdk/python/tests -q
-/opt/homebrew/bin/python3.10 -m compileall -q sdk/python/src
+python3.10 -m compileall -q sdk/python/src
 rg -n 'ClientPool|SyncClient|RouteBinding|RelayAwareHttpClient|RelayIpcConnectError' \
   sdk/python/native/src
 git diff --check
@@ -1248,10 +1248,31 @@ own them.
 
 Review before commit:
 
-- [ ] Compare the generated Rust/Python capability receipt row by row.
-- [ ] Trace every Python finalizer and explicit release through Core once.
-- [ ] Prove all route selection/retry decisions are Core calls, not duplicated
+- [x] Compare the generated Rust/Python capability receipt row by row.
+- [x] Trace every Python finalizer and explicit release through Core once.
+- [x] Prove all route selection/retry decisions are Core calls, not duplicated
   Python-native branches.
+
+Observed Task 7 evidence:
+
+- The focused Core parity suite passes with 7 tests. Rust and Python consume
+  the same frozen six-field FastDB digest-mismatch vector, and Python compares
+  direct IPC, explicit relay, and relay-aware semantic errors field for field
+  while Core path counters prove the selected transports.
+- The Python native extension passes format, check, and strict Clippy with
+  `-D warnings`; the Rust `c-two` SDK passes format, strict Clippy, 10 tests,
+  and doc tests; Python 3.10 and the project Python both compile the SDK source.
+- The first complete Python rerun exposed a stale pooled IPC client after a
+  Host restart at the same socket address. TDD added exact-client
+  `release_if_same` / `discard_if_same` ownership in `c2-ipc` and one
+  Core-owned pre-dispatch reconnect, so a late old-client drop cannot decrement
+  a racing replacement. The zero-copy IPC file then passed 10 consecutive
+  runs (70 tests), followed by the complete Python suite with 828 passed and
+  1 skipped.
+- A subsequent Core workspace rerun exposed test-only process relay
+  environment interference. Standalone session tests now explicitly disable
+  process relay discovery. The affected Core lib passed 5 consecutive runs,
+  then the full Core workspace tests and workspace strict-Clippy gate passed.
 
 ## Task 8: Implement and Execute the Exact 18-Row Portable Matrix
 

@@ -180,7 +180,7 @@ pub fn service_definition<S: Service>(
             })?;
             Ok(c_two::generated::MethodDefinition {
                 index,
-                name: method.name,
+                name: method.name.to_string(),
                 access: method.access,
             })
         })
