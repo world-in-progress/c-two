@@ -308,9 +308,7 @@ impl Connection {
         }
         let pool_arc = state.pool.as_ref().ok_or("peer pool not initialised")?;
         let pool = pool_arc.read();
-        let ptr = pool.data_ptr_at(seg_idx as u32, offset, is_dedicated)?;
-        let slice = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) };
-        Ok(slice.to_vec())
+        pool.copy_data_at(seg_idx as u32, offset, data_size, is_dedicated)
     }
 
     /// Free a buddy block in the peer's SHM pool.

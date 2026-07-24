@@ -536,6 +536,61 @@ impl MemPool {
         }
     }
 
+    /// Copy bytes from mapped shared-memory coordinates after validating that
+    /// the complete span belongs to the selected segment's data region.
+    pub fn copy_data_at(
+        &self,
+        seg_idx: u32,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<Vec<u8>, String> {
+        if data_size == 0 {
+            return Err("shared-memory copy span must not be empty".into());
+        }
+        let len = usize::try_from(data_size)
+            .map_err(|_| "shared-memory copy size is not addressable on this platform")?;
+        if len > isize::MAX as usize {
+            return Err("shared-memory copy size exceeds the maximum Rust slice length".into());
+        }
+
+        let pointer = if is_dedicated {
+            if offset != 0 {
+                return Err("dedicated shared-memory offset must be zero".into());
+            }
+            let entry = self
+                .dedicated
+                .get(&seg_idx)
+                .ok_or("invalid dedicated segment index")?;
+            if len > entry.segment.data_size() {
+                return Err(format!(
+                    "shared-memory copy span of {len} bytes is outside dedicated segment {seg_idx}"
+                ));
+            }
+            entry.segment.data_ptr()
+        } else {
+            let segment = self
+                .segments
+                .get(seg_idx as usize)
+                .ok_or("invalid segment index")?;
+            let start = usize::try_from(offset)
+                .map_err(|_| "shared-memory copy offset is not addressable on this platform")?;
+            let end = start
+                .checked_add(len)
+                .ok_or("shared-memory copy span overflows the platform address space")?;
+            if end > segment.allocator().data_size() {
+                return Err(format!(
+                    "shared-memory copy span {start}..{end} is outside buddy segment {seg_idx}"
+                ));
+            }
+            segment.allocator().data_ptr(offset)
+        };
+
+        // SAFETY: the branch above proves that the non-empty span is entirely
+        // inside the mapped data region and no longer than `isize::MAX`.
+        Ok(unsafe { std::slice::from_raw_parts(pointer, len) }.to_vec())
+    }
+
     // ── MemHandle API ──────────────────────────────────────────────
 
     /// Unified allocation returning a [`MemHandle`].
@@ -726,6 +781,44 @@ impl MemPool {
                 unsafe { std::slice::from_raw_parts(ptr, *len) }
             }
             MemHandle::FileSpill { mmap, len, .. } => &mmap[..*len],
+        }
+    }
+
+    /// Copy a handle's logical bytes after validating its public coordinates
+    /// against the mapped backing region.
+    pub fn copy_handle_data(&self, handle: &MemHandle) -> Result<Vec<u8>, String> {
+        match handle {
+            MemHandle::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => self.copy_data_at(
+                u32::from(*seg_idx),
+                *offset,
+                u32::try_from(*len)
+                    .map_err(|_| "buddy handle length exceeds the wire address space")?,
+                false,
+            ),
+            MemHandle::Dedicated { seg_idx, len } => self.copy_data_at(
+                u32::from(*seg_idx),
+                0,
+                u32::try_from(*len)
+                    .map_err(|_| "dedicated handle length exceeds the wire address space")?,
+                true,
+            ),
+            MemHandle::FileSpill { mmap, len, .. } => {
+                if *len == 0 {
+                    return Err("file-spill copy span must not be empty".into());
+                }
+                let bytes = mmap.get(..*len).ok_or_else(|| {
+                    format!(
+                        "file-spill copy span of {} bytes is outside file-spill mapping of {} bytes",
+                        len,
+                        mmap.len()
+                    )
+                })?;
+                Ok(bytes.to_vec())
+            }
         }
     }
 
@@ -1081,6 +1174,71 @@ mod tests {
             assert_eq!(*ptr.add(99), 0xAB);
         }
         pool.free(&a).unwrap();
+    }
+
+    #[test]
+    fn test_copy_data_at_reads_buddy_and_dedicated_allocations() {
+        let mut pool = test_pool(small_config());
+        for payload in [b"buddy".repeat(32), b"dedicated".repeat(20_000)] {
+            let allocation = pool.alloc(payload.len()).unwrap();
+            let ptr = pool.data_ptr(&allocation).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len());
+            }
+
+            assert_eq!(
+                pool.copy_data_at(
+                    allocation.seg_idx,
+                    allocation.offset,
+                    u32::try_from(payload.len()).unwrap(),
+                    allocation.is_dedicated,
+                )
+                .unwrap(),
+                payload,
+            );
+            pool.free(&allocation).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_copy_data_at_rejects_spans_outside_mapped_data() {
+        let mut pool = test_pool(small_config());
+        let buddy = pool.alloc(4096).unwrap();
+        let buddy_capacity = pool
+            .segment(buddy.seg_idx as usize)
+            .unwrap()
+            .allocator()
+            .data_size();
+        assert!(
+            pool.copy_data_at(
+                buddy.seg_idx,
+                u32::try_from(buddy_capacity - 1).unwrap(),
+                2,
+                false,
+            )
+            .unwrap_err()
+            .contains("outside buddy segment")
+        );
+        assert!(
+            pool.copy_data_at(buddy.seg_idx, buddy.offset, 0, false)
+                .unwrap_err()
+                .contains("must not be empty")
+        );
+        pool.free(&buddy).unwrap();
+
+        let dedicated = pool.alloc(128 * 1024).unwrap();
+        assert!(dedicated.is_dedicated);
+        assert!(
+            pool.copy_data_at(dedicated.seg_idx, 1, 1, true)
+                .unwrap_err()
+                .contains("offset must be zero")
+        );
+        assert!(
+            pool.copy_data_at(dedicated.seg_idx, 0, u32::MAX, true)
+                .unwrap_err()
+                .contains("outside dedicated segment")
+        );
+        pool.free(&dedicated).unwrap();
     }
 
     #[test]
@@ -1581,6 +1739,10 @@ mod handle_tests {
         let pattern = b"test_data_pattern";
         pool.handle_slice_mut(&mut handle)[..pattern.len()].copy_from_slice(pattern);
         assert_eq!(&pool.handle_slice(&handle)[..pattern.len()], pattern);
+        assert_eq!(
+            &pool.copy_handle_data(&handle).unwrap()[..pattern.len()],
+            pattern
+        );
         pool.release_handle(handle);
     }
 
@@ -1597,7 +1759,35 @@ mod handle_tests {
         let pattern = b"spill_pattern_data";
         pool.handle_slice_mut(&mut handle)[..pattern.len()].copy_from_slice(pattern);
         assert_eq!(&pool.handle_slice(&handle)[..pattern.len()], pattern);
+        assert_eq!(
+            &pool.copy_handle_data(&handle).unwrap()[..pattern.len()],
+            pattern
+        );
+        handle.set_len(8193);
+        assert!(
+            pool.copy_handle_data(&handle)
+                .unwrap_err()
+                .contains("outside file-spill mapping")
+        );
+        handle.set_len(8192);
         pool.release_handle(handle);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_copy_handle_data_rejects_publicly_constructed_out_of_bounds_handle() {
+        let mut pool = MemPool::new(test_config());
+        pool.ensure_buddy_segments(1).unwrap();
+        let capacity = pool.segment(0).unwrap().allocator().data_size();
+        let handle = MemHandle::Buddy {
+            seg_idx: 0,
+            offset: u32::try_from(capacity - 1).unwrap(),
+            len: 2,
+        };
+        assert!(
+            pool.copy_handle_data(&handle)
+                .unwrap_err()
+                .contains("outside buddy segment")
+        );
     }
 }

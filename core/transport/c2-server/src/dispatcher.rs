@@ -76,6 +76,48 @@ pub enum RequestData {
     },
 }
 
+impl RequestData {
+    /// Copy this request into Rust-owned bytes and release its transport storage.
+    ///
+    /// This is the explicit receive path for Rust CRM hosts that need an owned
+    /// buffer, including consumers that open a copy-backed FastDB payload.
+    /// Language bindings and other zero-copy consumers should continue matching
+    /// the variants directly and retain/release their scoped owners themselves.
+    /// Invalid coordinates are rejected without attempting a coordinate-derived
+    /// release because an unvalidated size could free the wrong buddy level.
+    pub fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
+        match self {
+            RequestData::Inline(data) => Ok(data),
+            RequestData::Shm {
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            } => {
+                let data = {
+                    let pool = pool.read();
+                    pool.copy_data_at(seg_idx as u32, offset, data_size, is_dedicated)
+                }
+                .map_err(|error| format!("request SHM read failed: {error}"))?;
+                pool.write()
+                    .free_at(seg_idx as u32, offset, data_size, is_dedicated)
+                    .map_err(|error| format!("request SHM release failed: {error}"))?;
+                Ok(data)
+            }
+            RequestData::Handle { handle, pool } => {
+                let data = {
+                    let pool = pool.read();
+                    pool.copy_handle_data(&handle)
+                }
+                .map_err(|error| format!("request handle read failed: {error}"))?;
+                pool.write().release_handle(handle);
+                Ok(data)
+            }
+        }
+    }
+}
+
 /// Explicitly release SHM resources held by a RequestData.
 /// Must be called on error paths where the request won't be consumed by a CRM callback.
 pub fn cleanup_request(request: RequestData) {
@@ -372,6 +414,7 @@ mod tests {
     use crate::scheduler::ConcurrencyMode;
     use c2_mem::PoolConfig;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct MockCallback;
 
@@ -406,6 +449,104 @@ mod tests {
             callback: Arc::new(MockCallback),
             method_names: vec!["method_a".into(), "method_b".into()],
         }
+    }
+
+    fn request_test_pool() -> MemPool {
+        static NEXT_POOL: AtomicU64 = AtomicU64::new(0);
+        MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 2,
+                dedicated_crash_timeout_secs: 5.0,
+                buddy_idle_decay_secs: 1.0,
+                spill_threshold: 0.8,
+                spill_dir: std::env::temp_dir().join("c_two_request_data_test_spill"),
+            },
+            format!(
+                "/c2rq{:08x}{:04x}",
+                std::process::id(),
+                NEXT_POOL.fetch_add(1, Ordering::Relaxed),
+            ),
+        )
+    }
+
+    #[test]
+    fn request_data_inline_materializes_owned_bytes() {
+        assert_eq!(
+            RequestData::Inline(b"inline".to_vec())
+                .into_owned_bytes()
+                .unwrap(),
+            b"inline",
+        );
+    }
+
+    #[test]
+    fn request_data_shm_materializes_and_releases_buddy_and_dedicated_allocations() {
+        for payload in [b"buddy".repeat(32), b"dedicated".repeat(5000)] {
+            let mut pool = request_test_pool();
+            let allocation = pool.alloc(payload.len()).unwrap();
+            let ptr = pool.data_ptr(&allocation).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len());
+            }
+            let pool = Arc::new(parking_lot::RwLock::new(pool));
+            let request = RequestData::Shm {
+                pool: Arc::clone(&pool),
+                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+                offset: allocation.offset,
+                data_size: u32::try_from(payload.len()).unwrap(),
+                is_dedicated: allocation.is_dedicated,
+            };
+
+            assert_eq!(request.into_owned_bytes().unwrap(), payload);
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        }
+    }
+
+    #[test]
+    fn request_data_shm_rejects_invalid_span_without_freeing_unproven_coordinates() {
+        let mut pool = request_test_pool();
+        let allocation = pool.alloc(4096).unwrap();
+        let capacity = pool
+            .segment(allocation.seg_idx as usize)
+            .unwrap()
+            .allocator()
+            .data_size();
+        let pool = Arc::new(parking_lot::RwLock::new(pool));
+        let request = RequestData::Shm {
+            pool: Arc::clone(&pool),
+            seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+            offset: u32::try_from(capacity - 1).unwrap(),
+            data_size: 2,
+            is_dedicated: false,
+        };
+
+        assert!(
+            request
+                .into_owned_bytes()
+                .unwrap_err()
+                .contains("outside buddy segment")
+        );
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        pool.write().free(&allocation).unwrap();
+    }
+
+    #[test]
+    fn request_data_handle_materializes_and_releases_reassembly_allocation() {
+        let payload = b"reassembled".repeat(512);
+        let mut pool = request_test_pool();
+        let mut handle = pool.alloc_handle(payload.len()).unwrap();
+        pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+        let pool = Arc::new(parking_lot::RwLock::new(pool));
+        let request = RequestData::Handle {
+            handle,
+            pool: Arc::clone(&pool),
+        };
+
+        assert_eq!(request.into_owned_bytes().unwrap(), payload);
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     #[test]
