@@ -12,5 +12,6 @@ pub use control::{RelayControlClient, RelayRegistration, RelayRouteInfo};
 pub use http_client::{HttpClient, HttpError};
 pub use pool::HttpClientPool;
 pub use relay_aware::{
-    RelayAwareClientConfig, RelayAwareHttpClient, RelayLocalIpcCandidate, RelayResolvedTarget,
+    HttpCallError, HttpCallPhase, RelayAwareClientConfig, RelayAwareHttpClient,
+    RelayLocalIpcCandidate, RelayResolvedTarget,
 };

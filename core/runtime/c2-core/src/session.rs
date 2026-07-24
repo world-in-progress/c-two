@@ -18,12 +18,14 @@ use c2_http::client::{
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
+use crate::outcome::RuntimeRouteSpec;
 use crate::{
     LifecycleError, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome,
-    RuntimeRouteSpec, ShutdownOutcome, UnregisterOutcome,
+    ShutdownOutcome, UnregisterOutcome,
 };
 use crate::{
-    auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
+    ObservedPath, PathCounters, auto_server_id, auto_server_instance_id, ipc_address_for_server_id,
+    validate_server_id,
 };
 
 #[cfg(test)]
@@ -114,8 +116,9 @@ fn route_close_from_server_outcome(outcome: ServerRouteCloseOutcome) -> RouteClo
     }
 }
 
+#[derive(Clone)]
 pub struct Runtime {
-    state: Mutex<RuntimeState>,
+    state: Arc<Mutex<RuntimeState>>,
 }
 
 impl fmt::Debug for Runtime {
@@ -135,6 +138,7 @@ struct RuntimeState {
     relay_anchor_address_override: Option<String>,
     use_process_relay_anchor: bool,
     relay_projection: Option<RelayProjection>,
+    path_counters: PathCounters,
     #[cfg(test)]
     forced_relay_config_error: Option<String>,
 }
@@ -146,14 +150,20 @@ struct RelayProjection {
     control: Arc<RelayControlClient>,
 }
 
-pub enum RelayResolvedConnection {
+pub(crate) struct RelayClientSettings {
+    pub(crate) use_proxy: bool,
+    pub(crate) max_attempts: usize,
+    pub(crate) call_timeout_secs: f64,
+    pub(crate) remote_payload_chunk_size: u64,
+}
+
+pub(crate) enum RelayResolvedConnection {
     Ipc {
         client: RelayAwareHttpClient,
         candidate: RelayLocalIpcCandidate,
     },
     Http {
         client: RelayAwareHttpClient,
-        relay_url: String,
     },
 }
 
@@ -163,7 +173,7 @@ impl Runtime {
             validate_server_id(server_id)?;
         }
         Ok(Self {
-            state: Mutex::new(RuntimeState {
+            state: Arc::new(Mutex::new(RuntimeState {
                 server_id_override: options.server_id,
                 server_ipc_overrides: options.server_ipc_overrides,
                 client_ipc_overrides: options.client_ipc_overrides,
@@ -176,9 +186,10 @@ impl Runtime {
                     .map(|addr| canonical_relay_anchor_address(&addr)),
                 use_process_relay_anchor: options.use_process_relay_anchor,
                 relay_projection: None,
+                path_counters: PathCounters::default(),
                 #[cfg(test)]
                 forced_relay_config_error: None,
-            }),
+            })),
         })
     }
 
@@ -273,6 +284,91 @@ impl Runtime {
         self.state.lock().client_config_frozen = true;
     }
 
+    pub fn path_counters(&self) -> PathCounters {
+        self.state.lock().path_counters
+    }
+
+    pub(crate) fn record_path(&self, path: ObservedPath) {
+        self.state.lock().path_counters.record(path);
+    }
+
+    pub(crate) fn acquire_ipc_client(
+        &self,
+        address: &str,
+    ) -> Result<Arc<c2_ipc::SyncClient>, c2_ipc::IpcError> {
+        let config = self
+            .client_ipc_config()
+            .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+        let client = c2_ipc::ClientPool::instance().acquire(address, Some(&config))?;
+        self.mark_client_config_frozen();
+        Ok(client)
+    }
+
+    pub(crate) fn release_ipc_client(&self, address: &str) {
+        c2_ipc::ClientPool::instance().release(address);
+    }
+
+    pub(crate) fn client_ipc_config(&self) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
+        let runtime_overrides = c2_config::RuntimeConfigOverrides {
+            client_ipc: self.client_ipc_overrides().unwrap_or_default(),
+            shm_threshold: self.shm_threshold_override(),
+            ..Default::default()
+        };
+        c2_config::ConfigResolver::resolve_client_ipc(
+            runtime_overrides.client_ipc.clone(),
+            runtime_overrides,
+            c2_config::ConfigSources::from_process(),
+        )
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))
+    }
+
+    pub(crate) fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
+        let runtime_overrides = c2_config::RuntimeConfigOverrides {
+            server_ipc: self.server_ipc_overrides().unwrap_or_default(),
+            shm_threshold: self.shm_threshold_override(),
+            ..Default::default()
+        };
+        c2_config::ConfigResolver::resolve_server_ipc(
+            runtime_overrides.server_ipc.clone(),
+            runtime_overrides,
+            c2_config::ConfigSources::from_process(),
+        )
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))
+    }
+
+    pub(crate) fn relay_client_settings(&self) -> Result<RelayClientSettings, LifecycleError> {
+        let sources = c2_config::ConfigSources::from_process();
+        let use_proxy = self.relay_use_proxy()?;
+        let configured_attempts =
+            c2_config::ConfigResolver::resolve_relay_route_max_attempts(sources.clone())
+                .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        let call_timeout_secs =
+            c2_config::ConfigResolver::resolve_relay_call_timeout_secs(sources.clone())
+                .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        let remote_payload_chunk_size =
+            c2_config::ConfigResolver::resolve_remote_payload_chunk_size(
+                self.remote_payload_chunk_size_override(),
+                sources,
+            )
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        Ok(RelayClientSettings {
+            use_proxy,
+            // One initial observation plus at most one pre-dispatch refresh.
+            max_attempts: configured_attempts.clamp(1, 2),
+            call_timeout_secs,
+            remote_payload_chunk_size,
+        })
+    }
+
+    pub(crate) fn relay_use_proxy(&self) -> Result<bool, LifecycleError> {
+        #[cfg(test)]
+        if let Some(message) = self.state.lock().forced_relay_config_error.clone() {
+            return Err(LifecycleError::Relay(message));
+        }
+        c2_config::ConfigResolver::resolve_relay_use_proxy(c2_config::ConfigSources::from_process())
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))
+    }
+
     pub fn clear_server_identity(&self) {
         self.state.lock().identity = None;
     }
@@ -324,7 +420,7 @@ impl Runtime {
         self.state.lock().forced_relay_config_error = Some(message.into());
     }
 
-    pub fn register_route(
+    pub(crate) fn register_route(
         &self,
         server: &Arc<c2_server::Server>,
         route: BuiltRoute,
@@ -563,7 +659,7 @@ impl Runtime {
         })
     }
 
-    pub fn unregister_route(
+    pub(crate) fn unregister_route(
         &self,
         server: &Arc<c2_server::Server>,
         name: &str,
@@ -599,7 +695,7 @@ impl Runtime {
         })
     }
 
-    pub fn shutdown(
+    pub(crate) fn shutdown(
         &self,
         server: Option<&Arc<c2_server::Server>>,
         route_names: Vec<String>,
@@ -752,7 +848,7 @@ impl Runtime {
         outcome
     }
 
-    pub fn resolve_relay_connection(
+    pub(crate) fn resolve_relay_connection(
         &self,
         expected: ExpectedRouteContract,
         relay_use_proxy: bool,
@@ -776,13 +872,11 @@ impl Runtime {
             RelayResolvedTarget::Ipc { candidate } => {
                 Ok(RelayResolvedConnection::Ipc { client, candidate })
             }
-            RelayResolvedTarget::Http { relay_url } => {
-                Ok(RelayResolvedConnection::Http { client, relay_url })
-            }
+            RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
         }
     }
 
-    pub fn resolve_relay_connection_after_local_ipc_failures(
+    pub(crate) fn resolve_relay_connection_after_local_ipc_failures(
         client: RelayAwareHttpClient,
         failed_candidates: &[RelayLocalIpcCandidate],
     ) -> Result<RelayResolvedConnection, LifecycleError> {
@@ -793,39 +887,11 @@ impl Runtime {
             RelayResolvedTarget::Ipc { candidate } => {
                 Ok(RelayResolvedConnection::Ipc { client, candidate })
             }
-            RelayResolvedTarget::Http { relay_url } => {
-                Ok(RelayResolvedConnection::Http { client, relay_url })
-            }
+            RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
         }
     }
 
-    pub fn connect_relay_http_client(
-        &self,
-        expected: ExpectedRouteContract,
-        relay_use_proxy: bool,
-        max_attempts: usize,
-        call_timeout_secs: f64,
-        remote_payload_chunk_size: u64,
-    ) -> Result<(RelayAwareHttpClient, String), LifecycleError> {
-        let projection = self.relay_projection(relay_use_proxy)?;
-        let client = RelayAwareHttpClient::new_with_control(
-            Arc::clone(&projection.control),
-            expected,
-            projection.relay_use_proxy,
-            RelayAwareClientConfig {
-                max_attempts,
-                call_timeout_secs,
-                remote_payload_chunk_size,
-            },
-        )
-        .map_err(runtime_http_error)?;
-        match client.resolve_http_target().map_err(runtime_http_error)? {
-            RelayResolvedTarget::Http { relay_url } => Ok((client, relay_url)),
-            RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
-        }
-    }
-
-    pub fn connect_explicit_relay_http_client(
+    pub(crate) fn connect_explicit_relay_http_client(
         &self,
         relay_url: &str,
         expected: ExpectedRouteContract,
@@ -833,7 +899,7 @@ impl Runtime {
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
-    ) -> Result<(RelayAwareHttpClient, String), LifecycleError> {
+    ) -> Result<RelayAwareHttpClient, LifecycleError> {
         let client = RelayAwareHttpClient::new(
             relay_url,
             expected,
@@ -846,7 +912,7 @@ impl Runtime {
         )
         .map_err(runtime_http_error)?;
         match client.resolve_http_target().map_err(runtime_http_error)? {
-            RelayResolvedTarget::Http { relay_url } => Ok((client, relay_url)),
+            RelayResolvedTarget::Http { .. } => Ok(client),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
         }
     }
@@ -893,7 +959,7 @@ impl Runtime {
         Ok(projection)
     }
 
-    fn server_runtime() -> Result<tokio::runtime::Runtime, LifecycleError> {
+    pub(crate) fn server_runtime() -> Result<tokio::runtime::Runtime, LifecycleError> {
         #[cfg(test)]
         if FORCE_SERVER_RUNTIME_FAILURE.with(|flag| flag.get()) {
             return Err(LifecycleError::Server(
@@ -1743,6 +1809,22 @@ mod tests {
         assert!(outcome.runtime_barrier_error.is_none());
         assert_eq!(session.server_id(), None);
         assert_eq!(session.server_address(), None);
+    }
+
+    #[test]
+    fn host_without_relay_does_not_resolve_unrelated_relay_configuration() {
+        let session = Runtime::new(RuntimeOptions {
+            server_id: Some(unique_route_name("host-no-relay-config")),
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
+        session.force_relay_config_error_for_test("relay configuration must remain untouched");
+
+        let host = session
+            .host(crate::HostOptions::default().without_relay())
+            .expect("local host must not resolve relay configuration");
+        drop(host);
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub enum LifecycleError {
         invalidation_error: Option<String>,
         transport_error: Option<String>,
     },
+    ResponseCopy(String),
+    Configuration(String),
     Server(String),
     Relay(String),
 }
@@ -80,6 +82,10 @@ impl fmt::Display for LifecycleError {
                     write!(formatter, "; transport cleanup: {transport_error}")?;
                 }
                 Ok(())
+            }
+            Self::ResponseCopy(message) => write!(formatter, "response copy failed: {message}"),
+            Self::Configuration(message) => {
+                write!(formatter, "runtime configuration error: {message}")
             }
             Self::Server(message) => write!(formatter, "server error: {message}"),
             Self::Relay(message) => write!(formatter, "relay error: {message}"),
@@ -213,8 +219,124 @@ impl From<LifecycleError> for Error {
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
         IpcError::CrmError(bytes) => normalize_ipc_semantic_bytes(&bytes),
+        IpcError::RouteNotFound(route_name) => semantic_route_error(
+            ErrorCode::ResourceNotFound,
+            format!("route not found: {route_name}"),
+            [("route", route_name)],
+        ),
+        IpcError::RouteRemoved {
+            route_name,
+            route_uid,
+        } => {
+            let mut details = BTreeMap::from([("route".to_string(), route_name.clone())]);
+            if let Some(route_uid) = route_uid {
+                details.insert("route_uid".to_string(), route_uid);
+            }
+            Error::Semantic(
+                C2Error::new(
+                    ErrorCode::ResourceRemoved,
+                    format!("route removed: {route_name}"),
+                )
+                .with_details(details),
+            )
+        }
+        IpcError::RouteClosed {
+            route_name,
+            route_uid,
+            reason,
+        } => semantic_route_error(
+            ErrorCode::ResourceClosed,
+            format!("route closed: {route_name}"),
+            [
+                ("route", route_name),
+                ("route_uid", route_uid),
+                ("reason", reason),
+            ],
+        ),
+        IpcError::RouteStale {
+            route_name,
+            current_route_uid,
+            current_route_revision,
+        } => semantic_route_error(
+            ErrorCode::RouteStale,
+            format!("route token is stale: {route_name}"),
+            [
+                ("route", route_name),
+                ("current_route_uid", current_route_uid),
+                ("current_route_revision", current_route_revision.to_string()),
+            ],
+        ),
+        IpcError::ContractMismatch(message) => Error::Semantic(
+            C2Error::new(ErrorCode::ContractMismatch, message).with_details(BTreeMap::from([(
+                "transport".to_string(),
+                "ipc".to_string(),
+            )])),
+        ),
+        IpcError::IdentityMismatch {
+            expected_server_id,
+            expected_server_instance_id,
+            actual_server_id,
+            actual_server_instance_id,
+        } => Error::Semantic(
+            C2Error::new(ErrorCode::IdentityMismatch, "IPC server identity mismatch").with_details(
+                BTreeMap::from([
+                    ("actual_server_id".to_string(), actual_server_id),
+                    (
+                        "actual_server_instance_id".to_string(),
+                        actual_server_instance_id,
+                    ),
+                    ("expected_server_id".to_string(), expected_server_id),
+                    (
+                        "expected_server_instance_id".to_string(),
+                        expected_server_instance_id,
+                    ),
+                ]),
+            ),
+        ),
+        IpcError::CatalogCompacted {
+            compacted_revision,
+            current_revision,
+        } => semantic_route_error(
+            ErrorCode::RouteCatalogCompacted,
+            "route catalog history was compacted".to_string(),
+            [
+                ("compacted_revision", compacted_revision.to_string()),
+                ("current_revision", current_revision.to_string()),
+            ],
+        ),
+        IpcError::WatchUnavailable(message) => Error::Semantic(
+            C2Error::new(ErrorCode::RouteWatchUnavailable, message).with_details(BTreeMap::from([
+                ("transport".to_string(), "ipc".to_string()),
+            ])),
+        ),
+        IpcError::Protocol(message) | IpcError::Handshake(message) => Error::Semantic(
+            protocol_violation("IPC protocol validation failed", "ipc", &message),
+        ),
+        IpcError::MethodNotFound {
+            route_name,
+            method_name,
+        } => semantic_route_error(
+            ErrorCode::ProtocolViolation,
+            format!("method is not present in the acquired route: {method_name}"),
+            [("route", route_name), ("method", method_name)],
+        ),
         transport => Error::Transport(TransportError::new(phase, TransportKind::Ipc, transport)),
     }
+}
+
+fn semantic_route_error<const N: usize>(
+    code: ErrorCode,
+    message: String,
+    details: [(&str, String); N],
+) -> Error {
+    Error::Semantic(
+        C2Error::new(code, message).with_details(
+            details
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        ),
+    )
 }
 
 /// Normalize an HTTP error without flattening its transport source.

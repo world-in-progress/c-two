@@ -19,3 +19,7 @@ parking_lot = { workspace = true }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+axum = "0.8"
+c2-http = { path = "../../transport/c2-http", features = ["relay"] }

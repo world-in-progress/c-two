@@ -55,6 +55,7 @@ enum RequestClient {
         reason: String,
     },
     NotFound,
+    RouteError(c2_ipc::IpcError),
     Unreachable,
 }
 
@@ -127,11 +128,22 @@ fn resource_not_found_response(route_name: &str) -> Response {
 }
 
 fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -> Response {
+    resource_unavailable_response_with_phase(route_name, message, "pre_dispatch")
+}
+
+fn resource_unavailable_response_with_phase(
+    route_name: &str,
+    message: impl Into<String>,
+    dispatch_phase: &str,
+) -> Response {
     c2_error_response(
         StatusCode::BAD_GATEWAY,
         c2_error::ErrorCode::ResourceUnavailable,
         message,
-        [("route", route_name.to_string())],
+        [
+            ("route", route_name.to_string()),
+            ("dispatch_phase", dispatch_phase.to_string()),
+        ],
     )
 }
 
@@ -168,6 +180,10 @@ where
         ),
     )
         .into_response()
+}
+
+fn semantic_error_response(status: StatusCode, error: c2_error::C2Error) -> Response {
+    (status, Json(error.envelope())).into_response()
 }
 
 fn content_length_from_headers(headers: &HeaderMap) -> ResponseResult<Option<u64>> {
@@ -1425,6 +1441,7 @@ async fn handle_probe(
             route_watch_unavailable_response(&route.name, reason)
         }
         RequestClient::NotFound => resource_not_found_response(&route_name),
+        RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error),
         RequestClient::Unreachable => resource_unavailable_response(
             &route_name,
             format!("relay upstream unavailable: {route_name}"),
@@ -1488,6 +1505,9 @@ async fn call_handler(
                 return route_watch_unavailable_response(&route.name, reason);
             }
             RequestClient::NotFound => return resource_not_found_response(&route_name),
+            RequestClient::RouteError(error) => {
+                return ipc_route_error_response(&route_name, &error);
+            }
             RequestClient::Unreachable => {
                 return resource_unavailable_response(
                     &route_name,
@@ -1520,7 +1540,7 @@ async fn call_handler(
     let call_result = match content_length {
         Some(content_length) => {
             client
-                .call_bound_sized_stream(
+                .call_bound_sized_stream_phased(
                     &binding,
                     &method_name,
                     content_length,
@@ -1539,7 +1559,9 @@ async fn call_handler(
                         return response.into_response();
                     }
                 };
-            client.call_bound(&binding, &method_name, &body).await
+            client
+                .call_bound_phased(&binding, &method_name, &body)
+                .await
         }
     };
 
@@ -1549,32 +1571,40 @@ async fn call_handler(
             result.into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc()),
             state.config().remote_payload_chunk_size,
         ),
-        Err(c2_ipc::IpcError::CrmError(err_bytes)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [("content-type", "application/octet-stream")],
-            err_bytes,
-        )
-            .into_response(),
-        Err(c2_ipc::IpcError::RouteStale { .. }) => {
-            drop(lease);
-            route_stale_response(&acquired_route)
-        }
-        Err(e) => {
-            if let Some(reason) = semantic_withdrawal_reason(&e) {
-                let not_found_route = semantic_not_found_route(&e).map(str::to_string);
-                drop(lease);
-                remove_unreachable_route_for_error(&state, &acquired_route, &e, reason);
-                if let Some(route) = not_found_route {
-                    resource_not_found_response(&route)
-                } else {
-                    resource_unavailable_response(&route_name, format!("relay error: {e}"))
+        Err(error) => {
+            let phase = error.phase();
+            let error = error.into_source();
+            match error {
+                c2_ipc::IpcError::CrmError(err_bytes) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/octet-stream")],
+                    err_bytes,
+                )
+                    .into_response(),
+                c2_ipc::IpcError::RouteStale { .. } => {
+                    drop(lease);
+                    route_stale_response(&acquired_route)
                 }
-            } else {
-                // Evict dead client so next request triggers reconnect.
-                if let Some(old_client) = lease.evict_current_client() {
-                    close_arc_client(old_client);
+                error if matches!(phase, c2_ipc::TransportPhase::PreDispatch) => {
+                    if let Some(reason) = semantic_withdrawal_reason(&error) {
+                        drop(lease);
+                        remove_unreachable_route_for_error(&state, &acquired_route, &error, reason);
+                    }
+                    ipc_route_error_response(&route_name, &error)
                 }
-                resource_unavailable_response(&route_name, format!("relay error: {e}"))
+                error => {
+                    // The request may already have reached the service. Evict
+                    // the failed transport, but never tell the client that
+                    // replay is safe.
+                    if let Some(old_client) = lease.evict_current_client() {
+                        close_arc_client(old_client);
+                    }
+                    resource_unavailable_response_with_phase(
+                        &route_name,
+                        format!("relay error after possible dispatch: {error}"),
+                        "dispatch_uncertain",
+                    )
+                }
             }
         }
     }
@@ -1648,9 +1678,16 @@ async fn acquire_request_client_for_route(
                 remove_unreachable_route_for_error(&state, &route, &error, reason);
             }
             match error {
-                c2_ipc::IpcError::RouteNotFound(_)
+                error @ (c2_ipc::IpcError::RouteNotFound(_)
                 | c2_ipc::IpcError::RouteRemoved { .. }
-                | c2_ipc::IpcError::RouteClosed { .. } => RequestClient::NotFound,
+                | c2_ipc::IpcError::RouteClosed { .. }
+                | c2_ipc::IpcError::ContractMismatch(_)
+                | c2_ipc::IpcError::IdentityMismatch { .. }
+                | c2_ipc::IpcError::Protocol(_)
+                | c2_ipc::IpcError::Handshake(_)
+                | c2_ipc::IpcError::CatalogCompacted { .. }
+                | c2_ipc::IpcError::WatchUnavailable(_)
+                | c2_ipc::IpcError::MethodNotFound { .. }) => RequestClient::RouteError(error),
                 _ => RequestClient::Unreachable,
             }
         }
@@ -1671,6 +1708,164 @@ fn route_stale_response(route: &RouteEntry) -> Response {
             ("route_revision", route.route_revision.to_string()),
         ],
     )
+}
+
+fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Response {
+    use c2_error::{C2Error, ErrorCode};
+
+    match error {
+        c2_ipc::IpcError::RouteNotFound(route) => semantic_error_response(
+            StatusCode::NOT_FOUND,
+            C2Error::new(
+                ErrorCode::ResourceNotFound,
+                format!("route not found: {route}"),
+            )
+            .with_details(BTreeMap::from([("route".to_string(), route.clone())])),
+        ),
+        c2_ipc::IpcError::RouteRemoved {
+            route_name,
+            route_uid,
+        } => {
+            let mut details = BTreeMap::from([("route".to_string(), route_name.clone())]);
+            if let Some(route_uid) = route_uid {
+                details.insert("route_uid".to_string(), route_uid.clone());
+            }
+            semantic_error_response(
+                StatusCode::GONE,
+                C2Error::new(
+                    ErrorCode::ResourceRemoved,
+                    format!("route removed: {route_name}"),
+                )
+                .with_details(details),
+            )
+        }
+        c2_ipc::IpcError::RouteClosed {
+            route_name,
+            route_uid,
+            reason,
+        } => semantic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            C2Error::new(
+                ErrorCode::ResourceClosed,
+                format!("route closed: {route_name}"),
+            )
+            .with_details(BTreeMap::from([
+                ("reason".to_string(), reason.clone()),
+                ("route".to_string(), route_name.clone()),
+                ("route_uid".to_string(), route_uid.clone()),
+            ])),
+        ),
+        c2_ipc::IpcError::RouteStale {
+            route_name,
+            current_route_uid,
+            current_route_revision,
+        } => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(
+                ErrorCode::RouteStale,
+                format!("route token is stale: {route_name}"),
+            )
+            .with_details(BTreeMap::from([
+                (
+                    "current_route_revision".to_string(),
+                    current_route_revision.to_string(),
+                ),
+                ("current_route_uid".to_string(), current_route_uid.clone()),
+                ("route".to_string(), route_name.clone()),
+            ])),
+        ),
+        c2_ipc::IpcError::ContractMismatch(message) => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(ErrorCode::ContractMismatch, message.clone()).with_details(
+                BTreeMap::from([
+                    ("route".to_string(), route_name.to_string()),
+                    ("transport".to_string(), "ipc".to_string()),
+                ]),
+            ),
+        ),
+        c2_ipc::IpcError::IdentityMismatch {
+            expected_server_id,
+            expected_server_instance_id,
+            actual_server_id,
+            actual_server_instance_id,
+        } => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(ErrorCode::IdentityMismatch, "IPC server identity mismatch").with_details(
+                BTreeMap::from([
+                    ("actual_server_id".to_string(), actual_server_id.clone()),
+                    (
+                        "actual_server_instance_id".to_string(),
+                        actual_server_instance_id.clone(),
+                    ),
+                    ("expected_server_id".to_string(), expected_server_id.clone()),
+                    (
+                        "expected_server_instance_id".to_string(),
+                        expected_server_instance_id.clone(),
+                    ),
+                    ("route".to_string(), route_name.to_string()),
+                ]),
+            ),
+        ),
+        c2_ipc::IpcError::CatalogCompacted {
+            compacted_revision,
+            current_revision,
+        } => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(
+                ErrorCode::RouteCatalogCompacted,
+                "route catalog history was compacted",
+            )
+            .with_details(BTreeMap::from([
+                (
+                    "compacted_revision".to_string(),
+                    compacted_revision.to_string(),
+                ),
+                ("current_revision".to_string(), current_revision.to_string()),
+                ("route".to_string(), route_name.to_string()),
+            ])),
+        ),
+        c2_ipc::IpcError::WatchUnavailable(message) => semantic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            C2Error::new(ErrorCode::RouteWatchUnavailable, message.clone()).with_details(
+                BTreeMap::from([
+                    ("route".to_string(), route_name.to_string()),
+                    ("transport".to_string(), "ipc".to_string()),
+                ]),
+            ),
+        ),
+        c2_ipc::IpcError::MethodNotFound {
+            route_name,
+            method_name,
+        } => semantic_error_response(
+            StatusCode::BAD_GATEWAY,
+            C2Error::new(
+                ErrorCode::ProtocolViolation,
+                format!("method is not present in the acquired route: {method_name}"),
+            )
+            .with_details(BTreeMap::from([
+                ("method".to_string(), method_name.clone()),
+                ("route".to_string(), route_name.clone()),
+            ])),
+        ),
+        c2_ipc::IpcError::Protocol(message) | c2_ipc::IpcError::Handshake(message) => {
+            semantic_error_response(
+                StatusCode::BAD_GATEWAY,
+                C2Error::new(
+                    ErrorCode::ProtocolViolation,
+                    "IPC protocol validation failed",
+                )
+                .with_details(BTreeMap::from([
+                    ("reason".to_string(), message.clone()),
+                    ("route".to_string(), route_name.to_string()),
+                    ("transport".to_string(), "ipc".to_string()),
+                ])),
+            )
+        }
+        error => resource_unavailable_response(
+            route_name,
+            format!("relay upstream unavailable before dispatch: {error}"),
+        ),
+    }
 }
 
 fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
@@ -1704,15 +1899,6 @@ fn semantic_withdrawal_reason(error: &c2_ipc::IpcError) -> Option<&'static str> 
         c2_ipc::IpcError::RouteNotFound(_) => Some("route-missing"),
         c2_ipc::IpcError::RouteRemoved { .. } => Some("route-removed"),
         c2_ipc::IpcError::RouteClosed { .. } => Some("route-closed"),
-        _ => None,
-    }
-}
-
-fn semantic_not_found_route(error: &c2_ipc::IpcError) -> Option<&str> {
-    match error {
-        c2_ipc::IpcError::RouteNotFound(route) => Some(route.as_str()),
-        c2_ipc::IpcError::RouteRemoved { route_name, .. }
-        | c2_ipc::IpcError::RouteClosed { route_name, .. } => Some(route_name.as_str()),
         _ => None,
     }
 }
@@ -1860,13 +2046,6 @@ mod tests {
             }),
             Some("route-closed")
         );
-        assert_eq!(
-            semantic_not_found_route(&c2_ipc::IpcError::RouteRemoved {
-                route_name: "grid".into(),
-                route_uid: Some("grid-uid".into()),
-            }),
-            Some("grid")
-        );
 
         assert_eq!(
             semantic_withdrawal_reason(&c2_ipc::IpcError::Io(std::io::Error::from(
@@ -1894,6 +2073,115 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn ipc_route_errors_preserve_exact_relay_semantics() {
+        use c2_error::ErrorCode;
+
+        let cases = [
+            (
+                c2_ipc::IpcError::RouteNotFound("grid".into()),
+                StatusCode::NOT_FOUND,
+                ErrorCode::ResourceNotFound,
+            ),
+            (
+                c2_ipc::IpcError::RouteRemoved {
+                    route_name: "grid".into(),
+                    route_uid: Some("grid-uid".into()),
+                },
+                StatusCode::GONE,
+                ErrorCode::ResourceRemoved,
+            ),
+            (
+                c2_ipc::IpcError::RouteClosed {
+                    route_name: "grid".into(),
+                    route_uid: "grid-uid".into(),
+                    reason: "shutdown".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ResourceClosed,
+            ),
+            (
+                c2_ipc::IpcError::RouteStale {
+                    route_name: "grid".into(),
+                    current_route_uid: "grid-uid-v2".into(),
+                    current_route_revision: 2,
+                },
+                StatusCode::CONFLICT,
+                ErrorCode::RouteStale,
+            ),
+            (
+                c2_ipc::IpcError::ContractMismatch("wrong contract".into()),
+                StatusCode::CONFLICT,
+                ErrorCode::ContractMismatch,
+            ),
+            (
+                c2_ipc::IpcError::IdentityMismatch {
+                    expected_server_id: "expected".into(),
+                    expected_server_instance_id: "expected-instance".into(),
+                    actual_server_id: "actual".into(),
+                    actual_server_instance_id: "actual-instance".into(),
+                },
+                StatusCode::CONFLICT,
+                ErrorCode::IdentityMismatch,
+            ),
+            (
+                c2_ipc::IpcError::CatalogCompacted {
+                    compacted_revision: 4,
+                    current_revision: 8,
+                },
+                StatusCode::CONFLICT,
+                ErrorCode::RouteCatalogCompacted,
+            ),
+            (
+                c2_ipc::IpcError::WatchUnavailable("watch disconnected".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::RouteWatchUnavailable,
+            ),
+            (
+                c2_ipc::IpcError::MethodNotFound {
+                    route_name: "grid".into(),
+                    method_name: "missing".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::ProtocolViolation,
+            ),
+            (
+                c2_ipc::IpcError::Protocol("malformed reply".into()),
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::ProtocolViolation,
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let response = ipc_route_error_response("grid", &error);
+            assert_eq!(response.status(), expected_status, "error={error}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["code"],
+                u16::from(expected_code),
+                "unexpected code for error={error}"
+            );
+            assert_eq!(
+                body["name"],
+                expected_code.name(),
+                "unexpected name for error={error}"
+            );
+            assert_ne!(
+                body["name"], "ResourceUnavailable",
+                "semantic error was flattened: {error}"
+            );
+        }
+
+        let response =
+            ipc_route_error_response("grid", &c2_ipc::IpcError::Config("offline".into()));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["name"], "ResourceUnavailable");
+        assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[test]
@@ -2251,12 +2539,12 @@ mod tests {
             );
         }
         assert!(
-            body.contains(".call_bound_sized_stream("),
-            "relay data-plane must use route-bound sized streaming for Content-Length requests"
+            body.contains(".call_bound_sized_stream_phased("),
+            "relay data-plane must use phased route-bound sized streaming for Content-Length requests"
         );
         assert!(
-            body.contains(".call_bound("),
-            "relay data-plane must use route-bound call for bounded unknown-length fallback"
+            body.contains(".call_bound_phased("),
+            "relay data-plane must use phased route-bound call for bounded unknown-length fallback"
         );
     }
 

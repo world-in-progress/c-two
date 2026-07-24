@@ -11,6 +11,58 @@ use serde_json::json;
 use super::{HttpClient, HttpClientPool, HttpError, RelayControlClient, RelayRouteInfo};
 use c2_contract::ExpectedRouteContract;
 
+/// Whether an HTTP call failure is proven to precede CRM dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HttpCallPhase {
+    PreDispatch,
+    DispatchUncertain,
+}
+
+/// An HTTP call failure paired with its authoritative dispatch phase.
+#[derive(Debug)]
+pub struct HttpCallError {
+    phase: HttpCallPhase,
+    source: HttpError,
+}
+
+impl HttpCallError {
+    const fn new(phase: HttpCallPhase, source: HttpError) -> Self {
+        Self { phase, source }
+    }
+
+    pub const fn phase(&self) -> HttpCallPhase {
+        self.phase
+    }
+
+    pub const fn is_retry_safe(&self) -> bool {
+        matches!(self.phase, HttpCallPhase::PreDispatch)
+    }
+
+    pub const fn source_error(&self) -> &HttpError {
+        &self.source
+    }
+
+    pub fn into_source(self) -> HttpError {
+        self.source
+    }
+}
+
+impl std::fmt::Display for HttpCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "HTTP call failed during {:?}: {}",
+            self.phase, self.source
+        )
+    }
+}
+
+impl std::error::Error for HttpCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RelayAwareClientConfig {
     pub max_attempts: usize,
@@ -100,6 +152,24 @@ impl RelayAwareHttpClient {
         super::http_client::runtime()
             .handle()
             .block_on(self.call_async(method_name, data))
+    }
+
+    /// Call through the selected relay path while retaining the dispatch
+    /// phase of any failure.
+    pub fn call_phased(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpCallError> {
+        super::http_client::runtime()
+            .handle()
+            .block_on(self.call_phased_async(method_name, data))
+    }
+
+    pub async fn call_phased_async(
+        &self,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<Vec<u8>, HttpCallError> {
+        self.call_async(method_name, data)
+            .await
+            .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
     }
 
     pub fn connect(&self) -> Result<(), HttpError> {
@@ -431,11 +501,35 @@ fn route_is_stale(err: &HttpError) -> bool {
         HttpError::ServerError(409, body) => {
             relay_error_code_is(body, c2_error::ErrorCode::RouteStale)
         }
-        HttpError::ServerError(502, body) => {
-            relay_error_code_is(body, c2_error::ErrorCode::ResourceUnavailable)
-        }
+        HttpError::ServerError(502, body) => canonical_semantic_error(body).is_some_and(|error| {
+            error.code == c2_error::ErrorCode::ResourceUnavailable
+                && error.details.get("dispatch_phase").map(String::as_str) == Some("pre_dispatch")
+        }),
         _ => false,
     }
+}
+
+fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
+    match error {
+        HttpError::InvalidInput(_) => HttpCallPhase::PreDispatch,
+        HttpError::ServerError(_, body)
+            if canonical_semantic_error(body).is_some_and(|error| {
+                error.code != c2_error::ErrorCode::ResourceUnavailable
+                    || error.details.get("dispatch_phase").map(String::as_str)
+                        == Some("pre_dispatch")
+            }) =>
+        {
+            HttpCallPhase::PreDispatch
+        }
+        HttpError::CrmError(_) | HttpError::Transport(_) | HttpError::ServerError(_, _) => {
+            HttpCallPhase::DispatchUncertain
+        }
+    }
+}
+
+fn canonical_semantic_error(body: &str) -> Option<c2_error::C2Error> {
+    let envelope = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body).ok()?;
+    c2_error::C2Error::from_envelope(envelope).ok()
 }
 
 fn relay_error_code_is(body: &str, expected: c2_error::ErrorCode) -> bool {
@@ -692,16 +786,14 @@ mod tests {
     }
 
     async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(canonical_error_json(
-                702,
-                "ResourceUnavailable",
-                "relay upstream unavailable",
-                &route,
-            )),
-        )
-            .into_response()
+        let mut error = canonical_error_json(
+            702,
+            "ResourceUnavailable",
+            "relay upstream unavailable",
+            &route,
+        );
+        error["details"]["dispatch_phase"] = json!("pre_dispatch");
+        (StatusCode::BAD_GATEWAY, Json(error)).into_response()
     }
 
     async fn generic_bad_gateway() -> Response {
@@ -714,6 +806,19 @@ mod tests {
             "relay temporarily unavailable",
         )
             .into_response()
+    }
+
+    async fn dispatch_uncertain_unavailable(
+        Path((route, _method)): Path<(String, String)>,
+    ) -> Response {
+        let mut error = canonical_error_json(
+            702,
+            "ResourceUnavailable",
+            "upstream connection lost after possible dispatch",
+            &route,
+        );
+        error["details"]["dispatch_phase"] = json!("dispatch_uncertain");
+        (StatusCode::BAD_GATEWAY, Json(error)).into_response()
     }
 
     async fn transient_resolve_error(
@@ -1574,6 +1679,54 @@ mod tests {
             resolve_count.load(Ordering::SeqCst),
             1,
             "ambiguous data-plane failures must not replay CRM calls"
+        );
+
+        registry_handle.abort();
+        bad_handle.abort();
+        live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn canonical_dispatch_uncertain_failure_is_not_replayed() {
+        let (bad_url, bad_handle) = spawn_app(
+            Router::new().route("/{route}/{method}", post(dispatch_uncertain_unavailable)),
+        )
+        .await;
+        let (live_url, live_handle) =
+            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: bad_url,
+            live_url,
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let error = client
+            .call_phased_async("step", b"payload")
+            .await
+            .expect_err("dispatch-uncertain relay failure");
+        assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            1,
+            "explicit dispatch uncertainty must never trigger a second data-plane attempt"
         );
 
         registry_handle.abort();

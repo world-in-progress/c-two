@@ -644,6 +644,32 @@ fn stream_error<E: Display>(err: E) -> IpcError {
     )))
 }
 
+fn pre_dispatch_call_error(source: IpcError) -> crate::sync_client::IpcCallError {
+    crate::sync_client::IpcCallError::new(crate::sync_client::TransportPhase::PreDispatch, source)
+}
+
+fn dispatch_uncertain_call_error(source: IpcError) -> crate::sync_client::IpcCallError {
+    crate::sync_client::IpcCallError::new(
+        crate::sync_client::TransportPhase::DispatchUncertain,
+        source,
+    )
+}
+
+fn classified_call_error(source: IpcError) -> crate::sync_client::IpcCallError {
+    crate::sync_client::IpcCallError::new(crate::sync_client::call_error_phase(&source), source)
+}
+
+fn stream_call_error(
+    source: IpcError,
+    sent_or_attempted: bool,
+) -> crate::sync_client::IpcCallError {
+    if sent_or_attempted {
+        dispatch_uncertain_call_error(source)
+    } else {
+        pre_dispatch_call_error(source)
+    }
+}
+
 async fn collect_exact_stream<S, B, E>(data_size: usize, chunks: S) -> Result<Vec<u8>, IpcError>
 where
     S: Stream<Item = Result<B, E>>,
@@ -1182,6 +1208,23 @@ impl IpcClient {
         .await
     }
 
+    /// Send a route-bound call with an explicit dispatch-safety phase.
+    pub async fn call_bound_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError> {
+        self.call_bound(binding, method_name, data)
+            .await
+            .map_err(|source| {
+                crate::sync_client::IpcCallError::new(
+                    crate::sync_client::call_error_phase(&source),
+                    source,
+                )
+            })
+    }
+
     /// Send a CRM call from a known-size body stream through a previously
     /// acquired immutable route binding.
     pub async fn call_bound_sized_stream<S, B, E>(
@@ -1196,59 +1239,95 @@ impl IpcClient {
         B: AsRef<[u8]>,
         E: Display,
     {
-        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
-        if data_len > max_payload_size {
-            return Err(IpcError::Config(format!(
-                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
-                binding.route_name()
-            )));
-        }
-        self.call_sized_stream_resolved_target(method_idx, identity, data_len, chunks)
+        self.call_bound_sized_stream_phased(binding, method_name, data_len, chunks)
             .await
+            .map_err(crate::sync_client::IpcCallError::into_source)
     }
 
-    async fn call_sized_stream_resolved_target<S, B, E>(
+    /// Send a route-bound streaming call with an explicit dispatch-safety
+    /// phase.
+    pub async fn call_bound_sized_stream_phased<S, B, E>(
         &self,
-        method_idx: u16,
-        identity: RouteCallIdentity,
+        binding: &RouteBinding,
+        method_name: &str,
         data_len: u64,
         chunks: S,
-    ) -> Result<ResponseData, IpcError>
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>>,
         B: AsRef<[u8]>,
         E: Display,
     {
-        let data_len = checked_payload_len_usize(data_len)?;
+        let (method_idx, identity, max_payload_size) = binding
+            .call_target_for(method_name)
+            .map_err(pre_dispatch_call_error)?;
+        if data_len > max_payload_size {
+            return Err(pre_dispatch_call_error(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
+                binding.route_name()
+            ))));
+        }
+        self.call_sized_stream_resolved_target_phased(method_idx, identity, data_len, chunks)
+            .await
+    }
+
+    async fn call_sized_stream_resolved_target_phased<S, B, E>(
+        &self,
+        method_idx: u16,
+        identity: RouteCallIdentity,
+        data_len: u64,
+        chunks: S,
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
+        let data_len = checked_payload_len_usize(data_len).map_err(pre_dispatch_call_error)?;
         if data_len == 0 {
-            return self.call_inline(&identity, method_idx, &[]).await;
+            return self
+                .call_inline(&identity, method_idx, &[])
+                .await
+                .map_err(classified_call_error);
         }
 
         match choose_request_transport(&self.config, self.pool.is_some(), data_len) {
             RequestTransportKind::Buddy => {
-                if let Some(alloc) = self.try_alloc_request_block(data_len)? {
+                if let Some(alloc) = self
+                    .try_alloc_request_block(data_len)
+                    .map_err(pre_dispatch_call_error)?
+                {
                     return self
                         .call_buddy_stream(&identity, method_idx, alloc, data_len, chunks)
-                        .await;
+                        .await
+                        .map_err(classified_call_error);
                 }
                 match choose_request_transport(&self.config, false, data_len) {
                     RequestTransportKind::Chunked => {
-                        self.call_chunked_stream(&identity, method_idx, data_len, chunks)
+                        self.call_chunked_stream_phased(&identity, method_idx, data_len, chunks)
                             .await
                     }
                     RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                        let data = collect_exact_stream(data_len, chunks).await?;
-                        self.call_inline(&identity, method_idx, &data).await
+                        let data = collect_exact_stream(data_len, chunks)
+                            .await
+                            .map_err(pre_dispatch_call_error)?;
+                        self.call_inline(&identity, method_idx, &data)
+                            .await
+                            .map_err(classified_call_error)
                     }
                 }
             }
             RequestTransportKind::Chunked => {
-                self.call_chunked_stream(&identity, method_idx, data_len, chunks)
+                self.call_chunked_stream_phased(&identity, method_idx, data_len, chunks)
                     .await
             }
             RequestTransportKind::Inline => {
-                let data = collect_exact_stream(data_len, chunks).await?;
-                self.call_inline(&identity, method_idx, &data).await
+                let data = collect_exact_stream(data_len, chunks)
+                    .await
+                    .map_err(pre_dispatch_call_error)?;
+                self.call_inline(&identity, method_idx, &data)
+                    .await
+                    .map_err(classified_call_error)
             }
         }
     }
@@ -1677,22 +1756,26 @@ impl IpcClient {
         }
     }
 
-    async fn call_chunked_stream<S, B, E>(
+    async fn call_chunked_stream_phased<S, B, E>(
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
         data_size: usize,
         chunks: S,
-    ) -> Result<ResponseData, IpcError>
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>>,
         B: AsRef<[u8]>,
         E: Display,
     {
         let chunk_size = self.config.chunk_size as usize;
-        let total_chunks = request_chunk_count(data_size, chunk_size)?;
+        let total_chunks =
+            request_chunk_count(data_size, chunk_size).map_err(pre_dispatch_call_error)?;
         if total_chunks == 0 {
-            return self.call_inline(identity, method_idx, &[]).await;
+            return self
+                .call_inline(identity, method_idx, &[])
+                .await
+                .map_err(classified_call_error);
         }
 
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
@@ -1701,7 +1784,8 @@ impl IpcClient {
             self.pending.lock().insert(rid, PendingResponse::Unary(tx));
         }
 
-        let ctrl = encode_call_control(identity, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)
+            .map_err(|error| pre_dispatch_call_error(error.into()))?;
         let send_result = self
             .send_chunked_stream_frames(rid, total_chunks, chunk_size, data_size, &ctrl, chunks)
             .await;
@@ -1711,8 +1795,8 @@ impl IpcClient {
         }
 
         match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(IpcError::Closed),
+            Ok(result) => result.map_err(classified_call_error),
+            Err(_) => Err(dispatch_uncertain_call_error(IpcError::Closed)),
         }
     }
 
@@ -1724,7 +1808,7 @@ impl IpcClient {
         data_size: usize,
         ctrl: &[u8],
         chunks: S,
-    ) -> Result<(), IpcError>
+    ) -> Result<(), crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>>,
         B: AsRef<[u8]>,
@@ -1743,7 +1827,7 @@ impl IpcClient {
                     if sent_or_attempted {
                         self.close_shared().await;
                     }
-                    return Err(stream_error(err));
+                    return Err(stream_call_error(stream_error(err), sent_or_attempted));
                 }
             };
             let mut data = chunk.as_ref();
@@ -1754,17 +1838,21 @@ impl IpcClient {
                 if sent_or_attempted {
                     self.close_shared().await;
                 }
-                return Err(IpcError::Config(
-                    "request body size overflow while streaming chunks".into(),
+                return Err(stream_call_error(
+                    IpcError::Config("request body size overflow while streaming chunks".into()),
+                    sent_or_attempted,
                 ));
             };
             if next_written > data_size {
                 if sent_or_attempted {
                     self.close_shared().await;
                 }
-                return Err(IpcError::Config(format!(
-                    "request body exceeded declared content length {data_size}"
-                )));
+                return Err(stream_call_error(
+                    IpcError::Config(format!(
+                        "request body exceeded declared content length {data_size}"
+                    )),
+                    sent_or_attempted,
+                ));
             }
 
             while !data.is_empty() {
@@ -1788,7 +1876,7 @@ impl IpcClient {
                         .await
                     {
                         self.close_shared().await;
-                        return Err(err);
+                        return Err(dispatch_uncertain_call_error(err));
                     }
                     pending_chunk.clear();
                     chunk_idx += 1;
@@ -1802,9 +1890,12 @@ impl IpcClient {
             if sent_or_attempted {
                 self.close_shared().await;
             }
-            return Err(IpcError::Config(format!(
-                "request body ended at {written} bytes, expected {data_size}"
-            )));
+            return Err(stream_call_error(
+                IpcError::Config(format!(
+                    "request body ended at {written} bytes, expected {data_size}"
+                )),
+                sent_or_attempted,
+            ));
         }
 
         if !pending_chunk.is_empty() {
@@ -1822,7 +1913,7 @@ impl IpcClient {
                 .await
             {
                 self.close_shared().await;
-                return Err(err);
+                return Err(dispatch_uncertain_call_error(err));
             }
             chunk_idx += 1;
         }
@@ -1831,9 +1922,12 @@ impl IpcClient {
             if sent_or_attempted {
                 self.close_shared().await;
             }
-            return Err(IpcError::Config(format!(
-                "request stream emitted {chunk_idx} chunks, expected {total_chunks}"
-            )));
+            return Err(stream_call_error(
+                IpcError::Config(format!(
+                    "request stream emitted {chunk_idx} chunks, expected {total_chunks}"
+                )),
+                sent_or_attempted,
+            ));
         }
         Ok(())
     }
@@ -2658,6 +2752,23 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_call_failure_phase_depends_on_frame_attempt_not_error_variant() {
+        let before_dispatch = stream_call_error(IpcError::Config("short body".into()), false);
+        let after_frame_attempt = stream_call_error(IpcError::Config("short body".into()), true);
+
+        assert_eq!(
+            before_dispatch.phase(),
+            crate::sync_client::TransportPhase::PreDispatch
+        );
+        assert_eq!(
+            after_frame_attempt.phase(),
+            crate::sync_client::TransportPhase::DispatchUncertain
+        );
+        assert!(before_dispatch.is_retry_safe());
+        assert!(!after_frame_attempt.is_retry_safe());
+    }
 
     #[test]
     fn reassembly_pool_unique_prefixes() {

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use c2_server::{AccessLevel, ConcurrencyMode};
 
 #[derive(Debug, Clone)]
-pub struct RuntimeRouteSpec {
+pub(crate) struct RuntimeRouteSpec {
     pub name: String,
     pub crm_ns: String,
     pub crm_name: String,

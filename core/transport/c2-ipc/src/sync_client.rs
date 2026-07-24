@@ -14,6 +14,86 @@ use crate::client::{
 };
 use crate::response::{ResponseData, ResponseLease};
 
+/// Whether an IPC call failure is proven to precede CRM dispatch.
+///
+/// This is intentionally a transport-owned fact. Core retry policy consumes
+/// it directly and never infers dispatch safety from display text or an OS
+/// error kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportPhase {
+    PreDispatch,
+    DispatchUncertain,
+}
+
+/// An IPC call failure paired with its authoritative dispatch phase.
+#[derive(Debug)]
+pub struct IpcCallError {
+    phase: TransportPhase,
+    source: IpcError,
+}
+
+impl IpcCallError {
+    pub(crate) const fn new(phase: TransportPhase, source: IpcError) -> Self {
+        Self { phase, source }
+    }
+
+    pub const fn phase(&self) -> TransportPhase {
+        self.phase
+    }
+
+    pub const fn is_retry_safe(&self) -> bool {
+        matches!(self.phase, TransportPhase::PreDispatch)
+    }
+
+    pub const fn source_error(&self) -> &IpcError {
+        &self.source
+    }
+
+    pub fn into_source(self) -> IpcError {
+        self.source
+    }
+}
+
+impl std::fmt::Display for IpcCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "IPC call failed during {:?}: {}",
+            self.phase, self.source
+        )
+    }
+}
+
+impl std::error::Error for IpcCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
+    match error {
+        IpcError::Config(_)
+        | IpcError::Handshake(_)
+        | IpcError::Protocol(_)
+        | IpcError::IdentityMismatch { .. }
+        | IpcError::ContractMismatch(_)
+        | IpcError::RouteNotFound(_)
+        | IpcError::RouteRemoved { .. }
+        | IpcError::RouteClosed { .. }
+        | IpcError::RouteStale { .. }
+        | IpcError::CatalogCompacted { .. }
+        | IpcError::WatchUnavailable(_)
+        | IpcError::MethodNotFound { .. }
+        | IpcError::Shm(_)
+        | IpcError::Pool(_) => TransportPhase::PreDispatch,
+        IpcError::Io(_)
+        | IpcError::Decode(_)
+        | IpcError::Chunk(_)
+        | IpcError::CrmError(_)
+        | IpcError::Closed => TransportPhase::DispatchUncertain,
+    }
+}
+
 // ── Global shared runtime ────────────────────────────────────────────────
 
 static GLOBAL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -82,6 +162,17 @@ impl SyncClient {
     ) -> Result<ResponseData, IpcError> {
         self.rt
             .block_on(self.inner.call_bound(binding, method_name, data))
+    }
+
+    /// Synchronous CRM call with an explicit dispatch-safety phase on failure.
+    pub fn call_bound_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, IpcCallError> {
+        self.call_bound(binding, method_name, data)
+            .map_err(|source| IpcCallError::new(call_error_phase(&source), source))
     }
 
     /// Whether the client has a SHM pool and data exceeds the threshold.
@@ -330,6 +421,21 @@ pub(crate) mod tests {
         assert_eq!(result, 42);
         let result2 = h2.block_on(async { 43 });
         assert_eq!(result2, 43);
+    }
+
+    #[test]
+    fn call_phase_is_transport_owned_and_dispatch_uncertainty_is_not_retry_safe() {
+        let before_dispatch = IpcCallError::new(
+            TransportPhase::PreDispatch,
+            IpcError::MethodNotFound {
+                route_name: "route".to_string(),
+                method_name: "missing".to_string(),
+            },
+        );
+        let uncertain = IpcCallError::new(TransportPhase::DispatchUncertain, IpcError::Closed);
+
+        assert!(before_dispatch.is_retry_safe());
+        assert!(!uncertain.is_retry_safe());
     }
 
     #[test]

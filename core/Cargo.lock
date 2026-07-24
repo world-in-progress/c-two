@@ -136,6 +136,7 @@ dependencies = [
 name = "c2-core"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "c2-config",
  "c2-contract",
  "c2-error",

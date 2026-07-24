@@ -666,25 +666,25 @@ Review before commit:
 
 ### Task 4.1 — Write connection-mode and retry RED tests
 
-- [ ] `DirectIpc` connects only to the supplied address, performs no relay
+- [x] `DirectIpc` connects only to the supplied address, performs no relay
   resolution, and never falls back.
-- [ ] `ExplicitRelay` performs contract-scoped resolution and the data-plane
+- [x] `ExplicitRelay` performs contract-scoped resolution and the data-plane
   call through the supplied relay URL even when a valid local IPC route exists.
-- [ ] `RelayAware` may select a verified local IPC candidate before dispatch;
+- [x] `RelayAware` may select a verified local IPC candidate before dispatch;
   otherwise it selects an independent relay path.
-- [ ] All modes return the same concrete `c2_core::Client` and generated-facing
+- [x] All modes return the same concrete `c2_core::Client` and generated-facing
   `EncodedClient` behavior.
-- [ ] Record `ObservedPath` and path counters; assert explicit relay cannot be
+- [x] Record `ObservedPath` and path counters; assert explicit relay cannot be
   reported as direct and relay-aware local/relay selections are distinguishable.
-- [ ] A failed local candidate whose relay fallback resolves to the same IPC
+- [x] A failed local candidate whose relay fallback resolves to the same IPC
   path yields semantic `FallbackDenied`.
-- [ ] `ContractMismatch`, `IdentityMismatch`, and `ProtocolViolation` are
+- [x] `ContractMismatch`, `IdentityMismatch`, and `ProtocolViolation` are
   terminal and perform zero fallback attempts.
-- [ ] A stale cached route may be discarded and resolved once before dispatch;
+- [x] A stale cached route may be discarded and resolved once before dispatch;
   a second stale observation is terminal.
-- [ ] A service `C2Error` and a dispatch-uncertain connection loss perform zero
+- [x] A service `C2Error` and a dispatch-uncertain connection loss perform zero
   automatic replay.
-- [ ] Route disappearance maps never-resolved, unavailable, removed, closed,
+- [x] Route disappearance maps never-resolved, unavailable, removed, closed,
   and stale states to the existing error registry codes. It does not mutate a
   retained `ContractRelease`/`ContractReleaseRef`.
 
@@ -700,29 +700,29 @@ state machine.
 
 ### Task 4.2 — Implement the client facade
 
-- [ ] Define `Connect`, `Client`, `ObservedPath`, and the sealed
+- [x] Define `Connect`, `Client`, `ObservedPath`, and the sealed
   `EncodedClient` exactly at the frozen boundary.
-- [ ] Keep low-level `SyncClient`, `RouteBinding`, `RelayAwareHttpClient`,
+- [x] Keep low-level `SyncClient`, `RouteBinding`, `RelayAwareHttpClient`,
   pools, route tokens, and HTTP request objects private to `c2-core::client`.
-- [ ] Acquire/verify route identity before returning `Client`; generated code
+- [x] Acquire/verify route identity before returning `Client`; generated code
   receives no separate binding.
-- [ ] Expose read-only `Client::expected_route()` and `Client::observed_path()`
+- [x] Expose read-only `Client::expected_route()` and `Client::observed_path()`
   facts for generated verification and receipts; expose no mutable binding or
   transport handle.
-- [ ] Route `call_owned` through `ResponseLease::into_owned_bytes`.
-- [ ] Route `call_held` through `ResponseLease::copy_bytes` and return
+- [x] Route `call_owned` through `ResponseLease::into_owned_bytes`.
+- [x] Route `call_held` through `ResponseLease::copy_bytes` and return
   `HeldResponse` retaining the response lease.
-- [ ] Decode IPC C2E1 and HTTP error envelopes through `c2_core::error`, with
+- [x] Decode IPC C2E1 and HTTP error envelopes through `c2_core::error`, with
   identical `C2Error` code/name/message/details.
-- [ ] Represent “request may have been dispatched” explicitly in the low-level
+- [x] Represent “request may have been dispatched” explicitly in the low-level
   error returned to Core. Do not infer it from text or socket error kind.
-- [ ] Move global IPC/HTTP pool acquisition, configuration freeze, release, and
+- [x] Move global IPC/HTTP pool acquisition, configuration freeze, release, and
   shutdown ordering behind `Runtime`; do not expose a second process singleton
   in the Rust SDK.
 
 ### Task 4.3 — Implement the host facade
 
-- [ ] Define:
+- [x] Define:
 
 ```rust
 pub struct MethodDefinition {
@@ -739,19 +739,19 @@ pub struct ServiceDefinition {
 }
 ```
 
-- [ ] Validate method indices/names against the admitted release before building
+- [x] Validate method indices/names against the admitted release before building
   a low-level `RouteBuildSpec`.
-- [ ] `Host::register` owns server creation, route construction, local
+- [x] `Host::register` owns server creation, route construction, local
   registration, optional relay projection, rollback, and a returned
   `Registration`.
-- [ ] `Registration::close` and `Drop` are idempotent. Explicit close returns
+- [x] `Registration::close` and `Drop` are idempotent. Explicit close returns
   typed local/relay cleanup outcomes; Drop performs best-effort cleanup.
-- [ ] The Core callback wraps `RequestData` in `RequestLease`, copies bytes
+- [x] The Core callback wraps `RequestData` in `RequestLease`, copies bytes
   without release, calls `EncodedService::invoke`, and only then drops/releases
   the request lease.
-- [ ] Translate `C2Error` from an encoded service into existing C2E1 user-error
+- [x] Translate `C2Error` from an encoded service into existing C2E1 user-error
   bytes; malformed adapter behavior becomes `ProtocolViolation`.
-- [ ] Do not let callers construct a `c2-server` dispatcher, pool, route
+- [x] Do not let callers construct a `c2-server` dispatcher, pool, route
   catalog, or IPC callback.
 
 Run focused GREEN:
@@ -775,11 +775,19 @@ git diff --check
 
 Review before commit:
 
-- [ ] Draw every pre-dispatch and post-dispatch edge from the tests and verify
+- [x] Draw every pre-dispatch and post-dispatch edge from the tests and verify
   only proven pre-dispatch edges are retryable.
-- [ ] Verify explicit relay calls cross the relay data-plane counter.
-- [ ] Verify immutable release identity survives all route state transitions.
-- [ ] Verify no public Core type exposes a low-level transport implementation.
+- [x] Verify explicit relay calls cross the relay data-plane counter.
+- [x] Verify immutable release identity survives all route state transitions.
+- [x] Verify no public Core type exposes a low-level transport implementation.
+
+> Staged downstream note (2026-07-24): making the low-level route/server and
+> relay orchestration methods crate-private intentionally turns the existing
+> Python native implementation into the RED starting point for Task 7. Its
+> direct imports of `RuntimeRouteSpec`/`RelayResolvedConnection` and calls to
+> the old low-level lifecycle methods no longer compile. Do not reopen those
+> Core internals as compatibility surface; Task 7 replaces the duplicate PyO3
+> orchestration with `Client`, `Host`, and `Registration`.
 
 ## Task 5: Add the User-Facing Rust SDK `c-two`
 

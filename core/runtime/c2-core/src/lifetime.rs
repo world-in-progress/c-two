@@ -17,6 +17,17 @@ pub struct HeldResponse {
 }
 
 impl HeldResponse {
+    /// Construct a held result whose HTTP transport has already produced an
+    /// owned byte vector. The same invalidation API is retained even though no
+    /// transport allocation remains to release.
+    pub fn from_owned_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            lease: None,
+            released: false,
+        }
+    }
+
     /// Copy the response while retaining its transport lease.
     ///
     /// A failed copy still attempts transport cleanup and preserves both causes

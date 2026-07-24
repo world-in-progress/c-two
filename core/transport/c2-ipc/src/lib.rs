@@ -32,4 +32,4 @@ pub use control::{ping, shutdown, socket_path_from_ipc_address};
 pub use pool::ClientPool;
 pub use response::{ResponseData, ResponseLease};
 pub use shm::{MappedSegment, SegmentCache, ShmError};
-pub use sync_client::SyncClient;
+pub use sync_client::{IpcCallError, SyncClient, TransportPhase};
