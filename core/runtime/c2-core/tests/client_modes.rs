@@ -455,6 +455,8 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     let mut registration = host
         .register(definition(&route_name))
         .expect("route registration");
+    let registered_route_uid = registration.outcome().route_uid.clone();
+    let registered_route_revision = registration.outcome().route_revision;
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -470,6 +472,11 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         .expect("direct client");
     accepts_client(&direct);
     assert_eq!(direct.observed_path(), ObservedPath::DirectIpc);
+    assert_eq!(direct.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        direct.observed_route().route_revision,
+        registered_route_revision
+    );
     assert_eq!(direct.expected_route(), &expected);
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
@@ -486,6 +493,11 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         .expect("explicit relay client");
     accepts_client(&explicit);
     assert_eq!(explicit.observed_path(), ObservedPath::ExplicitRelay);
+    assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        explicit.observed_route().route_revision,
+        registered_route_revision
+    );
     assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
@@ -500,6 +512,11 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     assert_eq!(
         relay_aware.observed_path(),
         ObservedPath::RelayAwareLocalIpc
+    );
+    assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        relay_aware.observed_route().route_revision,
+        registered_route_revision
     );
     assert_eq!(
         relay_aware

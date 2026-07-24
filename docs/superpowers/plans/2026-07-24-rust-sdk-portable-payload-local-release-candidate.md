@@ -129,6 +129,15 @@ pub enum ObservedPath {
     RelayAwareRelay,
 }
 
+pub struct ObservedRoute {
+    pub route_uid: String,
+    pub route_revision: u64,
+}
+
+impl Client {
+    pub fn observed_route(&self) -> &ObservedRoute;
+}
+
 pub enum Error {
     Semantic(c2_error::C2Error),
     Contract(c2_contract::ContractError),
@@ -165,6 +174,12 @@ pub struct ServiceDefinition;
 pub struct Host;
 pub struct HostOptions;
 pub struct Registration;
+pub struct RegisterOutcome {
+    pub route_name: String,
+    pub route_uid: String,
+    pub route_revision: u64,
+    // Existing host and IPC facts remain unchanged.
+}
 
 // c-two Rust SDK
 pub struct Held<T> {
@@ -1281,6 +1296,7 @@ Observed Task 7 evidence:
 
 **Create:**
 
+- `.superpowers/sdd/c-two-lrc-task-8-brief.md` (ignored local execution evidence)
 - `tools/local_rc/__init__.py`
 - `sdk/python/tests/fixtures/portable_matrix.py`
 - `sdk/python/tests/fixtures/portable_matrix_rust.rs`
@@ -1293,14 +1309,31 @@ Observed Task 7 evidence:
 
 **Modify:**
 
+- `AGENTS.md`
+- `core/runtime/c2-core/src/client.rs`
+- `core/runtime/c2-core/src/lib.rs`
+- `core/runtime/c2-core/src/outcome.rs`
+- `core/runtime/c2-core/src/session.rs`
+- `core/runtime/c2-core/tests/client_modes.rs`
+- `core/transport/c2-http/src/client/relay_aware.rs`
+- `sdk/rust/src/lib.rs`
+- `sdk/rust/tests/public_api.rs`
+- `sdk/python/native/src/core_ffi.rs`
+- `sdk/python/native/src/runtime_session_ffi.rs`
+- `sdk/python/src/c_two/transport/client/proxy.py`
+- `sdk/python/src/c_two/transport/registry.py`
 - `sdk/python/tests/fixtures/portable_interop.py`
+- `sdk/python/tests/integration/test_core_transport_parity.py`
+- `sdk/python/tests/integration/test_direct_ipc_contract_validation.py`
 - `sdk/python/tests/integration/test_portable_payload_cross_language.py`
-- `tests/fixtures/contracts/portable-release.contract.json`
+- `sdk/python/tests/integration/test_registry.py`
 - `cli/tests/contract_commands.rs`
+- `docs/issues/contract-release-deferred-capabilities.md`
+- `docs/superpowers/plans/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md`
 
 ### Task 8.1 — Freeze the row set and receipt validator
 
-- [ ] Encode exactly these dimensions:
+- [x] Encode exactly these dimensions:
 
 ```python
 PAYLOADS = ("no-payload", "record-v1", "object-graph-v1")
@@ -1312,9 +1345,9 @@ DIRECTIONS = (
 TRANSPORTS = ("direct", "relay")
 ```
 
-- [ ] Derive exactly 18 stable IDs with
+- [x] Derive exactly 18 stable IDs with
   `f"{payload}__{direction}__{transport}"`.
-- [ ] Pin the exact ordered set:
+- [x] Pin the exact ordered set:
 
 ```python
 EXPECTED_ROW_IDS = (
@@ -1338,16 +1371,16 @@ EXPECTED_ROW_IDS = (
     "object-graph-v1__python-client__rust-host__relay",
 )
 ```
-- [ ] Make `test_portable_matrix_receipt.py` reject a missing, duplicate,
+- [x] Make `test_portable_matrix_receipt.py` reject a missing, duplicate,
   skipped, xfailed, unexpected, or non-passing row.
-- [ ] Require each row object to contain:
+- [x] Require each row object to contain:
   row ID, both languages, transport, observed path, descriptor SHA-256,
   complete `ContractReleaseRef`, FastDB spec SHA-256 (or explicit null for
   no-payload), route UID/revision, logical result hash, client/host package
   hashes, c3 hash for relay, and status.
-- [ ] Reject a relay row unless observed path is `ExplicitRelay` and its
+- [x] Reject a relay row unless observed path is `ExplicitRelay` and its
   request/response path counters are positive.
-- [ ] Reject absolute paths, duplicate JSON keys, unknown fields, and unstable
+- [x] Reject absolute paths, duplicate JSON keys, unknown fields, and unstable
   row order.
 
 Run RED:
@@ -1360,13 +1393,13 @@ Expected RED: no exact row-set/receipt implementation exists.
 
 ### Task 8.2 — Build one real harness for all rows
 
-- [ ] Generate Rust and Python contract trees through the same `c3 contract
+- [x] Generate Rust and Python contract trees through the same `c3 contract
   codegen` path from the same descriptor bytes.
-- [ ] Build the Rust client/host fixture against `c-two` and generated code,
+- [x] Build the Rust client/host fixture against `c-two` and generated code,
   never low-level C-Two crates.
-- [ ] Run Python rows through the installed/importable public `c_two` package,
+- [x] Run Python rows through the installed/importable public `c_two` package,
   never direct native FFI orchestration.
-- [ ] For every relay row, launch the real local `c3` binary:
+- [x] For every relay row, launch the real local `c3` binary:
 
 ```bash
 export C2_LRC_RELAY_PORT="$(uv run python -c \
@@ -1377,28 +1410,28 @@ c3 relay \
   --advertise-url "http://127.0.0.1:${C2_LRC_RELAY_PORT}"
 ```
 
-- [ ] Register the route through the host’s Core facade, wait for
+- [x] Register the route through the host’s Core facade, wait for
   contract-scoped resolution, perform the call through
   `Connect::ExplicitRelay`, then shut relay/host down and assert no child
   survives.
-- [ ] Reuse identical input and logical expected-result fixtures across direct
+- [x] Reuse identical input and logical expected-result fixtures across direct
   and relay for each payload/direction.
-- [ ] Cover record `str`, `wstr`, bytes, nested list, null, and empty values.
-- [ ] Cover graph shared references, self-cycle, and mutual cycle using
+- [x] Cover record `str`, `wstr`, bytes, nested list, null, and empty values.
+- [x] Cover graph shared references, self-cycle, and mutual cycle using
   official FastDB graph APIs.
-- [ ] Hash a canonical logical-result receipt rather than serializing a C-Two
+- [x] Hash a canonical logical-result receipt rather than serializing a C-Two
   invented graph format.
 
 ### Task 8.3 — Add targeted negative and lifetime matrix evidence
 
-- [ ] Test route mismatch, contract fingerprint mismatch, FastDB digest
+- [x] Test route mismatch, contract fingerprint mismatch, FastDB digest
   mismatch, and route disappearance over direct and relay where transport
   changes the boundary.
-- [ ] Test Rust/Python error parity where language changes projection.
-- [ ] Verify retained `ContractReleaseRef` after route disappearance.
-- [ ] Record borrowed invalidation, held invalidation-before-release, owned
+- [x] Test Rust/Python error parity where language changes projection.
+- [x] Verify retained `ContractReleaseRef` after route disappearance.
+- [x] Record borrowed invalidation, held invalidation-before-release, owned
   response release, and detached-materialization survival evidence.
-- [ ] No negative test is multiplied mechanically across all 18 positive rows;
+- [x] No negative test is multiplied mechanically across all 18 positive rows;
   each test states which transport/language boundary it proves.
 
 ### Task 8.4 — Execute the development matrix
@@ -1431,11 +1464,53 @@ git diff --check
 
 Review before commit:
 
-- [ ] Independently enumerate the Cartesian product and compare all 18 IDs.
-- [ ] Inspect process/path counters for every relay row.
-- [ ] Verify no skip/xfail branch exists in the matrix harness.
-- [ ] Verify every child process, socket, SHM allocation, and temp directory is
+- [x] Independently enumerate the Cartesian product and compare all 18 IDs.
+- [x] Inspect process/path counters for every relay row.
+- [x] Verify no skip/xfail branch exists in the matrix harness.
+- [x] Verify every child process, socket, SHM allocation, and temp directory is
   cleaned on success and failure.
+
+Observed Task 8 evidence:
+
+- The receipt-validator RED failed at collection because
+  `tools.local_rc.portable_matrix_receipt` did not exist. The route-observation
+  RED then failed compilation because `RegisterOutcome` did not expose the
+  registered token and `Client` did not provide `observed_route()`.
+- The focused matrix/validator run passes 50 tests: 18 exact positive rows, one
+  complete-receipt assertion, five targeted negative/lifetime cases, and 26
+  strict receipt-validator tests. An independent shell enumeration matches the
+  receipt order byte for byte.
+- A combined cross-language run exposed that relay catalog resolution can
+  precede lazy data-plane-client readiness. The harness now polls the same
+  contract- and token-scoped `/_probe` used by explicit-relay connection before
+  making the one non-replayed business call. The final cross-language,
+  18-row, and receipt suite passes 51 tests.
+- The first complete Python rerun exposed seven stale tests that expected a
+  leaked native `RuntimeError` for direct contract mismatch. Direct IPC now
+  decodes the Core error envelope like explicit relay and relay-aware paths;
+  the tests assert public `ContractMismatch`. The complete Python suite then
+  passes 853 tests.
+- Core format, workspace strict Clippy, and the complete Core workspace tests
+  pass. CLI format, strict Clippy, and 45 tests pass. The `c-two` Rust SDK
+  format, strict Clippy, 10 tests, and doc tests pass. Python native format and
+  strict Clippy pass.
+- The development receipt at
+  `target/local-rc/portable-matrix-receipt.v1.json` has SHA-256
+  `1031cb4a062fe2931842030cd0819644cbb93deff6512b860ea9571e59948146`,
+  contains 18 passing rows split 9 direct/9 explicit relay, and every relay
+  row records positive request/response evidence. Its local linked/source
+  package hashes are deliberately not candidate-package evidence; Task 11
+  replaces this ephemeral receipt.
+- Same-agent specification/ownership review confirmed that Core remains
+  payload-neutral, the Rust harness imports only `c-two`, generated modules,
+  and official FastDB, Python does not orchestrate through `_native`, all relay
+  rows start real `c3`, and FastDB remains clean at
+  `6b9d0a55f27bb22fd13f867f321db821f21e777c`.
+- Same-agent correctness/lifetime/portability/maintenance review confirmed the
+  exact row set, connect-time route-token semantics, invalidation/release
+  ordering, materialization survival, canonical error projection, absence of
+  skip/xfail/opt-in branches, deterministic receipt encoding, and zero
+  surviving matrix/relay/build processes or matrix socket/temp residue.
 
 ## Task 9: Execute Generated TypeScript Against Real Hosts
 

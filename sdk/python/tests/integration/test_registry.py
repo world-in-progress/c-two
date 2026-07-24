@@ -16,7 +16,7 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.error import ResourceAlreadyRegistered, RouteStale
+from c_two.error import ContractMismatch, ResourceAlreadyRegistered, RouteStale
 from c_two.transport.registry import _ProcessRegistry
 from c_two.transport.client.proxy import CRMProxy
 
@@ -274,7 +274,7 @@ class TestRegisterConnect:
         addr = cc.server_address()
         assert addr is not None
 
-        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+        with pytest.raises(ContractMismatch, match='CRM contract mismatch'):
             cc.connect(OtherHello, name='hello', address=addr)
 
     def test_connect_ipc_rejects_crm_name_mismatch(self):
@@ -282,7 +282,7 @@ class TestRegisterConnect:
         addr = cc.server_address()
         assert addr is not None
 
-        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+        with pytest.raises(ContractMismatch, match='CRM contract mismatch'):
             cc.connect(RenamedHello, name='hello', address=addr)
 
     def test_validated_ipc_client_is_bound_to_connected_route(self):

@@ -31,6 +31,13 @@ pub enum ObservedPath {
     RelayAwareRelay,
 }
 
+/// Immutable route identity observed when one Core client is acquired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedRoute {
+    pub route_uid: String,
+    pub route_revision: u64,
+}
+
 /// Monotonic process-runtime observations of successfully selected paths.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PathCounters {
@@ -73,6 +80,7 @@ impl PathCounters {
 pub struct Client {
     expected: ExpectedRouteContract,
     observed_path: ObservedPath,
+    observed_route: ObservedRoute,
     inner: ClientInner,
 }
 
@@ -111,6 +119,10 @@ impl Client {
 
     pub const fn observed_path(&self) -> ObservedPath {
         self.observed_path
+    }
+
+    pub fn observed_route(&self) -> &ObservedRoute {
+        &self.observed_route
     }
 
     fn call_ipc(
@@ -188,15 +200,17 @@ impl Runtime {
         match mode {
             Connect::DirectIpc { address } => {
                 let connection = self.acquire_direct_ipc(&address, &expected)?;
+                let observed_route = observed_ipc_route(&connection);
                 self.finish_client(
                     expected,
                     ObservedPath::DirectIpc,
+                    observed_route,
                     ClientInner::Ipc(connection),
                 )
             }
             Connect::ExplicitRelay { relay_url } => {
                 let settings = self.relay_client_settings()?;
-                let client = self
+                let (client, route_uid, route_revision) = self
                     .connect_explicit_relay_http_client(
                         &relay_url,
                         expected.clone(),
@@ -209,6 +223,10 @@ impl Runtime {
                 self.finish_client(
                     expected,
                     ObservedPath::ExplicitRelay,
+                    ObservedRoute {
+                        route_uid,
+                        route_revision,
+                    },
                     ClientInner::Http(client),
                 )
             }
@@ -220,12 +238,14 @@ impl Runtime {
         &self,
         expected: ExpectedRouteContract,
         observed_path: ObservedPath,
+        observed_route: ObservedRoute,
         inner: ClientInner,
     ) -> Result<Client, Error> {
         self.record_path(observed_path);
         Ok(Client {
             expected,
             observed_path,
+            observed_route,
             inner,
         })
     }
@@ -345,18 +365,30 @@ impl Runtime {
             )
             .map_err(normalize_resolution_error)?;
         match resolved {
-            RelayResolvedConnection::Http { client } => self.finish_client(
+            RelayResolvedConnection::Http {
+                client,
+                route_uid,
+                route_revision,
+            } => self.finish_client(
                 expected,
                 ObservedPath::RelayAwareRelay,
+                ObservedRoute {
+                    route_uid,
+                    route_revision,
+                },
                 ClientInner::Http(client),
             ),
             RelayResolvedConnection::Ipc { client, candidate } => {
                 match self.acquire_relay_ipc(&candidate, &expected) {
-                    Ok(connection) => self.finish_client(
-                        expected,
-                        ObservedPath::RelayAwareLocalIpc,
-                        ClientInner::Ipc(connection),
-                    ),
+                    Ok(connection) => {
+                        let observed_route = observed_ipc_route(&connection);
+                        self.finish_client(
+                            expected,
+                            ObservedPath::RelayAwareLocalIpc,
+                            observed_route,
+                            ClientInner::Ipc(connection),
+                        )
+                    }
                     Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
                     Err(_) => {
                         let resolved = Runtime::resolve_relay_connection_after_local_ipc_failures(
@@ -365,16 +397,26 @@ impl Runtime {
                         )
                         .map_err(normalize_resolution_error)?;
                         match resolved {
-                            RelayResolvedConnection::Http { client } => self.finish_client(
+                            RelayResolvedConnection::Http {
+                                client,
+                                route_uid,
+                                route_revision,
+                            } => self.finish_client(
                                 expected,
                                 ObservedPath::RelayAwareRelay,
+                                ObservedRoute {
+                                    route_uid,
+                                    route_revision,
+                                },
                                 ClientInner::Http(client),
                             ),
                             RelayResolvedConnection::Ipc { candidate, .. } => {
                                 let connection = self.acquire_relay_ipc(&candidate, &expected)?;
+                                let observed_route = observed_ipc_route(&connection);
                                 self.finish_client(
                                     expected,
                                     ObservedPath::RelayAwareLocalIpc,
+                                    observed_route,
                                     ClientInner::Ipc(connection),
                                 )
                             }
@@ -383,6 +425,13 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+fn observed_ipc_route(connection: &PooledIpcClient) -> ObservedRoute {
+    ObservedRoute {
+        route_uid: connection.binding.route_uid().to_string(),
+        route_revision: connection.binding.route_revision(),
     }
 }
 

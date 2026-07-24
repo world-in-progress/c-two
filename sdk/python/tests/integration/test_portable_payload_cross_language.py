@@ -17,8 +17,24 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
+from c_two.error import ContractMismatch
 from c_two.transport.registry import _ProcessRegistry
-
+from fastdb4py.payload import Payload, PayloadError
+from tests.fixtures.portable_interop import (
+    GRAPH_SPEC,
+    GRAPH_SPEC_PATH,
+    RECORD_SPEC,
+    RECORD_SPEC_PATH,
+    PortableInterop,
+    PortableInteropResource,
+    assert_graph_detached,
+    assert_record_detached,
+    assert_view_invalidated,
+    build_graph_payload,
+    build_record_payload,
+    inspect_graph_payload,
+    inspect_record_payload,
+)
 
 REPOSITORY = Path(__file__).resolve().parents[4]
 FASTDB_REPOSITORY = REPOSITORY.parent / "fastdb"
@@ -27,33 +43,8 @@ RUST_HARNESS_SOURCE = (
     / "sdk/python/tests/fixtures/portable_interop_rust.rs"
 )
 TARGET_DIR = REPOSITORY / "core/target"
-RUN_INTEROP = os.environ.get("C2_RUN_PORTABLE_INTEROP") == "1"
 
-if RUN_INTEROP:
-    from fastdb4py.payload import Payload, PayloadError
-    from tests.fixtures.portable_interop import (
-        GRAPH_SPEC,
-        GRAPH_SPEC_PATH,
-        RECORD_SPEC,
-        RECORD_SPEC_PATH,
-        PortableInterop,
-        PortableInteropResource,
-        assert_graph_detached,
-        assert_record_detached,
-        assert_view_invalidated,
-        build_graph_payload,
-        build_record_payload,
-        inspect_graph_payload,
-        inspect_record_payload,
-    )
-
-pytestmark = [
-    pytest.mark.timeout(300),
-    pytest.mark.skipif(
-        not RUN_INTEROP,
-        reason="set C2_RUN_PORTABLE_INTEROP=1 to run the compiled cross-language proof",
-    ),
-]
+pytestmark = pytest.mark.timeout(300)
 
 IPC_OVERRIDES = {
     "pool_segment_size": 1024 * 1024,
@@ -384,7 +375,7 @@ def test_generated_rust_python_runtime_composition_is_bidirectional() -> None:
                 def record_roundtrip(self, payload: Payload) -> Payload:
                     ...
 
-            with pytest.raises(RuntimeError, match="CRM contract mismatch"):
+            with pytest.raises(ContractMismatch, match="CRM contract mismatch"):
                 cc.connect(
                     WrongPortableInterop,
                     name=rust_route,

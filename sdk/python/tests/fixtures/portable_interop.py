@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,27 @@ RECORD_SPEC: dict[str, Any] = json.loads(RECORD_SPEC_BYTES)
 GRAPH_SPEC: dict[str, Any] = json.loads(GRAPH_SPEC_BYTES)
 
 
+@cc.crm(namespace="test.portable-matrix.no-payload", version="0.1.0")
+class PortableNoPayload:
+    @cc.read
+    def ping(self) -> None:
+        ...
+
+
+@cc.crm(namespace="test.portable-matrix.record-v1", version="0.1.0")
+class PortableRecord:
+    @cc.transfer(input=RECORD_SPEC, output=RECORD_SPEC)
+    def roundtrip(self, payload: Payload) -> Payload:
+        ...
+
+
+@cc.crm(namespace="test.portable-matrix.object-graph-v1", version="0.1.0")
+class PortableObjectGraph:
+    @cc.transfer(input=GRAPH_SPEC, output=GRAPH_SPEC)
+    def roundtrip(self, payload: Payload) -> Payload:
+        ...
+
+
 @cc.crm(namespace="test.portable-interop", version="0.1.0")
 class PortableInterop:
     @cc.transfer(input=GRAPH_SPEC, output=GRAPH_SPEC)
@@ -47,6 +69,51 @@ class PortableInterop:
     @cc.transfer(input=RECORD_SPEC, output=RECORD_SPEC)
     def record_roundtrip(self, payload: Payload) -> Payload:
         ...
+
+
+LOGICAL_RESULTS: dict[str, dict[str, Any]] = {
+    "no-payload": {
+        "profile": "no-payload",
+        "result": {"ping": "ok"},
+        "schema": "c-two.portable-logical-result.v1",
+    },
+    "record-v1": {
+        "profile": "record-v1",
+        "result": {
+            "bytes_hex": "0001ff",
+            "nested": [[], None, ["", None, "tail"]],
+            "record_bool": True,
+            "record_u8": 0xAB,
+            "series": [None, [], [0, None, 0xFF], [7]],
+            "str": "\ufeffA\0B",
+            "wstr": "\ufeffA\0🌍Ω",
+        },
+        "schema": "c-two.portable-logical-result.v1",
+    },
+    "object-graph-v1": {
+        "profile": "object-graph-v1",
+        "result": {
+            "bytes_hex": "00ff7e",
+            "mutual_cycle": True,
+            "nested_null": True,
+            "self_cycle": True,
+            "shared_reference": True,
+            "str": "same",
+            "wstr": "A😀",
+        },
+        "schema": "c-two.portable-logical-result.v1",
+    },
+}
+
+
+def logical_result_sha256(payload: str) -> str:
+    canonical = json.dumps(
+        LOGICAL_RESULTS[payload],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def build_record_payload() -> Payload:

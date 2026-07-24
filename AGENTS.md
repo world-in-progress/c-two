@@ -50,10 +50,13 @@ cargo test --manifest-path sdk/rust/Cargo.toml --all-features
 cargo run --manifest-path sdk/rust/Cargo.toml --example client
 cargo run --manifest-path sdk/rust/Cargo.toml --example host
 
-# Opt-in compiled Rust/Python portable-payload interoperability proof
-C2_RUN_PORTABLE_INTEROP=1 C2_RELAY_ANCHOR_ADDRESS= \
-  uv run pytest sdk/python/tests/integration/test_portable_payload_cross_language.py \
-  -q --timeout=300 -s
+# Compiled Rust/Python portable proof and exact 18-row direct/relay matrix.
+# These are normal gates, not opt-in tests.
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
+  sdk/python/tests/integration/test_portable_payload_cross_language.py \
+  sdk/python/tests/integration/test_portable_payload_matrix.py \
+  -q --timeout=300
+uv run pytest tests/repo/test_portable_matrix_receipt.py -q
 
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two

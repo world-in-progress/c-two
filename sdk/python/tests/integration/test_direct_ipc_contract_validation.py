@@ -7,6 +7,7 @@ import pytest
 import c_two as cc
 from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
+from c_two.error import ContractMismatch
 from c_two.transport.registry import _ProcessRegistry
 
 
@@ -134,7 +135,7 @@ def test_explicit_direct_ipc_rejects_same_tag_contract_fingerprint_mismatch_with
 
     settings.relay_anchor_address = "http://127.0.0.1:9"
 
-    with pytest.raises(RuntimeError, match="CRM contract mismatch"):
+    with pytest.raises(ContractMismatch, match="CRM contract mismatch"):
         cc.connect(client_contract, name="grid", address=address)
 
     assert resource.calls == []

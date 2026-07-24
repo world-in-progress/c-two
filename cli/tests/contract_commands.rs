@@ -8,6 +8,23 @@ const RELEASE_DESCRIPTOR: &str =
     include_str!("../../tests/fixtures/contracts/portable-release.contract.json");
 const RELEASE_REFERENCE: &str =
     include_str!("../../tests/fixtures/contracts/portable-release.ref.json");
+const MATRIX_DESCRIPTORS: [(&str, &str, Option<&str>); 3] = [
+    (
+        "no-payload",
+        include_str!("../../tests/fixtures/contracts/portable-no-payload.contract.json"),
+        None,
+    ),
+    (
+        "record-v1",
+        include_str!("../../tests/fixtures/contracts/portable-record-v1.contract.json"),
+        Some("record.v1"),
+    ),
+    (
+        "object-graph-v1",
+        include_str!("../../tests/fixtures/contracts/portable-object-graph-v1.contract.json"),
+        Some("object_graph.v1"),
+    ),
+];
 
 #[test]
 fn contract_codegen_portable_project_tree() {
@@ -68,6 +85,68 @@ fn contract_codegen_portable_project_tree() {
             .stderr(predicate::str::contains(
                 "artifact destination already exists",
             ));
+    }
+}
+
+#[test]
+fn portable_matrix_descriptors_codegen_through_one_cli_path() {
+    let tempdir = tempfile::tempdir().unwrap();
+
+    for (payload, descriptor, fastdb_profile) in MATRIX_DESCRIPTORS {
+        let descriptor_value: serde_json::Value =
+            serde_json::from_str(descriptor).expect("matrix descriptor JSON");
+        let methods = descriptor_value["methods"]
+            .as_array()
+            .expect("matrix methods");
+        assert_eq!(methods.len(), 1, "{payload}");
+        match fastdb_profile {
+            Some(profile) => {
+                assert_eq!(
+                    methods[0]["bindings"]["input"]["spec"]["profile"], profile,
+                    "{payload}",
+                );
+                assert_eq!(
+                    methods[0]["bindings"]["output"]["spec"]["profile"], profile,
+                    "{payload}",
+                );
+            }
+            None => {
+                assert!(methods[0]["bindings"]["input"].is_null(), "{payload}");
+                assert!(methods[0]["bindings"]["output"].is_null(), "{payload}");
+            }
+        }
+
+        let descriptor_path = tempdir.path().join(format!("{payload}.contract.json"));
+        std::fs::write(&descriptor_path, descriptor).unwrap();
+        let mut canonical = Vec::new();
+        let mut release_refs = Vec::new();
+        for target in ["rust", "python"] {
+            let destination = tempdir.path().join(format!("{payload}-{target}"));
+            let mut command = Command::cargo_bin("c3").unwrap();
+            command
+                .args([
+                    "contract",
+                    "codegen",
+                    target,
+                    descriptor_path.to_str().unwrap(),
+                    "--out-dir",
+                    destination.to_str().unwrap(),
+                ])
+                .assert()
+                .success()
+                .stdout(predicate::str::is_empty());
+            canonical.push(std::fs::read(destination.join("metadata/contract.json")).unwrap());
+            release_refs.push(
+                std::fs::read(destination.join("metadata/contract-release-ref.json")).unwrap(),
+            );
+            assert_eq!(
+                destination.join(target).join("payloads").exists(),
+                fastdb_profile.is_some(),
+                "{payload} {target}",
+            );
+        }
+        assert_eq!(canonical[0], canonical[1], "{payload}");
+        assert_eq!(release_refs[0], release_refs[1], "{payload}");
     }
 }
 

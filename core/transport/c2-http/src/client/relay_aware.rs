@@ -91,15 +91,21 @@ pub struct RelayLocalIpcCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayResolvedTarget {
-    Ipc { candidate: RelayLocalIpcCandidate },
-    Http { relay_url: String },
+    Ipc {
+        candidate: RelayLocalIpcCandidate,
+    },
+    Http {
+        relay_url: String,
+        route_uid: String,
+        route_revision: u64,
+    },
 }
 
 impl RelayResolvedTarget {
     pub fn as_url(&self) -> &str {
         match self {
             Self::Ipc { candidate } => &candidate.address,
-            Self::Http { relay_url } => relay_url,
+            Self::Http { relay_url, .. } => relay_url,
         }
     }
 }
@@ -314,7 +320,11 @@ impl RelayAwareHttpClient {
                 {
                     Ok(()) => {
                         *self.current.lock() = Some(relay_url.clone());
-                        return Ok(RelayResolvedTarget::Http { relay_url });
+                        return Ok(RelayResolvedTarget::Http {
+                            relay_url,
+                            route_uid: route.route_uid,
+                            route_revision: route.route_revision,
+                        });
                     }
                     Err(err) if route_is_stale(&err) => {
                         self.control.invalidate(self.route_name());
@@ -1163,7 +1173,9 @@ mod tests {
         assert_eq!(
             target,
             RelayResolvedTarget::Http {
-                relay_url: live_url
+                relay_url: live_url,
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
             }
         );
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);

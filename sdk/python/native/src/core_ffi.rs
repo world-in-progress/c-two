@@ -8,7 +8,10 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
-use c2_core::{Client, EncodedClient, EncodedService, HeldResponse, LifecycleError, ObservedPath};
+use c2_core::{
+    Client, EncodedClient, EncodedService, HeldResponse, LifecycleError, ObservedPath,
+    ObservedRoute,
+};
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::BufferLeaseGuard;
 
@@ -21,16 +24,19 @@ pub(crate) struct PyCoreClient {
     inner: Mutex<Option<Client>>,
     route_name: String,
     observed_path: ObservedPath,
+    observed_route: ObservedRoute,
 }
 
 impl PyCoreClient {
     pub(crate) fn new(client: Client) -> Self {
         let route_name = client.expected_route().route_name.clone();
         let observed_path = client.observed_path();
+        let observed_route = client.observed_route().clone();
         Self {
             inner: Mutex::new(Some(client)),
             route_name,
             observed_path,
+            observed_route,
         }
     }
 
@@ -94,6 +100,16 @@ impl PyCoreClient {
             ObservedPath::RelayAwareLocalIpc => "relay_aware_local_ipc",
             ObservedPath::RelayAwareRelay => "relay_aware_relay",
         }
+    }
+
+    #[getter]
+    fn route_uid(&self) -> &str {
+        &self.observed_route.route_uid
+    }
+
+    #[getter]
+    fn route_revision(&self) -> u64 {
+        self.observed_route.route_revision
     }
 
     fn call<'py>(&self, py: Python<'py>, method_name: &str, data: &[u8]) -> PyResult<Py<PyAny>> {

@@ -164,6 +164,8 @@ pub(crate) enum RelayResolvedConnection {
     },
     Http {
         client: RelayAwareHttpClient,
+        route_uid: String,
+        route_revision: u64,
     },
 }
 
@@ -434,6 +436,8 @@ impl Runtime {
     ) -> Result<RegisterOutcome, LifecycleError> {
         let identity = self.ensure_server()?;
         let route_name = spec.name.clone();
+        let route_uid = route.route_uid().to_string();
+        let route_revision = route.route_revision();
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
         if route.name() != spec.name {
@@ -656,6 +660,8 @@ impl Runtime {
 
         Ok(RegisterOutcome {
             route_name,
+            route_uid,
+            route_revision,
             server_id: identity.server_id,
             server_instance_id: identity.server_instance_id,
             ipc_address: identity.ipc_address,
@@ -878,7 +884,15 @@ impl Runtime {
             RelayResolvedTarget::Ipc { candidate } => {
                 Ok(RelayResolvedConnection::Ipc { client, candidate })
             }
-            RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
+            RelayResolvedTarget::Http {
+                route_uid,
+                route_revision,
+                ..
+            } => Ok(RelayResolvedConnection::Http {
+                client,
+                route_uid,
+                route_revision,
+            }),
         }
     }
 
@@ -893,7 +907,15 @@ impl Runtime {
             RelayResolvedTarget::Ipc { candidate } => {
                 Ok(RelayResolvedConnection::Ipc { client, candidate })
             }
-            RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
+            RelayResolvedTarget::Http {
+                route_uid,
+                route_revision,
+                ..
+            } => Ok(RelayResolvedConnection::Http {
+                client,
+                route_uid,
+                route_revision,
+            }),
         }
     }
 
@@ -905,7 +927,7 @@ impl Runtime {
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
-    ) -> Result<RelayAwareHttpClient, LifecycleError> {
+    ) -> Result<(RelayAwareHttpClient, String, u64), LifecycleError> {
         let client = RelayAwareHttpClient::new(
             relay_url,
             expected,
@@ -918,7 +940,11 @@ impl Runtime {
         )
         .map_err(runtime_http_error)?;
         match client.resolve_http_target().map_err(runtime_http_error)? {
-            RelayResolvedTarget::Http { .. } => Ok(client),
+            RelayResolvedTarget::Http {
+                route_uid,
+                route_revision,
+                ..
+            } => Ok((client, route_uid, route_revision)),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
         }
     }

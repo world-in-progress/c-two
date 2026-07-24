@@ -1,0 +1,491 @@
+{
+  "crm": {
+    "name": "PortableObjectGraph",
+    "namespace": "test.portable-matrix.object-graph-v1",
+    "version": "0.1.0"
+  },
+  "fingerprints": {
+    "abi_hash": "df0d306b4b40c8724be9539f70912dd4b3c7a5ad8f54b19e95ef9c17c2ded5c1",
+    "signature_hash": "aeb06bf0f4745dab0af518caefe6a46ef4b17856fbfd6f567ff189b686d52e91"
+  },
+  "methods": [
+    {
+      "access": "write",
+      "bindings": {
+        "input": {
+          "kind": "fastdb",
+          "spec": {
+            "components": [
+              {
+                "fields": [
+                  {
+                    "id": "name",
+                    "type": {
+                      "kind": "str",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "owner",
+                    "type": {
+                      "kind": "ref",
+                      "nullable": true,
+                      "target": "Node"
+                    }
+                  }
+                ],
+                "id": "Asset",
+                "kind": "record"
+              },
+              {
+                "fields": [
+                  {
+                    "id": "flag",
+                    "type": {
+                      "kind": "bool",
+                      "nullable": true
+                    }
+                  },
+                  {
+                    "id": "code",
+                    "type": {
+                      "kind": "u16",
+                      "nullable": false
+                    }
+                  }
+                ],
+                "id": "Inline",
+                "kind": "record"
+              },
+              {
+                "fields": [
+                  {
+                    "id": "a_bool",
+                    "type": {
+                      "kind": "bool",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "b_u8",
+                    "type": {
+                      "kind": "u8",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "c_u16",
+                    "type": {
+                      "kind": "u16",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "d_u32",
+                    "type": {
+                      "kind": "u32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "e_i32",
+                    "type": {
+                      "kind": "i32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "f_u8n",
+                    "type": {
+                      "kind": "u8n",
+                      "max": 1,
+                      "min": 0,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "g_u16n",
+                    "type": {
+                      "kind": "u16n",
+                      "max": 1,
+                      "min": -1,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "h_f32",
+                    "type": {
+                      "kind": "f32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "i_f64",
+                    "type": {
+                      "kind": "f64",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "j_str",
+                    "type": {
+                      "kind": "str",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "k_wstr",
+                    "type": {
+                      "kind": "wstr",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "l_bytes",
+                    "type": {
+                      "kind": "bytes",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "m_inline",
+                    "type": {
+                      "id": "Inline",
+                      "kind": "component",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "n_values",
+                    "type": {
+                      "items": {
+                        "kind": "f32",
+                        "nullable": true
+                      },
+                      "kind": "list",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "o_peer",
+                    "type": {
+                      "kind": "ref",
+                      "nullable": false,
+                      "target": "Node"
+                    }
+                  },
+                  {
+                    "id": "p_asset",
+                    "type": {
+                      "kind": "ref",
+                      "nullable": false,
+                      "target": "Asset"
+                    }
+                  }
+                ],
+                "id": "Node",
+                "kind": "record"
+              }
+            ],
+            "entries": [
+              {
+                "cardinality": "one",
+                "id": "root",
+                "type": {
+                  "id": "Node",
+                  "kind": "component",
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "one",
+                "id": "asset",
+                "type": {
+                  "id": "Asset",
+                  "kind": "component",
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "refs",
+                "type": {
+                  "kind": "ref",
+                  "nullable": true,
+                  "target": "Node"
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "u8n_values",
+                "type": {
+                  "kind": "u8n",
+                  "max": 1,
+                  "min": 0,
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "u16n_values",
+                "type": {
+                  "kind": "u16n",
+                  "max": 1,
+                  "min": -1,
+                  "nullable": false
+                }
+              }
+            ],
+            "profile": "object_graph.v1",
+            "schema": "fastdb.payload.v1"
+          }
+        },
+        "output": {
+          "kind": "fastdb",
+          "spec": {
+            "components": [
+              {
+                "fields": [
+                  {
+                    "id": "name",
+                    "type": {
+                      "kind": "str",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "owner",
+                    "type": {
+                      "kind": "ref",
+                      "nullable": true,
+                      "target": "Node"
+                    }
+                  }
+                ],
+                "id": "Asset",
+                "kind": "record"
+              },
+              {
+                "fields": [
+                  {
+                    "id": "flag",
+                    "type": {
+                      "kind": "bool",
+                      "nullable": true
+                    }
+                  },
+                  {
+                    "id": "code",
+                    "type": {
+                      "kind": "u16",
+                      "nullable": false
+                    }
+                  }
+                ],
+                "id": "Inline",
+                "kind": "record"
+              },
+              {
+                "fields": [
+                  {
+                    "id": "a_bool",
+                    "type": {
+                      "kind": "bool",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "b_u8",
+                    "type": {
+                      "kind": "u8",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "c_u16",
+                    "type": {
+                      "kind": "u16",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "d_u32",
+                    "type": {
+                      "kind": "u32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "e_i32",
+                    "type": {
+                      "kind": "i32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "f_u8n",
+                    "type": {
+                      "kind": "u8n",
+                      "max": 1,
+                      "min": 0,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "g_u16n",
+                    "type": {
+                      "kind": "u16n",
+                      "max": 1,
+                      "min": -1,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "h_f32",
+                    "type": {
+                      "kind": "f32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "i_f64",
+                    "type": {
+                      "kind": "f64",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "j_str",
+                    "type": {
+                      "kind": "str",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "k_wstr",
+                    "type": {
+                      "kind": "wstr",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "l_bytes",
+                    "type": {
+                      "kind": "bytes",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "m_inline",
+                    "type": {
+                      "id": "Inline",
+                      "kind": "component",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "n_values",
+                    "type": {
+                      "items": {
+                        "kind": "f32",
+                        "nullable": true
+                      },
+                      "kind": "list",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "o_peer",
+                    "type": {
+                      "kind": "ref",
+                      "nullable": false,
+                      "target": "Node"
+                    }
+                  },
+                  {
+                    "id": "p_asset",
+                    "type": {
+                      "kind": "ref",
+                      "nullable": false,
+                      "target": "Asset"
+                    }
+                  }
+                ],
+                "id": "Node",
+                "kind": "record"
+              }
+            ],
+            "entries": [
+              {
+                "cardinality": "one",
+                "id": "root",
+                "type": {
+                  "id": "Node",
+                  "kind": "component",
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "one",
+                "id": "asset",
+                "type": {
+                  "id": "Asset",
+                  "kind": "component",
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "refs",
+                "type": {
+                  "kind": "ref",
+                  "nullable": true,
+                  "target": "Node"
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "u8n_values",
+                "type": {
+                  "kind": "u8n",
+                  "max": 1,
+                  "min": 0,
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "u16n_values",
+                "type": {
+                  "kind": "u16n",
+                  "max": 1,
+                  "min": -1,
+                  "nullable": false
+                }
+              }
+            ],
+            "profile": "object_graph.v1",
+            "schema": "fastdb.payload.v1"
+          }
+        }
+      },
+      "name": "roundtrip",
+      "parameters": [
+        {
+          "default": {
+            "kind": "missing"
+          },
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "payload",
+          "type": {
+            "kind": "payload"
+          }
+        }
+      ],
+      "return": {
+        "kind": "payload"
+      }
+    }
+  ],
+  "schema": "c-two.contract.v2"
+}

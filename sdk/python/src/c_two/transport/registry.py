@@ -82,10 +82,6 @@ def _relay_control_error_status(exc: BaseException) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _is_crm_contract_mismatch(exc: BaseException) -> bool:
-    return isinstance(exc, RuntimeError) and "CRM contract mismatch" in str(exc)
-
-
 def _is_missing_relay_address(exc: BaseException) -> bool:
     return getattr(exc, 'lifecycle_kind', None) == 'missing_relay_address'
 
@@ -428,8 +424,6 @@ class _ProcessRegistry:
                     *expected_contract.native_args(),
                 )
             except Exception as exc:
-                if _is_crm_contract_mismatch(exc):
-                    raise
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
                     raise cc_err from exc
                 status = _relay_control_error_status(exc)
@@ -446,11 +440,16 @@ class _ProcessRegistry:
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
-            client = self._runtime_session.acquire_ipc_client(
-                address,
-                name,
-                *expected_contract.native_args(),
-            )
+            try:
+                client = self._runtime_session.acquire_ipc_client(
+                    address,
+                    name,
+                    *expected_contract.native_args(),
+                )
+            except Exception as exc:
+                if (cc_err := _cc_error_from_native_exception(exc)) is not None:
+                    raise cc_err from exc
+                raise
             proxy = CRMProxy.ipc(
                 client,
                 name,
@@ -465,8 +464,6 @@ class _ProcessRegistry:
                     *expected_contract.native_args(),
                 )
             except Exception as exc:
-                if _is_crm_contract_mismatch(exc):
-                    raise
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
                     raise cc_err from exc
                 if _is_missing_relay_address(exc):
