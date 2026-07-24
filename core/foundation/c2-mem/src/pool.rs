@@ -545,6 +545,35 @@ impl MemPool {
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<Vec<u8>, String> {
+        let (pointer, len) = self.checked_data_pointer(seg_idx, offset, data_size, is_dedicated)?;
+
+        // SAFETY: `checked_data_pointer` proves that the non-empty span is
+        // entirely inside the mapped data region and no longer than
+        // `isize::MAX`.
+        Ok(unsafe { std::slice::from_raw_parts(pointer, len) }.to_vec())
+    }
+
+    /// Validate shared-memory coordinates without copying their contents.
+    ///
+    /// Checked release paths use this before deriving a buddy allocation level.
+    pub fn validate_data_at(
+        &self,
+        seg_idx: u32,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<(), String> {
+        self.checked_data_pointer(seg_idx, offset, data_size, is_dedicated)
+            .map(|_| ())
+    }
+
+    fn checked_data_pointer(
+        &self,
+        seg_idx: u32,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<(*mut u8, usize), String> {
         if data_size == 0 {
             return Err("shared-memory copy span must not be empty".into());
         }
@@ -586,9 +615,7 @@ impl MemPool {
             segment.allocator().data_ptr(offset)
         };
 
-        // SAFETY: the branch above proves that the non-empty span is entirely
-        // inside the mapped data region and no longer than `isize::MAX`.
-        Ok(unsafe { std::slice::from_raw_parts(pointer, len) }.to_vec())
+        Ok((pointer, len))
     }
 
     // ── MemHandle API ──────────────────────────────────────────────
@@ -818,6 +845,43 @@ impl MemPool {
                     )
                 })?;
                 Ok(bytes.to_vec())
+            }
+        }
+    }
+
+    /// Validate a handle's complete logical span without copying its contents.
+    pub fn validate_handle(&self, handle: &MemHandle) -> Result<(), String> {
+        match handle {
+            MemHandle::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => self.validate_data_at(
+                u32::from(*seg_idx),
+                *offset,
+                u32::try_from(*len)
+                    .map_err(|_| "buddy handle length exceeds the wire address space")?,
+                false,
+            ),
+            MemHandle::Dedicated { seg_idx, len } => self.validate_data_at(
+                u32::from(*seg_idx),
+                0,
+                u32::try_from(*len)
+                    .map_err(|_| "dedicated handle length exceeds the wire address space")?,
+                true,
+            ),
+            MemHandle::FileSpill { mmap, len, .. } => {
+                if *len == 0 {
+                    return Err("file-spill copy span must not be empty".into());
+                }
+                mmap.get(..*len).ok_or_else(|| {
+                    format!(
+                        "file-spill copy span of {} bytes is outside file-spill mapping of {} bytes",
+                        len,
+                        mmap.len()
+                    )
+                })?;
+                Ok(())
             }
         }
     }
@@ -1212,6 +1276,16 @@ mod tests {
             .data_size();
         assert!(
             pool.copy_data_at(
+                buddy.seg_idx,
+                u32::try_from(buddy_capacity - 1).unwrap(),
+                2,
+                false,
+            )
+            .unwrap_err()
+            .contains("outside buddy segment")
+        );
+        assert!(
+            pool.validate_data_at(
                 buddy.seg_idx,
                 u32::try_from(buddy_capacity - 1).unwrap(),
                 2,
@@ -1787,6 +1861,11 @@ mod handle_tests {
         };
         assert!(
             pool.copy_handle_data(&handle)
+                .unwrap_err()
+                .contains("outside buddy segment")
+        );
+        assert!(
+            pool.validate_handle(&handle)
                 .unwrap_err()
                 .contains("outside buddy segment")
         );

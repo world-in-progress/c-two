@@ -320,7 +320,7 @@ impl CrmCallback for PortableHost {
         request: RequestData,
         _response_pool: Arc<parking_lot::RwLock<MemPool>>,
     ) -> Result<ResponseMeta, CrmError> {
-        let bytes = request
+        let bytes = c2_server::RequestLease::new(request)
             .into_owned_bytes()
             .map_err(|error| crm_internal("materialize request", error))?;
         let method = contract::METHODS

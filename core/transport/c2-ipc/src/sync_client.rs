@@ -12,7 +12,7 @@ use crate::client::{
     ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestTransportKind, RouteBinding,
     ServerPoolState, choose_request_transport,
 };
-use crate::response::ResponseData;
+use crate::response::{ResponseData, ResponseLease};
 
 // ── Global shared runtime ────────────────────────────────────────────────
 
@@ -202,6 +202,11 @@ impl SyncClient {
     /// Get a reference to the client reassembly pool (for FFI layer).
     pub fn reassembly_pool_arc(&self) -> Arc<RwLock<MemPool>> {
         self.inner.reassembly_pool_arc()
+    }
+
+    /// Bind a response to the exact transport pools that own its backing.
+    pub fn lease_response(&self, response: ResponseData) -> ResponseLease {
+        ResponseLease::new(response, self.server_pool_arc(), self.reassembly_pool_arc())
     }
 
     /// Synchronous close.

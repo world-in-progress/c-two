@@ -18,8 +18,19 @@ pub enum LifecycleError {
     MissingRoute(String),
     RelayDuplicateRoute(String),
     MissingRelayAddress,
-    RelayHttp { status_code: u16, message: String },
+    RelayHttp {
+        status_code: u16,
+        message: String,
+    },
     RegisterFailure(Box<RegisterFailureOutcome>),
+    HeldResponseCopy {
+        copy_error: String,
+        transport_error: Option<String>,
+    },
+    HeldResponseRelease {
+        invalidation_error: Option<String>,
+        transport_error: Option<String>,
+    },
     Server(String),
     Relay(String),
 }
@@ -44,6 +55,32 @@ impl fmt::Display for LifecycleError {
                 "registration failed at {}: {}",
                 outcome.failure_source, outcome.error_message
             ),
+            Self::HeldResponseCopy {
+                copy_error,
+                transport_error,
+            } => {
+                write!(formatter, "held response copy failed: {copy_error}")?;
+                if let Some(transport_error) = transport_error {
+                    write!(
+                        formatter,
+                        "; response transport cleanup also failed: {transport_error}"
+                    )?;
+                }
+                Ok(())
+            }
+            Self::HeldResponseRelease {
+                invalidation_error,
+                transport_error,
+            } => {
+                formatter.write_str("held response release failed")?;
+                if let Some(invalidation_error) = invalidation_error {
+                    write!(formatter, "; invalidation: {invalidation_error}")?;
+                }
+                if let Some(transport_error) = transport_error {
+                    write!(formatter, "; transport cleanup: {transport_error}")?;
+                }
+                Ok(())
+            }
             Self::Server(message) => write!(formatter, "server error: {message}"),
             Self::Relay(message) => write!(formatter, "relay error: {message}"),
         }

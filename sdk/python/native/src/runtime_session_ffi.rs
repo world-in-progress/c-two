@@ -1198,6 +1198,10 @@ fn runtime_error_to_py(err: c2_core::LifecycleError) -> PyErr {
             });
             exc
         }
+        c2_core::LifecycleError::HeldResponseCopy { .. }
+        | c2_core::LifecycleError::HeldResponseRelease { .. } => {
+            PyRuntimeError::new_err(err.to_string())
+        }
         c2_core::LifecycleError::Server(message) => PyRuntimeError::new_err(message),
         c2_core::LifecycleError::Relay(message) => {
             PyRuntimeError::new_err(format!("relay error: {message}"))

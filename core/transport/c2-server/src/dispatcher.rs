@@ -77,67 +77,148 @@ pub enum RequestData {
 }
 
 impl RequestData {
-    /// Copy this request into Rust-owned bytes and release its transport storage.
-    ///
-    /// This is the explicit receive path for Rust CRM hosts that need an owned
-    /// buffer, including consumers that open a copy-backed FastDB payload.
-    /// Language bindings and other zero-copy consumers should continue matching
-    /// the variants directly and retain/release their scoped owners themselves.
-    /// Invalid coordinates are rejected without attempting a coordinate-derived
-    /// release because an unvalidated size could free the wrong buddy level.
-    pub fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
+    fn copy_bytes(&self) -> Result<Vec<u8>, String> {
         match self {
-            RequestData::Inline(data) => Ok(data),
-            RequestData::Shm {
+            Self::Inline(data) => Ok(data.clone()),
+            Self::Shm {
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            } => pool
+                .read()
+                .copy_data_at(u32::from(*seg_idx), *offset, *data_size, *is_dedicated)
+                .map_err(|error| format!("request SHM copy failed: {error}")),
+            Self::Handle { handle, pool } => pool
+                .read()
+                .copy_handle_data(handle)
+                .map_err(|error| format!("request handle copy failed: {error}")),
+        }
+    }
+
+    fn release(self) -> Result<(), String> {
+        match self {
+            Self::Inline(_) => Ok(()),
+            Self::Shm {
                 pool,
                 seg_idx,
                 offset,
                 data_size,
                 is_dedicated,
             } => {
-                let data = {
-                    let pool = pool.read();
-                    pool.copy_data_at(seg_idx as u32, offset, data_size, is_dedicated)
-                }
-                .map_err(|error| format!("request SHM read failed: {error}"))?;
-                pool.write()
-                    .free_at(seg_idx as u32, offset, data_size, is_dedicated)
+                let mut pool = pool.write();
+                pool.validate_data_at(u32::from(seg_idx), offset, data_size, is_dedicated)
+                    .map_err(|error| format!("request SHM release validation failed: {error}"))?;
+                pool.free_at(u32::from(seg_idx), offset, data_size, is_dedicated)
                     .map_err(|error| format!("request SHM release failed: {error}"))?;
-                Ok(data)
+                Ok(())
             }
-            RequestData::Handle { handle, pool } => {
-                let data = {
-                    let pool = pool.read();
-                    pool.copy_handle_data(&handle)
-                }
-                .map_err(|error| format!("request handle read failed: {error}"))?;
-                pool.write().release_handle(handle);
-                Ok(data)
+            Self::Handle { handle, pool } => {
+                let mut pool = pool.write();
+                pool.validate_handle(&handle).map_err(|error| {
+                    format!("request handle release validation failed: {error}")
+                })?;
+                release_request_handle(&mut pool, handle)
             }
         }
+    }
+}
+
+fn release_request_handle(pool: &mut MemPool, handle: MemHandle) -> Result<(), String> {
+    match handle {
+        MemHandle::Buddy {
+            seg_idx,
+            offset,
+            len,
+        } => {
+            let data_size = u32::try_from(len)
+                .map_err(|_| "request buddy handle length exceeds the wire address space")?;
+            pool.free_at(u32::from(seg_idx), offset, data_size, false)
+                .map_err(|error| format!("request handle release failed: {error}"))?;
+        }
+        MemHandle::Dedicated { seg_idx, len } => {
+            let data_size = u32::try_from(len)
+                .map_err(|_| "request dedicated handle length exceeds the wire address space")?;
+            pool.free_at(u32::from(seg_idx), 0, data_size, true)
+                .map_err(|error| format!("request handle release failed: {error}"))?;
+        }
+        MemHandle::FileSpill { .. } => {}
+    }
+    Ok(())
+}
+
+/// Owns one request transport allocation until it is explicitly released.
+///
+/// `copy_bytes` validates and copies without changing transport ownership.
+/// `release` is idempotent and validates public coordinates before deriving a
+/// buddy allocation level. Dropping an unreleased lease performs the same
+/// best-effort cleanup.
+pub struct RequestLease {
+    request: Option<RequestData>,
+}
+
+impl RequestLease {
+    pub fn new(request: RequestData) -> Self {
+        Self {
+            request: Some(request),
+        }
+    }
+
+    pub fn copy_bytes(&self) -> Result<Vec<u8>, String> {
+        self.request
+            .as_ref()
+            .ok_or_else(|| "request lease is already released".to_string())?
+            .copy_bytes()
+    }
+
+    pub fn release(&mut self) -> Result<(), String> {
+        let Some(request) = self.request.take() else {
+            return Ok(());
+        };
+        request.release()
+    }
+
+    pub fn into_owned_bytes(mut self) -> Result<Vec<u8>, String> {
+        let Some(request) = self.request.take() else {
+            return Err("request lease is already released".to_string());
+        };
+        self.request = match request {
+            RequestData::Inline(data) => return Ok(data),
+            transport_request => Some(transport_request),
+        };
+        let copy_result = self.copy_bytes();
+        let release_result = self.release();
+        combine_copy_and_release("request", copy_result, release_result)
+    }
+}
+
+impl Drop for RequestLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn combine_copy_and_release(
+    kind: &str,
+    copy_result: Result<Vec<u8>, String>,
+    release_result: Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    match (copy_result, release_result) {
+        (Ok(bytes), Ok(())) => Ok(bytes),
+        (Err(copy_error), Ok(())) => Err(copy_error),
+        (Ok(_), Err(release_error)) => Err(release_error),
+        (Err(copy_error), Err(release_error)) => Err(format!(
+            "{kind} copy failed: {copy_error}; {kind} release also failed: {release_error}"
+        )),
     }
 }
 
 /// Explicitly release SHM resources held by a RequestData.
 /// Must be called on error paths where the request won't be consumed by a CRM callback.
 pub fn cleanup_request(request: RequestData) {
-    match request {
-        RequestData::Shm {
-            pool,
-            seg_idx,
-            offset,
-            data_size,
-            is_dedicated,
-        } => {
-            let mut p = pool.write();
-            let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
-        }
-        RequestData::Handle { handle, pool } => {
-            let mut p = pool.write();
-            p.release_handle(handle);
-        }
-        RequestData::Inline(_) => {}
-    }
+    let mut lease = RequestLease::new(request);
+    let _ = lease.release();
 }
 
 impl std::fmt::Debug for RequestData {
@@ -475,11 +556,36 @@ mod tests {
     #[test]
     fn request_data_inline_materializes_owned_bytes() {
         assert_eq!(
-            RequestData::Inline(b"inline".to_vec())
+            RequestLease::new(RequestData::Inline(b"inline".to_vec()))
                 .into_owned_bytes()
                 .unwrap(),
             b"inline",
         );
+    }
+
+    #[test]
+    fn request_lease_copy_retains_backing_until_idempotent_release() {
+        let payload = b"borrowed request".repeat(128);
+        let mut pool = request_test_pool();
+        let allocation = pool.alloc(payload.len()).unwrap();
+        let pointer = pool.data_ptr(&allocation).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, payload.len());
+        }
+        let pool = Arc::new(parking_lot::RwLock::new(pool));
+        let mut lease = RequestLease::new(RequestData::Shm {
+            pool: Arc::clone(&pool),
+            seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+            offset: allocation.offset,
+            data_size: u32::try_from(payload.len()).unwrap(),
+            is_dedicated: allocation.is_dedicated,
+        });
+
+        assert_eq!(lease.copy_bytes().unwrap(), payload);
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        lease.release().unwrap();
+        lease.release().unwrap();
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     #[test]
@@ -500,7 +606,10 @@ mod tests {
                 is_dedicated: allocation.is_dedicated,
             };
 
-            assert_eq!(request.into_owned_bytes().unwrap(), payload);
+            assert_eq!(
+                RequestLease::new(request).into_owned_bytes().unwrap(),
+                payload
+            );
             assert_eq!(pool.read().stats().alloc_count, 0);
         }
     }
@@ -524,7 +633,7 @@ mod tests {
         };
 
         assert!(
-            request
+            RequestLease::new(request)
                 .into_owned_bytes()
                 .unwrap_err()
                 .contains("outside buddy segment")
@@ -545,7 +654,10 @@ mod tests {
             pool: Arc::clone(&pool),
         };
 
-        assert_eq!(request.into_owned_bytes().unwrap(), payload);
+        assert_eq!(
+            RequestLease::new(request).into_owned_bytes().unwrap(),
+            payload
+        );
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 

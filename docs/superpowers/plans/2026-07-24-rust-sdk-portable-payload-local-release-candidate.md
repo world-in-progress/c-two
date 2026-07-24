@@ -557,23 +557,23 @@ guidance must return no match.
 
 ### Task 3.1 — Write ordering and failure-path RED tests
 
-- [ ] Use an event log to assert borrowed input order:
+- [x] Use an event log to assert borrowed input order:
   `callback-enter`, `fastdb-invalidate`, `callback-exit`,
   `request-lease-release`.
-- [ ] Repeat the assertion for normal return, adapter error, early return, and
+- [x] Repeat the assertion for normal return, adapter error, early return, and
   unwind through an SDK-owned invalidation guard.
-- [ ] Assert checked views/clones sharing the owner fail after invalidation while
+- [x] Assert checked views/clones sharing the owner fail after invalidation while
   a detached materialized value remains valid.
-- [ ] Assert owned response order:
+- [x] Assert owned response order:
   `response-copy`, `response-lease-release`, `adapter-open-copy`, `return`.
-- [ ] Assert held response explicit `release()` and `Drop` both perform
+- [x] Assert held response explicit `release()` and `Drop` both perform
   `fastdb-invalidate` before `response-lease-release`, exactly once.
-- [ ] Inject invalidation failure and response-release failure independently and
+- [x] Inject invalidation failure and response-release failure independently and
   together. Both actions must be attempted once; combined failure must retain
   both causes.
-- [ ] Exercise inline, buddy SHM, dedicated SHM, and reassembly-handle response
+- [x] Exercise inline, buddy SHM, dedicated SHM, and reassembly-handle response
   variants.
-- [ ] Assert invalid SHM coordinates fail copy without deriving/freeing an
+- [x] Assert invalid SHM coordinates fail copy without deriving/freeing an
   allocation from unvalidated coordinates.
 
 Run RED:
@@ -587,31 +587,31 @@ cannot retain transport storage across an adapter scope.
 
 ### Task 3.2 — Add low-level lease primitives
 
-- [ ] Replace direct `RequestData::into_owned_bytes` use in Core-facing paths
+- [x] Replace direct `RequestData::into_owned_bytes` use in Core-facing paths
   with `RequestLease`.
-- [ ] `RequestLease::copy_bytes(&self)` validates/copies without release;
+- [x] `RequestLease::copy_bytes(&self)` validates/copies without release;
   `release` consumes the underlying transport ownership once; `Drop` is the
   fail-safe.
-- [ ] Split `ServerPoolState::read_and_free` into checked `copy_response` and
+- [x] Split `ServerPoolState::read_and_free` into checked `copy_response` and
   `release_response` operations, then retain `read_and_free` only as a composed
   internal convenience if existing relay code still consumes it atomically.
-- [ ] Implement `c2_ipc::ResponseLease` from `ResponseData` plus the exact
+- [x] Implement `c2_ipc::ResponseLease` from `ResponseData` plus the exact
   server/reassembly pool Arcs. Do not expose raw pointers or coordinate-based
   release to SDK callers.
-- [ ] For `Inline(Vec<u8>)`, `copy_bytes` clones while `into_owned_bytes` moves.
+- [x] For `Inline(Vec<u8>)`, `copy_bytes` clones while `into_owned_bytes` moves.
   For SHM/handle variants, both paths validate before release.
-- [ ] Add `SyncClient::lease_response(ResponseData) -> ResponseLease`.
+- [x] Add `SyncClient::lease_response(ResponseData) -> ResponseLease`.
 
 ### Task 3.3 — Add Core-owned held sequencing
 
-- [ ] Implement `c2_core::HeldResponse` with private bytes/lease fields and an
+- [x] Implement `c2_core::HeldResponse` with private bytes/lease fields and an
   idempotent state bit.
-- [ ] `invalidate_then_release` must always run the release after the callback,
+- [x] `invalidate_then_release` must always run the release after the callback,
   even if the callback returns `Err`.
-- [ ] `Drop` may perform only best-effort transport cleanup because it has no
+- [x] `Drop` may perform only best-effort transport cleanup because it has no
   FastDB object; SDK-owned `Held<Payload>` supplies the invalidation callback
   before its Core held response drops.
-- [ ] Document that unsafe raw pointers obtained outside checked FastDB access
+- [x] Document that unsafe raw pointers obtained outside checked FastDB access
   cannot be revoked.
 
 Run focused GREEN:
@@ -633,10 +633,10 @@ git diff --check
 
 Review before commit:
 
-- [ ] Trace ownership for all `RequestData` and `ResponseData` variants.
-- [ ] Prove every copy/read failure either retains a valid lease for safe
+- [x] Trace ownership for all `RequestData` and `ResponseData` variants.
+- [x] Prove every copy/read failure either retains a valid lease for safe
   cleanup or returns a typed combined cleanup error.
-- [ ] Prove Core contains no FastDB import, type, parser, or payload meaning.
+- [x] Prove Core contains no FastDB import, type, parser, or payload meaning.
 
 ## Task 4: Build the Single `c2-core` Client, Host, Route, and Retry Facade
 

@@ -447,3 +447,187 @@ mod client_tests {
         assert_eq!(hs.prefix, "test_prefix");
     }
 }
+
+#[cfg(test)]
+mod response_lease_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use c2_mem::{MemPool, PoolConfig};
+    use parking_lot::{Mutex, RwLock};
+
+    use crate::{ResponseData, ResponseLease, ServerPoolState};
+
+    const SEGMENT_SIZE: usize = 64 * 1024;
+
+    fn pool_config() -> PoolConfig {
+        PoolConfig {
+            segment_size: SEGMENT_SIZE,
+            min_block_size: 4096,
+            max_segments: 2,
+            max_dedicated_segments: 2,
+            dedicated_crash_timeout_secs: 5.0,
+            buddy_idle_decay_secs: 1.0,
+            spill_threshold: 1.0,
+            spill_dir: std::env::temp_dir().join("c_two_response_lease_test_spill"),
+        }
+    }
+
+    fn unique_prefix(label: char) -> String {
+        static NEXT_POOL: AtomicUsize = AtomicUsize::new(0);
+        let sequence = NEXT_POOL.fetch_add(1, Ordering::Relaxed);
+        format!("/c2lr{:08x}{sequence:04x}{label}", std::process::id())
+            .chars()
+            .take(24)
+            .collect()
+    }
+
+    fn empty_reassembly_pool(label: char) -> Arc<RwLock<MemPool>> {
+        Arc::new(RwLock::new(MemPool::new_with_prefix(
+            pool_config(),
+            unique_prefix(label),
+        )))
+    }
+
+    #[test]
+    fn inline_response_copy_and_release_are_independent_and_idempotent() {
+        let mut lease = ResponseLease::new(
+            ResponseData::Inline(b"inline response".to_vec()),
+            Arc::new(Mutex::new(None)),
+            empty_reassembly_pool('i'),
+        );
+
+        assert_eq!(lease.copy_bytes().unwrap(), b"inline response");
+        assert!(!lease.is_released());
+        lease.release().unwrap();
+        lease.release().unwrap();
+        assert!(lease.is_released());
+    }
+
+    #[test]
+    fn buddy_and_dedicated_response_leases_copy_then_release_real_backings() {
+        assert_shm_response(b"buddy response".repeat(128), false, 'b');
+        assert_shm_response(vec![0xD2; SEGMENT_SIZE + 4096], true, 'd');
+    }
+
+    #[test]
+    fn reassembly_handle_response_copies_then_releases_real_backing() {
+        let pool = empty_reassembly_pool('h');
+        let payload = b"reassembled response".repeat(256);
+        let handle = {
+            let mut pool = pool.write();
+            let mut handle = pool.alloc_handle(payload.len()).unwrap();
+            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+            handle
+        };
+        let mut lease = ResponseLease::new(
+            ResponseData::Handle(handle),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&pool),
+        );
+
+        assert_eq!(lease.copy_bytes().unwrap(), payload);
+        lease.release().unwrap();
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn invalid_shm_span_fails_copy_and_drop_without_freeing_an_allocation() {
+        let prefix = unique_prefix('x');
+        let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
+        let allocation = producer.alloc(4096).unwrap();
+        let segment_capacity = producer
+            .segment(allocation.seg_idx as usize)
+            .unwrap()
+            .allocator()
+            .data_size();
+        let reader = MemPool::new_with_prefix(pool_config(), prefix);
+        let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
+            SEGMENT_SIZE,
+            reader,
+        ))));
+        let lease = ResponseLease::new(
+            ResponseData::Shm {
+                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+                offset: u32::try_from(segment_capacity - 1).unwrap(),
+                data_size: 2,
+                is_dedicated: false,
+            },
+            server_pool,
+            empty_reassembly_pool('r'),
+        );
+
+        assert!(
+            lease
+                .copy_bytes()
+                .unwrap_err()
+                .contains("outside buddy segment")
+        );
+        drop(lease);
+
+        assert_eq!(producer.stats().alloc_count, 1);
+        producer.free(&allocation).unwrap();
+    }
+
+    #[test]
+    fn consuming_copy_retains_copy_and_release_failures() {
+        let pool = empty_reassembly_pool('c');
+        let handle = {
+            let mut pool = pool.write();
+            let mut handle = pool.alloc_handle(16).unwrap();
+            pool.handle_slice_mut(&mut handle)
+                .copy_from_slice(b"combined failure");
+            handle
+        };
+        let lease = ResponseLease::new(
+            ResponseData::Handle(handle),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&pool),
+        );
+        *pool.write() = MemPool::new_with_prefix(pool_config(), unique_prefix('z'));
+
+        let error = lease.into_owned_bytes().unwrap_err();
+        assert!(error.contains("response handle copy failed"), "{error}");
+        assert!(error.contains("response handle release failed"), "{error}");
+    }
+
+    fn assert_shm_response(payload: Vec<u8>, expected_dedicated: bool, label: char) {
+        let prefix = unique_prefix(label);
+        let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
+        let allocation = producer.alloc(payload.len()).unwrap();
+        assert_eq!(allocation.is_dedicated, expected_dedicated);
+        let pointer = producer.data_ptr(&allocation).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, payload.len());
+        }
+
+        let reader = MemPool::new_with_prefix(pool_config(), prefix);
+        let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
+            SEGMENT_SIZE,
+            reader,
+        ))));
+        let mut lease = ResponseLease::new(
+            ResponseData::Shm {
+                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+                offset: allocation.offset,
+                data_size: u32::try_from(payload.len()).unwrap(),
+                is_dedicated: allocation.is_dedicated,
+            },
+            Arc::clone(&server_pool),
+            empty_reassembly_pool(label.to_ascii_uppercase()),
+        );
+
+        assert_eq!(lease.copy_bytes().unwrap(), payload);
+        lease.release().unwrap();
+        assert_eq!(
+            server_pool
+                .lock()
+                .as_ref()
+                .unwrap()
+                .pool
+                .stats()
+                .alloc_count,
+            0
+        );
+    }
+}

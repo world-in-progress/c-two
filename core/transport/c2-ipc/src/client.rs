@@ -16,7 +16,6 @@ use tokio::net::UnixStream;
 use tokio::sync::{Mutex, oneshot};
 
 use c2_error::ErrorCode;
-use c2_mem::FreeResult;
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
@@ -109,37 +108,48 @@ impl ServerPoolState {
         }
     }
 
-    /// Read data from server SHM and free the allocation.
-    pub fn read_and_free(
+    /// Copy response bytes after lazily opening and validating the advertised
+    /// shared-memory span. Transport ownership is unchanged.
+    pub fn copy_response(
         &mut self,
         seg_idx: u16,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
-    ) -> Result<(Vec<u8>, FreeResult), String> {
-        if is_dedicated {
-            self.ensure_dedicated_segment(seg_idx, data_size as usize)?;
-        } else {
-            self.ensure_buddy_segment(seg_idx)?;
+    ) -> Result<Vec<u8>, String> {
+        self.ensure_segment(seg_idx, data_size, is_dedicated)?;
+        self.pool
+            .copy_data_at(u32::from(seg_idx), offset, data_size, is_dedicated)
+            .map_err(|error| format!("response SHM copy failed: {error}"))
+    }
+
+    /// Release response storage only after validating the complete advertised
+    /// span. This prevents an invalid size from deriving a different buddy
+    /// allocation level.
+    pub fn release_response(
+        &mut self,
+        seg_idx: u16,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<(), String> {
+        self.ensure_segment(seg_idx, data_size, is_dedicated)?;
+        self.pool
+            .validate_data_at(u32::from(seg_idx), offset, data_size, is_dedicated)
+            .map_err(|error| format!("response SHM release failed: validation failed: {error}"))?;
+        self.pool
+            .free_at(u32::from(seg_idx), offset, data_size, is_dedicated)
+            .map_err(|error| format!("response SHM release failed: {error}"))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pool_for_test(buddy_segment_size: usize, pool: MemPool) -> Self {
+        Self {
+            prefix: pool.prefix().to_string(),
+            buddy_segment_size,
+            pool,
         }
-
-        let ptr = self
-            .pool
-            .data_ptr_at(seg_idx as u32, offset, is_dedicated)?;
-        let data = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) }.to_vec();
-
-        let free_result = match self
-            .pool
-            .free_at(seg_idx as u32, offset, data_size, is_dedicated)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Warning: server SHM free_at failed: {e}");
-                FreeResult::Normal
-            }
-        };
-
-        Ok((data, free_result))
     }
 }
 
