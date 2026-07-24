@@ -97,7 +97,7 @@ impl BuddyAllocator {
 
         // R-C3: Verify SHM base address is properly aligned for SegmentHeader.
         assert!(
-            base as usize % std::mem::align_of::<SegmentHeader>() == 0,
+            (base as usize).is_multiple_of(std::mem::align_of::<SegmentHeader>()),
             "SHM base address must be aligned to SegmentHeader requirements"
         );
 
@@ -167,7 +167,7 @@ impl BuddyAllocator {
     pub unsafe fn attach(base: *mut u8, total_size: usize) -> Result<Self, &'static str> {
         // R-C3: Verify alignment for SegmentHeader access in attach path too.
         assert!(
-            base as usize % std::mem::align_of::<SegmentHeader>() == 0,
+            (base as usize).is_multiple_of(std::mem::align_of::<SegmentHeader>()),
             "SHM base address must be aligned to SegmentHeader requirements"
         );
 
@@ -307,7 +307,7 @@ impl BuddyAllocator {
         let block_size = self.level_block_size(level);
 
         // R-I4: Validate offset alignment.
-        if (offset as usize) % block_size != 0 {
+        if !(offset as usize).is_multiple_of(block_size) {
             return Err(format!(
                 "free: offset {} not aligned to block size {} at level {}",
                 offset, block_size, level
@@ -452,8 +452,7 @@ impl BuddyAllocator {
         let bitmap_bytes = crate::alloc::bitmap::total_bitmap_bytes(data_candidate, min_block);
         let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
         // Round up to page alignment.
-        let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
-        data_offset
+        (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1)
     }
 
     /// Compute the minimum total SHM size needed so that the usable data region

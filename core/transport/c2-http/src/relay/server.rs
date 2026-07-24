@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::relay::authority::{ControlError, RouteAuthority};
+use crate::relay::authority::{ControlError, LocalRegistration, LocalRouteOwner, RouteAuthority};
 use crate::relay::background::spawn_background_tasks;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
@@ -352,27 +352,26 @@ impl RelayServer {
                             url: s.config().effective_advertise_url(),
                         },
                     );
-                    if let Ok(resp) = client.post(&join_url).json(&envelope).send().await {
-                        if let Ok(envelope) =
+                    if let Ok(resp) = client.post(&join_url).json(&envelope).send().await
+                        && let Ok(envelope) =
                             resp.json::<crate::relay::types::FullSyncEnvelope>().await
-                        {
-                            let Ok(snapshot) =
-                                crate::relay::types::ValidatedFullSync::try_from(envelope)
-                            else {
-                                continue;
-                            };
-                            s.merge_snapshot(snapshot);
-                            let peers = s.list_peers();
-                            let announce = PeerEnvelope::new(
-                                s.relay_id(),
-                                PeerMessage::RelayJoin {
-                                    relay_id: s.relay_id().to_string(),
-                                    url: s.config().effective_advertise_url(),
-                                },
-                            );
-                            s.disseminator().broadcast(announce, &peers);
-                            break;
-                        }
+                    {
+                        let Ok(snapshot) =
+                            crate::relay::types::ValidatedFullSync::try_from(envelope)
+                        else {
+                            continue;
+                        };
+                        s.merge_snapshot(snapshot);
+                        let peers = s.list_peers();
+                        let announce = PeerEnvelope::new(
+                            s.relay_id(),
+                            PeerMessage::RelayJoin {
+                                relay_id: s.relay_id().to_string(),
+                                url: s.config().effective_advertise_url(),
+                            },
+                        );
+                        s.disseminator().broadcast(announce, &peers);
+                        break;
                     }
                 }
             });
@@ -631,21 +630,16 @@ impl RelayServer {
                                         continue;
                                     }
                                 };
-                                match state.commit_register_upstream(
-                                    name.clone(),
-                                    server_id,
-                                    server_instance_id,
-                                    address,
-                                    contract.crm_ns,
-                                    contract.crm_name,
-                                    contract.crm_ver,
-                                    contract.abi_hash,
-                                    contract.signature_hash,
-                                    contract.max_payload_size,
-                                    contract.route_uid,
-                                    contract.route_revision,
+                                match state.commit_register_upstream(LocalRegistration {
+                                    owner: LocalRouteOwner {
+                                        name: name.clone(),
+                                        server_id,
+                                        server_instance_id,
+                                        address,
+                                    },
+                                    contract,
                                     replacement,
-                                ) {
+                                }) {
                                     RegisterCommitResult::Registered { entry } => {
                                         tokio::spawn(async move { client.close_shared().await });
                                         eprintln!(
@@ -1221,7 +1215,8 @@ mod tests {
             ..RelayConfig::default()
         });
         let address = unique_ipc_address("same_owner_contract_mismatch");
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),

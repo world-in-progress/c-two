@@ -76,8 +76,8 @@ mod tests {
         assert_eq!(shm_handle.len(), size);
         // Data integrity check.
         let data = pool.handle_slice(&shm_handle);
-        for i in 0..size {
-            assert_eq!(data[i], (i % 251) as u8, "data mismatch at byte {i}");
+        for (i, byte) in data.iter().enumerate().take(size) {
+            assert_eq!(*byte, (i % 251) as u8, "data mismatch at byte {i}");
         }
 
         pool.release_handle(shm_handle);
@@ -123,8 +123,8 @@ mod tests {
         assert_eq!(returned.len(), size);
         // Data must be intact.
         let data = pool.handle_slice(&returned);
-        for i in 0..size {
-            assert_eq!(data[i], (i % 199) as u8, "data mismatch at byte {i}");
+        for (i, byte) in data.iter().enumerate().take(size) {
+            assert_eq!(*byte, (i % 199) as u8, "data mismatch at byte {i}");
         }
 
         pool.release_handle(returned);

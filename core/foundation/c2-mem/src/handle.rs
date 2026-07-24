@@ -36,6 +36,10 @@ impl MemHandle {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn is_file_spill(&self) -> bool {
         matches!(self, Self::FileSpill { .. })
     }
@@ -98,6 +102,7 @@ mod tests {
             len: 4096,
         };
         assert_eq!(h.len(), 4096);
+        assert!(!h.is_empty());
         assert!(h.is_buddy());
         assert!(!h.is_file_spill());
     }
@@ -109,6 +114,7 @@ mod tests {
             len: 1_000_000,
         };
         assert_eq!(h.len(), 1_000_000);
+        assert!(!h.is_empty());
         assert!(h.is_dedicated());
     }
 

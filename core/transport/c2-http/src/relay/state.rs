@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
 use crate::relay::authority::{
-    ControlError, OwnerReplacement, RouteAuthority, RouteCommand, RouteCommandResult,
+    ControlError, LocalRegistration, RouteAuthority, RouteCommand, RouteCommandResult,
 };
 use crate::relay::conn_pool::{
     AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerReplaceError,
@@ -51,7 +51,7 @@ pub enum RegisterCommitResult {
 
 pub enum UnregisterResult {
     Removed {
-        entry: RouteEntry,
+        entry: Box<RouteEntry>,
         removed_at: f64,
         removed_revision: u64,
         client: Option<Arc<IpcClient>>,
@@ -142,37 +142,12 @@ impl RelayState {
 
     // -- Transactional: route + connection together --
 
-    pub fn commit_register_upstream(
+    pub(crate) fn commit_register_upstream(
         &self,
-        name: String,
-        server_id: String,
-        server_instance_id: String,
-        address: String,
-        crm_ns: String,
-        crm_name: String,
-        crm_ver: String,
-        abi_hash: String,
-        signature_hash: String,
-        max_payload_size: u64,
-        route_uid: String,
-        route_revision: u64,
-        replacement: Option<OwnerReplacement>,
+        registration: LocalRegistration,
     ) -> RegisterCommitResult {
-        match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
-            name,
-            server_id,
-            server_instance_id,
-            address,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
-            max_payload_size,
-            route_uid,
-            route_revision,
-            replacement,
-        }) {
+        match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal(Box::new(registration)))
+        {
             Ok(RouteCommandResult::Registered { entry }) => {
                 RegisterCommitResult::Registered { entry }
             }
@@ -220,7 +195,7 @@ impl RelayState {
             }) => {
                 self.stop_upstream_control_if_owner_idle_for_route(&entry);
                 UnregisterResult::Removed {
-                    entry,
+                    entry: Box::new(entry),
                     removed_at,
                     removed_revision,
                     client,
@@ -256,7 +231,7 @@ impl RelayState {
                 route_table.unregister_local_route_if_matches(expected);
             let client = entry
                 .as_ref()
-                .and_then(|entry| UpstreamEndpointKey::from_route(entry))
+                .and_then(UpstreamEndpointKey::from_route)
                 .and_then(|key| {
                     if route_table.has_local_route_for_endpoint(&key) {
                         None
@@ -408,7 +383,7 @@ impl RelayState {
         };
 
         let lease_address = lease.address();
-        let expected_contract = expected_contract_for_route(&expected);
+        let expected_contract = expected_contract_for_route(expected);
         if let Some(reason) = self.upstream_control_watch_unavailable_for_route(expected) {
             match verify_route_after_watch_unavailable(&lease, &expected_contract).await {
                 Ok(()) => {}
@@ -465,7 +440,7 @@ impl RelayState {
 
         let lease_endpoint = lease.endpoint();
         let route_matches_lease =
-            self.renew_owner_lease_if_current_route(&expected, &lease_endpoint);
+            self.renew_owner_lease_if_current_route(expected, &lease_endpoint);
 
         if route_matches_lease {
             Ok((lease, expected.clone(), binding))
@@ -802,7 +777,7 @@ impl RelayState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::authority::RegisterPreparation;
+    use crate::relay::authority::{OwnerReplacement, RegisterPreparation};
 
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
@@ -810,6 +785,23 @@ mod tests {
     const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[derive(Clone, Copy)]
+    struct TestRouteContract<'a> {
+        crm_ns: &'a str,
+        crm_name: &'a str,
+        crm_ver: &'a str,
+        abi_hash: &'a str,
+        signature_hash: &'a str,
+    }
+
+    const TEST_ROUTE_CONTRACT: TestRouteContract<'static> = TestRouteContract {
+        crm_ns: TEST_CRM_NS,
+        crm_name: TEST_CRM_NAME,
+        crm_ver: TEST_CRM_VER,
+        abi_hash: TEST_ABI_HASH,
+        signature_hash: TEST_SIGNATURE_HASH,
+    };
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
@@ -865,11 +857,13 @@ mod tests {
             server_id,
             server_instance_id,
             address,
-            "test.echo",
-            "Echo",
-            "0.1.0",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            TestRouteContract {
+                crm_ns: "test.echo",
+                crm_name: "Echo",
+                crm_ver: "0.1.0",
+                abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            },
             client,
         )
     }
@@ -880,23 +874,20 @@ mod tests {
         server_id: &str,
         server_instance_id: &str,
         address: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
-        abi_hash: &str,
-        signature_hash: &str,
+        contract: TestRouteContract<'_>,
         _client: Arc<IpcClient>,
     ) -> RouteEntry {
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             name.to_string(),
             server_id.to_string(),
             server_instance_id.to_string(),
             address.to_string(),
-            crm_ns.to_string(),
-            crm_name.to_string(),
-            crm_ver.to_string(),
-            abi_hash.to_string(),
-            signature_hash.to_string(),
+            contract.crm_ns.to_string(),
+            contract.crm_name.to_string(),
+            contract.crm_ver.to_string(),
+            contract.abi_hash.to_string(),
+            contract.signature_hash.to_string(),
             1024,
             format!("{name}-{server_id}-uid"),
             1,
@@ -965,7 +956,7 @@ mod tests {
         let source = include_str!("state.rs");
         let body = source_between(
             source,
-            "pub fn commit_register_upstream(",
+            "pub(crate) fn commit_register_upstream(",
             "pub fn unregister_upstream(",
         )
         .expect("commit_register_upstream body should be found");
@@ -984,7 +975,7 @@ mod tests {
         RouteAuthority::new(state)
             .execute(RouteCommand::AnnouncePeer {
                 sender_relay_id,
-                entry,
+                entry: Box::new(entry),
             })
             .unwrap();
     }
@@ -1016,7 +1007,8 @@ mod tests {
     fn local_commit_rejects_invalid_crm_tag_without_fake_duplicate() {
         let state = RelayState::new(test_config(), null_disseminator());
 
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -1042,7 +1034,8 @@ mod tests {
     fn local_commit_rejects_invalid_ipc_address_without_fake_duplicate() {
         let state = RelayState::new(test_config(), null_disseminator());
 
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -1082,7 +1075,8 @@ mod tests {
     fn local_registration_does_not_create_idle_data_plane_client() {
         let state = RelayState::new(test_config(), null_disseminator());
 
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -1119,11 +1113,7 @@ mod tests {
             "server-grid",
             "server-grid-instance",
             "ipc://shared",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             manager,
         );
         let builder = Arc::new(IpcClient::new("ipc://shared"));
@@ -1134,11 +1124,7 @@ mod tests {
             "server-grid",
             "server-grid-instance",
             "ipc://shared",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             builder,
         );
 
@@ -1287,7 +1273,7 @@ mod tests {
         // Echo of our own route arriving via DigestDiff with our relay_id.
         let result = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
             sender_relay_id: "test-relay".into(),
-            entry: RouteEntry {
+            entry: Box::new(RouteEntry {
                 name: "grid".into(),
                 relay_id: "test-relay".into(),
                 relay_url: "http://elsewhere:8080".into(),
@@ -1304,7 +1290,7 @@ mod tests {
                 route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
-            },
+            }),
         });
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 
@@ -1402,7 +1388,8 @@ mod tests {
         let second = Arc::new(IpcClient::new("ipc://second"));
         second.force_connected(true);
 
-        let first_result = state.commit_register_upstream(
+        let first_result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-first".into(),
             "instance-first".into(),
@@ -1422,7 +1409,8 @@ mod tests {
             RegisterCommitResult::Registered { .. }
         ));
 
-        let second_result = state.commit_register_upstream(
+        let second_result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-second".into(),
             "instance-second".into(),
@@ -1457,7 +1445,8 @@ mod tests {
 
         let racer = Arc::new(IpcClient::new("ipc://racer"));
         racer.force_connected(true);
-        let racer_result = state.commit_register_upstream(
+        let racer_result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-racer".into(),
             "instance-racer".into(),
@@ -1479,7 +1468,8 @@ mod tests {
 
         let candidate = Arc::new(IpcClient::new("ipc://candidate"));
         candidate.force_connected(true);
-        let candidate_result = state.commit_register_upstream(
+        let candidate_result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-candidate".into(),
             "instance-candidate".into(),
@@ -1515,11 +1505,7 @@ mod tests {
             "server-old",
             "server-old-instance",
             "ipc://old",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             old,
         );
         state.evict_connection("grid");
@@ -1529,7 +1515,8 @@ mod tests {
 
         let replacement = Arc::new(IpcClient::new("ipc://new"));
         replacement.force_connected(true);
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-new".into(),
             "instance-new".into(),
@@ -1560,11 +1547,7 @@ mod tests {
             "server-old",
             "server-old-instance",
             "ipc://old",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             manager,
         );
         let builder = Arc::new(IpcClient::new("ipc://old"));
@@ -1575,11 +1558,7 @@ mod tests {
             "server-old",
             "server-old-instance",
             "ipc://old",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             builder,
         );
         let replacement_proof = confirmed_dead_replacement(
@@ -1591,7 +1570,8 @@ mod tests {
         )
         .await;
 
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "manager".into(),
             "server-new".into(),
             "server-new-instance".into(),
@@ -1649,7 +1629,8 @@ mod tests {
 
         let stale_replacement = Arc::new(IpcClient::new("ipc://replacement"));
         stale_replacement.force_connected(true);
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-racer".into(),
             "instance-racer".into(),
@@ -1685,11 +1666,7 @@ mod tests {
             "server-old",
             "server-old-instance",
             "ipc://old",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             old,
         );
         state.evict_connection("grid");
@@ -1704,7 +1681,8 @@ mod tests {
 
         let same_owner = Arc::new(IpcClient::new("ipc://old"));
         same_owner.force_connected(true);
-        let same_owner_result = state.commit_register_upstream(
+        let same_owner_result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-old".into(),
             "server-old-instance".into(),
@@ -1726,7 +1704,8 @@ mod tests {
 
         let replacement = Arc::new(IpcClient::new("ipc://replacement"));
         replacement.force_connected(true);
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-new".into(),
             "server-new-instance".into(),
@@ -1782,11 +1761,13 @@ mod tests {
             "server-old",
             "instance-old",
             "ipc://same",
-            "test.old",
-            "OldGrid",
-            "0.1.0",
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TestRouteContract {
+                crm_ns: "test.old",
+                crm_name: "OldGrid",
+                crm_ver: "0.1.0",
+                abi_hash: TEST_ABI_HASH,
+                signature_hash: TEST_SIGNATURE_HASH,
+            },
             old,
         );
         state.evict_connection("grid");
@@ -1803,11 +1784,13 @@ mod tests {
             "server-new",
             "instance-new",
             "ipc://same",
-            "test.new",
-            "NewGrid",
-            "0.1.0",
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TestRouteContract {
+                crm_ns: "test.new",
+                crm_name: "NewGrid",
+                crm_ver: "0.1.0",
+                abi_hash: TEST_ABI_HASH,
+                signature_hash: TEST_SIGNATURE_HASH,
+            },
             new_same_address,
         );
 
@@ -1865,7 +1848,8 @@ mod tests {
 
         let replacement = Arc::new(IpcClient::new("ipc://replacement"));
         replacement.force_connected(true);
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-new".into(),
             "instance-new".into(),
@@ -1904,16 +1888,13 @@ mod tests {
             "server-grid",
             "server-grid-instance",
             "ipc://grid",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             original,
         );
         state.evict_connection("grid");
 
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -1943,7 +1924,8 @@ mod tests {
         original.force_connected(true);
         register_local(&state, "grid", "server-grid", "ipc://grid", original);
 
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -1994,7 +1976,8 @@ mod tests {
             Ok(crate::relay::authority::RegisterPreflight::Available { .. })
         ));
 
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "instance-new".into(),
@@ -2031,7 +2014,8 @@ mod tests {
 
         let moved = Arc::new(IpcClient::new("ipc://new"));
         moved.force_connected(true);
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "instance-grid".into(),
@@ -2085,18 +2069,15 @@ mod tests {
             "server-grid",
             "server-grid-instance",
             "ipc://grid",
-            TEST_CRM_NS,
-            TEST_CRM_NAME,
-            TEST_CRM_VER,
-            TEST_ABI_HASH,
-            TEST_SIGNATURE_HASH,
+            TEST_ROUTE_CONTRACT,
             original,
         );
         state.evict_connection("grid");
 
         let replacement = Arc::new(IpcClient::new("ipc://grid"));
         replacement.force_connected(true);
-        let result = state.commit_register_upstream(
+        let result = test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),

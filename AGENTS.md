@@ -135,7 +135,7 @@ Do not reintroduce Python-side default validation for IPC or relay internals. SD
 
 Scheduler-related config follows the same boundary. Python may expose `ConcurrencyConfig` and SDK-level enums, but Rust now owns the resolved route concurrency handle, including mode, `max_pending`, `max_workers`, and close state. Python must pass the full typed config into Rust, then treat the native handle as the source of truth for both same-process direct calls and remote dispatch. Do not keep a second Python-owned scheduler state or hidden default policy alive after registration.
 
-Runtime-session config follows the same ownership rule. Rust `c2-runtime::RuntimeSession` owns process server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python may expose typed override facades and forward them into the native session, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
+Runtime config follows the same ownership rule. Rust `c2-core::Runtime` owns process server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python exposes that authority through its native `RuntimeSession` projection and may expose typed override facades, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
 
 ### Transport Layer
 
@@ -201,7 +201,7 @@ Paths: `core/`, `sdk/python/native/`
 | transport | `c2-ipc` | Async IPC client, UDS, SHM, chunked transfer |
 | transport | `c2-server` | Tokio UDS server with per-connection state and peer SHM lazy-open |
 | transport | `c2-http` | HTTP client, relay-aware client, and HTTP relay server behind `relay` feature |
-| runtime | `c2-runtime` | Process runtime session, route transactions, client pools, relay projection |
+| runtime | `c2-core` | Language-neutral runtime, route transactions, client pools, relay projection, and error normalization |
 | sdk/python/native | `c2-python-native` | PyO3 bindings for `c_two._native` |
 
 Memory subsystem:

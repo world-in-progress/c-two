@@ -137,9 +137,8 @@ impl SegmentCache {
 
     /// Open and cache a segment. No-op if already cached.
     pub fn open(&mut self, seg_idx: u16, name: &str, size: usize) -> Result<(), ShmError> {
-        if !self.segments.contains_key(&seg_idx) {
-            let seg = MappedSegment::open(name, size)?;
-            self.segments.insert(seg_idx, seg);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.segments.entry(seg_idx) {
+            entry.insert(MappedSegment::open(name, size)?);
         }
         Ok(())
     }

@@ -291,11 +291,11 @@ mod tests {
 
     #[test]
     fn raw_http_client_does_not_expose_public_named_route_crm_calls() {
-        let source = include_str!("client.rs");
+        let source = include_str!("http_client.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
-            .expect("client.rs must contain production section");
+            .expect("http_client.rs must contain production section");
         for forbidden in [
             "pub fn call(\n        &self,\n        route_name: &str,",
             "pub async fn call_async(\n        &self,\n        route_name: &str,",
@@ -310,11 +310,11 @@ mod tests {
 
     #[test]
     fn http_client_expected_contract_helpers_do_not_accept_optional_or_independent_route() {
-        let source = include_str!("client.rs");
+        let source = include_str!("http_client.rs");
         let production = source
             .split("#[cfg(test)]")
             .next()
-            .expect("client.rs must contain production section");
+            .expect("http_client.rs must contain production section");
         for forbidden in [
             "expected: Option<&ExpectedRouteContract>",
             "call_with_expected_crm_async(\n        &self,\n        route_name: &str,",

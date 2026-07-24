@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
-use super::client::{HttpError, HttpRouteToken, runtime};
+use super::http_client::{HttpError, HttpRouteToken, runtime};
 use c2_contract::ExpectedRouteContract;
 
 const CONTROL_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -60,6 +60,39 @@ struct RegisterRequest<'a> {
     abi_hash: &'a str,
     signature_hash: &'a str,
     max_payload_size: u64,
+}
+
+/// One contract-scoped route registration projected to a relay.
+#[derive(Debug, Clone, Copy)]
+pub struct RelayRegistration<'a> {
+    pub expected: &'a ExpectedRouteContract,
+    pub server_id: &'a str,
+    pub server_instance_id: &'a str,
+    pub address: &'a str,
+    pub max_payload_size: u64,
+}
+
+impl<'a> RelayRegistration<'a> {
+    fn request<'b>(
+        &'b self,
+        registration_token: Option<&'b str>,
+        prepare_only: bool,
+    ) -> RegisterRequest<'b> {
+        RegisterRequest {
+            name: &self.expected.route_name,
+            server_id: self.server_id,
+            server_instance_id: self.server_instance_id,
+            address: self.address,
+            registration_token,
+            prepare_only,
+            crm_ns: &self.expected.crm_ns,
+            crm_name: &self.expected.crm_name,
+            crm_ver: &self.expected.crm_ver,
+            abi_hash: &self.expected.abi_hash,
+            signature_hash: &self.expected.signature_hash,
+            max_payload_size: self.max_payload_size,
+        }
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -152,70 +185,24 @@ impl RelayControlClient {
         })
     }
 
-    pub fn register(
-        &self,
-        name: &str,
-        server_id: &str,
-        server_instance_id: &str,
-        address: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
-        abi_hash: &str,
-        signature_hash: &str,
-        max_payload_size: u64,
-    ) -> Result<(), HttpError> {
-        let request = RegisterRequest {
-            name,
-            server_id,
-            server_instance_id,
-            address,
-            registration_token: None,
-            prepare_only: false,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
-            max_payload_size,
-        };
+    pub fn register(&self, registration: RelayRegistration<'_>) -> Result<(), HttpError> {
+        let route_name = registration.expected.route_name.clone();
+        let request = registration.request(None, false);
         runtime().handle().block_on(self.post_json_with_retry(
             "/_register",
             &request,
             &[200, 201],
         ))?;
-        self.invalidate(name);
+        self.invalidate(&route_name);
         Ok(())
     }
 
     pub fn prepare_register(
         &self,
-        name: &str,
-        server_id: &str,
-        server_instance_id: &str,
-        address: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
-        abi_hash: &str,
-        signature_hash: &str,
-        max_payload_size: u64,
+        registration: RelayRegistration<'_>,
         registration_token: &str,
     ) -> Result<(), HttpError> {
-        let request = RegisterRequest {
-            name,
-            server_id,
-            server_instance_id,
-            address,
-            registration_token: Some(registration_token),
-            prepare_only: true,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
-            max_payload_size,
-        };
+        let request = registration.request(Some(registration_token), true);
         runtime()
             .handle()
             .block_on(self.post_json_with_retry("/_register", &request, &[202]))?;

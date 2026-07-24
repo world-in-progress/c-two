@@ -75,7 +75,7 @@ impl BuddySegment {
     ///
     /// # Safety
     /// The caller must ensure exclusive access to this region.
-    pub unsafe fn data_slice_mut(&self, offset: u32, len: usize) -> &mut [u8] {
+    pub unsafe fn data_slice_mut(&mut self, offset: u32, len: usize) -> &mut [u8] {
         let ptr = self.allocator.data_ptr(offset);
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }

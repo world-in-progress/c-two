@@ -196,10 +196,10 @@ impl ConnectionPool {
             )),
         );
         drop(inner);
-        if let Some(old_slot) = old_slot {
-            if let Some(client) = old_slot.retire() {
-                close_replaced_client(client);
-            }
+        if let Some(old_slot) = old_slot
+            && let Some(client) = old_slot.retire()
+        {
+            close_replaced_client(client);
         }
     }
 
@@ -426,15 +426,15 @@ impl UpstreamSlot {
                         Some(self.key.clone())
                     }
                     SlotState::Ready => {
-                        if let Some(client) = inner.client.clone() {
-                            if client.is_connected() {
-                                inner.active_requests += 1;
-                                inner.last_activity = now_millis();
-                                return Ok(UpstreamLease {
-                                    slot: self.clone(),
-                                    client,
-                                });
-                            }
+                        if let Some(client) = inner.client.clone()
+                            && client.is_connected()
+                        {
+                            inner.active_requests += 1;
+                            inner.last_activity = now_millis();
+                            return Ok(UpstreamLease {
+                                slot: self.clone(),
+                                client,
+                            });
                         }
                         inner.client = None;
                         inner.state = SlotState::Reconnecting;
@@ -643,9 +643,7 @@ impl UpstreamSlot {
         if inner.state == SlotState::Retired {
             return None;
         }
-        let Some(current) = inner.client.as_ref() else {
-            return None;
-        };
+        let current = inner.client.as_ref()?;
         if !Arc::ptr_eq(current, expected) {
             return None;
         }

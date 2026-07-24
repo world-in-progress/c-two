@@ -162,12 +162,12 @@ impl ClientPool {
         let mut entries = self.entries.lock();
 
         // Another thread may have raced and inserted the same address.
-        if let Some(entry) = entries.get_mut(address) {
-            if entry.client.is_connected() {
-                entry.ref_count += 1;
-                entry.last_release = None;
-                return Ok(Arc::clone(&entry.client));
-            }
+        if let Some(entry) = entries.get_mut(address)
+            && entry.client.is_connected()
+        {
+            entry.ref_count += 1;
+            entry.last_release = None;
+            return Ok(Arc::clone(&entry.client));
             // Stale racing entry — replace below.
         }
 
@@ -208,13 +208,12 @@ impl ClientPool {
         let mut entries = self.entries.lock();
         let grace = self.grace_period;
         entries.retain(|_addr, entry| {
-            if entry.ref_count == 0 {
-                if let Some(released_at) = entry.last_release {
-                    if released_at.elapsed() >= grace {
-                        // Drop the Arc — connection closes when last ref is gone.
-                        return false;
-                    }
-                }
+            if entry.ref_count == 0
+                && let Some(released_at) = entry.last_release
+                && released_at.elapsed() >= grace
+            {
+                // Drop the Arc — connection closes when last ref is gone.
+                return false;
             }
             true
         });

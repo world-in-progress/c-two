@@ -47,7 +47,7 @@ impl LevelBitmap {
     /// `base` must point to valid, properly aligned SHM memory that will
     /// outlive this struct. The memory must be at least `num_words * 8` bytes.
     pub unsafe fn new(base: *mut u8, num_blocks: usize) -> Self {
-        let num_words = (num_blocks + 63) / 64;
+        let num_words = num_blocks.div_ceil(64);
         Self {
             base: base as *mut AtomicU64,
             num_words,
@@ -154,7 +154,7 @@ pub fn total_bitmap_bytes(segment_data_size: usize, min_block: usize) -> usize {
     let mut block_size = segment_data_size;
     while block_size >= min_block {
         let num_blocks = segment_data_size / block_size;
-        let num_words = (num_blocks + 63) / 64;
+        let num_words = num_blocks.div_ceil(64);
         bytes += num_words * 8;
         block_size /= 2;
     }
@@ -178,7 +178,7 @@ mod tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
 
     fn make_bitmap(num_blocks: usize) -> (LevelBitmap, *mut u8, Layout) {
-        let num_words = (num_blocks + 63) / 64;
+        let num_words = num_blocks.div_ceil(64);
         let layout = Layout::from_size_align(num_words * 8, 8).unwrap();
         let ptr = unsafe { alloc_zeroed(layout) };
         let bm = unsafe { LevelBitmap::new(ptr, num_blocks) };

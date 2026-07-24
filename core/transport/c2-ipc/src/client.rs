@@ -320,28 +320,23 @@ impl MethodTable {
     fn from_route(route: &RouteInfo) -> Self {
         Self::from_entries(
             &route.methods,
-            route.name.clone(),
-            route.route_uid.clone(),
-            route.route_revision,
-            route.crm_ns.clone(),
-            route.crm_name.clone(),
-            route.crm_ver.clone(),
-            route.abi_hash.clone(),
-            route.signature_hash.clone(),
+            RouteCallIdentity {
+                route_name: route.name.clone(),
+                route_uid: route.route_uid.clone(),
+                observed_route_revision: route.route_revision,
+                crm_ns: route.crm_ns.clone(),
+                crm_name: route.crm_name.clone(),
+                crm_ver: route.crm_ver.clone(),
+                abi_hash: route.abi_hash.clone(),
+                signature_hash: route.signature_hash.clone(),
+            },
             route.max_payload_size,
         )
     }
 
     pub(crate) fn from_entries(
         entries: &[MethodEntry],
-        route_name: String,
-        route_uid: String,
-        route_revision: u64,
-        crm_ns: String,
-        crm_name: String,
-        crm_ver: String,
-        abi_hash: String,
-        signature_hash: String,
+        identity: RouteCallIdentity,
         max_payload_size: u64,
     ) -> Self {
         let mut name_to_idx = HashMap::with_capacity(entries.len());
@@ -349,14 +344,14 @@ impl MethodTable {
             name_to_idx.insert(e.name.clone(), e.index);
         }
         Self {
-            route_name,
-            route_uid,
-            route_revision,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
+            route_name: identity.route_name,
+            route_uid: identity.route_uid,
+            route_revision: identity.observed_route_revision,
+            crm_ns: identity.crm_ns,
+            crm_name: identity.crm_name,
+            crm_ver: identity.crm_ver,
+            abi_hash: identity.abi_hash,
+            signature_hash: identity.signature_hash,
             max_payload_size,
             name_to_idx,
         }
@@ -563,14 +558,16 @@ impl MethodTable {
             .collect::<Vec<_>>();
         Self::from_entries(
             &methods,
-            record.route_name.clone(),
-            record.route_uid.clone(),
-            record.route_revision,
-            record.contract.crm_ns.clone(),
-            record.contract.crm_name.clone(),
-            record.contract.crm_ver.clone(),
-            record.contract.abi_hash.clone(),
-            record.contract.signature_hash.clone(),
+            RouteCallIdentity {
+                route_name: record.route_name.clone(),
+                route_uid: record.route_uid.clone(),
+                observed_route_revision: record.route_revision,
+                crm_ns: record.contract.crm_ns.clone(),
+                crm_name: record.contract.crm_name.clone(),
+                crm_ver: record.contract.crm_ver.clone(),
+                abi_hash: record.contract.abi_hash.clone(),
+                signature_hash: record.contract.signature_hash.clone(),
+            },
             record.max_payload_size,
         )
     }
@@ -632,10 +629,9 @@ pub(crate) fn request_chunk_count(data_len: usize, chunk_size: usize) -> Result<
 }
 
 fn stream_error<E: Display>(err: E) -> IpcError {
-    IpcError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!("request body stream error: {err}"),
-    ))
+    IpcError::Io(std::io::Error::other(format!(
+        "request body stream error: {err}"
+    )))
 }
 
 async fn collect_exact_stream<S, B, E>(data_size: usize, chunks: S) -> Result<Vec<u8>, IpcError>
@@ -828,7 +824,7 @@ impl IpcClient {
         if let Some(ref pool_arc) = self.pool {
             let mut pool = pool_arc.lock();
             pool.ensure_ready()
-                .map_err(|e| IpcError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
         }
 
         // Perform handshake.
@@ -1902,14 +1898,16 @@ impl IpcClient {
             .collect::<Vec<_>>();
         MethodTable::from_entries(
             &method_entries,
-            contract.route_name.clone(),
-            contract.route_uid.clone(),
-            contract.route_revision,
-            contract.crm_ns.clone(),
-            contract.crm_name.clone(),
-            contract.crm_ver.clone(),
-            contract.abi_hash.clone(),
-            contract.signature_hash.clone(),
+            RouteCallIdentity {
+                route_name: contract.route_name.clone(),
+                route_uid: contract.route_uid.clone(),
+                observed_route_revision: contract.route_revision,
+                crm_ns: contract.crm_ns.clone(),
+                crm_name: contract.crm_name.clone(),
+                crm_ver: contract.crm_ver.clone(),
+                abi_hash: contract.abi_hash.clone(),
+                signature_hash: contract.signature_hash.clone(),
+            },
             contract.max_payload_size,
         )
     }
@@ -2105,14 +2103,12 @@ impl IpcClient {
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
         {
             let directory = self.route_directory.read();
-            if !directory.is_dirty() {
-                if let Some(table) = directory.route_table(&expected.route_name) {
-                    if Self::validate_method_table_contract(&expected.route_name, &table, expected)
-                        .is_ok()
-                    {
-                        return Ok(());
-                    }
-                }
+            if !directory.is_dirty()
+                && let Some(table) = directory.route_table(&expected.route_name)
+                && Self::validate_method_table_contract(&expected.route_name, &table, expected)
+                    .is_ok()
+            {
+                return Ok(());
             }
         }
 
@@ -2120,12 +2116,11 @@ impl IpcClient {
             self.rebuild_route_directory().await?;
             {
                 let directory = self.route_directory.read();
-                if let Some(table) = directory.route_table(&expected.route_name) {
-                    if Self::validate_method_table_contract(&expected.route_name, &table, expected)
+                if let Some(table) = directory.route_table(&expected.route_name)
+                    && Self::validate_method_table_contract(&expected.route_name, &table, expected)
                         .is_ok()
-                    {
-                        return Ok(());
-                    }
+                {
+                    return Ok(());
                 }
             }
         }
@@ -2157,23 +2152,28 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<RouteBinding, IpcError> {
-        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
         let mut last_unbound = None;
 
-        for attempt in 0..attempts {
+        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route(expected) {
                 Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::RouteNotFound(route_name));
                 }
-                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::WatchUnavailable(reason));
                 }
                 Err(err) => return Err(err),
             }
-            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if let Some(delay_ms) = delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
         }
 
         Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
@@ -2289,23 +2289,28 @@ impl IpcClient {
             }
         }
 
-        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
         let mut last_unbound = None;
 
-        for attempt in 0..attempts {
+        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route_token(expected, route_uid, route_revision) {
                 Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::RouteNotFound(route_name));
                 }
-                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::WatchUnavailable(reason));
                 }
                 Err(err) => return Err(err),
             }
-            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if let Some(delay_ms) = delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
         }
 
         Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
@@ -2473,10 +2478,8 @@ async fn recv_loop(
             recv_buf.reserve(payload_len - recv_buf.capacity());
         }
         recv_buf.resize(payload_len, 0);
-        if payload_len > 0 {
-            if reader.read_exact(&mut recv_buf).await.is_err() {
-                break;
-            }
+        if payload_len > 0 && reader.read_exact(&mut recv_buf).await.is_err() {
+            break;
         }
 
         // Handle signal frames.
@@ -2709,14 +2712,16 @@ mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
-                "grid".to_string(),
-                "grid-route-uid-0001".to_string(),
-                1,
-                "test.grid".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                ABI_HASH.to_string(),
-                SIG_HASH.to_string(),
+                RouteCallIdentity {
+                    route_name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0001".to_string(),
+                    observed_route_revision: 1,
+                    crm_ns: "test.grid".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: ABI_HASH.to_string(),
+                    signature_hash: SIG_HASH.to_string(),
+                },
                 1024,
             ),
         );
@@ -2739,14 +2744,16 @@ mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
-                "grid".to_string(),
-                "grid-route-uid-0002".to_string(),
-                2,
-                "test.grid".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                ABI_HASH.to_string(),
-                SIG_HASH.to_string(),
+                RouteCallIdentity {
+                    route_name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0002".to_string(),
+                    observed_route_revision: 2,
+                    crm_ns: "test.grid".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: ABI_HASH.to_string(),
+                    signature_hash: SIG_HASH.to_string(),
+                },
                 1024,
             ),
         );
@@ -2775,14 +2782,16 @@ mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
-                "grid".to_string(),
-                "grid-route-uid-0002".to_string(),
-                2,
-                "test.grid".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                ABI_HASH.to_string(),
-                SIG_HASH.to_string(),
+                RouteCallIdentity {
+                    route_name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0002".to_string(),
+                    observed_route_revision: 2,
+                    crm_ns: "test.grid".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: ABI_HASH.to_string(),
+                    signature_hash: SIG_HASH.to_string(),
+                },
                 1024,
             ),
         );

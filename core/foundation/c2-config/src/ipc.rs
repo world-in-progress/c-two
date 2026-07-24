@@ -392,8 +392,10 @@ mod tests {
 
     #[test]
     fn reject_zero_execution_workers() {
-        let mut cfg = ServerIpcConfig::default();
-        cfg.max_execution_workers = 0;
+        let cfg = ServerIpcConfig {
+            max_execution_workers: 0,
+            ..ServerIpcConfig::default()
+        };
 
         assert!(
             cfg.validate()
@@ -445,8 +447,10 @@ mod tests {
 
     #[test]
     fn reject_bad_threshold_ratio() {
-        let mut cfg = BaseIpcConfig::default();
-        cfg.chunk_threshold_ratio = 0.0;
+        let mut cfg = BaseIpcConfig {
+            chunk_threshold_ratio: 0.0,
+            ..BaseIpcConfig::default()
+        };
         assert!(
             cfg.validate()
                 .unwrap_err()
@@ -468,15 +472,19 @@ mod tests {
 
     #[test]
     fn reject_small_frame_size() {
-        let mut cfg = ServerIpcConfig::default();
-        cfg.max_frame_size = 16;
+        let cfg = ServerIpcConfig {
+            max_frame_size: 16,
+            ..ServerIpcConfig::default()
+        };
         assert!(cfg.validate().unwrap_err().contains("max_frame_size"));
     }
 
     #[test]
     fn reject_zero_payload_size() {
-        let mut cfg = ServerIpcConfig::default();
-        cfg.max_payload_size = 0;
+        let cfg = ServerIpcConfig {
+            max_payload_size: 0,
+            ..ServerIpcConfig::default()
+        };
         assert!(
             cfg.validate()
                 .unwrap_err()
@@ -498,9 +506,11 @@ mod tests {
 
     #[test]
     fn reject_threshold_exceeds_frame() {
-        let mut cfg = ServerIpcConfig::default();
-        cfg.shm_threshold = 1000;
-        cfg.max_frame_size = 500;
+        let cfg = ServerIpcConfig {
+            shm_threshold: 1000,
+            max_frame_size: 500,
+            ..ServerIpcConfig::default()
+        };
         assert!(cfg.validate().unwrap_err().contains("shm_threshold"));
     }
 

@@ -207,12 +207,12 @@ pub fn validate_route_state_envelope(
             sender_relay_id: envelope.sender_relay_id,
         });
     }
-    if let Some(expected) = expected_sender {
-        if envelope.sender_relay_id != expected {
-            return Err(PeerRouteStateError::InvalidSender {
-                sender_relay_id: envelope.sender_relay_id,
-            });
-        }
+    if let Some(expected) = expected_sender
+        && envelope.sender_relay_id != expected
+    {
+        return Err(PeerRouteStateError::InvalidSender {
+            sender_relay_id: envelope.sender_relay_id,
+        });
     }
 
     let digest_diff_entries = match &envelope.message {

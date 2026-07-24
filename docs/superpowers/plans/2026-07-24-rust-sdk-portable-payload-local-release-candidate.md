@@ -438,22 +438,22 @@ Review before commit:
 
 ### Task 2.1 — Freeze rename and error RED tests
 
-- [ ] Add a repository boundary test that rejects `c2-runtime`, `c2_runtime`,
+- [x] Add a repository boundary test that rejects `c2-runtime`, `c2_runtime`,
   `core/runtime/c2-runtime`, and Cargo dependencies on package `c2-runtime`
   outside historical documents.
-- [ ] Add compile tests for `c2_core::{Runtime, RuntimeOptions, Error}` and a
+- [x] Add compile tests for `c2_core::{Runtime, RuntimeOptions, Error}` and a
   failure test proving no `c2_runtime` import exists.
-- [ ] Add normalization tests for:
+- [x] Add normalization tests for:
   - valid IPC C2E1 bytes → `Error::Semantic(C2Error)`;
   - valid HTTP `C2ErrorEnvelope` → the identical semantic error;
   - malformed semantic bytes/body → `ProtocolViolation`;
   - `ContractError::LimitExceeded` → `Error::Admission`;
   - other `ContractError` → `Error::Contract`;
   - pre-dispatch transport failure versus dispatch-uncertain transport failure.
-- [ ] Assert FastDB outer-cause field names are emitted by one Core helper:
+- [x] Assert FastDB outer-cause field names are emitted by one Core helper:
   `cause_owner`, `fastdb_code`, `fastdb_symbol`, `fastdb_path`,
   `fastdb_message`, and `fastdb_details_json`.
-- [ ] Assert every generated client/resource phase uses the frozen error-code
+- [x] Assert every generated client/resource phase uses the frozen error-code
   mapping above and an existing semantic error passes through unchanged.
 
 Run RED:
@@ -466,8 +466,8 @@ Expected RED: package `c2-core` and the normalized error facade do not exist.
 
 ### Task 2.2 — Perform the clean cut
 
-- [ ] Use `git mv` for the runtime directory and sources.
-- [ ] Change package/import identity exactly:
+- [x] Use `git mv` for the runtime directory and sources.
+- [x] Change package/import identity exactly:
 
 ```toml
 [package]
@@ -479,29 +479,36 @@ edition.workspace = true
 name = "c2_core"
 ```
 
-- [ ] Rename `RuntimeSession` → `Runtime` and `RuntimeSessionOptions` →
+- [x] Rename `RuntimeSession` → `Runtime` and `RuntimeSessionOptions` →
   `RuntimeOptions` in the Rust authority. Keep the PyO3 class name
   `RuntimeSession` temporarily as a Python-language projection, not a Rust
   package/type alias.
-- [ ] Add direct dependencies on `c2-error`, `c2-ipc`, and the already-owned
+- [x] Add direct dependencies on `c2-error`, `c2-ipc`, and the already-owned
   HTTP/server crates to `c2-core`; do not add FastDB.
-- [ ] Move HTTP semantic-envelope parsing from
+- [x] Move HTTP semantic-envelope parsing from
   `sdk/python/native/src/http_ffi.rs` into `c2-core::error`.
-- [ ] Define typed `TransportPhase::{PreDispatch, DispatchUncertain}` and make
+- [x] Define typed `TransportPhase::{PreDispatch, DispatchUncertain}` and make
   fallback eligibility depend on that phase, never on string matching.
-- [ ] Implement one generic external-cause-to-C2-details function in Core. It
+- [x] Implement one generic external-cause-to-C2-details function in Core. It
   accepts already-extracted owner/code/symbol/path/message/details and does not
   inspect a FastDB object.
-- [ ] Update the Python native manifest/import so it compiles against
+- [x] Update the Python native manifest/import so it compiles against
   `c2-core`; do not migrate its duplicate orchestration until Task 7.
 
 ### Task 2.3 — Close the known Core strict-Clippy baseline
 
-- [ ] Replace two needless `as_bytes().len()` calls in
+- [x] Replace two needless `as_bytes().len()` calls in
   `c2-config/src/identity.rs` and `relay.rs`.
-- [ ] Initialize server/client IPC configs with struct update syntax in
+- [x] Initialize server/client IPC configs with struct update syntax in
   `c2-config/src/resolver.rs` rather than assigning fields after `Default`.
-- [ ] Do not add `#[allow]`.
+- [x] Do not add `#[allow]`.
+
+> Implementation note (2026-07-24): the initial four-warning inventory was
+> incomplete. Once the earlier blockers were removed, Rust/Clippy 1.91 exposed
+> the historical strict-warning backlog across `c2-mem`, `c2-config`,
+> `c2-codegen`, `c2-wire`, `c2-ipc`, `c2-server`, `c2-http`, and `c2-core`.
+> Task 2 restored the actual full-Core `-D warnings` baseline without
+> `#[allow]` or `#[expect]` suppression.
 
 Run focused GREEN:
 

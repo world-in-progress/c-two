@@ -56,7 +56,7 @@ pub(crate) enum RouteAuthorityWatchBatch {
 #[derive(Debug, Clone)]
 pub(crate) enum RouteAuthorityWatchEvent {
     Upserted {
-        entry: RouteEntry,
+        entry: Box<RouteEntry>,
         catalog_revision: u64,
     },
     Removed {
@@ -182,7 +182,7 @@ impl RouteTable {
             && tombstone.removed_revision > 0
             && valid_route_name(&tombstone.name)
             && valid_relay_id(&tombstone.relay_id)
-            && tombstone.server_id.as_deref().map_or(true, valid_server_id)
+            && tombstone.server_id.as_deref().is_none_or(valid_server_id)
     }
 
     // -- Route operations --
@@ -192,10 +192,10 @@ impl RouteTable {
             return false;
         }
         let key = (entry.name.clone(), entry.relay_id.clone());
-        if let Some(tombstone) = self.tombstones.get(&key) {
-            if entry.registered_at <= tombstone.removed_at {
-                return false;
-            }
+        if let Some(tombstone) = self.tombstones.get(&key)
+            && entry.registered_at <= tombstone.removed_at
+        {
+            return false;
         }
         true
     }
@@ -210,7 +210,7 @@ impl RouteTable {
         let catalog_revision = self.advance_catalog_revision();
         self.routes.insert(key, entry.clone());
         self.push_event(RouteAuthorityWatchEvent::Upserted {
-            entry,
+            entry: Box::new(entry),
             catalog_revision,
         });
     }
@@ -364,10 +364,10 @@ impl RouteTable {
             return false;
         }
         let key = (tombstone.name.clone(), tombstone.relay_id.clone());
-        if let Some(entry) = self.routes.get(&key) {
-            if entry.registered_at > tombstone.removed_at {
-                return false;
-            }
+        if let Some(entry) = self.routes.get(&key)
+            && entry.registered_at > tombstone.removed_at
+        {
+            return false;
         }
         if let Some(existing) = self.tombstones.get(&key) {
             if existing.removed_at >= tombstone.removed_at {
@@ -811,10 +811,10 @@ impl RouteTable {
         }
 
         for (key, entry) in replacement_routes {
-            if let Some(tombstone) = self.tombstones.get(&key) {
-                if entry.registered_at <= tombstone.removed_at {
-                    continue;
-                }
+            if let Some(tombstone) = self.tombstones.get(&key)
+                && entry.registered_at <= tombstone.removed_at
+            {
+                continue;
             }
             self.register_route(entry);
         }
@@ -961,15 +961,14 @@ pub(crate) fn valid_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> bool
 }
 
 fn valid_server_id(server_id: &str) -> bool {
-    c2_config::validate_server_id(server_id).is_ok()
-        && server_id.as_bytes().len() <= MAX_WIRE_TEXT_BYTES
+    c2_config::validate_server_id(server_id).is_ok() && server_id.len() <= MAX_WIRE_TEXT_BYTES
 }
 
 pub(crate) fn validate_server_instance_id_value(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("invalid server_instance_id: cannot be empty".to_string());
     }
-    if value.as_bytes().len() > MAX_WIRE_TEXT_BYTES {
+    if value.len() > MAX_WIRE_TEXT_BYTES {
         return Err(format!(
             "invalid server_instance_id: cannot exceed {} bytes",
             MAX_WIRE_TEXT_BYTES

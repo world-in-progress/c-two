@@ -391,14 +391,14 @@ def test_runtime_session_does_not_infer_started_from_socket_file():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[4]
-    session_rs = root / "core" / "runtime" / "c2-runtime" / "src" / "session.rs"
+    session_rs = root / "core" / "runtime" / "c2-core" / "src" / "session.rs"
     source = session_rs.read_text(encoding="utf-8")
     assert "socket_path().exists()" not in source
 
 
 def test_runtime_session_uses_commit_gated_server_registration() -> None:
     root = Path(__file__).resolve().parents[4]
-    session_rs = root / "core" / "runtime" / "c2-runtime" / "src" / "session.rs"
+    session_rs = root / "core" / "runtime" / "c2-core" / "src" / "session.rs"
     source = session_rs.read_text(encoding="utf-8")
 
     assert "server.reserve_route(route)" in source

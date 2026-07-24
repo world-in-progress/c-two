@@ -151,7 +151,7 @@ impl ShmRegion {
 
     /// # Safety
     /// The caller must ensure exclusive access and valid range.
-    pub unsafe fn as_slice_mut(&self) -> &mut [u8] {
+    pub unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.base, self.size) }
     }
 }
@@ -160,10 +160,10 @@ impl Drop for ShmRegion {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.base as *mut libc::c_void, self.size);
-            if self.is_owner {
-                if let Ok(c_name) = CString::new(self.name.as_str()) {
-                    libc::shm_unlink(c_name.as_ptr());
-                }
+            if self.is_owner
+                && let Ok(c_name) = CString::new(self.name.as_str())
+            {
+                libc::shm_unlink(c_name.as_ptr());
             }
         }
     }

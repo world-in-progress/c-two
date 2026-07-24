@@ -224,6 +224,23 @@ struct PendingRouteInfo {
     max_payload_size: u64,
 }
 
+impl PendingRouteInfo {
+    fn into_attestation(self) -> PendingRouteAttestation {
+        PendingRouteAttestation {
+            route_name: self.contract.route_name,
+            route_uid: self.route_uid,
+            route_revision: self.route_revision,
+            crm_ns: self.contract.crm_ns,
+            crm_name: self.contract.crm_name,
+            crm_ver: self.contract.crm_ver,
+            abi_hash: self.contract.abi_hash,
+            signature_hash: self.contract.signature_hash,
+            method_names: self.method_names,
+            max_payload_size: self.max_payload_size,
+        }
+    }
+}
+
 impl PendingRouteReservation {
     fn route_name(&self) -> &str {
         &self.route_name
@@ -733,19 +750,19 @@ impl Server {
         &self,
         route_name: &str,
         registration_token: &str,
-    ) -> Result<PendingRouteInfo, PendingRouteAttestationResponse> {
+    ) -> Result<PendingRouteInfo, Box<PendingRouteAttestationResponse>> {
         let pending_routes = self.pending_routes.lock();
         let Some(info) = pending_routes.get(route_name) else {
-            return Err(PendingRouteAttestationResponse::Rejected {
+            return Err(Box::new(PendingRouteAttestationResponse::Rejected {
                 code: PENDING_ROUTE_REJECT_NOT_FOUND.to_string(),
                 message: format!("pending route '{route_name}' not found"),
-            });
+            }));
         };
         if info.registration_token != registration_token {
-            return Err(PendingRouteAttestationResponse::Rejected {
+            return Err(Box::new(PendingRouteAttestationResponse::Rejected {
                 code: PENDING_ROUTE_REJECT_TOKEN_MISMATCH.to_string(),
                 message: format!("pending route '{route_name}' registration token mismatch"),
-            });
+            }));
         }
         Ok(info.clone())
     }
@@ -1541,18 +1558,18 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
                 let route_pending_permit = route_admission.pending_permit;
                 let method_idx = ctrl.method_idx;
                 tokio::spawn(async move {
-                    dispatch_admitted_buddy_call(
-                        &srv,
-                        &cn,
+                    dispatch_admitted_buddy_call(AdmittedBuddyCall {
+                        server: &srv,
+                        conn: &cn,
                         request_id,
-                        &pl,
+                        payload: &pl,
                         ctrl_consumed,
                         route,
                         method_idx,
-                        &wr,
-                        pending_permit,
+                        writer: &wr,
+                        _pending_permit: pending_permit,
                         route_pending_permit,
-                    )
+                    })
                     .await;
                 });
                 continue;
@@ -1589,18 +1606,18 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
             let route_pending_permit = route_admission.pending_permit;
             let method_idx = ctrl.method_idx;
             tokio::spawn(async move {
-                dispatch_admitted_call(
-                    &srv,
-                    &cn,
+                dispatch_admitted_call(AdmittedCall {
+                    server: &srv,
+                    conn: &cn,
                     request_id,
-                    &pl,
-                    ctrl_consumed,
+                    payload: &pl,
+                    control_consumed: ctrl_consumed,
                     route,
                     method_idx,
-                    &wr,
-                    pending_permit,
+                    writer: &wr,
+                    _pending_permit: pending_permit,
                     route_pending_permit,
-                )
+                })
                 .await;
             });
         } else {
@@ -1645,10 +1662,10 @@ async fn handle_handshake(
         let count = pool.segment_count();
         let mut segs = Vec::with_capacity(count);
         for i in 0..count {
-            if let Some(name) = pool.segment_name(i) {
-                if let Some(seg) = pool.segment(i) {
-                    segs.push((name.to_string(), seg.allocator().data_size() as u32));
-                }
+            if let Some(name) = pool.segment_name(i)
+                && let Some(seg) = pool.segment(i)
+            {
+                segs.push((name.to_string(), seg.allocator().data_size() as u32));
             }
         }
         let prefix = pool.prefix().to_string();
@@ -1764,32 +1781,6 @@ async fn handle_ctrl(
     }
 }
 
-fn route_attestation_from_parts(
-    route_name: String,
-    route_uid: String,
-    route_revision: u64,
-    crm_ns: String,
-    crm_name: String,
-    crm_ver: String,
-    abi_hash: String,
-    signature_hash: String,
-    method_names: Vec<String>,
-    max_payload_size: u64,
-) -> PendingRouteAttestation {
-    PendingRouteAttestation {
-        route_name,
-        route_uid,
-        route_revision,
-        crm_ns,
-        crm_name,
-        crm_ver,
-        abi_hash,
-        signature_hash,
-        method_names,
-        max_payload_size,
-    }
-}
-
 fn route_info_from_record(record: RouteRecordWire) -> RouteInfo {
     RouteInfo {
         name: record.route_name,
@@ -1836,20 +1827,9 @@ fn pending_route_attestation_payload(server: &Server, payload: &[u8]) -> Vec<u8>
         Ok(request) => {
             match server.attest_pending_route(&request.route_name, &request.registration_token) {
                 Ok(info) => PendingRouteAttestationResponse::Attested {
-                    contract: route_attestation_from_parts(
-                        info.contract.route_name,
-                        info.route_uid,
-                        info.route_revision,
-                        info.contract.crm_ns,
-                        info.contract.crm_name,
-                        info.contract.crm_ver,
-                        info.contract.abi_hash,
-                        info.contract.signature_hash,
-                        info.method_names,
-                        info.max_payload_size,
-                    ),
+                    contract: info.into_attestation(),
                 },
-                Err(response) => response,
+                Err(response) => *response,
             }
         }
         Err(err) => PendingRouteAttestationResponse::Rejected {
@@ -2434,18 +2414,32 @@ async fn write_unknown_method_index(
 // CRM call dispatch (inline, non-buddy, non-chunked)
 // ---------------------------------------------------------------------------
 
-async fn dispatch_admitted_call(
-    server: &Server,
-    conn: &Connection,
+struct AdmittedCall<'a> {
+    server: &'a Server,
+    conn: &'a Connection,
     request_id: u64,
-    payload: &[u8],
+    payload: &'a [u8],
     control_consumed: usize,
     route: Arc<CrmRoute>,
     method_idx: u16,
-    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    writer: &'a Arc<Mutex<OwnedWriteHalf>>,
     _pending_permit: OwnedSemaphorePermit,
     route_pending_permit: SchedulerPendingPermit,
-) {
+}
+
+async fn dispatch_admitted_call(call: AdmittedCall<'_>) {
+    let AdmittedCall {
+        server,
+        conn,
+        request_id,
+        payload,
+        control_consumed,
+        route,
+        method_idx,
+        writer,
+        _pending_permit,
+        route_pending_permit,
+    } = call;
     let _flight = crate::connection::FlightGuard::new(conn);
 
     let callback = Arc::clone(&route.callback);
@@ -2492,18 +2486,18 @@ async fn dispatch_call(
         }
     };
 
-    dispatch_admitted_call(
+    dispatch_admitted_call(AdmittedCall {
         server,
         conn,
         request_id,
         payload,
-        consumed,
-        admission.route,
-        ctrl.method_idx,
+        control_consumed: consumed,
+        route: admission.route,
+        method_idx: ctrl.method_idx,
         writer,
-        pending_permit,
-        admission.pending_permit,
-    )
+        _pending_permit: pending_permit,
+        route_pending_permit: admission.pending_permit,
+    })
     .await;
 }
 
@@ -2537,18 +2531,32 @@ fn cleanup_buddy_request_block(conn: &Arc<Connection>, payload: &[u8]) {
     schedule_peer_buddy_gc_if_idle(conn, free_result);
 }
 
-async fn dispatch_admitted_buddy_call(
-    server: &Server,
-    conn: &Arc<Connection>,
+struct AdmittedBuddyCall<'a> {
+    server: &'a Server,
+    conn: &'a Arc<Connection>,
     request_id: u64,
-    payload: &[u8],
+    payload: &'a [u8],
     ctrl_consumed: usize,
     route: Arc<CrmRoute>,
     method_idx: u16,
-    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    writer: &'a Arc<Mutex<OwnedWriteHalf>>,
     _pending_permit: OwnedSemaphorePermit,
     route_pending_permit: SchedulerPendingPermit,
-) {
+}
+
+async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
+    let AdmittedBuddyCall {
+        server,
+        conn,
+        request_id,
+        payload,
+        ctrl_consumed,
+        route,
+        method_idx,
+        writer,
+        _pending_permit,
+        route_pending_permit,
+    } = call;
     let _flight = crate::connection::FlightGuard::new(conn.as_ref());
 
     // 1. Decode buddy pointer (11 bytes).
@@ -4400,8 +4408,10 @@ mod tests {
             }
         }
 
-        let mut config = ServerIpcConfig::default();
-        config.max_execution_workers = 1;
+        let config = ServerIpcConfig {
+            max_execution_workers: 1,
+            ..ServerIpcConfig::default()
+        };
         let server = Arc::new(Server::new("ipc://server_execution_limit", config).unwrap());
 
         let active = Arc::new(AtomicUsize::new(0));
@@ -4510,9 +4520,11 @@ mod tests {
             }
         }
 
-        let mut config = ServerIpcConfig::default();
-        config.max_execution_workers = 2;
-        config.max_pending_requests = 8;
+        let config = ServerIpcConfig {
+            max_execution_workers: 2,
+            max_pending_requests: 8,
+            ..ServerIpcConfig::default()
+        };
         let rt = ServerRuntimeBuilder::build(&config).unwrap();
 
         rt.block_on(async move {
@@ -4686,9 +4698,11 @@ mod tests {
             }
         }
 
-        let mut config = ServerIpcConfig::default();
-        config.max_execution_workers = 1;
-        config.max_pending_requests = 8;
+        let config = ServerIpcConfig {
+            max_execution_workers: 1,
+            max_pending_requests: 8,
+            ..ServerIpcConfig::default()
+        };
         let rt = ServerRuntimeBuilder::build(&config).unwrap();
 
         rt.block_on(async move {
@@ -5042,8 +5056,10 @@ mod tests {
             }
         }
 
-        let mut config = ServerIpcConfig::default();
-        config.max_execution_workers = 1;
+        let config = ServerIpcConfig {
+            max_execution_workers: 1,
+            ..ServerIpcConfig::default()
+        };
         let server =
             Arc::new(Server::new("ipc://unregister_cancels_global_waiter", config).unwrap());
 
@@ -5152,8 +5168,10 @@ mod tests {
             }
         }
 
-        let mut config = ServerIpcConfig::default();
-        config.max_execution_workers = 1;
+        let config = ServerIpcConfig {
+            max_execution_workers: 1,
+            ..ServerIpcConfig::default()
+        };
         let server =
             Arc::new(Server::new("ipc://connection_cancels_global_waiter", config).unwrap());
 
@@ -5303,9 +5321,11 @@ mod tests {
             }
         }
 
-        let mut config = ServerIpcConfig::default();
-        config.max_pending_requests = 1;
-        config.max_execution_workers = 2;
+        let config = ServerIpcConfig {
+            max_pending_requests: 1,
+            max_execution_workers: 2,
+            ..ServerIpcConfig::default()
+        };
         let server = Arc::new(Server::new("ipc://server_pending_limit", config).unwrap());
 
         let started = Arc::new(AtomicUsize::new(0));
@@ -6065,18 +6085,19 @@ mod tests {
             Err(_) => panic!("route admission should succeed"),
         };
         let pending_permit = server.try_acquire_pending_request().unwrap();
-        dispatch_admitted_buddy_call(
-            &server,
-            &conn,
-            77,
-            &payload,
+        let writer = closed_writer();
+        dispatch_admitted_buddy_call(AdmittedBuddyCall {
+            server: &server,
+            conn: &conn,
+            request_id: 77,
+            payload: &payload,
             ctrl_consumed,
-            admission.route,
-            0,
-            &closed_writer(),
-            pending_permit,
-            admission.pending_permit,
-        )
+            route: admission.route,
+            method_idx: 0,
+            writer: &writer,
+            _pending_permit: pending_permit,
+            route_pending_permit: admission.pending_permit,
+        })
         .await;
 
         let observed = seen

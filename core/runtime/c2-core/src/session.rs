@@ -5,7 +5,6 @@
 //! callbacks and local direct-call bindings, but must not duplicate the runtime
 //! authority implemented here.
 
-use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,12 +14,12 @@ use parking_lot::Mutex;
 use c2_contract::ExpectedRouteContract;
 use c2_http::client::{
     HttpError, RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient,
-    RelayLocalIpcCandidate, RelayResolvedTarget,
+    RelayLocalIpcCandidate, RelayRegistration, RelayResolvedTarget,
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
 use crate::{
-    RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome,
+    LifecycleError, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome,
     RuntimeRouteSpec, ShutdownOutcome, UnregisterOutcome,
 };
 use crate::{
@@ -44,7 +43,7 @@ pub struct RuntimeIdentity {
 }
 
 #[derive(Debug, Clone)]
-pub struct RuntimeSessionOptions {
+pub struct RuntimeOptions {
     pub server_id: Option<String>,
     pub server_ipc_overrides: Option<ServerIpcConfigOverrides>,
     pub client_ipc_overrides: Option<ClientIpcConfigOverrides>,
@@ -54,7 +53,7 @@ pub struct RuntimeSessionOptions {
     pub use_process_relay_anchor: bool,
 }
 
-impl Default for RuntimeSessionOptions {
+impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             server_id: None,
@@ -67,50 +66,6 @@ impl Default for RuntimeSessionOptions {
         }
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeSessionError {
-    InvalidServerId(String),
-    ClientConfigFrozen,
-    DuplicateRoute(String),
-    MissingRoute(String),
-    RelayDuplicateRoute(String),
-    MissingRelayAddress,
-    RelayHttp { status_code: u16, message: String },
-    RegisterFailure(RegisterFailureOutcome),
-    Server(String),
-    Relay(String),
-}
-
-impl fmt::Display for RuntimeSessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidServerId(message) => write!(f, "{message}"),
-            Self::ClientConfigFrozen => write!(f, "client IPC configuration is frozen"),
-            Self::DuplicateRoute(name) => write!(f, "route already registered: {name}"),
-            Self::MissingRoute(name) => write!(f, "route not registered: {name}"),
-            Self::RelayDuplicateRoute(name) => {
-                write!(f, "relay route already registered: {name}")
-            }
-            Self::MissingRelayAddress => write!(f, "no relay address configured"),
-            Self::RelayHttp {
-                status_code,
-                message,
-            } => {
-                write!(f, "relay HTTP {status_code}: {message}")
-            }
-            Self::RegisterFailure(outcome) => write!(
-                f,
-                "registration failed at {}: {}",
-                outcome.failure_source, outcome.error_message
-            ),
-            Self::Server(message) => write!(f, "server error: {message}"),
-            Self::Relay(message) => write!(f, "relay error: {message}"),
-        }
-    }
-}
-
-impl Error for RuntimeSessionError {}
 
 fn registration_rollback_outcome(route_name: &str, local_removed: bool) -> RouteCloseOutcome {
     RouteCloseOutcome {
@@ -159,17 +114,17 @@ fn route_close_from_server_outcome(outcome: ServerRouteCloseOutcome) -> RouteClo
     }
 }
 
-pub struct RuntimeSession {
-    state: Mutex<RuntimeSessionState>,
+pub struct Runtime {
+    state: Mutex<RuntimeState>,
 }
 
-impl fmt::Debug for RuntimeSession {
+impl fmt::Debug for Runtime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RuntimeSession").finish_non_exhaustive()
+        f.debug_struct("Runtime").finish_non_exhaustive()
     }
 }
 
-struct RuntimeSessionState {
+struct RuntimeState {
     server_id_override: Option<String>,
     server_ipc_overrides: Option<ServerIpcConfigOverrides>,
     client_ipc_overrides: Option<ClientIpcConfigOverrides>,
@@ -202,13 +157,13 @@ pub enum RelayResolvedConnection {
     },
 }
 
-impl RuntimeSession {
-    pub fn new(options: RuntimeSessionOptions) -> Result<Self, RuntimeSessionError> {
+impl Runtime {
+    pub fn new(options: RuntimeOptions) -> Result<Self, LifecycleError> {
         if let Some(server_id) = options.server_id.as_deref() {
             validate_server_id(server_id)?;
         }
         Ok(Self {
-            state: Mutex::new(RuntimeSessionState {
+            state: Mutex::new(RuntimeState {
                 server_id_override: options.server_id,
                 server_ipc_overrides: options.server_ipc_overrides,
                 client_ipc_overrides: options.client_ipc_overrides,
@@ -227,7 +182,7 @@ impl RuntimeSession {
         })
     }
 
-    pub fn ensure_server(&self) -> Result<RuntimeIdentity, RuntimeSessionError> {
+    pub fn ensure_server(&self) -> Result<RuntimeIdentity, LifecycleError> {
         let mut state = self.state.lock();
         if let Some(identity) = &state.identity {
             return Ok(identity.clone());
@@ -275,7 +230,7 @@ impl RuntimeSession {
         &self,
         server_id: Option<String>,
         server_ipc_overrides: Option<ServerIpcConfigOverrides>,
-    ) -> Result<(), RuntimeSessionError> {
+    ) -> Result<(), LifecycleError> {
         if let Some(server_id) = server_id.as_deref() {
             validate_server_id(server_id)?;
         }
@@ -293,10 +248,10 @@ impl RuntimeSession {
     pub fn set_client_ipc_overrides(
         &self,
         overrides: Option<ClientIpcConfigOverrides>,
-    ) -> Result<(), RuntimeSessionError> {
+    ) -> Result<(), LifecycleError> {
         let mut state = self.state.lock();
         if state.client_config_frozen {
-            return Err(RuntimeSessionError::ClientConfigFrozen);
+            return Err(LifecycleError::ClientConfigFrozen);
         }
         state.client_ipc_overrides = overrides;
         Ok(())
@@ -340,10 +295,10 @@ impl RuntimeSession {
         self.state.lock().relay_anchor_address_override.clone()
     }
 
-    pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, RuntimeSessionError> {
+    pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, LifecycleError> {
         #[cfg(test)]
         if let Some(message) = self.state.lock().forced_relay_config_error.clone() {
-            return Err(RuntimeSessionError::Relay(message));
+            return Err(LifecycleError::Relay(message));
         }
         let (override_address, use_process_relay_anchor) = {
             let state = self.state.lock();
@@ -361,7 +316,7 @@ impl RuntimeSession {
         c2_config::ConfigResolver::resolve_relay_anchor_address(
             c2_config::ConfigSources::from_process(),
         )
-        .map_err(|e| RuntimeSessionError::Relay(e.to_string()))
+        .map_err(|e| LifecycleError::Relay(e.to_string()))
     }
 
     #[cfg(test)]
@@ -376,25 +331,25 @@ impl RuntimeSession {
         spec: RuntimeRouteSpec,
         relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
-    ) -> Result<RegisterOutcome, RuntimeSessionError> {
+    ) -> Result<RegisterOutcome, LifecycleError> {
         let identity = self.ensure_server()?;
         let route_name = spec.name.clone();
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
         if route.name() != spec.name {
-            return Err(RuntimeSessionError::Server(format!(
+            return Err(LifecycleError::Server(format!(
                 "route/spec name mismatch: route={:?}, spec={:?}",
                 route.name(),
                 spec.name
             )));
         }
         if route.method_names() != spec.method_names.as_slice() {
-            return Err(RuntimeSessionError::Server(format!(
+            return Err(LifecycleError::Server(format!(
                 "route/spec method_names mismatch for {route_name}"
             )));
         }
         if route.access_map_snapshot() != spec.access_map {
-            return Err(RuntimeSessionError::Server(format!(
+            return Err(LifecycleError::Server(format!(
                 "route/spec access map mismatch for {route_name}"
             )));
         }
@@ -404,7 +359,7 @@ impl RuntimeSession {
             || route.abi_hash() != spec.abi_hash
             || route.signature_hash() != spec.signature_hash
         {
-            return Err(RuntimeSessionError::Server(format!(
+            return Err(LifecycleError::Server(format!(
                 "route/spec crm contract mismatch for {route_name}: route={}/{}/{} hashes={}/{} spec={}/{}/{} hashes={}/{}",
                 route.crm_ns(),
                 route.crm_name(),
@@ -423,7 +378,7 @@ impl RuntimeSession {
             || scheduler_snapshot.max_pending != spec.max_pending
             || scheduler_snapshot.max_workers != spec.max_workers
         {
-            return Err(RuntimeSessionError::Server(format!(
+            return Err(LifecycleError::Server(format!(
                 "route/spec scheduler mismatch for {route_name}"
             )));
         }
@@ -431,9 +386,9 @@ impl RuntimeSession {
         let rt = Self::server_runtime()?;
         let reservation = rt.block_on(server.reserve_route(route)).map_err(|e| {
             if e.to_string().contains("already registered") {
-                RuntimeSessionError::DuplicateRoute(route_name.clone())
+                LifecycleError::DuplicateRoute(route_name.clone())
             } else {
-                RuntimeSessionError::Server(e.to_string())
+                LifecycleError::Server(e.to_string())
             }
         })?;
         let mut reservation = Some(reservation);
@@ -448,7 +403,7 @@ impl RuntimeSession {
                         rt.block_on(server.abort_reserved_route(
                             reservation.take().expect("reservation should exist"),
                         ));
-                        return Err(RuntimeSessionError::RegisterFailure(
+                        return Err(LifecycleError::RegisterFailure(Box::new(
                             RegisterFailureOutcome {
                                 route_name: route_name.clone(),
                                 failure_source: "relay_projection".to_string(),
@@ -457,7 +412,7 @@ impl RuntimeSession {
                                 rollback: Some(registration_rollback_outcome(&route_name, false)),
                                 relay_cleanup_error: None,
                             },
-                        ));
+                        )));
                     }
                 };
             let registration_token = reservation
@@ -465,17 +420,22 @@ impl RuntimeSession {
                 .expect("reservation should exist")
                 .registration_token()
                 .to_string();
+            let expected = ExpectedRouteContract {
+                route_name: spec.name.clone(),
+                crm_ns: spec.crm_ns.clone(),
+                crm_name: spec.crm_name.clone(),
+                crm_ver: spec.crm_ver.clone(),
+                abi_hash: spec.abi_hash.clone(),
+                signature_hash: spec.signature_hash.clone(),
+            };
             if let Err(err) = projection.control.prepare_register(
-                &spec.name,
-                &identity.server_id,
-                &identity.server_instance_id,
-                &identity.ipc_address,
-                &spec.crm_ns,
-                &spec.crm_name,
-                &spec.crm_ver,
-                &spec.abi_hash,
-                &spec.signature_hash,
-                server.config().max_payload_size,
+                RelayRegistration {
+                    expected: &expected,
+                    server_id: &identity.server_id,
+                    server_instance_id: &identity.server_instance_id,
+                    address: &identity.ipc_address,
+                    max_payload_size: server.config().max_payload_size,
+                },
                 &registration_token,
             ) {
                 rt.block_on(
@@ -484,7 +444,7 @@ impl RuntimeSession {
                     ),
                 );
                 let (status_code, error_message) = http_error_parts(err);
-                return Err(RuntimeSessionError::RegisterFailure(
+                return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
                         route_name: route_name.clone(),
                         failure_source: "relay_prepare".to_string(),
@@ -493,7 +453,7 @@ impl RuntimeSession {
                         rollback: Some(registration_rollback_outcome(&route_name, false)),
                         relay_cleanup_error: None,
                     },
-                ));
+                )));
             }
             relay_projection = Some(projection);
         }
@@ -505,7 +465,7 @@ impl RuntimeSession {
             )) {
                 Ok(token) => Some(token),
                 Err(err) => {
-                    return Err(RuntimeSessionError::RegisterFailure(
+                    return Err(LifecycleError::RegisterFailure(Box::new(
                         RegisterFailureOutcome {
                             route_name: route_name.clone(),
                             failure_source: "commit".to_string(),
@@ -514,14 +474,14 @@ impl RuntimeSession {
                             rollback: Some(registration_rollback_outcome(&route_name, false)),
                             relay_cleanup_error: None,
                         },
-                    ));
+                    )));
                 }
             }
         } else {
             if let Err(err) = rt.block_on(
                 server.commit_reserved_route(reservation.take().expect("reservation should exist")),
             ) {
-                return Err(RuntimeSessionError::RegisterFailure(
+                return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
                         route_name: route_name.clone(),
                         failure_source: "commit".to_string(),
@@ -530,24 +490,27 @@ impl RuntimeSession {
                         rollback: Some(registration_rollback_outcome(&route_name, false)),
                         relay_cleanup_error: None,
                     },
-                ));
+                )));
             }
             None
         };
 
         if let Some(projection) = relay_projection.as_ref() {
-            if let Err(err) = projection.control.register(
-                &spec.name,
-                &identity.server_id,
-                &identity.server_instance_id,
-                &identity.ipc_address,
-                &spec.crm_ns,
-                &spec.crm_name,
-                &spec.crm_ver,
-                &spec.abi_hash,
-                &spec.signature_hash,
-                server.config().max_payload_size,
-            ) {
+            let expected = ExpectedRouteContract {
+                route_name: spec.name.clone(),
+                crm_ns: spec.crm_ns.clone(),
+                crm_name: spec.crm_name.clone(),
+                crm_ver: spec.crm_ver.clone(),
+                abi_hash: spec.abi_hash.clone(),
+                signature_hash: spec.signature_hash.clone(),
+            };
+            if let Err(err) = projection.control.register(RelayRegistration {
+                expected: &expected,
+                server_id: &identity.server_id,
+                server_instance_id: &identity.server_instance_id,
+                address: &identity.ipc_address,
+                max_payload_size: server.config().max_payload_size,
+            }) {
                 let local_removed = rt.block_on(server.unregister_route(&spec.name));
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
@@ -556,7 +519,7 @@ impl RuntimeSession {
                     &identity.server_id,
                 );
                 let (status_code, error_message) = http_error_parts(err);
-                return Err(RuntimeSessionError::RegisterFailure(
+                return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
                         route_name: route_name.clone(),
                         failure_source: "relay_register".to_string(),
@@ -565,7 +528,7 @@ impl RuntimeSession {
                         rollback: Some(registration_rollback_outcome(&route_name, local_removed)),
                         relay_cleanup_error,
                     },
-                ));
+                )));
             }
             let route_admission_token = route_admission_token
                 .expect("relay-backed registration should have a route admission token");
@@ -577,7 +540,7 @@ impl RuntimeSession {
                     &spec.name,
                     &identity.server_id,
                 );
-                return Err(RuntimeSessionError::RegisterFailure(
+                return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
                         route_name: route_name.clone(),
                         failure_source: "route_open".to_string(),
@@ -586,7 +549,7 @@ impl RuntimeSession {
                         rollback: Some(registration_rollback_outcome(&route_name, local_removed)),
                         relay_cleanup_error,
                     },
-                ));
+                )));
             }
             relay_registered = true;
         }
@@ -606,14 +569,14 @@ impl RuntimeSession {
         name: &str,
         relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
-    ) -> Result<UnregisterOutcome, RuntimeSessionError> {
+    ) -> Result<UnregisterOutcome, LifecycleError> {
         let route_name = name.to_string();
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
         let rt = Self::server_runtime()?;
         let local_removed = rt.block_on(server.unregister_route(&route_name));
         if !local_removed {
-            return Err(RuntimeSessionError::MissingRoute(route_name));
+            return Err(LifecycleError::MissingRoute(route_name));
         }
 
         let relay_error =
@@ -726,15 +689,15 @@ impl RuntimeSession {
                                 .push(route_close_from_server_outcome(close));
                         }
                         for route_name in &pending_runtime_unregisters {
-                            if let Some(identity) = identity.as_ref() {
-                                if let Some(relay_error) = self.relay_cleanup(
+                            if let Some(identity) = identity.as_ref()
+                                && let Some(relay_error) = self.relay_cleanup(
                                     effective_relay_anchor_address.as_deref(),
                                     relay_use_proxy,
                                     route_name,
                                     &identity.server_id,
-                                ) {
-                                    outcome.relay_errors.push(relay_error);
-                                }
+                                )
+                            {
+                                outcome.relay_errors.push(relay_error);
                             }
                         }
                     }
@@ -796,7 +759,7 @@ impl RuntimeSession {
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
-    ) -> Result<RelayResolvedConnection, RuntimeSessionError> {
+    ) -> Result<RelayResolvedConnection, LifecycleError> {
         let projection = self.relay_projection(relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
             Arc::clone(&projection.control),
@@ -822,7 +785,7 @@ impl RuntimeSession {
     pub fn resolve_relay_connection_after_local_ipc_failures(
         client: RelayAwareHttpClient,
         failed_candidates: &[RelayLocalIpcCandidate],
-    ) -> Result<RelayResolvedConnection, RuntimeSessionError> {
+    ) -> Result<RelayResolvedConnection, LifecycleError> {
         match client
             .resolve_target_after_local_ipc_failures(failed_candidates)
             .map_err(runtime_http_error)?
@@ -843,7 +806,7 @@ impl RuntimeSession {
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
-    ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError> {
+    ) -> Result<(RelayAwareHttpClient, String), LifecycleError> {
         let projection = self.relay_projection(relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
             Arc::clone(&projection.control),
@@ -870,7 +833,7 @@ impl RuntimeSession {
         max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
-    ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError> {
+    ) -> Result<(RelayAwareHttpClient, String), LifecycleError> {
         let client = RelayAwareHttpClient::new(
             relay_url,
             expected,
@@ -894,13 +857,10 @@ impl RuntimeSession {
         }
     }
 
-    fn relay_projection(
-        &self,
-        relay_use_proxy: bool,
-    ) -> Result<RelayProjection, RuntimeSessionError> {
+    fn relay_projection(&self, relay_use_proxy: bool) -> Result<RelayProjection, LifecycleError> {
         let relay_anchor_address = self
             .effective_relay_anchor_address()?
-            .ok_or(RuntimeSessionError::MissingRelayAddress)?;
+            .ok_or(LifecycleError::MissingRelayAddress)?;
         self.relay_projection_for_address(&relay_anchor_address, relay_use_proxy)
     }
 
@@ -908,22 +868,21 @@ impl RuntimeSession {
         &self,
         relay_anchor_address: &str,
         relay_use_proxy: bool,
-    ) -> Result<RelayProjection, RuntimeSessionError> {
+    ) -> Result<RelayProjection, LifecycleError> {
         let relay_anchor_address = canonical_relay_anchor_address(relay_anchor_address);
         {
             let state = self.state.lock();
-            if let Some(projection) = state.relay_projection.as_ref() {
-                if projection.relay_anchor_address == relay_anchor_address
-                    && projection.relay_use_proxy == relay_use_proxy
-                {
-                    return Ok(projection.clone());
-                }
+            if let Some(projection) = state.relay_projection.as_ref()
+                && projection.relay_anchor_address == relay_anchor_address
+                && projection.relay_use_proxy == relay_use_proxy
+            {
+                return Ok(projection.clone());
             }
         }
 
         let control = Arc::new(
             RelayControlClient::new(&relay_anchor_address, relay_use_proxy)
-                .map_err(|e| RuntimeSessionError::Relay(e.to_string()))?,
+                .map_err(|e| LifecycleError::Relay(e.to_string()))?,
         );
         let projection = RelayProjection {
             relay_anchor_address,
@@ -934,17 +893,17 @@ impl RuntimeSession {
         Ok(projection)
     }
 
-    fn server_runtime() -> Result<tokio::runtime::Runtime, RuntimeSessionError> {
+    fn server_runtime() -> Result<tokio::runtime::Runtime, LifecycleError> {
         #[cfg(test)]
         if FORCE_SERVER_RUNTIME_FAILURE.with(|flag| flag.get()) {
-            return Err(RuntimeSessionError::Server(
+            return Err(LifecycleError::Server(
                 "failed to create runtime: injected test failure".to_string(),
             ));
         }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| RuntimeSessionError::Server(format!("failed to create runtime: {e}")))?;
+            .map_err(|e| LifecycleError::Server(format!("failed to create runtime: {e}")))?;
         Ok(rt)
     }
 
@@ -989,7 +948,7 @@ impl RuntimeSession {
     fn effective_relay_anchor_address_arg(
         &self,
         relay_anchor_address: Option<&str>,
-    ) -> Result<Option<String>, RuntimeSessionError> {
+    ) -> Result<Option<String>, LifecycleError> {
         match relay_anchor_address {
             Some(address) => Ok(Some(address.to_string())),
             None => self.effective_relay_anchor_address(),
@@ -1001,13 +960,13 @@ fn canonical_relay_anchor_address(address: &str) -> String {
     address.trim().trim_end_matches('/').to_string()
 }
 
-fn runtime_http_error(err: HttpError) -> RuntimeSessionError {
+fn runtime_http_error(err: HttpError) -> LifecycleError {
     match err {
-        HttpError::ServerError(status_code, message) => RuntimeSessionError::RelayHttp {
+        HttpError::ServerError(status_code, message) => LifecycleError::RelayHttp {
             status_code,
             message,
         },
-        other => RuntimeSessionError::Relay(other.to_string()),
+        other => LifecycleError::Relay(other.to_string()),
     }
 }
 
@@ -1094,7 +1053,7 @@ mod tests {
     }
 
     fn register_dummy(server: &Arc<c2_server::Server>, name: &str) {
-        let rt = RuntimeSession::server_runtime().expect("runtime");
+        let rt = Runtime::server_runtime().expect("runtime");
         let route = dummy_route(server, name);
         let reservation = rt
             .block_on(server.reserve_route(route))
@@ -1133,7 +1092,7 @@ mod tests {
 
     #[test]
     fn explicit_server_id_derives_ipc_address() {
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some("unit-server".to_string()),
             server_ipc_overrides: None,
             client_ipc_overrides: None,
@@ -1160,7 +1119,7 @@ mod tests {
     #[test]
     fn invalid_server_id_is_rejected() {
         for bad in ["", " ", "bad/name", "bad\\name", ".", "..", "bad\nid"] {
-            let err = RuntimeSession::new(RuntimeSessionOptions {
+            let err = Runtime::new(RuntimeOptions {
                 server_id: Some(bad.to_string()),
                 server_ipc_overrides: None,
                 client_ipc_overrides: None,
@@ -1179,7 +1138,7 @@ mod tests {
 
     #[test]
     fn auto_server_id_is_valid_and_address_matches() {
-        let session = RuntimeSession::new(RuntimeSessionOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions::default()).expect("session");
         let identity = session.ensure_server().expect("ensure server");
 
         c2_config::validate_server_id(&identity.server_id).expect("generated id should validate");
@@ -1193,7 +1152,7 @@ mod tests {
 
     #[test]
     fn clear_server_identity_preserves_explicit_override() {
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some("unit-retry".to_string()),
             server_ipc_overrides: None,
             client_ipc_overrides: None,
@@ -1222,7 +1181,7 @@ mod tests {
             max_pool_segments: Some(2),
             ..Default::default()
         };
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some("unit-server-overrides".to_string()),
             server_ipc_overrides: Some(overrides),
             client_ipc_overrides: None,
@@ -1246,7 +1205,7 @@ mod tests {
             reassembly_segment_size: Some(16 * 1024 * 1024),
             ..Default::default()
         };
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: None,
             server_ipc_overrides: None,
             client_ipc_overrides: Some(overrides),
@@ -1265,7 +1224,7 @@ mod tests {
 
     #[test]
     fn relay_anchor_address_override_is_canonicalized_and_clear_cache_is_safe() {
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             relay_anchor_address: Some(" http://relay.test/ ".to_string()),
             ..Default::default()
         })
@@ -1287,7 +1246,7 @@ mod tests {
     #[test]
     fn process_relay_anchor_can_be_disabled_for_standalone_direct_ipc() {
         with_process_relay_anchor("http://127.0.0.1:9", || {
-            let session = RuntimeSession::new(RuntimeSessionOptions {
+            let session = Runtime::new(RuntimeOptions {
                 use_process_relay_anchor: false,
                 ..Default::default()
             })
@@ -1299,8 +1258,7 @@ mod tests {
                 None,
             );
 
-            let default_session =
-                RuntimeSession::new(RuntimeSessionOptions::default()).expect("session");
+            let default_session = Runtime::new(RuntimeOptions::default()).expect("session");
             assert_eq!(
                 default_session
                     .effective_relay_anchor_address()
@@ -1313,7 +1271,7 @@ mod tests {
 
     #[test]
     fn unregister_missing_route_reports_missing_route() {
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("missing-session")),
             ..Default::default()
         })
@@ -1322,13 +1280,13 @@ mod tests {
         let err = session
             .unregister_route(&server, "absent", None, false)
             .expect_err("missing route should error");
-        assert_eq!(err, RuntimeSessionError::MissingRoute("absent".to_string()));
+        assert_eq!(err, LifecycleError::MissingRoute("absent".to_string()));
     }
 
     #[test]
     fn register_route_rejects_crm_contract_mismatch() {
         let route_name = unique_route_name("crm-contract-mismatch");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("crm-contract-session")),
             ..Default::default()
         })
@@ -1350,7 +1308,7 @@ mod tests {
     #[test]
     fn register_route_rejects_access_map_mismatch() {
         let route_name = unique_route_name("access-map-mismatch");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("access-map-session")),
             ..Default::default()
         })
@@ -1372,7 +1330,7 @@ mod tests {
     #[test]
     fn unregister_without_relay_does_not_publish_lazy_identity() {
         let route_name = unique_route_name("no-relay-unregister");
-        let session = RuntimeSession::new(RuntimeSessionOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions::default()).expect("session");
         let server = test_server("no-relay-unregister-server");
         register_dummy(&server, &route_name);
 
@@ -1391,7 +1349,7 @@ mod tests {
     #[test]
     fn unregister_relay_failure_returns_structured_outcome_after_local_remove() {
         let route_name = unique_route_name("relay-fail-route");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-fail-session")),
             ..Default::default()
         })
@@ -1412,7 +1370,7 @@ mod tests {
         let err = session
             .unregister_route(&server, &outcome.route_name, None, false)
             .expect_err("route should have already been removed locally");
-        assert!(matches!(err, RuntimeSessionError::MissingRoute(_)));
+        assert!(matches!(err, LifecycleError::MissingRoute(_)));
     }
 
     #[test]
@@ -1423,7 +1381,7 @@ mod tests {
         use std::thread;
 
         let route_name = unique_route_name("relay-commit-gate");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-commit-session")),
             ..Default::default()
         })
@@ -1462,7 +1420,7 @@ mod tests {
             "relay-backed registration must perform a non-publishing prepare before local commit"
         );
 
-        let rt = RuntimeSession::server_runtime().expect("runtime");
+        let rt = Runtime::server_runtime().expect("runtime");
         let visible_while_relay_pending = rt.block_on(server.contains_route(&route_name));
 
         release_tx.send(()).unwrap();
@@ -1471,7 +1429,7 @@ mod tests {
         let visible_after_failure = rt.block_on(server.contains_route(&route_name));
 
         let failure = match result {
-            Err(RuntimeSessionError::RegisterFailure(failure)) => failure,
+            Err(LifecycleError::RegisterFailure(failure)) => failure,
             other => panic!("unexpected register result: {other:?}"),
         };
         assert!(
@@ -1502,7 +1460,7 @@ mod tests {
         use std::thread;
 
         let route_name = unique_route_name("relay-final-fail");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-final-fail-session")),
             ..Default::default()
         })
@@ -1547,7 +1505,7 @@ mod tests {
         assert!(requests[2].contains("/_unregister"));
 
         let failure = match result {
-            Err(RuntimeSessionError::RegisterFailure(failure)) => failure,
+            Err(LifecycleError::RegisterFailure(failure)) => failure,
             other => panic!("unexpected register result: {other:?}"),
         };
         assert_eq!(failure.failure_source, "relay_register");
@@ -1566,7 +1524,7 @@ mod tests {
         assert_eq!(relay_cleanup_error.status_code, Some(409));
         assert_eq!(relay_cleanup_error.message, "cleanup failed");
 
-        let rt = RuntimeSession::server_runtime().expect("runtime");
+        let rt = Runtime::server_runtime().expect("runtime");
         assert!(
             !rt.block_on(server.contains_route(&route_name)),
             "relay final publish failure must roll back local route"
@@ -1581,7 +1539,7 @@ mod tests {
         use std::thread;
 
         let route_name = unique_route_name("relay-publish-gate");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("relay-publish-gate-session")),
             ..Default::default()
         })
@@ -1630,7 +1588,7 @@ mod tests {
             "final relay publish must use ordinary register after local commit"
         );
 
-        let rt = RuntimeSession::server_runtime().expect("runtime");
+        let rt = Runtime::server_runtime().expect("runtime");
         assert!(
             rt.block_on(server.contains_route(&route_name)),
             "route should be committed for final IPC re-attestation"
@@ -1644,7 +1602,7 @@ mod tests {
         relay_thread.join().unwrap();
         let result = register_thread.join().unwrap();
         let failure = match result {
-            Err(RuntimeSessionError::RegisterFailure(failure)) => failure,
+            Err(LifecycleError::RegisterFailure(failure)) => failure,
             other => panic!("unexpected register result: {other:?}"),
         };
         assert!(
@@ -1662,7 +1620,7 @@ mod tests {
     fn shutdown_is_idempotent_and_reports_removed_routes_once() {
         let first = unique_route_name("shutdown-a");
         let second = unique_route_name("shutdown-b");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             server_id: Some(unique_route_name("shutdown-session")),
             ..Default::default()
         })
@@ -1699,7 +1657,7 @@ mod tests {
         let first = unique_route_name("shutdown-close-a");
         let second = unique_route_name("shutdown-close-b");
         let session = Arc::new(
-            RuntimeSession::new(RuntimeSessionOptions {
+            Runtime::new(RuntimeOptions {
                 server_id: Some(unique_route_name("shutdown-close-session")),
                 ..Default::default()
             })
@@ -1764,7 +1722,7 @@ mod tests {
     #[test]
     fn shutdown_without_relay_does_not_publish_lazy_identity() {
         let route_name = unique_route_name("shutdown-no-relay");
-        let session = RuntimeSession::new(RuntimeSessionOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions::default()).expect("session");
         let server = test_server("shutdown-no-relay-server");
         register_dummy(&server, &route_name);
 
@@ -1790,7 +1748,7 @@ mod tests {
     #[test]
     fn shutdown_records_relay_config_resolution_errors() {
         let route_name = unique_route_name("shutdown-relay-config");
-        let session = RuntimeSession::new(RuntimeSessionOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions::default()).expect("session");
         session.force_relay_config_error_for_test("forced relay config failure");
         let server = test_server("shutdown-relay-config-server");
         register_dummy(&server, &route_name);
@@ -1817,7 +1775,7 @@ mod tests {
     #[test]
     fn shutdown_records_external_relay_cleanup_config_errors() {
         let route_name = unique_route_name("shutdown-relay-cleanup-config");
-        let session = RuntimeSession::new(RuntimeSessionOptions {
+        let session = Runtime::new(RuntimeOptions {
             relay_anchor_address: Some("http://127.0.0.1:9".to_string()),
             ..Default::default()
         })
@@ -1849,19 +1807,19 @@ mod tests {
     #[test]
     fn shutdown_runtime_construction_failure_reports_error_without_signalling_server() {
         let route_name = unique_route_name("shutdown-runtime-fail");
-        let session = RuntimeSession::new(RuntimeSessionOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions::default()).expect("session");
         let server = test_server("shutdown-runtime-fail-server");
         register_dummy(&server, &route_name);
 
         let runner = {
             let server = Arc::clone(&server);
             std::thread::spawn(move || {
-                let rt = RuntimeSession::server_runtime().expect("runtime");
+                let rt = Runtime::server_runtime().expect("runtime");
                 rt.block_on(server.run())
             })
         };
 
-        let rt = RuntimeSession::server_runtime().expect("runtime");
+        let rt = Runtime::server_runtime().expect("runtime");
         rt.block_on(server.wait_until_ready(Duration::from_secs(2)))
             .expect("server ready");
 
@@ -1901,19 +1859,19 @@ mod tests {
     #[test]
     fn shutdown_consumes_recorded_direct_shutdown_route_outcomes() {
         let route_name = unique_route_name("direct-shutdown-record");
-        let session = RuntimeSession::new(RuntimeSessionOptions::default()).expect("session");
+        let session = Runtime::new(RuntimeOptions::default()).expect("session");
         let server = test_server("direct-shutdown-record-server");
         register_dummy(&server, &route_name);
 
         let runner = {
             let server = Arc::clone(&server);
             std::thread::spawn(move || {
-                let rt = RuntimeSession::server_runtime().expect("runtime");
+                let rt = Runtime::server_runtime().expect("runtime");
                 rt.block_on(server.run())
             })
         };
 
-        let rt = RuntimeSession::server_runtime().expect("runtime");
+        let rt = Runtime::server_runtime().expect("runtime");
         rt.block_on(server.wait_until_ready(Duration::from_secs(2)))
             .expect("server ready");
         let ack = c2_ipc::shutdown(server.ipc_address(), Duration::from_secs(2))

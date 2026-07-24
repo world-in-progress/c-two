@@ -81,14 +81,13 @@ impl ShmSpinlock {
 
         loop {
             let current = self.atomic().load(Ordering::Relaxed);
-            if current == UNLOCKED {
-                if self
+            if current == UNLOCKED
+                && self
                     .atomic()
                     .compare_exchange_weak(UNLOCKED, my_pid, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
-                {
-                    return true;
-                }
+            {
+                return true;
             }
 
             total += 1;

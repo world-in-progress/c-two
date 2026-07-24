@@ -38,8 +38,10 @@ mod tests {
 
     #[test]
     fn runtime_options_derive_blocking_threads_from_server_config() {
-        let mut config = ServerIpcConfig::default();
-        config.max_execution_workers = 7;
+        let config = ServerIpcConfig {
+            max_execution_workers: 7,
+            ..ServerIpcConfig::default()
+        };
 
         let options = ServerRuntimeBuilder::options(&config);
 

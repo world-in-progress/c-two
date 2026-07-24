@@ -19,8 +19,9 @@ use axum::{
 use futures::StreamExt;
 
 use crate::relay::authority::{
-    ControlError, RegisterPreparation, RouteAuthority, attest_ipc_pending_route_contract,
-    attest_ipc_route_contract, read_ipc_route_contract,
+    ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
+    RouteAuthority, attest_ipc_pending_route_contract, attest_ipc_route_contract,
+    read_ipc_route_contract,
 };
 use crate::relay::conn_pool::UpstreamLease;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
@@ -40,17 +41,17 @@ const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
 const ROUTE_REVISION_HEADER: &str = "x-c2-route-revision";
 const UNKNOWN_LENGTH_BODY_LIMIT_BYTES: u64 = 64 * 1024;
 
+struct ReadyRequestClient {
+    lease: UpstreamLease,
+    route: RouteEntry,
+    binding: c2_ipc::RouteBinding,
+}
+
 enum RequestClient {
-    Ready {
-        lease: UpstreamLease,
-        route: RouteEntry,
-        binding: c2_ipc::RouteBinding,
-    },
-    Stale {
-        route: RouteEntry,
-    },
+    Ready(Box<ReadyRequestClient>),
+    Stale(Box<RouteEntry>),
     WatchUnavailable {
-        route: RouteEntry,
+        route: Box<RouteEntry>,
         reason: String,
     },
     NotFound,
@@ -61,6 +62,28 @@ struct ExpectedRouteToken {
     route_uid: String,
     route_revision: u64,
 }
+
+struct ResponseFailure(Box<Response>);
+
+impl ResponseFailure {
+    fn new(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
+impl From<Response> for ResponseFailure {
+    fn from(response: Response) -> Self {
+        Self::new(response)
+    }
+}
+
+impl IntoResponse for ResponseFailure {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
+type ResponseResult<T> = Result<T, ResponseFailure>;
 
 struct OptionalConnectInfo(Option<SocketAddr>);
 
@@ -147,7 +170,7 @@ where
         .into_response()
 }
 
-fn content_length_from_headers(headers: &HeaderMap) -> Result<Option<u64>, Response> {
+fn content_length_from_headers(headers: &HeaderMap) -> ResponseResult<Option<u64>> {
     let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
     let Some(value) = values.next() else {
         return Ok(None);
@@ -160,7 +183,8 @@ fn content_length_from_headers(headers: &HeaderMap) -> Result<Option<u64>, Respo
                 "message": "Content-Length must appear at most once",
             })),
         )
-            .into_response());
+            .into_response()
+            .into());
     }
     let raw = value.to_str().map_err(|_| {
         (
@@ -248,11 +272,10 @@ fn set_data_plane_after_precheck_hook(route_name: String, action: impl FnOnce() 
 fn run_data_plane_after_precheck_hook(route_name: &str) {
     let hook = {
         let mut guard = DATA_PLANE_AFTER_PRECHECK_HOOKS.lock().unwrap();
-        if let Some(index) = guard.iter().position(|hook| hook.route_name == route_name) {
-            Some(guard.remove(index))
-        } else {
-            None
-        }
+        guard
+            .iter()
+            .position(|hook| hook.route_name == route_name)
+            .map(|index| guard.remove(index))
     };
     if let Some(hook) = hook {
         (hook.action)();
@@ -262,7 +285,7 @@ fn run_data_plane_after_precheck_hook(route_name: &str) {
 fn expected_crm_from_headers(
     route_name: &str,
     headers: &HeaderMap,
-) -> Result<c2_contract::ExpectedRouteContract, Response> {
+) -> ResponseResult<c2_contract::ExpectedRouteContract> {
     let crm_ns = headers
         .get(EXPECTED_CRM_NS_HEADER)
         .map(|value| value.to_str().map(str::to_string));
@@ -287,7 +310,8 @@ fn expected_crm_from_headers(
                 "message": "expected CRM headers and hash headers are required",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
         (
             Some(Ok(crm_ns)),
             Some(Ok(crm_name)),
@@ -311,7 +335,8 @@ fn expected_crm_from_headers(
                         "message": err.to_string(),
                     })),
                 )
-                    .into_response());
+                    .into_response()
+                    .into());
             }
             Ok(expected)
         }
@@ -326,7 +351,8 @@ fn expected_crm_from_headers(
                 "message": "expected CRM headers must be valid UTF-8",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
         _ => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -334,7 +360,8 @@ fn expected_crm_from_headers(
                 "message": "expected CRM headers and hash headers must be supplied together",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -371,7 +398,7 @@ fn route_matches_expected_crm(
 fn route_token_from_headers(
     route_name: &str,
     headers: &HeaderMap,
-) -> Result<ExpectedRouteToken, Response> {
+) -> ResponseResult<ExpectedRouteToken> {
     let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER)?;
     let route_revision = single_route_token_header(route_name, headers, ROUTE_REVISION_HEADER)?;
 
@@ -393,21 +420,22 @@ fn route_token_from_headers(
                 return Err(protocol_violation_response(
                     route_name,
                     format!("invalid route token header {ROUTE_REVISION_HEADER}: must be > 0"),
-                ));
+                )
+                .into());
             }
             Ok(ExpectedRouteToken {
                 route_uid,
                 route_revision,
             })
         }
-        (None, None) => Err(protocol_violation_response(
-            route_name,
-            "route token headers are required",
-        )),
+        (None, None) => {
+            Err(protocol_violation_response(route_name, "route token headers are required").into())
+        }
         _ => Err(protocol_violation_response(
             route_name,
             "route token headers must be supplied together",
-        )),
+        )
+        .into()),
     }
 }
 
@@ -415,7 +443,7 @@ fn single_route_token_header(
     route_name: &str,
     headers: &HeaderMap,
     header_name: &'static str,
-) -> Result<Option<String>, Response> {
+) -> ResponseResult<Option<String>> {
     let mut values = headers.get_all(header_name).iter();
     let Some(value) = values.next() else {
         return Ok(None);
@@ -424,28 +452,29 @@ fn single_route_token_header(
         return Err(protocol_violation_response(
             route_name,
             format!("route token header {header_name} must not be repeated"),
-        ));
+        )
+        .into());
     }
     value.to_str().map(str::to_string).map(Some).map_err(|_| {
-        protocol_violation_response(route_name, "route token headers must be valid UTF-8")
+        protocol_violation_response(route_name, "route token headers must be valid UTF-8").into()
     })
 }
 
 fn validate_route_token_for_route(
     route: &RouteEntry,
     expected: &ExpectedRouteToken,
-) -> Result<(), Response> {
+) -> ResponseResult<()> {
     if route.route_uid == expected.route_uid && route.route_revision == expected.route_revision {
         Ok(())
     } else {
-        Err(route_stale_response(route))
+        Err(route_stale_response(route).into())
     }
 }
 
 fn register_contract_claim_from_body(
     route_name: &str,
     body: &serde_json::Value,
-) -> Result<Option<c2_contract::ExpectedRouteContract>, Response> {
+) -> ResponseResult<Option<c2_contract::ExpectedRouteContract>> {
     let crm_ns = register_body_string_field(body, "crm_ns")?;
     let crm_name = register_body_string_field(body, "crm_name")?;
     let crm_ver = register_body_string_field(body, "crm_ver")?;
@@ -471,7 +500,8 @@ fn register_contract_claim_from_body(
                         "message": err.to_string(),
                     })),
                 )
-                    .into_response());
+                    .into_response()
+                    .into());
             }
             Ok(Some(claimed))
         }
@@ -482,7 +512,8 @@ fn register_contract_claim_from_body(
                 "message": "crm_ns, crm_name, crm_ver, abi_hash, and signature_hash must be supplied together",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -507,7 +538,7 @@ async fn connect_ipc_for_register(address: &str) -> Result<IpcClient, String> {
 fn register_body_string_field<'a>(
     body: &'a serde_json::Value,
     field: &'static str,
-) -> Result<Option<&'a str>, Response> {
+) -> ResponseResult<Option<&'a str>> {
     match body.get(field) {
         Some(value) => value.as_str().map(Some).ok_or_else(|| {
             (
@@ -518,15 +549,13 @@ fn register_body_string_field<'a>(
                 })),
             )
                 .into_response()
+                .into()
         }),
         None => Ok(None),
     }
 }
 
-fn register_body_bool_field(
-    body: &serde_json::Value,
-    field: &'static str,
-) -> Result<bool, Response> {
+fn register_body_bool_field(body: &serde_json::Value, field: &'static str) -> ResponseResult<bool> {
     match body.get(field) {
         Some(value) => value.as_bool().ok_or_else(|| {
             (
@@ -537,12 +566,13 @@ fn register_body_bool_field(
                 })),
             )
                 .into_response()
+                .into()
         }),
         None => Ok(false),
     }
 }
 
-fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> Result<u64, Response> {
+fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> ResponseResult<u64> {
     match body.get(field) {
         Some(value) => match value.as_u64() {
             Some(value) if value > 0 => Ok(value),
@@ -553,7 +583,8 @@ fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> Res
                     "message": format!("{field} must be a positive integer"),
                 })),
             )
-                .into_response()),
+                .into_response()
+                .into()),
         },
         None => Err((
             StatusCode::BAD_REQUEST,
@@ -562,7 +593,8 @@ fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> Res
                 "message": format!("Missing \"{field}\""),
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -570,14 +602,14 @@ fn validate_expected_crm_for_route(
     state: &RelayState,
     route_name: &str,
     expected: &c2_contract::ExpectedRouteContract,
-) -> Result<RouteEntry, Response> {
+) -> ResponseResult<RouteEntry> {
     let Some(route) = state.local_route(route_name) else {
-        return Err(resource_not_found_response(route_name));
+        return Err(resource_not_found_response(route_name).into());
     };
     if route_matches_expected_crm(&route, expected) {
         Ok(route)
     } else {
-        Err(crm_contract_mismatch_response(route_name))
+        Err(crm_contract_mismatch_response(route_name).into())
     }
 }
 
@@ -585,11 +617,11 @@ fn validate_expected_crm_for_acquired_route(
     route_name: &str,
     route: &RouteEntry,
     expected: &c2_contract::ExpectedRouteContract,
-) -> Result<(), Response> {
+) -> ResponseResult<()> {
     if route_matches_expected_crm(route, expected) {
         Ok(())
     } else {
-        Err(crm_contract_mismatch_response(route_name))
+        Err(crm_contract_mismatch_response(route_name).into())
     }
 }
 
@@ -657,19 +689,19 @@ async fn handle_register(
     };
     let claimed_contract = match register_contract_claim_from_body(&name, &body) {
         Ok(claim) => claim,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let registration_token = match register_body_string_field(&body, "registration_token") {
         Ok(value) => value.map(str::to_string),
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let prepare_only = match register_body_bool_field(&body, "prepare_only") {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let max_payload_size = match register_body_u64_field(&body, "max_payload_size") {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     eprintln!(
         "[relay] Register request: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} prepare_only={prepare_only}"
@@ -731,17 +763,7 @@ async fn handle_register(
     };
 
     // Connect IPC client and attest the registered route contract.
-    let (
-        client,
-        crm_ns,
-        crm_name,
-        crm_ver,
-        abi_hash,
-        signature_hash,
-        max_payload_size,
-        route_uid,
-        route_revision,
-    ) = {
+    let (client, contract) = {
         let mut c = match connect_ipc_for_register(&address).await {
             Ok(client) => client,
             Err(e) => {
@@ -773,13 +795,10 @@ async fn handle_register(
         let contract = match claimed_contract.as_ref() {
             Some(claimed_contract) => match attest_ipc_route_contract(
                 &c,
-                &name,
-                &claimed_contract.crm_ns,
-                &claimed_contract.crm_name,
-                &claimed_contract.crm_ver,
-                &claimed_contract.abi_hash,
-                &claimed_contract.signature_hash,
-                max_payload_size,
+                ClaimedRouteContract {
+                    expected: claimed_contract,
+                    max_payload_size,
+                },
             )
             .await
             {
@@ -826,14 +845,11 @@ async fn handle_register(
                     };
                     match attest_ipc_pending_route_contract(
                         &mut c,
-                        &name,
                         registration_token,
-                        &claimed_contract.crm_ns,
-                        &claimed_contract.crm_name,
-                        &claimed_contract.crm_ver,
-                        &claimed_contract.abi_hash,
-                        &claimed_contract.signature_hash,
-                        max_payload_size,
+                        ClaimedRouteContract {
+                            expected: claimed_contract,
+                            max_payload_size,
+                        },
                     )
                     .await
                     {
@@ -988,23 +1004,14 @@ async fn handle_register(
             )
                 .into_response();
         }
-        (
-            Arc::new(c),
-            contract.crm_ns,
-            contract.crm_name,
-            contract.crm_ver,
-            contract.abi_hash,
-            contract.signature_hash,
-            contract.max_payload_size,
-            contract.route_uid,
-            contract.route_revision,
-        )
+        (Arc::new(c), contract)
     };
 
     if prepare_only {
         close_arc_client(client);
         eprintln!(
-            "[relay] Register prepared: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} crm={crm_ns}/{crm_name}/{crm_ver}"
+            "[relay] Register prepared: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} crm={}/{}/{}",
+            contract.crm_ns, contract.crm_name, contract.crm_ver,
         );
         return (
             StatusCode::ACCEPTED,
@@ -1050,21 +1057,16 @@ async fn handle_register(
         }
     };
 
-    let entry = match state.commit_register_upstream(
-        name.clone(),
-        server_id,
-        server_instance_id,
-        address,
-        crm_ns,
-        crm_name,
-        crm_ver,
-        abi_hash,
-        signature_hash,
-        max_payload_size,
-        route_uid,
-        route_revision,
+    let entry = match state.commit_register_upstream(LocalRegistration {
+        owner: LocalRouteOwner {
+            name: name.clone(),
+            server_id,
+            server_instance_id,
+            address,
+        },
+        contract,
         replacement,
-    ) {
+    }) {
         RegisterCommitResult::Registered { entry } => {
             close_arc_client(client);
             eprintln!(
@@ -1338,7 +1340,7 @@ async fn read_unknown_length_body(
     route_name: &str,
     body: Body,
     max_payload_size: u64,
-) -> Result<Vec<u8>, Response> {
+) -> ResponseResult<Vec<u8>> {
     let limit = UNKNOWN_LENGTH_BODY_LIMIT_BYTES.min(max_payload_size);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut data = Vec::new();
@@ -1365,14 +1367,12 @@ async fn read_unknown_length_body(
             .ok_or_else(|| payload_too_large_response(route_name, u64::MAX, max_payload_size))?;
         let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
         if next_len_u64 > max_payload_size {
-            return Err(payload_too_large_response(
-                route_name,
-                next_len_u64,
-                max_payload_size,
-            ));
+            return Err(
+                payload_too_large_response(route_name, next_len_u64, max_payload_size).into(),
+            );
         }
         if next_len > limit_usize {
-            return Err(unknown_length_too_large_response(route_name, limit));
+            return Err(unknown_length_too_large_response(route_name, limit).into());
         }
         data.extend_from_slice(&chunk);
     }
@@ -1388,38 +1388,39 @@ async fn handle_probe(
 ) -> Response {
     let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
     {
         Ok(route) => route,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let route_token = match route_token_from_headers(&route_name, &headers) {
         Ok(token) => token,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
-        return response;
+        return response.into_response();
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
     match acquire_request_client_for_route(state, &advertised_route).await {
-        RequestClient::Ready { lease, route, .. } => {
+        RequestClient::Ready(ready) => {
+            let ReadyRequestClient { lease, route, .. } = *ready;
             if let Err(response) =
                 validate_expected_crm_for_acquired_route(&route_name, &route, &expected_crm)
             {
                 drop(lease);
-                return response;
+                return response.into_response();
             }
             if let Err(response) = validate_route_token_for_route(&route, &route_token) {
                 drop(lease);
-                return response;
+                return response.into_response();
             }
             drop(lease);
             StatusCode::OK.into_response()
         }
-        RequestClient::Stale { route } => route_stale_response(&route),
+        RequestClient::Stale(route) => route_stale_response(&route),
         RequestClient::WatchUnavailable { route, reason } => {
             route_watch_unavailable_response(&route.name, reason)
         }
@@ -1443,43 +1444,46 @@ async fn call_handler(
 ) -> Response {
     let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
     {
         Ok(route) => route,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let route_token = match route_token_from_headers(&route_name, &headers) {
         Ok(token) => token,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
-        return response;
+        return response.into_response();
     }
     let content_length = match content_length_from_headers(&headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
-    if let Some(content_length) = content_length {
-        if content_length > advertised_route.max_payload_size {
-            return payload_too_large_response(
-                &route_name,
-                content_length,
-                advertised_route.max_payload_size,
-            );
-        }
+    if let Some(content_length) = content_length
+        && content_length > advertised_route.max_payload_size
+    {
+        return payload_too_large_response(
+            &route_name,
+            content_length,
+            advertised_route.max_payload_size,
+        );
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
     let (lease, acquired_route, binding) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
-            RequestClient::Ready {
-                lease,
-                route,
-                binding,
-            } => (lease, route, binding),
-            RequestClient::Stale { route } => return route_stale_response(&route),
+            RequestClient::Ready(ready) => {
+                let ReadyRequestClient {
+                    lease,
+                    route,
+                    binding,
+                } = *ready;
+                (lease, route, binding)
+            }
+            RequestClient::Stale(route) => return route_stale_response(&route),
             RequestClient::WatchUnavailable { route, reason } => {
                 return route_watch_unavailable_response(&route.name, reason);
             }
@@ -1495,21 +1499,21 @@ async fn call_handler(
         validate_expected_crm_for_acquired_route(&route_name, &acquired_route, &expected_crm)
     {
         drop(lease);
-        return response;
+        return response.into_response();
     }
     if let Err(response) = validate_route_token_for_route(&acquired_route, &route_token) {
         drop(lease);
-        return response;
+        return response.into_response();
     }
-    if let Some(content_length) = content_length {
-        if content_length > acquired_route.max_payload_size {
-            drop(lease);
-            return payload_too_large_response(
-                &route_name,
-                content_length,
-                acquired_route.max_payload_size,
-            );
-        }
+    if let Some(content_length) = content_length
+        && content_length > acquired_route.max_payload_size
+    {
+        drop(lease);
+        return payload_too_large_response(
+            &route_name,
+            content_length,
+            acquired_route.max_payload_size,
+        );
     }
     let client = lease.client();
 
@@ -1532,7 +1536,7 @@ async fn call_handler(
                     Ok(body) => body,
                     Err(response) => {
                         drop(lease);
-                        return response;
+                        return response.into_response();
                     }
                 };
             client.call_bound(&binding, &method_name, &body).await
@@ -1618,15 +1622,18 @@ async fn acquire_request_client_for_route(
 ) -> RequestClient {
     let route_name = route.name.clone();
     match state.acquire_upstream_for_route(route).await {
-        Ok((lease, route, binding)) => RequestClient::Ready {
+        Ok((lease, route, binding)) => RequestClient::Ready(Box::new(ReadyRequestClient {
             lease,
             route,
             binding,
-        },
+        })),
         Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
-        Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale { route },
+        Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale(Box::new(route)),
         Err(UpstreamAcquireError::WatchUnavailable { route, reason }) => {
-            RequestClient::WatchUnavailable { route, reason }
+            RequestClient::WatchUnavailable {
+                route: Box::new(route),
+                reason,
+            }
         }
         Err(UpstreamAcquireError::Unreachable {
             route,
@@ -1927,7 +1934,8 @@ mod tests {
         let state = test_state();
         let address = "ipc://identity-mismatch-owner";
         for route_name in ["manager", "builder"] {
-            match state.commit_register_upstream(
+            match test_commit_registration!(
+                &state,
                 route_name.into(),
                 "server-grid".into(),
                 "server-grid-instance".into(),
@@ -1946,7 +1954,8 @@ mod tests {
                 _ => panic!("unexpected registration result for {route_name}"),
             }
         }
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "other-endpoint".into(),
             "server-grid".into(),
             "server-grid-other-instance".into(),
@@ -2369,10 +2378,9 @@ mod tests {
         server_id: &str,
         address: &str,
         registration_token: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
+        crm: (&str, &str, &str),
     ) -> StatusCode {
+        let (crm_ns, crm_name, crm_ver) = crm;
         let app = build_router(state);
         let response = app
             .oneshot(
@@ -3067,7 +3075,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_exposes_ipc_address_only_to_loopback_clients() {
         let state = test_state();
-        state.commit_register_upstream(
+        test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "inst-grid".into(),
@@ -3258,9 +3267,7 @@ mod tests {
                 "server-grid",
                 &address,
                 &registration_token,
-                "test.echo",
-                "Echo",
-                "0.1.0",
+                ("test.echo", "Echo", "0.1.0"),
             )
             .await,
             StatusCode::BAD_REQUEST
@@ -3459,7 +3466,8 @@ mod tests {
             std::process::id(),
             unique_suffix()
         );
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -3524,7 +3532,8 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
 
-        state.commit_register_upstream(
+        test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "inst-grid".into(),
@@ -3582,7 +3591,8 @@ mod tests {
         )
         .await;
 
-        state.commit_register_upstream(
+        test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "inst-grid".into(),
@@ -3968,12 +3978,12 @@ mod tests {
         set_data_plane_after_precheck_hook(route_name.to_string(), move || {
             if let crate::relay::state::UnregisterResult::Removed { client, .. } =
                 state_for_hook.unregister_upstream(&route_for_hook, "server-old")
+                && let Some(client) = client
             {
-                if let Some(client) = client {
-                    tokio::spawn(async move { client.close_shared().await });
-                }
+                tokio::spawn(async move { client.close_shared().await });
             }
-            match state_for_hook.commit_register_upstream(
+            match test_commit_registration!(
+                &state_for_hook,
                 route_for_hook.clone(),
                 "server-new".into(),
                 "server-new-instance".into(),
@@ -4014,12 +4024,12 @@ mod tests {
         set_data_plane_after_precheck_hook(route_name.to_string(), move || {
             if let crate::relay::state::UnregisterResult::Removed { client, .. } =
                 state_for_hook.unregister_upstream(&route_for_hook, "server-old")
+                && let Some(client) = client
             {
-                if let Some(client) = client {
-                    tokio::spawn(async move { client.close_shared().await });
-                }
+                tokio::spawn(async move { client.close_shared().await });
             }
-            match state_for_hook.commit_register_upstream(
+            match test_commit_registration!(
+                &state_for_hook,
                 route_for_hook.clone(),
                 "server-new".into(),
                 "server-new-instance".into(),
@@ -4780,7 +4790,8 @@ mod tests {
         assert!(stale_client.has_route("manager"));
         assert!(!stale_client.has_route("builder"));
 
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "builder".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -4885,7 +4896,8 @@ mod tests {
         let table = attested.route_table("grid").expect("server exports grid");
         attested.close().await;
 
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),

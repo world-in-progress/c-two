@@ -12,6 +12,7 @@ use pyo3::types::PyBytes;
 use c2_config::{ConfigResolver, ConfigSources};
 use c2_http::client::{
     HttpClient, HttpClientPool, HttpError, RelayAwareHttpClient, RelayControlClient,
+    RelayRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -92,25 +93,20 @@ fn http_call_result_to_py<'py>(
             Err(exc)
         }
         Err(HttpError::ServerError(code, body)) => {
-            if let Some(error_bytes) = c2_error_wire_bytes_from_http_body(&body) {
-                let exc = PyErr::new::<HttpCrmCallError, _>(format!("HTTP {code}: {body}"));
-                let value = exc.value(py);
-                value.setattr("status_code", code)?;
-                value.setattr("body", body)?;
-                value.setattr("error_bytes", PyBytes::new(py, &error_bytes))?;
-                Err(exc)
-            } else {
-                Err(PyRuntimeError::new_err(format!("HTTP {code}: {body}")))
-            }
+            let error_bytes = c2_error_wire_bytes_from_http_body(&body);
+            let exc = PyErr::new::<HttpCrmCallError, _>(format!("HTTP {code}: {body}"));
+            let value = exc.value(py);
+            value.setattr("status_code", code)?;
+            value.setattr("body", body)?;
+            value.setattr("error_bytes", PyBytes::new(py, &error_bytes))?;
+            Err(exc)
         }
         Err(e) => Err(PyRuntimeError::new_err(format!("{e}"))),
     }
 }
 
-pub(crate) fn c2_error_wire_bytes_from_http_body(body: &str) -> Option<Vec<u8>> {
-    let envelope = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body).ok()?;
-    let error = c2_error::C2Error::from_envelope(envelope).ok()?;
-    Some(error.to_wire_bytes())
+pub(crate) fn c2_error_wire_bytes_from_http_body(body: &str) -> Vec<u8> {
+    c2_core::semantic_error_from_http_body(body).to_wire_bytes()
 }
 
 pub(crate) fn release_http_client_from_global_pool(base_url: &str) {
@@ -222,18 +218,21 @@ impl PyRustRelayControlClient {
         let abi_hash = abi_hash.to_string();
         let signature_hash = signature_hash.to_string();
         py.detach(move || {
-            inner.register(
-                &name,
-                &server_id,
-                &server_instance_id,
-                &ipc_address,
-                &crm_ns,
-                &crm_name,
-                &crm_ver,
-                &abi_hash,
-                &signature_hash,
+            let expected = c2_contract::ExpectedRouteContract {
+                route_name: name,
+                crm_ns,
+                crm_name,
+                crm_ver,
+                abi_hash,
+                signature_hash,
+            };
+            inner.register(RelayRegistration {
+                expected: &expected,
+                server_id: &server_id,
+                server_instance_id: &server_instance_id,
+                address: &ipc_address,
                 max_payload_size,
-            )
+            })
         })
         .map_err(py_http_error)
     }
@@ -264,11 +263,9 @@ fn py_http_error(err: HttpError) -> PyErr {
                 let value = exc.value(py);
                 value.setattr("status_code", code).ok();
                 value.setattr("body", body.as_str()).ok();
-                if let Some(error_bytes) = error_bytes.as_ref() {
-                    value
-                        .setattr("error_bytes", PyBytes::new(py, error_bytes))
-                        .ok();
-                }
+                value
+                    .setattr("error_bytes", PyBytes::new(py, &error_bytes))
+                    .ok();
             });
             exc
         }

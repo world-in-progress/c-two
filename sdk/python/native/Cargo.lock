@@ -80,6 +80,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "c2-core"
+version = "0.1.0"
+dependencies = [
+ "c2-config",
+ "c2-contract",
+ "c2-error",
+ "c2-http",
+ "c2-ipc",
+ "c2-mem",
+ "c2-server",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "c2-error"
 version = "0.1.0"
 dependencies = [
@@ -137,31 +154,17 @@ dependencies = [
  "c2-codegen",
  "c2-config",
  "c2-contract",
+ "c2-core",
  "c2-error",
  "c2-http",
  "c2-ipc",
  "c2-mem",
- "c2-runtime",
  "c2-server",
  "c2-wire",
  "parking_lot",
  "pyo3",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "c2-runtime"
-version = "0.1.0"
-dependencies = [
- "c2-config",
- "c2-contract",
- "c2-http",
- "c2-mem",
- "c2-server",
- "parking_lot",
- "tokio",
- "uuid",
 ]
 
 [[package]]

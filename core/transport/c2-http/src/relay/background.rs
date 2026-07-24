@@ -144,40 +144,6 @@ fn tombstone_retention(state: &RelayState) -> Duration {
     MIN_RETENTION.max(anti_entropy_window)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::relay::route_table::{TombstoneGcEntry, TombstoneGcReason};
-
-    #[test]
-    fn tombstone_gc_log_message_names_removed_route() {
-        let removed = TombstoneGcEntry {
-            tombstone: RouteTombstone {
-                name: "grid".into(),
-                relay_id: "relay-a".into(),
-                removed_at: 2000.0,
-                removed_revision: 17,
-                local_catalog_revision: 17,
-                server_id: Some("server-grid".into()),
-                observed_at: std::time::Instant::now(),
-            },
-            reason: TombstoneGcReason::RetentionExpired,
-            compaction_revision: 17,
-        };
-
-        let line = tombstone_gc_detail_line(&removed);
-
-        assert!(line.contains("[relay] GC removed route tombstone:"));
-        assert!(line.contains("name=grid"));
-        assert!(line.contains("relay_id=relay-a"));
-        assert!(line.contains("server_id=server-grid"));
-        assert!(line.contains("removed_at=2000"));
-        assert!(line.contains("removed_revision=17"));
-        assert!(line.contains("compaction_revision=17"));
-        assert!(line.contains("reason=retention-expired"));
-    }
-}
-
 /// Detect failed peers: Alive→Suspect→Dead with route removal.
 async fn failure_detection_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let hb = state.config().heartbeat_interval;
@@ -261,18 +227,18 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
         let envelope = PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
 
         let url = peer_endpoint_url(peer_url, "/_peer/digest");
-        if let Ok(resp) = client.post(&url).json(&envelope).send().await {
-            if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
-                let Ok(validated) = validate_route_state_envelope(resp_env, Some(peer_id.as_str()))
-                else {
-                    continue;
-                };
-                let Some(entries) = validated.into_digest_diff_entries() else {
-                    continue;
-                };
-                for diff_entry in entries {
-                    apply_digest_diff(&state, peer_id, diff_entry);
-                }
+        if let Ok(resp) = client.post(&url).json(&envelope).send().await
+            && let Ok(resp_env) = resp.json::<PeerEnvelope>().await
+        {
+            let Ok(validated) = validate_route_state_envelope(resp_env, Some(peer_id.as_str()))
+            else {
+                continue;
+            };
+            let Some(entries) = validated.into_digest_diff_entries() else {
+                continue;
+            };
+            for diff_entry in entries {
+                apply_digest_diff(&state, peer_id, diff_entry);
             }
         }
     }
@@ -284,7 +250,7 @@ fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: ValidatedDig
             let entry = active.into();
             let _ = RouteAuthority::new(state).execute(RouteCommand::AnnouncePeer {
                 sender_relay_id: peer_id.to_string(),
-                entry,
+                entry: Box::new(entry),
             });
         }
         ValidatedDigestDiffEntry::Deleted(deleted) => {
@@ -363,19 +329,19 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                 let envelope =
                     PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
                 let digest_url = peer_endpoint_url(&url, "/_peer/digest");
-                if let Ok(resp) = client.post(&digest_url).json(&envelope).send().await {
-                    if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
-                        let Ok(validated) =
-                            validate_route_state_envelope(resp_env, Some(relay_id.as_str()))
-                        else {
-                            continue;
-                        };
-                        let Some(entries) = validated.into_digest_diff_entries() else {
-                            continue;
-                        };
-                        for diff_entry in entries {
-                            apply_digest_diff(&state, &relay_id, diff_entry);
-                        }
+                if let Ok(resp) = client.post(&digest_url).json(&envelope).send().await
+                    && let Ok(resp_env) = resp.json::<PeerEnvelope>().await
+                {
+                    let Ok(validated) =
+                        validate_route_state_envelope(resp_env, Some(relay_id.as_str()))
+                    else {
+                        continue;
+                    };
+                    let Some(entries) = validated.into_digest_diff_entries() else {
+                        continue;
+                    };
+                    for diff_entry in entries {
+                        apply_digest_diff(&state, &relay_id, diff_entry);
                     }
                 }
             }
@@ -416,24 +382,58 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
                     url: state.config().effective_advertise_url(),
                 },
             );
-            if let Ok(resp) = client.post(&join_url).json(&envelope).send().await {
-                if let Ok(envelope) = resp.json::<FullSyncEnvelope>().await {
-                    let Ok(snapshot) = ValidatedFullSync::try_from(envelope) else {
-                        continue;
-                    };
-                    state.merge_snapshot(snapshot);
-                    let peers = state.list_peers();
-                    let announce = PeerEnvelope::new(
-                        state.relay_id(),
-                        PeerMessage::RelayJoin {
-                            relay_id: state.relay_id().to_string(),
-                            url: state.config().effective_advertise_url(),
-                        },
-                    );
-                    state.disseminator().broadcast(announce, &peers);
-                    break;
-                }
+            if let Ok(resp) = client.post(&join_url).json(&envelope).send().await
+                && let Ok(envelope) = resp.json::<FullSyncEnvelope>().await
+            {
+                let Ok(snapshot) = ValidatedFullSync::try_from(envelope) else {
+                    continue;
+                };
+                state.merge_snapshot(snapshot);
+                let peers = state.list_peers();
+                let announce = PeerEnvelope::new(
+                    state.relay_id(),
+                    PeerMessage::RelayJoin {
+                        relay_id: state.relay_id().to_string(),
+                        url: state.config().effective_advertise_url(),
+                    },
+                );
+                state.disseminator().broadcast(announce, &peers);
+                break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::route_table::{TombstoneGcEntry, TombstoneGcReason};
+
+    #[test]
+    fn tombstone_gc_log_message_names_removed_route() {
+        let removed = TombstoneGcEntry {
+            tombstone: RouteTombstone {
+                name: "grid".into(),
+                relay_id: "relay-a".into(),
+                removed_at: 2000.0,
+                removed_revision: 17,
+                local_catalog_revision: 17,
+                server_id: Some("server-grid".into()),
+                observed_at: std::time::Instant::now(),
+            },
+            reason: TombstoneGcReason::RetentionExpired,
+            compaction_revision: 17,
+        };
+
+        let line = tombstone_gc_detail_line(&removed);
+
+        assert!(line.contains("[relay] GC removed route tombstone:"));
+        assert!(line.contains("name=grid"));
+        assert!(line.contains("relay_id=relay-a"));
+        assert!(line.contains("server_id=server-grid"));
+        assert!(line.contains("removed_at=2000"));
+        assert!(line.contains("removed_revision=17"));
+        assert!(line.contains("compaction_revision=17"));
+        assert!(line.contains("reason=retention-expired"));
     }
 }

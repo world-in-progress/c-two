@@ -1,9 +1,9 @@
-//! Runtime identity helpers shared by SDK sessions.
+//! Runtime identity helpers shared by language SDKs.
 
-use crate::RuntimeSessionError;
+use crate::LifecycleError;
 
-pub fn validate_server_id(server_id: &str) -> Result<(), RuntimeSessionError> {
-    c2_config::validate_server_id(server_id).map_err(RuntimeSessionError::InvalidServerId)
+pub fn validate_server_id(server_id: &str) -> Result<(), LifecycleError> {
+    c2_config::validate_server_id(server_id).map_err(LifecycleError::InvalidServerId)
 }
 
 pub fn ipc_address_for_server_id(server_id: &str) -> String {

@@ -1,21 +1,21 @@
 [package]
-name = "c2-runtime"
+name = "c2-core"
 edition.workspace = true
 version.workspace = true
-description = "C-Two language-neutral process runtime session"
+description = "C-Two language-neutral runtime and orchestration core"
 
 [lib]
-name = "c2_runtime"
+name = "c2_core"
 
 [dependencies]
 c2-config = { path = "../../foundation/c2-config" }
 c2-contract = { path = "../../foundation/c2-contract" }
+c2-error = { path = "../../foundation/c2-error" }
 c2-mem = { path = "../../foundation/c2-mem" }
 c2-http = { path = "../../transport/c2-http" }
+c2-ipc = { path = "../../transport/c2-ipc" }
 c2-server = { path = "../../transport/c2-server" }
 parking_lot = { workspace = true }
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
-
-[dev-dependencies]
-c2-ipc = { path = "../../transport/c2-ipc" }

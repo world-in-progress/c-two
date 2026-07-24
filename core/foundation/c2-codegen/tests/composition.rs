@@ -14,9 +14,11 @@ fn compile_contract_artifacts(
     descriptor_json: &[u8],
     target: ContractCodegenTarget,
     options: &ContractCodegenOptions,
-) -> Result<ContractArtifactSet, CodegenError> {
-    let release = c2_contract::ContractRelease::from_descriptor_json(descriptor_json)?;
-    compile_admitted_contract_artifacts(&release, target, options)
+) -> Result<ContractArtifactSet, Box<CodegenError>> {
+    let release = c2_contract::ContractRelease::from_descriptor_json(descriptor_json)
+        .map_err(CodegenError::from)
+        .map_err(Box::new)?;
+    compile_admitted_contract_artifacts(&release, target, options).map_err(Box::new)
 }
 
 fn provenance() -> ArtifactProvenance {
@@ -245,7 +247,7 @@ fn preserves_fastdb_structured_error_and_outer_binding_path() {
     .unwrap_err();
 
     assert!(matches!(
-        error,
+        *error,
         CodegenError::FastDb {
             binding_path,
             code,

@@ -396,14 +396,19 @@ pub(crate) mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
-                "grid".to_string(),
-                "grid-route-uid-0001".to_string(),
-                1,
-                "cc.test".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+                c2_wire::control::RouteCallIdentity {
+                    route_name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0001".to_string(),
+                    observed_route_revision: 1,
+                    crm_ns: "cc.test".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                    signature_hash:
+                        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                            .to_string(),
+                },
                 4,
             ),
         );

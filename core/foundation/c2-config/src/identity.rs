@@ -8,7 +8,7 @@ pub fn validate_server_id(server_id: &str) -> Result<(), String> {
 
 pub fn validate_relay_id(relay_id: &str) -> Result<(), String> {
     validate_id("relay_id", relay_id)?;
-    if relay_id.as_bytes().len() > 255 {
+    if relay_id.len() > 255 {
         return Err("relay_id cannot exceed 255 bytes".to_string());
     }
     Ok(())

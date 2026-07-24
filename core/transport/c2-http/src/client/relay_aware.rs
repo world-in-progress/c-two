@@ -97,25 +97,25 @@ impl RelayAwareHttpClient {
     }
 
     pub fn call(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpError> {
-        super::client::runtime()
+        super::http_client::runtime()
             .handle()
             .block_on(self.call_async(method_name, data))
     }
 
     pub fn connect(&self) -> Result<(), HttpError> {
-        super::client::runtime()
+        super::http_client::runtime()
             .handle()
             .block_on(self.connect_async())
     }
 
     pub fn resolve_target(&self) -> Result<RelayResolvedTarget, HttpError> {
-        super::client::runtime()
+        super::http_client::runtime()
             .handle()
             .block_on(self.resolve_target_async())
     }
 
     pub fn resolve_http_target(&self) -> Result<RelayResolvedTarget, HttpError> {
-        super::client::runtime()
+        super::http_client::runtime()
             .handle()
             .block_on(self.resolve_http_target_async())
     }
@@ -124,7 +124,7 @@ impl RelayAwareHttpClient {
         &self,
         failed_candidates: &[RelayLocalIpcCandidate],
     ) -> Result<RelayResolvedTarget, HttpError> {
-        super::client::runtime()
+        super::http_client::runtime()
             .handle()
             .block_on(self.resolve_target_after_local_ipc_failures_async(failed_candidates))
     }
@@ -1317,7 +1317,12 @@ mod tests {
             None,
         );
         assert_eq!(
-            select_local_ipc_candidate(true, true, &[complete.clone()], &expected_contract()),
+            select_local_ipc_candidate(
+                true,
+                true,
+                std::slice::from_ref(&complete),
+                &expected_contract(),
+            ),
             Some(RelayLocalIpcCandidate {
                 address: "ipc://grid-server".to_string(),
                 server_id: "grid-server".to_string(),

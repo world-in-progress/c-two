@@ -278,13 +278,13 @@ impl MemPool {
             if seg.allocator().alloc_count() > 0 {
                 break;
             }
-            if let Some(idle_at) = self.idle_since.get(last).copied().flatten() {
-                if now.duration_since(idle_at) >= delay {
-                    self.segments.pop();
-                    self.idle_since.pop();
-                    removed += 1;
-                    continue;
-                }
+            if let Some(idle_at) = self.idle_since.get(last).copied().flatten()
+                && now.duration_since(idle_at) >= delay
+            {
+                self.segments.pop();
+                self.idle_since.pop();
+                removed += 1;
+                continue;
             }
             break;
         }
@@ -1005,10 +1005,11 @@ impl MemPool {
         if let Some(seg) = self.segments.get(idx) {
             seg.allocator().free(alloc.offset, alloc.level)?;
             // Track idle: if segment is now empty, record the time.
-            if seg.allocator().alloc_count() == 0 {
-                if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
-                    self.idle_since[idx] = Some(Instant::now());
-                }
+            if seg.allocator().alloc_count() == 0
+                && idx < self.idle_since.len()
+                && self.idle_since[idx].is_none()
+            {
+                self.idle_since[idx] = Some(Instant::now());
             }
             Ok(())
         } else {

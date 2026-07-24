@@ -228,7 +228,7 @@ pub fn encode_server_handshake(
 }
 
 fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
-    let actual = value.as_bytes().len();
+    let actual = value.len();
     if actual > MAX_HANDSHAKE_NAME_BYTES {
         return Err(EncodeError::FieldTooLong {
             field,
@@ -256,10 +256,10 @@ fn validate_route_uid(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("must not be empty".to_string());
     }
-    if value.as_bytes().len() > MAX_HANDSHAKE_NAME_BYTES {
+    if value.len() > MAX_HANDSHAKE_NAME_BYTES {
         return Err(format!(
             "is too long: {} bytes > {}",
-            value.as_bytes().len(),
+            value.len(),
             MAX_HANDSHAKE_NAME_BYTES
         ));
     }

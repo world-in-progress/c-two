@@ -13,14 +13,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use c2_contract::ExpectedRouteContract;
+use c2_core::{
+    RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RelayResolvedConnection,
+    RouteCloseOutcome, Runtime, RuntimeOptions, RuntimeRouteSpec, ShutdownOutcome,
+    UnregisterOutcome,
+};
 use c2_http::client::{RelayAwareHttpClient, RelayLocalIpcCandidate};
 use c2_ipc::{ClientPool, IpcError, RouteBinding, SyncClient};
 use c2_mem::BufferLeaseTracker;
-use c2_runtime::{
-    RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RelayResolvedConnection,
-    RouteCloseOutcome, RuntimeRouteSpec, RuntimeSession, RuntimeSessionOptions, ShutdownOutcome,
-    UnregisterOutcome,
-};
 use c2_server::AccessLevel;
 
 use crate::client_ffi::{PyRustClient, PyRustClientPool, call_sync_client};
@@ -338,7 +338,7 @@ impl PyRelayConnectedClient {
 
 #[pyclass(name = "RuntimeSession", frozen)]
 pub struct PyRuntimeSession {
-    inner: RuntimeSession,
+    inner: Runtime,
     lease_tracker: Arc<BufferLeaseTracker>,
     server_bridge: Mutex<Option<Py<PyAny>>>,
     pool: PyRustClientPool,
@@ -364,7 +364,7 @@ impl PyRuntimeSession {
             Some(overrides) => Some(parse_client_ipc_overrides(Some(overrides))?),
             None => None,
         };
-        let inner = RuntimeSession::new(RuntimeSessionOptions {
+        let inner = Runtime::new(RuntimeOptions {
             server_id,
             server_ipc_overrides,
             client_ipc_overrides,
@@ -505,7 +505,7 @@ impl PyRuntimeSession {
         };
         match self.inner.set_client_ipc_overrides(overrides) {
             Ok(()) => Ok(true),
-            Err(c2_runtime::RuntimeSessionError::ClientConfigFrozen) => Ok(false),
+            Err(c2_core::LifecycleError::ClientConfigFrozen) => Ok(false),
             Err(e) => Err(PyValueError::new_err(e.to_string())),
         }
     }
@@ -977,7 +977,7 @@ impl PyRuntimeSession {
                         failed_local_ipc_candidates.push(candidate);
                         let failed = failed_local_ipc_candidates.clone();
                         let next_target = match py.detach(move || {
-                            RuntimeSession::resolve_relay_connection_after_local_ipc_failures(
+                            Runtime::resolve_relay_connection_after_local_ipc_failures(
                                 relay_client,
                                 &failed,
                             )
@@ -1133,24 +1133,20 @@ fn expected_route_contract(
     Ok(expected)
 }
 
-fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
+fn runtime_error_to_py(err: c2_core::LifecycleError) -> PyErr {
     match err {
-        c2_runtime::RuntimeSessionError::InvalidServerId(message) => PyValueError::new_err(message),
-        c2_runtime::RuntimeSessionError::ClientConfigFrozen => {
-            PyValueError::new_err(err.to_string())
-        }
-        c2_runtime::RuntimeSessionError::DuplicateRoute(message) => {
+        c2_core::LifecycleError::InvalidServerId(message) => PyValueError::new_err(message),
+        c2_core::LifecycleError::ClientConfigFrozen => PyValueError::new_err(err.to_string()),
+        c2_core::LifecycleError::DuplicateRoute(message) => {
             let exc = PyRuntimeError::new_err(message);
             Python::attach(|py| {
                 exc.value(py).setattr("status_code", 409).ok();
             });
             exc
         }
-        c2_runtime::RuntimeSessionError::MissingRoute(message) => PyKeyError::new_err(message),
-        c2_runtime::RuntimeSessionError::MissingRelayAddress => {
-            PyLookupError::new_err(err.to_string())
-        }
-        c2_runtime::RuntimeSessionError::RelayDuplicateRoute(message) => {
+        c2_core::LifecycleError::MissingRoute(message) => PyKeyError::new_err(message),
+        c2_core::LifecycleError::MissingRelayAddress => PyLookupError::new_err(err.to_string()),
+        c2_core::LifecycleError::RelayDuplicateRoute(message) => {
             let exc = PyRuntimeError::new_err(message);
             Python::attach(|py| {
                 let value = exc.value(py);
@@ -1159,7 +1155,7 @@ fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
             });
             exc
         }
-        c2_runtime::RuntimeSessionError::RelayHttp {
+        c2_core::LifecycleError::RelayHttp {
             status_code,
             message,
         } => {
@@ -1168,22 +1164,21 @@ fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
                 let value = exc.value(py);
                 value.setattr("status_code", status_code).ok();
                 value.setattr("body", message.clone()).ok();
-                if let Some(error_bytes) = c2_error_wire_bytes_from_http_body(&message) {
-                    value
-                        .setattr("error_bytes", PyBytes::new(py, &error_bytes))
-                        .ok();
-                }
+                let error_bytes = c2_error_wire_bytes_from_http_body(&message);
+                value
+                    .setattr("error_bytes", PyBytes::new(py, &error_bytes))
+                    .ok();
             });
             exc
         }
-        c2_runtime::RuntimeSessionError::RegisterFailure(failure) => {
+        c2_core::LifecycleError::RegisterFailure(failure) => {
             let exc = PyRuntimeError::new_err(format!(
                 "registration failed at {}: {}",
                 failure.failure_source, failure.error_message
             ));
             Python::attach(|py| {
                 let value = exc.value(py);
-                if let Ok(dict) = register_failure_to_dict(py, failure.clone()) {
+                if let Ok(dict) = register_failure_to_dict(py, (*failure).clone()) {
                     value.setattr("registration_failure", dict.clone()).ok();
                     match dict.get_item("rollback") {
                         Ok(Some(rollback)) => value.setattr("rollback", rollback).ok(),
@@ -1203,20 +1198,18 @@ fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
             });
             exc
         }
-        c2_runtime::RuntimeSessionError::Server(message) => PyRuntimeError::new_err(message),
-        c2_runtime::RuntimeSessionError::Relay(message) => {
+        c2_core::LifecycleError::Server(message) => PyRuntimeError::new_err(message),
+        c2_core::LifecycleError::Relay(message) => {
             PyRuntimeError::new_err(format!("relay error: {message}"))
         }
     }
 }
 
-fn runtime_error_is_fallback_denied(err: &c2_runtime::RuntimeSessionError) -> bool {
-    let c2_runtime::RuntimeSessionError::RelayHttp { message, .. } = err else {
+fn runtime_error_is_fallback_denied(err: &c2_core::LifecycleError) -> bool {
+    let c2_core::LifecycleError::RelayHttp { message, .. } = err else {
         return false;
     };
-    let Some(error_bytes) = c2_error_wire_bytes_from_http_body(message) else {
-        return false;
-    };
+    let error_bytes = c2_error_wire_bytes_from_http_body(message);
     c2_error::C2Error::from_wire_bytes(&error_bytes)
         .ok()
         .flatten()
@@ -1292,7 +1285,7 @@ fn relay_ipc_fallback_denied_to_py(
 }
 
 fn resolve_relay_use_proxy_if_needed(
-    session: &RuntimeSession,
+    session: &Runtime,
     relay_anchor_address: Option<&str>,
 ) -> PyResult<bool> {
     let has_relay = match relay_anchor_address {
@@ -1309,7 +1302,7 @@ fn resolve_relay_use_proxy_if_needed(
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-fn resolve_remote_payload_chunk_size_for_session(session: &RuntimeSession) -> PyResult<u64> {
+fn resolve_remote_payload_chunk_size_for_session(session: &Runtime) -> PyResult<u64> {
     c2_config::ConfigResolver::resolve_remote_payload_chunk_size(
         session.remote_payload_chunk_size_override(),
         c2_config::ConfigSources::from_process(),
@@ -1318,7 +1311,7 @@ fn resolve_remote_payload_chunk_size_for_session(session: &RuntimeSession) -> Py
 }
 
 fn resolve_relay_use_proxy_for_shutdown(
-    session: &RuntimeSession,
+    session: &Runtime,
     relay_anchor_address: Option<&str>,
 ) -> Result<bool, String> {
     let has_relay = match relay_anchor_address {

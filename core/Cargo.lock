@@ -133,6 +133,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "c2-core"
+version = "0.1.0"
+dependencies = [
+ "c2-config",
+ "c2-contract",
+ "c2-error",
+ "c2-http",
+ "c2-ipc",
+ "c2-mem",
+ "c2-server",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "c2-error"
 version = "0.1.0"
 dependencies = [
@@ -199,21 +216,6 @@ name = "c2-mem-ffi"
 version = "0.1.0"
 dependencies = [
  "c2-mem",
-]
-
-[[package]]
-name = "c2-runtime"
-version = "0.1.0"
-dependencies = [
- "c2-config",
- "c2-contract",
- "c2-http",
- "c2-ipc",
- "c2-mem",
- "c2-server",
- "parking_lot",
- "tokio",
- "uuid",
 ]
 
 [[package]]
