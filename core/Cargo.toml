@@ -17,6 +17,8 @@ members = [
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/world-in-progress/c-two"
 
 [workspace.dependencies]
 parking_lot = "0.12"

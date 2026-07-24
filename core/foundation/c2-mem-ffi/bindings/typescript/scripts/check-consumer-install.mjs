@@ -1,10 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-import { runTsc } from './tsc-tools.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDir, '..');
@@ -34,26 +32,76 @@ function runNpm(args, options = {}) {
 }
 
 try {
-  const pack = runNpm(['pack', packageRoot, '--json', '--ignore-scripts'], {
-    cwd: tempRoot,
-  });
-  let entries;
-  try {
-    entries = JSON.parse(pack.stdout);
-  } catch (error) {
-    process.stdout.write(pack.stdout);
-    throw new Error(`Failed to parse npm pack JSON: ${String(error)}`);
+  let tarball = process.env.C2_MEM_FFI_PACKAGE_TARBALL;
+  if (tarball === undefined) {
+    const pack = runNpm(['pack', packageRoot, '--json', '--ignore-scripts'], {
+      cwd: tempRoot,
+    });
+    let entries;
+    try {
+      entries = JSON.parse(pack.stdout);
+    } catch (error) {
+      process.stdout.write(pack.stdout);
+      throw new Error(`Failed to parse npm pack JSON: ${String(error)}`);
+    }
+    const filename = entries?.[0]?.filename;
+    if (typeof filename !== 'string' || filename.length === 0) {
+      throw new Error('npm pack JSON did not contain a tarball filename.');
+    }
+    tarball = isAbsolute(filename) ? filename : resolve(tempRoot, filename);
+  } else {
+    tarball = resolve(tarball);
   }
-  const filename = entries?.[0]?.filename;
-  if (typeof filename !== 'string' || filename.length === 0) {
-    throw new Error('npm pack JSON did not contain a tarball filename.');
+  if (!existsSync(tarball)) {
+    throw new Error(`C-Two package tarball does not exist: ${tarball}`);
   }
-  const tarball = isAbsolute(filename) ? filename : resolve(tempRoot, filename);
+
+  let typescriptTarball = process.env.C2_TYPESCRIPT_PACKAGE_TARBALL;
+  if (typescriptTarball === undefined) {
+    const pack = runNpm([
+      'pack',
+      'typescript@5.9.3',
+      '--json',
+      '--pack-destination',
+      tempRoot,
+    ], {
+      cwd: tempRoot,
+    });
+    let entries;
+    try {
+      entries = JSON.parse(pack.stdout);
+    } catch (error) {
+      process.stdout.write(pack.stdout);
+      throw new Error(`Failed to parse TypeScript pack JSON: ${String(error)}`);
+    }
+    const filename = entries?.[0]?.filename;
+    if (typeof filename !== 'string' || filename.length === 0) {
+      throw new Error('TypeScript npm pack JSON did not contain a tarball filename.');
+    }
+    typescriptTarball = isAbsolute(filename) ? filename : resolve(tempRoot, filename);
+  } else {
+    typescriptTarball = resolve(typescriptTarball);
+  }
+  if (!existsSync(typescriptTarball)) {
+    throw new Error(`TypeScript package tarball does not exist: ${typescriptTarball}`);
+  }
+
   const consumerRoot = resolve(tempRoot, 'consumer');
   mkdirSync(consumerRoot);
-  runNpm(['install', tarball, '--ignore-scripts', '--no-audit', '--no-fund'], {
+  writeFileSync(resolve(consumerRoot, 'package.json'), JSON.stringify({
+    name: 'c-two-c2-mem-ffi-package-consumer',
+    private: true,
+    type: 'module',
+  }));
+  runNpm(['install', tarball, typescriptTarball, '--ignore-scripts', '--no-audit', '--no-fund'], {
     cwd: consumerRoot,
   });
+  const lock = JSON.parse(readFileSync(resolve(consumerRoot, 'package-lock.json'), 'utf8'));
+  for (const [path, metadata] of Object.entries(lock.packages ?? {})) {
+    if (metadata?.link === true) {
+      throw new Error(`clean consumer contains a sibling link dependency at ${path}`);
+    }
+  }
   writeFileSync(resolve(consumerRoot, 'smoke.mjs'), `
 import assert from 'node:assert/strict';
 
@@ -229,14 +277,17 @@ void smokeTypes;
   "include": ["smoke-types.mts"]
 }
 `);
-  runTsc(['-p', 'tsconfig.json'], {
+  run(process.execPath, [
+    resolve(consumerRoot, 'node_modules', 'typescript', 'bin', 'tsc'),
+    '-p',
+    'tsconfig.json',
+  ], {
     cwd: consumerRoot,
-    packageRoot,
   });
   run(process.execPath, ['smoke.mjs'], {
     cwd: consumerRoot,
   });
-  console.log('npm packed tarball installs, typechecks, and exercises bundled native request/response pool and request/response handle lifecycle paths from a clean consumer project.');
+  console.log('npm packed runtime and TypeScript tarballs install, typecheck, and exercise bundled native request/response pool and request/response handle lifecycle paths from a clean consumer project.');
 } finally {
   rmSync(tempRoot, { recursive: true, force: true });
 }

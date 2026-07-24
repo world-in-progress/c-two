@@ -2,6 +2,8 @@
 name = "c2-cli"
 version = "0.1.4"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/world-in-progress/c-two"
 description = "Cross-language command-line interface for C-Two"
 
 [[bin]]
@@ -12,10 +14,10 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-c2-config = { path = "../core/foundation/c2-config" }
-c2-codegen = { path = "../core/foundation/c2-codegen" }
-c2-contract = { path = "../core/foundation/c2-contract" }
-c2-http = { path = "../core/transport/c2-http", features = ["relay"] }
+c2-config = { version = "0.1.0", path = "../core/foundation/c2-config" }
+c2-codegen = { version = "0.1.0", path = "../core/foundation/c2-codegen" }
+c2-contract = { version = "0.1.0", path = "../core/foundation/c2-contract" }
+c2-http = { version = "0.1.0", path = "../core/transport/c2-http", features = ["relay"] }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"

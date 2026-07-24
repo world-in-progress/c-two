@@ -2,6 +2,8 @@
 name = "c2-contract"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Contract identity validation and hashing for C-Two routes"
 
 [dependencies]

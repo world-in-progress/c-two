@@ -1940,14 +1940,38 @@ export C2_LRC_REGISTRY="$C2_LRC_ROOT/registry"
 cargo local-registry sync \
   "$C2_LRC_ROOT/closure/Cargo.lock" \
   "$C2_LRC_REGISTRY"
-for crate_archive in "$C2_LRC_ROOT"/candidate/rust/*.crate; do
-  cargo local-registry add "$C2_LRC_REGISTRY" "$crate_archive"
-done
 ```
 
-for every FastDB/C-Two first-party archive. Validate actual CLI syntax from the
-pinned binary’s `--help` in the test instead of silently adapting to another
-version.
+The pinned `cargo-local-registry 0.2.12` help proves that its `add` command
+accepts a crate name/version to fetch from an upstream registry; it cannot
+import a locally built `.crate` archive. Do not use the previously assumed
+`add "$REGISTRY" "$archive"` spelling. Import every FastDB/C-Two first-party
+archive through the tested `tools.local_rc.local_registry.add_crate_archive`
+helper, which copies the exact archive bytes and writes Cargo's standard
+checksum-backed local-index record from the packaged normalized manifest.
+Then prove Cargo consumes that registry offline. This is an evidence-driven
+correction to the plan, not a fallback to source paths.
+
+- [ ] Break Cargo's unpublished-workspace bootstrap cycle without weakening
+  the retained candidate:
+  1. reconstruct both approved Git commits under one disposable source root;
+  2. sync the external lockfile closure while the committed `version + path`
+     edges are still resolvable;
+  3. package the C-Two closure in dependency order, importing each archive
+     into a disposable bootstrap registry before packaging its dependents;
+  4. remove dependency paths from the C-Two packaging snapshot;
+  5. build the retained C-Two archives against that archive-only bootstrap
+     registry and import only those final bytes into the retained registry;
+  6. regenerate the disposable snapshot lockfiles offline against the retained
+     registry before building c3, Python, or Node artifacts.
+
+  Cargo resolves every member of the unpublished workspace even when
+  packaging one leaf, so importing final archives strictly one at a time
+  cannot seed the first package. The bootstrap registry, its packages, both
+  source snapshots, and their Cargo homes are deleted after construction.
+  They are packaging inputs only: the retained registry and every isolated
+  consumer contain final archives and version-only dependency specifications,
+  with no source path fallback.
 
 - [ ] Configure the isolated consumer by rendering the canonical run-specific
   registry path:
@@ -1987,6 +2011,16 @@ Use the platform runtime-library variable equivalent outside macOS.
 - [ ] Build C-Two Python sdist plus current-runtime and CPython-3.10 wheels,
   retaining version `0.5.1`.
 - [ ] Combine them with Task 10 FastDB wheels in one isolated wheelhouse.
+- [ ] Include and hash the complete runtime dependency wheel closure required
+  by those first-party wheels. For the current candidate this is exactly
+  `numpy==2.2.6` for CPython 3.10 and `numpy==2.5.1` for the current CPython
+  3.14 runtime. Record both as `third-party` artifacts selected by the C-Two
+  source commit; do not preinstall them from an index before the no-index
+  proof.
+- [ ] Treat that pair as an explicit Phase 0B closure, not a generic Python
+  dependency-vendoring claim. A future first-party metadata change must fail
+  the exact wheelhouse/manifest checks until the pinned closure and its
+  platform evidence are deliberately updated.
 - [ ] In two clean environments:
 
 ```bash
@@ -2087,7 +2121,7 @@ cargo test --manifest-path sdk/rust/Cargo.toml --all-features
 cargo fmt --manifest-path sdk/python/native/Cargo.toml --all -- --check
 cargo clippy --manifest-path sdk/python/native/Cargo.toml --all-targets --no-deps -- -D warnings
 uv run pytest sdk/python/tests -q
-/opt/homebrew/bin/python3.10 -m compileall -q sdk/python/src
+"$(command -v python3.10)" -m compileall -q sdk/python/src
 npm --prefix core/foundation/c2-mem-ffi/bindings/typescript test
 npm --prefix core/foundation/c2-mem-ffi/bindings/typescript run pack:check
 uv run pytest tests/repo -q
@@ -2275,7 +2309,7 @@ cargo test --manifest-path sdk/rust/Cargo.toml --all-features
 cargo fmt --manifest-path sdk/python/native/Cargo.toml --all -- --check
 cargo clippy --manifest-path sdk/python/native/Cargo.toml --all-targets --no-deps -- -D warnings
 uv run pytest sdk/python/tests -q
-/opt/homebrew/bin/python3.10 -m compileall -q sdk/python/src
+"$(command -v python3.10)" -m compileall -q sdk/python/src
 npm --prefix core/foundation/c2-mem-ffi/bindings/typescript test
 npm --prefix core/foundation/c2-mem-ffi/bindings/typescript run typecheck
 npm --prefix core/foundation/c2-mem-ffi/bindings/typescript run pack:check

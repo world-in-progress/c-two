@@ -2,19 +2,21 @@
 name = "c2-core"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "C-Two language-neutral runtime and orchestration core"
 
 [lib]
 name = "c2_core"
 
 [dependencies]
-c2-config = { path = "../../foundation/c2-config" }
-c2-contract = { path = "../../foundation/c2-contract" }
-c2-error = { path = "../../foundation/c2-error" }
-c2-mem = { path = "../../foundation/c2-mem" }
-c2-http = { path = "../../transport/c2-http" }
-c2-ipc = { path = "../../transport/c2-ipc" }
-c2-server = { path = "../../transport/c2-server" }
+c2-config = { version = "0.1.0", path = "../../foundation/c2-config" }
+c2-contract = { version = "0.1.0", path = "../../foundation/c2-contract" }
+c2-error = { version = "0.1.0", path = "../../foundation/c2-error" }
+c2-mem = { version = "0.1.0", path = "../../foundation/c2-mem" }
+c2-http = { version = "0.1.0", path = "../../transport/c2-http" }
+c2-ipc = { version = "0.1.0", path = "../../transport/c2-ipc" }
+c2-server = { version = "0.1.0", path = "../../transport/c2-server" }
 parking_lot = { workspace = true }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }
@@ -22,4 +24,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 axum = "0.8"
-c2-http = { path = "../../transport/c2-http", features = ["relay"] }
+c2-http = { version = "0.1.0", path = "../../transport/c2-http", features = ["relay"] }

@@ -45,7 +45,7 @@ C2_MEM_TYPESCRIPT = (
 NODE_FIXTURE = (
     REPOSITORY / "sdk/python/tests/fixtures/typescript_real_call.mjs"
 )
-FASTDB_COMMIT = "6b9d0a55f27bb22fd13f867f321db821f21e777c"
+FASTDB_COMMIT = "7eb74734926bd8fe911229eee9744a6dd8172487"
 sys.path.insert(0, str(REPOSITORY))
 
 from tools.local_rc.typescript_receipt import (  # noqa: E402
@@ -122,47 +122,98 @@ class TypeScriptArtifacts:
 
     @classmethod
     def prepare(cls, work: Path) -> TypeScriptArtifacts:
-        assert _git(FASTDB_REPOSITORY, "rev-parse", "HEAD") == FASTDB_COMMIT
-        assert _git(FASTDB_REPOSITORY, "status", "--porcelain") == ""
-
-        _run_checked(
-            [
-                "cargo",
-                "build",
-                "--manifest-path",
-                str(REPOSITORY / "cli/Cargo.toml"),
-                "--bin",
-                "c3",
-            ],
-            cwd=REPOSITORY,
-            timeout=600,
+        configured_fastdb = os.environ.get(
+            "C2_TYPESCRIPT_FASTDB_PACKAGE"
         )
+        configured_c2_mem = os.environ.get(
+            "C2_TYPESCRIPT_C2_MEM_PACKAGE"
+        )
+        configured_typescript = os.environ.get(
+            "C2_TYPESCRIPT_COMPILER_PACKAGE"
+        )
+        configured_packages = (
+            configured_fastdb,
+            configured_c2_mem,
+            configured_typescript,
+        )
+        if any(configured_packages) and not all(configured_packages):
+            raise AssertionError(
+                "candidate TypeScript evidence requires FastDB, C-Two, "
+                "and TypeScript tarballs together"
+            )
+        candidate_packages = all(configured_packages)
+        if not candidate_packages:
+            assert _git(FASTDB_REPOSITORY, "rev-parse", "HEAD") == FASTDB_COMMIT
+            assert _git(FASTDB_REPOSITORY, "status", "--porcelain") == ""
+            _run_checked(
+                [
+                    "cargo",
+                    "build",
+                    "--manifest-path",
+                    str(REPOSITORY / "cli/Cargo.toml"),
+                    "--bin",
+                    "c3",
+                ],
+                cwd=REPOSITORY,
+                timeout=600,
+            )
         matrix_work = work / "matrix"
         matrix_work.mkdir()
         matrix = MatrixArtifacts.prepare(matrix_work)
 
-        wasm = FASTDB_TYPESCRIPT / "src/wasm/fastdb4ts.wasm"
-        if not wasm.is_file():
+        if candidate_packages:
+            fastdb_archive = Path(configured_fastdb)
+            c2_mem_archive = Path(configured_c2_mem)
+            typescript_archive = Path(configured_typescript)
+            for archive in (
+                fastdb_archive,
+                c2_mem_archive,
+                typescript_archive,
+            ):
+                if not archive.is_file():
+                    raise AssertionError(
+                        f"candidate npm tarball is missing: {archive}"
+                    )
+        else:
+            wasm = FASTDB_TYPESCRIPT / "src/wasm/fastdb4ts.wasm"
+            if not wasm.is_file():
+                _run_checked(
+                    ["npm", "run", "build:wasm"],
+                    cwd=FASTDB_TYPESCRIPT,
+                    timeout=900,
+                )
             _run_checked(
-                ["npm", "run", "build:wasm"],
+                ["npm", "run", "build"],
                 cwd=FASTDB_TYPESCRIPT,
-                timeout=900,
+                timeout=300,
             )
-        _run_checked(
-            ["npm", "run", "build"],
-            cwd=FASTDB_TYPESCRIPT,
-            timeout=300,
-        )
-
-        packages = work / "packages"
-        fastdb_archive = _pack_npm_package(
-            FASTDB_TYPESCRIPT,
-            packages / "fastdb4ts",
-        )
-        c2_mem_archive = _pack_npm_package(
-            C2_MEM_TYPESCRIPT,
-            packages / "c2-mem-ffi",
-        )
+            packages = work / "packages"
+            fastdb_archive = _pack_npm_package(
+                FASTDB_TYPESCRIPT,
+                packages / "fastdb4ts",
+            )
+            c2_mem_archive = _pack_npm_package(
+                C2_MEM_TYPESCRIPT,
+                packages / "c2-mem-ffi",
+            )
+            (packages / "typescript").mkdir(parents=True)
+            typescript_pack = _run_checked(
+                [
+                    "npm",
+                    "pack",
+                    "typescript@5.9.3",
+                    "--json",
+                    "--pack-destination",
+                    str(packages / "typescript"),
+                ],
+                cwd=work,
+                timeout=300,
+            )
+            typescript_entries = json.loads(typescript_pack.stdout)
+            typescript_filename = typescript_entries[0]["filename"]
+            typescript_archive = (
+                packages / "typescript" / typescript_filename
+            )
 
         node_root = work / "node"
         node_root.mkdir()
@@ -186,6 +237,7 @@ class TypeScriptArtifacts:
                 "--no-fund",
                 str(fastdb_archive),
                 str(c2_mem_archive),
+                str(typescript_archive),
             ],
             cwd=node_root,
             timeout=300,
@@ -235,7 +287,7 @@ class TypeScriptArtifacts:
             json.dumps(config, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-        tsc = FASTDB_TYPESCRIPT / "node_modules/typescript/bin/tsc"
+        tsc = node_root / "node_modules/typescript/bin/tsc"
         node_binary = shutil.which("node")
         if node_binary is None or not tsc.is_file():
             raise AssertionError("Node and the pinned TypeScript compiler are required")

@@ -47,19 +47,19 @@ RUST_HARNESS_SOURCE = (
     REPOSITORY / "sdk/python/tests/fixtures/portable_matrix_rust.rs"
 )
 TARGET_DIR = REPOSITORY / "core/target"
+_CANDIDATE_CONTRACT_ROOT = os.environ.get(
+    "C2_PORTABLE_MATRIX_CONTRACT_ROOT"
+)
+_contract_root = (
+    Path(_CANDIDATE_CONTRACT_ROOT)
+    if _CANDIDATE_CONTRACT_ROOT
+    else REPOSITORY / "tests/fixtures/contracts"
+)
 DESCRIPTOR_PATHS = {
-    "no-payload": (
-        REPOSITORY
-        / "tests/fixtures/contracts/portable-no-payload.contract.json"
-    ),
-    "record-v1": (
-        REPOSITORY
-        / "tests/fixtures/contracts/portable-record-v1.contract.json"
-    ),
-    "object-graph-v1": (
-        REPOSITORY
-        / "tests/fixtures/contracts/portable-object-graph-v1.contract.json"
-    ),
+    "no-payload": _contract_root / "portable-no-payload.contract.json",
+    "record-v1": _contract_root / "portable-record-v1.contract.json",
+    "object-graph-v1": _contract_root
+    / "portable-object-graph-v1.contract.json",
 }
 CRM_CLASSES = {
     "no-payload": PortableNoPayload,
@@ -293,6 +293,19 @@ class MatrixArtifacts:
         source = work / "src"
         source.mkdir()
         shutil.copyfile(RUST_HARNESS_SOURCE, source / "main.rs")
+        candidate_cargo_home = os.environ.get(
+            "C2_PORTABLE_MATRIX_CARGO_HOME"
+        )
+        if candidate_cargo_home:
+            dependencies = """\
+c-two = "=0.1.0"
+fastdb = "=0.1.22"
+"""
+        else:
+            dependencies = f"""\
+c-two = {{ version = "0.1.0", path = {_path_dependency(REPOSITORY / "sdk/rust")} }}
+fastdb = {{ path = {_path_dependency(FASTDB_REPOSITORY / "bindings/rust/fastdb")} }}
+"""
         manifest = f"""\
 [package]
 name = "c-two-portable-matrix-harness"
@@ -301,21 +314,31 @@ edition = "2024"
 publish = false
 
 [dependencies]
-c-two = {{ version = "0.1.0", path = {_path_dependency(REPOSITORY / "sdk/rust")} }}
-fastdb = {{ path = {_path_dependency(FASTDB_REPOSITORY / "bindings/rust/fastdb")} }}
+{dependencies}\
 """
         (work / "Cargo.toml").write_text(manifest, encoding="utf-8")
         environment = os.environ.copy()
-        environment["CARGO_TARGET_DIR"] = str(TARGET_DIR)
+        target_dir = Path(
+            os.environ.get(
+                "C2_PORTABLE_MATRIX_CARGO_TARGET_DIR",
+                str(TARGET_DIR),
+            )
+        )
+        environment["CARGO_TARGET_DIR"] = str(target_dir)
+        if candidate_cargo_home:
+            environment["CARGO_HOME"] = candidate_cargo_home
         environment["C2_ENV_FILE"] = ""
+        command = [
+            "cargo",
+            "build",
+            "--manifest-path",
+            str(work / "Cargo.toml"),
+            "--message-format=json-render-diagnostics",
+        ]
+        if candidate_cargo_home:
+            command.insert(2, "--offline")
         build = _run_checked(
-            [
-                "cargo",
-                "build",
-                "--manifest-path",
-                str(work / "Cargo.toml"),
-                "--message-format=json-render-diagnostics",
-            ],
+            command,
             cwd=work,
             environment=environment,
             timeout=300,
@@ -341,7 +364,7 @@ fastdb = {{ path = {_path_dependency(FASTDB_REPOSITORY / "bindings/rust/fastdb")
                 f"{sorted(map(str, c_two_rlibs))}"
             )
         rust_harness = (
-            TARGET_DIR
+            target_dir
             / "debug"
             / (
                 "c-two-portable-matrix-harness.exe"

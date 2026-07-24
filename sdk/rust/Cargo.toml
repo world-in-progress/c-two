@@ -3,6 +3,9 @@ name = "c-two"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
+repository = "https://github.com/world-in-progress/c-two"
+description = "User-facing Rust SDK for the C-Two resource RPC runtime"
 
 [lib]
 name = "c_two"

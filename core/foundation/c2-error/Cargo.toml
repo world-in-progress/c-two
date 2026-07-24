@@ -2,6 +2,8 @@
 name = "c2-error"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Canonical C-Two error codes and wire serialization"
 
 [dependencies]

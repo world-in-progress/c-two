@@ -2,6 +2,8 @@
 name = "c2-python-native"
 edition = "2024"
 version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/world-in-progress/c-two"
 description = "PyO3 native extension for the C-Two Python SDK"
 
 [lib]
@@ -13,13 +15,13 @@ default = ["python"]
 python = ["dep:pyo3"]
 
 [dependencies]
-c2-config = { path = "../../../core/foundation/c2-config" }
-c2-codegen = { path = "../../../core/foundation/c2-codegen" }
-c2-contract = { path = "../../../core/foundation/c2-contract" }
-c2-error = { path = "../../../core/foundation/c2-error" }
-c2-mem = { path = "../../../core/foundation/c2-mem" }
-c2-wire = { path = "../../../core/protocol/c2-wire" }
-c2-core = { path = "../../../core/runtime/c2-core" }
+c2-config = { version = "0.1.0", path = "../../../core/foundation/c2-config" }
+c2-codegen = { version = "0.1.0", path = "../../../core/foundation/c2-codegen" }
+c2-contract = { version = "0.1.0", path = "../../../core/foundation/c2-contract" }
+c2-error = { version = "0.1.0", path = "../../../core/foundation/c2-error" }
+c2-mem = { version = "0.1.0", path = "../../../core/foundation/c2-mem" }
+c2-wire = { version = "0.1.0", path = "../../../core/protocol/c2-wire" }
+c2-core = { version = "0.1.0", path = "../../../core/runtime/c2-core" }
 parking_lot = "0.12"
 pyo3 = { version = "0.29", optional = true }
 serde_json = "1"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -20,14 +21,20 @@ from fastdb4py.payload import (
 
 C_TWO_REPOSITORY = Path(__file__).resolve().parents[4]
 FASTDB_REPOSITORY = C_TWO_REPOSITORY.parent / "fastdb"
-RECORD_SPEC_PATH = (
-    FASTDB_REPOSITORY
-    / "tests/golden/payload/v1/spec/valid/record-all-types.source.json"
-)
-GRAPH_SPEC_PATH = (
-    FASTDB_REPOSITORY
-    / "tests/golden/payload/v1/binary/spec/graph-all-values.source.json"
-)
+_CANDIDATE_FIXTURE_ROOT = os.environ.get("C2_PORTABLE_MATRIX_FIXTURE_ROOT")
+if _CANDIDATE_FIXTURE_ROOT:
+    _fixture_root = Path(_CANDIDATE_FIXTURE_ROOT)
+    RECORD_SPEC_PATH = _fixture_root / "record-all-types.source.json"
+    GRAPH_SPEC_PATH = _fixture_root / "graph-all-values.source.json"
+else:
+    RECORD_SPEC_PATH = (
+        FASTDB_REPOSITORY
+        / "tests/golden/payload/v1/spec/valid/record-all-types.source.json"
+    )
+    GRAPH_SPEC_PATH = (
+        FASTDB_REPOSITORY
+        / "tests/golden/payload/v1/binary/spec/graph-all-values.source.json"
+    )
 
 RECORD_SPEC_BYTES = RECORD_SPEC_PATH.read_bytes()
 GRAPH_SPEC_BYTES = GRAPH_SPEC_PATH.read_bytes()
