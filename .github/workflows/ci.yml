@@ -105,7 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -146,7 +146,7 @@ jobs:
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' && matrix.python != '3.12'
         run: echo "Skipping this matrix leg for Dependabot pull requests"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
           python-version: ${{ matrix.python }}
