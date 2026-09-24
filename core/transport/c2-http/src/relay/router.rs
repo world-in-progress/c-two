@@ -4764,31 +4764,127 @@ mod tests {
     #[tokio::test]
     async fn probe_missing_upstream_route_removes_stale_local_route() {
         let state = test_state();
-        let stale_address = format!(
+        let owner_address = format!(
             "ipc://relay_probe_missing_route_{}_{}",
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address, "server-grid").await;
+        // The owner is alive and answers catalog lookups but never served this
+        // route, so the authoritative lookup must answer never-found. The
+        // local route is committed directly so the background control watch
+        // cannot withdraw it first: the data-plane acquisition is the only
+        // actor that observes the stale route.
+        let owner_server =
+            start_live_server_with_routes(&owner_address, "server-grid", &["other"]).await;
 
-        assert_eq!(
-            post_register(state.clone(), "grid", "server-grid", &stale_address).await,
-            StatusCode::CREATED
-        );
-        state.evict_connection("grid");
-        assert!(stale_server.unregister_route("grid").await);
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            1024,
+            "grid-never-served-uid".into(),
+            1,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for never-found stale route"),
+        }
 
-        assert_eq!(
-            get_probe(state.clone(), "grid").await,
-            StatusCode::NOT_FOUND
+        let (status, body) = get_probe_response(state.clone(), "grid").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], 701);
+        assert_eq!(body["name"], "ResourceNotFound");
+        assert_eq!(body["message"], "route not found: grid");
+        assert_eq!(body["details"]["route"], "grid");
+        assert!(
+            state.local_route("grid").is_none(),
+            "never-found upstream route is semantic withdrawal evidence"
         );
-        assert!(state.local_route("grid").is_none());
         assert_eq!(
             get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
             StatusCode::NOT_FOUND
         );
 
-        shutdown_live_server(&stale_server).await;
+        shutdown_live_server(&owner_server).await;
+    }
+
+    #[tokio::test]
+    async fn probe_known_removed_upstream_route_removes_stale_local_route() {
+        let state = test_state();
+        let owner_address = format!(
+            "ipc://relay_probe_removed_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let owner_server = start_live_server(&owner_address, "server-grid").await;
+
+        // Capture the live route identity before removal. The server
+        // tombstone keeps this uid, so the withdrawal response can be pinned
+        // to the exact removed incarnation.
+        let mut attested =
+            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default());
+        attested
+            .connect()
+            .await
+            .expect("attestation client connects");
+        let table = attested.route_table("grid").expect("server exports grid");
+        let route_uid = table.route_uid().to_string();
+        let route_revision = table.route_revision();
+        let max_payload_size = table.max_payload_size();
+        attested.close().await;
+
+        assert!(owner_server.unregister_route("grid").await);
+
+        // An explicit unregister leaves a tombstone, so the authoritative
+        // lookup answers known-removed (410), not never-found (404). The
+        // local route is committed after the removal so the data-plane
+        // acquisition deterministically observes the tombstone.
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            max_payload_size,
+            route_uid.clone(),
+            route_revision,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for known-removed stale route"),
+        }
+
+        let (status, body) = get_probe_response(state.clone(), "grid").await;
+        assert_eq!(status, StatusCode::GONE);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], 708);
+        assert_eq!(body["name"], "ResourceRemoved");
+        assert_eq!(body["message"], "route removed: grid");
+        assert_eq!(body["details"]["route"], "grid");
+        assert_eq!(body["details"]["route_uid"], route_uid);
+        assert!(
+            state.local_route("grid").is_none(),
+            "known-removed upstream route is semantic withdrawal evidence"
+        );
+        assert_eq!(
+            get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
+            StatusCode::NOT_FOUND
+        );
+
+        shutdown_live_server(&owner_server).await;
     }
 
     #[tokio::test]
@@ -4878,32 +4974,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_missing_upstream_route_removes_stale_local_route() {
+    async fn call_known_removed_upstream_route_removes_stale_local_route() {
         let state = test_state();
-        let stale_address = format!(
-            "ipc://relay_call_missing_route_{}_{}",
+        let owner_address = format!(
+            "ipc://relay_call_removed_route_{}_{}",
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address, "server-grid").await;
+        let owner_server = start_live_server(&owner_address, "server-grid").await;
 
-        assert_eq!(
-            post_register(state.clone(), "grid", "server-grid", &stale_address).await,
-            StatusCode::CREATED
-        );
-        assert!(stale_server.unregister_route("grid").await);
+        let mut attested =
+            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default());
+        attested
+            .connect()
+            .await
+            .expect("attestation client connects");
+        let table = attested.route_table("grid").expect("server exports grid");
+        let route_uid = table.route_uid().to_string();
+        let route_revision = table.route_revision();
+        let max_payload_size = table.max_payload_size();
+        attested.close().await;
 
-        assert_eq!(
-            post_call(state.clone(), "grid", "ping").await,
-            StatusCode::NOT_FOUND
+        assert!(owner_server.unregister_route("grid").await);
+
+        // The explicit unregister leaves a tombstone, so the call acquisition
+        // fails pre-dispatch with known-removed evidence and withdraws the
+        // stale local route. Committing the local route after the removal
+        // keeps the fixture independent of control-watch timing.
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            max_payload_size,
+            route_uid.clone(),
+            route_revision,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for known-removed stale route"),
+        }
+
+        // The canonical ResourceRemoved envelope is also the no-dispatch
+        // proof: a dispatched call would have returned 200 with the echo body.
+        let (status, body) = post_call_response(state.clone(), "grid", "ping").await;
+        assert_eq!(status, StatusCode::GONE);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], 708);
+        assert_eq!(body["name"], "ResourceRemoved");
+        assert_eq!(body["message"], "route removed: grid");
+        assert_eq!(body["details"]["route"], "grid");
+        assert_eq!(body["details"]["route_uid"], route_uid);
+        assert!(
+            state.local_route("grid").is_none(),
+            "known-removed upstream route is semantic withdrawal evidence"
         );
-        assert!(state.local_route("grid").is_none());
         assert_eq!(
             get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
             StatusCode::NOT_FOUND
         );
 
-        shutdown_live_server(&stale_server).await;
+        shutdown_live_server(&owner_server).await;
     }
 
     #[tokio::test]

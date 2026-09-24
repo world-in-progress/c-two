@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::{
     Json, Router,
@@ -88,8 +88,15 @@ fn runtime_options(server_id: String, relay_url: Option<String>) -> RuntimeOptio
     }
 }
 
+// Every relay-configuration reader and writer in this test process shares
+// this lock. Keep it until runtime/server teardown has finished; guarding
+// only the writer still lets parallel clients observe its invalid value.
+fn relay_env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn with_invalid_relay_proxy_env(test: impl FnOnce()) {
-    let _guard = ENV_LOCK.lock().expect("environment lock");
+    let _guard = relay_env_lock();
     let previous_env_file = std::env::var_os("C2_ENV_FILE");
     let previous_proxy = std::env::var_os("C2_RELAY_USE_PROXY");
     // SAFETY: this test owns the process-local environment lock and restores
@@ -455,6 +462,7 @@ fn relay_aware_connect_without_anchor_ignores_proxy_configuration() {
 
 #[test]
 fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths() {
+    let _environment = relay_env_lock();
     fn accepts_client(_: &c2_core::Client) {}
 
     let (mut relay, relay_url) = relay();
@@ -584,6 +592,7 @@ fn direct_ipc_uses_only_the_supplied_address_and_never_resolves_relay() {
 
 #[test]
 fn explicit_relay_uses_the_http_data_plane_even_when_local_ipc_is_valid() {
+    let _environment = relay_env_lock();
     let runtime =
         Runtime::new(runtime_options(unique_name("explicit-http"), None)).expect("runtime");
     let host = runtime
@@ -718,6 +727,7 @@ fn retained_release_identity_is_unchanged_by_route_failures() {
 
 #[test]
 fn relay_aware_rejects_a_fallback_to_the_same_failed_local_candidate() {
+    let _environment = relay_env_lock();
     let release = release();
     let expected = release
         .expected_route(unique_name("same-candidate"))
@@ -751,6 +761,7 @@ fn relay_aware_rejects_a_fallback_to_the_same_failed_local_candidate() {
 
 #[test]
 fn relay_aware_identity_mismatch_is_terminal_without_fallback_resolution() {
+    let _environment = relay_env_lock();
     let release = release();
     let route_name = unique_name("identity-terminal");
     let expected = release.expected_route(&route_name).expect("expected route");
@@ -791,6 +802,7 @@ fn relay_aware_identity_mismatch_is_terminal_without_fallback_resolution() {
 
 #[test]
 fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
+    let _environment = relay_env_lock();
     let release = release();
     let route_name = unique_name("contract-terminal");
     let actual_expected = release.expected_route(&route_name).expect("expected route");
@@ -841,6 +853,7 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
 
 #[test]
 fn relay_aware_protocol_violation_is_terminal_without_fallback_resolution() {
+    let _environment = relay_env_lock();
     let expected = release()
         .expected_route(unique_name("protocol-terminal"))
         .expect("expected route");
@@ -878,6 +891,7 @@ fn relay_aware_protocol_violation_is_terminal_without_fallback_resolution() {
 
 #[test]
 fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists() {
+    let _environment = relay_env_lock();
     let release = release();
     let expected = release
         .expected_route(unique_name("http-only"))
@@ -924,6 +938,7 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
 
 #[test]
 fn a_cached_stale_route_is_refreshed_once_and_a_second_stale_result_is_terminal() {
+    let _environment = relay_env_lock();
     let release = release();
     let expected = release
         .expected_route(unique_name("stale-once"))
@@ -979,6 +994,7 @@ fn a_cached_stale_route_is_refreshed_once_and_a_second_stale_result_is_terminal(
 
 #[test]
 fn service_error_is_not_replayed() {
+    let _environment = relay_env_lock();
     struct Fails {
         calls: AtomicU64,
     }
