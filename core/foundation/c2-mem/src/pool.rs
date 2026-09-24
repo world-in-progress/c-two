@@ -281,7 +281,7 @@ impl MemPool {
             for slot in &mut self.segments {
                 if slot
                     .as_ref()
-                    .is_some_and(|segment| segment.allocator().alloc_count() == 0)
+                    .is_some_and(|segment| segment.allocator().can_retire())
                 {
                     slot.take();
                     removed += 1;
@@ -302,7 +302,7 @@ impl MemPool {
         while self.segments.len() > 1 {
             let last = self.segments.len() - 1;
             let seg = self.segments[last].as_ref().expect("owner segment slot");
-            if seg.allocator().alloc_count() > 0 {
+            if !seg.allocator().can_retire() {
                 self.idle_since[last] = None;
                 break;
             }
@@ -492,8 +492,11 @@ impl MemPool {
                 }
                 return Ok(());
             }
-            if segment.allocator().alloc_count() != 0 {
-                return Err("cannot retire a backing with live allocations".into());
+            if !segment.allocator().can_retire() {
+                return Err(
+                    "cannot retire a backing with live allocations or unavailable allocator state"
+                        .into(),
+                );
             }
         }
         let name = Self::buddy_segment_name(&self.name_prefix, seg_idx, generation);
@@ -619,7 +622,7 @@ impl MemPool {
             if let Some(level) = seg.allocator().size_to_level(actual_size) {
                 seg.allocator().free(offset, level as u16)?;
                 let idx = seg_idx as usize;
-                if seg.allocator().alloc_count() == 0 {
+                if seg.allocator().can_retire() {
                     if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
                         self.idle_since[idx] = Some(Instant::now());
                     }
@@ -2090,6 +2093,79 @@ mod tests {
         assert_eq!(peer.stats().total_segments, 1);
         peer.free_at(high.seg_idx, high.generation, high.offset, 32 * 1024, false)
             .unwrap();
+    }
+
+    #[test]
+    fn busy_zero_counters_never_authorize_retirement() {
+        let config = PoolConfig {
+            max_segments: 2,
+            buddy_idle_decay_secs: 0.0,
+            ..test_config()
+        };
+        let mut owner = test_pool(config.clone());
+        owner.ensure_buddy_segments(2).unwrap();
+        let generation = owner.segment_generation(1).unwrap();
+        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
+        peer.ensure_peer_segment(1, generation, 4096).unwrap();
+        let word = unsafe {
+            owner
+                .segment(1)
+                .unwrap()
+                .base_ptr()
+                .add(std::mem::offset_of!(crate::SegmentHeader, spinlock))
+        };
+        let lock = unsafe { crate::ShmSpinlock::new(word) };
+        lock.try_lock().unwrap();
+        // The last free publishes a zero count before merging all bitmaps.
+        // While that critical section is still live, none of the three
+        // retirement paths may treat the zero count as a completed transition.
+        assert_eq!(owner.segment(1).unwrap().allocator().alloc_count(), 0);
+        assert_eq!(owner.gc_buddy(), 0);
+        assert_eq!(peer.gc_buddy(), 0);
+        assert!(
+            peer.ensure_peer_segment(1, generation + 1, 4096)
+                .unwrap_err()
+                .contains("cannot retire")
+        );
+        assert!(owner.segment(1).is_some());
+        assert!(peer.segment(1).is_some());
+        lock.unlock();
+        assert_eq!(peer.gc_buddy(), 1);
+        assert_eq!(owner.gc_buddy(), 1);
+    }
+
+    #[test]
+    fn poisoned_empty_counters_never_authorize_retirement() {
+        let config = PoolConfig {
+            max_segments: 2,
+            buddy_idle_decay_secs: 0.0,
+            ..test_config()
+        };
+        let mut owner = test_pool(config.clone());
+        owner.ensure_buddy_segments(2).unwrap();
+        let generation = owner.segment_generation(1).unwrap();
+        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
+        peer.ensure_peer_segment(1, generation, 4096).unwrap();
+        let word = unsafe {
+            owner
+                .segment(1)
+                .unwrap()
+                .base_ptr()
+                .add(std::mem::offset_of!(crate::SegmentHeader, spinlock))
+        };
+        let lock = unsafe { crate::ShmSpinlock::new(word) };
+        lock.try_lock().unwrap();
+        lock.poison_panicked(std::process::id());
+        assert!(owner.segment(1).unwrap().allocator().is_poisoned());
+        assert_eq!(owner.gc_buddy(), 0);
+        assert_eq!(peer.gc_buddy(), 0);
+        assert!(
+            peer.ensure_peer_segment(1, generation + 1, 4096)
+                .unwrap_err()
+                .contains("cannot retire")
+        );
+        assert!(owner.segment(1).is_some());
+        assert!(peer.segment(1).is_some());
     }
 
     #[test]

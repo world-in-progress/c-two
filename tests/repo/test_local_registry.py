@@ -93,7 +93,7 @@ version = "0.1.0"
 
 [dependencies]
 c2-core = "0.1.0"
-fastdb = "0.1.22"
+fastdb = "0.2.0"
 """,
     )
 
@@ -112,7 +112,7 @@ version = "0.1.0"
 
 [dependencies]
 c2-core = { version = "0.1.0", features = ["relay"] }
-fastdb = { version = "0.1.22", optional = true }
+fastdb = { version = "0.2.0", optional = true }
 """,
     )
     registry = tmp_path / "registry"
@@ -131,7 +131,7 @@ fastdb = { version = "0.1.22", optional = true }
     assert [
         (dependency["name"], dependency["req"])
         for dependency in entry["deps"]
-    ] == [("c2-core", "0.1.0"), ("fastdb", "0.1.22")]
+    ] == [("c2-core", "0.1.0"), ("fastdb", "0.2.0")]
     assert index.read_text(encoding="utf-8").endswith("\n")
 
 

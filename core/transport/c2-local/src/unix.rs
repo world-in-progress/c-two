@@ -37,7 +37,20 @@ pub struct Listener {
     // This rendezvous inode remains on disk. Unlinking it would let a contender
     // open a new inode while another process still holds the previous lock.
     // Keep the lock until both socket cleanup and native listener close finish.
-    _ownership: File,
+    _ownership: Ownership,
+}
+
+struct Ownership(File);
+
+impl Drop for Ownership {
+    fn drop(&mut self) {
+        // A concurrent fork/spawn may briefly retain the same open file
+        // description until CLOEXEC. Explicit unlock releases listener
+        // ownership now, rather than waiting for that inherited fd to close.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,7 +107,7 @@ impl SocketIdentity {
     }
 }
 
-fn ownership_lock(path: &Path) -> io::Result<File> {
+fn ownership_lock(path: &Path) -> io::Result<Ownership> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -108,12 +121,15 @@ fn ownership_lock(path: &Path) -> io::Result<File> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = io::Error::last_os_error();
         return Err(if error.kind() == io::ErrorKind::WouldBlock {
-            endpoint_in_use()
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "IPC endpoint listener ownership is already held",
+            )
         } else {
             error
         });
     }
-    Ok(file)
+    Ok(Ownership(file))
 }
 
 fn endpoint_in_use() -> io::Error {
@@ -176,7 +192,7 @@ impl Listener {
             std::fs::create_dir_all(parent)?;
         }
         let mut ownership = ownership_lock(&path)?;
-        remove_stale_socket(&path, &mut ownership)?;
+        remove_stale_socket(&path, &mut ownership.0)?;
         let inner = UnixListener::bind(&path)?;
         let metadata = std::fs::metadata(&path)?;
         let mut listener = Self {
@@ -187,7 +203,7 @@ impl Listener {
         };
         std::fs::set_permissions(&listener.path, std::fs::Permissions::from_mode(0o600))?;
         listener.identity = SocketIdentity::from_metadata(&std::fs::metadata(&listener.path)?);
-        listener.identity.write(&mut listener._ownership)?;
+        listener.identity.write(&mut listener._ownership.0)?;
         Ok(listener)
     }
 
@@ -213,6 +229,20 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn listener_unlocks_ownership_before_inherited_descriptors_are_closed() {
+        let endpoint =
+            LocalEndpoint::from_address(&format!("ipc://c2-inherited-lock-{}", std::process::id()))
+                .unwrap();
+        let listener = Listener::bind(&endpoint).unwrap();
+        // fork during a concurrent process spawn duplicates this open file
+        // description until CLOEXEC takes effect in the child.
+        let inherited = listener._ownership.0.try_clone().unwrap();
+        drop(listener);
+        let _next = Listener::bind(&endpoint).unwrap();
+        drop(inherited);
+    }
 
     #[test]
     fn crash_owner_child() {

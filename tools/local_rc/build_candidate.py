@@ -52,7 +52,9 @@ NUMPY_VERSIONS = {
 }
 EXPECTED_FASTDB_COMMIT = "7eb74734926bd8fe911229eee9744a6dd8172487"
 RUST_PACKAGE_ORDER = (
+    ("c2-local-security", "core/foundation/c2-local-security/Cargo.toml"),
     ("c2-config", "core/foundation/c2-config/Cargo.toml"),
+    ("c2-local", "core/transport/c2-local/Cargo.toml"),
     ("c2-contract", "core/foundation/c2-contract/Cargo.toml"),
     ("c2-error", "core/foundation/c2-error/Cargo.toml"),
     ("c2-mem", "core/foundation/c2-mem/Cargo.toml"),

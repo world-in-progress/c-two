@@ -320,7 +320,7 @@ publish = false
 
 [dependencies]
 c-two = {{ version = "0.1.0", path = {c_two:?} }}
-fastdb = {{ version = "0.1.22", path = {fastdb:?} }}
+fastdb = {{ version = "0.2.0", path = {fastdb:?} }}
 "#,
         c_two = repository.join("sdk/rust"),
         fastdb = fastdb.join("bindings/rust/fastdb"),

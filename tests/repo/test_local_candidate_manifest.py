@@ -43,7 +43,9 @@ FASTDB_COMMIT = "2" * 40
 
 def test_rust_package_order_covers_the_complete_first_party_closure() -> None:
     assert tuple(name for name, _ in RUST_PACKAGE_ORDER) == (
+        "c2-local-security",
         "c2-config",
+        "c2-local",
         "c2-contract",
         "c2-error",
         "c2-mem",

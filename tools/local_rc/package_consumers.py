@@ -23,6 +23,7 @@ from tools.local_rc.artifact_manifest import (
 )
 from tools.local_rc.build_candidate import NUMPY_VERSIONS
 from tools.local_rc.local_registry import (
+    FASTDB_VERSION,
     render_cargo_config,
     render_rust_consumer_manifest,
     validate_rust_consumer_manifest,
@@ -593,7 +594,7 @@ def run_rust_consumer(
             f"{complete}\n{host_stderr}"
         )
     c_two = candidate / "rust/c-two-0.1.0.crate"
-    fastdb = candidate / "fastdb/rust/fastdb-0.1.22.crate"
+    fastdb = candidate / f"fastdb/rust/fastdb-{FASTDB_VERSION}.crate"
     return {
         "c-two": _artifact_digest(artifacts, c_two, candidate),
         "fastdb": _artifact_digest(artifacts, fastdb, candidate),
@@ -781,7 +782,7 @@ def install_python_consumer(
             "--find-links",
             str(numpy_wheel.parent),
             f"numpy=={numpy_version}",
-            "fastdb4py==0.1.22",
+            f"fastdb4py=={FASTDB_VERSION}",
             "c-two==0.5.1",
         ],
         cwd=work,

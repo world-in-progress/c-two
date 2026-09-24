@@ -64,11 +64,7 @@ fn contract_codegen_portable_project_tree() {
                 .is_file()
         );
         assert!(destination.join(module).is_file());
-        assert!(
-            walk_files(&destination)
-                .iter()
-                .any(|path| path.to_string_lossy().contains("/payloads/"))
-        );
+        assert!(!walk_files(&destination.join(target).join("payloads")).is_empty());
 
         let mut repeat = Command::cargo_bin("c3").unwrap();
         repeat

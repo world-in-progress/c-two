@@ -112,7 +112,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
         return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], ()
 
     if scope == LOCAL_PLATFORM_SCOPE:
-        return [cargo("local-platform-tests", "core/Cargo.toml", "--lib",
+        return [cargo("local-platform-tests", "core/Cargo.toml", "--lib", "--no-fail-fast",
                       "-p", "c2-config", "-p", "c2-local-security", "-p", "c2-local",
                       "-p", "c2-mem", "-p", "c2-mem-ffi", "-p", "c2-wire",
                       "-p", "c2-ipc", "-p", "c2-server")]
@@ -135,6 +135,12 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
         cargo("python-native-test", "sdk/python/native/Cargo.toml"),
         ("fastdb-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/fastdb"), "--no-create-gitignore", "../fastdb"], ()),
         ("python-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/c-two"), "--no-create-gitignore", "sdk/python"], ()),
+        ("windows-wheel-consumer", [python, str(ROOT / "tools/ci/windows_wheel_smoke.py"),
+                                    "--fastdb-wheel", str(output / "wheels/fastdb"),
+                                    "--c-two-wheel", str(output / "wheels/c-two"),
+                                    "--c3", str(ROOT / "cli/target/debug/c3.exe"),
+                                    "--receipt", str(output / "installed-wheel-full-receipt.v1.json")],
+         ("fastdb-wheel-build", "python-wheel-build", "cli-build")),
         ("python-build", ["uv", "sync", "--locked", "--python", python], ()),
         ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build",)),
         ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], ("python-build",)),

@@ -791,7 +791,11 @@ def test_relay_router_does_not_silence_response_materialization_errors():
     call_handler = call_handler[:call_handler.index("async fn acquire_request_client")]
 
     assert "into_bytes_with_pool" in call_handler
-    assert "UpstreamResponseUnavailable" in call_handler
+    materialization = call_handler[call_handler.index("fn materialized_response_or_error"):]
+    assert "resource_unavailable_response_with_phase" in materialization
+    assert '"dispatch_uncertain"' in materialization
+    assert '"pre_dispatch"' not in materialization
+    assert "Json(serde_json::json!" not in materialization
     assert "unwrap_or_default()" not in call_handler
 
 

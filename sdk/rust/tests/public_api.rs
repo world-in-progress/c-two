@@ -477,17 +477,33 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
         ),
     )
     .expect("external manifest");
-    std::fs::write(src.join("main.rs"), source).expect("external source");
-
-    let output = Command::new(env!("CARGO"))
-        .args(["check", "--quiet", "--offline"])
-        .current_dir(&root)
-        .env(
-            "CARGO_TARGET_DIR",
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/compile-fail"),
-        )
-        .output()
-        .expect("external cargo check");
+    // Reuse the dependency versions tested by this SDK, including any locked
+    // registry version that has since been yanked. The positive control lets
+    // Cargo add this temporary root without resolving a fresh dependency graph.
+    std::fs::copy(sdk.join("Cargo.lock"), root.join("Cargo.lock"))
+        .expect("seed external dependency lock from the tested SDK");
+    std::fs::write(src.join("main.rs"), "fn main() {}\n")
+        .expect("external positive-control source");
+    let check = |locked: bool| {
+        let mut command = Command::new(env!("CARGO"));
+        command.args(["check", "--quiet", "--offline"]);
+        if locked {
+            command.arg("--locked");
+        }
+        command
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", sdk.join("target/compile-fail"))
+            .output()
+            .expect("external cargo check")
+    };
+    let control = check(false);
+    assert!(
+        control.status.success(),
+        "external positive control failed before the API rejection probe:\n{}",
+        String::from_utf8_lossy(&control.stderr),
+    );
+    std::fs::write(src.join("main.rs"), source).expect("external rejection source");
+    let output = check(true);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),

@@ -3,6 +3,13 @@ name: Windows Native
 on:
   push:
     branches: [socu/windows-native-ipc]
+  pull_request:
+    paths:
+      - "core/**"
+      - "sdk/**"
+      - "cli/**"
+      - "tools/ci/**"
+      - ".github/workflows/windows-native.yml"
 
 permissions:
   contents: read

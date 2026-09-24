@@ -7,7 +7,9 @@
       "defines": ["NAPI_VERSION=10"],
       "msvs_settings": {
         "VCCLCompilerTool": {
-          "AdditionalOptions": ["/std:c11"]
+          "AdditionalOptions!": ["-std:c++20", "/std:c++20"],
+          "LanguageStandard": "stdcpp20",
+          "LanguageStandard_C": "stdc11"
         }
       }
     }

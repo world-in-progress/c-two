@@ -1,7 +1,9 @@
 use super::LocalEndpoint;
 use c2_local_security::LocalSecurityAttributes;
+use sha2::{Digest, Sha256};
 use std::io;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -9,8 +11,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
 };
-use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_PIPE_BUSY, GetLastError, HANDLE};
 use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 
 pub enum Stream {
     Client(NamedPipeClient),
@@ -86,19 +89,24 @@ pub fn poll_flush(stream: &mut Stream, cx: &mut Context<'_>) -> Poll<io::Result<
 }
 
 pub struct Listener {
+    // Declaration order matters: close the pending server instance before
+    // releasing the exclusive listener lease. Connected streams do not retain it.
     pending: NamedPipeServer,
     endpoint: LocalEndpoint,
     security: LocalSecurityAttributes,
+    _ownership: OwnedHandle,
 }
 
 impl Listener {
     pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
         let mut security = LocalSecurityAttributes::new()?;
-        let pending = create_instance(endpoint, &mut security, true)?;
+        let ownership = claim_listener(endpoint, &mut security)?;
+        let pending = create_instance(endpoint, &mut security)?;
         Ok(Self {
             pending,
             endpoint: endpoint.clone(),
             security,
+            _ownership: ownership,
         })
     }
 
@@ -107,21 +115,54 @@ impl Listener {
         // listener. The next accept resumes it instead of removing the endpoint.
         self.pending.connect().await?;
         // Keep a listening instance present before delivering this connection.
-        let next = create_instance(&self.endpoint, &mut self.security, false)?;
+        let next = create_instance(&self.endpoint, &mut self.security)?;
         Ok(Stream::Server(std::mem::replace(&mut self.pending, next)))
     }
+}
+
+fn claim_listener(
+    endpoint: &LocalEndpoint,
+    security: &mut LocalSecurityAttributes,
+) -> io::Result<OwnedHandle> {
+    let mut digest = Sha256::new();
+    for unit in endpoint.os_name().encode_wide() {
+        digest.update(unit.to_le_bytes());
+    }
+    let name: Vec<u16> = format!(r"Local\c_two_listener-{:x}", digest.finalize())
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // This is an existence lease, not a mutex lock: no thread owns or waits on
+    // it. Tokio may move/drop Listener on another thread. Clients never open it,
+    // so old pipe handles cannot keep a stopped listener's lease alive.
+    let raw = unsafe { CreateMutexW(security.as_mut_ptr(), 0, name.as_ptr()) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    // SAFETY: CreateMutexW returned one fresh owned handle, including when it
+    // opened an existing object. Every error path closes that handle as well.
+    let ownership = unsafe { OwnedHandle::from_raw_handle(raw) };
+    if existed {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "IPC endpoint already has an active listener",
+        ));
+    }
+    Ok(ownership)
 }
 
 fn create_instance(
     endpoint: &LocalEndpoint,
     security: &mut LocalSecurityAttributes,
-    first: bool,
 ) -> io::Result<NamedPipeServer> {
     let mut options = ServerOptions::new();
     options
         .pipe_mode(PipeMode::Byte)
         .reject_remote_clients(true)
-        .first_pipe_instance(first);
+        // FIRST_PIPE_INSTANCE would prevent restart while an old client still
+        // retains the pipe object. The separate kernel lease owns exclusivity.
+        .first_pipe_instance(false);
     // SAFETY: the ACL owner lives across the synchronous CreateNamedPipe call;
     // the returned handle is explicitly non-inheritable.
     unsafe {

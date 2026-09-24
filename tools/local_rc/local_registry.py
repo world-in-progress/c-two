@@ -15,9 +15,10 @@ from typing import Any, Iterable, Iterator, Mapping
 
 
 C2_VERSION = "0.1.0"
-FASTDB_VERSION = "0.1.22"
+FASTDB_VERSION = "0.2.0"
 CARGO_LOCAL_REGISTRY_VERSION = "0.2.12"
 FIRST_PARTY_VERSIONS = {
+    "c2-local-security": C2_VERSION,
     "c2-config": C2_VERSION,
     "c2-contract": C2_VERSION,
     "c2-codegen": C2_VERSION,
@@ -26,6 +27,7 @@ FIRST_PARTY_VERSIONS = {
     "c2-mem-ffi": C2_VERSION,
     "c2-wire": C2_VERSION,
     "c2-ipc": C2_VERSION,
+    "c2-local": C2_VERSION,
     "c2-http": C2_VERSION,
     "c2-server": C2_VERSION,
     "c2-core": C2_VERSION,

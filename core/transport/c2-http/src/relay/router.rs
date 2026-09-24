@@ -1624,25 +1624,17 @@ fn materialized_response_or_error(
                 body,
             )
                 .into_response(),
-            Err(err) => (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": "RelayRemotePayloadChunkConfigInvalid",
-                    "route": route_name,
-                    "message": err.to_string(),
-                })),
-            )
-                .into_response(),
+            Err(err) => resource_unavailable_response_with_phase(
+                route_name,
+                format!("failed to construct relay response body: {err}"),
+                "dispatch_uncertain",
+            ),
         },
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "UpstreamResponseUnavailable",
-                "route": route_name,
-                "message": format!("failed to materialize upstream response: {err}"),
-            })),
-        )
-            .into_response(),
+        Err(err) => resource_unavailable_response_with_phase(
+            route_name,
+            format!("failed to materialize upstream response: {err}"),
+            "dispatch_uncertain",
+        ),
     }
 }
 
@@ -2551,17 +2543,38 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_response_error_is_not_silently_returned_as_empty_success() {
-        let response = materialized_response_or_error(
-            "grid",
-            Err("server pool not initialised".to_string()),
-            c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
-        );
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"], "UpstreamResponseUnavailable");
-        assert_eq!(payload["route"], "grid");
+        for (result, chunk_size, expected_message) in [
+            (
+                Err("server pool not initialised".to_string()),
+                c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+                "server pool not initialised",
+            ),
+            (
+                Err("response SHM release failed: backing unavailable".to_string()),
+                c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+                "response SHM release failed: backing unavailable",
+            ),
+            (
+                Ok(b"already dispatched".to_vec()),
+                0,
+                "remote_payload_chunk_size",
+            ),
+        ] {
+            let response = materialized_response_or_error("grid", result, chunk_size);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body)
+                .expect("relay failures must decode through the canonical HTTP error envelope");
+            let error = c2_error::C2Error::from_envelope(envelope).unwrap();
+            assert_eq!(error.code, c2_error::ErrorCode::ResourceUnavailable);
+            assert_eq!(error.details["route"], "grid");
+            assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
+            assert!(
+                error.message.contains(expected_message),
+                "{}",
+                error.message
+            );
+        }
     }
 
     fn test_state() -> Arc<RelayState> {
