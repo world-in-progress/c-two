@@ -1,0 +1,87 @@
+name: Windows Native
+
+on:
+  push:
+    branches: [socu/windows-native-ipc]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FASTDB_SOURCE_SHA: ceebed2edbef580ba0a42dcd28dadf9628894523
+  C2_ENV_FILE: ""
+  C2_RELAY_ANCHOR_ADDRESS: ""
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  PYTHONUTF8: "1"
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / MSVC x64 / Python 3.12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: c-two
+          ref: ${{ github.sha }}
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: world-in-progress/fastdb
+          ref: ${{ env.FASTDB_SOURCE_SHA }}
+          path: fastdb
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            c-two/core -> target
+            c-two/cli -> target
+            c-two/sdk/rust -> target
+            c-two/sdk/python/native -> target
+            fastdb/bindings/rust -> target
+          key: ${{ matrix.os }}-msvc-${{ env.FASTDB_SOURCE_SHA }}
+
+      - name: Collect native build and test evidence
+        working-directory: c-two
+        env:
+          C2_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          C2_RUNNER_LABEL: ${{ matrix.os }}
+        run: >-
+          python tools/ci/windows_native.py
+          --expected-c-two-sha "${{ github.sha }}"
+          --expected-fastdb-sha "${{ env.FASTDB_SOURCE_SHA }}"
+          --output artifacts/windows-native
+
+      - name: Upload logs and run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-${{ matrix.os }}-${{ github.sha }}
+          path: c-two/artifacts/windows-native/
+          if-no-files-found: error
+          retention-days: 14
