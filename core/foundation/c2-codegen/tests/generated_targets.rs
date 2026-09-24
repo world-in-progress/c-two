@@ -84,8 +84,8 @@ fn every_target_contains_a_c_two_owned_contract_module() {
                 "createHttpRelayEncodedTransport",
                 "createRelayAwareHttpEncodedTransport",
                 "createNodeIpcConnect",
-                "createNodePosixDedicatedRequestShmWriter",
-                "createNodePosixNativeBuddyResponseShmReader",
+                "createNativeRequestShmWriter",
+                "createNativeResponseShmReader",
             ] {
                 assert!(
                     source.contains(transport_symbol),

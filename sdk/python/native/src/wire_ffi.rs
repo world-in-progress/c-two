@@ -340,11 +340,18 @@ fn decode_reply_control(data: &[u8], offset: usize) -> PyResult<(u8, Option<Vec<
 
 // ── Buddy payload ───────────────────────────────────────────────────────
 
-/// Encode buddy SHM pointer: `[2B seg_idx][4B offset][4B size][1B flags]`.
+/// Encode buddy SHM pointer: `[2B seg_idx][4B generation][4B offset][4B size][1B flags]`.
 #[pyfunction]
-fn encode_buddy_payload(seg_idx: u16, offset: u32, data_size: u32, is_dedicated: bool) -> Vec<u8> {
+fn encode_buddy_payload(
+    seg_idx: u16,
+    generation: u32,
+    offset: u32,
+    data_size: u32,
+    is_dedicated: bool,
+) -> Vec<u8> {
     let bp = c2_wire::buddy::BuddyPayload {
         seg_idx,
+        generation,
         offset,
         data_size,
         is_dedicated,
@@ -354,11 +361,17 @@ fn encode_buddy_payload(seg_idx: u16, offset: u32, data_size: u32, is_dedicated:
 
 /// Decode buddy SHM pointer.
 ///
-/// Returns `(seg_idx, offset, data_size, is_dedicated)`.
+/// Returns `(seg_idx, generation, offset, data_size, is_dedicated)`.
 #[pyfunction]
-fn decode_buddy_payload(payload: &[u8]) -> PyResult<(u16, u32, u32, bool)> {
+fn decode_buddy_payload(payload: &[u8]) -> PyResult<(u16, u32, u32, u32, bool)> {
     let (bp, _) = c2_wire::buddy::decode_buddy_payload(payload).map_err(decode_err)?;
-    Ok((bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated))
+    Ok((
+        bp.seg_idx,
+        bp.generation,
+        bp.offset,
+        bp.data_size,
+        bp.is_dedicated,
+    ))
 }
 
 // ── Chunk header ────────────────────────────────────────────────────────

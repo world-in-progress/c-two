@@ -69,7 +69,7 @@ export interface C2IpcConnection {
   close?(): void | Promise<void>;
 }
 
-export type C2IpcConnect = (socketPath: string) => C2IpcConnection | Promise<C2IpcConnection>;
+export type C2IpcConnect = (address: string) => C2IpcConnection | Promise<C2IpcConnection>;
 
 export interface C2NodeIpcSocket {
   write(data: C2ByteArray, callback?: (error?: Error | null) => void): boolean | void;
@@ -89,6 +89,7 @@ export interface C2NodeIpcNet {
 
 export interface C2NodeIpcConnectOptions {
   readonly net: C2NodeIpcNet;
+  readonly resolveEndpoint: (address: string) => string;
 }
 
 export interface C2IpcShmSegment {
@@ -100,7 +101,7 @@ export interface C2IpcResponseShmBlock {
   readonly prefix: string;
   readonly segments: readonly C2IpcShmSegment[];
   readonly segmentIndex: number;
-  readonly segmentName: string;
+  readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
   readonly dedicated: boolean;
@@ -116,6 +117,7 @@ export interface C2IpcResponseShmReader {
 
 export interface C2IpcRequestShmBlock {
   readonly segmentIndex: number;
+  readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
   readonly dedicated: boolean;
@@ -129,57 +131,12 @@ export interface C2IpcRequestShmWriter {
   markConsumed?(block: C2IpcRequestShmBlock): void | Promise<void>;
 }
 
-export interface C2NodePosixShmFileReadResult {
-  readonly bytesRead: number;
-}
-
-export interface C2NodePosixShmFileWriteResult {
-  readonly bytesWritten: number;
-}
-
-export interface C2NodePosixShmFileHandle {
-  read(
-    buffer: Uint8Array,
-    offset: number,
-    length: number,
-    position: number,
-  ): C2NodePosixShmFileReadResult | Promise<C2NodePosixShmFileReadResult>;
-  write(
-    buffer: Uint8Array,
-    offset: number,
-    length: number,
-    position: number,
-  ): C2NodePosixShmFileWriteResult | Promise<C2NodePosixShmFileWriteResult>;
-  truncate?(length: number): void | Promise<void>;
-  close(): void | Promise<void>;
-}
-
-export interface C2NodePosixShmFileSystem {
-  open(
-    path: string,
-    flags: string | number,
-    mode?: number,
-  ): C2NodePosixShmFileHandle | Promise<C2NodePosixShmFileHandle>;
-  unlink(path: string): void | Promise<void>;
-}
-
-export interface C2NodePosixShmOptions {
-  readonly fs: C2NodePosixShmFileSystem;
-  readonly shmDir?: string;
-}
-
-export interface C2NodePosixDedicatedRequestShmWriterOptions extends C2NodePosixShmOptions {
-  readonly prefix?: string;
-  readonly startSegmentIndex?: number;
-  readonly unlinkOnRelease?: boolean;
-}
-
-export interface C2NodePosixNativeBuddyResponseShmBackend {
+export interface C2NativeResponseShmBackend {
   readResponse(block: C2IpcResponseShmBlock, destination: Uint8Array): void | Promise<void>;
   releaseResponse(block: C2IpcResponseShmBlock): void | Promise<void>;
 }
 
-export interface C2NodePosixNativeBuddyRequestShmBackend {
+export interface C2NativeRequestShmBackend {
   readonly prefix: string;
   readonly segments: readonly C2IpcShmSegment[];
   writeRequest(payload: Uint8Array): C2IpcRequestShmBlock | Promise<C2IpcRequestShmBlock>;
@@ -220,22 +177,22 @@ export interface C2MemFfiRequestPoolBinding {
   close?(): void | Promise<void>;
 }
 
-export interface C2NodePosixNativeBuddyResponseShmReaderOptions {
-  readonly backend: C2NodePosixNativeBuddyResponseShmBackend;
+export interface C2NativeResponseShmReaderOptions {
+  readonly backend: C2NativeResponseShmBackend;
 }
 
-export interface C2NodePosixNativeBuddyRequestShmWriterOptions {
-  readonly backend: C2NodePosixNativeBuddyRequestShmBackend;
+export interface C2NativeRequestShmWriterOptions {
+  readonly backend: C2NativeRequestShmBackend;
 }
 
-export interface C2MemFfiNativeBuddyResponseShmReaderOptions {
+export interface C2MemFfiNativeResponseShmReaderOptions {
   readonly binding: C2MemFfiResponsePoolFactory;
   readonly segmentSize?: number;
   readonly maxSegments?: number;
   readonly minBlockSize?: number;
 }
 
-export interface C2MemFfiNativeBuddyRequestShmWriterOptions {
+export interface C2MemFfiNativeRequestShmWriterOptions {
   readonly pool: C2MemFfiRequestPoolBinding;
 }
 
@@ -395,6 +352,7 @@ interface C2IpcReplyChunk {
 
 interface C2IpcBuddyPayload {
   readonly segmentIndex: number;
+  readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
   readonly dedicated: boolean;
@@ -446,7 +404,7 @@ export class C2IpcRouteNotFoundError extends Error {
 }
 
 export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
-  const socketPath = ipcSocketPathFromAddress(address);
+  validateIpcAddress(address);
   const connect = normalizeIpcConnect(options, "C-Two IPC transport options");
   const responsePayloadAllocator = normalizeResponsePayloadAllocator(options.responsePayloadAllocator, "C-Two IPC responsePayloadAllocator");
   const responseShmReader = normalizeIpcResponseShmReader(options.responseShmReader, "C-Two IPC responseShmReader");
@@ -465,7 +423,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
 
   const openConnection = (): Promise<C2IpcOpenConnection> => {
     if (connectionPromise === undefined) {
-      connectionPromise = connectAndHandshakeIpc(socketPath, connect, requestShmWriter).catch((error) => {
+      connectionPromise = connectAndHandshakeIpc(address, connect, requestShmWriter).catch((error) => {
         connectionPromise = undefined;
         throw error;
       });
@@ -944,20 +902,16 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   };
 }
 
-const C2_IPC_SOCKET_DIR = "/tmp/c_two_ipc";
-const C2_IPC_HANDSHAKE_VERSION = 10;
+const C2_IPC_HANDSHAKE_VERSION = 11;
 const C2_IPC_FRAME_BODY_HEADER_BYTES = 12;
 const C2_IPC_FRAME_HEADER_BYTES = 16;
-const C2_IPC_BUDDY_PAYLOAD_BYTES = 11;
+const C2_IPC_BUDDY_PAYLOAD_BYTES = 15;
 const C2_IPC_BUDDY_FLAG_DEDICATED = 1 << 0;
 const C2_IPC_REPLY_CHUNK_META_BYTES = 16;
 const C2_IPC_REQUEST_CHUNK_HEADER_BYTES = 4;
-const C2_IPC_DEDICATED_SHM_HEADER_BYTES = 64;
 const C2_IPC_DEFAULT_REQUEST_SHM_THRESHOLD = 4096;
 const C2_IPC_DEFAULT_REQUEST_CHUNK_SIZE = 131_072;
-const C2_NODE_POSIX_SHM_DEFAULT_DIR = "/dev/shm";
-const C2_NODE_POSIX_SHM_PAGE_BYTES = 4096;
-const C2_IPC_MAX_SHM_PREFIX_BYTES = 24;
+const C2_IPC_MAX_SHM_PREFIX_BYTES = 255;
 const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
 const C2_MEM_FFI_DEFAULT_MAX_SEGMENTS = 16;
 const C2_MEM_FFI_DEFAULT_MIN_BLOCK_SIZE = 4096;
@@ -1016,7 +970,12 @@ function normalizeIpcConnect<Payload extends C2ResponsePayload>(value: C2IpcTran
 
 export function createNodeIpcConnect(options: C2NodeIpcConnectOptions): C2IpcConnect {
   const net = normalizeNodeIpcNet(options, "C-Two Node IPC connect options");
-  return async (socketPath: string): Promise<C2IpcConnection> => {
+  if (typeof options.resolveEndpoint !== "function") {
+    throw new C2IpcTransportError("C-Two Node IPC requires the native endpoint resolver.");
+  }
+  return async (address: string): Promise<C2IpcConnection> => {
+    validateIpcAddress(address);
+    const socketPath = options.resolveEndpoint(address);
     if (typeof socketPath !== "string" || socketPath.length === 0) {
       throw new C2IpcTransportError("C-Two Node IPC socket path must be a non-empty string.");
     }
@@ -1394,129 +1353,14 @@ function normalizeIpcRequestChunkSize(value: number | undefined, label: string):
   return value;
 }
 
-export function createNodePosixDedicatedResponseShmReader(options: C2NodePosixShmOptions): C2IpcResponseShmReader {
-  const { fs, shmDir } = normalizeNodePosixShmOptions(options, "C-Two Node/POSIX dedicated response SHM reader options");
+export function createNativeResponseShmReader(options: C2NativeResponseShmReaderOptions): C2IpcResponseShmReader {
+  const backend = normalizeNativeResponseBackend(options, "C-Two native response SHM reader options");
   return {
     async read(block: C2IpcResponseShmBlock, destination?: Uint8Array): Promise<Uint8Array | void> {
-      requireDedicatedNodePosixShmBlock(block, "reader");
+      requireNativeResponseShmBlock(block, "reader");
       const target = destination ?? new Uint8Array(block.byteLength);
       if (target.byteLength !== block.byteLength) {
-        throw new C2IpcTransportError(`C-Two Node/POSIX dedicated SHM reader destination length ${target.byteLength} does not match block byteLength ${block.byteLength}.`);
-      }
-      const path = posixShmNameToPath(block.segmentName, shmDir);
-      const handle = await openNodePosixShmFile(fs, path, "r", undefined, "read");
-      try {
-        await readNodePosixShmFully(handle, target, C2_IPC_DEDICATED_SHM_HEADER_BYTES + block.offset);
-      } finally {
-        await closeNodePosixShmFile(handle);
-      }
-      return destination === undefined ? target : undefined;
-    },
-    async release(block: C2IpcResponseShmBlock): Promise<void> {
-      requireDedicatedNodePosixShmBlock(block, "release");
-      const path = posixShmNameToPath(block.segmentName, shmDir);
-      const handle = await openNodePosixShmFile(fs, path, "r+", undefined, "release");
-      try {
-        const readDone = new Uint8Array([1, 0, 0, 0]);
-        await writeNodePosixShmFully(handle, readDone, 0);
-      } finally {
-        await closeNodePosixShmFile(handle);
-      }
-    },
-  };
-}
-
-export function createNodePosixDedicatedRequestShmWriter(options: C2NodePosixDedicatedRequestShmWriterOptions): C2IpcRequestShmWriter {
-  const { fs, shmDir } = normalizeNodePosixShmOptions(options, "C-Two Node/POSIX dedicated request SHM writer options");
-  const prefix = normalizeNodePosixRequestShmPrefix(options.prefix);
-  let nextSegmentIndex = normalizeNodePosixDedicatedSegmentIndex(options.startSegmentIndex, "startSegmentIndex");
-  const activeSegmentIndexes = new Set<number>();
-  const unlinkOnRelease = options.unlinkOnRelease ?? true;
-  return {
-    prefix,
-    segments: [],
-    async write(payload: Uint8Array): Promise<C2IpcRequestShmBlock> {
-      const bytes = requireUint8Array(payload, "payload");
-      if (bytes.byteLength <= 0 || bytes.byteLength > 0xffffffff) {
-        throw new C2IpcTransportError(`C-Two Node/POSIX dedicated request SHM payload byteLength ${bytes.byteLength} is outside the dedicated SHM wire range.`);
-      }
-      if (nextSegmentIndex > 0xffff) {
-        throw new C2IpcTransportError("C-Two Node/POSIX dedicated request SHM segment index space is exhausted.");
-      }
-      const segmentIndex = nextSegmentIndex;
-      nextSegmentIndex += 1;
-      const segmentName = dedicatedShmSegmentName(prefix, segmentIndex);
-      const path = posixShmNameToPath(segmentName, shmDir);
-      let handle: C2NodePosixShmFileHandle | undefined;
-      try {
-        await tryUnlinkNodePosixShm(fs, path);
-        handle = await openNodePosixShmFile(fs, path, "w+", 0o600, "create");
-        if (handle.truncate === undefined) {
-          throw new C2IpcTransportError("C-Two Node/POSIX dedicated request SHM file handle truncate must be a function.");
-        }
-        await handle.truncate(pageAlignNodePosixShmSize(C2_IPC_DEDICATED_SHM_HEADER_BYTES + bytes.byteLength));
-        await writeNodePosixShmFully(handle, bytes, C2_IPC_DEDICATED_SHM_HEADER_BYTES);
-        activeSegmentIndexes.add(segmentIndex);
-        return {
-          segmentIndex,
-          offset: 0,
-          byteLength: bytes.byteLength,
-          dedicated: true,
-        };
-      } catch (error) {
-        if (handle !== undefined) {
-          await closeNodePosixShmFile(handle);
-          handle = undefined;
-        }
-        await tryUnlinkNodePosixShm(fs, path);
-        if (error instanceof C2IpcTransportError) {
-          throw error;
-        }
-        throw new C2IpcTransportError(`C-Two Node/POSIX dedicated request SHM writer failed: ${String(error)}`);
-      } finally {
-        if (handle !== undefined) {
-          await closeNodePosixShmFile(handle);
-        }
-      }
-    },
-    async release(block: C2IpcRequestShmBlock): Promise<void> {
-      if (!block.dedicated) {
-        throw new C2IpcTransportError("C-Two Node/POSIX dedicated request SHM writer can only release dedicated blocks.");
-      }
-      if (block.offset !== 0) {
-        throw new C2IpcTransportError("C-Two Node/POSIX dedicated request SHM block offset must be 0.");
-      }
-      if (!Number.isSafeInteger(block.byteLength) || block.byteLength <= 0 || block.byteLength > 0xffffffff) {
-        throw new C2IpcTransportError("C-Two Node/POSIX dedicated request SHM block byteLength must be a positive u32 integer.");
-      }
-      if (!Number.isSafeInteger(block.segmentIndex) || block.segmentIndex < 0 || block.segmentIndex > 0xffff) {
-        throw new C2IpcTransportError("C-Two Node/POSIX dedicated request SHM block segmentIndex must be a u16 integer.");
-      }
-      if (!activeSegmentIndexes.has(block.segmentIndex)) {
-        throw new C2IpcTransportError("C-Two Node/POSIX dedicated request SHM block is unknown or already released.");
-      }
-      const segmentName = dedicatedShmSegmentName(prefix, block.segmentIndex);
-      const path = posixShmNameToPath(segmentName, shmDir);
-      if (unlinkOnRelease) {
-        try {
-          await fs.unlink(path);
-        } catch (error) {
-          throw new C2IpcTransportError(`C-Two Node/POSIX dedicated request SHM unlink failed: ${String(error)}`);
-        }
-      }
-      activeSegmentIndexes.delete(block.segmentIndex);
-    },
-  };
-}
-
-export function createNodePosixNativeBuddyResponseShmReader(options: C2NodePosixNativeBuddyResponseShmReaderOptions): C2IpcResponseShmReader {
-  const backend = normalizeNodePosixNativeBuddyResponseBackend(options, "C-Two Node/POSIX native buddy response SHM reader options");
-  return {
-    async read(block: C2IpcResponseShmBlock, destination?: Uint8Array): Promise<Uint8Array | void> {
-      requireNativeBuddyResponseShmBlock(block, "reader");
-      const target = destination ?? new Uint8Array(block.byteLength);
-      if (target.byteLength !== block.byteLength) {
-        throw new C2IpcTransportError(`C-Two Node/POSIX native buddy SHM reader destination length ${target.byteLength} does not match block byteLength ${block.byteLength}.`);
+        throw new C2IpcTransportError(`C-Two native SHM reader destination length ${target.byteLength} does not match block byteLength ${block.byteLength}.`);
       }
       const result = (await backend.readResponse(block, target)) as C2ByteArray | ArrayBufferLike | void;
       let postReadError: unknown;
@@ -1524,7 +1368,7 @@ export function createNodePosixNativeBuddyResponseShmReader(options: C2NodePosix
         if (result !== undefined) {
           const bytes = requireIpcShmReaderBytes(result);
           if (bytes.byteLength !== block.byteLength) {
-            throw new C2IpcTransportError(`C-Two Node/POSIX native buddy SHM reader returned ${bytes.byteLength} bytes, expected ${block.byteLength}.`);
+            throw new C2IpcTransportError(`C-Two native SHM reader returned ${bytes.byteLength} bytes, expected ${block.byteLength}.`);
           }
           if (bytes !== target) {
             target.set(bytes);
@@ -1537,56 +1381,41 @@ export function createNodePosixNativeBuddyResponseShmReader(options: C2NodePosix
         try {
           await backend.releaseResponse(block);
         } catch (releaseError) {
-          throw new C2IpcTransportError(`C-Two Node/POSIX native buddy SHM reader post-read validation failed and release failed: validation=${String(postReadError)} release=${String(releaseError)}`);
+          throw new C2IpcTransportError(`C-Two native SHM reader post-read validation failed and release failed: validation=${String(postReadError)} release=${String(releaseError)}`);
         }
         if (postReadError instanceof C2IpcTransportError) {
           throw postReadError;
         }
-        throw new C2IpcTransportError(`C-Two Node/POSIX native buddy SHM reader post-read validation failed: ${String(postReadError)}`);
+        throw new C2IpcTransportError(`C-Two native SHM reader post-read validation failed: ${String(postReadError)}`);
       }
       return destination === undefined ? target : undefined;
     },
     async release(block: C2IpcResponseShmBlock): Promise<void> {
-      requireNativeBuddyResponseShmBlock(block, "release");
+      requireNativeResponseShmBlock(block, "release");
       await backend.releaseResponse(block);
     },
   };
 }
 
-export function createNodePosixNativeBuddyRequestShmWriter(options: C2NodePosixNativeBuddyRequestShmWriterOptions): C2IpcRequestShmWriter {
-  const backend = normalizeNodePosixNativeBuddyRequestBackend(options, "C-Two Node/POSIX native buddy request SHM writer options");
+export function createNativeRequestShmWriter(options: C2NativeRequestShmWriterOptions): C2IpcRequestShmWriter {
+  const backend = normalizeNativeRequestBackend(options, "C-Two native request SHM writer options");
   return {
     prefix: backend.prefix,
     segments: backend.segments,
     async write(payload: Uint8Array): Promise<C2IpcRequestShmBlock> {
       const block = await backend.writeRequest(requireUint8Array(payload, "payload"));
-      const releasableBlock = releasableIpcRequestShmBlock(block);
-      if (releasableBlock?.dedicated === true) {
-        try {
-          await backend.releaseRequest(releasableBlock);
-        } catch (releaseError) {
-          throw new C2IpcTransportError(`C-Two Node/POSIX native buddy request SHM backend returned a dedicated block and release failed: ${String(releaseError)}`);
-        }
-        throw new C2IpcTransportError("C-Two Node/POSIX native buddy request SHM backend must return non-dedicated blocks.");
-      }
       return block;
     },
     release(block: C2IpcRequestShmBlock): void | Promise<void> {
-      if (block.dedicated) {
-        throw new C2IpcTransportError("C-Two Node/POSIX native buddy request SHM writer can only release non-dedicated blocks.");
-      }
       return backend.releaseRequest(block);
     },
     markConsumed(block: C2IpcRequestShmBlock): void | Promise<void> {
-      if (block.dedicated) {
-        throw new C2IpcTransportError("C-Two Node/POSIX native buddy request SHM writer can only mark non-dedicated blocks consumed.");
-      }
       return backend.markRequestConsumed?.(block);
     },
   };
 }
 
-export function createC2MemFfiNativeBuddyResponseShmReader(options: C2MemFfiNativeBuddyResponseShmReaderOptions): C2ClosableIpcResponseShmReader {
+export function createC2MemFfiNativeResponseShmReader(options: C2MemFfiNativeResponseShmReaderOptions): C2ClosableIpcResponseShmReader {
   const normalized = normalizeC2MemFfiResponsePoolFactory(options, "C-Two c2-mem-ffi response SHM reader options");
   const pools = new Map<string, Promise<C2MemFfiResponsePoolBinding>>();
   let closed = false;
@@ -1596,7 +1425,7 @@ export function createC2MemFfiNativeBuddyResponseShmReader(options: C2MemFfiNati
     const prefix = block.prefix;
     let pool = pools.get(prefix);
     if (pool === undefined) {
-      const segmentSize = resolveC2MemFfiResponseSegmentSize(block, normalized.segmentSize);
+      const segmentSize = resolveC2MemFfiResponseSegmentSize(block, normalized.segmentSize, normalized.minBlockSize);
       pool = Promise.resolve(normalized.binding.createResponsePool({
         prefix,
         segmentSize,
@@ -1610,7 +1439,7 @@ export function createC2MemFfiNativeBuddyResponseShmReader(options: C2MemFfiNati
     }
     return await pool;
   };
-  const backend: C2NodePosixNativeBuddyResponseShmBackend = {
+  const backend: C2NativeResponseShmBackend = {
     async readResponse(block: C2IpcResponseShmBlock, destination: Uint8Array): Promise<void> {
       const pool = await poolForBlock(block);
       await pool.read(block, destination);
@@ -1620,7 +1449,7 @@ export function createC2MemFfiNativeBuddyResponseShmReader(options: C2MemFfiNati
       await pool.release(block);
     },
   };
-  const reader = createNodePosixNativeBuddyResponseShmReader({ backend });
+  const reader = createNativeResponseShmReader({ backend });
   return Object.assign(reader, {
     async close(): Promise<void> {
       if (closed) {
@@ -1644,10 +1473,10 @@ export function createC2MemFfiNativeBuddyResponseShmReader(options: C2MemFfiNati
   });
 }
 
-export function createC2MemFfiNativeBuddyRequestShmWriter(options: C2MemFfiNativeBuddyRequestShmWriterOptions): C2ClosableIpcRequestShmWriter {
+export function createC2MemFfiNativeRequestShmWriter(options: C2MemFfiNativeRequestShmWriterOptions): C2ClosableIpcRequestShmWriter {
   const pool = normalizeC2MemFfiRequestPool(options, "C-Two c2-mem-ffi request SHM writer options");
   let closed = false;
-  const writer = createNodePosixNativeBuddyRequestShmWriter({
+  const writer = createNativeRequestShmWriter({
     backend: {
       prefix: pool.prefix,
       segments: pool.segments,
@@ -1676,61 +1505,7 @@ export function createC2MemFfiNativeBuddyRequestShmWriter(options: C2MemFfiNativ
   });
 }
 
-function normalizeNodePosixShmOptions(options: C2NodePosixShmOptions, label: string): { readonly fs: C2NodePosixShmFileSystem; readonly shmDir: string } {
-  if (typeof options !== "object" || options === null) {
-    throw new C2IpcTransportError(`${label} must be an object.`);
-  }
-  const fs = options.fs;
-  if (typeof fs !== "object" || fs === null) {
-    throw new C2IpcTransportError(`${label} fs must be an object.`);
-  }
-  if (typeof fs.open !== "function") {
-    throw new C2IpcTransportError(`${label} fs.open must be a function.`);
-  }
-  if (typeof fs.unlink !== "function") {
-    throw new C2IpcTransportError(`${label} fs.unlink must be a function.`);
-  }
-  return { fs, shmDir: normalizeNodePosixShmDir(options.shmDir) };
-}
-
-function normalizeNodePosixShmDir(value: string | undefined): string {
-  const dir = value ?? C2_NODE_POSIX_SHM_DEFAULT_DIR;
-  if (typeof dir !== "string" || dir.length === 0) {
-    throw new C2IpcTransportError("C-Two Node/POSIX SHM directory must be a non-empty string.");
-  }
-  if (/[\u0000-\u001F\u007F-\u009F]/.test(dir)) {
-    throw new C2IpcTransportError("C-Two Node/POSIX SHM directory cannot contain control characters.");
-  }
-  return dir.endsWith("/") && dir.length > 1 ? dir.slice(0, -1) : dir;
-}
-
-function normalizeNodePosixRequestShmPrefix(value: string | undefined): string {
-  const prefix = value ?? randomNodePosixRequestShmPrefix();
-  requirePosixShmName(prefix, "request SHM prefix");
-  const byteLength = utf8ByteLength(prefix);
-  if (byteLength > C2_IPC_MAX_SHM_PREFIX_BYTES) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX request SHM prefix cannot exceed ${C2_IPC_MAX_SHM_PREFIX_BYTES} bytes.`);
-  }
-  return prefix;
-}
-
-function randomNodePosixRequestShmPrefix(): string {
-  const time = Math.floor(Date.now()).toString(16).slice(-4).padStart(4, "0");
-  const random = Math.floor(Math.random() * 0x10000).toString(16).padStart(4, "0");
-  return `/cc2n${time}${random}`;
-}
-
-function normalizeNodePosixDedicatedSegmentIndex(value: number | undefined, label: string): number {
-  if (value === undefined) {
-    return 256;
-  }
-  if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX dedicated request SHM ${label} must be a u16 integer.`);
-  }
-  return value;
-}
-
-function normalizeNodePosixNativeBuddyResponseBackend(options: C2NodePosixNativeBuddyResponseShmReaderOptions, label: string): C2NodePosixNativeBuddyResponseShmBackend {
+function normalizeNativeResponseBackend(options: C2NativeResponseShmReaderOptions, label: string): C2NativeResponseShmBackend {
   if (typeof options !== "object" || options === null) {
     throw new C2IpcTransportError(`${label} must be an object.`);
   }
@@ -1747,10 +1522,10 @@ function normalizeNodePosixNativeBuddyResponseBackend(options: C2NodePosixNative
   return backend;
 }
 
-function normalizeNodePosixNativeBuddyRequestBackend(
-  options: C2NodePosixNativeBuddyRequestShmWriterOptions,
+function normalizeNativeRequestBackend(
+  options: C2NativeRequestShmWriterOptions,
   label: string,
-): C2NodePosixNativeBuddyRequestShmBackend {
+): C2NativeRequestShmBackend {
   if (typeof options !== "object" || options === null) {
     throw new C2IpcTransportError(`${label} must be an object.`);
   }
@@ -1760,12 +1535,12 @@ function normalizeNodePosixNativeBuddyRequestBackend(
   }
   const prefix = backend.prefix;
   if (typeof prefix !== "string" || prefix.length === 0) {
-    throw new C2IpcTransportError(`${label} backend.prefix must be a non-empty POSIX SHM prefix.`);
+    throw new C2IpcTransportError(`${label} backend.prefix must be a non-empty shared-memory identity prefix.`);
   }
-  requireIpcHandshakeText(prefix, "native buddy request SHM prefix");
-  requirePosixShmName(prefix, "native buddy request SHM prefix");
+  requireIpcHandshakeText(prefix, "native request SHM prefix");
+  requireShmIdentity(prefix, "native request SHM prefix");
   if (utf8ByteLength(prefix) > C2_IPC_MAX_SHM_PREFIX_BYTES) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX native buddy request SHM prefix cannot exceed ${C2_IPC_MAX_SHM_PREFIX_BYTES} bytes.`);
+    throw new C2IpcTransportError(`C-Two native request SHM prefix cannot exceed ${C2_IPC_MAX_SHM_PREFIX_BYTES} bytes.`);
   }
   if (!Array.isArray(backend.segments)) {
     throw new C2IpcTransportError(`${label} backend.segments must be an array.`);
@@ -1780,10 +1555,10 @@ function normalizeNodePosixNativeBuddyRequestBackend(
     const name = segment.name;
     const size = segment.size;
     if (typeof name !== "string" || name.length === 0) {
-      throw new C2IpcTransportError(`${label} backend segment ${index} name must be a non-empty POSIX SHM name.`);
+      throw new C2IpcTransportError(`${label} backend segment ${index} name must be a non-empty shared-memory identity name.`);
     }
-    requireIpcHandshakeText(name, `native buddy request SHM segment ${index} name`);
-    requirePosixShmName(name, `native buddy request SHM segment ${index} name`);
+    requireIpcHandshakeText(name, `native request SHM segment ${index} name`);
+    requireShmIdentity(name, `native request SHM segment ${index} name`);
     if (typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0 || size > 0xffffffff) {
       throw new C2IpcTransportError(`${label} backend segment ${index} size must be a positive u32 integer.`);
     }
@@ -1814,7 +1589,7 @@ function normalizeNodePosixNativeBuddyRequestBackend(
 }
 
 function normalizeC2MemFfiResponsePoolFactory(
-  options: C2MemFfiNativeBuddyResponseShmReaderOptions,
+  options: C2MemFfiNativeResponseShmReaderOptions,
   label: string,
 ): { readonly binding: C2MemFfiResponsePoolFactory; readonly segmentSize: number | undefined; readonly maxSegments: number; readonly minBlockSize: number } {
   if (typeof options !== "object" || options === null) {
@@ -1853,7 +1628,7 @@ function normalizeC2MemFfiResponsePoolBinding(value: unknown, label: string): C2
 }
 
 function normalizeC2MemFfiRequestPool(
-  options: C2MemFfiNativeBuddyRequestShmWriterOptions,
+  options: C2MemFfiNativeRequestShmWriterOptions,
   label: string,
 ): C2MemFfiRequestPoolBinding {
   if (typeof options !== "object" || options === null) {
@@ -1878,23 +1653,24 @@ function normalizeC2MemFfiRequestPool(
   return pool;
 }
 
-function resolveC2MemFfiResponseSegmentSize(block: C2IpcResponseShmBlock, configuredSegmentSize: number | undefined): number {
+function resolveC2MemFfiResponseSegmentSize(block: C2IpcResponseShmBlock, configuredSegmentSize: number | undefined, minBlockSize: number): number {
   if (configuredSegmentSize !== undefined) {
     return configuredSegmentSize;
   }
-  const advertisedSegment = block.segments[block.segmentIndex];
+  const advertisedSegment = block.segments[block.dedicated ? 0 : block.segmentIndex];
   if (advertisedSegment !== undefined) {
     return normalizeC2MemFfiPositiveU32(advertisedSegment.size, `C-Two c2-mem-ffi response SHM segment ${block.segmentIndex} advertised size`);
   }
+  if (block.dedicated) return minBlockSize;
   throw new C2IpcTransportError("C-Two c2-mem-ffi response SHM reader requires segmentSize when the server handshake does not advertise the response buddy segment.");
 }
 
 function requireC2MemFfiResponsePrefix(prefix: string): void {
   if (typeof prefix !== "string" || prefix.length === 0) {
-    throw new C2IpcTransportError("C-Two c2-mem-ffi response SHM prefix must be a non-empty POSIX SHM prefix.");
+    throw new C2IpcTransportError("C-Two c2-mem-ffi response SHM prefix must be a non-empty shared-memory identity prefix.");
   }
   requireIpcHandshakeText(prefix, "c2-mem-ffi response SHM prefix");
-  requirePosixShmName(prefix, "c2-mem-ffi response SHM prefix");
+  requireShmIdentity(prefix, "c2-mem-ffi response SHM prefix");
   if (utf8ByteLength(prefix) > C2_IPC_MAX_SHM_PREFIX_BYTES) {
     throw new C2IpcTransportError(`C-Two c2-mem-ffi response SHM prefix cannot exceed ${C2_IPC_MAX_SHM_PREFIX_BYTES} bytes.`);
   }
@@ -1923,120 +1699,23 @@ function normalizeC2MemFfiPositiveU32(value: number, label: string): number {
   return value;
 }
 
-function requireNativeBuddyResponseShmBlock(block: C2IpcResponseShmBlock, action: string): void {
-  if (block.dedicated) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX native buddy response SHM reader only supports non-dedicated buddy blocks; ${action} for dedicated blocks requires the dedicated SHM helper or a composite runtime reader.`);
+function requireNativeResponseShmBlock(block: C2IpcResponseShmBlock, action: string): void {
+  if (releasableIpcRequestShmBlock(block) === undefined || (block.dedicated && block.offset !== 0)) {
+    throw new C2IpcTransportError(`C-Two native SHM ${action} received invalid coordinates.`);
   }
 }
 
-function requireDedicatedNodePosixShmBlock(block: C2IpcResponseShmBlock, action: string): void {
-  if (!block.dedicated) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX dedicated SHM reader only supports dedicated C-Two SHM blocks; ${action} for non-dedicated buddy blocks requires a native buddy allocator backend.`);
-  }
-  if (block.offset !== 0) {
-    throw new C2IpcTransportError("C-Two Node/POSIX dedicated SHM block offset must be 0.");
-  }
-  requirePosixShmName(block.segmentName, "dedicated segment name");
-}
-
-function dedicatedShmSegmentName(prefix: string, segmentIndex: number): string {
-  if (!Number.isSafeInteger(segmentIndex) || segmentIndex < 0 || segmentIndex > 0xffff) {
-    throw new C2IpcTransportError("C-Two Node/POSIX dedicated SHM segmentIndex must be a u16 integer.");
-  }
-  return `${prefix}_d${segmentIndex.toString(16).padStart(4, "0")}`;
-}
-
-function posixShmNameToPath(name: string, shmDir: string): string {
-  requirePosixShmName(name, "segment name");
-  return `${shmDir}/${name.slice(1)}`;
-}
-
-function requirePosixShmName(name: string, label: string): void {
+function requireShmIdentity(name: string, label: string): void {
   if (typeof name !== "string" || name.length < 2 || !name.startsWith("/")) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX SHM ${label} must start with "/" and contain a name.`);
+    throw new C2IpcTransportError(`C-Two Node/shared-memory identity ${label} must start with "/" and contain a name.`);
   }
   const body = name.slice(1);
   if (body === "." || body === ".." || body.includes("/") || body.includes("\\")) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX SHM ${label} cannot contain path separators.`);
+    throw new C2IpcTransportError(`C-Two Node/shared-memory identity ${label} cannot contain path separators.`);
   }
   if (/[\u0000-\u001F\u007F-\u009F]/.test(name)) {
-    throw new C2IpcTransportError(`C-Two Node/POSIX SHM ${label} cannot contain control characters.`);
+    throw new C2IpcTransportError(`C-Two Node/shared-memory identity ${label} cannot contain control characters.`);
   }
-}
-
-async function openNodePosixShmFile(
-  fs: C2NodePosixShmFileSystem,
-  path: string,
-  flags: string | number,
-  mode: number | undefined,
-  operation: string,
-): Promise<C2NodePosixShmFileHandle> {
-  try {
-    const handle = await fs.open(path, flags, mode);
-    if (typeof handle !== "object" || handle === null) {
-      throw new C2IpcTransportError("C-Two Node/POSIX SHM fs.open must return a file handle object.");
-    }
-    if (typeof handle.read !== "function") {
-      throw new C2IpcTransportError("C-Two Node/POSIX SHM file handle read must be a function.");
-    }
-    if (typeof handle.write !== "function") {
-      throw new C2IpcTransportError("C-Two Node/POSIX SHM file handle write must be a function.");
-    }
-    if (typeof handle.close !== "function") {
-      throw new C2IpcTransportError("C-Two Node/POSIX SHM file handle close must be a function.");
-    }
-    return handle;
-  } catch (error) {
-    if (error instanceof C2IpcTransportError) {
-      throw error;
-    }
-    throw new C2IpcTransportError(`C-Two Node/POSIX SHM ${operation} failed for ${path}: ${String(error)}`);
-  }
-}
-
-async function closeNodePosixShmFile(handle: C2NodePosixShmFileHandle): Promise<void> {
-  try {
-    await handle.close();
-  } catch {
-  }
-}
-
-async function readNodePosixShmFully(handle: C2NodePosixShmFileHandle, destination: Uint8Array, position: number): Promise<void> {
-  let offset = 0;
-  while (offset < destination.byteLength) {
-    const result = await handle.read(destination, offset, destination.byteLength - offset, position + offset);
-    const bytesRead = result.bytesRead;
-    if (!Number.isSafeInteger(bytesRead) || bytesRead <= 0 || bytesRead > destination.byteLength - offset) {
-      throw new C2IpcTransportError("C-Two Node/POSIX SHM read did not produce the requested byte range.");
-    }
-    offset += bytesRead;
-  }
-}
-
-async function writeNodePosixShmFully(handle: C2NodePosixShmFileHandle, source: Uint8Array, position: number): Promise<void> {
-  let offset = 0;
-  while (offset < source.byteLength) {
-    const result = await handle.write(source, offset, source.byteLength - offset, position + offset);
-    const bytesWritten = result.bytesWritten;
-    if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0 || bytesWritten > source.byteLength - offset) {
-      throw new C2IpcTransportError("C-Two Node/POSIX SHM write did not consume the requested byte range.");
-    }
-    offset += bytesWritten;
-  }
-}
-
-async function tryUnlinkNodePosixShm(fs: C2NodePosixShmFileSystem, path: string): Promise<void> {
-  try {
-    await fs.unlink(path);
-  } catch {
-  }
-}
-
-function pageAlignNodePosixShmSize(size: number): number {
-  if (!Number.isSafeInteger(size) || size <= 0) {
-    throw new C2IpcTransportError("C-Two Node/POSIX SHM size must be a positive safe integer.");
-  }
-  return Math.ceil(size / C2_NODE_POSIX_SHM_PAGE_BYTES) * C2_NODE_POSIX_SHM_PAGE_BYTES;
 }
 
 function requireIpcConnection(value: unknown): C2IpcConnection {
@@ -2056,10 +1735,10 @@ function requireIpcConnection(value: unknown): C2IpcConnection {
   return candidate as C2IpcConnection;
 }
 
-async function connectAndHandshakeIpc(socketPath: string, connect: C2IpcConnect, requestShmWriter: C2IpcRequestShmWriter | undefined): Promise<C2IpcOpenConnection> {
+async function connectAndHandshakeIpc(address: string, connect: C2IpcConnect, requestShmWriter: C2IpcRequestShmWriter | undefined): Promise<C2IpcOpenConnection> {
   let connection: C2IpcConnection;
   try {
-    connection = requireIpcConnection(await connect(socketPath));
+    connection = requireIpcConnection(await connect(address));
   } catch (error) {
     if (error instanceof C2IpcTransportError) {
       throw error;
@@ -2094,13 +1773,12 @@ async function connectAndHandshakeIpc(socketPath: string, connect: C2IpcConnect,
   }
 }
 
-function ipcSocketPathFromAddress(address: string): string {
+function validateIpcAddress(address: string): void {
   if (typeof address !== "string" || !address.startsWith("ipc://")) {
     throw new C2IpcTransportError("C-Two IPC address must be an ipc:// address.");
   }
   const region = address.slice("ipc://".length);
   validateIpcRegionId(region);
-  return `${C2_IPC_SOCKET_DIR}/${region}.sock`;
 }
 
 function validateIpcRegionId(region: string): void {
@@ -2252,11 +1930,15 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
   }
   const block = value as Partial<C2IpcRequestShmBlock>;
   const segmentIndex = block.segmentIndex;
+  const generation = block.generation;
   const offset = block.offset;
   const byteLength = block.byteLength;
   const dedicated = block.dedicated;
   if (typeof segmentIndex !== "number" || !Number.isSafeInteger(segmentIndex) || segmentIndex < 0 || segmentIndex > 0xffff) {
     throw new C2IpcTransportError("C-Two IPC requestShmWriter block segmentIndex must be a u16 integer.");
+  }
+  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0 || generation > 0xffffffff || (dedicated ? generation !== 0 : generation === 0)) {
+    throw new C2IpcTransportError("C-Two IPC requestShmWriter block generation must be a positive u32 for buddy memory or 0 for dedicated memory.");
   }
   if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0 || offset > 0xffffffff) {
     throw new C2IpcTransportError("C-Two IPC requestShmWriter block offset must be a u32 integer.");
@@ -2283,7 +1965,7 @@ function requireIpcRequestShmBlock(value: unknown, expectedByteLength: number, r
       throw new C2IpcTransportError(`C-Two IPC requestShmWriter block range ${offset}+${byteLength} exceeds segment ${segmentIndex} size ${segmentSize}.`);
     }
   }
-  return { segmentIndex, offset, byteLength, dedicated };
+  return { segmentIndex, generation, offset, byteLength, dedicated };
 }
 
 function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | undefined {
@@ -2292,6 +1974,7 @@ function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | un
   }
   const block = value as Partial<C2IpcRequestShmBlock>;
   const segmentIndex = block.segmentIndex;
+  const generation = block.generation;
   const offset = block.offset;
   const byteLength = block.byteLength;
   const dedicated = block.dedicated;
@@ -2300,6 +1983,11 @@ function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | un
     !Number.isSafeInteger(segmentIndex) ||
     segmentIndex < 0 ||
     segmentIndex > 0xffff ||
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation < 0 ||
+    generation > 0xffffffff ||
+    (dedicated ? generation !== 0 : generation === 0) ||
     typeof offset !== "number" ||
     !Number.isSafeInteger(offset) ||
     offset < 0 ||
@@ -2312,12 +2000,13 @@ function releasableIpcRequestShmBlock(value: unknown): C2IpcRequestShmBlock | un
   ) {
     return undefined;
   }
-  return { segmentIndex, offset, byteLength, dedicated };
+  return { segmentIndex, generation, offset, byteLength, dedicated };
 }
 
 function encodeIpcBuddyPayload(block: C2IpcRequestShmBlock): Uint8Array {
   return concatUint8Arrays([
     writeU16LE(block.segmentIndex),
+    writeU32LE(block.generation),
     writeU32LE(block.offset),
     writeU32LE(block.byteLength),
     new Uint8Array([block.dedicated ? C2_IPC_BUDDY_FLAG_DEDICATED : 0]),
@@ -2632,22 +2321,28 @@ function decodeIpcBuddyPayload(payload: Uint8Array): C2IpcBuddyPayload {
   if (payload.byteLength < C2_IPC_BUDDY_PAYLOAD_BYTES) {
     throw new C2IpcTransportError("C-Two IPC buddy payload is truncated.");
   }
-  const flags = payload[10];
+  const flags = payload[14];
   if ((flags & ~C2_IPC_BUDDY_FLAG_DEDICATED) !== 0) {
     throw new C2IpcTransportError(`C-Two IPC buddy payload flags ${flags} are invalid.`);
   }
-  const byteLength = readU32LE(payload, 6);
+  const byteLength = readU32LE(payload, 10);
   if (byteLength <= 0) {
     throw new C2IpcTransportError("C-Two IPC SHM response data_size must be positive.");
   }
   if (byteLength > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
     throw new C2IpcTransportError(`C-Two IPC SHM response data_size ${byteLength} must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES}.`);
   }
+  const generation = readU32LE(payload, 2);
+  const dedicated = (flags & C2_IPC_BUDDY_FLAG_DEDICATED) !== 0;
+  if (dedicated ? generation !== 0 : generation === 0) {
+    throw new C2IpcTransportError("C-Two IPC buddy generation must be positive; dedicated generation must be 0.");
+  }
   return {
     segmentIndex: readU16LE(payload, 0),
-    offset: readU32LE(payload, 2),
+    generation,
+    offset: readU32LE(payload, 6),
     byteLength,
-    dedicated: (flags & C2_IPC_BUDDY_FLAG_DEDICATED) !== 0,
+    dedicated,
   };
 }
 
@@ -2659,9 +2354,6 @@ function buildIpcResponseShmBlock(handshake: C2IpcHandshake, buddy: C2IpcBuddyPa
     throw new C2IpcTransportError("C-Two IPC server handshake did not advertise an SHM prefix for an SHM response.");
   }
   const advertisedSegment = handshake.shmSegments[buddy.segmentIndex];
-  const segmentName = buddy.dedicated
-    ? `${handshake.shmPrefix}_d${buddy.segmentIndex.toString(16).padStart(4, "0")}`
-    : advertisedSegment?.name ?? `${handshake.shmPrefix}_b${buddy.segmentIndex.toString(16).padStart(4, "0")}`;
   if (!buddy.dedicated && advertisedSegment !== undefined && buddy.offset + buddy.byteLength > advertisedSegment.size) {
     throw new C2IpcTransportError(`C-Two IPC SHM response range ${buddy.offset}+${buddy.byteLength} exceeds segment ${buddy.segmentIndex} size ${advertisedSegment.size}.`);
   }
@@ -2669,7 +2361,7 @@ function buildIpcResponseShmBlock(handshake: C2IpcHandshake, buddy: C2IpcBuddyPa
     prefix: handshake.shmPrefix,
     segments: handshake.shmSegments,
     segmentIndex: buddy.segmentIndex,
-    segmentName,
+    generation: buddy.generation,
     offset: buddy.offset,
     byteLength: buddy.byteLength,
     dedicated: buddy.dedicated,

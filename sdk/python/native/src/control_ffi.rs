@@ -14,9 +14,9 @@ fn timeout_duration(timeout_seconds: f64) -> PyResult<Duration> {
 }
 
 #[pyfunction]
-fn ipc_socket_path(address: &str) -> PyResult<String> {
-    c2_core::direct_ipc_socket_path(address)
-        .map(|path| path.to_string_lossy().into_owned())
+fn ipc_endpoint_name(address: &str) -> PyResult<String> {
+    c2_core::direct_ipc_endpoint(address)
+        .map(|endpoint| endpoint.os_name().to_string_lossy().into_owned())
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
@@ -57,7 +57,7 @@ fn ipc_shutdown<'py>(
 }
 
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(ipc_socket_path, module)?)?;
+    module.add_function(wrap_pyfunction!(ipc_endpoint_name, module)?)?;
     module.add_function(wrap_pyfunction!(ipc_ping, module)?)?;
     module.add_function(wrap_pyfunction!(ipc_shutdown, module)?)?;
     Ok(())

@@ -2307,12 +2307,13 @@ mod tests {
                 RequestData::Shm {
                     pool,
                     seg_idx,
+                    generation,
                     offset,
                     data_size,
                     is_dedicated,
                 } => {
                     let mut pool = pool.write();
-                    let _ = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                    let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
                     "shm"
                 }
                 RequestData::Handle { handle, pool } => {

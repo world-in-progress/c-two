@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import re
-import selectors
 import shutil
 import signal
 import socket
@@ -21,6 +20,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
 import c_two as cc
+from tests.fixtures.process_control import portable_command, readline_with_timeout
 from c_two.config.settings import settings
 from c_two.transport.registry import _ProcessRegistry
 from fastdb4py.payload import Payload, PayloadError, View
@@ -128,7 +128,7 @@ def _run_checked(
     timeout: float = 180,
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
-        command,
+        portable_command(command),
         cwd=cwd,
         env=environment,
         check=False,
@@ -299,7 +299,7 @@ class MatrixArtifacts:
         if candidate_cargo_home:
             dependencies = """\
 c-two = "=0.1.0"
-fastdb = "=0.1.22"
+fastdb = "=0.2.0"
 """
         else:
             dependencies = f"""\
@@ -407,16 +407,6 @@ publish = false
         raise AssertionError(f"unknown SDK language: {language}")
 
 
-def _readline_with_timeout(stream: Any, timeout: float) -> str:
-    selector = selectors.DefaultSelector()
-    selector.register(stream, selectors.EVENT_READ)
-    try:
-        if not selector.select(timeout):
-            raise TimeoutError("timed out waiting for Rust matrix host readiness")
-        return stream.readline()
-    finally:
-        selector.close()
-
 
 def _parse_key_values(line: str, prefix: str) -> dict[str, str]:
     if not line.startswith(prefix):
@@ -461,7 +451,7 @@ class RustHost:
         try:
             if self._process.stdout is None:
                 raise AssertionError("Rust matrix host stdout is unavailable")
-            self._ready_line = _readline_with_timeout(self._process.stdout, 30)
+            self._ready_line = readline_with_timeout(self._process.stdout, 30)
             ready = _parse_key_values(self._ready_line, "READY ")
             if ready.get("address") != address:
                 raise AssertionError(

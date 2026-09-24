@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import selectors
 import shutil
 import subprocess
 import sys
@@ -16,6 +15,7 @@ from typing import Any
 import pytest
 
 import c_two as cc
+from tests.fixtures.process_control import readline_with_timeout
 from c_two.config.settings import settings
 from c_two.error import ContractMismatch
 from c_two.transport.registry import _ProcessRegistry
@@ -190,20 +190,10 @@ fastdb = {{ path = {_path_dependency(FASTDB_REPOSITORY / "bindings/rust/fastdb")
         f"stdout:\n{completed.stdout}\n"
         f"stderr:\n{completed.stderr}"
     )
-    binary = TARGET_DIR / "debug/c-two-portable-interop-harness"
+    binary = TARGET_DIR / "debug" / ("c-two-portable-interop-harness.exe" if os.name == "nt" else "c-two-portable-interop-harness")
     assert binary.is_file()
     return binary, generated_python
 
-
-def _readline_with_timeout(stream: Any, timeout: float) -> str:
-    selector = selectors.DefaultSelector()
-    selector.register(stream, selectors.EVENT_READ)
-    try:
-        if not selector.select(timeout):
-            raise TimeoutError("timed out waiting for Rust host readiness")
-        return stream.readline()
-    finally:
-        selector.close()
 
 
 class _RustHost:
@@ -225,7 +215,7 @@ class _RustHost:
         )
         try:
             assert self._process.stdout is not None
-            self._ready_line = _readline_with_timeout(self._process.stdout, 20)
+            self._ready_line = readline_with_timeout(self._process.stdout, 20)
             if self._ready_line != f"READY {self._address}\n":
                 stdout, stderr = self._process.communicate(timeout=5)
                 raise AssertionError(

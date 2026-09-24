@@ -10,11 +10,12 @@ use crate::client::ServerPoolState;
 /// Response data from a CRM call.
 #[derive(Debug)]
 pub enum ResponseData {
-    /// UDS inline data (already in Rust heap).
+    /// Local IPC inline data (already in Rust heap).
     Inline(Vec<u8>),
     /// SHM buddy/dedicated data (coordinates only — no copy yet).
     Shm {
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
@@ -98,6 +99,7 @@ impl ResponseLease {
             ResponseData::Inline(bytes) => Ok(bytes.clone()),
             ResponseData::Shm {
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
@@ -106,7 +108,7 @@ impl ResponseLease {
                 let state = server_pool
                     .as_mut()
                     .ok_or_else(|| "server pool not initialised".to_string())?;
-                state.copy_response(*seg_idx, *offset, *data_size, *is_dedicated)
+                state.copy_response(*seg_idx, *generation, *offset, *data_size, *is_dedicated)
             }
             ResponseData::Handle(handle) => self
                 .reassembly_pool
@@ -128,6 +130,7 @@ impl ResponseLease {
             ResponseData::Inline(_) => Ok(()),
             ResponseData::Shm {
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
@@ -136,7 +139,7 @@ impl ResponseLease {
                 let state = server_pool
                     .as_mut()
                     .ok_or_else(|| "server pool not initialised".to_string())?;
-                state.release_response(seg_idx, offset, data_size, is_dedicated)
+                state.release_response(seg_idx, generation, offset, data_size, is_dedicated)
             }
             ResponseData::Handle(handle) => {
                 let mut pool = self.reassembly_pool.write();
@@ -181,18 +184,24 @@ fn release_response_handle(pool: &mut MemPool, handle: MemHandle) -> Result<(), 
     match handle {
         MemHandle::Buddy {
             seg_idx,
+            generation,
             offset,
-            len,
+            allocation_size,
+            ..
         } => {
-            let data_size = u32::try_from(len)
-                .map_err(|_| "response buddy handle length exceeds the wire address space")?;
-            pool.free_at(u32::from(seg_idx), offset, data_size, false)
-                .map_err(|error| format!("response handle release failed: {error}"))?;
+            pool.free_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                allocation_size,
+                false,
+            )
+            .map_err(|error| format!("response handle release failed: {error}"))?;
         }
         MemHandle::Dedicated { seg_idx, len } => {
             let data_size = u32::try_from(len)
                 .map_err(|_| "response dedicated handle length exceeds the wire address space")?;
-            pool.free_at(u32::from(seg_idx), 0, data_size, true)
+            pool.free_at(u32::from(seg_idx), 0, 0, data_size, true)
                 .map_err(|error| format!("response handle release failed: {error}"))?;
         }
         MemHandle::FileSpill { .. } => {}

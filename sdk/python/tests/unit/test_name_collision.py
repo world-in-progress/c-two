@@ -7,7 +7,6 @@ Verifies that:
 """
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
@@ -25,9 +24,6 @@ from tests.fixtures.counter import Counter, CounterImpl
 
 ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
-
-
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 
 def _unique_addr() -> str:

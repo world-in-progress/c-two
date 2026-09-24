@@ -36,7 +36,24 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     errno != libc::ESRCH
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn is_process_alive(pid: u32) -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    if pid == 0 {
+        return false;
+    }
+    let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if raw.is_null() {
+        // Access denied and other ambiguous failures cannot prove death.
+        return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32);
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    unsafe { WaitForSingleObject(process.as_raw_handle(), 0) != WAIT_OBJECT_0 }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn is_process_alive(_pid: u32) -> bool {
     true // Conservative: assume alive on non-Unix
 }
@@ -248,6 +265,27 @@ mod tests {
         // After unlock, should be UNLOCKED (0).
         let stored = spinlock.atomic().load(Ordering::Relaxed);
         assert_eq!(stored, UNLOCKED);
+    }
+
+    #[test]
+    fn test_process_liveness_tracks_real_child_exit() {
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/C", "ping -n 30 127.0.0.1 >NUL"]);
+            command
+        } else {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let alive = is_process_alive(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(alive);
+        assert!(!is_process_alive(pid));
+        assert!(is_process_alive(std::process::id()));
     }
 
     #[test]

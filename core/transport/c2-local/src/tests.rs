@@ -1,0 +1,98 @@
+use super::*;
+use tokio::io::AsyncReadExt;
+
+#[tokio::test]
+async fn owned_halves_exchange_bytes_and_abort_wakes_a_pending_read() {
+    let (client, server) = LocalStream::pair().await.unwrap();
+    let (mut reader, _) = server.into_split();
+    let (_, mut writer) = client.into_split();
+    writer.write_all(b"hello").await.unwrap();
+    let mut bytes = [0; 5];
+    reader.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"hello");
+    writer.abort_handle().abort();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), reader.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_partial_write_poisoned_the_connection() {
+    let (mut client, _server) = LocalStream::pair().await.unwrap();
+    let abort = client.abort_handle();
+    let bytes = vec![0; 16 * 1024 * 1024];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.write_all(&bytes))
+            .await
+            .is_err()
+    );
+    assert!(abort.is_aborted());
+    assert!(client.write_all(b"new frame").await.is_err());
+}
+
+#[tokio::test]
+async fn duplicate_listener_cannot_displace_owner_and_restart_works() {
+    let address = format!("ipc://c2-listener-test-{}", std::process::id());
+    let endpoint = LocalEndpoint::from_address(&address).unwrap();
+    let mut first = LocalListener::bind(&endpoint).unwrap();
+    assert!(LocalListener::bind(&endpoint).is_err());
+    let (_, _) = tokio::try_join!(
+        LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+        first.accept()
+    )
+    .unwrap();
+    drop(first);
+    let _restarted = LocalListener::bind(&endpoint).unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_accept_can_accept_the_next_client() {
+    let endpoint =
+        LocalEndpoint::from_address(&format!("ipc://c2-accept-test-{}", std::process::id()))
+            .unwrap();
+    let mut listener = LocalListener::bind(&endpoint).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    let (_, _) = tokio::try_join!(
+        LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+        listener.accept()
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn completed_reply_remains_readable_after_server_stream_is_dropped() {
+    let (mut client, mut server) = LocalStream::pair().await.unwrap();
+    let expected = b"shutdown initiate acknowledged";
+    server.write_all(expected).await.unwrap();
+    drop(server);
+    let mut actual = vec![0; expected.len()];
+    tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut actual))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn listener_restarts_after_server_closes_even_with_an_old_client_handle() {
+    let endpoint =
+        LocalEndpoint::from_address(&format!("ipc://c2-restart-test-{}", std::process::id()))
+            .unwrap();
+    let mut listener = LocalListener::bind(&endpoint).unwrap();
+    let (client, server) = tokio::try_join!(
+        LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+        listener.accept(),
+    )
+    .unwrap();
+    drop(server);
+    drop(listener);
+    let _next = LocalListener::bind(&endpoint).unwrap();
+    drop(client);
+}

@@ -7,9 +7,9 @@ export const C2_MEM_FFI_STATUS_INVALID_ARGUMENT = 2;
 export const C2_MEM_FFI_STATUS_POOL_ERROR = 3;
 export const C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4;
 
-export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 24;
+export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-export const C2_MEM_FFI_ABI_VERSION = 1;
+export const C2_MEM_FFI_ABI_VERSION = 2;
 
 export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_OK
@@ -39,6 +39,7 @@ export interface C2MemFfiShmSegment {
 
 export interface C2MemFfiRequestBlock {
   readonly segmentIndex: number;
+  readonly generation: number;
   readonly offset: number;
   readonly byteLength: number;
   readonly dedicated: boolean;
@@ -47,16 +48,15 @@ export interface C2MemFfiRequestBlock {
 export interface C2MemFfiResponseBlock extends C2MemFfiRequestBlock {
   readonly prefix?: string;
   readonly segments?: readonly C2MemFfiShmSegment[];
-  readonly segmentName?: string;
 }
 
-export interface C2MemFfiNativeBuddyResponsePool {
+export interface C2MemFfiNativeResponsePool {
   read(block: C2MemFfiResponseBlock, destination: Uint8Array): MaybePromise<void>;
   release(block: C2MemFfiResponseBlock): MaybePromise<void>;
   close?(): MaybePromise<void>;
 }
 
-export interface C2MemFfiNativeBuddyRequestPool {
+export interface C2MemFfiNativeRequestPool {
   readonly prefix: string;
   readonly segments: readonly C2MemFfiShmSegment[];
   write(payload: Uint8Array): MaybePromise<C2MemFfiRequestBlock>;
@@ -65,13 +65,13 @@ export interface C2MemFfiNativeBuddyRequestPool {
   close?(): MaybePromise<void>;
 }
 
-export interface C2MemFfiNativeBuddyResponseBackend {
+export interface C2MemFfiNativeResponseBackend {
   readResponse(block: C2MemFfiResponseBlock, destination: Uint8Array): MaybePromise<void>;
   releaseResponse(block: C2MemFfiResponseBlock): MaybePromise<void>;
   close(): Promise<void>;
 }
 
-export interface C2MemFfiNativeBuddyRequestBackend {
+export interface C2MemFfiNativeRequestBackend {
   readonly prefix: string;
   readonly segments: readonly C2MemFfiShmSegment[];
   writeRequest(payload: Uint8Array): MaybePromise<C2MemFfiRequestBlock>;
@@ -114,6 +114,7 @@ export interface C2MemFfiResponsePoolSymbols<Handle = unknown> extends C2MemFfiA
 }
 
 export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> {
+  c2_mem_ffi_local_endpoint(address: string): C2MemFfiCallResult<string>;
   c2_mem_ffi_request_pool_read_local(pool: Handle, block: C2MemFfiRequestBlock, destination: Uint8Array): MaybePromise<C2MemFfiCallResult<number>>;
 }
 
@@ -133,11 +134,12 @@ export interface C2MemFfiNodeNativeLoadOptions {
 }
 
 export interface C2MemFfiResponsePoolFactory {
-  createResponsePool(config: C2MemFfiPoolConfig): Promise<C2MemFfiNativeBuddyResponsePool>;
+  createResponsePool(config: C2MemFfiPoolConfig): Promise<C2MemFfiNativeResponsePool>;
 }
 
 export interface C2MemFfiNodeRuntime {
   readonly connect: C2NodeIpcConnect;
+  readonly resolveEndpoint: (address: string) => string;
   readonly responsePoolFactory: C2MemFfiResponsePoolFactory;
 }
 
@@ -147,7 +149,7 @@ export interface C2NodeIpcConnection {
   close?(): MaybePromise<void>;
 }
 
-export type C2NodeIpcConnect = (socketPath: string) => MaybePromise<C2NodeIpcConnection>;
+export type C2NodeIpcConnect = (address: string) => MaybePromise<C2NodeIpcConnection>;
 
 export interface C2NodeIpcSocket {
   readonly destroyed: boolean;
@@ -166,6 +168,7 @@ export interface C2NodeIpcSocket {
 }
 
 export interface C2NodeIpcConnectOptions {
+  readonly resolveEndpoint?: (address: string) => string;
   readonly createConnection?: (socketPath: string) => C2NodeIpcSocket;
 }
 
@@ -207,13 +210,15 @@ export function loadBundledC2MemFfiNodeNativeSymbols<Handle = unknown>(
 export function createBundledC2MemFfiNodeRuntime(
   options: C2MemFfiNodeNativeLoadOptions = {},
 ): C2MemFfiNodeRuntime {
-  const { responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
+  const resolveEndpoint = (address: string): string => resolveLocalIpcEndpoint(address, options);
   return Object.freeze({
-    connect: createNodeIpcConnect(),
+    connect: createNodeIpcConnect({ resolveEndpoint }),
+    resolveEndpoint,
     responsePoolFactory: Object.freeze({
       async createResponsePool(
         config: C2MemFfiPoolConfig,
-      ): Promise<C2MemFfiNativeBuddyResponsePool> {
+      ): Promise<C2MemFfiNativeResponsePool> {
+        const { responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
         return await createC2MemFfiResponsePoolFromSymbols(
           responseSymbols,
           config,
@@ -223,16 +228,32 @@ export function createBundledC2MemFfiNodeRuntime(
   });
 }
 
+export function resolveLocalIpcEndpoint(address: string, options: C2MemFfiNodeNativeLoadOptions = {}): string {
+  if (typeof address !== "string" || address.includes("\0")) {
+    throw new C2NodeIpcConnectionError("C-Two IPC address must be a string without NUL characters.");
+  }
+  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
+  const result = symbols.c2_mem_ffi_local_endpoint(address);
+  if (result.status !== C2_MEM_FFI_STATUS_OK || typeof result.value !== "string") {
+    throw new C2NodeIpcConnectionError(`C-Two native endpoint resolution failed for ${address} (status ${result.status}).`);
+  }
+  return result.value;
+}
+
 export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2NodeIpcConnect {
   if (typeof options !== "object" || options === null) {
     throw new C2NodeIpcConnectionError("C-Two Node IPC connect options must be an object.");
   }
   const openSocket = options.createConnection ?? createConnection;
+  const resolveEndpoint = options.resolveEndpoint ?? resolveLocalIpcEndpoint;
+  if (typeof resolveEndpoint !== "function") {
+    throw new C2NodeIpcConnectionError("C-Two Node IPC resolveEndpoint option must be a function.");
+  }
   if (typeof openSocket !== "function") {
     throw new C2NodeIpcConnectionError("C-Two Node IPC createConnection option must be a function.");
   }
-  return async (socketPath: string): Promise<C2NodeIpcConnection> => {
-    const normalizedPath = requireNodeIpcSocketPath(socketPath);
+  return async (address: string): Promise<C2NodeIpcConnection> => {
+    const normalizedPath = requireNodeIpcSocketPath(resolveEndpoint(address));
     let socket: C2NodeIpcSocket;
     try {
       socket = openSocket(normalizedPath);
@@ -320,13 +341,16 @@ function bundledC2MemFfiNodeNativeLibraryName(): string {
   if (process.platform === "linux") {
     return "libc2_mem_ffi.so";
   }
+  if (process.platform === "win32") {
+    return "c2_mem_ffi.dll";
+  }
   throw new C2MemFfiBindingError(`c2-mem-ffi bundled Node native library is not available for ${process.platform}.`);
 }
 
 export async function createC2MemFfiRequestPoolFromSymbols<Handle>(
   symbols: C2MemFfiRequestPoolSymbols<Handle>,
   config: C2MemFfiPoolConfig,
-): Promise<C2MemFfiNativeBuddyRequestPool> {
+): Promise<C2MemFfiNativeRequestPool> {
   const normalizedConfig = normalizePoolConfig(config, "c2-mem-ffi request pool config");
   await requireAbiVersion(symbols, "c2-mem-ffi request pool symbols");
   const handle = await requireOkValue(
@@ -422,7 +446,7 @@ export async function createC2MemFfiRequestPoolFromSymbols<Handle>(
 export async function createC2MemFfiResponsePoolFromSymbols<Handle>(
   symbols: C2MemFfiResponsePoolSymbols<Handle>,
   config: C2MemFfiPoolConfig,
-): Promise<C2MemFfiNativeBuddyResponsePool> {
+): Promise<C2MemFfiNativeResponsePool> {
   const normalizedConfig = normalizePoolConfig(config, "c2-mem-ffi response pool config");
   await requireAbiVersion(symbols, "c2-mem-ffi response pool symbols");
   const handle = await requireOkValue(
@@ -438,7 +462,7 @@ export async function createC2MemFfiResponsePoolFromSymbols<Handle>(
   return {
     async read(block: C2MemFfiResponseBlock, destination: Uint8Array): Promise<void> {
       ensurePoolOpen(closed, "response");
-      const responseBlock = requireNonDedicatedResponseBlock(block, "read");
+      const responseBlock = requireResponseBlock(block, "read");
       requireUint8Array(destination, "destination");
       if (destination.byteLength !== responseBlock.byteLength) {
         throw new C2MemFfiBindingError(`c2-mem-ffi response destination length ${destination.byteLength} does not match block byteLength ${responseBlock.byteLength}.`);
@@ -451,7 +475,7 @@ export async function createC2MemFfiResponsePoolFromSymbols<Handle>(
     async release(block: C2MemFfiResponseBlock): Promise<void> {
       ensurePoolOpen(closed, "response");
       await requireOk(
-        await symbols.c2_mem_ffi_response_pool_release(handle, requireNonDedicatedResponseBlock(block, "release")),
+        await symbols.c2_mem_ffi_response_pool_release(handle, requireResponseBlock(block, "release")),
         "c2_mem_ffi_response_pool_release",
       );
     },
@@ -465,15 +489,15 @@ export async function createC2MemFfiResponsePoolFromSymbols<Handle>(
   };
 }
 
-export function createC2MemFfiNativeBuddyResponseBackend(
-  pool: C2MemFfiNativeBuddyResponsePool,
-): C2MemFfiNativeBuddyResponseBackend {
-  const normalized = normalizeResponsePool(pool, "c2-mem-ffi native buddy response pool");
+export function createC2MemFfiNativeResponseBackend(
+  pool: C2MemFfiNativeResponsePool,
+): C2MemFfiNativeResponseBackend {
+  const normalized = normalizeResponsePool(pool, "c2-mem-ffi native response pool");
   let closed = false;
   return {
     async readResponse(block: C2MemFfiResponseBlock, destination: Uint8Array): Promise<void> {
       ensureOpen(closed, "response");
-      const normalizedBlock = requireNonDedicatedResponseBlock(block, "read");
+      const normalizedBlock = requireResponseBlock(block, "read");
       requireUint8Array(destination, "destination");
       if (destination.byteLength !== normalizedBlock.byteLength) {
         throw new C2MemFfiBindingError(`c2-mem-ffi response destination length ${destination.byteLength} does not match block byteLength ${normalizedBlock.byteLength}.`);
@@ -482,7 +506,7 @@ export function createC2MemFfiNativeBuddyResponseBackend(
     },
     async releaseResponse(block: C2MemFfiResponseBlock): Promise<void> {
       ensureOpen(closed, "response");
-      await normalized.release(requireNonDedicatedResponseBlock(block, "release"));
+      await normalized.release(requireResponseBlock(block, "release"));
     },
     async close(): Promise<void> {
       if (closed) {
@@ -494,10 +518,10 @@ export function createC2MemFfiNativeBuddyResponseBackend(
   };
 }
 
-export function createC2MemFfiNativeBuddyRequestBackend(
-  pool: C2MemFfiNativeBuddyRequestPool,
-): C2MemFfiNativeBuddyRequestBackend {
-  const normalized = normalizeRequestPool(pool, "c2-mem-ffi native buddy request pool");
+export function createC2MemFfiNativeRequestBackend(
+  pool: C2MemFfiNativeRequestPool,
+): C2MemFfiNativeRequestBackend {
+  const normalized = normalizeRequestPool(pool, "c2-mem-ffi native request pool");
   let closed = false;
   return {
     prefix: normalized.prefix,
@@ -661,7 +685,7 @@ class NodeIpcConnection implements C2NodeIpcConnection {
   }
 }
 
-function normalizeResponsePool(pool: C2MemFfiNativeBuddyResponsePool, label: string): C2MemFfiNativeBuddyResponsePool {
+function normalizeResponsePool(pool: C2MemFfiNativeResponsePool, label: string): C2MemFfiNativeResponsePool {
   if (typeof pool !== "object" || pool === null) {
     throw new C2MemFfiBindingError(`${label} must be an object.`);
   }
@@ -677,7 +701,7 @@ function normalizeResponsePool(pool: C2MemFfiNativeBuddyResponsePool, label: str
   return pool;
 }
 
-function normalizeRequestPool(pool: C2MemFfiNativeBuddyRequestPool, label: string): C2MemFfiNativeBuddyRequestPool {
+function normalizeRequestPool(pool: C2MemFfiNativeRequestPool, label: string): C2MemFfiNativeRequestPool {
   if (typeof pool !== "object" || pool === null) {
     throw new C2MemFfiBindingError(`${label} must be an object.`);
   }
@@ -688,7 +712,7 @@ function normalizeRequestPool(pool: C2MemFfiNativeBuddyRequestPool, label: strin
   if (pool.segments.length === 0 || pool.segments.length > C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS) {
     throw new C2MemFfiBindingError(`${label}.segments length must be between 1 and ${C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS}.`);
   }
-  const segments = Object.freeze(pool.segments.map((segment, index) => normalizeRequestSegment(prefix, segment, index, label)));
+  const segments = Object.freeze(pool.segments.map((segment, index) => normalizeRequestSegment(segment, index, label)));
   if (typeof pool.write !== "function") {
     throw new C2MemFfiBindingError(`${label}.write must be a function.`);
   }
@@ -723,7 +747,7 @@ function normalizeSegment(segment: C2MemFfiShmSegment, label: string): C2MemFfiS
   if (typeof segment !== "object" || segment === null) {
     throw new C2MemFfiBindingError(`${label} must be an object.`);
   }
-  requirePosixShmName(segment.name, `${label}.name`);
+  requireShmIdentity(segment.name, `${label}.name`);
   if (!Number.isSafeInteger(segment.size) || segment.size <= 0 || segment.size > 0xffffffff) {
     throw new C2MemFfiBindingError(`${label}.size must be a positive u32 integer.`);
   }
@@ -731,30 +755,25 @@ function normalizeSegment(segment: C2MemFfiShmSegment, label: string): C2MemFfiS
 }
 
 function normalizeRequestSegment(
-  prefix: string,
   segment: C2MemFfiShmSegment,
   index: number,
   label: string,
 ): C2MemFfiShmSegment {
   const normalized = normalizeSegment(segment, `${label}.segments[${index}]`);
-  const expectedName = `${prefix}_b${index.toString(16).padStart(4, "0")}`;
-  if (normalized.name !== expectedName) {
-    throw new C2MemFfiBindingError(`${label} segment ${index} name must be "${expectedName}".`);
-  }
   return normalized;
 }
 
 function requirePrefix(value: string, label: string): string {
-  requirePosixShmName(value, label);
+  requireShmIdentity(value, label);
   if (utf8ByteLength(value) > C2_MEM_FFI_MAX_SHM_PREFIX_BYTES) {
     throw new C2MemFfiBindingError(`${label} cannot exceed ${C2_MEM_FFI_MAX_SHM_PREFIX_BYTES} bytes.`);
   }
   return value;
 }
 
-function requirePosixShmName(value: string, label: string): void {
+function requireShmIdentity(value: string, label: string): void {
   if (typeof value !== "string" || value.length <= 1 || !value.startsWith("/")) {
-    throw new C2MemFfiBindingError(`${label} must be a non-empty POSIX SHM name beginning with "/".`);
+    throw new C2MemFfiBindingError(`${label} must be a non-empty shared-memory identity name beginning with "/".`);
   }
   if (value.slice(1).includes("/")) {
     throw new C2MemFfiBindingError(`${label} must not contain "/" after the leading slash.`);
@@ -805,11 +824,8 @@ function nodeIpcError(prefix: string, error: unknown): C2NodeIpcConnectionError 
   return new C2NodeIpcConnectionError(`${prefix}: ${String(error)}`);
 }
 
-function requireNonDedicatedResponseBlock(block: C2MemFfiResponseBlock, action: string): C2MemFfiResponseBlock {
+function requireResponseBlock(block: C2MemFfiResponseBlock, action: string): C2MemFfiResponseBlock {
   const normalized = requireBlockShape(block, `response block ${action}`);
-  if (normalized.dedicated) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi native buddy response backend only supports non-dedicated blocks; ${action} received a dedicated block.`);
-  }
   validateResponseBlockMetadata(block, normalized);
   return block;
 }
@@ -821,9 +837,6 @@ function validateResponseBlockMetadata(
   if (block.prefix !== undefined) {
     requirePrefix(block.prefix, "c2-mem-ffi response block prefix");
   }
-  if (block.segmentName !== undefined) {
-    requirePosixShmName(block.segmentName, "c2-mem-ffi response block segmentName");
-  }
   if (block.segments === undefined) {
     return;
   }
@@ -833,23 +846,13 @@ function validateResponseBlockMetadata(
   if (block.segments.length > C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS) {
     throw new C2MemFfiBindingError(`c2-mem-ffi response block segments length must be no greater than ${C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS}.`);
   }
+  for (const [index, segment] of block.segments.entries()) {
+    normalizeSegment(segment, `c2-mem-ffi response block segments[${index}]`);
+  }
+  if (block.dedicated) return;
   const segment = block.segments[normalized.segmentIndex];
-  if (segment === undefined) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi response block segmentIndex ${normalized.segmentIndex} is not advertised.`);
-  }
-  const normalizedSegment = normalizeSegment(segment, `c2-mem-ffi response block segments[${normalized.segmentIndex}]`);
-  if (block.prefix !== undefined) {
-    const expectedName = `${block.prefix}_b${normalized.segmentIndex.toString(16).padStart(4, "0")}`;
-    if (normalizedSegment.name !== expectedName) {
-      throw new C2MemFfiBindingError(`c2-mem-ffi response block segment ${normalized.segmentIndex} name must be "${expectedName}".`);
-    }
-  }
-  if (block.segmentName !== undefined && block.segmentName !== normalizedSegment.name) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi response block segmentName ${block.segmentName} does not match advertised segment ${normalizedSegment.name}.`);
-  }
-  const end = normalized.offset + normalized.byteLength;
-  if (end > normalizedSegment.size) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi response block range ${normalized.offset}+${normalized.byteLength} exceeds advertised segment ${normalized.segmentIndex} size ${normalizedSegment.size}.`);
+  if (segment !== undefined && normalized.offset + normalized.byteLength > segment.size) {
+    throw new C2MemFfiBindingError(`c2-mem-ffi response block range exceeds advertised segment ${normalized.segmentIndex} size ${segment.size}.`);
   }
 }
 
@@ -860,12 +863,10 @@ function requireOwnedRequestBlock(
   action: string,
 ): C2MemFfiRequestBlock {
   const normalized = requireBlockShape(block, `request block ${action}`);
-  if (normalized.dedicated) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi native buddy request backend only supports non-dedicated blocks; ${action} received a dedicated block.`);
-  }
   if (expectedByteLength !== undefined && normalized.byteLength !== expectedByteLength) {
     throw new C2MemFfiBindingError(`c2-mem-ffi request block byteLength ${normalized.byteLength} does not match payload length ${expectedByteLength}.`);
   }
+  if (normalized.dedicated) return block;
   const segment = segments[normalized.segmentIndex];
   if (segment === undefined) {
     throw new C2MemFfiBindingError(`c2-mem-ffi request block segmentIndex ${normalized.segmentIndex} is not advertised.`);
@@ -880,7 +881,7 @@ function requireOwnedRequestBlock(
 function requireBlockShape(
   block: C2MemFfiRequestBlock,
   label: string,
-): { readonly segmentIndex: number; readonly offset: number; readonly byteLength: number; readonly dedicated: boolean } {
+): { readonly segmentIndex: number; readonly generation: number; readonly offset: number; readonly byteLength: number; readonly dedicated: boolean } {
   if (typeof block !== "object" || block === null) {
     throw new C2MemFfiBindingError(`c2-mem-ffi ${label} must be an object.`);
   }
@@ -890,14 +891,21 @@ function requireBlockShape(
   if (!Number.isSafeInteger(block.offset) || block.offset < 0 || block.offset > 0xffffffff) {
     throw new C2MemFfiBindingError(`c2-mem-ffi ${label} offset must be a u32 integer.`);
   }
+  if (!Number.isSafeInteger(block.generation) || block.generation < 0 || block.generation > 0xffffffff || (!block.dedicated && block.generation === 0) || (block.dedicated && block.generation !== 0)) {
+    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} generation must be a positive u32 for buddy memory or 0 for dedicated memory.`);
+  }
   if (!Number.isSafeInteger(block.byteLength) || block.byteLength <= 0 || block.byteLength > 0xffffffff) {
     throw new C2MemFfiBindingError(`c2-mem-ffi ${label} byteLength must be a positive u32 integer.`);
   }
   if (typeof block.dedicated !== "boolean") {
     throw new C2MemFfiBindingError(`c2-mem-ffi ${label} dedicated must be a boolean.`);
   }
+  if (block.dedicated && block.offset !== 0) {
+    throw new C2MemFfiBindingError(`c2-mem-ffi ${label} dedicated offset must be 0.`);
+  }
   return {
     segmentIndex: block.segmentIndex,
+    generation: block.generation,
     offset: block.offset,
     byteLength: block.byteLength,
     dedicated: block.dedicated,
@@ -906,7 +914,7 @@ function requireBlockShape(
 
 function ensureOpen(closed: boolean, label: string): void {
   if (closed) {
-    throw new C2MemFfiBindingError(`c2-mem-ffi native buddy ${label} backend is closed.`);
+    throw new C2MemFfiBindingError(`c2-mem-ffi native ${label} backend is closed.`);
   }
 }
 
@@ -986,7 +994,7 @@ function c2MemFfiStatusName(status: unknown): string {
 }
 
 async function releaseInvalidRequestBlock(
-  pool: C2MemFfiNativeBuddyRequestPool,
+  pool: C2MemFfiNativeRequestPool,
   block: C2MemFfiRequestBlock,
   priorError: unknown,
 ): Promise<void> {

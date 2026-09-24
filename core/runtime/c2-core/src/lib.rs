@@ -15,7 +15,7 @@ mod session;
 
 pub use client::{Client, Connect, EncodedClient, ObservedPath, ObservedRoute, PathCounters};
 pub use control::{
-    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_socket_path,
+    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
     ping_direct_ipc, shutdown_direct_ipc,
 };
 pub use error::{

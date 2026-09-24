@@ -3,7 +3,7 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=10]
+//! [1B version=11]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -37,7 +37,7 @@ use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 10;
+pub const HANDSHAKE_VERSION: u8 = 11;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 

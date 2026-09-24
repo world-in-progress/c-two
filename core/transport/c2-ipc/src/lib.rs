@@ -1,6 +1,6 @@
 //! Async IPC client for C-Two.
 //!
-//! Connects to a C-Two IPC server via Unix Domain Socket, performs
+//! Connects to a C-Two IPC server through its local OS stream, performs
 //! handshake, and forwards requests using buddy SHM.
 //!
 //! # Architecture
@@ -10,15 +10,14 @@
 //!     -> IpcClient::acquire_route_token(route contract, route token)
 //!     -> IpcClient::call_bound(binding, method, payload)
 //!         -> select inline / buddy SHM / chunked request transport
-//!         -> send_task:  serialize frame -> write UDS
-//!         -> recv_task:  read UDS -> match request_id -> oneshot -> caller
+//!         -> send_task:  serialize frame -> write local stream
+//!         -> recv_task:  read local stream -> match request_id -> oneshot -> caller
 //! ```
 
 pub mod client;
 pub mod control;
 pub mod pool;
 pub mod response;
-pub mod shm;
 pub mod sync_client;
 
 #[cfg(test)]
@@ -28,8 +27,7 @@ pub use c2_wire::shutdown_control::{DirectShutdownAck, ShutdownControlRouteOutco
 pub use client::{
     ClientIpcConfig, IpcClient, IpcError, MethodTable, RouteBinding, ServerPoolState,
 };
-pub use control::{ping, shutdown, socket_path_from_ipc_address};
+pub use control::{local_endpoint_from_ipc_address, ping, shutdown};
 pub use pool::ClientPool;
 pub use response::{ResponseData, ResponseLease};
-pub use shm::{MappedSegment, SegmentCache, ShmError};
 pub use sync_client::{IpcCallError, SyncClient, TransportPhase};

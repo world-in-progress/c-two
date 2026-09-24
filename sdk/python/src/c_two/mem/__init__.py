@@ -1,7 +1,7 @@
 """Unified memory pool for cross-process shared memory.
 
-Wraps the Rust ``c2_mempool`` native extension, providing zero-syscall
-dynamic allocation within pre-mapped POSIX shared memory segments for
+Projects the Rust ``c2-mem`` pool, providing dynamic allocation within
+shared memory mappings for
 the C-Two IPC transport.
 
 Typical usage::

@@ -7,11 +7,13 @@ export function resolveCargo() {
     return process.env.CARGO;
   }
   const candidates = [];
+  const executable = process.platform === 'win32' ? 'cargo.exe' : 'cargo';
   if (process.env.CARGO_HOME) {
-    candidates.push(resolve(process.env.CARGO_HOME, 'bin', 'cargo'));
+    candidates.push(resolve(process.env.CARGO_HOME, 'bin', executable));
   }
-  if (process.env.HOME) {
-    candidates.push(resolve(process.env.HOME, '.cargo', 'bin', 'cargo'));
+  const userDirectory = process.env.USERPROFILE ?? process.env.HOME;
+  if (userDirectory) {
+    candidates.push(resolve(userDirectory, '.cargo', 'bin', executable));
   }
   candidates.push('/opt/homebrew/bin/cargo', '/usr/local/bin/cargo');
   for (const candidate of candidates) {

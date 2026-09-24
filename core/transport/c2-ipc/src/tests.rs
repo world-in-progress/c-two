@@ -118,18 +118,20 @@ mod client_tests {
     #[test]
     fn test_buddy_frame_encoding() {
         // Build a buddy call frame as call_buddy would:
-        // payload = [11B buddy_payload][call_control]
+        // payload = [15B buddy_payload][call_control]
         // flags   = FLAG_CALL_V2 | FLAG_BUDDY
         use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
 
         let bp = BuddyPayload {
             seg_idx: 0,
+            generation: 1,
             offset: 4096,
             data_size: 8192,
             is_dedicated: false,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
+        assert_eq!(buddy_bytes, [0, 0, 1, 0, 0, 0, 0, 16, 0, 0, 0, 32, 0, 0, 0]);
 
         let ctrl = encode_call_control(&call_identity("grid"), 3).unwrap();
         let mut payload = Vec::new();
@@ -149,6 +151,7 @@ mod client_tests {
         // Decode buddy payload.
         let (decoded_bp, bp_consumed) = decode_buddy_payload(frame_payload).unwrap();
         assert_eq!(decoded_bp.seg_idx, 0);
+        assert_eq!(decoded_bp.generation, 1);
         assert_eq!(decoded_bp.offset, 4096);
         assert_eq!(decoded_bp.data_size, 8192);
         assert!(!decoded_bp.is_dedicated);
@@ -166,11 +169,16 @@ mod client_tests {
 
         let bp = BuddyPayload {
             seg_idx: 5,
+            generation: 0,
             offset: 0,
             data_size: 1_000_000,
             is_dedicated: true,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
+        assert_eq!(
+            buddy_bytes,
+            [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x42, 0x0f, 0, 1]
+        );
         let ctrl = encode_call_control(&call_identity("net"), 1).unwrap();
 
         let mut payload = Vec::new();
@@ -183,6 +191,7 @@ mod client_tests {
         assert!(hdr.is_buddy());
         let (decoded_bp, _) = decode_buddy_payload(frame_payload).unwrap();
         assert_eq!(decoded_bp.seg_idx, 5);
+        assert_eq!(decoded_bp.generation, 0);
         assert!(decoded_bp.is_dedicated);
         assert_eq!(decoded_bp.data_size, 1_000_000);
     }
@@ -512,23 +521,27 @@ mod response_lease_tests {
 
     #[test]
     fn reassembly_handle_response_copies_then_releases_real_backing() {
-        let pool = empty_reassembly_pool('h');
         let payload = b"reassembled response".repeat(256);
-        let handle = {
-            let mut pool = pool.write();
-            let mut handle = pool.alloc_handle(payload.len()).unwrap();
-            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
-            handle
-        };
-        let mut lease = ResponseLease::new(
-            ResponseData::Handle(handle),
-            Arc::new(Mutex::new(None)),
-            Arc::clone(&pool),
-        );
+        for logical_len in [payload.len(), 4096, 1, 0] {
+            let pool = empty_reassembly_pool('h');
+            let handle = {
+                let mut pool = pool.write();
+                let mut handle = pool.alloc_handle(payload.len()).unwrap();
+                pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+                handle.set_len(logical_len);
+                handle
+            };
+            let mut lease = ResponseLease::new(
+                ResponseData::Handle(handle),
+                Arc::new(Mutex::new(None)),
+                Arc::clone(&pool),
+            );
 
-        assert_eq!(lease.copy_bytes().unwrap(), payload);
-        lease.release().unwrap();
-        assert_eq!(pool.read().stats().alloc_count, 0);
+            assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
+            assert_eq!(pool.read().stats().alloc_count, 1);
+            lease.release().unwrap();
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        }
     }
 
     #[test]
@@ -541,7 +554,7 @@ mod response_lease_tests {
             .unwrap()
             .allocator()
             .data_size();
-        let reader = MemPool::new_with_prefix(pool_config(), prefix);
+        let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string());
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             SEGMENT_SIZE,
             reader,
@@ -549,6 +562,7 @@ mod response_lease_tests {
         let lease = ResponseLease::new(
             ResponseData::Shm {
                 seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+                generation: allocation.generation,
                 offset: u32::try_from(segment_capacity - 1).unwrap(),
                 data_size: 2,
                 is_dedicated: false,
@@ -601,7 +615,7 @@ mod response_lease_tests {
             std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, payload.len());
         }
 
-        let reader = MemPool::new_with_prefix(pool_config(), prefix);
+        let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string());
         let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
             SEGMENT_SIZE,
             reader,
@@ -609,6 +623,7 @@ mod response_lease_tests {
         let mut lease = ResponseLease::new(
             ResponseData::Shm {
                 seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+                generation: allocation.generation,
                 offset: allocation.offset,
                 data_size: u32::try_from(payload.len()).unwrap(),
                 is_dedicated: allocation.is_dedicated,

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import signal
 import subprocess
 import sys
@@ -22,6 +23,10 @@ PORTABLE_TESTS = (
     "sdk/python/tests/integration/test_portable_payload_matrix.py",
 )
 TYPESCRIPT_TEST = "sdk/python/tests/integration/test_typescript_real_calls.py"
+LOCAL_PLATFORM_SCOPE = "local-platform"
+FULL_SCOPE = "full"
+SCOPES = (LOCAL_PLATFORM_SCOPE, FULL_SCOPE)
+Gate = tuple[str, list[str], tuple[str, ...]]
 
 
 def capture(command: Sequence[str], cwd: Path) -> dict[str, Any]:
@@ -92,25 +97,48 @@ def run_step(
     return record
 
 
-def gates(python: str, output: Path) -> list[tuple[str, list[str], str | None]]:
-    def cargo(name: str, manifest: str, *arguments: str) -> tuple[str, list[str], None]:
-        return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], None
+def npm_command(*arguments: str) -> list[str]:
+    if os.name != "nt":
+        return ["npm", *arguments]
+    # CreateProcess does not execute npm.cmd directly. Use the JavaScript entry
+    # point bundled beside setup-node's node.exe without introducing a shell.
+    node = Path(shutil.which("node") or "node.exe")
+    script = node.parent / "node_modules/npm/bin/npm-cli.js"
+    return [str(node), str(script), *arguments]
 
+
+def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
+    def cargo(name: str, manifest: str, *arguments: str) -> Gate:
+        return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], ()
+
+    if scope == LOCAL_PLATFORM_SCOPE:
+        return [cargo("local-platform-tests", "core/Cargo.toml", "--lib",
+                      "-p", "c2-config", "-p", "c2-local-security", "-p", "c2-local",
+                      "-p", "c2-mem", "-p", "c2-mem-ffi", "-p", "c2-wire",
+                      "-p", "c2-ipc", "-p", "c2-server")]
+    if scope != FULL_SCOPE:
+        raise ValueError(f"Unknown native gate scope: {scope}")
+    fastdb_typescript = "../fastdb/ts/fastdb4ts"
+    c2_mem_typescript = "core/foundation/c2-mem-ffi/bindings/typescript"
     return [
-        ("python310-install", ["uv", "python", "install", "3.10"], None),
+        ("python310-install", ["uv", "python", "install", "3.10"], ()),
+        ("fastdb-npm-install", npm_command("ci", "--prefix", fastdb_typescript), ()),
+        ("c2-mem-npm-install", npm_command("ci", "--prefix", c2_mem_typescript), ()),
+        ("c2-mem-node-tests", npm_command("test", "--prefix", c2_mem_typescript), ("c2-mem-npm-install",)),
+        ("c2-mem-node-package", npm_command("run", "pack:check", "--prefix", c2_mem_typescript), ("c2-mem-npm-install",)),
         cargo("fastdb-rust-test", "../fastdb/bindings/rust/Cargo.toml", "--workspace", "--all-features"),
-        ("core-check", ["cargo", "check", "--locked", "--manifest-path", "core/Cargo.toml", "--workspace", "--all-targets"], None),
+        ("core-check", ["cargo", "check", "--locked", "--manifest-path", "core/Cargo.toml", "--workspace", "--all-targets"], ()),
         cargo("core-test", "core/Cargo.toml", "--workspace"),
-        ("cli-build", ["cargo", "build", "--locked", "--manifest-path", "cli/Cargo.toml", "--bins"], None),
+        ("cli-build", ["cargo", "build", "--locked", "--manifest-path", "cli/Cargo.toml", "--bins"], ()),
         cargo("cli-test", "cli/Cargo.toml"),
         cargo("rust-sdk-test", "sdk/rust/Cargo.toml", "--all-features"),
         cargo("python-native-test", "sdk/python/native/Cargo.toml"),
-        ("fastdb-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/fastdb"), "--no-create-gitignore", "../fastdb"], None),
-        ("python-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/c-two"), "--no-create-gitignore", "sdk/python"], None),
-        ("python-build", ["uv", "sync", "--locked", "--python", python], None),
-        ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], "python-build"),
-        ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], "python-build"),
-        ("typescript-tests", ["uv", "run", "--no-sync", "pytest", TYPESCRIPT_TEST, "-q", "--timeout=600", f"--junitxml={output / 'typescript-tests.xml'}"], "python-build"),
+        ("fastdb-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/fastdb"), "--no-create-gitignore", "../fastdb"], ()),
+        ("python-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/c-two"), "--no-create-gitignore", "sdk/python"], ()),
+        ("python-build", ["uv", "sync", "--locked", "--python", python], ()),
+        ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build",)),
+        ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], ("python-build",)),
+        ("typescript-tests", ["uv", "run", "--no-sync", "pytest", TYPESCRIPT_TEST, "-q", "--timeout=600", f"--junitxml={output / 'typescript-tests.xml'}"], ("python-build", "fastdb-npm-install", "c2-mem-npm-install")),
     ]
 
 
@@ -125,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--expected-c-two-sha", required=True)
     parser.add_argument("--expected-fastdb-sha", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--scope", choices=SCOPES, default=FULL_SCOPE)
     options = parser.parse_args(argv)
     output = options.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -134,10 +163,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment.pop("CARGO_TARGET_DIR", None)
     environment.update({
         "C2_ENV_FILE": "", "C2_RELAY_ANCHOR_ADDRESS": "", "PYTHONUTF8": "1",
-        "C2_PORTABLE_MATRIX_RECEIPT": str(output / "portable-matrix-receipt.v1.json"),
+        "C2_PORTABLE_MATRIX_RECEIPT": str(output / f"portable-matrix-{options.scope}-receipt.v1.json"),
         "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "development",
-        "C2_TYPESCRIPT_RECEIPT": str(output / "typescript-real-call-receipt.v1.json"),
+        "C2_TYPESCRIPT_RECEIPT": str(output / f"typescript-real-call-{options.scope}-receipt.v1.json"),
         "C2_TYPESCRIPT_EVIDENCE_STAGE": "development",
+        "C2_TYPESCRIPT_FASTDB_SOURCE_SHA": options.expected_fastdb_sha,
     })
     sources = {}
     for name, path, expected in (
@@ -146,22 +176,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         result = capture(["git", "rev-parse", "HEAD"], path)
         sources[name] = {"expected_sha": expected, "actual_sha": result.get("output"), "verified": result.get("exit_code") == 0 and result.get("output") == expected}
+    selected_gates = gates(sys.executable, output, options.scope)
+    toolchains = {
+        "python": [sys.executable, "--version"], "rustc": ["rustc", "-vV"],
+        "cargo": ["cargo", "--version"],
+        "msvc": ["cl"] if os.name == "nt" else ["false"],
+        "identity": ["whoami", "/all"] if os.name == "nt" else ["id"],
+    }
+    if options.scope == FULL_SCOPE:
+        toolchains.update({
+            "uv": ["uv", "--version"], "cmake": ["cmake", "--version"],
+            "swig": ["swig", "-version"], "node": ["node", "--version"],
+            "npm": npm_command("--version"),
+            "emscripten": [sys.executable, str(Path(os.environ.get("EMSDK", "../emsdk")) / "upstream/emscripten/emcc.py"), "--version"],
+        })
     evidence: dict[str, Any] = {
         "schema": "c-two.native-run-evidence.v1",
+        "scope": options.scope,
+        "applicable_gates": [name for name, _, _ in selected_gates],
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": "running", "sources": sources,
         "workflow_sha": os.environ.get("C2_WORKFLOW_SHA"),
         "run_id": os.environ.get("GITHUB_RUN_ID"),
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
         "runner": {"requested_label": os.environ.get("C2_RUNNER_LABEL"), "os": platform.platform(), "machine": platform.machine(), "image": os.environ.get("ImageOS"), "image_version": os.environ.get("ImageVersion")},
-        "toolchains": {name: capture(command, ROOT) for name, command in {
-            "python": [sys.executable, "--version"], "rustc": ["rustc", "-vV"],
-            "cargo": ["cargo", "--version"], "uv": ["uv", "--version"],
-            "cmake": ["cmake", "--version"], "swig": ["swig", "-version"],
-            "node": ["node", "--version"],
-            "msvc": ["cl"] if os.name == "nt" else ["false"],
-            "identity": ["whoami", "/all"] if os.name == "nt" else ["id"],
-        }.items()},
+        "toolchains": {name: capture(command, ROOT) for name, command in toolchains.items()},
         "steps": [], "artifacts": [],
     }
     write_evidence(output, evidence)
@@ -170,9 +209,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif not all(source["verified"] for source in sources.values()):
         evidence["error"] = "Checked-out source SHA does not match the requested immutable source."
     else:
-        for name, command, dependency in gates(sys.executable, output):
-            if dependency and not any(step["id"] == dependency and step["status"] == "passed" for step in evidence["steps"]):
-                record = {"id": name, "command": command, "status": "not_run", "reason": f"prerequisite {dependency} failed"}
+        for name, command, dependencies in selected_gates:
+            passed = {step["id"] for step in evidence["steps"] if step["status"] == "passed"}
+            missing = [dependency for dependency in dependencies if dependency not in passed]
+            if missing:
+                record = {"id": name, "command": command, "status": "not_run", "reason": f"prerequisites did not pass: {', '.join(missing)}"}
             else:
                 record = run_step(name, command, cwd=ROOT, output=output, environment=environment)
             evidence["steps"].append(record)

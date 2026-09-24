@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use c2_config::LocalEndpoint;
 use std::time::Duration;
 
 use crate::LifecycleError;
@@ -20,9 +20,9 @@ pub struct DirectIpcShutdownOutcome {
     pub route_outcomes: Vec<DirectIpcShutdownRouteOutcome>,
 }
 
-/// Resolve a validated direct IPC address to its local socket path.
-pub fn direct_ipc_socket_path(address: &str) -> Result<PathBuf, LifecycleError> {
-    c2_ipc::socket_path_from_ipc_address(address)
+/// Resolve a validated direct IPC address to its operating-system endpoint.
+pub fn direct_ipc_endpoint(address: &str) -> Result<LocalEndpoint, LifecycleError> {
+    c2_ipc::local_endpoint_from_ipc_address(address)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
@@ -67,15 +67,14 @@ mod tests {
     #[test]
     fn invalid_address_is_a_core_configuration_error() {
         let error =
-            direct_ipc_socket_path("tcp://not-ipc").expect_err("non-IPC address must be rejected");
+            direct_ipc_endpoint("tcp://not-ipc").expect_err("non-IPC address must be rejected");
         assert!(matches!(error, LifecycleError::Configuration(_)));
     }
 
     #[test]
     fn absent_server_probe_is_false() {
         let address = format!("ipc://core-control-absent-{}", std::process::id());
-        let path = direct_ipc_socket_path(&address).expect("valid address");
-        let _ = std::fs::remove_file(path);
+        direct_ipc_endpoint(&address).expect("valid address");
 
         assert!(
             !ping_direct_ipc(&address, Duration::from_millis(10))

@@ -126,11 +126,11 @@ class TestDataReadWrite:
         pool.write(alloc, data)
 
         # Read using read_at (simulates remote side).
-        result = pool.read_at(alloc.seg_idx, alloc.offset, len(data), alloc.is_dedicated)
+        result = pool.read_at(alloc.seg_idx, alloc.generation, alloc.offset, len(data), alloc.is_dedicated)
         assert result == data
 
         # Free using free_at (simulates remote side).
-        pool.free_at(alloc.seg_idx, alloc.offset, 4096, alloc.is_dedicated)
+        pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, alloc.is_dedicated)
         stats = pool.stats()
         assert stats.alloc_count == 0
 
@@ -173,12 +173,12 @@ class TestSegmentManagement:
             alloc = pool.alloc(4096)
             name = pool.segment_name(0)
             assert name is not None
-            assert name.startswith('/cc3b')
+            assert name == pool.derive_segment_name(0, alloc.generation)
             pool.free(alloc)
         finally:
             pool.destroy()
 
-    def test_open_segment(self):
+    def test_open_peer_segment(self):
         """Test that one pool can open another pool's segment."""
         pool1 = MemPool(PoolConfig(
             segment_size=64 * 1024,
@@ -189,21 +189,27 @@ class TestSegmentManagement:
             alloc = pool1.alloc(4096)
             data = b'shared data across pools'
             pool1.write(alloc, data)
-            seg_name = pool1.segment_name(0)
+            peer_prefix = pool1.prefix()
 
             # Open same segment from second pool.
-            pool2 = MemPool(PoolConfig(
+            pool2 = MemPool.open_peer(peer_prefix, PoolConfig(
                 segment_size=64 * 1024,
                 min_block_size=4096,
             ))
-            pool2.open_segment(seg_name, 64 * 1024)
+            pool2.ensure_peer_segment(alloc.seg_idx, alloc.generation, 64 * 1024)
 
-            # Read from pool2 using read_at.
-            result = pool2.read_at(0, alloc.offset, len(data), False)
+            # A different generation cannot replace a backing with a live block.
+            with pytest.raises(RuntimeError):
+                pool2.ensure_peer_segment(alloc.seg_idx, alloc.generation + 1, 64 * 1024)
+            with pytest.raises(RuntimeError):
+                pool2.read_at(alloc.seg_idx, alloc.generation + 1, alloc.offset, len(data), False)
+
+            # Read from pool2 using the producer's actual generation.
+            result = pool2.read_at(alloc.seg_idx, alloc.generation, alloc.offset, len(data), False)
             assert result == data
 
             # Free from pool2 (cross-process free).
-            pool2.free_at(0, alloc.offset, 4096, False)
+            pool2.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, False)
         finally:
             if pool2 is not None:
                 pool2.destroy()
@@ -352,14 +358,14 @@ class TestThreadSafety:
                     data = f't{thread_id}-{i}'.encode().ljust(64, b'\x00')
                     pool.write(alloc, data)
                     result = pool.read_at(
-                        alloc.seg_idx, alloc.offset, len(data), alloc.is_dedicated,
+                        alloc.seg_idx, alloc.generation, alloc.offset, len(data), alloc.is_dedicated,
                     )
                     if result != data:
                         errors.append(
                             f'Thread {thread_id}: data mismatch at iter {i}'
                         )
                     pool.free_at(
-                        alloc.seg_idx, alloc.offset, 4096, alloc.is_dedicated,
+                        alloc.seg_idx, alloc.generation, alloc.offset, 4096, alloc.is_dedicated,
                     )
             except Exception as e:
                 errors.append(f'Thread {thread_id}: {e}')
@@ -517,10 +523,10 @@ class TestDoubleFreeSafety:
         ))
         try:
             alloc = pool.alloc(4096)
-            pool.free_at(alloc.seg_idx, alloc.offset, alloc.actual_size, False)
+            pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, alloc.actual_size, False)
             # Second free — should raise or be safely handled
             try:
-                pool.free_at(alloc.seg_idx, alloc.offset, alloc.actual_size, False)
+                pool.free_at(alloc.seg_idx, alloc.generation, alloc.offset, alloc.actual_size, False)
             except RuntimeError:
                 pass  # Expected: double-free detected
             # Either way, pool stats should not underflow

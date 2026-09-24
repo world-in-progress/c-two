@@ -1,8 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +20,8 @@ use c2_error::{C2Error, ErrorCode};
 use c2_http::client::RelayRouteInfo;
 use c2_http::relay::{RelayConfig, RelayServer};
 use c2_ipc::IpcError;
+use c2_local::{LocalEndpoint, LocalListener};
+use tokio::io::AsyncReadExt;
 
 const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
@@ -295,50 +294,64 @@ fn counted_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
 
 struct MalformedIpcServer {
     address: String,
-    socket_path: PathBuf,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for MalformedIpcServer {
     fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
 fn malformed_ipc_server() -> MalformedIpcServer {
     let address = format!("ipc://{}", unique_name("malformed-handshake"));
-    let socket_path = c2_ipc::socket_path_from_ipc_address(&address).expect("IPC socket path");
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).expect("IPC socket parent");
-    }
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path).expect("malformed IPC listener");
+    let endpoint = LocalEndpoint::from_address(&address).expect("IPC endpoint");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let thread = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("malformed IPC accept");
-        let mut length = [0_u8; 4];
-        stream
-            .read_exact(&mut length)
-            .expect("read client handshake length");
-        let body_len = u32::from_le_bytes(length) as usize;
-        let mut body = vec![0_u8; body_len];
-        stream
-            .read_exact(&mut body)
-            .expect("read client handshake body");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("malformed IPC runtime");
+        runtime.block_on(async move {
+            let mut listener = LocalListener::bind(&endpoint).expect("malformed IPC listener");
+            ready_tx.send(()).expect("malformed IPC ready");
+            tokio::select! {
+                _ = shutdown_rx => {},
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let mut stream = listener.accept().await.expect("malformed IPC accept");
+                    let mut length = [0_u8; 4];
+                    stream.read_exact(&mut length).await.expect("read client handshake length");
+                    let body_len = u32::from_le_bytes(length) as usize;
+                    let mut body = vec![0_u8; body_len];
+                    stream.read_exact(&mut body).await.expect("read client handshake body");
 
-        let mut malformed = Vec::with_capacity(16);
-        malformed.extend_from_slice(&12_u32.to_le_bytes());
-        malformed.extend_from_slice(&0_u64.to_le_bytes());
-        malformed.extend_from_slice(&(1_u32 << 1).to_le_bytes());
-        stream
-            .write_all(&malformed)
-            .expect("write non-handshake response");
+                    let mut malformed = Vec::with_capacity(16);
+                    malformed.extend_from_slice(&12_u32.to_le_bytes());
+                    malformed.extend_from_slice(&0_u64.to_le_bytes());
+                    malformed.extend_from_slice(&(1_u32 << 1).to_le_bytes());
+                    stream.write_all(&malformed).await.expect("write non-handshake response");
+                    // Keep the pipe alive until the client consumes the invalid
+                    // response and closes; closing a Windows server pipe early
+                    // can discard bytes still waiting in its buffer.
+                    let mut extra = [0_u8; 1];
+                    let _ = stream.read(&mut extra).await;
+                }) => result.expect("malformed IPC exchange must finish"),
+            }
+        });
     });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("malformed IPC readiness");
     MalformedIpcServer {
         address,
-        socket_path,
+        shutdown: Some(shutdown_tx),
         thread: Some(thread),
     }
 }

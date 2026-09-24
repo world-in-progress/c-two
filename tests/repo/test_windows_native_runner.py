@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 
 def _runner():
@@ -34,3 +36,32 @@ def test_timeout_records_failure_and_reaps_child(tmp_path):
     assert record["process_exited"] is True
     assert record["exit_code"] != 0
     assert "started" in (tmp_path / "timeout.log").read_text()
+
+
+def test_failed_prerequisite_marks_scope_failed_and_runs_independent_gate(tmp_path, monkeypatch):
+    runner = _runner()
+    # Exercise the Windows evidence orchestration with real portable child
+    # commands; this test does not claim to execute a Windows native backend.
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
+    monkeypatch.setattr(runner, "gates", lambda python, output, scope: [
+        ("install", [sys.executable, "-c", "raise SystemExit(7)"], ()),
+        ("dependent", [sys.executable, "-c", "raise AssertionError('must not run')"], ("install",)),
+        ("independent", [sys.executable, "-c", "print('independent executed')"], ()),
+    ])
+    output = tmp_path / "evidence"
+    result = runner.main([
+        "--scope", "local-platform", "--output", str(output),
+        "--expected-c-two-sha", "a" * 40, "--expected-fastdb-sha", "a" * 40,
+    ])
+    evidence = json.loads((output / "run-evidence.json").read_text())
+    assert result == 1
+    assert evidence["status"] == "failed"
+    assert evidence["scope"] == "local-platform"
+    assert evidence["applicable_gates"] == ["install", "dependent", "independent"]
+    assert [step["status"] for step in evidence["steps"]] == ["failed", "not_run", "passed"]
+    assert evidence["steps"][0]["exit_code"] == 7
+    assert not (output / "dependent.log").exists()
+    assert "independent executed" in (output / "independent.log").read_text()

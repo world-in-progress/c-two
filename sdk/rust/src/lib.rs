@@ -17,7 +17,7 @@ pub use c2_core::{
     ObservedPath, ObservedRoute, PathCounters, Registration, RouteConcurrency,
     RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot, Runtime,
     RuntimeIdentity, RuntimeOptions, ServiceConcurrencyMode, ServiceDefinition,
-    direct_ipc_socket_path, ping_direct_ipc, shutdown_direct_ipc,
+    direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc,
 };
 pub use error::Error;
 pub use held::Held;

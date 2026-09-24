@@ -996,7 +996,7 @@ fn valid_server_instance_id(value: &str) -> bool {
 }
 
 fn valid_ipc_address(address: &str) -> bool {
-    c2_ipc::socket_path_from_ipc_address(address).is_ok()
+    c2_ipc::local_endpoint_from_ipc_address(address).is_ok()
 }
 
 pub(crate) fn valid_relay_url(url: &str) -> bool {

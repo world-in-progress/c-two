@@ -369,7 +369,7 @@ Protocol-agnostic communication with automatic protocol detection based on addre
 | `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
 | `http://host:port` | HTTP relay | Cross-machine, web-compatible |
 
-The IPC transport uses a **control-plane / data-plane separation**: method routing flows through UDS inline frames while payload bytes can be exchanged via shared memory. The current portable FastDB receive path is copy-backed. `cc.hold()` and `cc.InputLifetime.BORROWED` provide explicit invalidation/lease boundaries without implying direct FastDB construction in transport memory.
+The IPC transport separates its control and data paths: method routing uses local stream frames (Unix UDS or Windows Named Pipes), while payload bytes can be exchanged through native shared mappings. The current portable FastDB receive path is copy-backed. `cc.hold()` and `cc.InputLifetime.BORROWED` provide explicit invalidation/lease boundaries without implying direct FastDB construction in transport memory. Windows implementation and execution evidence are tracked in [the implementation record](docs/windows-native-implementation.md).
 
 ### Rust Native Layer
 

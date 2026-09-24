@@ -9,15 +9,13 @@ Usage:
 from __future__ import annotations
 
 import gc
-import glob
 import math
-import os
 import statistics
 import sys
 import time
 
 import c_two as cc
-from c_two.transport.client.util import _socket_path_from_address
+from c_two.transport.client.util import ping
 from c_two.transport.registry import _ProcessRegistry
 
 # ── Echo CRMs ─────────────────────────────────────────────────────────
@@ -68,23 +66,13 @@ def _rounds(size: int) -> int:
 
 _counter = 0
 
-def _wait_sock(address: str, timeout: float = 5.0) -> None:
-    """Wait for the UDS socket file to appear."""
-    import pathlib
-    sock = pathlib.Path(_socket_path_from_address(address))
+def _wait_for_ipc(address: str, timeout: float = 5.0) -> None:
+    """Probe the native IPC server until it is responsive."""
     t0 = time.monotonic()
-    while not sock.exists():
+    while not ping(address, timeout=0.5):
         if time.monotonic() - t0 > timeout:
             break
         time.sleep(0.01)
-
-
-def _cleanup() -> None:
-    for f in glob.glob('/tmp/c_two_ipc/bench_seg_*.sock'):
-        try:
-            os.unlink(f)
-        except OSError:
-            pass
 
 
 # ── Benchmark runners ─────────────────────────────────────────────────
@@ -104,7 +92,7 @@ def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
     cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(Echo, EchoImpl(), name='echo_b')
     address = cc.server_address()
-    _wait_sock(address)
+    _wait_for_ipc(address)
 
     payload = b'\xAB' * payload_size
     rounds = _rounds(payload_size)
@@ -151,7 +139,7 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
     cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(DictEcho, DictEchoImpl(), name='echo_d')
     address = cc.server_address()
-    _wait_sock(address)
+    _wait_for_ipc(address)
 
     # Build a dict payload of approximately the target size.
     # Use a large binary field to control size precisely.
@@ -187,7 +175,6 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main() -> None:
-    _cleanup()
 
     py_ver = sys.version.split('\n')[0]
     print('=' * 120)
@@ -255,7 +242,6 @@ def main() -> None:
             d = f'{r[1]:.4f}' if r[1] else ''
             print(f'{size_label}\t{seg_label}\t{b}\t{d}')
 
-    _cleanup()
 
 
 if __name__ == '__main__':

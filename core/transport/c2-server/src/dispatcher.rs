@@ -39,6 +39,7 @@ pub enum ResponseMeta {
     /// CRM wrote result into response SHM (via pool.alloc + pool.write).
     ShmAlloc {
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
@@ -62,11 +63,12 @@ pub enum RequestData {
     Shm {
         pool: Arc<parking_lot::RwLock<MemPool>>,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
     },
-    /// Inline bytes from UDS frame.
+    /// Inline bytes from a local IPC frame.
     Inline(Vec<u8>),
     /// Reassembled MemHandle from chunked transfer.
     /// ShmBuffer.release() returns handle to pool.
@@ -83,12 +85,19 @@ impl RequestData {
             Self::Shm {
                 pool,
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
             } => pool
                 .read()
-                .copy_data_at(u32::from(*seg_idx), *offset, *data_size, *is_dedicated)
+                .copy_data_at(
+                    u32::from(*seg_idx),
+                    *generation,
+                    *offset,
+                    *data_size,
+                    *is_dedicated,
+                )
                 .map_err(|error| format!("request SHM copy failed: {error}")),
             Self::Handle { handle, pool } => pool
                 .read()
@@ -103,15 +112,28 @@ impl RequestData {
             Self::Shm {
                 pool,
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
             } => {
                 let mut pool = pool.write();
-                pool.validate_data_at(u32::from(seg_idx), offset, data_size, is_dedicated)
-                    .map_err(|error| format!("request SHM release validation failed: {error}"))?;
-                pool.free_at(u32::from(seg_idx), offset, data_size, is_dedicated)
-                    .map_err(|error| format!("request SHM release failed: {error}"))?;
+                pool.validate_data_at(
+                    u32::from(seg_idx),
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                )
+                .map_err(|error| format!("request SHM release validation failed: {error}"))?;
+                pool.free_at(
+                    u32::from(seg_idx),
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                )
+                .map_err(|error| format!("request SHM release failed: {error}"))?;
                 Ok(())
             }
             Self::Handle { handle, pool } => {
@@ -129,18 +151,24 @@ fn release_request_handle(pool: &mut MemPool, handle: MemHandle) -> Result<(), S
     match handle {
         MemHandle::Buddy {
             seg_idx,
+            generation,
             offset,
-            len,
+            allocation_size,
+            ..
         } => {
-            let data_size = u32::try_from(len)
-                .map_err(|_| "request buddy handle length exceeds the wire address space")?;
-            pool.free_at(u32::from(seg_idx), offset, data_size, false)
-                .map_err(|error| format!("request handle release failed: {error}"))?;
+            pool.free_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                allocation_size,
+                false,
+            )
+            .map_err(|error| format!("request handle release failed: {error}"))?;
         }
         MemHandle::Dedicated { seg_idx, len } => {
             let data_size = u32::try_from(len)
                 .map_err(|_| "request dedicated handle length exceeds the wire address space")?;
-            pool.free_at(u32::from(seg_idx), 0, data_size, true)
+            pool.free_at(u32::from(seg_idx), 0, 0, data_size, true)
                 .map_err(|error| format!("request handle release failed: {error}"))?;
         }
         MemHandle::FileSpill { .. } => {}
@@ -226,13 +254,14 @@ impl std::fmt::Debug for RequestData {
         match self {
             RequestData::Shm {
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
                 ..
             } => write!(
                 f,
-                "RequestData::Shm(seg={seg_idx}, off={offset}, size={data_size}, ded={is_dedicated})"
+                "RequestData::Shm(seg={seg_idx}, gen={generation}, off={offset}, size={data_size}, ded={is_dedicated})"
             ),
             RequestData::Inline(v) => write!(f, "RequestData::Inline({} bytes)", v.len()),
             RequestData::Handle { .. } => write!(f, "RequestData::Handle"),
@@ -576,6 +605,7 @@ mod tests {
         let mut lease = RequestLease::new(RequestData::Shm {
             pool: Arc::clone(&pool),
             seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+            generation: allocation.generation,
             offset: allocation.offset,
             data_size: u32::try_from(payload.len()).unwrap(),
             is_dedicated: allocation.is_dedicated,
@@ -601,6 +631,7 @@ mod tests {
             let request = RequestData::Shm {
                 pool: Arc::clone(&pool),
                 seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+                generation: allocation.generation,
                 offset: allocation.offset,
                 data_size: u32::try_from(payload.len()).unwrap(),
                 is_dedicated: allocation.is_dedicated,
@@ -627,6 +658,7 @@ mod tests {
         let request = RequestData::Shm {
             pool: Arc::clone(&pool),
             seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+            generation: allocation.generation,
             offset: u32::try_from(capacity - 1).unwrap(),
             data_size: 2,
             is_dedicated: false,
@@ -645,20 +677,23 @@ mod tests {
     #[test]
     fn request_data_handle_materializes_and_releases_reassembly_allocation() {
         let payload = b"reassembled".repeat(512);
-        let mut pool = request_test_pool();
-        let mut handle = pool.alloc_handle(payload.len()).unwrap();
-        pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
-        let pool = Arc::new(parking_lot::RwLock::new(pool));
-        let request = RequestData::Handle {
-            handle,
-            pool: Arc::clone(&pool),
-        };
+        for logical_len in [payload.len(), 4096, 1, 0] {
+            let mut pool = request_test_pool();
+            let mut handle = pool.alloc_handle(payload.len()).unwrap();
+            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+            handle.set_len(logical_len);
+            let pool = Arc::new(parking_lot::RwLock::new(pool));
+            let request = RequestData::Handle {
+                handle,
+                pool: Arc::clone(&pool),
+            };
 
-        assert_eq!(
-            RequestLease::new(request).into_owned_bytes().unwrap(),
-            payload
-        );
-        assert_eq!(pool.read().stats().alloc_count, 0);
+            assert_eq!(
+                RequestLease::new(request).into_owned_bytes().unwrap(),
+                payload[..logical_len]
+            );
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        }
     }
 
     #[test]

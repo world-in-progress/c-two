@@ -11,4 +11,5 @@ name = "c2_mem_ffi"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
+c2-config = { version = "0.1.0", path = "../c2-config" }
 c2-mem = { version = "0.1.0", path = "../c2-mem" }

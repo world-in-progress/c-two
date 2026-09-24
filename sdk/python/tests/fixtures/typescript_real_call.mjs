@@ -24,22 +24,26 @@ const payloadApi = config.payloadModule === null
   ? undefined
   : await import(pathToFileURL(config.payloadModule).href);
 const observations = [];
-const nodeRuntime = createBundledC2MemFfiNodeRuntime();
-const responseShmReader = contract.createC2MemFfiNativeBuddyResponseShmReader({
-  binding: nodeRuntime.responsePoolFactory,
-});
+let responseShmReader;
 
-function transportFor(responsePayloadAllocator) {
-  const observe = (observation) => observations.push(observation);
-  const ipc = {
+function localIpcOptions(responsePayloadAllocator) {
+  const nodeRuntime = createBundledC2MemFfiNodeRuntime();
+  responseShmReader ??= contract.createC2MemFfiNativeResponseShmReader({
+    binding: nodeRuntime.responsePoolFactory,
+  });
+  return {
     connect: nodeRuntime.connect,
     responseShmReader,
     requestChunkSize: 64 * 1024,
     responsePayloadAllocator,
   };
+}
+
+function transportFor(responsePayloadAllocator) {
+  const observe = (observation) => observations.push(observation);
   if (config.mode === 'direct-ipc') {
     return contract.createIpcEncodedTransport(config.endpoint, {
-      ...ipc,
+      ...localIpcOptions(responsePayloadAllocator),
       observe,
     });
   }
@@ -53,7 +57,7 @@ function transportFor(responsePayloadAllocator) {
   if (config.mode === 'relay-aware-local-ipc') {
     return contract.createRelayAwareHttpEncodedTransport(config.endpoint, {
       observe,
-      ipc,
+      ipc: localIpcOptions(responsePayloadAllocator),
       responsePayloadAllocator,
       responsePayloadUnknownLengthStrategy: 'buffer',
     });
@@ -455,7 +459,7 @@ try {
     opaqueAllocator = await proveOpaqueAllocatorRelease();
   }
 } finally {
-  await responseShmReader.close();
+  await responseShmReader?.close();
 }
 
 const expectedPath = {

@@ -2,8 +2,10 @@ import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 import { runCargo } from './cargo-tools.mjs';
+import { nativeLibraryName } from './platform.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDir, '..');
@@ -13,11 +15,6 @@ const distNative = resolve(packageRoot, 'dist', 'native');
 const output = resolve(distNative, 'c2_mem_ffi_node.node');
 const nodeInclude = resolve(process.execPath, '..', '..', 'include', 'node');
 const c2MemFfiInclude = resolve(crateRoot, 'include');
-
-if (process.platform === 'win32') {
-  console.log('Skipping c2-mem-ffi Node addon build on Windows; POSIX SHM support is required.');
-  process.exit(0);
-}
 
 mkdirSync(distNative, { recursive: true });
 
@@ -43,10 +40,24 @@ try {
 }
 
 const targetDirectory = JSON.parse(metadata.stdout).target_directory;
-const libraryName = process.platform === 'darwin'
-  ? 'libc2_mem_ffi.dylib'
-  : 'libc2_mem_ffi.so';
+const libraryName = nativeLibraryName();
 copyFileSync(resolve(targetDirectory, 'debug', libraryName), resolve(distNative, libraryName));
+
+if (process.platform === 'win32') {
+  // node-gyp resolves the matching Node headers/import library and MSVC tools.
+  const require = createRequire(import.meta.url);
+  const nodeGyp = require.resolve('node-gyp/bin/node-gyp.js');
+  const result = spawnSync(process.execPath, [nodeGyp, 'rebuild', '--release'], {
+    cwd: packageRoot,
+    stdio: 'inherit',
+  });
+  if (result.error || result.status !== 0) {
+    console.error(result.error?.message ?? `node-gyp failed with exit ${result.status}`);
+    process.exit(result.status ?? 1);
+  }
+  copyFileSync(resolve(packageRoot, 'build', 'Release', 'c2_mem_ffi_node.node'), output);
+  process.exit(0);
+}
 
 const cc = process.env.CC || 'cc';
 const args = [

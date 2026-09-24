@@ -4,7 +4,7 @@ Provides the Python CRM dispatch surface while delegating registration,
 transport, scheduling, and lifecycle to ``c2-core`` through PyO3.
 
 CRM domain logic (CRM instance creation, method discovery, dispatch tables,
-shutdown callbacks) remains in Python.  Only the UDS accept loop,
+shutdown callbacks) remains in Python.  The native local accept loop,
 frame parsing, heartbeat, and concurrency scheduling move to Rust.
 """
 from __future__ import annotations

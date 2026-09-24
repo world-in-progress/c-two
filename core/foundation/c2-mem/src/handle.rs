@@ -1,6 +1,6 @@
 //! Unified memory handle abstracting buddy, dedicated, and file-spill backends.
 
-use memmap2::MmapMut;
+use crate::spill::SpillMapping;
 use std::path::PathBuf;
 
 /// A handle to an allocated memory region.
@@ -14,14 +14,17 @@ pub enum MemHandle {
     /// T1/T2: allocation within a buddy segment.
     Buddy {
         seg_idx: u16,
+        generation: u32,
         offset: u32,
+        /// Original buddy block capacity; logical length may shrink after assembly.
+        allocation_size: u32,
         len: usize,
     },
     /// T3: dedicated SHM segment.
     Dedicated { seg_idx: u16, len: usize },
     /// T4: file-backed mmap (disk spill).
     FileSpill {
-        mmap: MmapMut,
+        mmap: SpillMapping,
         path: PathBuf,
         len: usize,
     },
@@ -68,12 +71,14 @@ impl std::fmt::Debug for MemHandle {
         match self {
             Self::Buddy {
                 seg_idx,
+                generation,
                 offset,
+                allocation_size,
                 len,
             } => {
                 write!(
                     f,
-                    "MemHandle::Buddy(seg={seg_idx}, off={offset}, len={len})"
+                    "MemHandle::Buddy(seg={seg_idx}, gen={generation}, off={offset}, capacity={allocation_size}, len={len})"
                 )
             }
             Self::Dedicated { seg_idx, len } => {
@@ -98,7 +103,9 @@ mod tests {
     fn test_buddy_handle_len() {
         let h = MemHandle::Buddy {
             seg_idx: 0,
+            generation: 1,
             offset: 1024,
+            allocation_size: 4096,
             len: 4096,
         };
         assert_eq!(h.len(), 4096);

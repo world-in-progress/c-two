@@ -1,28 +1,7 @@
-import { spawnSync } from 'node:child_process';
+import { runNpm } from './npm-tools.mjs';
+import { nativeLibraryName } from './platform.mjs';
 
-function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    encoding: 'utf8',
-    ...options,
-  });
-  if (result.error) {
-    console.error(result.error.message);
-    process.exit(1);
-  }
-  if (result.status !== 0) {
-    process.stdout.write(result.stdout ?? '');
-    process.stderr.write(result.stderr ?? '');
-    process.exit(result.status ?? 1);
-  }
-  return result;
-}
 
-function runNpm(args, options = {}) {
-  if (process.env.npm_execpath) {
-    return run(process.execPath, [process.env.npm_execpath, ...args], options);
-  }
-  return run('npm', args, options);
-}
 
 const result = runNpm(['pack', '--dry-run', '--json', '--ignore-scripts']);
 
@@ -48,9 +27,7 @@ const required = [
   'dist/index.js',
   'dist/index.d.ts',
   'dist/native/c2_mem_ffi_node.node',
-  process.platform === 'darwin'
-    ? 'dist/native/libc2_mem_ffi.dylib'
-    : 'dist/native/libc2_mem_ffi.so',
+  `dist/native/${nativeLibraryName()}`,
 ];
 
 const missing = required.filter((path) => !files.has(path));

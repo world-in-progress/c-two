@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tokio-based UDS server for C-Two IPC transport"
+description = "Tokio-based local server for C-Two IPC transport"
 
 [dependencies]
 c2-config = { version = "0.1.0", path = "../../foundation/c2-config" }
@@ -12,6 +12,7 @@ c2-error = { version = "0.1.0", path = "../../foundation/c2-error" }
 c2-contract = { version = "0.1.0", path = "../../foundation/c2-contract" }
 c2-wire = { version = "0.1.0", path = "../../protocol/c2-wire" }
 c2-mem = { version = "0.1.0", path = "../../foundation/c2-mem" }
+c2-local = { version = "0.1.0", path = "../c2-local" }
 parking_lot = { workspace = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
 tracing = "0.1"

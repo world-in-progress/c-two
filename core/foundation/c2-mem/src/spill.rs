@@ -3,12 +3,34 @@
 //! Provides:
 //! - [`available_physical_memory`] — query OS for free physical RAM
 //! - [`should_spill`] — decide if an allocation should go to disk
-//! - [`create_file_spill`] — create a file-backed mmap with unlink-on-create
+//! - [`create_file_spill`] — create a private mapping with OS-owned cleanup
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::MmapMut;
+
+/// The mapping closes before its backing file. On Windows the file carries
+/// DELETE_ON_CLOSE, so normal drop and process termination both remove it.
+#[derive(Debug)]
+pub struct SpillMapping {
+    mapping: MmapMut,
+    _file: std::fs::File,
+}
+
+impl std::ops::Deref for SpillMapping {
+    type Target = MmapMut;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mapping
+    }
+}
+
+impl std::ops::DerefMut for SpillMapping {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.mapping
+    }
+}
 
 static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -58,9 +80,21 @@ pub fn available_physical_memory() -> u64 {
     0 // fallback: always spill
 }
 
+// Windows paging-file-backed mappings consume commit as well as RAM.
+#[cfg(windows)]
+pub fn available_physical_memory() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return 0;
+    }
+    status.ullAvailPhys.min(status.ullAvailPageFile)
+}
+
 // ── Platform: Other ────────────────────────────────────────────────
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn available_physical_memory() -> u64 {
     0 // conservative: always spill on unknown platforms
 }
@@ -86,14 +120,20 @@ pub fn should_spill(requested: usize, threshold: f64) -> bool {
 
 // ── File-backed mmap ───────────────────────────────────────────────
 
-/// Create a file-backed mmap buffer with unlink-on-create semantics.
-///
-/// The file is removed from the directory immediately after mmap, but
-/// the mapping remains valid (POSIX guarantee). On process crash the
-/// OS reclaims the fd + mmap — no residual files.
+/// Create a private file-backed mapping. Unix unlinks the open file;
+/// Windows deletes it when the owned mapping and file handle close.
 ///
 /// Returns `(mmap, path)` where `path` is for logging/debug only.
-pub fn create_file_spill(size: usize, spill_dir: &Path) -> std::io::Result<(MmapMut, PathBuf)> {
+pub fn create_file_spill(
+    size: usize,
+    spill_dir: &Path,
+) -> std::io::Result<(SpillMapping, PathBuf)> {
+    if size == 0 || size > isize::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid spill size",
+        ));
+    }
     std::fs::create_dir_all(spill_dir)?;
 
     let pid = std::process::id();
@@ -101,20 +141,39 @@ pub fn create_file_spill(size: usize, spill_dir: &Path) -> std::io::Result<(Mmap
     let filename = format!("c2_{pid}_{seq}.spill");
     let path = spill_dir.join(&filename);
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+        };
+        options
+            .share_mode(0)
+            .custom_flags(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE);
+    }
+    let file = options.open(&path)?;
+    // Unlink before fallible sizing/mapping on Unix, so errors also clean up.
+    #[cfg(unix)]
+    std::fs::remove_file(&path)?;
     file.set_len(size as u64)?;
 
     // SAFETY: file is freshly created and exclusively owned.
     let mmap = unsafe { MmapMut::map_mut(&file)? };
 
-    // Unlink-on-create: remove from directory, mmap stays valid.
-    let _ = std::fs::remove_file(&path);
-
-    Ok((mmap, path))
+    Ok((
+        SpillMapping {
+            mapping: mmap,
+            _file: file,
+        },
+        path,
+    ))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -126,7 +185,7 @@ mod tests {
     #[test]
     fn test_available_physical_memory_returns_nonzero() {
         let mem = available_physical_memory();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         assert!(mem > 0, "expected nonzero available memory, got {mem}");
     }
 
@@ -157,6 +216,10 @@ mod tests {
         mmap.flush().unwrap();
         assert_eq!(&mmap[..pattern.len()], pattern);
 
+        // Windows marks the file for deletion while the mapping is live.
+        // The last owned view/handle release completes that deletion.
+        drop(mmap);
+
         let entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -175,5 +238,62 @@ mod tests {
         drop(mmap);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_process_child() {
+        let Some(directory) = std::env::var_os("C2_TEST_SPILL_CHILD_DIR") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let (mut mapping, _) = create_file_spill(8192, &directory).unwrap();
+        mapping[..4].copy_from_slice(b"live");
+        std::fs::write(directory.join("ready"), b"ready").unwrap();
+        // Parent intentionally kills this process while its mapping is live.
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::hint::black_box(mapping);
+    }
+
+    #[test]
+    fn spill_is_removed_when_owner_process_is_killed() {
+        let directory = std::env::temp_dir().join(format!("c2_spill_crash_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let ready = directory.join("ready");
+        let _ = std::fs::remove_file(&ready);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "spill::tests::spill_process_child",
+                "--nocapture",
+            ])
+            .env("C2_TEST_SPILL_CHILD_DIR", &directory)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let was_ready = ready.exists();
+        let _ = child.kill();
+        child.wait().unwrap();
+        let remaining: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "spill")
+            })
+            .collect();
+        let _ = std::fs::remove_file(&ready);
+        let _ = std::fs::remove_dir(&directory);
+        assert!(was_ready, "child did not create its live spill mapping");
+        assert!(
+            remaining.is_empty(),
+            "spill files survive killed owner: {remaining:?}"
+        );
     }
 }

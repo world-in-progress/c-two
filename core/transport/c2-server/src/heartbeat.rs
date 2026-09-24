@@ -5,8 +5,7 @@
 
 use std::sync::Arc;
 
-use tokio::io::AsyncWriteExt;
-use tokio::net::unix::OwnedWriteHalf;
+use c2_local::LocalWriteHalf;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, interval};
 use tracing::warn;
@@ -51,7 +50,7 @@ fn build_ping_frame() -> Vec<u8> {
 /// - If `heartbeat_interval` ≤ 0 → heartbeat is disabled; waits forever.
 pub async fn run_heartbeat(
     conn: Arc<Connection>,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: Arc<Mutex<LocalWriteHalf>>,
     config: &ServerIpcConfig,
 ) -> HeartbeatResult {
     if config.heartbeat_interval_secs <= 0.0 {
@@ -66,6 +65,7 @@ pub async fn run_heartbeat(
     ticker.tick().await;
 
     let ping_frame = build_ping_frame();
+    let abort = writer.lock().await.abort_handle();
 
     loop {
         ticker.tick().await;
@@ -77,6 +77,7 @@ pub async fn run_heartbeat(
                 idle_secs = format!("{idle:.1}"),
                 "heartbeat timeout — closing connection"
             );
+            abort.abort();
             return HeartbeatResult::TimedOut;
         }
 
@@ -126,8 +127,8 @@ mod tests {
         // We can't easily test "parks forever", so we race it against a timeout.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
-        // We need a real UDS pair for the writer; use a dummy.
-        let (sock_a, _sock_b) = tokio::net::UnixStream::pair().unwrap();
+        // Exercise the actual local OS backend while heartbeat is disabled.
+        let (sock_a, _sock_b) = c2_local::LocalStream::pair().await.unwrap();
         let (_reader, write_half) = sock_a.into_split();
         let writer = Arc::new(Mutex::new(write_half));
 
@@ -160,7 +161,7 @@ mod tests {
             ..ServerIpcConfig::default()
         };
 
-        let (sock_a, sock_b) = tokio::net::UnixStream::pair().unwrap();
+        let (sock_a, sock_b) = c2_local::LocalStream::pair().await.unwrap();
         let (_read_a, write_half) = sock_a.into_split();
         let (mut read_b, _write_b) = sock_b.into_split();
         let writer = Arc::new(Mutex::new(write_half));
@@ -187,6 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_timeout_returns() {
+        use tokio::io::AsyncReadExt;
         let conn = Arc::new(Connection::new(1));
         let config = ServerIpcConfig {
             heartbeat_interval_secs: 0.05,
@@ -194,7 +196,7 @@ mod tests {
             ..ServerIpcConfig::default()
         };
 
-        let (sock_a, _sock_b) = tokio::net::UnixStream::pair().unwrap();
+        let (sock_a, mut sock_b) = c2_local::LocalStream::pair().await.unwrap();
         let (_read_a, write_half) = sock_a.into_split();
         let writer = Arc::new(Mutex::new(write_half));
 
@@ -207,5 +209,15 @@ mod tests {
             "heartbeat should return before outer timeout"
         );
         assert_eq!(result.unwrap(), HeartbeatResult::TimedOut);
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), sock_b.read_to_end(&mut received))
+            .await
+            .expect("nonresponding peer must observe EOF")
+            .expect("peer read should finish cleanly");
+        assert!(
+            !received.is_empty(),
+            "peer must receive a PING before timeout"
+        );
+        assert!(received.chunks_exact(17).all(|frame| frame[16] == 0x01));
     }
 }

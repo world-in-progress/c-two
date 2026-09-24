@@ -1,18 +1,19 @@
-//! Async IPC client — connects to a C-Two IPC server via UDS.
+//! Async IPC client — connects to a C-Two IPC server through a local OS stream.
 //!
 //! Performs handshake, then multiplexes concurrent requests over
-//! a single UDS connection using request IDs.
+//! a single local connection using request IDs.
 
 use parking_lot::{Mutex as StdMutex, RwLock};
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use c2_local::{
+    AbortHandle, DEFAULT_CONNECT_TIMEOUT, LocalEndpoint, LocalReadHalf, LocalStream, LocalWriteHalf,
+};
 use futures_util::{Stream, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, oneshot};
 
 use c2_error::ErrorCode;
@@ -63,33 +64,6 @@ pub struct ServerPoolState {
 }
 
 impl ServerPoolState {
-    fn buddy_segment_name(prefix: &str, idx: usize) -> String {
-        format!("{}_{}{:04x}", prefix, "b", idx)
-    }
-
-    fn dedicated_segment_name(prefix: &str, idx: u32) -> String {
-        format!("{}_{}{:04x}", prefix, "d", idx)
-    }
-
-    /// Ensure the pool has the buddy segment at `seg_idx` open.
-    fn ensure_buddy_segment(&mut self, seg_idx: u16) -> Result<(), String> {
-        let idx = seg_idx as usize;
-        if idx < self.pool.segment_count() {
-            return Ok(());
-        }
-        for i in self.pool.segment_count()..=idx {
-            let name = Self::buddy_segment_name(&self.prefix, i);
-            self.pool.open_segment(&name, self.buddy_segment_size)?;
-        }
-        Ok(())
-    }
-
-    /// Ensure a dedicated segment is open at the specific index.
-    fn ensure_dedicated_segment(&mut self, seg_idx: u16, min_size: usize) -> Result<(), String> {
-        let name = Self::dedicated_segment_name(&self.prefix, seg_idx as u32);
-        self.pool.open_dedicated_at(seg_idx as u32, &name, min_size)
-    }
-
     /// Lazy-open the segment for the given coordinates if not yet mapped.
     ///
     /// Called transparently by language binding response buffers before any
@@ -98,13 +72,23 @@ impl ServerPoolState {
     pub fn ensure_segment(
         &mut self,
         seg_idx: u16,
+        generation: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<(), String> {
         if is_dedicated {
-            self.ensure_dedicated_segment(seg_idx, data_size as usize)
+            if generation != 0 {
+                return Err("dedicated generation must be zero".into());
+            }
+            let name = MemPool::dedicated_segment_name(&self.prefix, u32::from(seg_idx));
+            self.pool
+                .open_dedicated_at(u32::from(seg_idx), &name, data_size as usize)
         } else {
-            self.ensure_buddy_segment(seg_idx)
+            self.pool.ensure_peer_segment(
+                u32::from(seg_idx),
+                generation,
+                self.buddy_segment_size.max(data_size as usize),
+            )
         }
     }
 
@@ -113,13 +97,20 @@ impl ServerPoolState {
     pub fn copy_response(
         &mut self,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<Vec<u8>, String> {
-        self.ensure_segment(seg_idx, data_size, is_dedicated)?;
+        self.ensure_segment(seg_idx, generation, data_size, is_dedicated)?;
         self.pool
-            .copy_data_at(u32::from(seg_idx), offset, data_size, is_dedicated)
+            .copy_data_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            )
             .map_err(|error| format!("response SHM copy failed: {error}"))
     }
 
@@ -129,16 +120,29 @@ impl ServerPoolState {
     pub fn release_response(
         &mut self,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<(), String> {
-        self.ensure_segment(seg_idx, data_size, is_dedicated)?;
+        self.ensure_segment(seg_idx, generation, data_size, is_dedicated)?;
         self.pool
-            .validate_data_at(u32::from(seg_idx), offset, data_size, is_dedicated)
+            .validate_data_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            )
             .map_err(|error| format!("response SHM release failed: validation failed: {error}"))?;
         self.pool
-            .free_at(u32::from(seg_idx), offset, data_size, is_dedicated)
+            .free_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            )
             .map_err(|error| format!("response SHM release failed: {error}"))?;
         Ok(())
     }
@@ -158,7 +162,7 @@ impl ServerPoolState {
 /// IPC client error.
 #[derive(Debug)]
 pub enum IpcError {
-    /// I/O error on the UDS connection.
+    /// I/O error on the local connection.
     Io(std::io::Error),
     /// Invalid client configuration or IPC address.
     Config(String),
@@ -707,12 +711,12 @@ where
 
 /// Async IPC client for the C-Two relay.
 ///
-/// Connects to a C-Two IPC server via Unix Domain Socket, performs
+/// Connects to a C-Two IPC server through its local OS endpoint, performs
 /// handshake, and multiplexes concurrent CRM calls.
 pub struct IpcClient {
-    socket_path: PathBuf,
-    address_error: Option<String>,
-    writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+    endpoint: Result<LocalEndpoint, String>,
+    abort: Arc<StdMutex<Option<AbortHandle>>>,
+    writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     pending: Arc<StdMutex<PendingMap>>,
     rid_counter: Arc<AtomicU32>,
     pub(crate) route_directory: Arc<RwLock<RouteDirectory>>,
@@ -743,23 +747,13 @@ const _: () = {
     }
 };
 
-/// Monotonic counter so each reassembly MemPool gets a unique SHM prefix.
-/// Format: `/cc3a{pid:08x}{counter:08x}` — 32-bit range, 27 chars max.
+/// Label counter for reassembly pools. MemPool adds its incarnation and owns
+/// platform segment-name derivation.
 static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic counter so each IpcClient gets a unique conn_id.
 static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLIENT_OWN_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn socket_path_from_address(address: &str) -> (PathBuf, Option<String>) {
-    match crate::control::socket_path_from_ipc_address(address) {
-        Ok(path) => (path, None),
-        Err(error) => (
-            PathBuf::from("/tmp/c_two_ipc").join("invalid.sock"),
-            Some(error.to_string()),
-        ),
-    }
-}
 
 impl IpcClient {
     fn own_pool_from_config(config: &ClientIpcConfig) -> Option<Arc<StdMutex<MemPool>>> {
@@ -784,11 +778,12 @@ impl IpcClient {
         pool: Option<Arc<StdMutex<MemPool>>>,
         config: ClientIpcConfig,
     ) -> Self {
-        let (socket_path, address_error) = socket_path_from_address(address);
+        let endpoint = crate::control::local_endpoint_from_ipc_address(address)
+            .map_err(|error| error.to_string());
 
         Self {
-            socket_path,
-            address_error,
+            endpoint,
+            abort: Arc::new(StdMutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: Arc::new(AtomicU32::new(1)),
@@ -824,8 +819,7 @@ impl IpcClient {
 
     /// Create a new IPC client targeting the given address.
     ///
-    /// The address should be like `ipc://name` — the socket path is
-    /// derived as `/tmp/c_two_ipc/{name}.sock`.
+    /// The address is logical (`ipc://name`); Rust derives the local OS endpoint.
     pub fn new(address: &str) -> Self {
         Self::from_parts(address, None, ClientIpcConfig::default())
     }
@@ -850,11 +844,13 @@ impl IpcClient {
 
     /// Connect and perform handshake.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
-        if let Some(error) = self.address_error.clone() {
-            return Err(IpcError::Config(error));
-        }
-        let stream = UnixStream::connect(&self.socket_path).await?;
-        let (reader, mut writer) = tokio::io::split(stream);
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .map_err(|error| IpcError::Config(error.clone()))?;
+        let stream = LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT).await?;
+        *self.abort.lock() = Some(stream.abort_handle());
+        let (reader, mut writer) = stream.into_split();
 
         // Pre-allocate first SHM segment so handshake announces it.
         if let Some(ref pool_arc) = self.pool {
@@ -864,7 +860,17 @@ impl IpcClient {
         }
 
         // Perform handshake.
-        let hs = self.do_handshake(&mut writer, reader).await?;
+        let hs = tokio::time::timeout(
+            DEFAULT_CONNECT_TIMEOUT,
+            self.do_handshake(&mut writer, reader),
+        )
+        .await
+        .map_err(|_| {
+            IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "local handshake deadline expired",
+            ))
+        })??;
         let server_identity = hs
             .server_identity
             .clone()
@@ -875,8 +881,12 @@ impl IpcClient {
         self.server_identity = Some(server_identity);
 
         // Open server SHM segments into a ServerPoolState for buddy response reads.
-        if !hs.segments.is_empty() {
-            let buddy_seg_size = hs.segments[0].1 as usize;
+        {
+            let buddy_seg_size = hs
+                .segments
+                .first()
+                .map(|(_, size)| *size as usize)
+                .unwrap_or(self.config.pool_segment_size as usize);
             let cfg = c2_mem::config::PoolConfig {
                 segment_size: buddy_seg_size,
                 min_block_size: 4096,
@@ -885,14 +895,9 @@ impl IpcClient {
                 dedicated_crash_timeout_secs: 60.0,
                 buddy_idle_decay_secs: 60.0,
                 spill_threshold: 1.0,
-                spill_dir: std::path::PathBuf::from("/tmp"),
+                spill_dir: std::env::temp_dir().join("c_two_response_cache"),
             };
-            let mut pool = MemPool::new_with_prefix(cfg, hs.prefix.clone());
-            for (name, size) in &hs.segments {
-                if let Err(e) = pool.open_segment(name, *size as usize) {
-                    eprintln!("Warning: failed to open server SHM segment ({name}): {e}");
-                }
-            }
+            let pool = MemPool::open_peer(cfg, hs.prefix.clone());
             *self.server_pool.lock() = Some(ServerPoolState {
                 prefix: hs.prefix.clone(),
                 buddy_segment_size: buddy_seg_size,
@@ -914,8 +919,8 @@ impl IpcClient {
 
     async fn do_handshake(
         &self,
-        writer: &mut tokio::io::WriteHalf<UnixStream>,
-        mut reader: tokio::io::ReadHalf<UnixStream>,
+        writer: &mut LocalWriteHalf,
+        mut reader: LocalReadHalf,
     ) -> Result<Handshake, IpcError> {
         // Build segment list and prefix from pool (if available).
         let (segments, prefix, cap_flags) = if let Some(ref pool_arc) = self.pool {
@@ -1070,7 +1075,7 @@ impl IpcClient {
     }
 
     async fn send_control_unary_raw(
-        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
         payload: Vec<u8>,
@@ -1108,7 +1113,7 @@ impl IpcClient {
     }
 
     async fn list_routes_raw(
-        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
         selector: RouteSelector,
@@ -1129,7 +1134,7 @@ impl IpcClient {
     }
 
     async fn rebuild_directory_raw(
-        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
         directory: Arc<RwLock<RouteDirectory>>,
@@ -1443,6 +1448,7 @@ impl IpcClient {
         // Build buddy payload.
         let bp = BuddyPayload {
             seg_idx: alloc.seg_idx as u16,
+            generation: alloc.generation,
             offset: alloc.offset,
             data_size: data.len() as u32,
             is_dedicated: alloc.is_dedicated,
@@ -1618,6 +1624,7 @@ impl IpcClient {
         // Build buddy payload from pre-allocated coordinates.
         let bp = BuddyPayload {
             seg_idx: alloc.seg_idx as u16,
+            generation: alloc.generation,
             offset: alloc.offset,
             data_size: data_size as u32,
             is_dedicated: alloc.is_dedicated,
@@ -2507,24 +2514,35 @@ impl IpcClient {
     /// cannot prove unique ownership at shutdown time.
     pub async fn close_shared(&self) {
         self.connected.store(false, Ordering::Release);
-        // Best-effort: send DISCONNECT signal so the server can clean up
-        // immediately instead of waiting for heartbeat timeout.
-        {
+        // Bound both writer-lock acquisition and the control exchange. A
+        // cancelled partial write aborts its stream instead of leaving a frame
+        // prefix for a later writer to reuse.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             let mut guard = self.writer.lock().await;
-            if let Some(w) = guard.as_mut() {
-                let disconnect_frame =
-                    frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
-                let _ = w.write_all(&disconnect_frame).await;
+            if let Some(writer) = guard.as_mut() {
+                let frame = frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
+                let _ = writer.write_all(&frame).await;
+            }
+        })
+        .await;
+        let receiver = self.recv_handle.lock().take();
+        if let Some(mut receiver) = receiver {
+            // The receive loop ends on DISCONNECT_ACK or peer EOF.
+            if tokio::time::timeout(std::time::Duration::from_millis(100), &mut receiver)
+                .await
+                .is_err()
+            {
+                if let Some(abort) = self.abort.lock().as_ref() {
+                    abort.abort();
+                }
+                receiver.abort();
+                let _ = receiver.await;
             }
         }
-        // Brief grace period for the server to reply DISCONNECT_ACK.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        // Drop writer to close the write half.
-        *self.writer.lock().await = None;
-        // Abort recv task in case the peer does not close promptly.
-        if let Some(handle) = self.recv_handle.lock().take() {
-            handle.abort();
+        if let Some(abort) = self.abort.lock().take() {
+            abort.abort();
         }
+        *self.writer.lock().await = None;
         // Wake pending callers.
         let mut pending = self.pending.lock();
         for (_, pending) in pending.drain() {
@@ -2552,10 +2570,10 @@ fn complete_unary_pending(
 }
 
 async fn recv_loop(
-    mut reader: tokio::io::ReadHalf<UnixStream>,
+    mut reader: LocalReadHalf,
     pending: Arc<StdMutex<PendingMap>>,
     _server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
-    writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+    writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     chunk_registry: Arc<ChunkRegistry>,
     conn_id: u64,
 ) {
@@ -2732,6 +2750,7 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
         match ctrl {
             ReplyControl::Success => Ok(ResponseData::Shm {
                 seg_idx: bp.seg_idx,
+                generation: bp.generation,
                 offset: bp.offset,
                 data_size: bp.data_size,
                 is_dedicated: bp.is_dedicated,
@@ -2784,8 +2803,8 @@ mod tests {
         assert_ne!(prefix1, prefix3);
         assert!(prefix1.starts_with("/cc3a"), "unexpected prefix: {prefix1}");
         assert!(
-            prefix1.len() <= 24,
-            "prefix exceeds SHM name limit: {}",
+            prefix1.len() <= c2_contract::MAX_WIRE_TEXT_BYTES,
+            "prefix exceeds handshake text limit: {}",
             prefix1.len()
         );
     }

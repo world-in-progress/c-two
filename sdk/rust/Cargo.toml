@@ -14,7 +14,7 @@ name = "c_two"
 c2-core = { version = "0.1.0", path = "../../core/runtime/c2-core" }
 c2-contract = { version = "0.1.0", path = "../../core/foundation/c2-contract" }
 c2-error = { version = "0.1.0", path = "../../core/foundation/c2-error" }
-fastdb = { version = "0.1.22", path = "../../../fastdb/bindings/rust/fastdb" }
+fastdb = { version = "0.2.0", path = "../../../fastdb/bindings/rust/fastdb" }
 
 [dev-dependencies]
 c2-http = { version = "0.1.0", path = "../../core/transport/c2-http", features = ["relay"] }

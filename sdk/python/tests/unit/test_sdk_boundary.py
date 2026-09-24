@@ -685,7 +685,7 @@ def test_route_authority_reports_invalid_ipc_address_as_validation_error():
     state_source = state.read_text(encoding="utf-8")
 
     assert "InvalidAddress { reason: String }" in authority_source
-    assert "socket_path_from_ipc_address(address)" in authority_source
+    assert "local_endpoint_from_ipc_address(address)" in authority_source
     assert "ControlError::InvalidAddress { reason }" in state_source
 
 
@@ -709,7 +709,7 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
     assert "valid_relay_url(&url)" in source
     assert "let removed = self.routes.get(&key).cloned();" in source
     assert "if !self.apply_tombstone(tombstone)" in source
-    assert "c2_ipc::socket_path_from_ipc_address" in source
+    assert "c2_ipc::local_endpoint_from_ipc_address" in source
     assert 'starts_with("ipc://")' not in source
     assert "valid_nonempty_identity" not in source
 

@@ -23,5 +23,6 @@ tokio = { version = "1", features = ["rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+c2-local = { version = "0.1.0", path = "../../transport/c2-local" }
 axum = "0.8"
 c2-http = { version = "0.1.0", path = "../../transport/c2-http", features = ["relay"] }

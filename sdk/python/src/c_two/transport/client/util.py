@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 
-def _socket_path_from_address(server_address: str) -> str:
-    from c_two._native import ipc_socket_path
+def _endpoint_name_from_address(server_address: str) -> str:
+    from c_two._native import ipc_endpoint_name
 
-    return ipc_socket_path(server_address)
+    return ipc_endpoint_name(server_address)
 
 
 def ping(server_address: str, timeout: float = 0.5) -> bool:

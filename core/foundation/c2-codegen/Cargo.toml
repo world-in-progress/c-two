@@ -8,7 +8,7 @@ description = "Language-neutral SDK code generation for C-Two contracts"
 
 [dependencies]
 c2-contract = { version = "0.1.0", path = "../c2-contract" }
-fastdb = { version = "0.1.22", path = "../../../../fastdb/bindings/rust/fastdb" }
+fastdb = { version = "0.2.0", path = "../../../../fastdb/bindings/rust/fastdb" }
 rustix = { version = "1", features = ["fs"] }
 serde_json = "1"
 sha2 = "0.11"

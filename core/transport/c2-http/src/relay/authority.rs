@@ -400,7 +400,7 @@ impl<'a> RouteAuthority<'a> {
     }
 
     pub(crate) fn validate_ipc_address(&self, address: &str) -> Result<(), ControlError> {
-        c2_ipc::socket_path_from_ipc_address(address)
+        c2_ipc::local_endpoint_from_ipc_address(address)
             .map(|_| ())
             .map_err(|err| ControlError::InvalidAddress {
                 reason: err.to_string(),

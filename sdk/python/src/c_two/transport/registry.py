@@ -657,7 +657,9 @@ class _ProcessRegistry:
 
         try:
             signal.signal(signal.SIGINT, _handle_signal)
-            if sys.platform != 'win32':
+            if sys.platform == 'win32':
+                signal.signal(signal.SIGBREAK, _handle_signal)
+            else:
                 signal.signal(signal.SIGTERM, _handle_signal)
         except ValueError:
             # Not the main thread — signals cannot be registered.

@@ -45,7 +45,7 @@ C2_MEM_TYPESCRIPT = (
 NODE_FIXTURE = (
     REPOSITORY / "sdk/python/tests/fixtures/typescript_real_call.mjs"
 )
-FASTDB_COMMIT = "7eb74734926bd8fe911229eee9744a6dd8172487"
+FASTDB_COMMIT = os.environ.get("C2_TYPESCRIPT_FASTDB_SOURCE_SHA", "ceebed2edbef580ba0a42dcd28dadf9628894523")
 sys.path.insert(0, str(REPOSITORY))
 
 from tools.local_rc.typescript_receipt import (  # noqa: E402
@@ -177,11 +177,34 @@ class TypeScriptArtifacts:
         else:
             wasm = FASTDB_TYPESCRIPT / "src/wasm/fastdb4ts.wasm"
             if not wasm.is_file():
-                _run_checked(
-                    ["npm", "run", "build:wasm"],
-                    cwd=FASTDB_TYPESCRIPT,
-                    timeout=900,
-                )
+                if os.name == "nt":
+                    emsdk = os.environ.get("EMSDK")
+                    if not emsdk:
+                        raise AssertionError("EMSDK is required for native Windows WASM builds")
+                    emcmake = Path(emsdk) / "upstream/emscripten/emcmake.py"
+                    if not emcmake.is_file():
+                        raise AssertionError(f"Emscripten CMake helper is missing: {emcmake}")
+                    build_directory = work / "fastdb-wasm"
+                    _run_checked(
+                        [sys.executable, str(emcmake), "cmake",
+                         "-S", str(FASTDB_REPOSITORY / "ts/embind"),
+                         "-B", str(build_directory), "-G", "Ninja",
+                         "-DCMAKE_BUILD_TYPE=Release"],
+                        cwd=FASTDB_TYPESCRIPT,
+                        timeout=300,
+                    )
+                    _run_checked(
+                        ["cmake", "--build", str(build_directory),
+                         "--target", "fastdb4ts", "--config", "Release"],
+                        cwd=FASTDB_TYPESCRIPT,
+                        timeout=900,
+                    )
+                else:
+                    _run_checked(
+                        ["npm", "run", "build:wasm"],
+                        cwd=FASTDB_TYPESCRIPT,
+                        timeout=900,
+                    )
             _run_checked(
                 ["npm", "run", "build"],
                 cwd=FASTDB_TYPESCRIPT,

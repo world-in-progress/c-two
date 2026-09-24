@@ -77,9 +77,9 @@ def encode_client_handshake(
 ) -> bytes:
     """Encode client→server handshake.
 
-    Format (v10)::
+    Format (v11)::
 
-        [1B version=10]
+        [1B version=11]
         [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -99,9 +99,9 @@ def encode_server_handshake(
 ) -> bytes:
     """Encode server→client handshake ACK.
 
-    Format (v10)::
+    Format (v11)::
 
-        [1B version=10]
+        [1B version=11]
         [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]

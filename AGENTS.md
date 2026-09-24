@@ -177,7 +177,7 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 Transport modes:
 
 - Thread-local: same-process `cc.connect()` returns a zero-serialization proxy. It passes Python objects directly and may use the native route-concurrency handle through a thin Python adapter; do not route this path through Rust bytes dispatch for symmetry.
-- IPC (`ipc://`): UDS control channel plus POSIX SHM data plane through Rust. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls.
+- IPC (`ipc://`): Rust `c2-local` owns local streams (Unix UDS or Windows byte-mode Named Pipes), while `c2-mem` owns POSIX SHM or Windows named mappings. `c2-config::LocalEndpoint` derives the OS endpoint from the logical address; SDKs must use that authority. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls.
 - HTTP (`http://`): relay-based cross-machine transport through Rust.
 
 Direct IPC is a complete standalone mode. `cc.connect(..., address='ipc://...')` must bypass relay discovery and remain usable when no relay is configured or a relay environment variable points at an unavailable server. Relay is only a discovery/forwarding projection above IPC; do not make relay the owner of IPC registration, scheduling, or connection establishment.
@@ -216,8 +216,9 @@ Paths: `core/`, `sdk/python/native/`
 | foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
 | protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
-| transport | `c2-ipc` | Async IPC client, UDS, SHM, chunked transfer |
-| transport | `c2-server` | Tokio UDS server with per-connection state and peer SHM lazy-open |
+| transport | `c2-local` | Async Unix UDS / Windows Named Pipe streams, listener ownership and cancellation |
+| transport | `c2-ipc` | Async IPC client, local streams, SHM, chunked transfer |
+| transport | `c2-server` | Local server with per-connection state and peer SHM lazy-open |
 | transport | `c2-http` | HTTP client, relay-aware client, and HTTP relay server behind `relay` feature |
 | runtime | `c2-core` | Language-neutral runtime, route transactions, client pools, relay projection, and error normalization |
 | sdk/rust | `c-two` / `c_two` | User-facing Rust facade, FastDB adapter, and checked held/borrowed owners |
@@ -228,8 +229,10 @@ Memory subsystem:
 - Allocation tiers: buddy SHM, dedicated SHM, file spill.
 - `MemHandle` abstracts buddy, dedicated, and file-spill handles.
 - `c2-mem` owns SDK-visible buffer lease accounting. Lease tracking records metadata and retention state only; it must not read payload bytes, allocate a second buffer, or replace `MemPool::free_at()` / `release_handle()` as the memory release authority.
-- SHM segment names are deterministic: `{prefix}_b{idx:04x}` for buddy and `{prefix}_d{idx:04x}` for dedicated.
-- Server lazy-opens peer segments from prefix and index. There is no explicit segment announcement protocol.
+- Each owner pool appends a fresh PID/UUID incarnation to its logical label. `MemPool` alone derives bounded OS backing names; SDKs must not concatenate prefix/index suffixes.
+- Buddy references include a checked `u32` backing generation in handshake protocol version 11. Receiver pools use `MemPool::open_peer()` and lazy-open the exact prefix/index/generation; handshake segment names are descriptive metadata. Older generations cannot read or free a new backing, and a live allocation prevents retirement.
+- The last peer free drops an idle cached view. Owner GC observes remote frees and preserves slot generation counters across reclamation. Dedicated indices never wrap past the wire's `u16` range. There is no separate segment announcement protocol.
+- Windows pipes and mappings share a current-logon SID access policy, use local namespaces, and do not require global mapping privileges. File spill has an owner that closes its mapping before the backing file, with Windows delete-on-close cleanup.
 
 ### CLI
 
