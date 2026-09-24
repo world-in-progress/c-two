@@ -1,6 +1,8 @@
 # Windows native implementation
 
-Status: resumed at the user's request on 2026-09-24 after FastDB 0.2.0 publication and the OIDC migration completed. The target architecture and evidence boundaries are recorded in [the analysis](reports/2026-09-24-windows-native-ipc-analysis.zh-CN.md). Implementation continues on `socu/windows-native-ipc`. The first baseline used FastDB's official release source `ceebed2edbef580ba0a42dcd28dadf9628894523`; the next run pins the MSVC repair source `6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4` from [FastDB PR #37](https://github.com/world-in-progress/fastdb/pull/37). That patch is an unreleased source input, not a replacement for the immutable 0.2.0 release.
+Status: the development implementation and hosted Windows x64 acceptance completed on 2026-09-25. [Final validation](reports/windows-native-final-validation.md) records four successful jobs on Windows Server 2022/2025, strict cross-language receipts, installed-wheel consumers under runner and non-administrator accounts, and downloaded artifact hashes. The tested source is C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` on `socu/windows-native-ipc`, paired with FastDB `6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4` from [FastDB PR #37](https://github.com/world-in-progress/fastdb/pull/37). Later documentation commits are not artifact source commits. This is development-build acceptance; formal publication and the additional environments below remain separate work.
+
+The target architecture and evidence boundaries are recorded in [the analysis](reports/2026-09-24-windows-native-ipc-analysis.zh-CN.md). Work resumed on 2026-09-24 after FastDB 0.2.0 publication and the OIDC migration. The first baseline used the official release source `ceebed2edbef580ba0a42dcd28dadf9628894523`; the validated MSVC repair is an unreleased source input, not a replacement for that immutable release.
 
 ## Sequence and acceptance
 
@@ -8,12 +10,12 @@ Status: resumed at the user's request on 2026-09-24 after FastDB 0.2.0 publicati
 | --- | --- | --- | --- |
 | W0 | Native Windows CI; immutable C-Two/FastDB inputs; per-command run evidence | Actual hosted Windows result, including truthful compilation failures | Complete |
 | W1 | Extract `c2-local`; migrate Unix endpoint, listener, stream, control and readiness | Core, SDK and direct/relay regression on Unix; no Unix types in common call paths | Complete on macOS |
-| W2 | Windows byte-mode Named Pipes; shared current-logon security | Native connect, duplicate listener, bounded cancellation/close and ordinary-user access | In progress |
+| W2 | Windows byte-mode Named Pipes; shared current-logon security | Native connect, duplicate listener, bounded cancellation/close and ordinary-user access | Complete on Windows 2022/2025, including non-administrator consumers |
 | W3 | Windows mapping, spill, process and memory handling; segment incarnation | Native mapping lifecycle, idle reclaim/regrow, outstanding lease and stale-reference tests | Complete on both Windows runners |
-| W4 | Complete Python/Rust/Node runtime and artifact projections | Actual portable matrices, package installation and DLL loading | Python/Rust proven; Node in progress |
-| W5 | Second Windows runner, minimum/free-threaded Python, ordinary users and cross-OS relay | Evidence for each declared supported environment and path; Unix regression | Partial; see coverage limits |
+| W4 | Complete Python/Rust/Node runtime and artifact projections | Actual portable matrices, package installation and DLL loading | Complete on both Windows runners |
+| W5 | Second Windows runner, minimum/free-threaded Python, ordinary users and cross-OS relay | Evidence for each declared supported environment and path; Unix regression | Second runner, non-administrator execution and Python 3.10 syntax complete; native Python variants and cross-OS execution remain open |
 
-Each stage is completed only when its required execution evidence exists. A green compiler check cannot complete a runtime or distribution stage. Failed baseline runs are recorded separately from the existing success-only portable receipts.
+Each stage is completed only when its required execution evidence exists. A green compiler check cannot complete a runtime or distribution stage. Failed baseline runs are recorded separately from the existing success-only portable receipts. The evidence log below is chronological: pending statements describe that earlier source/run, and the final entry records the accepted result.
 
 ## Segment identity contract
 
@@ -48,7 +50,8 @@ This contract must be proven by a test retaining an old peer mapping while the p
 
 - Run [36017573157](https://github.com/Dsssyc/c-two/actions/runs/36017573157), on `b39bc20f12e8603ec38fa594ce7109343f072761`, passed both local-platform gates (513 tests per OS). Console evidence records 21/22 full gates passing per OS, with `core-test` the sole failed gate: a proxy-environment test race on Windows 2022 and two route-withdrawal fixture status mismatches on Windows 2025. These are not a complete Core pass because Cargo stopped at each failing binary.
 - The next correction shares the existing process-environment lock between test readers and writers, and gives never-found/known-removed relay fixtures deterministic 404/410 paths. No production behavior or failure assertion is weakened. Host checks pass all 13 client-mode tests and the three affected relay tests; see [environment isolation](reports/windows-proxy-test-isolation.md) and [route withdrawal](reports/windows-route-removal-tests.md). Native Windows confirmation is pending the next run.
+- Final run [36034972057](https://github.com/Dsssyc/c-two/actions/runs/36034972057), on C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` and the same FastDB repair source, passes all four jobs. Each OS passes 22/22 full gates, 513 local-platform tests, 954 Core tests, 829 Python tests, strict 18-row Rust/Python and 12-row TypeScript receipts, and both installed-wheel consumers. Lifecycle and account/process/workspace cleanup pass. Downloaded ZIP digests, all recorded internal hashes and the retained executable's equality with every matrix/wheel receipt were verified. See [final validation](reports/windows-native-final-validation.md) for the exact evidence and release boundaries.
 
 ## Outstanding environment coverage
 
-Windows Server hosted jobs, Windows 11 desktop behavior, ordinary-user tokens, and a real Windows/Linux two-machine relay are separate evidence targets. Until executed, none is inferred from another target's result. No Windows support claim is made merely by adding configuration or compiling from macOS.
+Windows Server 2022/2025 x64 hosted execution and non-administrator consumers are verified. Windows 11 desktop, Windows services, ARM64, native Windows Python 3.10/free-threaded 3.14 wheels and a real Windows/Linux two-machine relay remain separate, unexecuted targets. Native wheel execution here uses CPython 3.12; minimum-supported Python 3.10 coverage is a syntax check. No result is inferred for these other environments from the hosted pass.

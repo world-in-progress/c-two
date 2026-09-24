@@ -1,6 +1,8 @@
 # Windows CI current failures — diagnostic probe 2026-09-25
 
-Probe only: no fixes, builds, downloads, or reruns were attempted. Windows adaptation is NOT complete.
+Historical probe for run 36017573157. The later fixes and successful run 36034972057 are recorded in [final validation](windows-native-final-validation.md).
+
+Probe only: no fixes, builds, downloads, or reruns were attempted in this investigation. Windows adaptation was not complete at this snapshot.
 
 Observed HEAD: `b39bc20f12e8603ec38fa594ce7109343f072761` (`git rev-parse HEAD` ran; `git status --short` ran and returned empty — clean tree at the frozen input commit).
 

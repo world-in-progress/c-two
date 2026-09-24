@@ -4,6 +4,8 @@ The native Windows backend uses byte-mode Named Pipes for `ipc://` control traff
 
 The [Windows Native workflow](https://github.com/Dsssyc/c-two/actions/workflows/windows-native.yml) builds immutable C-Two/FastDB source pairs on Windows 2022 and 2025, using MSVC x64 and Python 3.12. Its full artifact contains wheels, a standalone `cli/c3.exe`, per-gate logs and `run-evidence.json` with artifact SHA-256 values. Use a run whose required gates actually passed; compilation alone is not an installed-runtime result. The installed-wheel receipt separately proves direct IPC, HTTP relay, a 1 MiB FastDB payload, checked held-view invalidation and resource shutdown outside the source checkout.
 
+[Run 36034972057](https://github.com/Dsssyc/c-two/actions/runs/36034972057) passes all required gates on both runners, including separate non-administrator wheel consumers. Its [final validation report](reports/windows-native-final-validation.md) identifies the exact tested source pair, downloadable artifacts and hashes. The artifact API reports expiry on 2026-10-08 UTC.
+
 These are development artifacts. The existing C-Two 0.5.1 and FastDB 0.2.0 registry releases do not contain these Windows wheels. The pinned FastDB MSVC repair is tracked by [FastDB PR #37](https://github.com/world-in-progress/fastdb/pull/37); producing a new official Windows distribution requires new release versions and their publication gates. Candidate wheels must not be uploaded over the existing releases.
 
 ## Use a matching artifact pair
@@ -40,4 +42,4 @@ cargo build --locked --manifest-path cli/Cargo.toml --bin c3
 
 The full hosted gate additionally prepares Node 22, Ninja, Git Bash and Emscripten 5.0.2 for generated TypeScript and native Node tests. Run the same workflow for complete evidence rather than treating a local Python import as equivalent coverage.
 
-Windows 11 desktop, non-administrator token execution, Windows services, Python 3.10/3.14t native Windows wheels and a real Windows/Linux relay link are separate coverage targets. Their status is recorded in [the implementation report](windows-native-implementation.md); a Windows Server x64 result does not prove those environments.
+Non-administrator token execution is verified on both hosted runners. Windows 11 desktop, Windows services, ARM64, Python 3.10/3.14t native Windows wheels and a real Windows/Linux relay link remain separate coverage targets. Their status is recorded in [the implementation report](windows-native-implementation.md); a Windows Server x64 result does not prove those environments.
