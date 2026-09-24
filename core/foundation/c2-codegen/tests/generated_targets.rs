@@ -262,7 +262,9 @@ fn generated_typescript_project_typechecks_against_fastdb_source() {
         .nth(3)
         .unwrap();
     let fastdb_typescript = repository.parent().unwrap().join("fastdb/ts/fastdb4ts");
-    let tsc = fastdb_typescript.join("node_modules/.bin/tsc");
+    // npm's `.bin/tsc` entry is a POSIX shell shim that CreateProcess cannot
+    // execute on Windows; run the compiler's JavaScript entry with Node.
+    let tsc = fastdb_typescript.join("node_modules/typescript/bin/tsc");
     let payload_module = fastdb_typescript.join("src/payload/index.ts");
     if !tsc.is_file() || !payload_module.is_file() {
         eprintln!(
@@ -306,7 +308,8 @@ fn generated_typescript_project_typechecks_against_fastdb_source() {
     let config_path = tempdir.path().join("tsconfig.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
-    let output = Command::new(tsc)
+    let output = Command::new("node")
+        .arg(&tsc)
         .args(["--project", config_path.to_str().unwrap()])
         .current_dir(tempdir.path())
         .output()
@@ -326,7 +329,8 @@ fn generated_typescript_payload_lifecycle_is_failure_safe() {
         .nth(3)
         .unwrap();
     let fastdb_typescript = repository.parent().unwrap().join("fastdb/ts/fastdb4ts");
-    let tsc = fastdb_typescript.join("node_modules/.bin/tsc");
+    // See the typecheck test: Windows cannot execute the POSIX `.bin/tsc` shim.
+    let tsc = fastdb_typescript.join("node_modules/typescript/bin/tsc");
     let node = Command::new("node").arg("--version").output();
     if !tsc.is_file() || node.is_err() {
         eprintln!(
@@ -601,7 +605,8 @@ requireEvents([
     let config_path = tempdir.path().join("tsconfig.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
-    let typecheck = Command::new(&tsc)
+    let typecheck = Command::new("node")
+        .arg(&tsc)
         .args(["--project", config_path.to_str().unwrap()])
         .current_dir(tempdir.path())
         .output()

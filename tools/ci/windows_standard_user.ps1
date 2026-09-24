@@ -41,6 +41,14 @@ function Add-Diagnostic([string]$Message) {
     $report.errors.Add($Message)
 }
 
+function Add-Failure([System.Management.Automation.ErrorRecord]$Record) {
+    # Keep the failing script line: hosted-only failures otherwise need another
+    # full CI cycle before the cause is visible.
+    $message = $Record.Exception.Message
+    if ($Record.InvocationInfo) { $message = "line $($Record.InvocationInfo.ScriptLineNumber): $message" }
+    Add-Diagnostic $message
+}
+
 function Get-OwnedProcesses {
     $owned = [Collections.Generic.List[object]]::new()
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -163,7 +171,7 @@ runpy.run_path(staged["helper"], run_name="__main__")
     }
     $consumerPassed = $true
 } catch {
-    Add-Diagnostic $_.Exception.Message
+    Add-Failure $_
 } finally {
     if ($testSid) {
         try {
@@ -189,7 +197,7 @@ runpy.run_path(staged["helper"], run_name="__main__")
             $report.cleanup.remaining_pids = @($remaining | ForEach-Object { $_.ProcessId })
             $report.cleanup.processes_exited = $remaining.Count -eq 0
             if ($remaining.Count -ne 0) { throw 'Owned processes remain after cleanup.' }
-        } catch { Add-Diagnostic $_.Exception.Message }
+        } catch { Add-Failure $_ }
     }
     if ($workspaceCreated) {
         try {
@@ -200,21 +208,26 @@ runpy.run_path(staged["helper"], run_name="__main__")
                         Copy-Item -LiteralPath $source -Destination $entry[1]
                     } else {
                         $content = [string](Get-Content -LiteralPath $source -Raw)
+                        # Start-Process creates both redirect files eagerly, so an
+                        # empty stderr log is normal. Get-Content -Raw then yields
+                        # AutomationNull, which the [string] cast keeps as $null
+                        # instead of the empty string Replace requires.
+                        if ($null -eq $content) { $content = '' }
                         $content.Replace($accountName, '<ephemeral-user>') | Set-Content -LiteralPath $entry[1] -Encoding utf8 -NoNewline
                     }
                 }
             }
-        } catch { Add-Diagnostic $_.Exception.Message }
+        } catch { Add-Failure $_ }
         try {
             Remove-Item -LiteralPath $workspace -Recurse -Force
             $report.cleanup.workspace_removed = -not (Test-Path -LiteralPath $workspace)
-        } catch { Add-Diagnostic $_.Exception.Message }
+        } catch { Add-Failure $_ }
     }
     if ($testAccount) {
         try {
             Remove-LocalUser -SID $testSid -Confirm:$false
             $report.cleanup.account_removed = @((Get-LocalUser) | Where-Object { $_.SID -eq $testSid }).Count -eq 0
-        } catch { Add-Diagnostic $_.Exception.Message }
+        } catch { Add-Failure $_ }
     }
     if ($child) { $child.Dispose() }
     if ($secret) { $secret.Dispose() }

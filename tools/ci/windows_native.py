@@ -130,13 +130,16 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
         ("core-check", ["cargo", "check", "--locked", "--manifest-path", "core/Cargo.toml", "--workspace", "--all-targets"], ()),
         cargo("core-test", "core/Cargo.toml", "--workspace"),
         ("cli-build", ["cargo", "build", "--locked", "--manifest-path", "cli/Cargo.toml", "--bins"], ()),
+        cargo("cli-test", "cli/Cargo.toml"),
+        # Retain the CLI only after every gate that can relink it has run.
+        # Windows relinks are not byte-stable, so a copy taken before cli-test
+        # would not match the binary every later gate and receipt actually uses.
         ("cli-artifact", [python, "-c",
                           "from pathlib import Path; import shutil, sys; "
                           "target = Path(sys.argv[2]); target.parent.mkdir(parents=True, exist_ok=True); "
                           "shutil.copy2(sys.argv[1], target)",
                           str(ROOT / "cli/target/debug/c3.exe"), str(output / "cli/c3.exe")],
-         ("cli-build",)),
-        cargo("cli-test", "cli/Cargo.toml"),
+         ("cli-test",)),
         cargo("rust-sdk-test", "sdk/rust/Cargo.toml", "--all-features"),
         cargo("python-native-test", "sdk/python/native/Cargo.toml"),
         ("fastdb-wheel-build", ["uv", "build", "--wheel", "--python", python, "--out-dir", str(output / "wheels/fastdb"), "--no-create-gitignore", "../fastdb"], ()),

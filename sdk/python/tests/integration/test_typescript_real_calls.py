@@ -164,18 +164,11 @@ class TypeScriptArtifacts:
         if not candidate_packages:
             assert _git(FASTDB_REPOSITORY, "rev-parse", "HEAD") == FASTDB_COMMIT
             assert _git(FASTDB_REPOSITORY, "status", "--porcelain") == ""
-            _run_checked(
-                [
-                    "cargo",
-                    "build",
-                    "--manifest-path",
-                    str(REPOSITORY / "cli/Cargo.toml"),
-                    "--bin",
-                    "c3",
-                ],
-                cwd=REPOSITORY,
-                timeout=600,
-            )
+            # MatrixArtifacts.prepare resolves the CLI through the shared helper,
+            # which builds it only when no binary exists. Rebuilding an existing
+            # c3 here would replace the relinked artifact that the CI gate has
+            # already retained and hashed, so the downloadable c3.exe could no
+            # longer match the binary these receipts name.
         matrix_work = work / "matrix"
         matrix_work.mkdir()
         matrix = MatrixArtifacts.prepare(matrix_work)
