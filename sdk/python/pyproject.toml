@@ -1,6 +1,6 @@
 [project]
 name = "c-two"
-version = "0.5.1"
+version = "0.6.0"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
 license-files = ["LICENSE"]
@@ -16,6 +16,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Scientific/Engineering",
     "Topic :: System :: Distributed Computing",
 ]
@@ -32,6 +33,7 @@ manifest-path = "native/Cargo.toml"
 module-name = "c_two._native"
 python-source = "src"
 features = ["pyo3/extension-module"]
+auditwheel = "repair"
 include = ["LICENSE"]
 
 [tool.pytest.ini_options]
