@@ -120,6 +120,16 @@ impl Listener {
     }
 }
 
+impl Drop for Listener {
+    fn drop(&mut self) {
+        // Mio keeps a pending ConnectNamedPipe operation and its handle alive
+        // until IOCP reports cancellation. Disconnect this unaccepted instance
+        // before releasing the listener lease so it cannot capture a client
+        // intended for the next listener. Accepted streams are separate owners.
+        let _ = self.pending.disconnect();
+    }
+}
+
 fn claim_listener(
     endpoint: &LocalEndpoint,
     security: &mut LocalSecurityAttributes,

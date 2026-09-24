@@ -95,7 +95,7 @@ The complete Phase 0B upstream local candidate is recorded in [`docs/reports/202
 
 The retained canonical manifest and receipts under `docs/reports/evidence/` prove 42 exact artifacts, 4/4 isolated Rust/Python/Node consumers, 18/18 Rust/Python direct/relay rows, 12/12 generated TypeScript Node rows, and the 12-row SDK parity inventory. They are evidence records only. Do not add package archives, local registries, wheelhouses, native libraries, generated trees, or build outputs to Git.
 
-Official immutable FastDB/C-Two distribution, hosted verification, browser runtime, C++ C-Two SDK, compatibility ranges, trust/signature/revocation, streaming, post-dispatch retry/deduplication, and Toodle consumption remain open. Never infer a registry release or hosted pass from the local candidate.
+FastDB 0.2.0 is now published separately; its release does not change these historical candidate inputs or prove C-Two publication. Current Windows source builds pin the additional MSVC repair documented in `docs/windows-native-implementation.md`. Official C-Two portable-package distribution, browser runtime, C++ C-Two SDK, compatibility ranges, trust/signature/revocation, streaming, post-dispatch retry/deduplication, and Toodle consumption remain open. Hosted evidence must name its actual source pair and passing gates; never infer it from the local candidate.
 
 ## Architecture
 
@@ -232,7 +232,9 @@ Memory subsystem:
 - Each owner pool appends a fresh PID/UUID incarnation to its logical label. `MemPool` alone derives bounded OS backing names; SDKs must not concatenate prefix/index suffixes.
 - Buddy references include a checked `u32` backing generation in handshake protocol version 11. Receiver pools use `MemPool::open_peer()` and lazy-open the exact prefix/index/generation; handshake segment names are descriptive metadata. Older generations cannot read or free a new backing, and a live allocation prevents retirement.
 - The last peer free drops an idle cached view. Owner GC observes remote frees and preserves slot generation counters across reclamation. Dedicated indices never wrap past the wire's `u16` range. There is no separate segment announcement protocol.
+- Shared allocator header version 2 preserves the full PID in a 64-bit lock word. Death observers refuse access without changing that PID-only word; a panicking holder poisons its own backing. Never steal a dead holder's lock or infer retirement from independently sampled lock/count fields. Retirement checks the allocation count while holding the same SHM lock, with one nonblocking acquisition attempt.
 - Windows pipes and mappings share a current-logon SID access policy, use local namespaces, and do not require global mapping privileges. File spill has an owner that closes its mapping before the backing file, with Windows delete-on-close cleanup.
+- Windows listener exclusivity belongs to a separate non-inheritable kernel existence lease, held only by the listener. Connected streams must not retain it. This allows restart while old client handles still exist. Unix listeners own a persistent rendezvous lock and recorded socket identity; only matching orphaned sockets may be reclaimed.
 
 ### CLI
 

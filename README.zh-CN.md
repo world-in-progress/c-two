@@ -44,11 +44,7 @@ Portable-payload 地基目前已经具备 correctness、deterministic codegen、
 
 ## 快速开始
 
-> **开发分支要求：** 下方 portable-payload 示例是在当前源码 checkout
-> 中、针对 `../fastdb` 的审计后 sibling checkout 完成证明的。当前已发布
-> package 尚未包含这套完整集成，因此只执行 `pip install c-two` 不能运行
-> 该示例。请参阅[开发环境](#开发环境)和
-> [延后能力 Issue](docs/issues/contract-release-deferred-capabilities.md)。
+> **开发构建要求：** 当前代码使用 FastDB 0.2.0。示例需要本 C-Two checkout 或配套开发构建；已发布的 C-Two 包尚未包含完整 portable-payload 与 Windows 集成。请参阅[开发环境](#开发环境)、[Windows 构建与使用说明](docs/windows-native-usage.md)和[历史候选包报告](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md)。
 
 ### 定义显式 portable-payload 契约
 
@@ -355,10 +351,10 @@ stats = cc.hold_stats()
 | 协议方案 | 传输方式 | 适用场景 |
 |----------|----------|----------|
 | `thread://` | 进程内直接调用 | 零序列化、测试 |
-| `ipc:///path` | Unix 域套接字 + 共享内存 | 多进程、同主机 |
+| `ipc://server` | Unix 域套接字或 Windows Named Pipes + 原生共享内存 | 多进程、同主机 |
 | `http://host:port` | HTTP 中继 | 跨机器、Web 兼容 |
 
-IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联帧传输，payload bytes 可以通过共享内存交换。当前 portable FastDB receive path 是 copy-backed；`cc.hold()` 与 `cc.InputLifetime.BORROWED` 提供显式 invalidation/lease 边界，但不代表 FastDB 已直接构造在 transport memory 中。
+IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 Rust `c2-local` 的本地流传输，Unix 使用 UDS，Windows 使用字节模式 Named Pipes；payload bytes 可以通过原生共享映射交换。当前 portable FastDB receive path 是 copy-backed；`cc.hold()` 与 `cc.InputLifetime.BORROWED` 提供显式 invalidation/lease 边界，但不代表 FastDB 已直接构造在 transport memory 中。Windows 的实际测试结果见[实现记录](docs/windows-native-implementation.md)。
 
 ### Rust 原生层
 
@@ -368,7 +364,7 @@ Rust 工作空间按 4 层组织（foundation → protocol → transport → run
 
 - **Contract Core (`c2-contract`)** — 语言中立的 `c-two.contract.v2` validation、canonical descriptor hashing、release identity 与 opaque nested-spec extraction。
 - **Contract Codegen (`c2-codegen`)** — 委托官方 FastDB Rust projection、校验返回 artifacts、确定性组合 C-Two/FastDB 输出并发布完整新目录。
-- **伙伴分配器** — IPC 传输的零系统调用共享内存分配。跨进程，快速路径上无锁。
+- **伙伴分配器** — 通过共享内存内的跨进程原子锁保护分配与释放。拒绝继续修改持有者崩溃或 panic 后可能未完成的分配器状态。
 - **线协议** — 帧编码、分块组装和分块注册表，管理大载荷的生命周期。
 - **HTTP 中继** — 基于 [axum](https://github.com/tokio-rs/axum) 的高吞吐网关，桥接 HTTP 到 IPC。处理连接池和请求多路复用。
 
@@ -445,8 +441,9 @@ portable-payload 用户面。Registry 安装成功不能作为审计后开发分
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
-# 将经过审计且兼容的 FastDB 源码 checkout 放在 ../fastdb。
-# 本地已证明的精确 revision 记录在 deferred-capabilities Issue 中。
+# 将 FastDB 0.2.0 源码 checkout 放在 ../fastdb。
+# Windows 还需要 docs/windows-native-usage.md 中记录的 MSVC 修复源；
+# windows-native.yml 固定了实际使用的精确提交。
 cp .env.example .env               # 配置环境变量（可选）
 uv sync                            # 安装依赖 + 编译 Rust 扩展
 uv sync --group examples           # 安装示例依赖（pandas、pyarrow）

@@ -103,7 +103,11 @@ def main() -> None:
         link = link_c3(binary, bin_dir, force=args.force, copy=args.copy)
         print(f"linked: {link}")
         if bin_dir.resolve() not in _path_entries():
-            print(f'add to PATH: export PATH="{bin_dir.resolve()}:$PATH"')
+            if os.name == "nt":
+                directory = str(bin_dir.resolve()).replace("'", "''")
+                print(f"add to PATH (PowerShell): $env:PATH = '{directory};' + $env:PATH")
+            else:
+                print(f'add to PATH: export PATH="{bin_dir.resolve()}:$PATH"')
 
 
 if __name__ == "__main__":

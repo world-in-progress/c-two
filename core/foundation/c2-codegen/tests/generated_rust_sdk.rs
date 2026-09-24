@@ -225,8 +225,21 @@ fn generated_service_trait_rejects_the_wrong_payload_shape() {
         .expect("publish generated contract");
     write_consumer_manifest(temp.path(), &repository, &fastdb);
     std::fs::create_dir(temp.path().join("src")).expect("consumer source directory");
+    let source_path = temp.path().join("src/lib.rs");
     std::fs::write(
-        temp.path().join("src/lib.rs"),
+        &source_path,
+        "#[path = \"../generated/rust/c_two_contract.rs\"]\nmod contract;\n",
+    )
+    .expect("valid generated-module control source");
+    let control = cargo(temp.path(), &["check", "--quiet", "--offline"]);
+    assert!(
+        control.status.success(),
+        "generated Rust positive control failed before the wrong-shape probe:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&control.stdout),
+        String::from_utf8_lossy(&control.stderr),
+    );
+    std::fs::write(
+        &source_path,
         r#"
 #[path = "../generated/rust/c_two_contract.rs"]
 mod contract;
@@ -246,7 +259,7 @@ impl contract::Service for WrongShape {
     )
     .expect("compile-fail source");
 
-    let output = cargo(temp.path(), &["check", "--quiet", "--offline"]);
+    let output = cargo(temp.path(), &["check", "--quiet", "--offline", "--locked"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "wrong service shape compiled");
     assert!(
@@ -326,6 +339,11 @@ fastdb = {{ version = "0.2.0", path = {fastdb:?} }}
         fastdb = fastdb.join("bindings/rust/fastdb"),
     );
     std::fs::write(root.join("Cargo.toml"), manifest).expect("consumer manifest");
+    // The outer Core build populated this dependency graph. Preserve its
+    // locked versions, including registry entries yanked after the lock was
+    // committed; Cargo only needs to add the temporary consumer/root package.
+    std::fs::copy(repository.join("core/Cargo.lock"), root.join("Cargo.lock"))
+        .expect("seed consumer dependencies from the tested Core workspace");
 }
 
 fn cargo(root: &Path, arguments: &[&str]) -> Output {

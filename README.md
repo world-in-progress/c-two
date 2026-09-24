@@ -44,7 +44,7 @@ The tracked Kostya benchmark keeps Python-only `pickle-records` and `pickle-arra
 
 ## Quick Start
 
-> **Local-candidate requirement:** The portable-payload example below is proven from C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02` against FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487`. The complete candidate passes isolated archive-only consumers, but these bytes are not published packages, so `pip install c-two` alone cannot run this development-branch integration. See the [local-candidate report](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md), [Development Setup](#development-setup), and the [deferred-capabilities issue](docs/issues/contract-release-deferred-capabilities.md).
+> **Development-build requirement:** This line uses FastDB 0.2.0. The examples require this C-Two checkout or matching development artifacts; the published C-Two package does not contain the complete portable-payload and Windows integration. See [Development Setup](#development-setup), [Windows build inputs and usage](docs/windows-native-usage.md), and the [historical local-candidate report](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md) for the earlier, separately pinned package proof.
 
 ### Define an explicit portable-payload contract
 
@@ -366,10 +366,10 @@ Protocol-agnostic communication with automatic protocol detection based on addre
 | Scheme | Transport | Use case |
 |--------|-----------|----------|
 | `thread://` | In-process direct call | Zero serialization, testing |
-| `ipc:///path` | Unix domain socket + shared memory | Multi-process, same host |
+| `ipc://server` | Unix domain socket or Windows Named Pipe + native shared memory | Multi-process, same host |
 | `http://host:port` | HTTP relay | Cross-machine, web-compatible |
 
-The IPC transport separates its control and data paths: method routing uses local stream frames (Unix UDS or Windows Named Pipes), while payload bytes can be exchanged through native shared mappings. The current portable FastDB receive path is copy-backed. `cc.hold()` and `cc.InputLifetime.BORROWED` provide explicit invalidation/lease boundaries without implying direct FastDB construction in transport memory. Windows implementation and execution evidence are tracked in [the implementation record](docs/windows-native-implementation.md).
+The IPC transport separates its control and data paths: method routing uses local stream frames (Unix UDS or Windows Named Pipes), while payload bytes can be exchanged through native shared mappings. The current portable FastDB receive path is copy-backed. `cc.hold()` and `cc.InputLifetime.BORROWED` provide explicit invalidation/lease boundaries without implying direct FastDB construction in transport memory. See [Windows development builds and usage](docs/windows-native-usage.md) and [the implementation record](docs/windows-native-implementation.md) for execution evidence.
 
 ### Rust Native Layer
 
@@ -379,7 +379,7 @@ The Rust workspace is organized in four layers (foundation → protocol → tran
 
 - **Contract Core (`c2-contract`)** — Language-neutral `c-two.contract.v2` validation, canonical descriptor hashing, release identity, and opaque nested-spec extraction.
 - **Contract Codegen (`c2-codegen`)** — Delegates nested specs to the official FastDB Rust projection, verifies returned artifacts, composes C-Two and FastDB outputs deterministically, and publishes a complete new tree.
-- **Buddy Allocator** — Zero-syscall shared memory allocation for the IPC transport. Cross-process, lock-free on the fast path.
+- **Buddy Allocator** — Allocation and release use a cross-process atomic lock in shared memory. A dead or panicking holder cannot authorize further mutations of potentially incomplete allocator state.
 - **Wire Protocol** — Frame encoding, chunk assembly, and chunk registry for large-payload lifecycle management.
 - **HTTP Relay** — High-throughput [axum](https://github.com/tokio-rs/axum)-based gateway bridging HTTP to IPC. Handles connection pooling and request multiplexing.
 
@@ -455,10 +455,9 @@ If no pre-built wheel is available for your platform, pip will build from source
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
-# Place FastDB implementation commit
-# 7eb74734926bd8fe911229eee9744a6dd8172487 at ../fastdb.
-# C-Two implementation commit
-# bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02 is the audited package input.
+# Place a FastDB 0.2.0 source checkout at ../fastdb.
+# Windows requires the additional exact MSVC repair source documented in
+# docs/windows-native-usage.md and pinned by windows-native.yml.
 cp .env.example .env               # configure environment (optional)
 uv sync                            # install dependencies + compile Rust extensions
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)

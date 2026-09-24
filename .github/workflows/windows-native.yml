@@ -10,6 +10,7 @@ on:
       - "cli/**"
       - "tools/ci/**"
       - ".github/workflows/windows-native.yml"
+      - ".gitattributes"
 
 permissions:
   contents: read
@@ -94,7 +95,7 @@ jobs:
             # invokes native Windows Python/CMake/emcc; do not select WSL bash.
             $gitBash = Join-Path $env:ProgramFiles "Git/bin/bash.exe"
             if (-not (Test-Path $gitBash -PathType Leaf)) { throw "Git Bash is required: $gitBash" }
-            "npm_config_script_shell=$gitBash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "C2_FASTDB_NPM_SCRIPT_SHELL=$gitBash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             & $gitBash --version
             if ($LASTEXITCODE -ne 0) { throw "Git Bash probe failed with $LASTEXITCODE" }
             & ninja --version

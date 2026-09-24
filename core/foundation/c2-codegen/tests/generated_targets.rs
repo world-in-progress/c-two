@@ -222,6 +222,13 @@ fastdb = {{ path = {fastdb:?} }}
         fastdb = fastdb.join("bindings/rust/fastdb"),
     );
     std::fs::write(tempdir.path().join("Cargo.toml"), manifest).unwrap();
+    // Reuse the graph available to the enclosing Core test invocation, rather
+    // than freshly selecting registry versions for this temporary root.
+    std::fs::copy(
+        repository.join("core/Cargo.lock"),
+        tempdir.path().join("Cargo.lock"),
+    )
+    .expect("seed generated project dependencies from the tested Core workspace");
     std::fs::create_dir(tempdir.path().join("src")).unwrap();
     std::fs::write(
         tempdir.path().join("src/lib.rs"),
@@ -230,7 +237,7 @@ fastdb = {{ path = {fastdb:?} }}
     .unwrap();
 
     let output = Command::new(env!("CARGO"))
-        .args(["check", "--quiet"])
+        .args(["check", "--quiet", "--offline"])
         .current_dir(tempdir.path())
         .env(
             "CARGO_TARGET_DIR",

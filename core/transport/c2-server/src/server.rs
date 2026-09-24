@@ -3563,18 +3563,10 @@ mod tests {
         Arc::new(Mutex::new(writer))
     }
 
-    fn endpoint_connects(endpoint: &LocalEndpoint) -> bool {
-        let endpoint = endpoint.clone();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT))
-                .is_ok()
-        })
-        .join()
-        .unwrap()
+    async fn endpoint_connects(endpoint: &LocalEndpoint) -> bool {
+        LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT)
+            .await
+            .is_ok()
     }
 
     #[tokio::test]
@@ -3619,7 +3611,7 @@ mod tests {
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Ready);
         assert!(server.is_ready());
         assert!(server.is_running());
-        assert!(endpoint_connects(server.local_endpoint()));
+        assert!(endpoint_connects(server.local_endpoint()).await);
 
         server.request_shutdown_signal();
         runner.await.unwrap().unwrap();
@@ -3721,7 +3713,7 @@ mod tests {
             .wait_until_ready(Duration::from_secs(2))
             .await
             .unwrap();
-        assert!(endpoint_connects(first.local_endpoint()));
+        assert!(endpoint_connects(first.local_endpoint()).await);
 
         let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
         let second_result = tokio::time::timeout(Duration::from_millis(200), {
@@ -3732,11 +3724,9 @@ mod tests {
 
         match second_result {
             Ok(Err(err)) => {
-                let message = err.to_string();
                 assert!(
-                    message.contains("already has an active listener")
-                        || message.contains("address already in use"),
-                    "unexpected error: {message}",
+                    matches!(err, ServerError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
+                    "unexpected error: {err}",
                 );
             }
             Ok(Ok(())) => panic!("second server unexpectedly started and stopped cleanly"),
@@ -3747,7 +3737,7 @@ mod tests {
         }
 
         assert!(first.is_ready());
-        assert!(endpoint_connects(first.local_endpoint()));
+        assert!(endpoint_connects(first.local_endpoint()).await);
         first.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
     }
@@ -3764,7 +3754,7 @@ mod tests {
             .wait_until_ready(Duration::from_secs(2))
             .await
             .unwrap();
-        assert!(endpoint_connects(first.local_endpoint()));
+        assert!(endpoint_connects(first.local_endpoint()).await);
 
         let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
         let second_result = tokio::time::timeout(Duration::from_millis(200), {
@@ -3776,14 +3766,13 @@ mod tests {
             .expect("second server hung instead of rejecting the active socket")
             .expect_err("second bind must fail");
         assert!(
-            err.to_string().contains("active listener")
-                || err.to_string().contains("address already in use"),
+            matches!(err, ServerError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
             "unexpected error: {err}",
         );
         second.request_shutdown_signal();
 
         assert!(first.is_ready());
-        assert!(endpoint_connects(first.local_endpoint()));
+        assert!(endpoint_connects(first.local_endpoint()).await);
         first.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
     }
@@ -3807,7 +3796,7 @@ mod tests {
             .wait_until_ready(Duration::from_secs(2))
             .await
             .unwrap();
-        assert!(endpoint_connects(server.local_endpoint()));
+        assert!(endpoint_connects(server.local_endpoint()).await);
 
         server.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
@@ -3822,7 +3811,7 @@ mod tests {
             .wait_until_ready(Duration::from_secs(2))
             .await
             .unwrap();
-        assert!(endpoint_connects(server.local_endpoint()));
+        assert!(endpoint_connects(server.local_endpoint()).await);
 
         server.request_shutdown_signal();
         second_runner.await.unwrap().unwrap();
@@ -3850,8 +3839,7 @@ mod tests {
             .await
             .expect_err("active socket should reject the first attempt");
         assert!(
-            failed.to_string().contains("active listener")
-                || failed.to_string().contains("address already in use"),
+            matches!(failed, ServerError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse),
             "unexpected error: {failed}",
         );
         assert!(matches!(
@@ -3871,7 +3859,7 @@ mod tests {
             .wait_until_ready(Duration::from_secs(2))
             .await
             .unwrap();
-        assert!(endpoint_connects(second.local_endpoint()));
+        assert!(endpoint_connects(second.local_endpoint()).await);
 
         second.request_shutdown_signal();
         second_runner.await.unwrap().unwrap();

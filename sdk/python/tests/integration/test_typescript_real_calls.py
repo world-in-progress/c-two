@@ -84,6 +84,25 @@ def _git(repository: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def _fastdb_npm_build_command() -> list[str]:
+    command = ["npm"]
+    if os.name == "nt":
+        configured = os.environ.get("C2_FASTDB_NPM_SCRIPT_SHELL")
+        shell = (
+            Path(configured)
+            if configured
+            else Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Git/bin/bash.exe"
+        )
+        if not shell.is_file():
+            raise AssertionError(
+                "FastDB npm build requires Git Bash; configure "
+                f"C2_FASTDB_NPM_SCRIPT_SHELL (not found: {shell})"
+            )
+        command.extend(["--script-shell", str(shell)])
+    return [*command, "run", "build"]
+
+
 def _pack_npm_package(package: Path, destination: Path) -> Path:
     destination.mkdir(parents=True)
     _run_checked(
@@ -206,7 +225,7 @@ class TypeScriptArtifacts:
                         timeout=900,
                     )
             _run_checked(
-                ["npm", "run", "build"],
+                _fastdb_npm_build_command(),
                 cwd=FASTDB_TYPESCRIPT,
                 timeout=300,
             )
