@@ -166,8 +166,8 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
                                    "-q", "--timeout=30", f"--junitxml={output / 'windows-harness-tests.xml'}"],
          ("python-build",)),
         ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build",)),
-        ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], ("python-build",)),
-        ("typescript-tests", ["uv", "run", "--no-sync", "pytest", TYPESCRIPT_TEST, "-q", "--timeout=600", f"--junitxml={output / 'typescript-tests.xml'}"], ("python-build", "fastdb-npm-install", "c2-mem-npm-install")),
+        ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], ("python-build", "cli-artifact")),
+        ("typescript-tests", ["uv", "run", "--no-sync", "pytest", TYPESCRIPT_TEST, "-q", "--timeout=600", f"--junitxml={output / 'typescript-tests.xml'}"], ("python-build", "fastdb-npm-install", "c2-mem-npm-install", "cli-artifact")),
     ]
 
 
@@ -197,6 +197,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "C2_TYPESCRIPT_RECEIPT": str(output / f"typescript-real-call-{options.scope}-receipt.v1.json"),
         "C2_TYPESCRIPT_EVIDENCE_STAGE": "development",
         "C2_TYPESCRIPT_FASTDB_SOURCE_SHA": options.expected_fastdb_sha,
+        # Both matrices must exercise the retained cli/c3.exe bytes. Point them
+        # at the artifact copy instead of a target-dir binary that any later
+        # cargo invocation can relink, and require cli-artifact first.
+        "C2_PORTABLE_MATRIX_C3_BIN": str(output / "cli/c3.exe"),
     })
     sources = {}
     for name, path, expected in (
