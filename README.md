@@ -61,7 +61,7 @@ This installs the published 0.5.x runtime. Pre-built wheels cover CPython 3.10â€
 ### Development checkout
 
 ```bash
-git clone https://github.com/world-in-progress/c-two.git
+git clone --branch dev-feature https://github.com/Dsssyc/c-two.git
 cd c-two
 # Full interoperability tests, golden fixtures, and TypeScript fixtures also
 # need the pinned FastDB source checkout as a sibling:

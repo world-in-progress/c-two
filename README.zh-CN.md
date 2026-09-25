@@ -61,7 +61,7 @@ pip install c-two
 ### 开发环境（源码 checkout）
 
 ```bash
-git clone https://github.com/world-in-progress/c-two.git
+git clone --branch dev-feature https://github.com/Dsssyc/c-two.git
 cd c-two
 # 完整互操作测试、golden fixture 与 TypeScript fixture 还需要将固定版本的
 # FastDB 源码 checkout 放在同级目录：
