@@ -2,7 +2,7 @@ name: Windows Native
 
 on:
   push:
-    branches: [socu/windows-native-ipc, dev-feature, main]
+    branches: [socu/windows-native-ipc, main]
   pull_request:
     paths:
       - "core/**"
