@@ -52,6 +52,28 @@ Contract, fail-closed on every deviation:
   fail; tags are never moved and assets are never clobbered. ``--dry-run``
   performs the identical read-only verification, including all remote
   comparisons, and never publishes.
+- ``--skip-already-published`` (passed only for automatic ``workflow_run``
+  promotions, never manual dispatches) finishes as an explicit
+  no-publication skip plan when the target version — the ``c3`` version for
+  GitHub releases, the ``c_two`` version for PyPI, decided independently — is
+  already fully published. The skip is decided by an authenticated read-only
+  preflight before any candidate artifact is downloaded: the version is read
+  from the source tree at the candidate SHA exactly the way the Release
+  Candidate workflow derives it, then the remote state is validated. A
+  GitHub-release skip requires a published (non-draft, non-prerelease)
+  release behind a tag at a different commit, every canonical asset present
+  with positive size and an API sha256 digest, and the published
+  ``rc-manifest.json`` — the only asset downloaded, digest-verified — bound
+  to that tag's commit with every canonical asset's API digest and byte size
+  bound to that manifest (sidecars through the canonical checksum format).
+  A PyPI skip requires the exact 30-row
+  5-platform x 6-ABI wheel inventory plus the sdist under the version's own
+  names with digests, and asserts nothing about whose bytes the registry
+  holds: a complete registry version is immutable, so there is nothing to
+  publish either way. Skips mutate no tag, release, or registry state.
+  Incomplete, renamed, foreign, malformed, empty, or unbound remote state
+  still fails closed, and a manual dispatch that hits the same collision
+  fails as before.
 
 Exit codes: ``0`` plan ready, ``75`` deferred (other gate still running),
 ``1`` validation failure with diagnostics on stderr.
@@ -59,16 +81,19 @@ Exit codes: ``0`` plan ready, ``75`` deferred (other gate still running),
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import json
 import os
 import re
 import stat
 import sys
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -90,7 +115,7 @@ from tools.local_rc import (  # noqa: E402
     typescript_receipt,
 )
 import release_candidate as rc_helper  # noqa: E402
-from packaging.utils import parse_wheel_filename  # noqa: E402
+from packaging.utils import InvalidWheelFilename, parse_wheel_filename  # noqa: E402
 
 EXPECT_REPOSITORY = "world-in-progress/c-two"
 EXPECT_REF = "refs/heads/main"
@@ -104,6 +129,7 @@ CONTEXT_SCHEMA = "c-two.release-candidate.context.v1"
 PLAN_SCHEMA = "c-two.release-promotion-plan.v1"
 PYPI_HOST = "https://pypi.org"
 EXIT_DEFERRED = 75
+SKIP_ACTION = "skip-already-published"
 
 CLI_TARGETS = (
     "x86_64-unknown-linux-gnu",
@@ -117,6 +143,9 @@ EXPECTED_CLI_NAMES = tuple(
     f"c3-{target}{'.exe' if target == WINDOWS_TARGET else ''}" for target in CLI_TARGETS
 )
 EXPECTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14", "3.14t")
+# The wheel population one published c_two version carries on PyPI
+# (5 platforms x 6 interpreter/ABI rows) plus exactly one sdist.
+EXPECTED_WHEEL_ROWS = len(CLI_TARGETS) * len(EXPECTED_PYTHONS)
 # Advertised row -> exact tag pair. A free-threaded 3.14t wheel is
 # interpreter cp314 with ABI cp314t (c_two-...-cp314-cp314t-<plat>.whl); it
 # must never be confused with the GIL build's cp314-cp314 pair.
@@ -566,17 +595,26 @@ def verify_manifest_binding(manifest: dict[str, Any], extraction: Path, source_s
             "fastdb_source_rev": meta["fastdb_source_rev"]}
 
 
-def verify_wheel_rows(wheels: list[dict[str, Any]], c_two_version: str) -> dict[str, str]:
-    """Require the 30 unique target x interpreter wheel rows (5 platforms x 6 ABIs).
+def map_wheel_rows(
+    wheel_names: Iterable[str], c_two_version: str,
+) -> dict[tuple[str, str, str], str]:
+    """Map each wheel filename to its exact ``(target, interpreter, abi)`` row.
 
-    Rows are keyed by the exact ``(interpreter, abi)`` tag pair so the GIL
-    ``cp314-cp314`` and free-threaded ``cp314-cp314t`` builds stay distinct.
+    Shared by the verified-manifest inventory and the PyPI preflight: any
+    name that is not exactly one advertised row of the version's
+    5-platform x 6-ABI matrix — an invalid filename, wrong distribution or
+    version, an ambiguous tag pair or platform, or a duplicate row — fails
+    closed. Rows are keyed by the exact ``(interpreter, abi)`` tag pair so
+    the GIL ``cp314-cp314`` and free-threaded ``cp314-cp314t`` builds stay
+    distinct.
     """
     allowed_pairs = set(PYTHON_ABI_PAIRS.values())
     by_row: dict[tuple[str, str, str], str] = {}
-    for entry in wheels:
-        name = entry["name"]
-        distribution, version, _, tags = parse_wheel_filename(name)
+    for name in wheel_names:
+        try:
+            distribution, version, _, tags = parse_wheel_filename(name)
+        except (InvalidWheelFilename, ValueError) as error:
+            raise PromotionError(f"wheel {name} is not a valid wheel filename: {error}") from error
         _require(distribution.replace("_", "-").lower() == "c-two",
                  f"unexpected wheel distribution {name}")
         _require(str(version) == c_two_version,
@@ -594,6 +632,12 @@ def verify_wheel_rows(wheels: list[dict[str, Any]], c_two_version: str) -> dict[
         _require(key not in by_row,
                  f"duplicate wheel row for {key[0]} {key[1]}-{key[2]}")
         by_row[key] = name
+    return by_row
+
+
+def verify_wheel_rows(wheels: list[dict[str, Any]], c_two_version: str) -> dict[str, str]:
+    """Require the 30 unique target x interpreter wheel rows (5 platforms x 6 ABIs)."""
+    by_row = map_wheel_rows((entry["name"] for entry in wheels), c_two_version)
     python_by_pair = {pair: python for python, pair in PYTHON_ABI_PAIRS.items()}
     coverage = {(target, python) for target in CLI_TARGETS for python in EXPECTED_PYTHONS}
     have = {(target, python_by_pair[(interpreter, abi)])
@@ -1122,6 +1166,25 @@ def verify_windows_native(
     return validated
 
 
+def expected_release_asset_names() -> set[str]:
+    """The canonical asset population of one published c3 release, by name.
+
+    Mirrors exactly what ``stage_github_release_assets`` stages: every CLI
+    executable with its sidecar, the canonical installer assets, the FastDB
+    license evidence, and the candidate manifest. Used to decide — without
+    staging or downloading bytes — whether an existing release for an
+    already-tagged version is complete and foreign-free.
+    """
+    names: set[str] = set()
+    for cli_name in EXPECTED_CLI_NAMES:
+        names.add(cli_name)
+        names.add(_sidecar_name(cli_name))
+    names.update(EXPECTED_INSTALLER_NAMES)
+    names.update(FASTDB_LICENSE_ASSETS)
+    names.add(MANIFEST_NAME)
+    return names
+
+
 def stage_github_release_assets(
     extraction: Path, manifest: dict[str, Any], staging: Path, staged_root: Path
 ) -> list[dict[str, Any]]:
@@ -1205,16 +1268,188 @@ def resolve_tag_commit(api: GitHubApi, tag: str) -> str | None:
     raise PromotionError(f"tag {tag} points at unsupported object type {obj.get('type')!r}")
 
 
+def _published_asset_bindings(
+    manifest: dict[str, Any], manifest_sha: str, manifest_bytes: int,
+) -> dict[str, tuple[str, int]]:
+    """Expected ``(sha256, bytes)`` for every canonical release asset, derived
+    from the published rc-manifest.json.
+
+    The executables, canonical installers, and FastDB license evidence bind
+    directly to their manifest entries; the five executable sidecars bind to
+    release_candidate.py's canonical checksum format ``f'{sha256}  {name}\\n'``
+    derived from those entries; rc-manifest.json binds to its own
+    just-verified digest. Missing, duplicate, or malformed manifest entries
+    fail closed.
+    """
+    bindings: dict[str, tuple[str, int]] = {MANIFEST_NAME: (manifest_sha, manifest_bytes)}
+
+    def collect(entries: Any, kind: str, names: Iterable[str]) -> None:
+        _require(isinstance(entries, list), f"published {MANIFEST_NAME} {kind} list is missing")
+        by_name: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            _require(isinstance(entry, dict),
+                     f"published {MANIFEST_NAME} {kind} entry is not an object")
+            name = entry.get("name")
+            _require(isinstance(name, str) and name,
+                     f"published {MANIFEST_NAME} {kind} entry has no name")
+            _require(name not in by_name,
+                     f"published {MANIFEST_NAME} lists {name} twice under {kind}")
+            by_name[name] = entry
+        for name in names:
+            entry = by_name.get(name)
+            _require(entry is not None,
+                     f"published {MANIFEST_NAME} has no {kind} entry for {name}")
+            sha = entry.get("sha256")
+            size = entry.get("bytes")
+            _require(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha),
+                     f"published {MANIFEST_NAME} {kind} entry {name} has no sha256 digest")
+            _require(isinstance(size, int) and not isinstance(size, bool) and size > 0,
+                     f"published {MANIFEST_NAME} {kind} entry {name} has no positive byte size")
+            bindings[name] = (sha, size)
+
+    collect(manifest.get("cli"), "cli", EXPECTED_CLI_NAMES)
+    collect(manifest.get("installers"), "installers", EXPECTED_INSTALLER_NAMES)
+    collect(manifest.get("fastdb_proof"), "fastdb_proof", FASTDB_LICENSE_ASSETS)
+    for name in EXPECTED_CLI_NAMES:
+        sha, _ = bindings[name]
+        # release_candidate.py writes text in native mode. The Windows-built
+        # executable's sidecar therefore has CRLF; Unix builds use LF.
+        newline = "\r\n" if name == f"c3-{WINDOWS_TARGET}.exe" else "\n"
+        sidecar = f"{sha}  {name}{newline}".encode()
+        bindings[_sidecar_name(name)] = (sha256_bytes(sidecar), len(sidecar))
+    return bindings
+
+
+def _release_skip_state(
+    api: GitHubApi, tag: str, title: str, tag_commit: str, source_sha: str,
+) -> dict[str, Any]:
+    """Classify a version whose tag already points at a different commit.
+
+    The single skip validator, shared by the early preflight and the
+    post-verification race path. The skip requires a published (non-draft,
+    non-prerelease), correctly named release carrying every canonical asset,
+    and the retained published ``rc-manifest.json`` — the only asset
+    downloaded, verified against its API digest — bound to the tagged source
+    commit with every canonical asset's API digest and byte size bound to
+    that manifest (sidecars through the canonical checksum format). A missing
+    release, a renamed or unpublished one, malformed, foreign, empty, or
+    undigested assets, an unbound manifest, or an altered executable,
+    installer, license, or sidecar stay fail-closed: the version cannot be
+    completed from a different source and its tag must never move.
+    """
+    status, release = api.get_json(f"/repos/{api.repository}/releases/tags/{tag}")
+    _require(
+        status == 200 and isinstance(release, dict),
+        f"tag {tag} already points at {tag_commit} but carries no release; the version is "
+        "incompletely published and needs manual resolution; refusing to move the tag",
+    )
+    _require(release.get("name") == title,
+             f"existing release for {tag} is named {release.get('name')!r}, expected {title!r}")
+    _require(release.get("tag_name") == tag,
+             f"existing release for {tag} reports tag_name {release.get('tag_name')!r}")
+    _require(
+        release.get("draft") is not True and release.get("prerelease") is not True,
+        f"release {tag} is not a published release (draft={release.get('draft')!r}, "
+        f"prerelease={release.get('prerelease')!r}); refusing to skip an unpublished release",
+    )
+    remote: dict[str, dict[str, Any]] = {}
+    for asset in release.get("assets", []):
+        _require(isinstance(asset, dict), f"release {tag} carries a malformed asset entry")
+        name = asset.get("name")
+        _require(isinstance(name, str) and name, f"release {tag} carries an unnamed asset")
+        remote[name] = asset
+    expected = expected_release_asset_names()
+    foreign = sorted(set(remote) - expected)
+    _require(not foreign, f"release {tag} carries foreign assets {foreign}; refusing to touch them")
+    missing = sorted(expected - set(remote))
+    _require(
+        not missing,
+        f"release {tag} is missing assets {missing}; the version was published from "
+        f"{tag_commit} and cannot be completed from {source_sha}",
+    )
+    # Bind the published release to the tagged source: download only the
+    # retained manifest, verify its API digest, and require its recorded
+    # source commit and c3 version to match the tag.
+    manifest_asset = remote[MANIFEST_NAME]
+    status, blob = api.get_bytes(
+        f"/repos/{api.repository}/releases/assets/{manifest_asset.get('id')}",
+        accept="application/octet-stream",
+    )
+    _require(status == 200, f"cannot download the published {MANIFEST_NAME} from {tag}")
+    manifest_digest = manifest_asset["digest"][len("sha256:"):]
+    _require(sha256_bytes(blob) == manifest_digest,
+             f"published {MANIFEST_NAME} bytes do not match their API digest")
+    try:
+        published_manifest = json.loads(blob.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise PromotionError(f"published {MANIFEST_NAME} is not valid JSON: {error}") from error
+    version = tag[len(TAG_PREFIX):]
+    _require(isinstance(published_manifest, dict)
+             and published_manifest.get("schema") == MANIFEST_SCHEMA,
+             f"published {MANIFEST_NAME} schema is not {MANIFEST_SCHEMA}")
+    _require(
+        published_manifest.get("source_commit_sha") == tag_commit,
+        f"published {MANIFEST_NAME} records source "
+        f"{published_manifest.get('source_commit_sha')!r}, not the tagged commit {tag_commit}; "
+        "the release is not bound to its tag",
+    )
+    meta = published_manifest.get("meta")
+    _require(isinstance(meta, dict) and meta.get("c3_version") == version,
+             f"published {MANIFEST_NAME} does not record c3 version {version}")
+    # Bind every canonical asset's API digest and size to the manifest: a
+    # replaced executable, installer, license, or sidecar cannot match the
+    # bytes the published manifest recorded.
+    bindings = _published_asset_bindings(published_manifest, manifest_digest, len(blob))
+    for name in sorted(expected):
+        asset = remote[name]
+        size = asset.get("size")
+        digest = asset.get("digest")
+        _require(isinstance(size, int) and not isinstance(size, bool) and size > 0,
+                 f"release {tag} asset {name} has no positive size")
+        _require(isinstance(digest, str) and digest.startswith("sha256:"),
+                 f"release {tag} asset {name} lacks an API sha256 digest")
+        expected_sha, expected_size = bindings[name]
+        _require(
+            size == expected_size,
+            f"release {tag} asset {name} is {size} bytes; the published manifest binds "
+            f"{expected_size}",
+        )
+        _require(
+            digest == f"sha256:{expected_sha}",
+            f"release {tag} asset {name} digest does not match the published manifest",
+        )
+    return {
+        "tag": tag,
+        "title": title,
+        "tag_exists": True,
+        "tag_commit": tag_commit,
+        "release_exists": True,
+        "published_from": tag_commit,
+        "action": SKIP_ACTION,
+        "assets": [],
+        "candidate_bytes_compared": False,
+        "manifest_sha256": manifest_digest,
+        "reason": (
+            f"tag {tag} points at {tag_commit} and its published release is complete and "
+            f"bound to that source through {MANIFEST_NAME}, with every asset digest bound "
+            f"to it; the version was already released from that commit, not the candidate "
+            f"{source_sha}"
+        ),
+    }
+
+
 def github_release_state(
-    api: GitHubApi, tag: str, title: str, source_sha: str, assets: list[dict[str, Any]]
+    api: GitHubApi, tag: str, title: str, source_sha: str, assets: list[dict[str, Any]],
+    *, allow_skip: bool = False,
 ) -> dict[str, Any]:
     """Classify each planned asset against the existing release; never clobber or move tags."""
     tag_commit = resolve_tag_commit(api, tag)
-    if tag_commit is not None:
-        _require(
-            tag_commit == source_sha,
+    if tag_commit is not None and tag_commit != source_sha:
+        if allow_skip:
+            return _release_skip_state(api, tag, title, tag_commit, source_sha)
+        raise PromotionError(
             f"tag {tag} already points at {tag_commit}, not the candidate source {source_sha}; "
-            "refusing to move an existing tag",
+            "refusing to move an existing tag"
         )
     status, release = api.get_json(f"/repos/{api.repository}/releases/tags/{tag}")
     release_exists = status == 200
@@ -1263,8 +1498,8 @@ def github_release_state(
     }
 
 
-def pypi_state(project: str, version: str, files: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compare the staged dist files with the registry; only byte-equal files may be skipped."""
+def _pypi_version_listing(project: str, version: str) -> dict[str, str] | None:
+    """Fetch the published filename -> sha256 listing for one version (None on 404)."""
     url = f"{PYPI_HOST}/pypi/{project}/{version}/json"
     request = urllib.request.Request(url, headers={"User-Agent": "c-two-release-promotion"})
     try:
@@ -1272,9 +1507,7 @@ def pypi_state(project: str, version: str, files: list[dict[str, Any]]) -> dict[
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         if error.code == 404:
-            for entry in files:
-                entry["disposition"] = "upload"
-            return {"project": project, "version": version, "action": "upload", "files": files}
+            return None
         raise PromotionError(f"PyPI check for {project} {version} returned HTTP {error.code}") from error
     except (urllib.error.URLError, OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PromotionError(f"PyPI check for {project} {version} failed: {error}") from error
@@ -1283,8 +1516,23 @@ def pypi_state(project: str, version: str, files: list[dict[str, Any]]) -> dict[
         if isinstance(entry, dict) and isinstance(entry.get("filename"), str):
             digests = entry.get("digests")
             sha256 = digests.get("sha256") if isinstance(digests, dict) else None
-            _require(isinstance(sha256, str), f"PyPI file {entry['filename']} has no sha256 digest")
+            _require(
+                isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256),
+                f"PyPI file {entry['filename']} has no valid sha256 digest",
+            )
             published[entry["filename"]] = sha256
+    return published
+
+
+def pypi_state(
+    project: str, version: str, files: list[dict[str, Any]], *, allow_skip: bool = False,
+) -> dict[str, Any]:
+    """Compare the staged dist files with the registry; only byte-equal files may be skipped."""
+    published = _pypi_version_listing(project, version)
+    if published is None:
+        for entry in files:
+            entry["disposition"] = "upload"
+        return {"project": project, "version": version, "action": "upload", "files": files}
     planned_names = {entry["name"] for entry in files}
     foreign = sorted(set(published) - planned_names)
     _require(not foreign,
@@ -1296,13 +1544,136 @@ def pypi_state(project: str, version: str, files: list[dict[str, Any]]) -> dict[
         elif remote == entry["sha256"]:
             entry["disposition"] = "verified-existing"
         else:
-            raise PromotionError(
-                f"PyPI {project} {version} already publishes {entry['name']} with different "
-                f"bytes (pypi {remote}, candidate {entry['sha256']}); refusing to clobber"
-            )
+            entry["disposition"] = "conflict"
+    conflicts = [entry for entry in files if entry["disposition"] == "conflict"]
+    if conflicts:
+        # A published PyPI version is immutable: when the registry already
+        # holds the exact complete inventory, an automatic promotion finishes
+        # as an explicit skip instead of failing. Any missing file keeps the
+        # fail-closed clobber refusal.
+        if allow_skip and not any(entry["disposition"] == "upload" for entry in files):
+            for entry in files:
+                entry["disposition"] = SKIP_ACTION
+            return {
+                "project": project,
+                "version": version,
+                "action": SKIP_ACTION,
+                "files": files,
+                "reason": (
+                    f"PyPI {project} {version} already publishes the complete "
+                    f"{len(files)}-file inventory with bytes differing from this candidate; "
+                    "a published version is immutable, so there is nothing to publish"
+                ),
+            }
+        first = conflicts[0]
+        raise PromotionError(
+            f"PyPI {project} {version} already publishes {first['name']} with different "
+            f"bytes (pypi {published[first['name']]}, candidate {first['sha256']}); "
+            "refusing to clobber"
+        )
     to_upload = [entry["name"] for entry in files if entry["disposition"] == "upload"]
     return {"project": project, "version": version,
             "action": "upload" if to_upload else "none", "files": files}
+
+
+def _source_file_text(api: GitHubApi, source_sha: str, path: str) -> str:
+    """Read one repository file at the candidate source SHA (authenticated)."""
+    status, payload = api.get_json(f"/repos/{api.repository}/contents/{path}?ref={source_sha}")
+    _require(
+        status == 200 and isinstance(payload, dict)
+        and payload.get("encoding") == "base64" and isinstance(payload.get("content"), str),
+        f"cannot read {path} at {source_sha} through the authenticated API",
+    )
+    try:
+        return base64.b64decode(payload["content"]).decode("utf-8")
+    except (ValueError, UnicodeError) as error:
+        raise PromotionError(f"invalid base64 contents for {path} at {source_sha}: {error}") from error
+
+
+def _parse_c3_version(text: str) -> str:
+    """Mirror the Release Candidate workflow's cli/Cargo.toml version read."""
+    match = re.search(r'^version = "(.+)"$', text, re.MULTILINE)
+    _require(match is not None, "cli/Cargo.toml at the candidate source has no version field")
+    return match.group(1)
+
+
+def _parse_c_two_version(text: str) -> str:
+    """Mirror the Release Candidate workflow's sdk/python/pyproject.toml read."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise PromotionError(
+            f"sdk/python/pyproject.toml at the candidate source is invalid TOML: {error}"
+        ) from error
+    project = data.get("project")
+    version = project.get("version") if isinstance(project, dict) else None
+    _require(isinstance(version, str) and version,
+             "sdk/python/pyproject.toml at the candidate source has no project.version")
+    return version
+
+
+def preflight_already_published(
+    api: GitHubApi, options: argparse.Namespace, source_sha: str
+) -> dict[str, Any] | None:
+    """Decide the automatic already-published skip before any artifact download.
+
+    The target version is read from the source tree at the candidate SHA
+    exactly the way the Release Candidate workflow derives it, so the
+    preflight never guesses a version the tested bytes do not carry. The
+    GitHub-release skip additionally downloads exactly one small asset — the
+    published ``rc-manifest.json`` — to bind the release to the tagged
+    source. A PyPI skip never compares the candidate's bytes: it asserts only
+    that the registry version is complete under the exact wheel matrix, and a
+    complete registry version is immutable regardless of whose bytes it
+    holds. Returns a skip fragment (carrying ``versions`` and ``action``) or
+    None when the promotion must continue to full verification.
+    """
+    if options.target == "github-release":
+        version = _parse_c3_version(_source_file_text(api, source_sha, "cli/Cargo.toml"))
+        tag = f"{TAG_PREFIX}{version}"
+        tag_commit = resolve_tag_commit(api, tag)
+        if tag_commit is None or tag_commit == source_sha:
+            # Unreleased version, or a same-source rerun: normal promotion.
+            return None
+        skip = _release_skip_state(api, tag, f"c3 {version}", tag_commit, source_sha)
+        skip["versions"] = {"c3_version": version}
+        return skip
+    version = _parse_c_two_version(
+        _source_file_text(api, source_sha, "sdk/python/pyproject.toml"))
+    published = _pypi_version_listing(options.pypi_project, version)
+    if published is None:
+        return None
+    wheel_prefix = f"c_two-{version}-"
+    sdist_name = f"c_two-{version}.tar.gz"
+    wheels = sorted(
+        name for name in published
+        if name.startswith(wheel_prefix) and name.endswith(".whl"))
+    foreign = sorted(
+        name for name in published if name != sdist_name and name not in wheels)
+    _require(not foreign,
+             f"PyPI {options.pypi_project} {version} already publishes foreign files {foreign}")
+    # Exact inventory, not a prefix count: every published wheel must map to
+    # one row of the version's 5-platform x 6-ABI matrix with no duplicates
+    # or unmappable names; a malformed matrix fails closed here.
+    rows = map_wheel_rows(wheels, version)
+    if len(rows) != EXPECTED_WHEEL_ROWS or sdist_name not in published:
+        # Incomplete: a same-source retry may legitimately complete it, so
+        # continue to full verification and the byte-exact classification.
+        return None
+    return {
+        "versions": {"c_two_version": version},
+        "action": SKIP_ACTION,
+        "project": options.pypi_project,
+        "version": version,
+        "published_files": len(published),
+        "candidate_bytes_compared": False,
+        "reason": (
+            f"PyPI {options.pypi_project} {version} already publishes the exact "
+            f"{EXPECTED_WHEEL_ROWS}-row platform/ABI wheel inventory plus the sdist; a "
+            "published version is immutable, so there is nothing to publish. This skip "
+            "does not assert that the published bytes equal this candidate's"
+        ),
+    }
 
 
 def write_release_body(path: Path, plan: dict[str, Any], manifest_sha: str) -> None:
@@ -1410,6 +1781,31 @@ def command_prepare(options: argparse.Namespace) -> int:
 
     require_passed_jobs(api, candidate["id"], {"context", "manifest"})
 
+    if options.skip_already_published:
+        skip = preflight_already_published(api, options, source_sha)
+        if skip is not None:
+            versions = skip.pop("versions")
+            plan: dict[str, Any] = {
+                "schema": PLAN_SCHEMA,
+                "target": options.target,
+                "repository": repository,
+                "dry_run": bool(options.dry_run),
+                "source_sha": source_sha,
+                "versions": versions,
+                "candidate_run": {"id": candidate.get("id"), "url": candidate.get("html_url")},
+                "skip": skip,
+            }
+            Path(options.plan_output).write_text(
+                json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            print(f"no publication: {skip['reason']}")
+            print(
+                f"promotion plan {options.plan_output}: target={options.target} "
+                f"source={source_sha[:12]} candidate_run={candidate.get('id')} "
+                f"action={skip['action']}" + (" [dry run]" if options.dry_run else "")
+            )
+            return 0
+
     download_dir = Path(options.download_dir)
     extraction = download_dir / "candidate"
     extraction.mkdir(parents=True, exist_ok=True)
@@ -1443,24 +1839,36 @@ def command_prepare(options: argparse.Namespace) -> int:
         title = f"c3 {versions['c3_version']}"
         assets = stage_github_release_assets(extraction, manifest, staging, download_dir)
         # Read-only remote comparison runs identically in dry runs; only the
-        # caller's publishing steps are suppressed.
-        plan["github_release"] = github_release_state(api, tag, title, source_sha, assets)
+        # caller's publishing steps are suppressed. A tag that moved to a
+        # different commit since the preflight classifies as a skip here too.
+        plan["github_release"] = github_release_state(
+            api, tag, title, source_sha, assets, allow_skip=options.skip_already_published)
     else:
         files = stage_pypi_files(extraction, manifest, staging / "dist", download_dir)
-        plan["pypi"] = pypi_state(options.pypi_project, versions["c_two_version"], files)
-        # The publishing action consumes the staging directory directly, so it
-        # must hold exactly the registry-missing files; verified-existing
-        # copies are removed from staging, never from the extracted sources.
-        for entry in plan["pypi"]["files"]:
-            if entry["disposition"] == "verified-existing":
+        plan["pypi"] = pypi_state(
+            options.pypi_project, versions["c_two_version"], files,
+            allow_skip=options.skip_already_published)
+        if plan["pypi"]["action"] == SKIP_ACTION:
+            # Nothing may be published for an already-complete registry
+            # version; drop every staged copy so no upload path can see them.
+            for entry in plan["pypi"]["files"]:
                 staged_file = download_dir / entry["staged_path"]
                 if staged_file.is_file():
                     staged_file.unlink()
-        staged = sorted(path.name for path in (staging / "dist").iterdir())
-        expected = sorted(entry["name"] for entry in plan["pypi"]["files"]
-                          if entry["disposition"] == "upload")
-        _require(staged == expected,
-                 f"PyPI staging holds {staged}, expected exactly the missing files {expected}")
+        else:
+            # The publishing action consumes the staging directory directly, so it
+            # must hold exactly the registry-missing files; verified-existing
+            # copies are removed from staging, never from the extracted sources.
+            for entry in plan["pypi"]["files"]:
+                if entry["disposition"] == "verified-existing":
+                    staged_file = download_dir / entry["staged_path"]
+                    if staged_file.is_file():
+                        staged_file.unlink()
+            staged = sorted(path.name for path in (staging / "dist").iterdir())
+            expected = sorted(entry["name"] for entry in plan["pypi"]["files"]
+                              if entry["disposition"] == "upload")
+            _require(staged == expected,
+                     f"PyPI staging holds {staged}, expected exactly the missing files {expected}")
 
     Path(options.plan_output).write_text(
         json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1490,6 +1898,11 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--plan-output", default="promotion-plan.json")
     prepare.add_argument("--release-body-output", default=None)
     prepare.add_argument("--pypi-project", default="c-two")
+    prepare.add_argument("--skip-already-published", action="store_true",
+                         help="Automatic workflow_run mode: when the target version is already "
+                              "fully published from an older source, finish as an explicit "
+                              "no-publication skip instead of failing; manual dispatches must "
+                              "not pass this flag so collisions stay fail-closed")
     prepare.add_argument("--dry-run", action="store_true",
                          help="Identical read-only verification including remote comparison; "
                               "the caller still performs no publishing")

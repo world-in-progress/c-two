@@ -58,6 +58,36 @@ def test_python_release_prepare_job_reads_actions_with_least_privilege():
     assert "id-token: write" not in text
 
 
+def test_python_release_skips_explicitly_when_version_already_published():
+    """Automatic workflow_run promotions whose c-two version is already fully
+    published on PyPI (a complete, immutable registry version) finish as a
+    no-publication skip that does not assert candidate byte equality; manual
+    dispatches keep failing closed on that collision. The decision is
+    independent of the c3 release state."""
+    text = _workflow_text()
+    prepare = text.split("  publish:", 1)[0]
+
+    # The skip allowance exists only on the automatic workflow_run path.
+    assert "AUTOMATIC: ${{ github.event_name == 'workflow_run' }}" in prepare
+    assert (
+        'if [ "$AUTOMATIC" = "true" ]; then args+=(--skip-already-published); fi'
+        in prepare
+    )
+    # The prepare parser accepts the skip plan and reports it explicitly,
+    # reading the reason from the selected group so a late race skip stored
+    # under pypi cannot raise.
+    assert 'plan.get("pypi") or plan["skip"]' in prepare
+    assert "No publication: {group['reason']}" in prepare
+    assert "plan['skip']['reason']" not in prepare
+    assert '"skip-already-published"' in prepare
+    # A skip retains no staged distribution files or plan artifact and never
+    # publishes: both retention steps are gated, and publish still requires
+    # 'upload'.
+    assert prepare.count("action != 'skip-already-published'") == 2
+    publish = text.split("  publish:", 1)[1]
+    assert "needs.prepare.outputs.action == 'upload'" in publish
+
+
 def test_publish_uses_pypi_oidc_trust_identity_and_environment():
     publish = _workflow_text().split("  publish:", 1)[1]
 

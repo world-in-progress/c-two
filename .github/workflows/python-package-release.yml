@@ -14,6 +14,13 @@ name: Python Package Release
 # current main workflow code (never the candidate SHA) and must run on
 # refs/heads/main of the canonical repository; dry_run performs the identical
 # read-only verification without publishing.
+# Automatic workflow_run promotions whose c-two version is already fully
+# published on PyPI finish as an explicit no-publication skip (no registry
+# writes): the registry must hold the exact 30-row platform/ABI wheel
+# inventory plus the sdist with digests, and the skip does not assert that
+# the published bytes equal the candidate's — a complete version is
+# immutable. Manual dispatches keep failing closed on that collision, and
+# the c3 and c-two versions are decided independently.
 
 on:
   workflow_run:
@@ -84,6 +91,7 @@ jobs:
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha || inputs.source_sha }}
           CANDIDATE_RUN_ID: ${{ (github.event.workflow_run.name == 'Release Candidate' && github.event.workflow_run.id) || inputs.candidate_run_id }}
           DRY_RUN: ${{ inputs.dry_run == true }}
+          AUTOMATIC: ${{ github.event_name == 'workflow_run' }}
         run: |
           set -euo pipefail
           args=(
@@ -94,6 +102,9 @@ jobs:
           if [ -n "$SOURCE_SHA" ]; then args+=(--source-sha "$SOURCE_SHA"); fi
           if [ -n "$CANDIDATE_RUN_ID" ]; then args+=(--candidate-run-id "$CANDIDATE_RUN_ID"); fi
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          # Only the automatic workflow_run path may finish as an explicit
+          # already-published skip; manual dispatches stay fail-closed.
+          if [ "$AUTOMATIC" = "true" ]; then args+=(--skip-already-published); fi
           code=0
           python .github/scripts/promote_release_candidate.py prepare "${args[@]}" || code=$?
           if [ "$code" -eq 75 ]; then
@@ -108,24 +119,32 @@ jobs:
           python - <<'PY'
           import json, os, pathlib
           plan = json.loads(pathlib.Path("promotion-plan.json").read_text(encoding="utf-8"))
+          group = plan.get("pypi") or plan["skip"]
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("deferred=false\n")
-              output.write(f"action={plan['pypi']['action']}\n")
+              output.write(f"action={group['action']}\n")
               output.write(f"source_sha={plan['source_sha']}\n")
+          if group["action"] == "skip-already-published":
+              # Early skips live under plan["skip"]; a late race skip is
+              # classified inside pypi — read the selected group's own
+              # reason either way.
+              print(f"No publication: {group['reason']}")
           PY
 
       # The upload's least-common ancestor is the staging directory itself, so
       # the artifact members are dist/<name> under the staging root;
-      # downloading into ./staging restores the plan's staging/dist layout.
+      # downloading into ./staging restores the plan's staging/dist layout. An
+      # already-published skip retains nothing: it decided before staging any
+      # distribution files.
       - name: Retain the staged, verified distribution files
-        if: steps.prepare.outputs.deferred != 'true'
+        if: steps.prepare.outputs.deferred != 'true' && steps.prepare.outputs.action != 'skip-already-published'
         uses: actions/upload-artifact@v4
         with:
           name: promotion-staging
           path: candidate-download/staging
 
       - name: Retain the promotion plan
-        if: steps.prepare.outputs.deferred != 'true'
+        if: steps.prepare.outputs.deferred != 'true' && steps.prepare.outputs.action != 'skip-already-published'
         uses: actions/upload-artifact@v4
         with:
           name: promotion-plan

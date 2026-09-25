@@ -105,6 +105,34 @@ def test_cli_release_defers_when_only_one_gate_has_completed():
     assert "action=deferred" in text
 
 
+def test_cli_release_skips_explicitly_when_version_already_published():
+    """Automatic workflow_run promotions whose c3 version is already fully
+    released from the tagged source commit finish as a no-publication skip
+    validated against the published, manifest-bound release; manual
+    dispatches keep failing closed on that collision."""
+    text = _workflow_text()
+    prepare = text.split("  publish:", 1)[0]
+
+    # The skip allowance exists only on the automatic workflow_run path.
+    assert "AUTOMATIC: ${{ github.event_name == 'workflow_run' }}" in prepare
+    assert (
+        'if [ "$AUTOMATIC" = "true" ]; then args+=(--skip-already-published); fi'
+        in prepare
+    )
+    # The prepare parser accepts the skip plan and reports it explicitly,
+    # reading the reason from the selected group so a late race skip stored
+    # under github_release cannot raise.
+    assert 'plan.get("github_release") or plan["skip"]' in prepare
+    assert "No publication: {release['reason']}" in prepare
+    assert "plan['skip']['reason']" not in prepare
+    assert '"skip-already-published"' in prepare
+    # A skip retains no staged bytes or plan artifact and never publishes:
+    # both retention steps are gated, and publish still requires 'upload'.
+    assert prepare.count("action != 'skip-already-published'") == 2
+    publish = text.split("  publish:", 1)[1]
+    assert "needs.prepare.outputs.action == 'upload'" in publish
+
+
 def test_cli_release_prepare_job_reads_actions_with_least_privilege():
     text = _workflow_text().split("  publish:", 1)[0]
 
