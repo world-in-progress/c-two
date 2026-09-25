@@ -2,13 +2,14 @@ name: Windows Native
 
 on:
   push:
-    branches: [socu/windows-native-ipc]
+    branches: [socu/windows-native-ipc, dev-feature, main]
   pull_request:
     paths:
       - "core/**"
       - "sdk/**"
       - "cli/**"
       - "tools/ci/**"
+      - ".github/scripts/prepare_fastdb_sdk.py"
       - ".github/workflows/windows-native.yml"
       - ".gitattributes"
 
@@ -42,7 +43,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           path: c-two
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -54,6 +55,18 @@ jobs:
         with:
           python-version: "3.12"
           architecture: x64
+
+      # Core and the Rust SDK consume the registry fastdb-sys package, which
+      # links only against the published CoreSDK in system mode. App CLI and
+      # Python extension gates opt back into source mode inside
+      # tools/ci/windows_native.py through their fastdb-sys Git patches.
+      - name: Prepare official FastDB CoreSDK
+        id: fastdb_sdk
+        run: >-
+          python c-two/.github/scripts/prepare_fastdb_sdk.py
+          --target x86_64-pc-windows-msvc
+          --output "${{ runner.temp }}/fastdb-core-sdk"
+          --emit-github
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -91,7 +104,7 @@ jobs:
             $nodeVersion = & node --version
             if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v22\.') { throw "Node 22 is required: $nodeVersion" }
             Write-Output "Application Node: $nodeVersion"
-            # FastDB 0.2.0's npm build scripts use POSIX shell syntax. Git Bash
+            # FastDB's npm build scripts use POSIX shell syntax. Git Bash
             # invokes native Windows Python/CMake/emcc; do not select WSL bash.
             $gitBash = Join-Path $env:ProgramFiles "Git/bin/bash.exe"
             if (-not (Test-Path $gitBash -PathType Leaf)) { throw "Git Bash is required: $gitBash" }
@@ -128,7 +141,7 @@ jobs:
             c-two/sdk/rust -> target
             c-two/sdk/python/native -> target
             fastdb/bindings/rust -> target
-          key: ${{ matrix.os }}-${{ matrix.scope }}-msvc-${{ env.FASTDB_SOURCE_SHA }}
+          key: ${{ matrix.os }}-${{ matrix.scope }}-msvc-${{ env.FASTDB_SOURCE_SHA }}-coresdk021
 
       - name: Collect native build and test evidence
         working-directory: c-two
@@ -137,8 +150,9 @@ jobs:
           C2_RUNNER_LABEL: ${{ matrix.os }}
         run: >-
           python tools/ci/windows_native.py
-          --expected-c-two-sha "${{ github.sha }}"
+          --expected-c-two-sha "${{ github.event.pull_request.head.sha || github.sha }}"
           --expected-fastdb-sha "${{ env.FASTDB_SOURCE_SHA }}"
+          --fastdb-system-lib-dir "${{ steps.fastdb_sdk.outputs.lib-dir }}"
           --scope "${{ matrix.scope }}"
           --output "artifacts/windows-native/${{ matrix.scope }}"
 

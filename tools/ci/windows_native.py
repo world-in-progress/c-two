@@ -27,6 +27,18 @@ LOCAL_PLATFORM_SCOPE = "local-platform"
 FULL_SCOPE = "full"
 SCOPES = (LOCAL_PLATFORM_SCOPE, FULL_SCOPE)
 Gate = tuple[str, list[str], tuple[str, ...]]
+FASTDB_LINK_MODE_ENV = "FASTDB_PAYLOAD_LINK_MODE"
+FASTDB_SYSTEM_LIB_DIR_ENV = "FASTDB_PAYLOAD_SYSTEM_LIB_DIR"
+# Deployable applications link FastDB statically through their fastdb-sys Git
+# patches, so every gate that builds or tests one of them must replace the base
+# system-mode environment with explicit source link mode.
+SOURCE_MODE_GATES = frozenset({
+    "cli-build",
+    "cli-test",
+    "python-native-test",
+    "python-wheel-build",
+    "python-build",
+})
 
 
 def capture(command: Sequence[str], cwd: Path) -> dict[str, Any]:
@@ -107,6 +119,60 @@ def npm_command(*arguments: str) -> list[str]:
     return [str(node), str(script), *arguments]
 
 
+def platform_fastdb_library() -> str:
+    if os.name == "nt":
+        return "fastdb.lib"
+    if sys.platform == "darwin":
+        return "libfastdb.dylib"
+    return "libfastdb.so"
+
+
+def validate_system_lib_dir(raw: Path) -> tuple[Path | None, str | None]:
+    """Resolve and validate the prepared CoreSDK lib directory, or explain why."""
+    if not raw.is_absolute():
+        return None, f"{FASTDB_SYSTEM_LIB_DIR_ENV} must be an absolute path: {raw}"
+    resolved = raw.resolve()
+    if not resolved.is_dir():
+        return None, f"prepared FastDB CoreSDK lib directory is missing: {resolved}"
+    library = resolved / platform_fastdb_library()
+    if not library.is_file():
+        return None, f"prepared FastDB CoreSDK is missing {library.name}: {library}"
+    return resolved, None
+
+
+def system_mode_environment(base: dict[str, str], lib_dir: Path) -> dict[str, str]:
+    """Link core/RustSDK consumers against the published system CoreSDK."""
+    environment = dict(base)
+    environment[FASTDB_LINK_MODE_ENV] = "system"
+    environment[FASTDB_SYSTEM_LIB_DIR_ENV] = str(lib_dir)
+    # System-linked consumer binaries resolve fastdb.dll through PATH.
+    separator = ";" if os.name == "nt" else ":"
+    path_keys = [key for key in environment if key.upper() == "PATH"]
+    existing = environment[path_keys[0]] if path_keys else ""
+    for key in path_keys:
+        environment.pop(key)
+    environment["PATH"] = f"{lib_dir}{separator}{existing}" if existing else str(lib_dir)
+    return environment
+
+
+def source_mode_environment(base: dict[str, str]) -> dict[str, str]:
+    """Drop system-mode overrides so app workspaces use their Git-patch source builds."""
+    environment = dict(base)
+    environment[FASTDB_LINK_MODE_ENV] = "source"
+    environment.pop(FASTDB_SYSTEM_LIB_DIR_ENV, None)
+    return environment
+
+
+def gate_environment(
+    name: str, base: dict[str, str], system_lib_dir: Path | None
+) -> dict[str, str]:
+    if system_lib_dir is None:
+        return dict(base)
+    if name in SOURCE_MODE_GATES:
+        return source_mode_environment(base)
+    return system_mode_environment(base, system_lib_dir)
+
+
 def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
     def cargo(name: str, manifest: str, *arguments: str) -> Gate:
         return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], ()
@@ -181,6 +247,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-c-two-sha", required=True)
     parser.add_argument("--expected-fastdb-sha", required=True)
+    parser.add_argument("--fastdb-system-lib-dir", type=Path, default=None,
+                        help="absolute lib directory of the verified official FastDB "
+                             "CoreSDK; supplies system link mode to core/RustSDK "
+                             "consumer gates while app gates keep source mode")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scope", choices=SCOPES, default=FULL_SCOPE)
     options = parser.parse_args(argv)
@@ -210,6 +280,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = capture(["git", "rev-parse", "HEAD"], path)
         sources[name] = {"expected_sha": expected, "actual_sha": result.get("output"), "verified": result.get("exit_code") == 0 and result.get("output") == expected}
     selected_gates = gates(sys.executable, output, options.scope)
+    system_lib_dir: Path | None = None
+    fastdb_sdk_error: str | None = None
+    if options.fastdb_system_lib_dir is not None:
+        system_lib_dir, fastdb_sdk_error = validate_system_lib_dir(options.fastdb_system_lib_dir)
+    elif options.scope == FULL_SCOPE:
+        # Core and the Rust SDK consume the registry fastdb-sys package, which
+        # cannot build from source; the full scope is unrunnable without the
+        # prepared system CoreSDK.
+        fastdb_sdk_error = (
+            "full scope requires --fastdb-system-lib-dir from "
+            ".github/scripts/prepare_fastdb_sdk.py"
+        )
+    if options.scope == FULL_SCOPE:
+        unknown_source_gates = sorted(SOURCE_MODE_GATES - {name for name, _, _ in selected_gates})
+        if unknown_source_gates:
+            fastdb_sdk_error = (
+                f"source-mode gate names no longer exist: {', '.join(unknown_source_gates)}"
+            )
     toolchains = {
         "python": [sys.executable, "--version"], "rustc": ["rustc", "-vV"],
         "cargo": ["cargo", "--version"],
@@ -229,6 +317,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "applicable_gates": [name for name, _, _ in selected_gates],
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": "running", "sources": sources,
+        "fastdb_sdk": {
+            "system_lib_dir": str(system_lib_dir) if system_lib_dir else None,
+            "expected_library": platform_fastdb_library(),
+            "source_mode_gates": sorted(SOURCE_MODE_GATES),
+        },
         "workflow_sha": os.environ.get("C2_WORKFLOW_SHA"),
         "run_id": os.environ.get("GITHUB_RUN_ID"),
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
@@ -241,6 +334,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         evidence["error"] = "This gate requires native x64 Windows."
     elif not all(source["verified"] for source in sources.values()):
         evidence["error"] = "Checked-out source SHA does not match the requested immutable source."
+    elif fastdb_sdk_error is not None:
+        evidence["error"] = fastdb_sdk_error
     else:
         for name, command, dependencies in selected_gates:
             passed = {step["id"] for step in evidence["steps"] if step["status"] == "passed"}
@@ -248,7 +343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if missing:
                 record = {"id": name, "command": command, "status": "not_run", "reason": f"prerequisites did not pass: {', '.join(missing)}"}
             else:
-                record = run_step(name, command, cwd=ROOT, output=output, environment=environment)
+                record = run_step(name, command, cwd=ROOT, output=output,
+                                  environment=gate_environment(name, environment, system_lib_dir))
             evidence["steps"].append(record)
             write_evidence(output, evidence)
     evidence["status"] = "passed" if evidence["steps"] and all(step["status"] == "passed" for step in evidence["steps"]) and "error" not in evidence else "failed"

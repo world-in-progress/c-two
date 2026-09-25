@@ -164,7 +164,9 @@ def test_ci_keeps_workflow_policy_tests_lightweight():
     assert "sdk/python/tests/unit/test_c3_tool.py" not in ci_text
     assert "tests/repo/test_python_package_release_workflow.py" in ci_text
     assert "sdk/python/tests/unit/test_python_package_release_workflow.py" not in ci_text
-    assert "uv run pytest sdk/python/tests -q --timeout=30" in ci_text
+    # The native extension is built in source mode first; --no-sync keeps the
+    # system-mode consumer environment from relinking it against the SDK.
+    assert "uv run --no-sync pytest sdk/python/tests -q --timeout=30" in ci_text
 
 
 def test_cli_enables_graceful_termination_signal_handling():
