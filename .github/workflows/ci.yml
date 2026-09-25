@@ -263,7 +263,7 @@ jobs:
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         run: |
           uv python install 3.10
-          uv sync
+          uv sync --python "${{ matrix.python }}"
           cargo build --locked --manifest-path cli/Cargo.toml
         env:
           FASTDB_PAYLOAD_LINK_MODE: source
@@ -273,6 +273,7 @@ jobs:
         run: cargo test --manifest-path sdk/python/native/Cargo.toml
         env:
           FASTDB_PAYLOAD_LINK_MODE: source
+          PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
 
       # The extension is already built in source mode above; --no-sync keeps
       # uv from relinking it against the system SDK. The system environment is
