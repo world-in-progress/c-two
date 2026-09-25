@@ -678,3 +678,14 @@ def test_manifest_rejects_a_wheel_for_another_target(rc, tmp_path, capsys):
     rewrite_receipt(root, name, swap)
     assert rc.main(manifest_args(root, root / "rc-manifest.json")) == 1
     assert "wheel platform does not match" in capsys.readouterr().err
+
+
+def test_checksum_commands_need_only_the_standard_library(tmp_path):
+    import subprocess
+    import sys
+    helper = Path(__file__).resolve().parents[2] / ".github/scripts/release_candidate.py"
+    artifact = tmp_path / "c3-test"
+    artifact.write_bytes(b"standalone CLI fixture")
+    for command in ("checksum", "verify"):
+        subprocess.run([sys.executable, "-S", str(helper), command, str(artifact)],
+                       check=True, capture_output=True, text=True)

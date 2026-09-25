@@ -33,10 +33,7 @@ import json
 import re
 import sys
 import tarfile
-import tomllib
 from pathlib import Path, PurePosixPath
-
-from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 
 MANIFEST_SCHEMA = "c-two.release-candidate.v1"
 SDIST_REPORT_SCHEMA = "c-two.release-candidate.sdist-inspection.v1"
@@ -136,6 +133,8 @@ def _find_workspace_root(manifest: str, members: dict, read) -> tuple[str, dict]
     be its own workspace root when it declares ``[workspace]`` alongside
     ``[package]``.
     """
+    import tomllib
+
     parts = PurePosixPath(manifest).parts
     for depth in range(len(parts) - 1, 0, -1):
         candidate = str(PurePosixPath(*parts[:depth], "Cargo.toml"))
@@ -168,6 +167,8 @@ def _resolve_dependency_directory(base: PurePosixPath, relative: str) -> PurePos
 
 
 def inspect_sdist(archive: Path) -> dict:
+    import tomllib
+
     report: dict = {
         "schema": SDIST_REPORT_SCHEMA,
         "archive": archive.name,
@@ -363,6 +364,8 @@ def _validate_candidate_bindings(options: argparse.Namespace, problems: list[str
     and the FastDB proof checks run whenever a FastDB proof inventory exists
     alongside the published listing receipt.
     """
+    from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+
     rows: dict[tuple[str, str], tuple[str, dict]] = {}
     cli_by_name = {entry["name"]: entry for entry in cli}
     wheels_by_identity = {(entry["name"], entry["sha256"]): entry for entry in wheels}
