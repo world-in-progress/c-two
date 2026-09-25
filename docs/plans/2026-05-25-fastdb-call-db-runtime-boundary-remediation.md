@@ -1,5 +1,7 @@
 # C-Two FastDB Call-DB Runtime Boundary Remediation
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans or subagent-driven-development to implement this plan task by task. This document is a remediation plan, not an implementation patch.
 
 **Date:** 2026-05-25

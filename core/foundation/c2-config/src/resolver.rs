@@ -492,8 +492,10 @@ fn resolve_server_ipc_config(
     overrides: ServerIpcConfigOverrides,
     shm_threshold: u64,
 ) -> Result<ServerIpcConfig, ConfigError> {
-    let mut cfg = ServerIpcConfig::default();
-    cfg.shm_threshold = shm_threshold;
+    let mut cfg = ServerIpcConfig {
+        shm_threshold,
+        ..ServerIpcConfig::default()
+    };
 
     apply_base_env(&mut cfg.base, catalog)?;
     if let Some(v) = catalog.optional_u64("C2_IPC_MAX_FRAME_SIZE").transpose()? {
@@ -570,8 +572,10 @@ fn resolve_client_ipc_config(
     overrides: ClientIpcConfigOverrides,
     shm_threshold: u64,
 ) -> Result<ClientIpcConfig, ConfigError> {
-    let mut cfg = ClientIpcConfig::default();
-    cfg.shm_threshold = shm_threshold;
+    let mut cfg = ClientIpcConfig {
+        shm_threshold,
+        ..ClientIpcConfig::default()
+    };
 
     apply_base_env(&mut cfg.base, catalog)?;
     apply_base_overrides(&mut cfg.base, &overrides.base);
@@ -921,9 +925,14 @@ mod tests {
         )
         .expect("write env file");
 
-        let mut overrides = RuntimeConfigOverrides::default();
-        overrides.shm_threshold = Some(16_384);
-        overrides.server_ipc.pool_segment_size = Some(4_194_304);
+        let overrides = RuntimeConfigOverrides {
+            shm_threshold: Some(16_384),
+            server_ipc: ServerIpcConfigOverrides {
+                pool_segment_size: Some(4_194_304),
+                ..ServerIpcConfigOverrides::default()
+            },
+            ..RuntimeConfigOverrides::default()
+        };
 
         let sources = ConfigSources {
             env_file: EnvFilePolicy::Path(env_file),
@@ -1190,8 +1199,10 @@ mod tests {
 
     #[test]
     fn global_shm_threshold_is_injected_into_scoped_ipc_configs() {
-        let mut global = RuntimeConfigOverrides::default();
-        global.shm_threshold = Some(16_384);
+        let global = RuntimeConfigOverrides {
+            shm_threshold: Some(16_384),
+            ..RuntimeConfigOverrides::default()
+        };
 
         let server = ConfigResolver::resolve_server_ipc(
             ServerIpcConfigOverrides::default(),

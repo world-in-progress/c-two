@@ -82,8 +82,8 @@ def _relay_control_error_status(exc: BaseException) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _is_crm_contract_mismatch(exc: BaseException) -> bool:
-    return isinstance(exc, RuntimeError) and "CRM contract mismatch" in str(exc)
+def _is_missing_relay_address(exc: BaseException) -> bool:
+    return getattr(exc, 'lifecycle_kind', None) == 'missing_relay_address'
 
 
 def _cc_error_from_native_exception(exc: BaseException) -> CCError | None:
@@ -344,12 +344,18 @@ class _ProcessRegistry:
                 if created_server:
                     server = self._server
                     self._server = None
-                    self._runtime_session.clear_server_identity()
                     if server is not None:
                         try:
                             server.shutdown()
                         except Exception:
                             log.warning('Error shutting down Server after failed register', exc_info=True)
+                    try:
+                        self._runtime_session.clear_server_identity()
+                    except Exception:
+                        log.warning(
+                            'Error clearing Core identity after failed register',
+                            exc_info=True,
+                        )
                 raise
 
         log.debug('Registered CRM %s at %s', name, server_address)
@@ -418,8 +424,6 @@ class _ProcessRegistry:
                     *expected_contract.native_args(),
                 )
             except Exception as exc:
-                if _is_crm_contract_mismatch(exc):
-                    raise
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
                     raise cc_err from exc
                 status = _relay_control_error_status(exc)
@@ -436,15 +440,20 @@ class _ProcessRegistry:
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
-            client = self._runtime_session.acquire_ipc_client(
-                address,
-                name,
-                *expected_contract.native_args(),
-            )
+            try:
+                client = self._runtime_session.acquire_ipc_client(
+                    address,
+                    name,
+                    *expected_contract.native_args(),
+                )
+            except Exception as exc:
+                if (cc_err := _cc_error_from_native_exception(exc)) is not None:
+                    raise cc_err from exc
+                raise
             proxy = CRMProxy.ipc(
                 client,
                 name,
-                on_terminate=lambda addr=address: self._runtime_session.release_ipc_client(addr),
+                on_terminate=client.close,
                 lease_tracker=lease_tracker,
             )
         else:
@@ -455,10 +464,13 @@ class _ProcessRegistry:
                     *expected_contract.native_args(),
                 )
             except Exception as exc:
-                if _is_crm_contract_mismatch(exc):
-                    raise
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
                     raise cc_err from exc
+                if _is_missing_relay_address(exc):
+                    raise LookupError(
+                        f'Name {name!r} is not registered locally '
+                        f'and no address was provided',
+                    ) from exc
                 status = _relay_control_error_status(exc)
                 if status == 404:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc
@@ -557,8 +569,6 @@ class _ProcessRegistry:
             self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
             self._server = None
 
-        runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
-
         if server is not None:
             try:
                 outcome = server.shutdown(
@@ -571,7 +581,6 @@ class _ProcessRegistry:
         else:
             try:
                 outcome = dict(runtime_session.shutdown(
-                    None,
                     route_names=[],
                     relay_anchor_address=None,
                 ))
@@ -599,7 +608,6 @@ class _ProcessRegistry:
                     message,
                 )
 
-        self._runtime_session.shutdown_http_clients()
     # ------------------------------------------------------------------
     # Serve (daemon mode)
     # ------------------------------------------------------------------
@@ -649,7 +657,9 @@ class _ProcessRegistry:
 
         try:
             signal.signal(signal.SIGINT, _handle_signal)
-            if sys.platform != 'win32':
+            if sys.platform == 'win32':
+                signal.signal(signal.SIGBREAK, _handle_signal)
+            else:
                 signal.signal(signal.SIGTERM, _handle_signal)
         except ValueError:
             # Not the main thread — signals cannot be registered.

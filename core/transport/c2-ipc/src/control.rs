@@ -1,382 +1,313 @@
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::future::Future;
+use std::io;
+use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 
-use c2_config::validate_ipc_region_id;
+use crate::client::IpcError;
+use c2_local::{LocalEndpoint, LocalStream};
 use c2_wire::flags::{FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{self, HEADER_SIZE};
 use c2_wire::msg_type::{PING_BYTES, PONG_BYTES};
 use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_ack, encode_shutdown_initiate};
 
-use crate::client::IpcError;
-
-const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
-
-pub fn socket_path_from_ipc_address(address: &str) -> Result<PathBuf, IpcError> {
-    let region = address
-        .strip_prefix("ipc://")
-        .ok_or_else(|| IpcError::Config(format!("invalid IPC address: {address}")))?;
-    validate_ipc_region_id(region).map_err(IpcError::Config)?;
-    Ok(PathBuf::from(IPC_SOCK_DIR).join(format!("{region}.sock")))
+pub fn local_endpoint_from_ipc_address(address: &str) -> Result<LocalEndpoint, IpcError> {
+    LocalEndpoint::from_address(address).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidInput {
+            IpcError::Config(error.to_string())
+        } else {
+            IpcError::Io(error)
+        }
+    })
 }
 
-fn read_exact_or_none(stream: &mut UnixStream, len: usize) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    match stream.read_exact(&mut buf) {
-        Ok(()) => Some(buf),
-        Err(_) => None,
+enum Exchange {
+    Absent,
+    NoReply,
+    Reply(u32, Vec<u8>),
+}
+
+async fn read_reply(stream: &mut LocalStream) -> io::Result<(u32, Vec<u8>)> {
+    let mut header = [0_u8; HEADER_SIZE];
+    stream.read_exact(&mut header).await?;
+    let (total_len, body) = frame::decode_total_len(&header)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
+    let (header, prefix) = frame::decode_frame_body(body, total_len)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
+    // Administrative acknowledgements contain a control document, never a CRM
+    // payload. Reject hostile lengths before reserving a buffer.
+    if header.payload_len() > 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local control reply exceeds 1 MiB",
+        ));
     }
+    let mut payload = prefix.to_vec();
+    let prefix_len = payload.len();
+    payload.resize(header.payload_len(), 0);
+    stream.read_exact(&mut payload[prefix_len..]).await?;
+    Ok((header.flags, payload))
 }
 
-fn send_signal_and_read_reply(
-    address: &str,
+async fn exchange(
+    endpoint: &LocalEndpoint,
     timeout: Duration,
     signal: &[u8],
-) -> Result<Option<(u32, Vec<u8>)>, IpcError> {
-    let socket_path = socket_path_from_ipc_address(address)?;
-    if !socket_path.exists() {
-        return Ok(None);
-    }
-
-    let mut stream = match UnixStream::connect(&socket_path) {
-        Ok(stream) => stream,
-        Err(_) => return Ok(None),
-    };
-    if stream.set_read_timeout(Some(timeout)).is_err() {
-        return Ok(None);
-    }
-    if stream.set_write_timeout(Some(timeout)).is_err() {
-        return Ok(None);
-    }
-
-    let frame_bytes = frame::encode_frame(0, FLAG_SIGNAL, signal);
-    if stream.write_all(&frame_bytes).is_err() {
-        return Ok(None);
-    }
-
-    let header = match read_exact_or_none(&mut stream, HEADER_SIZE) {
-        Some(header) => header,
-        None => return Ok(None),
-    };
-
-    let (total_len, body) = match frame::decode_total_len(&header) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let (frame_header, payload_prefix) = match frame::decode_frame_body(body, total_len) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let payload_len = frame_header.payload_len();
-    let mut payload = payload_prefix.to_vec();
-    if payload.len() < payload_len {
-        let remaining = payload_len - payload.len();
-        match read_exact_or_none(&mut stream, remaining) {
-            Some(tail) => payload.extend_from_slice(&tail),
-            None => return Ok(None),
+) -> Result<Exchange, IpcError> {
+    let operation = async {
+        let mut stream = match LocalStream::connect(endpoint, timeout).await {
+            Ok(stream) => stream,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Exchange::Absent);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(IpcError::Io(error));
+            }
+            // On macOS, ConnectionRefused can mean a live listener's backlog
+            // is full. It cannot prove that a server has stopped.
+            Err(_) => return Ok(Exchange::NoReply),
+        };
+        let frame = frame::encode_frame(0, FLAG_SIGNAL, signal);
+        if stream
+            .write_all_with_timeout(&frame, timeout)
+            .await
+            .is_err()
+        {
+            return Ok(Exchange::NoReply);
         }
-    }
-    Ok(Some((frame_header.flags, payload)))
+        Ok(match read_reply(&mut stream).await {
+            Ok((flags, payload)) => Exchange::Reply(flags, payload),
+            Err(_) => Exchange::NoReply,
+        })
+    };
+    tokio::time::timeout(timeout, operation)
+        .await
+        .unwrap_or(Ok(Exchange::NoReply))
 }
 
-fn is_valid_signal_reply(flags: u32, payload: &[u8], expected: &[u8]) -> bool {
-    flags & FLAG_SIGNAL != 0 && flags & FLAG_RESPONSE != 0 && payload == expected
+// Synchronous probes can run on a thread that already has a Tokio runtime.
+// Their bounded I/O uses a separate runtime, never nested block_on or a second
+// implementation of the operating-system transport.
+fn blocking<T: Send + 'static>(
+    future: impl Future<Output = Result<T, IpcError>> + Send + 'static,
+) -> Result<T, IpcError> {
+    std::thread::Builder::new()
+        .name("c2-local-control".into())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(IpcError::Io)?
+                .block_on(future)
+        })
+        .map_err(IpcError::Io)?
+        .join()
+        .map_err(|_| IpcError::Io(io::Error::other("local control worker panicked")))?
 }
 
 pub fn ping(address: &str, timeout: Duration) -> Result<bool, IpcError> {
-    socket_path_from_ipc_address(address)?;
-    let started = std::time::Instant::now();
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
-            return Ok(false);
-        }
-        let remaining = timeout.saturating_sub(elapsed);
-        let attempt_timeout = remaining.min(Duration::from_millis(100));
-        match send_signal_and_read_reply(address, attempt_timeout, &PING_BYTES)? {
-            Some((flags, payload)) => {
-                return Ok(is_valid_signal_reply(flags, &payload, &PONG_BYTES));
+    let endpoint = local_endpoint_from_ipc_address(address)?;
+    blocking(async move {
+        let started = Instant::now();
+        while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
+            if remaining.is_zero() {
+                break;
             }
-            None => {
-                let sleep_for = remaining.min(Duration::from_millis(10));
-                if sleep_for.is_zero() {
-                    return Ok(false);
+            match exchange(
+                &endpoint,
+                remaining.min(Duration::from_millis(100)),
+                &PING_BYTES,
+            )
+            .await?
+            {
+                Exchange::Reply(flags, payload) => {
+                    return Ok(flags & FLAG_SIGNAL != 0
+                        && flags & FLAG_RESPONSE != 0
+                        && payload == PONG_BYTES);
                 }
-                std::thread::sleep(sleep_for);
+                Exchange::Absent | Exchange::NoReply => {
+                    tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
+                }
             }
         }
+        Ok(false)
+    })
+}
+
+fn unacknowledged() -> DirectShutdownAck {
+    DirectShutdownAck {
+        acknowledged: false,
+        shutdown_started: false,
+        server_stopped: false,
+        route_outcomes: Vec::new(),
     }
 }
 
 pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectShutdownAck, IpcError> {
-    let socket_path = socket_path_from_ipc_address(address)?;
-    let request = encode_shutdown_initiate();
-    let started = std::time::Instant::now();
-    loop {
-        if !socket_path.exists() {
-            return Ok(DirectShutdownAck {
-                acknowledged: true,
-                shutdown_started: false,
-                server_stopped: true,
-                route_outcomes: Vec::new(),
-            });
-        }
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
-            return Ok(DirectShutdownAck {
-                acknowledged: false,
-                shutdown_started: false,
-                server_stopped: false,
-                route_outcomes: Vec::new(),
-            });
-        }
-        let remaining = timeout.saturating_sub(elapsed);
-        // Give the server enough time to accept and ack a draining duplicate
-        // initiate; short retry loops can create stale connections faster than
-        // the accept loop can drain them under load.
-        let attempt_timeout = remaining.min(Duration::from_millis(500));
-        match send_signal_and_read_reply(address, attempt_timeout, &request)? {
-            Some((flags, payload)) => {
-                if flags & FLAG_SIGNAL == 0 || flags & FLAG_RESPONSE == 0 {
+    let endpoint = local_endpoint_from_ipc_address(address)?;
+    blocking(async move {
+        let started = Instant::now();
+        let request = encode_shutdown_initiate();
+        while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
+            if remaining.is_zero() {
+                break;
+            }
+            match exchange(
+                &endpoint,
+                remaining.min(Duration::from_millis(500)),
+                &request,
+            )
+            .await?
+            {
+                Exchange::Absent => {
                     return Ok(DirectShutdownAck {
-                        acknowledged: false,
+                        acknowledged: true,
                         shutdown_started: false,
-                        server_stopped: false,
+                        server_stopped: true,
                         route_outcomes: Vec::new(),
                     });
                 }
-                match decode_shutdown_ack(&payload) {
-                    Ok(outcome) => return Ok(outcome),
-                    Err(_) => {
-                        return Ok(DirectShutdownAck {
-                            acknowledged: false,
-                            shutdown_started: false,
-                            server_stopped: false,
-                            route_outcomes: Vec::new(),
-                        });
+                Exchange::Reply(flags, payload) => {
+                    if flags & FLAG_SIGNAL == 0 || flags & FLAG_RESPONSE == 0 {
+                        return Ok(unacknowledged());
                     }
+                    return Ok(decode_shutdown_ack(&payload).unwrap_or_else(|_| unacknowledged()));
                 }
-            }
-            None => {
-                let sleep_for = remaining.min(Duration::from_millis(10));
-                if sleep_for.is_zero() {
-                    return Ok(DirectShutdownAck {
-                        acknowledged: false,
-                        shutdown_started: false,
-                        server_stopped: false,
-                        route_outcomes: Vec::new(),
-                    });
+                Exchange::NoReply => {
+                    tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
                 }
-                std::thread::sleep(sleep_for);
             }
         }
-    }
+        Ok(unacknowledged())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixListener;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
-
+    use c2_local::LocalListener;
     use c2_wire::shutdown_control::encode_shutdown_ack;
+    use std::sync::mpsc;
+
+    fn address(label: &str) -> String {
+        format!("ipc://control-{label}-{}", std::process::id())
+    }
+
+    fn responder(
+        address: String,
+        delay: Duration,
+        discard_first: bool,
+        expected: Vec<u8>,
+        reply: Vec<u8>,
+    ) -> (mpsc::Receiver<()>, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    tokio::time::sleep(delay).await;
+                    let endpoint = LocalEndpoint::from_address(&address).unwrap();
+                    let mut listener = LocalListener::bind(&endpoint).unwrap();
+                    tx.send(()).unwrap();
+                    if discard_first {
+                        let mut first = listener.accept().await.unwrap();
+                        let _ = read_reply(&mut first).await.unwrap();
+                    }
+                    let mut stream = listener.accept().await.unwrap();
+                    let (_, payload) = read_reply(&mut stream).await.unwrap();
+                    assert_eq!(payload, expected);
+                    stream
+                        .write_all(&frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE, &reply))
+                        .await
+                        .unwrap();
+                });
+        });
+        (rx, thread)
+    }
 
     #[test]
-    fn socket_path_rejects_invalid_ipc_addresses() {
+    fn invalid_addresses_are_configuration_errors() {
         for address in [
-            "tcp://not-ipc",
+            "tcp://host",
             "ipc://",
-            "ipc://../escape",
+            "ipc://..",
             "ipc://bad/name",
             "ipc://bad\\name",
-            "ipc://.",
-            "ipc://..",
-            "ipc:// leading",
-            "ipc://trailing ",
-            "ipc://bad\nname",
         ] {
-            let err = socket_path_from_ipc_address(address).expect_err("invalid address must fail");
-            assert!(matches!(err, IpcError::Config(_)), "{address}: {err:?}");
+            assert!(matches!(
+                ping(address, Duration::from_millis(10)),
+                Err(IpcError::Config(_))
+            ));
+            assert!(matches!(
+                shutdown(address, Duration::from_millis(10)),
+                Err(IpcError::Config(_))
+            ));
         }
     }
 
     #[test]
-    fn socket_path_accepts_plain_region() {
-        let path = socket_path_from_ipc_address("ipc://unit-server").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/c_two_ipc/unit-server.sock"));
-    }
-
-    #[test]
-    fn ping_absent_socket_returns_false() {
-        let address = "ipc://unit-control-absent";
-        let path = socket_path_from_ipc_address(address).unwrap();
-        let _ = fs::remove_file(path);
-        let result = ping(address, Duration::from_millis(10)).unwrap();
-        assert!(!result);
-    }
-
-    #[test]
-    fn ping_retries_until_timeout_when_socket_appears_late() {
-        let address = "ipc://unit-control-late-ping";
-        let path = socket_path_from_ipc_address(address).unwrap();
-        let _ = fs::remove_file(&path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let server_path = path.clone();
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            let listener = UnixListener::bind(&server_path).unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut header = [0u8; HEADER_SIZE];
-            stream.read_exact(&mut header).unwrap();
-            let (total_len, body) = frame::decode_total_len(&header).unwrap();
-            let (frame_header, payload_prefix) = frame::decode_frame_body(body, total_len).unwrap();
-            let payload_len = frame_header.payload_len();
-            let mut payload = payload_prefix.to_vec();
-            if payload.len() < payload_len {
-                let mut tail = vec![0u8; payload_len - payload.len()];
-                stream.read_exact(&mut tail).unwrap();
-                payload.extend_from_slice(&tail);
-            }
-            assert_eq!(payload, PING_BYTES);
-            let reply = frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE, &PONG_BYTES);
-            stream.write_all(&reply).unwrap();
-        });
-
-        let result = ping(address, Duration::from_millis(500)).unwrap();
-
-        assert!(result);
-        handle.join().unwrap();
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn shutdown_absent_socket_returns_true() {
-        let address = "ipc://unit-control-absent-shutdown";
-        let path = socket_path_from_ipc_address(address).unwrap();
-        let _ = fs::remove_file(path);
-        let result = shutdown(address, Duration::from_millis(10)).unwrap();
-        assert!(result.acknowledged);
-        assert!(!result.shutdown_started);
-        assert!(result.server_stopped);
+    fn absent_endpoint_has_no_ping_and_is_already_stopped() {
+        let address = address("absent");
+        assert!(!ping(&address, Duration::from_millis(20)).unwrap());
+        let result = shutdown(&address, Duration::from_millis(20)).unwrap();
+        assert!(result.acknowledged && result.server_stopped && !result.shutdown_started);
         assert!(result.route_outcomes.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn shutdown_live_socket_sends_single_byte_initiate_without_wait_budget() {
-        let address = "ipc://unit-control-shutdown-initiate";
-        let path = socket_path_from_ipc_address(address).unwrap();
-        let _ = fs::remove_file(&path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let server_path = path.clone();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            let listener = UnixListener::bind(&server_path).unwrap();
-            ready_tx.send(()).unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut header = [0u8; HEADER_SIZE];
-            stream.read_exact(&mut header).unwrap();
-            let (total_len, body) = frame::decode_total_len(&header).unwrap();
-            let (frame_header, payload_prefix) = frame::decode_frame_body(body, total_len).unwrap();
-            let payload_len = frame_header.payload_len();
-            let mut payload = payload_prefix.to_vec();
-            if payload.len() < payload_len {
-                let mut tail = vec![0u8; payload_len - payload.len()];
-                stream.read_exact(&mut tail).unwrap();
-                payload.extend_from_slice(&tail);
-            }
-            assert_eq!(payload, encode_shutdown_initiate());
-            let ack = DirectShutdownAck {
+    fn refused_socket_does_not_prove_shutdown_completed() {
+        let address = address("refused");
+        let endpoint = local_endpoint_from_ipc_address(&address).unwrap();
+        let path = std::path::Path::new(endpoint.os_name());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An unowned socket produces ConnectionRefused. The same error can
+        // come from a live macOS listener whose queue is full.
+        drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+        let result = shutdown(&address, Duration::from_millis(20));
+        std::fs::remove_file(path).unwrap();
+        let result = result.unwrap();
+        assert!(!result.acknowledged);
+        assert!(!result.server_stopped);
+    }
+
+    #[test]
+    fn ping_retries_until_endpoint_appears() {
+        let address = address("late");
+        let (_ready, thread) = responder(
+            address.clone(),
+            Duration::from_millis(50),
+            false,
+            PING_BYTES.to_vec(),
+            PONG_BYTES.to_vec(),
+        );
+        assert!(ping(&address, Duration::from_secs(1)).unwrap());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_ack_only_proves_initiation_and_retries_dropped_exchange() {
+        for discard_first in [false, true] {
+            let address = address(if discard_first { "retry" } else { "initiate" });
+            let expected = DirectShutdownAck {
                 acknowledged: true,
                 shutdown_started: true,
                 server_stopped: false,
                 route_outcomes: Vec::new(),
             };
-            let reply_payload = encode_shutdown_ack(&ack).unwrap();
-            let reply = frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE, &reply_payload);
-            stream.write_all(&reply).unwrap();
-        });
-
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        let result = shutdown(address, Duration::from_millis(500)).unwrap();
-
-        assert!(result.acknowledged);
-        assert!(result.shutdown_started);
-        assert!(!result.server_stopped);
-        assert!(result.route_outcomes.is_empty());
-        handle.join().unwrap();
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn shutdown_retries_until_ack_deadline_while_socket_still_exists() {
-        let address = "ipc://unit-control-shutdown-retry";
-        let path = socket_path_from_ipc_address(address).unwrap();
-        let _ = fs::remove_file(&path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let server_path = path.clone();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            let listener = UnixListener::bind(&server_path).unwrap();
-            ready_tx.send(()).unwrap();
-
-            let (mut first, _) = listener.accept().unwrap();
-            let mut header = [0u8; HEADER_SIZE];
-            first.read_exact(&mut header).unwrap();
-            drop(first);
-
-            let (mut second, _) = listener.accept().unwrap();
-            let mut header = [0u8; HEADER_SIZE];
-            second.read_exact(&mut header).unwrap();
-            let (total_len, body) = frame::decode_total_len(&header).unwrap();
-            let (frame_header, payload_prefix) = frame::decode_frame_body(body, total_len).unwrap();
-            let payload_len = frame_header.payload_len();
-            let mut payload = payload_prefix.to_vec();
-            if payload.len() < payload_len {
-                let mut tail = vec![0u8; payload_len - payload.len()];
-                second.read_exact(&mut tail).unwrap();
-                payload.extend_from_slice(&tail);
-            }
-            assert_eq!(payload, encode_shutdown_initiate());
-            let ack = DirectShutdownAck {
-                acknowledged: true,
-                shutdown_started: true,
-                server_stopped: false,
-                route_outcomes: Vec::new(),
-            };
-            let reply_payload = encode_shutdown_ack(&ack).unwrap();
-            let reply = frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE, &reply_payload);
-            second.write_all(&reply).unwrap();
-        });
-
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        let result = shutdown(address, Duration::from_millis(500)).unwrap();
-
-        assert!(result.acknowledged);
-        assert!(result.shutdown_started);
-        assert!(!result.server_stopped);
-        assert!(result.route_outcomes.is_empty());
-        handle.join().unwrap();
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn ping_rejects_invalid_ipc_address() {
-        let err = ping("tcp://not-ipc", Duration::from_millis(10))
-            .expect_err("invalid address must fail");
-        assert!(matches!(err, IpcError::Config(_)));
-    }
-
-    #[test]
-    fn shutdown_rejects_invalid_ipc_address() {
-        let err = shutdown("tcp://not-ipc", Duration::from_millis(10))
-            .expect_err("invalid address must fail");
-        assert!(matches!(err, IpcError::Config(_)));
+            let (ready, thread) = responder(
+                address.clone(),
+                Duration::ZERO,
+                discard_first,
+                encode_shutdown_initiate().to_vec(),
+                encode_shutdown_ack(&expected).unwrap(),
+            );
+            ready.recv_timeout(Duration::from_secs(1)).unwrap();
+            let result = shutdown(&address, Duration::from_secs(1)).unwrap();
+            assert!(result.acknowledged && result.shutdown_started && !result.server_stopped);
+            assert!(result.route_outcomes.is_empty());
+            thread.join().unwrap();
+        }
     }
 }

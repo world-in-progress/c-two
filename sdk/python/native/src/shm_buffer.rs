@@ -26,6 +26,7 @@ enum ShmBufferInner {
     PeerShm {
         pool: Arc<RwLock<MemPool>>,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
@@ -74,6 +75,7 @@ impl PyShmBuffer {
     pub fn from_peer_shm(
         pool: Arc<RwLock<MemPool>>,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
@@ -82,6 +84,7 @@ impl PyShmBuffer {
             inner: Mutex::new(Some(ShmBufferInner::PeerShm {
                 pool,
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
@@ -178,12 +181,13 @@ impl PyShmBuffer {
             Some(ShmBufferInner::PeerShm {
                 pool,
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
             }) => {
                 let mut p = pool.write();
-                let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                let _ = p.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
                 Ok(())
             }
             Some(ShmBufferInner::Handle { handle, pool }) => {
@@ -239,13 +243,14 @@ impl PyShmBuffer {
             ShmBufferInner::PeerShm {
                 pool,
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
             } => {
                 let pool_guard = pool.read();
                 let raw_ptr = pool_guard
-                    .data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
+                    .data_ptr_at(*seg_idx as u32, *generation, *offset, *is_dedicated)
                     .map_err(|e| PyBufferError::new_err(format!("SHM access: {e}")))?;
                 (raw_ptr as *const u8, *data_size as usize)
             }
@@ -270,7 +275,7 @@ impl PyShmBuffer {
             (*view).readonly = 1;
             (*view).itemsize = 1;
             (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
-                b"B\0".as_ptr() as *mut std::os::raw::c_char
+                c"B".as_ptr().cast_mut()
             } else {
                 std::ptr::null_mut()
             };
@@ -315,12 +320,13 @@ impl Drop for PyShmBuffer {
                 ShmBufferInner::PeerShm {
                     pool,
                     seg_idx,
+                    generation,
                     offset,
                     data_size,
                     is_dedicated,
                 } => {
                     let mut p = pool.write();
-                    let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                    let _ = p.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
                 }
                 ShmBufferInner::Handle { handle, pool } => {
                     let mut p = pool.write();

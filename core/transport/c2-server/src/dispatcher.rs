@@ -39,6 +39,7 @@ pub enum ResponseMeta {
     /// CRM wrote result into response SHM (via pool.alloc + pool.write).
     ShmAlloc {
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
@@ -62,11 +63,12 @@ pub enum RequestData {
     Shm {
         pool: Arc<parking_lot::RwLock<MemPool>>,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
     },
-    /// Inline bytes from UDS frame.
+    /// Inline bytes from a local IPC frame.
     Inline(Vec<u8>),
     /// Reassembled MemHandle from chunked transfer.
     /// ShmBuffer.release() returns handle to pool.
@@ -76,26 +78,175 @@ pub enum RequestData {
     },
 }
 
+impl RequestData {
+    fn copy_bytes(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Inline(data) => Ok(data.clone()),
+            Self::Shm {
+                pool,
+                seg_idx,
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            } => pool
+                .read()
+                .copy_data_at(
+                    u32::from(*seg_idx),
+                    *generation,
+                    *offset,
+                    *data_size,
+                    *is_dedicated,
+                )
+                .map_err(|error| format!("request SHM copy failed: {error}")),
+            Self::Handle { handle, pool } => pool
+                .read()
+                .copy_handle_data(handle)
+                .map_err(|error| format!("request handle copy failed: {error}")),
+        }
+    }
+
+    fn release(self) -> Result<(), String> {
+        match self {
+            Self::Inline(_) => Ok(()),
+            Self::Shm {
+                pool,
+                seg_idx,
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            } => {
+                let mut pool = pool.write();
+                pool.validate_data_at(
+                    u32::from(seg_idx),
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                )
+                .map_err(|error| format!("request SHM release validation failed: {error}"))?;
+                pool.free_at(
+                    u32::from(seg_idx),
+                    generation,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                )
+                .map_err(|error| format!("request SHM release failed: {error}"))?;
+                Ok(())
+            }
+            Self::Handle { handle, pool } => {
+                let mut pool = pool.write();
+                pool.validate_handle(&handle).map_err(|error| {
+                    format!("request handle release validation failed: {error}")
+                })?;
+                release_request_handle(&mut pool, handle)
+            }
+        }
+    }
+}
+
+fn release_request_handle(pool: &mut MemPool, handle: MemHandle) -> Result<(), String> {
+    match handle {
+        MemHandle::Buddy {
+            seg_idx,
+            generation,
+            offset,
+            allocation_size,
+            ..
+        } => {
+            pool.free_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                allocation_size,
+                false,
+            )
+            .map_err(|error| format!("request handle release failed: {error}"))?;
+        }
+        MemHandle::Dedicated { seg_idx, len } => {
+            let data_size = u32::try_from(len)
+                .map_err(|_| "request dedicated handle length exceeds the wire address space")?;
+            pool.free_at(u32::from(seg_idx), 0, 0, data_size, true)
+                .map_err(|error| format!("request handle release failed: {error}"))?;
+        }
+        MemHandle::FileSpill { .. } => {}
+    }
+    Ok(())
+}
+
+/// Owns one request transport allocation until it is explicitly released.
+///
+/// `copy_bytes` validates and copies without changing transport ownership.
+/// `release` is idempotent and validates public coordinates before deriving a
+/// buddy allocation level. Dropping an unreleased lease performs the same
+/// best-effort cleanup.
+pub struct RequestLease {
+    request: Option<RequestData>,
+}
+
+impl RequestLease {
+    pub fn new(request: RequestData) -> Self {
+        Self {
+            request: Some(request),
+        }
+    }
+
+    pub fn copy_bytes(&self) -> Result<Vec<u8>, String> {
+        self.request
+            .as_ref()
+            .ok_or_else(|| "request lease is already released".to_string())?
+            .copy_bytes()
+    }
+
+    pub fn release(&mut self) -> Result<(), String> {
+        let Some(request) = self.request.take() else {
+            return Ok(());
+        };
+        request.release()
+    }
+
+    pub fn into_owned_bytes(mut self) -> Result<Vec<u8>, String> {
+        let Some(request) = self.request.take() else {
+            return Err("request lease is already released".to_string());
+        };
+        self.request = match request {
+            RequestData::Inline(data) => return Ok(data),
+            transport_request => Some(transport_request),
+        };
+        let copy_result = self.copy_bytes();
+        let release_result = self.release();
+        combine_copy_and_release("request", copy_result, release_result)
+    }
+}
+
+impl Drop for RequestLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn combine_copy_and_release(
+    kind: &str,
+    copy_result: Result<Vec<u8>, String>,
+    release_result: Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    match (copy_result, release_result) {
+        (Ok(bytes), Ok(())) => Ok(bytes),
+        (Err(copy_error), Ok(())) => Err(copy_error),
+        (Ok(_), Err(release_error)) => Err(release_error),
+        (Err(copy_error), Err(release_error)) => Err(format!(
+            "{kind} copy failed: {copy_error}; {kind} release also failed: {release_error}"
+        )),
+    }
+}
+
 /// Explicitly release SHM resources held by a RequestData.
 /// Must be called on error paths where the request won't be consumed by a CRM callback.
 pub fn cleanup_request(request: RequestData) {
-    match request {
-        RequestData::Shm {
-            pool,
-            seg_idx,
-            offset,
-            data_size,
-            is_dedicated,
-        } => {
-            let mut p = pool.write();
-            let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
-        }
-        RequestData::Handle { handle, pool } => {
-            let mut p = pool.write();
-            p.release_handle(handle);
-        }
-        RequestData::Inline(_) => {}
-    }
+    let mut lease = RequestLease::new(request);
+    let _ = lease.release();
 }
 
 impl std::fmt::Debug for RequestData {
@@ -103,13 +254,14 @@ impl std::fmt::Debug for RequestData {
         match self {
             RequestData::Shm {
                 seg_idx,
+                generation,
                 offset,
                 data_size,
                 is_dedicated,
                 ..
             } => write!(
                 f,
-                "RequestData::Shm(seg={seg_idx}, off={offset}, size={data_size}, ded={is_dedicated})"
+                "RequestData::Shm(seg={seg_idx}, gen={generation}, off={offset}, size={data_size}, ded={is_dedicated})"
             ),
             RequestData::Inline(v) => write!(f, "RequestData::Inline({} bytes)", v.len()),
             RequestData::Handle { .. } => write!(f, "RequestData::Handle"),
@@ -372,6 +524,7 @@ mod tests {
     use crate::scheduler::ConcurrencyMode;
     use c2_mem::PoolConfig;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct MockCallback;
 
@@ -405,6 +558,141 @@ mod tests {
             )),
             callback: Arc::new(MockCallback),
             method_names: vec!["method_a".into(), "method_b".into()],
+        }
+    }
+
+    fn request_test_pool() -> MemPool {
+        static NEXT_POOL: AtomicU64 = AtomicU64::new(0);
+        MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 2,
+                dedicated_crash_timeout_secs: 5.0,
+                buddy_idle_decay_secs: 1.0,
+                spill_threshold: 0.8,
+                spill_dir: std::env::temp_dir().join("c_two_request_data_test_spill"),
+            },
+            format!(
+                "/c2rq{:08x}{:04x}",
+                std::process::id(),
+                NEXT_POOL.fetch_add(1, Ordering::Relaxed),
+            ),
+        )
+    }
+
+    #[test]
+    fn request_data_inline_materializes_owned_bytes() {
+        assert_eq!(
+            RequestLease::new(RequestData::Inline(b"inline".to_vec()))
+                .into_owned_bytes()
+                .unwrap(),
+            b"inline",
+        );
+    }
+
+    #[test]
+    fn request_lease_copy_retains_backing_until_idempotent_release() {
+        let payload = b"borrowed request".repeat(128);
+        let mut pool = request_test_pool();
+        let allocation = pool.alloc(payload.len()).unwrap();
+        let pointer = pool.data_ptr(&allocation).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), pointer, payload.len());
+        }
+        let pool = Arc::new(parking_lot::RwLock::new(pool));
+        let mut lease = RequestLease::new(RequestData::Shm {
+            pool: Arc::clone(&pool),
+            seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+            generation: allocation.generation,
+            offset: allocation.offset,
+            data_size: u32::try_from(payload.len()).unwrap(),
+            is_dedicated: allocation.is_dedicated,
+        });
+
+        assert_eq!(lease.copy_bytes().unwrap(), payload);
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        lease.release().unwrap();
+        lease.release().unwrap();
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn request_data_shm_materializes_and_releases_buddy_and_dedicated_allocations() {
+        for payload in [b"buddy".repeat(32), b"dedicated".repeat(5000)] {
+            let mut pool = request_test_pool();
+            let allocation = pool.alloc(payload.len()).unwrap();
+            let ptr = pool.data_ptr(&allocation).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len());
+            }
+            let pool = Arc::new(parking_lot::RwLock::new(pool));
+            let request = RequestData::Shm {
+                pool: Arc::clone(&pool),
+                seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+                generation: allocation.generation,
+                offset: allocation.offset,
+                data_size: u32::try_from(payload.len()).unwrap(),
+                is_dedicated: allocation.is_dedicated,
+            };
+
+            assert_eq!(
+                RequestLease::new(request).into_owned_bytes().unwrap(),
+                payload
+            );
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        }
+    }
+
+    #[test]
+    fn request_data_shm_rejects_invalid_span_without_freeing_unproven_coordinates() {
+        let mut pool = request_test_pool();
+        let allocation = pool.alloc(4096).unwrap();
+        let capacity = pool
+            .segment(allocation.seg_idx as usize)
+            .unwrap()
+            .allocator()
+            .data_size();
+        let pool = Arc::new(parking_lot::RwLock::new(pool));
+        let request = RequestData::Shm {
+            pool: Arc::clone(&pool),
+            seg_idx: u16::try_from(allocation.seg_idx).unwrap(),
+            generation: allocation.generation,
+            offset: u32::try_from(capacity - 1).unwrap(),
+            data_size: 2,
+            is_dedicated: false,
+        };
+
+        assert!(
+            RequestLease::new(request)
+                .into_owned_bytes()
+                .unwrap_err()
+                .contains("outside buddy segment")
+        );
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        pool.write().free(&allocation).unwrap();
+    }
+
+    #[test]
+    fn request_data_handle_materializes_and_releases_reassembly_allocation() {
+        let payload = b"reassembled".repeat(512);
+        for logical_len in [payload.len(), 4096, 1, 0] {
+            let mut pool = request_test_pool();
+            let mut handle = pool.alloc_handle(payload.len()).unwrap();
+            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+            handle.set_len(logical_len);
+            let pool = Arc::new(parking_lot::RwLock::new(pool));
+            let request = RequestData::Handle {
+                handle,
+                pool: Arc::clone(&pool),
+            };
+
+            assert_eq!(
+                RequestLease::new(request).into_owned_bytes().unwrap(),
+                payload[..logical_len]
+            );
+            assert_eq!(pool.read().stats().alloc_count, 0);
         }
     }
 

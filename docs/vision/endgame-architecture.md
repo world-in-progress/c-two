@@ -35,7 +35,7 @@ Toodle 的治理底座不限定 GIS，但它也不是吞并所有领域习惯与
 │ L3  Geospatial CRM Catalog — 通用地理资源原语（领域实例化）           │
 │     • VectorLayer · RasterLayer · TiledGrid · DEM · PointCloud        │
 │     • Topology · GridSchema · STAC-backed RemoteLayer                 │
-│     • 以 fastdb 作为零反序列化主干，确保跨语言 codec 一致性            │
+│     • 以 FastDB Core-owned portable payload 保持跨语言语义一致性       │
 │     • 注：其他领域（ML / 金融 / IoT）可以有自己的 L3 Catalog          │
 ├──────────────────────────────────────────────────────────────────────┤
 │ L2  Toodle — Trust-Oriented Open Distributed Linking Environment      │
@@ -45,7 +45,7 @@ Toodle 的治理底座不限定 GIS，但它也不是吞并所有领域习惯与
 │     • 面向人和 Agent 的可信资源访问；领域规则由上层 Resource Service 承担│
 ├──────────────────────────────────────────────────────────────────────┤
 │ L1  c-two — 分布式资源运行时协议                                      │
-│     • canonical CRM descriptor / ContractReleaseRef                  │
+│     • c-two.contract.v2 / ContractReleaseRef / payload composition   │
 │     • 注册-获取  • IPC/HTTP 传输  • Relay mesh  • exact route contract │
 │     • Python SDK；auth metadata、Rust SDK 与 TypeScript SDK 仍按 roadmap 推进│
 └──────────────────────────────────────────────────────────────────────┘
@@ -68,7 +68,7 @@ Toodle 的治理底座不限定 GIS，但它也不是吞并所有领域习惯与
 C-Two 是一个**资源运行时协议**。这里的 runtime Resource 是实现 CRM 契约的有状态对象，与 Toodle Catalog 中持久、可修订的 Resource 是不同层次的概念。C-Two 的最小集合只有三件东西：
 
 - **Resource**：实现 CRM 契约、持有状态与领域逻辑的运行时对象；当前 Python SDK 中是普通 Python 类实例。
-- **CRM 契约**（Core Resource Model contract）：带命名空间和版本的接口声明；`c-two.contract.v1` 是 canonical descriptor，`ContractReleaseRef` 是它的持久、route-independent 精确引用。
+- **CRM 契约**（Core Resource Model contract）：带命名空间和版本的接口声明；`c-two.contract.v2` 是 canonical descriptor，`ContractReleaseRef` 是它的持久、route-independent 精确引用。
 - **传输与运行时发现**：注册/连接、IPC、HTTP 与 Relay Mesh，负责把带精确 contract expectation 的调用送到活跃 route。
 
 ### 2.2 为什么 c-two 不该再扩张
@@ -80,7 +80,7 @@ C-Two 是一个**资源运行时协议**。这里的 runtime Resource 是实现 
 | canonical CRM descriptor、`ContractReleaseRef`、精确 route contract | Catalog、Resource identity/revision、trust envelope |
 | 注册/连接、IPC/HTTP/relay、buffer 与 lease 生命周期 | Authority、认证、授权、租户与 policy |
 | 方法级并发（`@cc.read`/`@cc.write`）和 runtime lifecycle | Service activation 策略、federation catalog、业务一致性算法 |
-| FastDB payload ABI ref 的契约编排 | FastDB 内部 schema/storage codec、领域文件格式与算法 |
+| Opaque nested FastDB specification 的契约与 artifact 编排 | FastDB 内部 schema/binary/runtime、领域文件格式与算法 |
 
 ### 2.3 当前仍需补齐的通用机制
 
@@ -88,7 +88,7 @@ C-Two 是一个**资源运行时协议**。这里的 runtime Resource 是实现 
 |---|---|---|
 | **Contract compatibility** | 已有精确 `ContractReleaseRef`，尚无 semver/range 匹配 | 在不削弱精确校验的前提下解析兼容 release |
 | **`auth_hook` + call metadata** | 尚未形成完整公共契约；C-Two 只提供机制，Toodle 解释身份与 policy | 让受信 Authority 在所有 transport 上执行一致准入 |
-| **Rust SDK + FastDB Rust call-db runtime** | C-Two contract core 已就绪，但真实 SDK 与 FastDB-owned payload runtime 仍缺失 | Rust/Python 双向、payload-bearing interoperability |
+| **完整 Rust SDK** | lower-level public Rust crates 与 FastDB payload runtime 已完成真实双向证明，但尚未收敛为覆盖 IPC/HTTP/relay/lifecycle 的统一受支持 facade | 在不获得 Python 缺失能力的前提下提供完整 Rust 用户面 |
 | **TypeScript SDK** | 生成 transport/codec 基础持续演进，完整发布与浏览器边界仍未收敛 | Web/Node 消费同一 CRM contract 与 payload ABI |
 | **Async、streaming、backpressure** | 属于后续 runtime workstream，不能以 chunking 冒充 streaming | 长任务与多语言调用的可取消、有界执行 |
 
@@ -238,7 +238,7 @@ L3 不是一个“crate”，而是一组领域约定：哪些地理资源类型
 
 因为建模（洪水、交通、土地利用）的 CRM **永远是领域特定的**，而且演化速度远快于 L3 原语。
 把建模 CRM 放进 L3 会让核心 catalog 被领域细节拖累。正确的做法是：建模 CRM 住在**扩展包**
-（[§8](#8-建模扩展--复合进程对称的自包含与依赖)），通过**依赖 L3 CRM** 来读写通用资源。
+（[§8](#modeling-extension-composition)），通过**依赖 L3 CRM** 来读写通用资源。
 
 ## 6. L4 · Gridmen：人在回路的智能地理编辑器
 
@@ -290,8 +290,8 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 | Agent Tool 要求 | CRM 对应 |
 |---|---|
 | 命名 | `@cc.crm(namespace='hydro.swmm', version='0.3.0')` + method name |
-| 类型化参数 | canonical descriptor 中的方法签名与 portable `PayloadAbiRef` |
-| 版本 | `c-two.contract.v1` + exact `ContractReleaseRef`；范围兼容仍待实现 |
+| 类型化参数 | canonical descriptor 中的方法签名与显式 nested FastDB binding |
+| 版本 | `c-two.contract.v2` + exact `ContractReleaseRef`；范围兼容仍待实现 |
 | 权限边界 | `@cc.read` / `@cc.write` 是调度元数据；授权由 Toodle PolicyDecision 负责 |
 
 这意味着 Toodle 可以把 Catalog 中已获授权 Resource Service 的 validated CRM contract 投影为标准 tool schema（例如 MCP），但投影不能把“可描述”误当作“已授权”，也不能把普通 Resource 隐式服务化。
@@ -336,6 +336,8 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 3. **Dry-run / 审批钩子**：写方法应该能"只校验不执行"，让 Toodle 在用户审批前得到影响预估。
    （这是新需求，需要进入 roadmap。）
 4. **Streaming 返回**：长任务（跑一个模型）需要流式进度，Agent 才能实时反馈给用户。
+
+<a id="modeling-extension-composition"></a>
 
 ## 8. 建模扩展 = 复合进程：对称的自包含与依赖
 
@@ -390,7 +392,7 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 
 Extension 不是 C-Two 本体。它的代码、模型和 UI artifact 首先是 Toodle Resource；需要运行时能力时，再由明确的 Resource Service declaration 绑定 Resource、CRM contract release、activation policy、权限需求和可审计的 Agent/UI projection。字段名和安装格式属于 Toodle 的独立协议，不在本文中复制定义。
 
-C-Two 只拥有两段通用机制：以 canonical `c-two.contract.v1` / `ContractReleaseRef` 表达精确 CRM release，以及在激活后以 `ExpectedRouteContract` 注册、解析和调用 runtime route。Extension 安装、ResourceBindings、PolicyDecision、Activator 算法和是否允许 Agent 调用都不属于 C-Two。
+C-Two 只拥有两段通用机制：以 canonical `c-two.contract.v2` / `ContractReleaseRef` 表达精确 CRM release，以及在激活后以 `ExpectedRouteContract` 注册、解析和调用 runtime route。Extension 安装、ResourceBindings、PolicyDecision、Activator 算法和是否允许 Agent 调用都不属于 C-Two。
 
 ### 8.4 扩展之间的依赖
 
@@ -410,12 +412,12 @@ Toodle 可以在自己的声明中表达“需要某类 Resource Service/CRM con
 
 | 能力 | 住在哪一层 | 理由 |
 |---|---|---|
-| canonical `c-two.contract.v1` descriptor 与 `ContractReleaseRef` | **C-Two** | CRM contract semantics 与精确、route-independent release identity 属于协议机制 |
+| canonical `c-two.contract.v2` descriptor 与 `ContractReleaseRef` | **C-Two** | CRM contract semantics 与精确、route-independent release identity 属于协议机制 |
 | CRM 注册与获取 | **c-two** | 资源运行时的最基本机制 |
 | IPC / HTTP / Relay 传输 | **c-two** | 跨进程/跨机能力 |
 | `ExpectedRouteContract` 与 contract-scoped route resolve | **C-Two** | 活跃 RuntimeInstance 的精确寻址与调用准入 |
 | 方法级读写并发 (`@cc.read`/`@cc.write`) | **c-two** | 单 CRM 内部的调度 |
-| Buffer 生命周期、零拷贝、Hold | **c-two** | 性能原语 |
+| Buffer/lease 生命周期、SHM transport 与 Hold | **c-two** | Transport 与 lifetime 原语；不替代 FastDB payload owner |
 | `auth_hook` + call metadata 透传 | **c-two（待补）** | 让 Toodle 构建安全层的钩子 |
 | Dry-run / 审批预估 | **c-two（待补）** | 让 Toodle / Agent 做影响分析 |
 | Streaming 返回 | **c-two（待补）** | 长任务进度回传 |
@@ -430,7 +432,7 @@ Toodle 可以在自己的声明中表达“需要某类 Resource Service/CRM con
 | 扩展安装 / 依赖解析 | **Toodle** | 生态治理 |
 | Agent tool schema 导出 | **Toodle** | 但 c-two 需支持 CRM 自省 |
 | — | — | — |
-| FastDB call-db schema/layout/codec/view runtime | **FastDB** | Portable payload ABI 的内部实现不属于 C-Two contract/runtime |
+| FastDB nested schema、binary、builder、view、materialize、invalidate 与 payload codegen | **FastDB** | Portable payload semantic authority 不属于 C-Two contract/runtime |
 | 图层符号 / 渲染 / 视口 | **Gridmen** | UX |
 | 文件格式（GeoTIFF / Shapefile 等） | **L3 CRM 实现** | 与协议无关 |
 | 目视解译、矢量化 | **Gridmen + 专用 CV 模型** | 不是协议能解决的 |
@@ -441,12 +443,13 @@ Toodle 可以在自己的声明中表达“需要某类 Resource Service/CRM con
 本节只表达跨仓库依赖方向；C-Two 的可执行顺序以 [`docs/roadmap.md`](../roadmap.md) 为准，Toodle 与 FastDB 分别在自己的仓库维护计划。里程碑按相对依赖而非时间点刻画。
 
 ### Milestone M1 · c-two 自立（当前）
-- canonical `c-two.contract.v1`、exact `ContractReleaseRef`、contract-scoped route、transport 与 runtime lifecycle 构成稳定地基
+- canonical `c-two.contract.v2`、exact `ContractReleaseRef`、opaque nested FastDB delegation、artifact composition、contract-scoped route、transport 与 runtime lifecycle 构成稳定地基
 - 后续按 roadmap 补齐 compatibility、call metadata/auth hook、dry-run、async、backpressure 与 streaming，不以私有 SDK 旁路替代
 
-### Milestone M2 · Rust SDK + FastDB Rust call-db runtime
-- C-Two Rust SDK 复用现有 Rust core crate，不创建 placeholder facade
-- FastDB 提供 Rust/C ABI payload runtime；完成 Rust↔Python 双向 no-payload 与 FastDB payload proof
+### Milestone M2 · 完整 Rust SDK 与不可变依赖分发
+- 已有 lower-level Rust client/host + official FastDB crate 的 Rust↔Python/Rust payload-bearing proof
+- 将它收敛为受支持 Rust SDK 前，先完成一致的 lifecycle/error/HTTP/relay surface，不能只包装现有 internals
+- 经单独授权发布并 pin FastDB Rust/Python/TypeScript artifacts，移除 sibling-checkout 分发限制
 
 ### Milestone M3 · TypeScript SDK + FastDB codec
 - TypeScript 消费同一个 canonical CRM descriptor、release identity、route contract 与 FastDB binding

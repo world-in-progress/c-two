@@ -5,8 +5,6 @@ during ``cc.unregister()`` or ``cc.shutdown()``.
 """
 from __future__ import annotations
 
-import logging
-
 import pytest
 
 import c_two as cc
@@ -58,31 +56,29 @@ class TestUnregisterRelayAbsence:
         self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test')
         self.registry.unregister('test')  # Should not raise
 
-    def test_explicit_unregister_raises_when_relay_unreachable(self):
-        """Explicit unregister reports relay cleanup failure after local removal."""
+    def test_late_relay_anchor_change_is_rejected_before_unregister(self):
+        """A started Core host keeps the relay projection it registered with."""
         impl = RelayShutdownCRM()
         self.registry.register(IRelayShutdownCRM, impl, name='test_down')
-        self.registry.set_relay_anchor('http://127.0.0.1:9')
 
-        with pytest.raises(RuntimeError, match='Relay unregistration failed'):
-            self.registry.unregister('test_down')
+        with pytest.raises(RuntimeError, match='relay anchor is frozen'):
+            self.registry.set_relay_anchor('http://127.0.0.1:9')
+
+        self.registry.unregister('test_down')
         assert 'test_down' not in self.registry.names
         assert impl.cleanup_calls == 1
 
         self.registry.shutdown()
         assert impl.cleanup_calls == 1
 
-    def test_shutdown_relay_unreachable(self, caplog):
-        """Shutdown logs info when relay is unreachable (no error)."""
+    def test_shutdown_ignores_late_process_relay_setting(self):
+        """Shutdown uses the Core host's frozen relay projection."""
         impl = RelayShutdownCRM()
         self.registry.register(IRelayShutdownCRM, impl, name='test_sd')
-        self.registry.set_relay_anchor('http://127.0.0.1:9')
+        settings.relay_anchor_address = 'http://127.0.0.1:9'
 
-        with caplog.at_level(logging.INFO):
-            self.registry.shutdown()  # Should not raise
+        self.registry.shutdown()
 
-        assert any('unreachable' in r.message.lower() or 'relay' in r.message.lower()
-                    for r in caplog.records)
         assert impl.cleanup_calls == 1
 
     def test_shutdown_after_unregister_does_not_double_call_callback(self):

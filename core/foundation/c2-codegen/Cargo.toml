@@ -2,9 +2,15 @@
 name = "c2-codegen"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Language-neutral SDK code generation for C-Two contracts"
 
 [dependencies]
-c2-contract = { path = "../c2-contract" }
+c2-contract = { version = "0.1.0", path = "../c2-contract" }
+fastdb = "=0.2.1"
+rustix = { version = "1", features = ["fs"] }
 serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
 thiserror = "2"

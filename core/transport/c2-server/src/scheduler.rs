@@ -198,15 +198,13 @@ impl SchedulerInner {
                 if state.writer_active {
                     return false;
                 }
-                let mut earlier_readers = 0usize;
-                for entry in &state.queue {
+                for (earlier_readers, entry) in state.queue.iter().enumerate() {
                     if entry.ticket == ticket {
                         return earlier_readers < worker_slots;
                     }
                     if entry.access == HeldAccess::Write {
                         return false;
                     }
-                    earlier_readers += 1;
                 }
                 false
             }
@@ -339,13 +337,13 @@ impl Scheduler {
         if state.closed {
             return Err(SchedulerAcquireError::Closed);
         }
-        if let Some(limit) = self.inner.limits.max_pending {
-            if state.pending >= limit.get() {
-                return Err(SchedulerAcquireError::Capacity {
-                    field: "max_pending",
-                    limit: limit.get(),
-                });
-            }
+        if let Some(limit) = self.inner.limits.max_pending
+            && state.pending >= limit.get()
+        {
+            return Err(SchedulerAcquireError::Capacity {
+                field: "max_pending",
+                limit: limit.get(),
+            });
         }
 
         state.pending += 1;

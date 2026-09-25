@@ -1,141 +1,229 @@
 name: CLI Release
 
+# Exact-tested-candidate promotion (step 2 of the release plan). This workflow
+# never rebuilds: it promotes the byte-exact c3 binaries, canonical installer
+# assets, and FastDB license evidence retained by the Release Candidate
+# workflow, and only after BOTH same-source main-push gates succeeded — the
+# Release Candidate run itself and the Windows Native full-scope runs on
+# windows-2022 and windows-2025. Whichever gate completes first defers; the
+# late completion re-triggers promotion. All provenance is resolved through
+# the authenticated GitHub API before any publish authority is used, and the
+# publishing job only ever uploads the verified, staged bytes.
+# The prepare job checks out the current main workflow code (never the
+# candidate SHA) and must run on refs/heads/main of the canonical repository;
+# dry_run performs the identical read-only verification without publishing.
+
 on:
-  workflow_dispatch:
-  push:
+  workflow_run:
+    workflows: [Release Candidate, Windows Native]
+    types: [completed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: "Release Candidate run id to promote (or leave empty with source_sha)"
+        default: ""
+        type: string
+      source_sha:
+        description: "Candidate source SHA from a canonical main push (or leave empty with candidate_run_id)"
+        default: ""
+        type: string
+      dry_run:
+        description: "Prepare and verify the promotion without publishing"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Promotions must not race each other: the second run re-checks remote state
+# and skips only byte-identical assets.
+concurrency:
+  group: cli-release-promotion
+  cancel-in-progress: false
 
 jobs:
-  version-check:
+  prepare:
+    name: verify tested candidate
+    # Fail closed outside the canonical repository/main ref and for
+    # pull_request candidate runs: fork PR artifacts and off-main dispatches
+    # must never reach publish authority.
+    if: >-
+      github.repository == 'world-in-progress/c-two' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      should_release: ${{ steps.check.outputs.should_release }}
-      should_publish_installer: ${{ steps.check.outputs.should_publish_installer }}
-      version: ${{ steps.check.outputs.version }}
-      tag: ${{ steps.check.outputs.tag }}
+      deferred: ${{ steps.prepare.outputs.deferred }}
+      action: ${{ steps.prepare.outputs.action }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      title: ${{ steps.prepare.outputs.title }}
+      source_sha: ${{ steps.prepare.outputs.source_sha }}
+      release_exists: ${{ steps.prepare.outputs.release_exists }}
+      tag_exists: ${{ steps.prepare.outputs.tag_exists }}
     steps:
+      # The default checkout is the current main code: the promotion trusts
+      # the reviewed validators on main, never the candidate's input SHA.
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      - name: Check CLI release against GitHub Releases
-        id: check
+      - name: Install packaging
+        run: python -m pip install --quiet packaging
+
+      - name: Verify the tested candidate and stage release bytes
+        id: prepare
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python .github/scripts/check_cli_release.py
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || inputs.source_sha }}
+          CANDIDATE_RUN_ID: ${{ (github.event.workflow_run.name == 'Release Candidate' && github.event.workflow_run.id) || inputs.candidate_run_id }}
+          DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          set -euo pipefail
+          args=(
+            --target github-release
+            --download-dir candidate-download
+            --plan-output promotion-plan.json
+            --release-body-output release-body.md
+          )
+          if [ -n "$SOURCE_SHA" ]; then args+=(--source-sha "$SOURCE_SHA"); fi
+          if [ -n "$CANDIDATE_RUN_ID" ]; then args+=(--candidate-run-id "$CANDIDATE_RUN_ID"); fi
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          code=0
+          python .github/scripts/promote_release_candidate.py prepare "${args[@]}" || code=$?
+          if [ "$code" -eq 75 ]; then
+            {
+              echo "deferred=true"
+              echo "action=deferred"
+            } >> "$GITHUB_OUTPUT"
+            echo "Deferring: the other same-source gate is still running; its completion re-triggers promotion."
+            exit 0
+          fi
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python - <<'PY'
+          import json, os, pathlib
+          plan = json.loads(pathlib.Path("promotion-plan.json").read_text(encoding="utf-8"))
+          release = plan["github_release"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("deferred=false\n")
+              output.write(f"action={release['action']}\n")
+              output.write(f"tag={release['tag']}\n")
+              output.write(f"title={release['title']}\n")
+              output.write(f"source_sha={plan['source_sha']}\n")
+              output.write(f"release_exists={str(release['release_exists']).lower()}\n")
+              output.write(f"tag_exists={str(release['tag_exists']).lower()}\n")
+          PY
 
-  build:
-    needs: version-check
-    if: needs.version-check.outputs.should_release == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            manylinux-image: quay.io/pypa/manylinux2014_x86_64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            manylinux-image: quay.io/pypa/manylinux2014_aarch64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
-    name: c3 (${{ matrix.target }})
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
+      # The upload's least-common ancestor is the staging directory itself, so
+      # the artifact members are <name>; downloading into ./staging
+      # restores the exact plan staged_path layout.
+      - name: Retain the staged, verified release bytes
+        if: steps.prepare.outputs.deferred != 'true'
+        uses: actions/upload-artifact@v4
         with:
-          targets: ${{ matrix.target }}
+          name: promotion-staging
+          path: candidate-download/staging
 
-      - name: Build c3 CLI (manylinux)
-        if: startsWith(matrix.os, 'ubuntu')
-        shell: bash
-        run: |
-          docker run --rm \
-            -v "$PWD:/io" \
-            -w /io \
-            -e CARGO_TARGET_DIR=/io/cli/target \
-            "${{ matrix.manylinux-image }}" \
-            bash -lc 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source "$HOME/.cargo/env" && cargo build --manifest-path cli/Cargo.toml --release --target "${{ matrix.target }}"'
-
-      - name: Build c3 CLI (native)
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          cargo build --manifest-path cli/Cargo.toml \
-            --release --target "${{ matrix.target }}"
-
-      - name: Package c3 CLI artifact
-        shell: bash
-        run: |
-          mkdir -p cli-dist
-          cp "cli/target/${{ matrix.target }}/release/c3" "cli-dist/c3-${{ matrix.target }}"
-          (cd cli-dist && shasum -a 256 "c3-${{ matrix.target }}" > "c3-${{ matrix.target }}.sha256")
-
-      - uses: actions/upload-artifact@v4
+      - name: Retain the promotion plan and release body
+        if: steps.prepare.outputs.deferred != 'true'
+        uses: actions/upload-artifact@v4
         with:
-          name: cli-${{ matrix.target }}
+          name: promotion-plan
           path: |
-            cli-dist/c3-${{ matrix.target }}
-            cli-dist/c3-${{ matrix.target }}.sha256
-
-  installer:
-    needs: version-check
-    if: needs.version-check.outputs.should_release == 'true' || needs.version-check.outputs.should_publish_installer == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Package c3 installer
-        shell: bash
-        run: |
-          mkdir -p cli-dist
-          cp cli/install-c3.sh cli-dist/c3-installer.sh
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-installer
-          path: cli-dist/c3-installer.sh
+            promotion-plan.json
+            release-body.md
 
   publish:
-    needs: [version-check, build, installer]
-    if: needs.version-check.outputs.should_release == 'true'
+    name: publish verified candidate
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.deferred == 'false' &&
+      needs.prepare.outputs.action == 'upload' &&
+      inputs.dry_run != true
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
+    env:
+      REPO: world-in-progress/c-two
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: cli-*
-          path: dist
-          merge-multiple: true
+          name: promotion-staging
+          path: staging
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.version-check.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: c3 ${{ needs.version-check.outputs.version }}
-          files: dist/c3-*
-
-  publish-installer:
-    needs: [version-check, installer]
-    if: needs.version-check.outputs.should_publish_installer == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
       - uses: actions/download-artifact@v4
         with:
-          name: cli-installer
-          path: dist
+          name: promotion-plan
+          path: .
 
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.version-check.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: c3 ${{ needs.version-check.outputs.version }}
-          files: dist/c3-installer.sh
+      - name: Recheck staged bytes before publication
+        run: |
+          python - <<'PY'
+          import hashlib, json, pathlib
+          plan = json.loads(pathlib.Path("promotion-plan.json").read_text())
+          group = plan.get("github_release") or plan["pypi"]
+          entries = group.get("assets", group.get("files", []))
+          root = pathlib.Path("staging").resolve()
+          selected = set()
+          for entry in entries:
+              if entry["disposition"] != "upload":
+                  continue
+              path = pathlib.Path(entry["staged_path"]).resolve()
+              assert path.is_relative_to(root) and path.is_file(), path
+              assert path.stat().st_size == entry["bytes"], path
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"], path
+              selected.add(path)
+          assert selected, "nothing verified for publication"
+          if "pypi" in plan:
+              assert selected == {p.resolve() for p in (root / "dist").rglob("*") if p.is_file()}
+          PY
+
+      # Create only when the verified plan says the release is missing; a
+      # partial existing release is completed, never recreated. An existing
+      # tag (already proven to point at the candidate source) is guarded with
+      # --verify-tag; a missing one is created at the candidate source SHA.
+      - name: Create the release when the plan says it is missing
+        if: needs.prepare.outputs.release_exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TITLE: ${{ needs.prepare.outputs.title }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ "$TAG_EXISTS" = "true" ]; then
+            extra+=(--verify-tag)
+          else
+            extra+=(--target "$SOURCE_SHA")
+          fi
+          gh release create "$TAG" --repo "$REPO" --title "$TITLE" \
+            --notes-file release-body.md "${extra[@]}"
+
+      # No --clobber anywhere: the upload list holds only plan-verified
+      # missing assets, and gh release upload fails if a name already exists.
+      - name: Upload the verified candidate bytes as release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python - <<'PY' > upload-files.txt
+          import json, pathlib
+          plan = json.loads(pathlib.Path("promotion-plan.json").read_text(encoding="utf-8"))
+          for asset in plan["github_release"]["assets"]:
+              if asset["disposition"] == "upload":
+                  print(asset["staged_path"])
+          PY
+          test -s upload-files.txt
+          xargs gh release upload "$TAG" --repo "$REPO" < upload-files.txt

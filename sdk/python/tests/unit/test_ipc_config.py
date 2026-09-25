@@ -468,22 +468,21 @@ def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
     assert '_relay_control_client_for' not in source
 
 
-def test_relay_connected_http_mode_preserves_relay_aware_call_path():
+def test_relay_connected_http_mode_uses_single_core_client_call_path():
     repo_root = Path(__file__).resolve().parents[4]
-    source = (
+    runtime_source = (
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
     ).read_text(encoding='utf-8')
+    client_source = (
+        repo_root / 'sdk/python/native/src/core_ffi.rs'
+    ).read_text(encoding='utf-8')
 
-    assert 'client: Arc<RelayAwareHttpClient>' in source
-    assert 'call_relay_aware_http_client(py, client, method_name, data)' in source
-    assert 'resolve_relay_connection(' in source
-    assert 'resolve_relay_target(' not in source
-
-    close_inner = source.split('fn close_inner(&self) {', 1)[1].split(
-        'impl Drop for PyRelayConnectedClient',
-        1,
-    )[0]
-    assert 'release_http_client_from_global_pool' not in close_inner
+    assert 'Connect::RelayAware' in runtime_source
+    assert 'self.connect_core(py, expected, Connect::RelayAware)' in runtime_source
+    assert 'inner: Mutex<Option<Client>>' in client_source
+    assert '.call_held(method_name, &request)' in client_source
+    assert 'RelayAwareHttpClient' not in runtime_source
+    assert 'release_http_client_from_global_pool' not in client_source
 
 
 def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatch):

@@ -1,10 +1,9 @@
+import { runNpm } from './npm-tools.mjs';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-import { runTsc } from './tsc-tools.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDir, '..');
@@ -26,34 +25,78 @@ function run(command, args, options = {}) {
   return result;
 }
 
-function runNpm(args, options = {}) {
-  if (process.env.npm_execpath) {
-    return run(process.execPath, [process.env.npm_execpath, ...args], options);
-  }
-  return run('npm', args, options);
-}
 
 try {
-  const pack = runNpm(['pack', packageRoot, '--json', '--ignore-scripts'], {
-    cwd: tempRoot,
-  });
-  let entries;
-  try {
-    entries = JSON.parse(pack.stdout);
-  } catch (error) {
-    process.stdout.write(pack.stdout);
-    throw new Error(`Failed to parse npm pack JSON: ${String(error)}`);
+  let tarball = process.env.C2_MEM_FFI_PACKAGE_TARBALL;
+  if (tarball === undefined) {
+    const pack = runNpm(['pack', packageRoot, '--json', '--ignore-scripts'], {
+      cwd: tempRoot,
+    });
+    let entries;
+    try {
+      entries = JSON.parse(pack.stdout);
+    } catch (error) {
+      process.stdout.write(pack.stdout);
+      throw new Error(`Failed to parse npm pack JSON: ${String(error)}`);
+    }
+    const filename = entries?.[0]?.filename;
+    if (typeof filename !== 'string' || filename.length === 0) {
+      throw new Error('npm pack JSON did not contain a tarball filename.');
+    }
+    tarball = isAbsolute(filename) ? filename : resolve(tempRoot, filename);
+  } else {
+    tarball = resolve(tarball);
   }
-  const filename = entries?.[0]?.filename;
-  if (typeof filename !== 'string' || filename.length === 0) {
-    throw new Error('npm pack JSON did not contain a tarball filename.');
+  if (!existsSync(tarball)) {
+    throw new Error(`C-Two package tarball does not exist: ${tarball}`);
   }
-  const tarball = isAbsolute(filename) ? filename : resolve(tempRoot, filename);
+
+  let typescriptTarball = process.env.C2_TYPESCRIPT_PACKAGE_TARBALL;
+  if (typescriptTarball === undefined) {
+    const pack = runNpm([
+      'pack',
+      'typescript@5.9.3',
+      '--json',
+      '--pack-destination',
+      tempRoot,
+    ], {
+      cwd: tempRoot,
+    });
+    let entries;
+    try {
+      entries = JSON.parse(pack.stdout);
+    } catch (error) {
+      process.stdout.write(pack.stdout);
+      throw new Error(`Failed to parse TypeScript pack JSON: ${String(error)}`);
+    }
+    const filename = entries?.[0]?.filename;
+    if (typeof filename !== 'string' || filename.length === 0) {
+      throw new Error('TypeScript npm pack JSON did not contain a tarball filename.');
+    }
+    typescriptTarball = isAbsolute(filename) ? filename : resolve(tempRoot, filename);
+  } else {
+    typescriptTarball = resolve(typescriptTarball);
+  }
+  if (!existsSync(typescriptTarball)) {
+    throw new Error(`TypeScript package tarball does not exist: ${typescriptTarball}`);
+  }
+
   const consumerRoot = resolve(tempRoot, 'consumer');
   mkdirSync(consumerRoot);
-  runNpm(['install', tarball, '--ignore-scripts', '--no-audit', '--no-fund'], {
+  writeFileSync(resolve(consumerRoot, 'package.json'), JSON.stringify({
+    name: 'c-two-c2-mem-ffi-package-consumer',
+    private: true,
+    type: 'module',
+  }));
+  runNpm(['install', tarball, typescriptTarball, '--ignore-scripts', '--no-audit', '--no-fund'], {
     cwd: consumerRoot,
   });
+  const lock = JSON.parse(readFileSync(resolve(consumerRoot, 'package-lock.json'), 'utf8'));
+  for (const [path, metadata] of Object.entries(lock.packages ?? {})) {
+    if (metadata?.link === true) {
+      throw new Error(`clean consumer contains a sibling link dependency at ${path}`);
+    }
+  }
   writeFileSync(resolve(consumerRoot, 'smoke.mjs'), `
 import assert from 'node:assert/strict';
 
@@ -67,7 +110,7 @@ import {
 
 const { requestSymbols, responseSymbols, symbols } = loadBundledC2MemFfiNodeNativeSymbols();
 
-assert.equal(C2_MEM_FFI_ABI_VERSION, 1);
+assert.equal(C2_MEM_FFI_ABI_VERSION, 2);
 assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
 assert.equal(typeof createNodeIpcConnect, 'function');
 
@@ -123,7 +166,7 @@ await symbols.c2_mem_ffi_response_pool_destroy(responseHandle);
 try {
   await symbols.c2_mem_ffi_response_pool_read(
     responseHandle,
-    { segmentIndex: 0, offset: 0, byteLength: 1, dedicated: false },
+    { segmentIndex: 0, generation: 7, offset: 0, byteLength: 1, dedicated: false },
     new Uint8Array(1),
   );
   throw new Error('destroyed native response pool handle remained usable');
@@ -148,19 +191,22 @@ const fakeServerPool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols
   minBlockSize: 4096,
 });
 const responsePool = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
-  prefix: \`/cc2p\${prefixSeed}c\`,
+  prefix: fakeServerPool.prefix,
   segmentSize: 65536,
   maxSegments: 1,
   minBlockSize: 4096,
 });
 try {
-  const payload = new Uint8Array([9, 7, 5, 3]);
-  const block = await fakeServerPool.write(payload);
-  await fakeServerPool.forgetConsumed(block);
-  const destination = new Uint8Array(payload.byteLength);
-  await responsePool.read(block, destination);
-  assert.deepEqual(Array.from(destination), Array.from(payload));
-  await responsePool.release(block);
+  for (const payload of [new Uint8Array([9, 7, 5, 3]), new Uint8Array(128 * 1024 + 3).fill(9)]) {
+    const block = await fakeServerPool.write(payload);
+    assert.equal(block.dedicated, payload.byteLength > 65536);
+    assert.equal(block.generation === 0, block.dedicated);
+    const destination = new Uint8Array(payload.byteLength);
+    await responsePool.read(block, destination);
+    assert.deepEqual(destination, payload);
+    await responsePool.release(block);
+    await fakeServerPool.forgetConsumed(block);
+  }
 } finally {
   await responsePool.close?.();
   await fakeServerPool.close?.();
@@ -169,21 +215,21 @@ try {
   writeFileSync(resolve(consumerRoot, 'smoke-types.mts'), `
 import {
   C2_MEM_FFI_ABI_VERSION,
-  type C2MemFfiNativeBuddyRequestBackend,
-  type C2MemFfiNativeBuddyResponseBackend,
+  type C2MemFfiNativeRequestBackend,
+  type C2MemFfiNativeResponseBackend,
   type C2MemFfiNodeNativeSymbols,
   type C2MemFfiPoolConfig,
   type C2MemFfiRequestBlock,
   type C2MemFfiResponseBlock,
-  createC2MemFfiNativeBuddyRequestBackend,
-  createC2MemFfiNativeBuddyResponseBackend,
+  createC2MemFfiNativeRequestBackend,
+  createC2MemFfiNativeResponseBackend,
   createC2MemFfiRequestPoolFromSymbols,
   createC2MemFfiResponsePoolFromSymbols,
   createNodeIpcConnect,
   loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
 
-const abiVersion: 1 = C2_MEM_FFI_ABI_VERSION;
+const abiVersion: 2 = C2_MEM_FFI_ABI_VERSION;
 const symbols: C2MemFfiNodeNativeSymbols = loadBundledC2MemFfiNodeNativeSymbols();
 const connect = createNodeIpcConnect();
 const poolConfig: C2MemFfiPoolConfig = {
@@ -196,8 +242,8 @@ const poolConfig: C2MemFfiPoolConfig = {
 async function smokeTypes(): Promise<C2MemFfiResponseBlock> {
   const requestPool = await createC2MemFfiRequestPoolFromSymbols(symbols.requestSymbols, poolConfig);
   const responsePool = await createC2MemFfiResponsePoolFromSymbols(symbols.responseSymbols, poolConfig);
-  const requestBackend: C2MemFfiNativeBuddyRequestBackend = createC2MemFfiNativeBuddyRequestBackend(requestPool);
-  const responseBackend: C2MemFfiNativeBuddyResponseBackend = createC2MemFfiNativeBuddyResponseBackend(responsePool);
+  const requestBackend: C2MemFfiNativeRequestBackend = createC2MemFfiNativeRequestBackend(requestPool);
+  const responseBackend: C2MemFfiNativeResponseBackend = createC2MemFfiNativeResponseBackend(responsePool);
   const requestBlock: C2MemFfiRequestBlock = await requestBackend.writeRequest(new Uint8Array([abiVersion]));
   await requestBackend.releaseRequest(requestBlock);
   await responseBackend.close();
@@ -229,14 +275,17 @@ void smokeTypes;
   "include": ["smoke-types.mts"]
 }
 `);
-  runTsc(['-p', 'tsconfig.json'], {
+  run(process.execPath, [
+    resolve(consumerRoot, 'node_modules', 'typescript', 'bin', 'tsc'),
+    '-p',
+    'tsconfig.json',
+  ], {
     cwd: consumerRoot,
-    packageRoot,
   });
   run(process.execPath, ['smoke.mjs'], {
     cwd: consumerRoot,
   });
-  console.log('npm packed tarball installs, typechecks, and exercises bundled native request/response pool and request/response handle lifecycle paths from a clean consumer project.');
+  console.log('npm packed runtime and TypeScript tarballs install, typecheck, and exercise bundled native request/response pool and request/response handle lifecycle paths from a clean consumer project.');
 } finally {
   rmSync(tempRoot, { recursive: true, force: true });
 }

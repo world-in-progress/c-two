@@ -39,49 +39,24 @@ impl PeerShmState {
         }
     }
 
-    /// Derive buddy segment SHM name from prefix and index.
-    fn buddy_segment_name(prefix: &str, idx: usize) -> String {
-        format!("{}_{}{:04x}", prefix, "b", idx)
-    }
-
-    /// Derive dedicated segment SHM name from prefix and index.
-    fn dedicated_segment_name(prefix: &str, idx: u32) -> String {
-        format!("{}_{}{:04x}", prefix, "d", idx)
-    }
-
-    /// Ensure the pool has the buddy segment at `seg_idx` open.
-    /// If not yet open, derive the name from prefix and lazy-open it.
-    fn ensure_buddy_segment(&self, seg_idx: u32) -> Result<(), String> {
+    fn ensure_segment(
+        &self,
+        seg_idx: u32,
+        generation: u32,
+        data_size: usize,
+        dedicated: bool,
+    ) -> Result<(), String> {
         let pool_arc = self.pool.as_ref().ok_or("peer pool not initialised")?;
-        // Fast path: check segment count under read lock
-        {
-            let pool = pool_arc.read();
-            if (seg_idx as usize) < pool.segment_count() {
-                return Ok(());
+        let mut pool = pool_arc.write();
+        if dedicated {
+            if generation != 0 {
+                return Err("dedicated generation must be zero".into());
             }
+            let name = MemPool::dedicated_segment_name(&self.prefix, seg_idx);
+            pool.open_dedicated_at(seg_idx, &name, data_size)
+        } else {
+            pool.ensure_peer_segment(seg_idx, generation, self.buddy_segment_size.max(data_size))
         }
-        // Slow path: open missing segments under write lock
-        let mut pool = pool_arc.write();
-        // Re-check after upgrading (another thread may have opened it)
-        let idx = seg_idx as usize;
-        if idx < pool.segment_count() {
-            return Ok(());
-        }
-        for i in pool.segment_count()..=idx {
-            let name = Self::buddy_segment_name(&self.prefix, i);
-            pool.open_segment(&name, self.buddy_segment_size)?;
-        }
-        Ok(())
-    }
-
-    /// Ensure a dedicated segment is open at the specific producer index.
-    // TODO: add read-check-first optimisation once MemPool exposes a
-    // `has_dedicated(seg_idx)` predicate to avoid unconditional write-lock.
-    fn ensure_dedicated_segment(&self, seg_idx: u32, min_size: usize) -> Result<(), String> {
-        let pool_arc = self.pool.as_ref().ok_or("peer pool not initialised")?;
-        let mut pool = pool_arc.write();
-        let name = Self::dedicated_segment_name(&self.prefix, seg_idx);
-        pool.open_dedicated_at(seg_idx, &name, min_size)
     }
 }
 
@@ -200,7 +175,7 @@ impl Connection {
     ///
     /// Always creates a `MemPool` with the peer's prefix so that later
     /// `read_peer_data` / `free_peer_block` can lazy-open segments by
-    /// deriving their names from `{prefix}_b{idx:04x}`.
+    /// resolving names through MemPool's prefix, index, and generation authority.
     /// Minimum buddy segment size required by the allocator (2 × min_block_size).
     const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
 
@@ -234,21 +209,10 @@ impl Connection {
             dedicated_crash_timeout_secs: 0.0,
             buddy_idle_decay_secs: 60.0,
             spill_threshold: 1.0,
-            spill_dir: std::path::PathBuf::from("/tmp/c_two_spill_srv"),
+            spill_dir: std::env::temp_dir().join("c_two_request_cache"),
         };
         let peer_prefix = state.prefix.clone();
-        let mut pool = MemPool::new_with_prefix(cfg, peer_prefix);
-
-        // Eagerly open any segments declared in the handshake.
-        for (name, size) in &segments {
-            if let Err(e) = pool.open_segment(name, *size as usize) {
-                warn!(
-                    conn_id = self.conn_id,
-                    segment = name.as_str(),
-                    "failed to open peer segment: {e}"
-                );
-            }
-        }
+        let pool = MemPool::open_peer(cfg, peer_prefix);
         state.pool = Some(Arc::new(RwLock::new(pool)));
     }
 
@@ -257,15 +221,12 @@ impl Connection {
     pub fn ensure_peer_segment(
         &self,
         seg_idx: u16,
+        generation: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<(), String> {
         let state = self.peer_shm.lock();
-        if is_dedicated {
-            state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)
-        } else {
-            state.ensure_buddy_segment(seg_idx as u32)
-        }
+        state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)
     }
 
     /// Ensure the peer's SHM segment is mapped and return the pool Arc.
@@ -273,44 +234,36 @@ impl Connection {
     pub fn ensure_and_get_peer_pool(
         &self,
         seg_idx: u16,
+        generation: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<Arc<RwLock<MemPool>>, String> {
         let state = self.peer_shm.lock();
-        if is_dedicated {
-            state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)?;
-        } else {
-            state.ensure_buddy_segment(seg_idx as u32)?;
-        }
+        state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)?;
         state
             .pool
             .clone()
             .ok_or_else(|| "peer pool not initialised".to_string())
     }
 
-    /// Read `data_size` bytes from the peer's SHM at `(seg_idx, offset)`.
+    /// Read `data_size` bytes from the peer's SHM at `(seg_idx, generation, offset)`.
     ///
     /// Lazy-opens the segment if it hasn't been seen before — the name is
-    /// derived deterministically from `{prefix}_b{idx:04x}`.
+    /// derived by MemPool from its prefix, index, and generation.
     pub fn read_peer_data(
         &self,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<Vec<u8>, String> {
         let state = self.peer_shm.lock();
         // Lazy-open the segment if the pool hasn't mapped it yet.
-        if is_dedicated {
-            state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)?;
-        } else {
-            state.ensure_buddy_segment(seg_idx as u32)?;
-        }
+        state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated)?;
         let pool_arc = state.pool.as_ref().ok_or("peer pool not initialised")?;
         let pool = pool_arc.read();
-        let ptr = pool.data_ptr_at(seg_idx as u32, offset, is_dedicated)?;
-        let slice = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) };
-        Ok(slice.to_vec())
+        pool.copy_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
     }
 
     /// Free a buddy block in the peer's SHM pool.
@@ -320,17 +273,15 @@ impl Connection {
     pub fn free_peer_block(
         &self,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> FreeResult {
         let state = self.peer_shm.lock();
         // Lazy-open the segment before freeing.
-        let lazy_res = if is_dedicated {
-            state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)
-        } else {
-            state.ensure_buddy_segment(seg_idx as u32)
-        };
+        let lazy_res =
+            state.ensure_segment(seg_idx as u32, generation, data_size as usize, is_dedicated);
         if let Err(e) = lazy_res {
             warn!(
                 conn_id = self.conn_id,
@@ -340,7 +291,11 @@ impl Connection {
         }
         if let Some(pool_arc) = state.pool.as_ref() {
             let mut pool = pool_arc.write();
-            match pool.free_at(seg_idx as u32, offset, data_size, is_dedicated) {
+            match pool
+                .validate_data_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
+                .and_then(|_| {
+                    pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated)
+                }) {
                 Ok(result) => return result,
                 Err(e) => {
                     warn!(

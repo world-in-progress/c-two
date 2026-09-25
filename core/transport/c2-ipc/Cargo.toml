@@ -2,18 +2,20 @@
 name = "c2-ipc"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Async IPC client for C-Two relay"
 
 [dependencies]
-c2-config = { path = "../../foundation/c2-config" }
-c2-contract = { path = "../../foundation/c2-contract" }
-c2-error = { path = "../../foundation/c2-error" }
-c2-wire = { path = "../../protocol/c2-wire" }
-c2-mem = { path = "../../foundation/c2-mem" }
+c2-config = { version = "0.1.0", path = "../../foundation/c2-config" }
+c2-contract = { version = "0.1.0", path = "../../foundation/c2-contract" }
+c2-error = { version = "0.1.0", path = "../../foundation/c2-error" }
+c2-wire = { version = "0.1.0", path = "../../protocol/c2-wire" }
+c2-mem = { version = "0.1.0", path = "../../foundation/c2-mem" }
+c2-local = { version = "0.1.0", path = "../c2-local" }
 futures-util = "0.3"
 parking_lot = { workspace = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
-libc = "0.2"
 
 [dev-dependencies]
-c2-server = { path = "../c2-server" }
+c2-server = { version = "0.1.0", path = "../c2-server" }

@@ -74,6 +74,7 @@ where
 
     Ok(Some(ResponseMeta::ShmAlloc {
         seg_idx: alloc.seg_idx as u16,
+        generation: alloc.generation,
         offset: alloc.offset,
         data_size,
         is_dedicated: alloc.is_dedicated,
@@ -139,6 +140,7 @@ mod tests {
 
         let ResponseMeta::ShmAlloc {
             seg_idx,
+            generation,
             offset,
             data_size,
             is_dedicated,
@@ -149,7 +151,7 @@ mod tests {
 
         let pool_guard = pool.read();
         let ptr = pool_guard
-            .data_ptr_at(seg_idx as u32, offset, is_dedicated)
+            .data_ptr_at(seg_idx as u32, generation, offset, is_dedicated)
             .unwrap();
         let actual = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) };
         assert_eq!(actual, payload.as_slice());

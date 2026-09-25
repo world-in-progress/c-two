@@ -1,0 +1,343 @@
+{
+  "crm": {
+    "name": "PortableRecord",
+    "namespace": "test.portable-matrix.record-v1",
+    "version": "0.1.0"
+  },
+  "fingerprints": {
+    "abi_hash": "d16ea9279dd20aaa352a0b4531850fa8236f984ae79fd5458b9ab7d0dd37d6d7",
+    "signature_hash": "f0fba7083ae518473fe1a6cbdbf086e8e2d370ae9c7bdb21ace56d89edaab5c3"
+  },
+  "methods": [
+    {
+      "access": "write",
+      "bindings": {
+        "input": {
+          "kind": "fastdb",
+          "spec": {
+            "components": [
+              {
+                "fields": [
+                  {
+                    "id": "boolean_value",
+                    "type": {
+                      "kind": "bool",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u8_value",
+                    "type": {
+                      "kind": "u8",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u16_value",
+                    "type": {
+                      "kind": "u16",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u32_value",
+                    "type": {
+                      "kind": "u32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "i32_value",
+                    "type": {
+                      "kind": "i32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u8n_value",
+                    "type": {
+                      "kind": "u8n",
+                      "max": 1,
+                      "min": 0,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u16n_value",
+                    "type": {
+                      "kind": "u16n",
+                      "max": 1,
+                      "min": -1,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "f32_value",
+                    "type": {
+                      "kind": "f32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "f64_value",
+                    "type": {
+                      "kind": "f64",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "str_value",
+                    "type": {
+                      "kind": "str",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "wstr_value",
+                    "type": {
+                      "kind": "wstr",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "bytes_value",
+                    "type": {
+                      "kind": "bytes",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "component_value",
+                    "type": {
+                      "id": "Leaf",
+                      "kind": "component",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "list_value",
+                    "type": {
+                      "items": {
+                        "items": {
+                          "kind": "str",
+                          "nullable": true
+                        },
+                        "kind": "list",
+                        "nullable": true
+                      },
+                      "kind": "list",
+                      "nullable": false
+                    }
+                  }
+                ],
+                "id": "AllTypes",
+                "kind": "record"
+              },
+              {
+                "fields": [],
+                "id": "Leaf",
+                "kind": "record"
+              }
+            ],
+            "entries": [
+              {
+                "cardinality": "one",
+                "id": "single",
+                "type": {
+                  "id": "AllTypes",
+                  "kind": "component",
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "series",
+                "type": {
+                  "items": {
+                    "kind": "u8",
+                    "nullable": true
+                  },
+                  "kind": "list",
+                  "nullable": true
+                }
+              }
+            ],
+            "profile": "record.v1",
+            "schema": "fastdb.payload.v1"
+          }
+        },
+        "output": {
+          "kind": "fastdb",
+          "spec": {
+            "components": [
+              {
+                "fields": [
+                  {
+                    "id": "boolean_value",
+                    "type": {
+                      "kind": "bool",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u8_value",
+                    "type": {
+                      "kind": "u8",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u16_value",
+                    "type": {
+                      "kind": "u16",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u32_value",
+                    "type": {
+                      "kind": "u32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "i32_value",
+                    "type": {
+                      "kind": "i32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u8n_value",
+                    "type": {
+                      "kind": "u8n",
+                      "max": 1,
+                      "min": 0,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "u16n_value",
+                    "type": {
+                      "kind": "u16n",
+                      "max": 1,
+                      "min": -1,
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "f32_value",
+                    "type": {
+                      "kind": "f32",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "f64_value",
+                    "type": {
+                      "kind": "f64",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "str_value",
+                    "type": {
+                      "kind": "str",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "wstr_value",
+                    "type": {
+                      "kind": "wstr",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "bytes_value",
+                    "type": {
+                      "kind": "bytes",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "component_value",
+                    "type": {
+                      "id": "Leaf",
+                      "kind": "component",
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "id": "list_value",
+                    "type": {
+                      "items": {
+                        "items": {
+                          "kind": "str",
+                          "nullable": true
+                        },
+                        "kind": "list",
+                        "nullable": true
+                      },
+                      "kind": "list",
+                      "nullable": false
+                    }
+                  }
+                ],
+                "id": "AllTypes",
+                "kind": "record"
+              },
+              {
+                "fields": [],
+                "id": "Leaf",
+                "kind": "record"
+              }
+            ],
+            "entries": [
+              {
+                "cardinality": "one",
+                "id": "single",
+                "type": {
+                  "id": "AllTypes",
+                  "kind": "component",
+                  "nullable": false
+                }
+              },
+              {
+                "cardinality": "many",
+                "id": "series",
+                "type": {
+                  "items": {
+                    "kind": "u8",
+                    "nullable": true
+                  },
+                  "kind": "list",
+                  "nullable": true
+                }
+              }
+            ],
+            "profile": "record.v1",
+            "schema": "fastdb.payload.v1"
+          }
+        }
+      },
+      "name": "roundtrip",
+      "parameters": [
+        {
+          "default": {
+            "kind": "missing"
+          },
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "payload",
+          "type": {
+            "kind": "payload"
+          }
+        }
+      ],
+      "return": {
+        "kind": "payload"
+      }
+    }
+  ],
+  "schema": "c-two.contract.v2"
+}

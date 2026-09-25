@@ -1,14 +1,15 @@
-"""Native server bridge — Python wrapper around ``RustServer``.
+"""Python CRM bridge projected through the language-neutral C-Two Core host.
 
-Provides the Python CRM dispatch surface while delegating transport to the
-Rust ``c2-server`` crate via PyO3 bindings.
+Provides the Python CRM dispatch surface while delegating registration,
+transport, scheduling, and lifecycle to ``c2-core`` through PyO3.
 
 CRM domain logic (CRM instance creation, method discovery, dispatch tables,
-shutdown callbacks) remains in Python.  Only the UDS accept loop,
+shutdown callbacks) remains in Python.  The native local accept loop,
 frame parsing, heartbeat, and concurrency scheduling move to Rust.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
@@ -85,11 +86,12 @@ class CRMSlot:
                 if lifetime is InputLifetime.BORROWED:
                     binding = getattr(method, '_input_payload_binding', None)
                     if (
-                        getattr(binding, 'kind', None) is not PayloadPlanKind.FDB
-                        or getattr(binding, 'view_from_buffer', None) is None
+                        getattr(binding, 'kind', None) is not PayloadPlanKind.FASTDB
+                        or not getattr(binding, 'supports_scoped_owner', False)
                     ):
                         raise ValueError(
-                            f'input_lifetime BORROWED for {name!r} requires a buffer-view FDB input payload',
+                            f'input_lifetime BORROWED for {name!r} requires '
+                            'an explicit FastDB Payload input binding',
                         )
                     buffer_mode = 'borrowed'
                 elif lifetime is InputLifetime.MATERIALIZED:
@@ -102,23 +104,6 @@ class CRMSlot:
                             "cc.register(..., input_lifetime=...), not @cc.transfer(buffer='hold')",
                         )
                 self._dispatch_table[name] = (method, access, buffer_mode)
-
-
-def _session_has_relay(runtime_session: object, relay_anchor_address: str | None) -> bool:
-    if relay_anchor_address is not None:
-        return True
-    value = getattr(runtime_session, 'effective_relay_anchor_address', None)
-    if value is None:
-        return False
-    try:
-        return value() is not None if callable(value) else value is not None
-    except Exception:
-        return False
-
-
-def _new_standalone_runtime_session() -> object:
-    from c_two._native import RuntimeSession
-    return RuntimeSession(use_process_relay_anchor=False)
 
 
 def _ensure_no_standalone_relay(
@@ -157,7 +142,7 @@ class NativeServerBridge:
 
     Manages CRM slots in Python (CRM instance creation, dispatch tables,
     shutdown callbacks) while delegating the IPC transport to the
-    Rust ``RustServer`` (c2-server crate).
+    language-neutral Core host.
     """
 
     def __init__(
@@ -169,6 +154,7 @@ class NativeServerBridge:
         server_instance_id: str | None = None,
         hold_warn_seconds: float = 60.0,
         lease_tracker: object | None = None,
+        runtime_session: object | None = None,
     ) -> None:
         self._config = _resolve_server_ipc_config(ipc_overrides)
         self._address = bind_address
@@ -190,32 +176,19 @@ class NativeServerBridge:
             )
         self._hold_sweep_interval = 10
 
-        from c_two._native import RustServer
+        del server_instance_id
+        if runtime_session is None:
+            from c_two._native import RuntimeSession
 
-        self._rust_server = RustServer(
-            address=bind_address,
-            shm_threshold=int(self._config['shm_threshold']),
-            pool_enabled=self._config['pool_enabled'],
-            pool_segment_size=self._config['pool_segment_size'],
-            max_pool_segments=self._config['max_pool_segments'],
-            reassembly_segment_size=self._config['reassembly_segment_size'],
-            reassembly_max_segments=self._config['reassembly_max_segments'],
-            max_frame_size=self._config['max_frame_size'],
-            max_payload_size=self._config['max_payload_size'],
-            max_pending_requests=self._config['max_pending_requests'],
-            max_execution_workers=self._config['max_execution_workers'],
-            pool_decay_seconds=self._config['pool_decay_seconds'],
-            heartbeat_interval=self._config['heartbeat_interval'],
-            heartbeat_timeout=self._config['heartbeat_timeout'],
-            max_total_chunks=self._config['max_total_chunks'],
-            chunk_gc_interval=self._config['chunk_gc_interval'],
-            chunk_threshold_ratio=self._config['chunk_threshold_ratio'],
-            chunk_assembler_timeout=self._config['chunk_assembler_timeout'],
-            max_reassembly_bytes=self._config['max_reassembly_bytes'],
-            chunk_size=self._config['chunk_size'],
-            server_id=server_id,
-            server_instance_id=server_instance_id,
-        )
+            if server_id is None and bind_address.startswith('ipc://'):
+                server_id = bind_address.removeprefix('ipc://')
+            runtime_session = RuntimeSession(
+                server_id=server_id,
+                server_ipc_overrides=ipc_overrides,
+                shm_threshold=int(self._config['shm_threshold']),
+                use_process_relay_anchor=False,
+            )
+        self._runtime_session = runtime_session
 
     # ------------------------------------------------------------------
     # CRM registration
@@ -300,12 +273,29 @@ class NativeServerBridge:
                 raise ValueError(f'Name already registered: {routing_name!r}')
             _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
             if runtime_session is None:
-                runtime_session = _new_standalone_runtime_session()
-            if _session_has_relay(runtime_session, relay_anchor_address) and not self.is_started():
-                self.start()
+                runtime_session = self._runtime_session
+            else:
+                self._runtime_session = runtime_session
+            from ...crm.descriptor import (
+                build_contract_descriptor,
+                contract_descriptor_diagnostics,
+            )
+
+            diagnostics = contract_descriptor_diagnostics(crm_class, methods)
+            descriptor = build_contract_descriptor(
+                crm_class,
+                methods,
+                portable=not diagnostics,
+            )
+            descriptor_json = json.dumps(
+                descriptor,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode()
             try:
                 _outcome, native_concurrency = runtime_session.register_route(
-                    self._rust_server,
                     routing_name,
                     dispatcher,
                     methods,
@@ -318,6 +308,7 @@ class NativeServerBridge:
                     crm_ver,
                     abi_hash,
                     signature_hash,
+                    descriptor_json,
                     relay_anchor_address,
                 )
             except Exception as exc:
@@ -349,10 +340,9 @@ class NativeServerBridge:
 
         _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
         if runtime_session is None:
-            runtime_session = _new_standalone_runtime_session()
+            runtime_session = self._runtime_session
 
         outcome = dict(runtime_session.unregister_route(
-            self._rust_server,
             name,
             relay_anchor_address,
         ))
@@ -403,10 +393,14 @@ class NativeServerBridge:
     # ------------------------------------------------------------------
 
     def is_started(self) -> bool:
-        return bool(getattr(self._rust_server, 'is_running', False))
+        return bool(self._runtime_session.host_started)
 
     def start(self, timeout: float = 5.0) -> None:
-        self._rust_server.start_and_wait(float(timeout))
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError('timeout must be a non-negative finite number')
+        del timeout
+        self._runtime_session.ensure_host_started()
 
     def shutdown(
         self,
@@ -421,10 +415,11 @@ class NativeServerBridge:
 
         _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
         if runtime_session is None:
-            runtime_session = _new_standalone_runtime_session()
+            runtime_session = self._runtime_session
+        else:
+            self._runtime_session = runtime_session
 
         outcome = dict(runtime_session.shutdown(
-            self._rust_server,
             route_names=route_names,
             relay_anchor_address=relay_anchor_address,
             timeout_seconds=float(timeout),

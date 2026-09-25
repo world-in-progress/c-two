@@ -1,31 +1,16 @@
-"""Kostya-style coordinate benchmark — C-Two IPC variants.
+"""Kostya-style coordinate benchmark for C-Two pickle IPC baselines.
 
-Compares Python pickle fallback with the current FastDB-first CRM ABI,
-prepared call-db SHM writing, and client-side ``cc.hold(...)`` model for
-transporting coordinate records:
-``row_id, x, y, z, name``.
+The former annotation-inferred FastDB variants were removed with the legacy
+runtime authority. An explicit portable ``Payload`` benchmark will be added
+only after the generic Rust/Python interoperability path is proven, so this
+benchmark currently measures two truthful Python pickle baselines:
 
-Strategies:
-  * pickle-records       : list[dict] over Python pickle
-  * pickle-arrays        : numpy arrays + string list over Python pickle
-  * fastdb-control-*               : control path using ordinary
-                                     fdb.Batch.allocate(...), showing call-db
-                                     repack cost outside the recommended
-                                     resource output construction path
-  * fastdb-require-*               : payload built through
-                                     fdb.require(fdb.batch(...)); useful for
-                                     measuring the recommended construction
-                                     path, transport, and retained-view cost
-  * fastdb-numeric-control-*       : numeric-only control path used
-                                     to isolate string and field-layout cost
-  * fastdb-numeric-require-runtime-*:
-                                     resource builds the numeric payload each
-                                     call through fdb.require(...); useful for
-                                     measuring resource-time construction cost
+* ``pickle-records``: ``list[dict]`` in row-oriented form;
+* ``pickle-arrays``: NumPy arrays plus a string list.
 
 Run:
     C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/kostya_ctwo_benchmark.py \
-        --variant fastdb-require-retained --n 100000 --iters 20
+        --variant pickle-arrays --n 100000 --iters 20
 """
 from __future__ import annotations
 
@@ -39,7 +24,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import fastdb4py as fdb
 import numpy as np
 
 import c_two as cc
@@ -47,29 +31,6 @@ import c_two as cc
 
 _BENCH_SCHEMA_MODULE = 'c_two_kostya_benchmark'
 sys.modules.setdefault(_BENCH_SCHEMA_MODULE, sys.modules[__name__])
-
-
-@fdb.feature
-class Coord:
-    row_id: fdb.U32
-    x: fdb.F64
-    y: fdb.F64
-    z: fdb.F64
-    name: fdb.STR
-
-
-Coord.__module__ = _BENCH_SCHEMA_MODULE
-
-
-@fdb.feature
-class CoordNumeric:
-    row_id: fdb.U32
-    x: fdb.F64
-    y: fdb.F64
-    z: fdb.F64
-
-
-CoordNumeric.__module__ = _BENCH_SCHEMA_MODULE
 
 
 @dataclass
@@ -108,18 +69,6 @@ class ICoordArrays:
         ...
 
 
-@cc.crm(namespace='bench.kostya.fastdb', version='0.1.0')
-class ICoordFastdb:
-    def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
-        ...
-
-
-@cc.crm(namespace='bench.kostya.fastdb.numeric', version='0.1.0')
-class ICoordFastdbNumeric:
-    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
-        ...
-
-
 def _coord_names(n: int) -> list[str]:
     return [f'coord_{i % 50000:05d}' for i in range(n)]
 
@@ -137,56 +86,6 @@ def _make_coord_arrays(n: int) -> CoordArrays:
         z=idx.astype(np.float64) * 0.3,
         name=_coord_names(n),
     )
-
-
-def _make_coord_control_batch(n: int) -> fdb.Batch[Coord]:
-    idx = _coord_index(n)
-    batch = fdb.Batch.allocate(Coord, n)
-    batch.fill(
-        row_id=idx,
-        x=idx.astype(np.float64) * 0.1,
-        y=idx.astype(np.float64) * 0.2,
-        z=idx.astype(np.float64) * 0.3,
-        name=_coord_names(n),
-    )
-    return batch
-
-
-def _make_coord_numeric_control_batch(n: int) -> fdb.Batch[CoordNumeric]:
-    idx = _coord_index(n)
-    batch = fdb.Batch.allocate(CoordNumeric, n)
-    batch.fill(
-        row_id=idx,
-        x=idx.astype(np.float64) * 0.1,
-        y=idx.astype(np.float64) * 0.2,
-        z=idx.astype(np.float64) * 0.3,
-    )
-    return batch
-
-
-def _make_coord_require_batch(n: int) -> fdb.Batch[Coord]:
-    idx = _coord_index(n)
-    batch = fdb.require(fdb.batch(Coord, rows=n))
-    batch.fill(
-        row_id=idx,
-        x=idx.astype(np.float64) * 0.1,
-        y=idx.astype(np.float64) * 0.2,
-        z=idx.astype(np.float64) * 0.3,
-        name=_coord_names(n),
-    )
-    return batch
-
-
-def _make_coord_numeric_require_batch(n: int) -> fdb.Batch[CoordNumeric]:
-    idx = _coord_index(n)
-    batch = fdb.require(fdb.batch(CoordNumeric, rows=n))
-    batch.fill(
-        row_id=idx,
-        x=idx.astype(np.float64) * 0.1,
-        y=idx.astype(np.float64) * 0.2,
-        z=idx.astype(np.float64) * 0.3,
-    )
-    return batch
 
 
 class CoordRecordsCRM:
@@ -214,38 +113,6 @@ class CoordArraysCRM:
         return self._payload
 
 
-class CoordFastdbControlCRM:
-    def __init__(self, n: int):
-        self._payload = _make_coord_control_batch(n)
-
-    def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
-        return self._payload
-
-
-class CoordFastdbRequireCRM:
-    def __init__(self, n: int):
-        self._payload = _make_coord_require_batch(n)
-
-    def coords(self, count: fdb.I32) -> fdb.Batch[Coord]:
-        return self._payload
-
-
-class CoordFastdbNumericControlCRM:
-    def __init__(self, n: int):
-        self._payload = _make_coord_numeric_control_batch(n)
-
-    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
-        return self._payload
-
-
-class CoordFastdbNumericRequireCRM:
-    def __init__(self, n: int):
-        self._n = n
-
-    def coords(self, count: fdb.I32) -> fdb.Batch[CoordNumeric]:
-        return _make_coord_numeric_require_batch(self._n)
-
-
 def consume_records(payload: CoordRecords) -> float:
     return sum(
         float(row['x']) + float(row['y']) + float(row['z'])
@@ -255,24 +122,6 @@ def consume_records(payload: CoordRecords) -> float:
 
 def consume_arrays(payload: CoordArrays) -> float:
     return float(payload.x.sum() + payload.y.sum() + payload.z.sum())
-
-
-def consume_fastdb_safe(batch: fdb.Batch[Coord]) -> float:
-    column = batch.column
-    return float(
-        np.asarray(column.x).sum()
-        + np.asarray(column.y).sum()
-        + np.asarray(column.z).sum()
-    )
-
-
-def consume_fastdb_unsafe(batch: fdb.Batch[Coord]) -> float:
-    column = batch.column
-    return float(
-        column.x.unsafe_numpy_view().sum()
-        + column.y.unsafe_numpy_view().sum()
-        + column.z.unsafe_numpy_view().sum()
-    )
 
 
 def _request_count(_n: int) -> int:
@@ -296,7 +145,6 @@ class VariantSpec:
     contract: type
     resource_factory: Callable[[int], object]
     consumer: Callable[[object], float]
-    use_hold: bool
 
 
 VARIANTS: dict[str, VariantSpec] = {
@@ -304,85 +152,11 @@ VARIANTS: dict[str, VariantSpec] = {
         contract=ICoordRecords,
         resource_factory=CoordRecordsCRM,
         consumer=consume_records,
-        use_hold=False,
     ),
     'pickle-arrays': VariantSpec(
         contract=ICoordArrays,
         resource_factory=CoordArraysCRM,
         consumer=consume_arrays,
-        use_hold=False,
-    ),
-    'fastdb-control-default': VariantSpec(
-        contract=ICoordFastdb,
-        resource_factory=CoordFastdbControlCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=False,
-    ),
-    'fastdb-control-retained': VariantSpec(
-        contract=ICoordFastdb,
-        resource_factory=CoordFastdbControlCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=True,
-    ),
-    'fastdb-control-retained-unsafe': VariantSpec(
-        contract=ICoordFastdb,
-        resource_factory=CoordFastdbControlCRM,
-        consumer=consume_fastdb_unsafe,
-        use_hold=True,
-    ),
-    'fastdb-require-default': VariantSpec(
-        contract=ICoordFastdb,
-        resource_factory=CoordFastdbRequireCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=False,
-    ),
-    'fastdb-require-retained': VariantSpec(
-        contract=ICoordFastdb,
-        resource_factory=CoordFastdbRequireCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=True,
-    ),
-    'fastdb-require-retained-unsafe': VariantSpec(
-        contract=ICoordFastdb,
-        resource_factory=CoordFastdbRequireCRM,
-        consumer=consume_fastdb_unsafe,
-        use_hold=True,
-    ),
-    'fastdb-numeric-control-default': VariantSpec(
-        contract=ICoordFastdbNumeric,
-        resource_factory=CoordFastdbNumericControlCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=False,
-    ),
-    'fastdb-numeric-control-retained': VariantSpec(
-        contract=ICoordFastdbNumeric,
-        resource_factory=CoordFastdbNumericControlCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=True,
-    ),
-    'fastdb-numeric-control-retained-unsafe': VariantSpec(
-        contract=ICoordFastdbNumeric,
-        resource_factory=CoordFastdbNumericControlCRM,
-        consumer=consume_fastdb_unsafe,
-        use_hold=True,
-    ),
-    'fastdb-numeric-require-runtime-default': VariantSpec(
-        contract=ICoordFastdbNumeric,
-        resource_factory=CoordFastdbNumericRequireCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=False,
-    ),
-    'fastdb-numeric-require-runtime-retained': VariantSpec(
-        contract=ICoordFastdbNumeric,
-        resource_factory=CoordFastdbNumericRequireCRM,
-        consumer=consume_fastdb_safe,
-        use_hold=True,
-    ),
-    'fastdb-numeric-require-runtime-retained-unsafe': VariantSpec(
-        contract=ICoordFastdbNumeric,
-        resource_factory=CoordFastdbNumericRequireCRM,
-        consumer=consume_fastdb_unsafe,
-        use_hold=True,
     ),
 }
 
@@ -412,10 +186,7 @@ def _wait_ready(ready_path: str, timeout: float = 60.0) -> str:
     raise TimeoutError(f'server not ready in {timeout}s')
 
 
-def _call_once(method, spec: VariantSpec, consumer: Callable[[object], float], request: int) -> float:
-    if spec.use_hold:
-        with cc.hold(method)(request) as held:
-            return consumer(held.value)
+def _call_once(method, consumer: Callable[[object], float], request: int) -> float:
     return consumer(method(request))
 
 
@@ -439,7 +210,7 @@ def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict[str, obje
 
         for _ in range(warmup):
             _assert_expected_total(
-                _call_once(method, spec, spec.consumer, request),
+                _call_once(method, spec.consumer, request),
                 n,
             )
 
@@ -449,7 +220,7 @@ def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict[str, obje
             for _ in range(iters):
                 t0 = time.perf_counter()
                 _assert_expected_total(
-                    _call_once(method, spec, spec.consumer, request),
+                    _call_once(method, spec.consumer, request),
                     n,
                 )
                 total_ms.append((time.perf_counter() - t0) * 1000)

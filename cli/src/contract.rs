@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 #[derive(Debug, Args)]
@@ -11,11 +12,9 @@ pub struct ContractArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ContractCommand {
-    /// Export payload ABI artifact descriptors from a Python CRM class.
-    Artifacts(PythonArtifactsArgs),
     /// Generate SDK artifacts from a portable descriptor.
     Codegen(CodegenArgs),
-    /// Report fastdb-first portability diagnostics for a Python CRM class.
+    /// Report portable-contract diagnostics for a Python CRM class.
     Diagnose(PythonDiagnoseArgs),
     /// Export a portable descriptor from a Python CRM class.
     Export(PythonExportArgs),
@@ -23,7 +22,7 @@ pub enum ContractCommand {
     Infer(PythonInferArgs),
     /// Derive a route-independent release reference from a portable descriptor.
     ReleaseRef(ReleaseRefArgs),
-    /// Validate a portable c-two.contract.v1 descriptor.
+    /// Validate a portable c-two.contract.v2 descriptor.
     Validate(ValidateArgs),
 }
 
@@ -69,49 +68,23 @@ pub struct PythonDiagnoseArgs {
     pub pretty: bool,
 }
 
-#[derive(Debug, Args)]
-pub struct PythonArtifactsArgs {
-    /// Python CRM class target as module:ClassName.
-    pub target: String,
-    /// Python executable used for import/reflection. Defaults to C2_PYTHON or python3.
-    #[arg(long)]
-    pub python: Option<String>,
-    /// Limit artifacts to one CRM method; repeatable.
-    #[arg(long = "method")]
-    pub methods: Vec<String>,
-    /// Write payload ABI artifact JSON to this file instead of stdout.
-    #[arg(long)]
-    pub out: Option<String>,
-    /// Pretty-print payload ABI artifact JSON.
-    #[arg(long)]
-    pub pretty: bool,
-}
-
 #[derive(Debug, Subcommand)]
 pub enum CodegenCommand {
-    /// Generate a TypeScript client and optional C-Two FastDB helpers.
-    Typescript(TypeScriptCodegenArgs),
+    /// Generate a Rust contract project tree.
+    Rust(CodegenTargetArgs),
+    /// Generate a Python contract project tree.
+    Python(CodegenTargetArgs),
+    /// Generate a TypeScript contract project tree.
+    Typescript(CodegenTargetArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct TypeScriptCodegenArgs {
+pub struct CodegenTargetArgs {
     /// Descriptor JSON path, or "-" to read from stdin.
     pub path: String,
-    /// Write generated TypeScript to this file instead of stdout.
+    /// Publish the complete generated artifact tree at this absent destination.
     #[arg(long)]
-    pub out: Option<String>,
-    /// Fail when the descriptor references codecs without built-in TypeScript support.
-    #[arg(long)]
-    pub strict_codecs: bool,
-    /// FastDB schema descriptor JSON file or artifact bundle for C-Two FastDB helper generation; repeatable.
-    #[arg(long = "fastdb-schema")]
-    pub fastdb_schemas: Vec<String>,
-    /// Write generated C-Two FastDB TypeScript helpers to this file.
-    #[arg(long = "fastdb-out")]
-    pub fastdb_out: Option<String>,
-    /// Python executable used for C-Two FastDB helper generation. Defaults to C2_PYTHON or python3.
-    #[arg(long)]
-    pub python: Option<String>,
+    pub out_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -154,20 +127,16 @@ pub struct PythonInferArgs {
     /// Write portability diagnostics for the inferred projection instead of exporting a portable descriptor.
     #[arg(long)]
     pub diagnose: bool,
-    /// Write payload ABI artifacts for the inferred projection instead of exporting a portable descriptor.
-    #[arg(long)]
-    pub artifacts: bool,
-    /// Write descriptor, diagnostics, or payload ABI artifact JSON to this file instead of stdout.
+    /// Write descriptor or diagnostics JSON to this file instead of stdout.
     #[arg(long)]
     pub out: Option<String>,
-    /// Pretty-print descriptor, diagnostics, or payload ABI artifact JSON.
+    /// Pretty-print descriptor or diagnostics JSON.
     #[arg(long)]
     pub pretty: bool,
 }
 
 pub fn run(args: ContractArgs) -> Result<()> {
     match args.command {
-        ContractCommand::Artifacts(args) => artifacts(args),
         ContractCommand::Codegen(args) => codegen(args),
         ContractCommand::Diagnose(args) => diagnose(args),
         ContractCommand::Export(args) => export(args),
@@ -175,25 +144,6 @@ pub fn run(args: ContractArgs) -> Result<()> {
         ContractCommand::ReleaseRef(args) => release_ref(args),
         ContractCommand::Validate(args) => validate(&args.path),
     }
-}
-
-fn artifacts(args: PythonArtifactsArgs) -> Result<()> {
-    let mut py_args = vec![
-        "-m".to_string(),
-        "c_two.cli.contract".to_string(),
-        "artifacts".to_string(),
-        args.target,
-    ];
-    for method in args.methods {
-        py_args.push("--method".to_string());
-        py_args.push(method);
-    }
-    if args.pretty {
-        py_args.push("--pretty".to_string());
-    }
-    let payload = run_python_contract(args.python.as_deref(), &py_args)?;
-    validate_artifact_payload(&payload)?;
-    write_payload(&payload, args.out.as_deref())
 }
 
 fn diagnose(args: PythonDiagnoseArgs) -> Result<()> {
@@ -217,19 +167,16 @@ fn diagnose(args: PythonDiagnoseArgs) -> Result<()> {
 
 fn validate(path: &str) -> Result<()> {
     let payload = read_payload(path)?;
-    c2_contract::validate_portable_contract_descriptor_json(payload.as_bytes())
-        .map_err(|err| anyhow!("{err}"))?;
-    let digest = c2_contract::contract_descriptor_sha256_hex(payload.as_bytes())
-        .map_err(|err| anyhow!("{err}"))?;
+    let release = admit_contract_once(payload.as_bytes())?;
+    let digest = release.descriptor_sha256();
     let label = if path == "-" { "stdin" } else { path };
-    println!("{label}: valid c-two.contract.v1 sha256={digest}");
+    println!("{label}: valid c-two.contract.v2 sha256={digest}");
     Ok(())
 }
 
 fn release_ref(args: ReleaseRefArgs) -> Result<()> {
     let payload = read_payload(&args.path)?;
-    let release = c2_contract::ContractRelease::from_descriptor_json(payload.as_bytes())
-        .map_err(|error| anyhow!("{error}"))?;
+    let release = admit_contract_once(payload.as_bytes())?;
     let compact = release
         .reference()
         .to_canonical_json()
@@ -247,69 +194,38 @@ fn release_ref(args: ReleaseRefArgs) -> Result<()> {
 }
 
 fn codegen(args: CodegenArgs) -> Result<()> {
-    match args.command {
-        CodegenCommand::Typescript(args) => codegen_typescript(args),
-    }
-}
-
-fn codegen_typescript(args: TypeScriptCodegenArgs) -> Result<()> {
-    if args.fastdb_out.is_some() && args.fastdb_schemas.is_empty() {
-        return Err(anyhow!(
-            "--fastdb-out requires at least one --fastdb-schema"
-        ));
-    }
-    if !args.fastdb_schemas.is_empty() && args.fastdb_out.is_none() {
-        return Err(anyhow!("--fastdb-schema requires --fastdb-out"));
-    }
-    if !args.fastdb_schemas.is_empty() && args.path == "-" {
-        return Err(anyhow!(
-            "--fastdb-schema requires a descriptor file path, not stdin"
-        ));
-    }
+    let (target, args) = match args.command {
+        CodegenCommand::Rust(args) => (c2_codegen::ContractCodegenTarget::Rust, args),
+        CodegenCommand::Python(args) => (c2_codegen::ContractCodegenTarget::Python, args),
+        CodegenCommand::Typescript(args) => (c2_codegen::ContractCodegenTarget::TypeScript, args),
+    };
     let payload = read_payload(&args.path)?;
-    let generated = c2_codegen::generate_typescript_client(
-        payload.as_bytes(),
-        c2_codegen::TypeScriptOptions {
-            strict_codecs: args.strict_codecs,
-        },
+    let release = admit_contract_once(payload.as_bytes())?;
+    let artifacts = c2_codegen::compile_contract_artifacts(
+        &release,
+        target,
+        &c2_codegen::ContractCodegenOptions::default(),
     )
-    .map_err(|err| anyhow!("{err}"))?;
-    write_payload(&generated, args.out.as_deref())?;
-    if let Some(fastdb_out) = args.fastdb_out.as_deref() {
-        run_python_fastdb_typescript(
-            args.python.as_deref(),
-            &args.path,
-            fastdb_out,
-            &args.fastdb_schemas,
-        )?;
-    }
-    Ok(())
+    .map_err(|error| anyhow!("{error}"))?;
+    artifacts
+        .publish_new_tree(&args.out_dir)
+        .map_err(|error| anyhow!("{error}"))
 }
 
-fn run_python_fastdb_typescript(
-    python: Option<&str>,
-    contract_path: &str,
-    output_path: &str,
-    schema_paths: &[String],
-) -> Result<()> {
-    let mut py_args = vec![
-        "-m".to_string(),
-        "c_two.fastdb.typescript".to_string(),
-        contract_path.to_string(),
-        output_path.to_string(),
-    ];
-    for schema_path in schema_paths {
-        py_args.push("--schema".to_string());
-        py_args.push(schema_path.clone());
+fn admit_contract_once(payload: &[u8]) -> Result<c2_contract::ContractRelease> {
+    #[cfg(debug_assertions)]
+    let before = c2_contract::descriptor_admission_count_for_current_thread();
+    let release = c2_contract::ContractRelease::from_descriptor_json(payload);
+    #[cfg(debug_assertions)]
+    {
+        let after = c2_contract::descriptor_admission_count_for_current_thread();
+        debug_assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "a CLI descriptor operation must enter ContractRelease admission exactly once"
+        );
     }
-    let payload = run_python_contract(python, &py_args)?;
-    if !payload.trim().is_empty() {
-        return Err(anyhow!(
-            "C-Two FastDB TypeScript helper generation wrote unexpected stdout: {}",
-            payload.trim()
-        ));
-    }
-    Ok(())
+    release.map_err(|error| anyhow!("{error}"))
 }
 
 fn export(args: PythonExportArgs) -> Result<()> {
@@ -332,11 +248,6 @@ fn export(args: PythonExportArgs) -> Result<()> {
 }
 
 fn infer(args: PythonInferArgs) -> Result<()> {
-    if args.diagnose && args.artifacts {
-        return Err(anyhow!(
-            "--diagnose and --artifacts cannot be used together"
-        ));
-    }
     let mut py_args = vec![
         "-m".to_string(),
         "c_two.cli.contract".to_string(),
@@ -358,16 +269,11 @@ fn infer(args: PythonInferArgs) -> Result<()> {
     if args.diagnose {
         py_args.push("--diagnose".to_string());
     }
-    if args.artifacts {
-        py_args.push("--artifacts".to_string());
-    }
     if args.pretty {
         py_args.push("--pretty".to_string());
     }
     let payload = run_python_contract(args.python.as_deref(), &py_args)?;
-    if args.artifacts {
-        validate_artifact_payload(&payload)?;
-    } else if args.diagnose {
+    if args.diagnose {
         validate_diagnostic_payload(&payload)?;
     } else {
         validate_descriptor_payload(&payload)?;
@@ -403,18 +309,6 @@ fn run_python_contract(python: Option<&str>, args: &[String]) -> Result<String> 
 fn validate_descriptor_payload(payload: &str) -> Result<()> {
     c2_contract::validate_portable_contract_descriptor_json(payload.as_bytes())
         .map_err(|err| anyhow!("{err}"))
-}
-
-fn validate_artifact_payload(payload: &str) -> Result<()> {
-    let parsed: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|err| anyhow!("payload ABI artifact output is not valid JSON: {err}"))?;
-    match parsed {
-        serde_json::Value::Array(items) if items.iter().all(|item| item.is_object()) => Ok(()),
-        serde_json::Value::Array(_) => Err(anyhow!(
-            "payload ABI artifact output must be a JSON array of objects"
-        )),
-        _ => Err(anyhow!("payload ABI artifact output must be a JSON array")),
-    }
 }
 
 fn validate_diagnostic_payload(payload: &str) -> Result<()> {

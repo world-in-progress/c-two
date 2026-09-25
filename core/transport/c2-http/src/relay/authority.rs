@@ -41,37 +41,51 @@ pub(crate) struct AttestedRouteContract {
     pub max_payload_size: u64,
 }
 
+pub(crate) struct ClaimedRouteContract<'a> {
+    pub expected: &'a ExpectedRouteContract,
+    pub max_payload_size: u64,
+}
+
+pub(crate) struct LocalRouteOwner {
+    pub name: String,
+    pub server_id: String,
+    pub server_instance_id: String,
+    pub address: String,
+}
+
+pub(crate) struct LocalRegistration {
+    pub owner: LocalRouteOwner,
+    pub contract: AttestedRouteContract,
+    pub replacement: Option<OwnerReplacement>,
+}
+
 fn existing_contract_mismatch_reason(
-    route_name: &str,
     existing: &RouteEntry,
-    crm_ns: &str,
-    crm_name: &str,
-    crm_ver: &str,
-    abi_hash: &str,
-    signature_hash: &str,
-    max_payload_size: u64,
+    claimed: &ClaimedRouteContract<'_>,
 ) -> Option<String> {
-    if existing.crm_ns != crm_ns
-        || existing.crm_name != crm_name
-        || existing.crm_ver != crm_ver
-        || existing.abi_hash != abi_hash
-        || existing.signature_hash != signature_hash
-        || existing.max_payload_size != max_payload_size
+    let expected = claimed.expected;
+    if existing.crm_ns != expected.crm_ns
+        || existing.crm_name != expected.crm_name
+        || existing.crm_ver != expected.crm_ver
+        || existing.abi_hash != expected.abi_hash
+        || existing.signature_hash != expected.signature_hash
+        || existing.max_payload_size != claimed.max_payload_size
     {
         return Some(format!(
-            "CRM contract mismatch for route '{route_name}': existing {}/{}/{} hashes={}/{} max_payload_size={}, got {}/{}/{} hashes={}/{} max_payload_size={}",
+            "CRM contract mismatch for route '{}': existing {}/{}/{} hashes={}/{} max_payload_size={}, got {}/{}/{} hashes={}/{} max_payload_size={}",
+            expected.route_name,
             existing.crm_ns,
             existing.crm_name,
             existing.crm_ver,
             existing.abi_hash,
             existing.signature_hash,
             existing.max_payload_size,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
-            max_payload_size
+            expected.crm_ns,
+            expected.crm_name,
+            expected.crm_ver,
+            expected.abi_hash,
+            expected.signature_hash,
+            claimed.max_payload_size
         ));
     }
     None
@@ -129,23 +143,10 @@ pub(crate) async fn read_ipc_route_contract(
 
 pub(crate) async fn attest_ipc_route_contract(
     client: &IpcClient,
-    route_name: &str,
-    claimed_crm_ns: &str,
-    claimed_crm_name: &str,
-    claimed_crm_ver: &str,
-    claimed_abi_hash: &str,
-    claimed_signature_hash: &str,
-    claimed_max_payload_size: u64,
+    claimed: ClaimedRouteContract<'_>,
 ) -> Result<AttestedRouteContract, ControlError> {
-    let claimed = ExpectedRouteContract {
-        route_name: route_name.to_string(),
-        crm_ns: claimed_crm_ns.to_string(),
-        crm_name: claimed_crm_name.to_string(),
-        crm_ver: claimed_crm_ver.to_string(),
-        abi_hash: claimed_abi_hash.to_string(),
-        signature_hash: claimed_signature_hash.to_string(),
-    };
-    if c2_contract::validate_expected_route_contract(&claimed).is_err() {
+    let route_name = claimed.expected.route_name.as_str();
+    if c2_contract::validate_expected_route_contract(claimed.expected).is_err() {
         return Err(ControlError::ContractMismatch {
             reason: format!(
                 "IPC upstream route '{route_name}' registration did not claim a complete CRM contract"
@@ -153,40 +154,36 @@ pub(crate) async fn attest_ipc_route_contract(
         });
     }
     let binding = client
-        .attest_route_for_registration(&claimed)
+        .attest_route_for_registration(claimed.expected)
         .await
         .map_err(|err| control_error_from_ipc_attestation_error(route_name, err))?;
     let max_payload_size = binding.max_payload_size();
-    if claimed_max_payload_size != max_payload_size {
+    if claimed.max_payload_size != max_payload_size {
         return Err(ControlError::ContractMismatch {
             reason: format!(
-                "IPC upstream route '{route_name}' max_payload_size mismatch: claimed {claimed_max_payload_size}, got {max_payload_size}"
+                "IPC upstream route '{route_name}' max_payload_size mismatch: claimed {}, got {max_payload_size}",
+                claimed.max_payload_size
             ),
         });
     }
     Ok(AttestedRouteContract {
         route_uid: binding.route_uid().to_string(),
         route_revision: binding.route_revision(),
-        crm_ns: claimed.crm_ns,
-        crm_name: claimed.crm_name,
-        crm_ver: claimed.crm_ver,
-        abi_hash: claimed.abi_hash,
-        signature_hash: claimed.signature_hash,
+        crm_ns: claimed.expected.crm_ns.clone(),
+        crm_name: claimed.expected.crm_name.clone(),
+        crm_ver: claimed.expected.crm_ver.clone(),
+        abi_hash: claimed.expected.abi_hash.clone(),
+        signature_hash: claimed.expected.signature_hash.clone(),
         max_payload_size,
     })
 }
 
 pub(crate) async fn attest_ipc_pending_route_contract(
     client: &mut IpcClient,
-    route_name: &str,
     registration_token: &str,
-    claimed_crm_ns: &str,
-    claimed_crm_name: &str,
-    claimed_crm_ver: &str,
-    claimed_abi_hash: &str,
-    claimed_signature_hash: &str,
-    claimed_max_payload_size: u64,
+    claimed: ClaimedRouteContract<'_>,
 ) -> Result<AttestedRouteContract, ControlError> {
+    let route_name = claimed.expected.route_name.as_str();
     let (contract, binding) = match client
         .acquire_pending_route_attestation(route_name, registration_token)
         .await
@@ -197,31 +194,23 @@ pub(crate) async fn attest_ipc_pending_route_contract(
             return Err(control_error_from_ipc_attestation_error(route_name, err));
         }
     };
-    let claimed = ExpectedRouteContract {
-        route_name: route_name.to_string(),
-        crm_ns: claimed_crm_ns.to_string(),
-        crm_name: claimed_crm_name.to_string(),
-        crm_ver: claimed_crm_ver.to_string(),
-        abi_hash: claimed_abi_hash.to_string(),
-        signature_hash: claimed_signature_hash.to_string(),
-    };
     let max_payload_size = binding.max_payload_size();
-    if c2_contract::validate_expected_route_contract(&claimed).is_err() {
+    if c2_contract::validate_expected_route_contract(claimed.expected).is_err() {
         return Err(ControlError::ContractMismatch {
             reason: format!(
                 "IPC upstream route '{route_name}' registration did not claim a complete CRM contract"
             ),
         });
     }
-    if claimed != contract {
+    if claimed.expected != &contract {
         return Err(ControlError::ContractMismatch {
             reason: format!(
                 "IPC upstream pending route '{route_name}' CRM contract mismatch: claimed {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
-                claimed.crm_ns,
-                claimed.crm_name,
-                claimed.crm_ver,
-                claimed.abi_hash,
-                claimed.signature_hash,
+                claimed.expected.crm_ns,
+                claimed.expected.crm_name,
+                claimed.expected.crm_ver,
+                claimed.expected.abi_hash,
+                claimed.expected.signature_hash,
                 contract.crm_ns,
                 contract.crm_name,
                 contract.crm_ver,
@@ -230,10 +219,11 @@ pub(crate) async fn attest_ipc_pending_route_contract(
             ),
         });
     }
-    if claimed_max_payload_size != max_payload_size {
+    if claimed.max_payload_size != max_payload_size {
         return Err(ControlError::ContractMismatch {
             reason: format!(
-                "IPC upstream pending route '{route_name}' max_payload_size mismatch: claimed {claimed_max_payload_size}, got {max_payload_size}"
+                "IPC upstream pending route '{route_name}' max_payload_size mismatch: claimed {}, got {max_payload_size}",
+                claimed.max_payload_size
             ),
         });
     }
@@ -252,14 +242,14 @@ pub(crate) async fn attest_ipc_pending_route_contract(
 #[derive(Clone)]
 pub(crate) enum RegisterPreflight {
     Available {
-        replacement: Option<OwnerReplacementCandidate>,
+        replacement: Option<Box<OwnerReplacementCandidate>>,
     },
     SameOwner,
 }
 
 pub(crate) enum RegisterPreparation {
     Available {
-        replacement: Option<OwnerReplacementCandidate>,
+        replacement: Option<Box<OwnerReplacementCandidate>>,
     },
     SameOwner,
     DuplicateAlive {
@@ -327,28 +317,14 @@ impl OwnerReplacementCandidate {
 }
 
 pub(crate) enum RouteCommand {
-    RegisterLocal {
-        name: String,
-        server_id: String,
-        server_instance_id: String,
-        address: String,
-        crm_ns: String,
-        crm_name: String,
-        crm_ver: String,
-        abi_hash: String,
-        signature_hash: String,
-        max_payload_size: u64,
-        route_uid: String,
-        route_revision: u64,
-        replacement: Option<OwnerReplacement>,
-    },
+    RegisterLocal(Box<LocalRegistration>),
     UnregisterLocal {
         name: String,
         server_id: String,
     },
     AnnouncePeer {
         sender_relay_id: String,
-        entry: RouteEntry,
+        entry: Box<RouteEntry>,
     },
     WithdrawPeer {
         sender_relay_id: String,
@@ -424,7 +400,7 @@ impl<'a> RouteAuthority<'a> {
     }
 
     pub(crate) fn validate_ipc_address(&self, address: &str) -> Result<(), ControlError> {
-        c2_ipc::socket_path_from_ipc_address(address)
+        c2_ipc::local_endpoint_from_ipc_address(address)
             .map(|_| ())
             .map_err(|err| ControlError::InvalidAddress {
                 reason: err.to_string(),
@@ -477,7 +453,7 @@ impl<'a> RouteAuthority<'a> {
 
         let replacement = self.different_owner_replacement(&existing)?;
         Ok(RegisterPreflight::Available {
-            replacement: Some(replacement),
+            replacement: Some(Box::new(replacement)),
         })
     }
 
@@ -486,7 +462,7 @@ impl<'a> RouteAuthority<'a> {
         name: &str,
         server_id: &str,
         address: &str,
-    ) -> Result<Option<OwnerReplacementCandidate>, ControlError> {
+    ) -> Result<Option<Box<OwnerReplacementCandidate>>, ControlError> {
         let mut last_stale_owner = None;
         for _ in 0..3 {
             self.validate_route_name(name)?;
@@ -521,7 +497,9 @@ impl<'a> RouteAuthority<'a> {
                         existing_address: replacement.existing_address,
                     });
                 }
-                OwnerProbe::RouteMissing | OwnerProbe::Dead => return Ok(Some(replacement)),
+                OwnerProbe::RouteMissing | OwnerProbe::Dead => {
+                    return Ok(Some(Box::new(replacement)));
+                }
                 OwnerProbe::Stale => {
                     last_stale_owner = Some(replacement.existing_address);
                 }
@@ -573,7 +551,7 @@ impl<'a> RouteAuthority<'a> {
 
     pub(crate) async fn confirm_replacement_for_commit(
         &self,
-        replacement: Option<OwnerReplacementCandidate>,
+        replacement: Option<Box<OwnerReplacementCandidate>>,
     ) -> Result<Option<OwnerReplacement>, ControlError> {
         let Some(replacement) = replacement else {
             return Ok(None);
@@ -584,10 +562,10 @@ impl<'a> RouteAuthority<'a> {
                 existing_address: replacement.existing_address,
             }),
             OwnerProbe::RouteMissing => Ok(Some(
-                replacement.with_evidence(OwnerReplacementEvidence::ConfirmedRouteMissing),
+                (*replacement).with_evidence(OwnerReplacementEvidence::ConfirmedRouteMissing),
             )),
             OwnerProbe::Dead => Ok(Some(
-                replacement.with_evidence(OwnerReplacementEvidence::ConfirmedDead),
+                (*replacement).with_evidence(OwnerReplacementEvidence::ConfirmedDead),
             )),
             OwnerProbe::Stale => Err(ControlError::DuplicateRoute {
                 existing_address: replacement.existing_address,
@@ -600,42 +578,14 @@ impl<'a> RouteAuthority<'a> {
         command: RouteCommand,
     ) -> Result<RouteCommandResult, ControlError> {
         match command {
-            RouteCommand::RegisterLocal {
-                name,
-                server_id,
-                server_instance_id,
-                address,
-                crm_ns,
-                crm_name,
-                crm_ver,
-                abi_hash,
-                signature_hash,
-                max_payload_size,
-                route_uid,
-                route_revision,
-                replacement,
-            } => self.register_local(
-                name,
-                server_id,
-                server_instance_id,
-                address,
-                crm_ns,
-                crm_name,
-                crm_ver,
-                abi_hash,
-                signature_hash,
-                max_payload_size,
-                route_uid,
-                route_revision,
-                replacement,
-            ),
+            RouteCommand::RegisterLocal(registration) => self.register_local(*registration),
             RouteCommand::UnregisterLocal { name, server_id } => {
                 self.unregister_local(name, server_id)
             }
             RouteCommand::AnnouncePeer {
                 sender_relay_id,
                 entry,
-            } => self.announce_peer(sender_relay_id, entry),
+            } => self.announce_peer(sender_relay_id, *entry),
             RouteCommand::WithdrawPeer {
                 sender_relay_id,
                 name,
@@ -658,20 +608,29 @@ impl<'a> RouteAuthority<'a> {
 
     fn register_local(
         &self,
-        name: String,
-        server_id: String,
-        server_instance_id: String,
-        address: String,
-        crm_ns: String,
-        crm_name: String,
-        crm_ver: String,
-        abi_hash: String,
-        signature_hash: String,
-        max_payload_size: u64,
-        route_uid: String,
-        route_revision: u64,
-        replacement: Option<OwnerReplacement>,
+        registration: LocalRegistration,
     ) -> Result<RouteCommandResult, ControlError> {
+        let LocalRegistration {
+            owner:
+                LocalRouteOwner {
+                    name,
+                    server_id,
+                    server_instance_id,
+                    address,
+                },
+            contract:
+                AttestedRouteContract {
+                    route_uid,
+                    route_revision,
+                    crm_ns,
+                    crm_name,
+                    crm_ver,
+                    abi_hash,
+                    signature_hash,
+                    max_payload_size,
+                },
+            replacement,
+        } = registration;
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
         self.validate_server_instance_id(&server_instance_id)?;
@@ -716,15 +675,20 @@ impl<'a> RouteAuthority<'a> {
             if existing_server_id == server_id {
                 if existing_address == address {
                     if existing_server_instance_id == server_instance_id {
+                        let expected = ExpectedRouteContract {
+                            route_name: name.clone(),
+                            crm_ns: crm_ns.clone(),
+                            crm_name: crm_name.clone(),
+                            crm_ver: crm_ver.clone(),
+                            abi_hash: abi_hash.clone(),
+                            signature_hash: signature_hash.clone(),
+                        };
                         if let Some(reason) = existing_contract_mismatch_reason(
-                            &name,
                             &existing,
-                            &crm_ns,
-                            &crm_name,
-                            &crm_ver,
-                            &abi_hash,
-                            &signature_hash,
-                            max_payload_size,
+                            &ClaimedRouteContract {
+                                expected: &expected,
+                                max_payload_size,
+                            },
                         ) {
                             return Err(ControlError::ContractMismatch { reason });
                         }
@@ -823,15 +787,13 @@ impl<'a> RouteAuthority<'a> {
         self.state.insert_owner_slot(&entry);
         route_table.register_prevalidated_route(entry.clone());
         drop(route_table);
-        if let Some(old_endpoint) = old_endpoint_for_cleanup {
-            if old_endpoint != new_endpoint {
-                if let Some(client) = self
-                    .state
-                    .remove_connection_if_endpoint_unused(&old_endpoint)
-                {
-                    close_replaced_owner_client(client);
-                }
-            }
+        if let Some(old_endpoint) = old_endpoint_for_cleanup
+            && old_endpoint != new_endpoint
+            && let Some(client) = self
+                .state
+                .remove_connection_if_endpoint_unused(&old_endpoint)
+        {
+            close_replaced_owner_client(client);
         }
         Ok(RouteCommandResult::Registered { entry })
     }
@@ -1182,7 +1144,7 @@ mod tests {
 
         let result = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
             sender_relay_id: "bad/relay".into(),
-            entry: peer_route("grid", "bad/relay"),
+            entry: Box::new(peer_route("grid", "bad/relay")),
         });
 
         match result {

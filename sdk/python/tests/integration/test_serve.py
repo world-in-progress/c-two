@@ -1,18 +1,19 @@
 """Integration tests for ``cc.serve()`` — subprocess lifecycle.
 
 Tests start a real CRM resource process that calls ``cc.serve()``,
-then send SIGINT and verify graceful shutdown.
+then send a console interrupt and verify graceful shutdown.
 """
 from __future__ import annotations
 
 import os
-import signal as _signal
 import subprocess
 import sys
 import textwrap
 import time
 
 import pytest
+
+from tests.fixtures.process_control import interrupt_python_process, python_process_options
 
 
 _SERVE_SCRIPT = textwrap.dedent("""\
@@ -62,10 +63,10 @@ def _wait_for_output(proc: subprocess.Popen, pattern: str, timeout: float = 10.0
 
 
 class TestServeSubprocess:
-    """Start a serve() subprocess, verify it blocks, send SIGINT."""
+    """Start a serve() subprocess, verify it blocks, send a console interrupt."""
 
     def test_serve_blocks_and_sigint_shuts_down(self, tmp_path):
-        """Process blocks on cc.serve(), SIGINT triggers graceful exit."""
+        """Process blocks on cc.serve(), A console interrupt triggers graceful exit."""
         marker = tmp_path / 'shutdown_marker.txt'
 
         env = os.environ.copy()
@@ -80,6 +81,7 @@ class TestServeSubprocess:
             text=True,
             env=env,
             cwd=str(tmp_path),  # Avoid picking up .env from repo root.
+            **python_process_options(),
         )
 
         # Wait for the banner to appear (proves serve() is blocking).
@@ -94,14 +96,14 @@ class TestServeSubprocess:
         assert proc.poll() is None
 
         # Send SIGINT to trigger graceful shutdown.
-        proc.send_signal(_signal.SIGINT)
+        interrupt_python_process(proc)
 
         try:
             proc.wait(timeout=10.0)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-            pytest.fail('Process did not exit after SIGINT')
+            pytest.fail('Process did not exit after a console interrupt')
 
         assert proc.returncode == 0
 
@@ -127,6 +129,7 @@ class TestServeSubprocess:
             text=True,
             env=env,
             cwd=str(os.path.dirname(__file__)),  # Avoid .env from repo root.
+            **python_process_options(),
         )
 
         # Wait for the "no CRM" banner.
@@ -140,7 +143,7 @@ class TestServeSubprocess:
         assert proc.poll() is None
 
         # Stop it.
-        proc.send_signal(_signal.SIGINT)
+        interrupt_python_process(proc)
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:

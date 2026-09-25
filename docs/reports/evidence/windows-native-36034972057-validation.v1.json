@@ -1,0 +1,793 @@
+{
+  "schema": "c-two.windows-final-validation.v1",
+  "validation_date": "2026-09-25",
+  "workflow_run": {
+    "id": 36034972057,
+    "url": "https://github.com/Dsssyc/c-two/actions/runs/36034972057",
+    "attempt": 1
+  },
+  "sources": {
+    "c-two": "5cf96eafc4674f7961beb15b7a976cfee7f238d0",
+    "fastdb": "6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4"
+  },
+  "status": "passed",
+  "verification": "Downloaded ZIP bytes matched GitHub API digests and sizes. Recorded member hashes and sizes, native gate outcomes, strict portable and TypeScript receipts, isolated installed-wheel provenance, owner lifetimes and cleanup were checked. Raw runneradmin 8.3 origins rely on the successful Windows Path.resolve containment check; no NTFS resolution on the macOS verifier is claimed.",
+  "artifacts": [
+    {
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20260920.314.1"
+      },
+      "scope": "full",
+      "artifact_id": 10825710829,
+      "artifact_name": "windows-native-windows-2022-full-5cf96eafc4674f7961beb15b7a976cfee7f238d0",
+      "artifact_url": "https://github.com/Dsssyc/c-two/actions/runs/36034972057/artifacts/10825710829",
+      "zip_sha256": "b61f3c71eb2d9a6c75ebf38c4b953cb5d3ebf73909f2ed3c307110de4c973b30",
+      "zip_bytes": 11561573,
+      "expires_at": "2026-10-08T18:08:06Z",
+      "run_evidence_sha256": "d5e3fbc51bc4555d8a99cbd78f53c1c78dfef12e56fee82857e71f356bd145bd",
+      "gates": [
+        {
+          "id": "python310-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-package",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-rust-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-check",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-artifact",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "rust-sdk-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-native-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-wheel-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-standard-user-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-harness-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "portable-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "typescript-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "c2-mem-node-package.log",
+          "bytes": 300,
+          "sha256": "d5134fe58b76e2a1596a51db4ee0c197c27bc797221f183082c4c20aa3b35800"
+        },
+        {
+          "path": "c2-mem-node-tests.log",
+          "bytes": 7348,
+          "sha256": "a0029301689bc85d40292736276b7ede61641b614962c8d379e8719c69c5520f"
+        },
+        {
+          "path": "c2-mem-npm-install.log",
+          "bytes": 3804,
+          "sha256": "7ca89a351269513132a6ae3abc98ea9533977d49ade8378008d1e45a3d9ec528"
+        },
+        {
+          "path": "cli/c3.exe",
+          "bytes": 20648960,
+          "sha256": "bb202d8a4d76b099918766824ad4629f8847eece83d6fb5ca228952838ace2cf"
+        },
+        {
+          "path": "cli-artifact.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "cli-build.log",
+          "bytes": 8705,
+          "sha256": "863c6c92d1b80ff08e922a8fa8d718d1219a4c6af9194debbe81bd91e0561c60"
+        },
+        {
+          "path": "cli-test.log",
+          "bytes": 4531,
+          "sha256": "758d1943dacb0a32f8803c87ed6cb9794d357d08925ee35acfedf6034defb91b"
+        },
+        {
+          "path": "core-check.log",
+          "bytes": 9996,
+          "sha256": "9a22e66a368bc2332b84815897af2fcab6699a2d82fce64cad56d020db428dbb"
+        },
+        {
+          "path": "core-test.log",
+          "bytes": 85565,
+          "sha256": "9d380f953efe89a3110aa3d15a95b2ee37448162203acf8b0f4bce64e62072ec"
+        },
+        {
+          "path": "emsdk-setup.log",
+          "bytes": 907,
+          "sha256": "b78cb247c26a4d47e288c1aadf2a01ecf78c13afca2e0e540c236c89b60c30d4"
+        },
+        {
+          "path": "fastdb-npm-install.log",
+          "bytes": 72,
+          "sha256": "9fd942002735aa2e9e2ff946129aee1c7c55a50f5ea6e27460b7efd46864d1ba"
+        },
+        {
+          "path": "fastdb-rust-test.log",
+          "bytes": 3865,
+          "sha256": "4be4bc429f953544903d93d30101cfafc7c80951795924939000657b45558c82"
+        },
+        {
+          "path": "fastdb-wheel-build.log",
+          "bytes": 16588,
+          "sha256": "2cc6e8f30b3cd820134cc6abec744af37c890cd40833bc26c0cbed02c6a75f5c"
+        },
+        {
+          "path": "installed-wheel-full-receipt.v1.json",
+          "bytes": 8350,
+          "sha256": "0c4f8fb19db046005c1b07921b985f58041519ddec566f3095d7f4ac831cb577"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json",
+          "bytes": 8937,
+          "sha256": "9ae5f044845d3810d15f802f43a2e0eb45d4e8836b4ce07e5c2209a9bcd88c1d"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stderr.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stdout.log",
+          "bytes": 119,
+          "sha256": "665ff7c45f754d61c5f781869a1618d6d090c596e453bab6d5b7b3ec3b4e5ece"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.wrapper.json",
+          "bytes": 447,
+          "sha256": "b643890524142540d3679e3175a372d12f39cdf4878940fe2b06f32acd18c896"
+        },
+        {
+          "path": "portable-matrix-full-receipt.v1.json",
+          "bytes": 19286,
+          "sha256": "26e6fbccd706dc08c56261a7dadad3d3bcee3336f282a20372ffaf2b36c5fe94"
+        },
+        {
+          "path": "portable-tests.log",
+          "bytes": 112,
+          "sha256": "5af74e9ea5cc3feba41873956432b854c67049ecda585d50de244af17d070da9"
+        },
+        {
+          "path": "portable-tests.xml",
+          "bytes": 4381,
+          "sha256": "034c6636c2912c89c898ab2858f8ef8007fcdc8ebaf1d0cad3d261d1f109dbd9"
+        },
+        {
+          "path": "python-build.log",
+          "bytes": 1230,
+          "sha256": "9eae5d115f7b46322c00b64a0bcca759db261694dd7bd5ad93bfc9fe9700ef38"
+        },
+        {
+          "path": "python-native-test.log",
+          "bytes": 6185,
+          "sha256": "3b7b2aac55e6b3f0855a643c2959f85edb42a756c3da6c18d07a3c6cc8a722cc"
+        },
+        {
+          "path": "python-tests.log",
+          "bytes": 1005,
+          "sha256": "e36226ce81efe45eaa5305ef8fc6c4aef71c39645682b6363fb1462e3636c461"
+        },
+        {
+          "path": "python-tests.xml",
+          "bytes": 112510,
+          "sha256": "cd217bdb52d506be714f6b186a03fb18c20f747531b079046b5477f0f387d8b8"
+        },
+        {
+          "path": "python-wheel-build.log",
+          "bytes": 8252,
+          "sha256": "33f788b190d5aa4b904e32d74a1d22d27e6d2a933acbd083d7299d8450283020"
+        },
+        {
+          "path": "python310-install.log",
+          "bytes": 410,
+          "sha256": "03295e9d3344be846528d6471c48609e478cbd86151b690eb3f361d9dc5c0c11"
+        },
+        {
+          "path": "rust-sdk-test.log",
+          "bytes": 8360,
+          "sha256": "78d0b0e946293b2e29c2e7395904acee7e61addff3d75e132bc3a662edc3a242"
+        },
+        {
+          "path": "typescript-real-call-full-receipt.v1.json",
+          "bytes": 12065,
+          "sha256": "07b9378ec27f687fdbff3fb2c0a743f646ec343cee890b12ae9de76357e189cc"
+        },
+        {
+          "path": "typescript-tests.log",
+          "bytes": 113,
+          "sha256": "c8d0de29b2e75c3e1f4359b5804922c4773ec5c4328e38a449d3dcb21c368142"
+        },
+        {
+          "path": "typescript-tests.xml",
+          "bytes": 2354,
+          "sha256": "76cf2e94eb9f5569f31653db14fc91b11d85d62117308ab33161747b68d0dc90"
+        },
+        {
+          "path": "wheels/c-two/c_two-0.5.1-cp312-cp312-win_amd64.whl",
+          "bytes": 3643373,
+          "sha256": "d9641f3dfa99d68baee7d0df84065fe92960ce3e2d82b98617ede3c5e20bd128"
+        },
+        {
+          "path": "wheels/fastdb/fastdb4py-0.2.0-cp312-cp312-win_amd64.whl",
+          "bytes": 802541,
+          "sha256": "b06fddaf617c60f75daf064e62e86207fbcc5b386441494dfff9303b19ef4c61"
+        },
+        {
+          "path": "windows-harness-tests.log",
+          "bytes": 100,
+          "sha256": "0ab34e2f34243ba0acacabbd21135bf9784751a719e30a71d0c0d6f3126852e1"
+        },
+        {
+          "path": "windows-harness-tests.xml",
+          "bytes": 805,
+          "sha256": "8d537fbe19f742c3dde80c54a3b9b6336e5554b129e06171a89cececc31898f0"
+        },
+        {
+          "path": "windows-standard-user-consumer.log",
+          "bytes": 38,
+          "sha256": "d70a27901e6d6876145caefb6eb5799e6e36972393b878a108be6a6212182aba"
+        },
+        {
+          "path": "windows-wheel-consumer.log",
+          "bytes": 123,
+          "sha256": "a80b6dc1d8feeac3c7445b86107b79529af8b604e2b79cff27e97e3df5b80b35"
+        }
+      ],
+      "verified_counts": {
+        "core_tests": 954,
+        "python_tests": 829,
+        "portable_tests": 25,
+        "rust_python_matrix_rows": 18,
+        "typescript_tests": 13,
+        "typescript_matrix_rows": 12,
+        "rust_sdk_tests": 10,
+        "fastdb_rust_tests": 22,
+        "cli_tests": 36,
+        "native_node_tests": 33,
+        "wheel_harness_tests": 4,
+        "wheel_consumers": 2,
+        "borrowed_inputs_invalidated_per_consumer": 4
+      }
+    },
+    {
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260907.229.1"
+      },
+      "scope": "full",
+      "artifact_id": 10825532067,
+      "artifact_name": "windows-native-windows-2025-full-5cf96eafc4674f7961beb15b7a976cfee7f238d0",
+      "artifact_url": "https://github.com/Dsssyc/c-two/actions/runs/36034972057/artifacts/10825532067",
+      "zip_sha256": "d05035067d79f1ac387a2b3eaab58822cbc703c9745d00b756fc2ecdc6bc46da",
+      "zip_bytes": 11550285,
+      "expires_at": "2026-10-08T18:08:14Z",
+      "run_evidence_sha256": "d58930cd7326e5848fdb03894eab03dedbdd7178ba5fee7d3221f94a45ecf36b",
+      "gates": [
+        {
+          "id": "python310-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-package",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-rust-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-check",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-artifact",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "rust-sdk-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-native-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-wheel-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-standard-user-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-harness-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "portable-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "typescript-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "c2-mem-node-package.log",
+          "bytes": 300,
+          "sha256": "d5134fe58b76e2a1596a51db4ee0c197c27bc797221f183082c4c20aa3b35800"
+        },
+        {
+          "path": "c2-mem-node-tests.log",
+          "bytes": 7343,
+          "sha256": "0dd26f23344cc8e9351f8ff3bc93193015689f2573507a44dc3765ba776a7758"
+        },
+        {
+          "path": "c2-mem-npm-install.log",
+          "bytes": 3798,
+          "sha256": "8e884b2fbf1cadcd8910e6954c7f98316484191e0c210d43c44aa9d5e78464e1"
+        },
+        {
+          "path": "cli/c3.exe",
+          "bytes": 20645376,
+          "sha256": "ad43ee89f3569833cf44e76eb76bb04aaf91a9fc9cd13acd9bdd0a5be9e05af2"
+        },
+        {
+          "path": "cli-artifact.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "cli-build.log",
+          "bytes": 8705,
+          "sha256": "8264c695ab97c15bc60b897a239d035240063fc98c000a0f0179a848d738952b"
+        },
+        {
+          "path": "cli-test.log",
+          "bytes": 4531,
+          "sha256": "9d8535387f6ddca0e7d0791d103b2cc34f9e27da44ba38096550bed8df20dae9"
+        },
+        {
+          "path": "core-check.log",
+          "bytes": 9996,
+          "sha256": "cb1e767b184a57da3e4f14f419d29551e10b6c16bf81212c9e422c69f3ed4b81"
+        },
+        {
+          "path": "core-test.log",
+          "bytes": 85564,
+          "sha256": "8fafd40ba5ef783985035e219f7cd5dbe727dc887df84db38446d242c8117728"
+        },
+        {
+          "path": "emsdk-setup.log",
+          "bytes": 907,
+          "sha256": "ad034d75a7f682677322836d5ecd621f93765ee9ca39952bc2269ffc270b6907"
+        },
+        {
+          "path": "fastdb-npm-install.log",
+          "bytes": 72,
+          "sha256": "a0cb316623623e7383e6b711e2969ec3da86a78e39eceb84025fe617e9edb9bf"
+        },
+        {
+          "path": "fastdb-rust-test.log",
+          "bytes": 3865,
+          "sha256": "568a3e7e3f4f2d8c00008618b37081eb11f25a71ea7f191ae1aa16fb18b480f8"
+        },
+        {
+          "path": "fastdb-wheel-build.log",
+          "bytes": 16506,
+          "sha256": "2ff1c4b9b3a3ce8cbe54a583862956a776869a5a98965cdc24a76b6a2c3b383a"
+        },
+        {
+          "path": "installed-wheel-full-receipt.v1.json",
+          "bytes": 8362,
+          "sha256": "64f32d9ade65dbd9ec7d142899d019941652b1acf56e726a77a8d21debfc30f6"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json",
+          "bytes": 8948,
+          "sha256": "32e50b6a2ccdf97d57f54e7600003ebb576a4c38823429a87354a9493c3af593"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stderr.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stdout.log",
+          "bytes": 119,
+          "sha256": "e6fede5c768ff2ed5a16c725bf8da7dbdf7fe000f878a670d02f032de221c42c"
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.wrapper.json",
+          "bytes": 446,
+          "sha256": "c6850723116c89f4ea1591d07bff700a7ce7cbe222161f3182133e432a3f438a"
+        },
+        {
+          "path": "portable-matrix-full-receipt.v1.json",
+          "bytes": 19286,
+          "sha256": "aabee5208846f2b19e8023d8e53c608356636b91279ae38106691f9cba00df36"
+        },
+        {
+          "path": "portable-tests.log",
+          "bytes": 112,
+          "sha256": "eb723c9af538449db65eeb31448fe48090c4403e26ad3874417cb6a9f0d817ee"
+        },
+        {
+          "path": "portable-tests.xml",
+          "bytes": 4381,
+          "sha256": "5cc133baf84bbe3458430a7bfcf578eeae05aa046560492dc1e712c1bdbd0784"
+        },
+        {
+          "path": "python-build.log",
+          "bytes": 1230,
+          "sha256": "081f942748c003454bb918ae4e84a0ef79eb22231ea1401127c3a999d903d0df"
+        },
+        {
+          "path": "python-native-test.log",
+          "bytes": 6185,
+          "sha256": "d7097e0f97af1e987eb015086004e83998314b3d2fa1928890dcdef39e11d0ac"
+        },
+        {
+          "path": "python-tests.log",
+          "bytes": 1005,
+          "sha256": "396e42b4b2fe1781290c6bd5d11c7a603d97fc77f3b8b500d5dc01639305eae7"
+        },
+        {
+          "path": "python-tests.xml",
+          "bytes": 112510,
+          "sha256": "8f0291cdbbc186f831704605ef343b796b145c72f9ddb5d1b26827558501aebc"
+        },
+        {
+          "path": "python-wheel-build.log",
+          "bytes": 8252,
+          "sha256": "3ae14154b197f46d074763a30411df9d001ccc913726b9b3c0becd77c1e3f457"
+        },
+        {
+          "path": "python310-install.log",
+          "bytes": 411,
+          "sha256": "e8583cd7f7db90fd3febdc44083290c5fcc840920e8773471ce9bfe44261112e"
+        },
+        {
+          "path": "rust-sdk-test.log",
+          "bytes": 8360,
+          "sha256": "60986ce6432c9caa10678db1a68ae0bf10cc74ea5cb0292aa7306da08778b78d"
+        },
+        {
+          "path": "typescript-real-call-full-receipt.v1.json",
+          "bytes": 12065,
+          "sha256": "5e5a57f42d356063250c9cec6608e20e135af4d87c8ccbd64e3288462fb67846"
+        },
+        {
+          "path": "typescript-tests.log",
+          "bytes": 113,
+          "sha256": "d59335a775415dc3fcd19f79f595d2902bc70c132a697beeca234f412ec39774"
+        },
+        {
+          "path": "typescript-tests.xml",
+          "bytes": 2354,
+          "sha256": "1e5c5a2fd956a9681f405d1895a64665de3ee99115b2f2da7f3e835a25363396"
+        },
+        {
+          "path": "wheels/c-two/c_two-0.5.1-cp312-cp312-win_amd64.whl",
+          "bytes": 3640599,
+          "sha256": "4892eb0bb4854a00c1cca858a80047dfb5c732da3c8940eb34b8568580a5e16f"
+        },
+        {
+          "path": "wheels/fastdb/fastdb4py-0.2.0-cp312-cp312-win_amd64.whl",
+          "bytes": 800788,
+          "sha256": "27d2fa628d5373ee98154ad52aac096ca76d5da0f30cc17fa6e5a713ba76af93"
+        },
+        {
+          "path": "windows-harness-tests.log",
+          "bytes": 100,
+          "sha256": "497319fdb349cdd3e1cfc6e6075d0959ebfad14eb38b95adf44e6f228030e6d6"
+        },
+        {
+          "path": "windows-harness-tests.xml",
+          "bytes": 805,
+          "sha256": "05eb07720ce9fe3ab293dc3773676d648e82ee109cd1688d145ad14dc82cd6bb"
+        },
+        {
+          "path": "windows-standard-user-consumer.log",
+          "bytes": 38,
+          "sha256": "d70a27901e6d6876145caefb6eb5799e6e36972393b878a108be6a6212182aba"
+        },
+        {
+          "path": "windows-wheel-consumer.log",
+          "bytes": 123,
+          "sha256": "a80b6dc1d8feeac3c7445b86107b79529af8b604e2b79cff27e97e3df5b80b35"
+        }
+      ],
+      "verified_counts": {
+        "core_tests": 954,
+        "python_tests": 829,
+        "portable_tests": 25,
+        "rust_python_matrix_rows": 18,
+        "typescript_tests": 13,
+        "typescript_matrix_rows": 12,
+        "rust_sdk_tests": 10,
+        "fastdb_rust_tests": 22,
+        "cli_tests": 36,
+        "native_node_tests": 33,
+        "wheel_harness_tests": 4,
+        "wheel_consumers": 2,
+        "borrowed_inputs_invalidated_per_consumer": 4
+      }
+    },
+    {
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20260913.307.1"
+      },
+      "scope": "local-platform",
+      "artifact_id": 10825130065,
+      "artifact_name": "windows-native-windows-2022-local-platform-5cf96eafc4674f7961beb15b7a976cfee7f238d0",
+      "artifact_url": "https://github.com/Dsssyc/c-two/actions/runs/36034972057/artifacts/10825130065",
+      "zip_sha256": "1284898d14397770eb846ee770f96f83c163387995619443b0c5491908076a19",
+      "zip_bytes": 10703,
+      "expires_at": "2026-10-08T17:33:46Z",
+      "run_evidence_sha256": "55c87d2460fb4d722ecbc507075b2394e11986dad10e4df9c9247f7ba6e55dff",
+      "gates": [
+        {
+          "id": "local-platform-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "local-platform-tests.log",
+          "bytes": 39515,
+          "sha256": "7e092aa1d5aaa44f73952906d17b24c8f1ec69eb3c0224cb3b8a46f1359083e0"
+        }
+      ],
+      "verified_counts": {
+        "local_platform_tests": 513
+      }
+    },
+    {
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260922.246.2"
+      },
+      "scope": "local-platform",
+      "artifact_id": 10824350873,
+      "artifact_name": "windows-native-windows-2025-local-platform-5cf96eafc4674f7961beb15b7a976cfee7f238d0",
+      "artifact_url": "https://github.com/Dsssyc/c-two/actions/runs/36034972057/artifacts/10824350873",
+      "zip_sha256": "827847dd26d79142f4a32b799c988703d48e4eaf10d23daf339454096126261a",
+      "zip_bytes": 10701,
+      "expires_at": "2026-10-08T17:33:53Z",
+      "run_evidence_sha256": "dd2b4fa89606ed8f16316cf22b8009dd23dbc776e8d441d626ff7dfb8b0abab5",
+      "gates": [
+        {
+          "id": "local-platform-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "local-platform-tests.log",
+          "bytes": 39515,
+          "sha256": "2be628db9ba049481140e1713c58499223da49620e8dd0666dd96339785a2dcd"
+        }
+      ],
+      "verified_counts": {
+        "local_platform_tests": 513
+      }
+    }
+  ]
+}

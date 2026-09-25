@@ -1,5 +1,7 @@
 # C-Two FastDB 0.1.18 Lifetime Integration Implementation Plan
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Move C-Two's FDB-first CRM payload lifetime model onto the released FastDB 0.1.18 owner, invalidation, and materialization APIs.

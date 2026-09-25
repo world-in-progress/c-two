@@ -1,5 +1,7 @@
 # FastDB-First Closure Review Packet
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 > **Status:** Superseded for integration-order purposes by the FastDB-first contract boundary redesign
 > **Date:** 2026-05-20
 > **Related plan:** `docs/plans/2026-05-18-fastdb-first-crm-abi-and-bridge.md`

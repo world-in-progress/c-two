@@ -1,0 +1,21 @@
+[package]
+name = "c-two"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+repository = "https://github.com/world-in-progress/c-two"
+description = "User-facing Rust SDK for the C-Two resource RPC runtime"
+
+[lib]
+name = "c_two"
+
+[dependencies]
+c2-core = { version = "0.1.0", path = "../../core/runtime/c2-core" }
+c2-contract = { version = "0.1.0", path = "../../core/foundation/c2-contract" }
+c2-error = { version = "0.1.0", path = "../../core/foundation/c2-error" }
+fastdb = "=0.2.1"
+
+[dev-dependencies]
+c2-http = { version = "0.1.0", path = "../../core/transport/c2-http", features = ["relay"] }
+serde_json = "1"

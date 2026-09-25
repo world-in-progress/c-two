@@ -2,11 +2,14 @@
 
 本目录收录 C-Two 的长期愿景与架构定位文档。与 `docs/plans/`、`docs/superpowers/specs/` 这类落地到具体版本/PR 的文档不同，`vision/` 下的内容回答的是 **"我们最终要成为什么"**，并为下游框架（Toodle、Gridmen 等）提供协议边界的锚点。
 
+> 索引中明确标记为 **历史/已 supersede** 的文档只保留决策证据，不属于当前实现指导。
+
 ## 索引
 
 | 文档 | 主题 |
 |------|------|
-| [`cross-language-contract-codec-architecture.md`](./cross-language-contract-codec-architecture.md) | 资源优先 CRM 投影、FastDB call-db payload ABI、Python fallback 与 portable export 的边界 |
+| [`cross-language-contract-codec-architecture.md`](./cross-language-contract-codec-architecture.md) | `c-two.contract.v2`、opaque nested FastDB delegation、artifact composition 与 runtime lifetime 边界 |
+| [`fastdb-neutral-allocator-integration.md`](./fastdb-neutral-allocator-integration.md) | **历史/已 supersede**：2026-05 allocator 调研证据；不得作为当前实现指导 |
 | [`route-token-endpoint-connection-architecture.md`](./route-token-endpoint-connection-architecture.md) | IPC endpoint connection、RouteBinding、relay registry 与 route token 的 clean-cut 边界 |
 | [`sota-patterns.md`](./sota-patterns.md) | C-Two RPC 的 SOTA 设计模式（隐式服务、注册-获取、资源托管） |
 | [`endgame-architecture.md`](./endgame-architecture.md) | 分布式资源运行时的 endgame 架构：Toodle / 智能体 / 人在回路 |

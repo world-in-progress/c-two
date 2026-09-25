@@ -1,0 +1,26 @@
+{
+  "crm": {
+    "name": "PortableNoPayload",
+    "namespace": "test.portable-matrix.no-payload",
+    "version": "0.1.0"
+  },
+  "fingerprints": {
+    "abi_hash": "07e38482f66e0895472c0e9adbdab3c597acd3687833b5d84274db3e65f3fbac",
+    "signature_hash": "e6002e354be6626971bac745bc9c010cffe8eaf1884d102f08f33ef1da02bfef"
+  },
+  "methods": [
+    {
+      "access": "read",
+      "bindings": {
+        "input": null,
+        "output": null
+      },
+      "name": "ping",
+      "parameters": [],
+      "return": {
+        "kind": "none"
+      }
+    }
+  ],
+  "schema": "c-two.contract.v2"
+}

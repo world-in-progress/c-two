@@ -49,7 +49,6 @@ pub fn parse_upstream(value: &str) -> Result<(String, String, String), String> {
         ));
     };
     let name = name.trim();
-    let server_id = server_id;
     let address = address.trim();
     if name.is_empty() {
         return Err("Upstream name cannot be empty".to_string());
@@ -62,17 +61,19 @@ pub fn parse_upstream(value: &str) -> Result<(String, String, String), String> {
 }
 
 pub fn run(args: RelayArgs) -> Result<()> {
-    let mut overrides = RuntimeConfigOverrides::default();
-    overrides.relay = RelayConfigOverrides {
-        bind: args.bind.clone(),
-        relay_id: args.relay_id.clone(),
-        advertise_url: args.advertise_url.clone(),
-        seeds: if args.seeds.is_empty() {
-            None
-        } else {
-            Some(args.seeds.clone())
+    let overrides = RuntimeConfigOverrides {
+        relay: RelayConfigOverrides {
+            bind: args.bind.clone(),
+            relay_id: args.relay_id.clone(),
+            advertise_url: args.advertise_url.clone(),
+            seeds: if args.seeds.is_empty() {
+                None
+            } else {
+                Some(args.seeds.clone())
+            },
+            idle_timeout_secs: args.idle_timeout_secs,
+            ..Default::default()
         },
-        idle_timeout_secs: args.idle_timeout_secs,
         ..Default::default()
     };
     let resolved = ConfigResolver::resolve_relay_server(overrides, ConfigSources::from_process())

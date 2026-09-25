@@ -19,8 +19,9 @@ use axum::{
 use futures::StreamExt;
 
 use crate::relay::authority::{
-    ControlError, RegisterPreparation, RouteAuthority, attest_ipc_pending_route_contract,
-    attest_ipc_route_contract, read_ipc_route_contract,
+    ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
+    RouteAuthority, attest_ipc_pending_route_contract, attest_ipc_route_contract,
+    read_ipc_route_contract,
 };
 use crate::relay::conn_pool::UpstreamLease;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
@@ -40,20 +41,21 @@ const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
 const ROUTE_REVISION_HEADER: &str = "x-c2-route-revision";
 const UNKNOWN_LENGTH_BODY_LIMIT_BYTES: u64 = 64 * 1024;
 
+struct ReadyRequestClient {
+    lease: UpstreamLease,
+    route: RouteEntry,
+    binding: c2_ipc::RouteBinding,
+}
+
 enum RequestClient {
-    Ready {
-        lease: UpstreamLease,
-        route: RouteEntry,
-        binding: c2_ipc::RouteBinding,
-    },
-    Stale {
-        route: RouteEntry,
-    },
+    Ready(Box<ReadyRequestClient>),
+    Stale(Box<RouteEntry>),
     WatchUnavailable {
-        route: RouteEntry,
+        route: Box<RouteEntry>,
         reason: String,
     },
     NotFound,
+    RouteError(c2_ipc::IpcError),
     Unreachable,
 }
 
@@ -61,6 +63,28 @@ struct ExpectedRouteToken {
     route_uid: String,
     route_revision: u64,
 }
+
+struct ResponseFailure(Box<Response>);
+
+impl ResponseFailure {
+    fn new(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
+impl From<Response> for ResponseFailure {
+    fn from(response: Response) -> Self {
+        Self::new(response)
+    }
+}
+
+impl IntoResponse for ResponseFailure {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
+type ResponseResult<T> = Result<T, ResponseFailure>;
 
 struct OptionalConnectInfo(Option<SocketAddr>);
 
@@ -104,11 +128,22 @@ fn resource_not_found_response(route_name: &str) -> Response {
 }
 
 fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -> Response {
+    resource_unavailable_response_with_phase(route_name, message, "pre_dispatch")
+}
+
+fn resource_unavailable_response_with_phase(
+    route_name: &str,
+    message: impl Into<String>,
+    dispatch_phase: &str,
+) -> Response {
     c2_error_response(
         StatusCode::BAD_GATEWAY,
         c2_error::ErrorCode::ResourceUnavailable,
         message,
-        [("route", route_name.to_string())],
+        [
+            ("route", route_name.to_string()),
+            ("dispatch_phase", dispatch_phase.to_string()),
+        ],
     )
 }
 
@@ -147,7 +182,11 @@ where
         .into_response()
 }
 
-fn content_length_from_headers(headers: &HeaderMap) -> Result<Option<u64>, Response> {
+fn semantic_error_response(status: StatusCode, error: c2_error::C2Error) -> Response {
+    (status, Json(error.envelope())).into_response()
+}
+
+fn content_length_from_headers(headers: &HeaderMap) -> ResponseResult<Option<u64>> {
     let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
     let Some(value) = values.next() else {
         return Ok(None);
@@ -160,7 +199,8 @@ fn content_length_from_headers(headers: &HeaderMap) -> Result<Option<u64>, Respo
                 "message": "Content-Length must appear at most once",
             })),
         )
-            .into_response());
+            .into_response()
+            .into());
     }
     let raw = value.to_str().map_err(|_| {
         (
@@ -248,11 +288,10 @@ fn set_data_plane_after_precheck_hook(route_name: String, action: impl FnOnce() 
 fn run_data_plane_after_precheck_hook(route_name: &str) {
     let hook = {
         let mut guard = DATA_PLANE_AFTER_PRECHECK_HOOKS.lock().unwrap();
-        if let Some(index) = guard.iter().position(|hook| hook.route_name == route_name) {
-            Some(guard.remove(index))
-        } else {
-            None
-        }
+        guard
+            .iter()
+            .position(|hook| hook.route_name == route_name)
+            .map(|index| guard.remove(index))
     };
     if let Some(hook) = hook {
         (hook.action)();
@@ -262,7 +301,7 @@ fn run_data_plane_after_precheck_hook(route_name: &str) {
 fn expected_crm_from_headers(
     route_name: &str,
     headers: &HeaderMap,
-) -> Result<c2_contract::ExpectedRouteContract, Response> {
+) -> ResponseResult<c2_contract::ExpectedRouteContract> {
     let crm_ns = headers
         .get(EXPECTED_CRM_NS_HEADER)
         .map(|value| value.to_str().map(str::to_string));
@@ -287,7 +326,8 @@ fn expected_crm_from_headers(
                 "message": "expected CRM headers and hash headers are required",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
         (
             Some(Ok(crm_ns)),
             Some(Ok(crm_name)),
@@ -311,7 +351,8 @@ fn expected_crm_from_headers(
                         "message": err.to_string(),
                     })),
                 )
-                    .into_response());
+                    .into_response()
+                    .into());
             }
             Ok(expected)
         }
@@ -326,7 +367,8 @@ fn expected_crm_from_headers(
                 "message": "expected CRM headers must be valid UTF-8",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
         _ => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -334,7 +376,8 @@ fn expected_crm_from_headers(
                 "message": "expected CRM headers and hash headers must be supplied together",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -371,7 +414,7 @@ fn route_matches_expected_crm(
 fn route_token_from_headers(
     route_name: &str,
     headers: &HeaderMap,
-) -> Result<ExpectedRouteToken, Response> {
+) -> ResponseResult<ExpectedRouteToken> {
     let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER)?;
     let route_revision = single_route_token_header(route_name, headers, ROUTE_REVISION_HEADER)?;
 
@@ -393,21 +436,22 @@ fn route_token_from_headers(
                 return Err(protocol_violation_response(
                     route_name,
                     format!("invalid route token header {ROUTE_REVISION_HEADER}: must be > 0"),
-                ));
+                )
+                .into());
             }
             Ok(ExpectedRouteToken {
                 route_uid,
                 route_revision,
             })
         }
-        (None, None) => Err(protocol_violation_response(
-            route_name,
-            "route token headers are required",
-        )),
+        (None, None) => {
+            Err(protocol_violation_response(route_name, "route token headers are required").into())
+        }
         _ => Err(protocol_violation_response(
             route_name,
             "route token headers must be supplied together",
-        )),
+        )
+        .into()),
     }
 }
 
@@ -415,7 +459,7 @@ fn single_route_token_header(
     route_name: &str,
     headers: &HeaderMap,
     header_name: &'static str,
-) -> Result<Option<String>, Response> {
+) -> ResponseResult<Option<String>> {
     let mut values = headers.get_all(header_name).iter();
     let Some(value) = values.next() else {
         return Ok(None);
@@ -424,28 +468,29 @@ fn single_route_token_header(
         return Err(protocol_violation_response(
             route_name,
             format!("route token header {header_name} must not be repeated"),
-        ));
+        )
+        .into());
     }
     value.to_str().map(str::to_string).map(Some).map_err(|_| {
-        protocol_violation_response(route_name, "route token headers must be valid UTF-8")
+        protocol_violation_response(route_name, "route token headers must be valid UTF-8").into()
     })
 }
 
 fn validate_route_token_for_route(
     route: &RouteEntry,
     expected: &ExpectedRouteToken,
-) -> Result<(), Response> {
+) -> ResponseResult<()> {
     if route.route_uid == expected.route_uid && route.route_revision == expected.route_revision {
         Ok(())
     } else {
-        Err(route_stale_response(route))
+        Err(route_stale_response(route).into())
     }
 }
 
 fn register_contract_claim_from_body(
     route_name: &str,
     body: &serde_json::Value,
-) -> Result<Option<c2_contract::ExpectedRouteContract>, Response> {
+) -> ResponseResult<Option<c2_contract::ExpectedRouteContract>> {
     let crm_ns = register_body_string_field(body, "crm_ns")?;
     let crm_name = register_body_string_field(body, "crm_name")?;
     let crm_ver = register_body_string_field(body, "crm_ver")?;
@@ -471,7 +516,8 @@ fn register_contract_claim_from_body(
                         "message": err.to_string(),
                     })),
                 )
-                    .into_response());
+                    .into_response()
+                    .into());
             }
             Ok(Some(claimed))
         }
@@ -482,7 +528,8 @@ fn register_contract_claim_from_body(
                 "message": "crm_ns, crm_name, crm_ver, abi_hash, and signature_hash must be supplied together",
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -507,7 +554,7 @@ async fn connect_ipc_for_register(address: &str) -> Result<IpcClient, String> {
 fn register_body_string_field<'a>(
     body: &'a serde_json::Value,
     field: &'static str,
-) -> Result<Option<&'a str>, Response> {
+) -> ResponseResult<Option<&'a str>> {
     match body.get(field) {
         Some(value) => value.as_str().map(Some).ok_or_else(|| {
             (
@@ -518,15 +565,13 @@ fn register_body_string_field<'a>(
                 })),
             )
                 .into_response()
+                .into()
         }),
         None => Ok(None),
     }
 }
 
-fn register_body_bool_field(
-    body: &serde_json::Value,
-    field: &'static str,
-) -> Result<bool, Response> {
+fn register_body_bool_field(body: &serde_json::Value, field: &'static str) -> ResponseResult<bool> {
     match body.get(field) {
         Some(value) => value.as_bool().ok_or_else(|| {
             (
@@ -537,12 +582,13 @@ fn register_body_bool_field(
                 })),
             )
                 .into_response()
+                .into()
         }),
         None => Ok(false),
     }
 }
 
-fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> Result<u64, Response> {
+fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> ResponseResult<u64> {
     match body.get(field) {
         Some(value) => match value.as_u64() {
             Some(value) if value > 0 => Ok(value),
@@ -553,7 +599,8 @@ fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> Res
                     "message": format!("{field} must be a positive integer"),
                 })),
             )
-                .into_response()),
+                .into_response()
+                .into()),
         },
         None => Err((
             StatusCode::BAD_REQUEST,
@@ -562,7 +609,8 @@ fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> Res
                 "message": format!("Missing \"{field}\""),
             })),
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
@@ -570,14 +618,14 @@ fn validate_expected_crm_for_route(
     state: &RelayState,
     route_name: &str,
     expected: &c2_contract::ExpectedRouteContract,
-) -> Result<RouteEntry, Response> {
+) -> ResponseResult<RouteEntry> {
     let Some(route) = state.local_route(route_name) else {
-        return Err(resource_not_found_response(route_name));
+        return Err(resource_not_found_response(route_name).into());
     };
     if route_matches_expected_crm(&route, expected) {
         Ok(route)
     } else {
-        Err(crm_contract_mismatch_response(route_name))
+        Err(crm_contract_mismatch_response(route_name).into())
     }
 }
 
@@ -585,11 +633,11 @@ fn validate_expected_crm_for_acquired_route(
     route_name: &str,
     route: &RouteEntry,
     expected: &c2_contract::ExpectedRouteContract,
-) -> Result<(), Response> {
+) -> ResponseResult<()> {
     if route_matches_expected_crm(route, expected) {
         Ok(())
     } else {
-        Err(crm_contract_mismatch_response(route_name))
+        Err(crm_contract_mismatch_response(route_name).into())
     }
 }
 
@@ -657,19 +705,19 @@ async fn handle_register(
     };
     let claimed_contract = match register_contract_claim_from_body(&name, &body) {
         Ok(claim) => claim,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let registration_token = match register_body_string_field(&body, "registration_token") {
         Ok(value) => value.map(str::to_string),
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let prepare_only = match register_body_bool_field(&body, "prepare_only") {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let max_payload_size = match register_body_u64_field(&body, "max_payload_size") {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     eprintln!(
         "[relay] Register request: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} prepare_only={prepare_only}"
@@ -731,17 +779,7 @@ async fn handle_register(
     };
 
     // Connect IPC client and attest the registered route contract.
-    let (
-        client,
-        crm_ns,
-        crm_name,
-        crm_ver,
-        abi_hash,
-        signature_hash,
-        max_payload_size,
-        route_uid,
-        route_revision,
-    ) = {
+    let (client, contract) = {
         let mut c = match connect_ipc_for_register(&address).await {
             Ok(client) => client,
             Err(e) => {
@@ -773,13 +811,10 @@ async fn handle_register(
         let contract = match claimed_contract.as_ref() {
             Some(claimed_contract) => match attest_ipc_route_contract(
                 &c,
-                &name,
-                &claimed_contract.crm_ns,
-                &claimed_contract.crm_name,
-                &claimed_contract.crm_ver,
-                &claimed_contract.abi_hash,
-                &claimed_contract.signature_hash,
-                max_payload_size,
+                ClaimedRouteContract {
+                    expected: claimed_contract,
+                    max_payload_size,
+                },
             )
             .await
             {
@@ -826,14 +861,11 @@ async fn handle_register(
                     };
                     match attest_ipc_pending_route_contract(
                         &mut c,
-                        &name,
                         registration_token,
-                        &claimed_contract.crm_ns,
-                        &claimed_contract.crm_name,
-                        &claimed_contract.crm_ver,
-                        &claimed_contract.abi_hash,
-                        &claimed_contract.signature_hash,
-                        max_payload_size,
+                        ClaimedRouteContract {
+                            expected: claimed_contract,
+                            max_payload_size,
+                        },
                     )
                     .await
                     {
@@ -988,23 +1020,14 @@ async fn handle_register(
             )
                 .into_response();
         }
-        (
-            Arc::new(c),
-            contract.crm_ns,
-            contract.crm_name,
-            contract.crm_ver,
-            contract.abi_hash,
-            contract.signature_hash,
-            contract.max_payload_size,
-            contract.route_uid,
-            contract.route_revision,
-        )
+        (Arc::new(c), contract)
     };
 
     if prepare_only {
         close_arc_client(client);
         eprintln!(
-            "[relay] Register prepared: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} crm={crm_ns}/{crm_name}/{crm_ver}"
+            "[relay] Register prepared: name={name} server_id={server_id} server_instance_id={server_instance_id} address={address} crm={}/{}/{}",
+            contract.crm_ns, contract.crm_name, contract.crm_ver,
         );
         return (
             StatusCode::ACCEPTED,
@@ -1050,21 +1073,16 @@ async fn handle_register(
         }
     };
 
-    let entry = match state.commit_register_upstream(
-        name.clone(),
-        server_id,
-        server_instance_id,
-        address,
-        crm_ns,
-        crm_name,
-        crm_ver,
-        abi_hash,
-        signature_hash,
-        max_payload_size,
-        route_uid,
-        route_revision,
+    let entry = match state.commit_register_upstream(LocalRegistration {
+        owner: LocalRouteOwner {
+            name: name.clone(),
+            server_id,
+            server_instance_id,
+            address,
+        },
+        contract,
         replacement,
-    ) {
+    }) {
         RegisterCommitResult::Registered { entry } => {
             close_arc_client(client);
             eprintln!(
@@ -1338,7 +1356,7 @@ async fn read_unknown_length_body(
     route_name: &str,
     body: Body,
     max_payload_size: u64,
-) -> Result<Vec<u8>, Response> {
+) -> ResponseResult<Vec<u8>> {
     let limit = UNKNOWN_LENGTH_BODY_LIMIT_BYTES.min(max_payload_size);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut data = Vec::new();
@@ -1365,14 +1383,12 @@ async fn read_unknown_length_body(
             .ok_or_else(|| payload_too_large_response(route_name, u64::MAX, max_payload_size))?;
         let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
         if next_len_u64 > max_payload_size {
-            return Err(payload_too_large_response(
-                route_name,
-                next_len_u64,
-                max_payload_size,
-            ));
+            return Err(
+                payload_too_large_response(route_name, next_len_u64, max_payload_size).into(),
+            );
         }
         if next_len > limit_usize {
-            return Err(unknown_length_too_large_response(route_name, limit));
+            return Err(unknown_length_too_large_response(route_name, limit).into());
         }
         data.extend_from_slice(&chunk);
     }
@@ -1388,42 +1404,44 @@ async fn handle_probe(
 ) -> Response {
     let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
     {
         Ok(route) => route,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let route_token = match route_token_from_headers(&route_name, &headers) {
         Ok(token) => token,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
-        return response;
+        return response.into_response();
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
     match acquire_request_client_for_route(state, &advertised_route).await {
-        RequestClient::Ready { lease, route, .. } => {
+        RequestClient::Ready(ready) => {
+            let ReadyRequestClient { lease, route, .. } = *ready;
             if let Err(response) =
                 validate_expected_crm_for_acquired_route(&route_name, &route, &expected_crm)
             {
                 drop(lease);
-                return response;
+                return response.into_response();
             }
             if let Err(response) = validate_route_token_for_route(&route, &route_token) {
                 drop(lease);
-                return response;
+                return response.into_response();
             }
             drop(lease);
             StatusCode::OK.into_response()
         }
-        RequestClient::Stale { route } => route_stale_response(&route),
+        RequestClient::Stale(route) => route_stale_response(&route),
         RequestClient::WatchUnavailable { route, reason } => {
             route_watch_unavailable_response(&route.name, reason)
         }
         RequestClient::NotFound => resource_not_found_response(&route_name),
+        RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error),
         RequestClient::Unreachable => resource_unavailable_response(
             &route_name,
             format!("relay upstream unavailable: {route_name}"),
@@ -1443,47 +1461,53 @@ async fn call_handler(
 ) -> Response {
     let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
     {
         Ok(route) => route,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let route_token = match route_token_from_headers(&route_name, &headers) {
         Ok(token) => token,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
-        return response;
+        return response.into_response();
     }
     let content_length = match content_length_from_headers(&headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
-    if let Some(content_length) = content_length {
-        if content_length > advertised_route.max_payload_size {
-            return payload_too_large_response(
-                &route_name,
-                content_length,
-                advertised_route.max_payload_size,
-            );
-        }
+    if let Some(content_length) = content_length
+        && content_length > advertised_route.max_payload_size
+    {
+        return payload_too_large_response(
+            &route_name,
+            content_length,
+            advertised_route.max_payload_size,
+        );
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
     let (lease, acquired_route, binding) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
-            RequestClient::Ready {
-                lease,
-                route,
-                binding,
-            } => (lease, route, binding),
-            RequestClient::Stale { route } => return route_stale_response(&route),
+            RequestClient::Ready(ready) => {
+                let ReadyRequestClient {
+                    lease,
+                    route,
+                    binding,
+                } = *ready;
+                (lease, route, binding)
+            }
+            RequestClient::Stale(route) => return route_stale_response(&route),
             RequestClient::WatchUnavailable { route, reason } => {
                 return route_watch_unavailable_response(&route.name, reason);
             }
             RequestClient::NotFound => return resource_not_found_response(&route_name),
+            RequestClient::RouteError(error) => {
+                return ipc_route_error_response(&route_name, &error);
+            }
             RequestClient::Unreachable => {
                 return resource_unavailable_response(
                     &route_name,
@@ -1495,28 +1519,28 @@ async fn call_handler(
         validate_expected_crm_for_acquired_route(&route_name, &acquired_route, &expected_crm)
     {
         drop(lease);
-        return response;
+        return response.into_response();
     }
     if let Err(response) = validate_route_token_for_route(&acquired_route, &route_token) {
         drop(lease);
-        return response;
+        return response.into_response();
     }
-    if let Some(content_length) = content_length {
-        if content_length > acquired_route.max_payload_size {
-            drop(lease);
-            return payload_too_large_response(
-                &route_name,
-                content_length,
-                acquired_route.max_payload_size,
-            );
-        }
+    if let Some(content_length) = content_length
+        && content_length > acquired_route.max_payload_size
+    {
+        drop(lease);
+        return payload_too_large_response(
+            &route_name,
+            content_length,
+            acquired_route.max_payload_size,
+        );
     }
     let client = lease.client();
 
     let call_result = match content_length {
         Some(content_length) => {
             client
-                .call_bound_sized_stream(
+                .call_bound_sized_stream_phased(
                     &binding,
                     &method_name,
                     content_length,
@@ -1532,10 +1556,12 @@ async fn call_handler(
                     Ok(body) => body,
                     Err(response) => {
                         drop(lease);
-                        return response;
+                        return response.into_response();
                     }
                 };
-            client.call_bound(&binding, &method_name, &body).await
+            client
+                .call_bound_phased(&binding, &method_name, &body)
+                .await
         }
     };
 
@@ -1545,32 +1571,40 @@ async fn call_handler(
             result.into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc()),
             state.config().remote_payload_chunk_size,
         ),
-        Err(c2_ipc::IpcError::CrmError(err_bytes)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [("content-type", "application/octet-stream")],
-            err_bytes,
-        )
-            .into_response(),
-        Err(c2_ipc::IpcError::RouteStale { .. }) => {
-            drop(lease);
-            route_stale_response(&acquired_route)
-        }
-        Err(e) => {
-            if let Some(reason) = semantic_withdrawal_reason(&e) {
-                let not_found_route = semantic_not_found_route(&e).map(str::to_string);
-                drop(lease);
-                remove_unreachable_route_for_error(&state, &acquired_route, &e, reason);
-                if let Some(route) = not_found_route {
-                    resource_not_found_response(&route)
-                } else {
-                    resource_unavailable_response(&route_name, format!("relay error: {e}"))
+        Err(error) => {
+            let phase = error.phase();
+            let error = error.into_source();
+            match error {
+                c2_ipc::IpcError::CrmError(err_bytes) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/octet-stream")],
+                    err_bytes,
+                )
+                    .into_response(),
+                c2_ipc::IpcError::RouteStale { .. } => {
+                    drop(lease);
+                    route_stale_response(&acquired_route)
                 }
-            } else {
-                // Evict dead client so next request triggers reconnect.
-                if let Some(old_client) = lease.evict_current_client() {
-                    close_arc_client(old_client);
+                error if matches!(phase, c2_ipc::TransportPhase::PreDispatch) => {
+                    if let Some(reason) = semantic_withdrawal_reason(&error) {
+                        drop(lease);
+                        remove_unreachable_route_for_error(&state, &acquired_route, &error, reason);
+                    }
+                    ipc_route_error_response(&route_name, &error)
                 }
-                resource_unavailable_response(&route_name, format!("relay error: {e}"))
+                error => {
+                    // The request may already have reached the service. Evict
+                    // the failed transport, but never tell the client that
+                    // replay is safe.
+                    if let Some(old_client) = lease.evict_current_client() {
+                        close_arc_client(old_client);
+                    }
+                    resource_unavailable_response_with_phase(
+                        &route_name,
+                        format!("relay error after possible dispatch: {error}"),
+                        "dispatch_uncertain",
+                    )
+                }
             }
         }
     }
@@ -1590,25 +1624,17 @@ fn materialized_response_or_error(
                 body,
             )
                 .into_response(),
-            Err(err) => (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": "RelayRemotePayloadChunkConfigInvalid",
-                    "route": route_name,
-                    "message": err.to_string(),
-                })),
-            )
-                .into_response(),
+            Err(err) => resource_unavailable_response_with_phase(
+                route_name,
+                format!("failed to construct relay response body: {err}"),
+                "dispatch_uncertain",
+            ),
         },
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "UpstreamResponseUnavailable",
-                "route": route_name,
-                "message": format!("failed to materialize upstream response: {err}"),
-            })),
-        )
-            .into_response(),
+        Err(err) => resource_unavailable_response_with_phase(
+            route_name,
+            format!("failed to materialize upstream response: {err}"),
+            "dispatch_uncertain",
+        ),
     }
 }
 
@@ -1618,15 +1644,18 @@ async fn acquire_request_client_for_route(
 ) -> RequestClient {
     let route_name = route.name.clone();
     match state.acquire_upstream_for_route(route).await {
-        Ok((lease, route, binding)) => RequestClient::Ready {
+        Ok((lease, route, binding)) => RequestClient::Ready(Box::new(ReadyRequestClient {
             lease,
             route,
             binding,
-        },
+        })),
         Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
-        Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale { route },
+        Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale(Box::new(route)),
         Err(UpstreamAcquireError::WatchUnavailable { route, reason }) => {
-            RequestClient::WatchUnavailable { route, reason }
+            RequestClient::WatchUnavailable {
+                route: Box::new(route),
+                reason,
+            }
         }
         Err(UpstreamAcquireError::Unreachable {
             route,
@@ -1641,9 +1670,16 @@ async fn acquire_request_client_for_route(
                 remove_unreachable_route_for_error(&state, &route, &error, reason);
             }
             match error {
-                c2_ipc::IpcError::RouteNotFound(_)
+                error @ (c2_ipc::IpcError::RouteNotFound(_)
                 | c2_ipc::IpcError::RouteRemoved { .. }
-                | c2_ipc::IpcError::RouteClosed { .. } => RequestClient::NotFound,
+                | c2_ipc::IpcError::RouteClosed { .. }
+                | c2_ipc::IpcError::ContractMismatch(_)
+                | c2_ipc::IpcError::IdentityMismatch { .. }
+                | c2_ipc::IpcError::Protocol(_)
+                | c2_ipc::IpcError::Handshake(_)
+                | c2_ipc::IpcError::CatalogCompacted { .. }
+                | c2_ipc::IpcError::WatchUnavailable(_)
+                | c2_ipc::IpcError::MethodNotFound { .. }) => RequestClient::RouteError(error),
                 _ => RequestClient::Unreachable,
             }
         }
@@ -1664,6 +1700,164 @@ fn route_stale_response(route: &RouteEntry) -> Response {
             ("route_revision", route.route_revision.to_string()),
         ],
     )
+}
+
+fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Response {
+    use c2_error::{C2Error, ErrorCode};
+
+    match error {
+        c2_ipc::IpcError::RouteNotFound(route) => semantic_error_response(
+            StatusCode::NOT_FOUND,
+            C2Error::new(
+                ErrorCode::ResourceNotFound,
+                format!("route not found: {route}"),
+            )
+            .with_details(BTreeMap::from([("route".to_string(), route.clone())])),
+        ),
+        c2_ipc::IpcError::RouteRemoved {
+            route_name,
+            route_uid,
+        } => {
+            let mut details = BTreeMap::from([("route".to_string(), route_name.clone())]);
+            if let Some(route_uid) = route_uid {
+                details.insert("route_uid".to_string(), route_uid.clone());
+            }
+            semantic_error_response(
+                StatusCode::GONE,
+                C2Error::new(
+                    ErrorCode::ResourceRemoved,
+                    format!("route removed: {route_name}"),
+                )
+                .with_details(details),
+            )
+        }
+        c2_ipc::IpcError::RouteClosed {
+            route_name,
+            route_uid,
+            reason,
+        } => semantic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            C2Error::new(
+                ErrorCode::ResourceClosed,
+                format!("route closed: {route_name}"),
+            )
+            .with_details(BTreeMap::from([
+                ("reason".to_string(), reason.clone()),
+                ("route".to_string(), route_name.clone()),
+                ("route_uid".to_string(), route_uid.clone()),
+            ])),
+        ),
+        c2_ipc::IpcError::RouteStale {
+            route_name,
+            current_route_uid,
+            current_route_revision,
+        } => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(
+                ErrorCode::RouteStale,
+                format!("route token is stale: {route_name}"),
+            )
+            .with_details(BTreeMap::from([
+                (
+                    "current_route_revision".to_string(),
+                    current_route_revision.to_string(),
+                ),
+                ("current_route_uid".to_string(), current_route_uid.clone()),
+                ("route".to_string(), route_name.clone()),
+            ])),
+        ),
+        c2_ipc::IpcError::ContractMismatch(message) => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(ErrorCode::ContractMismatch, message.clone()).with_details(
+                BTreeMap::from([
+                    ("route".to_string(), route_name.to_string()),
+                    ("transport".to_string(), "ipc".to_string()),
+                ]),
+            ),
+        ),
+        c2_ipc::IpcError::IdentityMismatch {
+            expected_server_id,
+            expected_server_instance_id,
+            actual_server_id,
+            actual_server_instance_id,
+        } => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(ErrorCode::IdentityMismatch, "IPC server identity mismatch").with_details(
+                BTreeMap::from([
+                    ("actual_server_id".to_string(), actual_server_id.clone()),
+                    (
+                        "actual_server_instance_id".to_string(),
+                        actual_server_instance_id.clone(),
+                    ),
+                    ("expected_server_id".to_string(), expected_server_id.clone()),
+                    (
+                        "expected_server_instance_id".to_string(),
+                        expected_server_instance_id.clone(),
+                    ),
+                    ("route".to_string(), route_name.to_string()),
+                ]),
+            ),
+        ),
+        c2_ipc::IpcError::CatalogCompacted {
+            compacted_revision,
+            current_revision,
+        } => semantic_error_response(
+            StatusCode::CONFLICT,
+            C2Error::new(
+                ErrorCode::RouteCatalogCompacted,
+                "route catalog history was compacted",
+            )
+            .with_details(BTreeMap::from([
+                (
+                    "compacted_revision".to_string(),
+                    compacted_revision.to_string(),
+                ),
+                ("current_revision".to_string(), current_revision.to_string()),
+                ("route".to_string(), route_name.to_string()),
+            ])),
+        ),
+        c2_ipc::IpcError::WatchUnavailable(message) => semantic_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            C2Error::new(ErrorCode::RouteWatchUnavailable, message.clone()).with_details(
+                BTreeMap::from([
+                    ("route".to_string(), route_name.to_string()),
+                    ("transport".to_string(), "ipc".to_string()),
+                ]),
+            ),
+        ),
+        c2_ipc::IpcError::MethodNotFound {
+            route_name,
+            method_name,
+        } => semantic_error_response(
+            StatusCode::BAD_GATEWAY,
+            C2Error::new(
+                ErrorCode::ProtocolViolation,
+                format!("method is not present in the acquired route: {method_name}"),
+            )
+            .with_details(BTreeMap::from([
+                ("method".to_string(), method_name.clone()),
+                ("route".to_string(), route_name.clone()),
+            ])),
+        ),
+        c2_ipc::IpcError::Protocol(message) | c2_ipc::IpcError::Handshake(message) => {
+            semantic_error_response(
+                StatusCode::BAD_GATEWAY,
+                C2Error::new(
+                    ErrorCode::ProtocolViolation,
+                    "IPC protocol validation failed",
+                )
+                .with_details(BTreeMap::from([
+                    ("reason".to_string(), message.clone()),
+                    ("route".to_string(), route_name.to_string()),
+                    ("transport".to_string(), "ipc".to_string()),
+                ])),
+            )
+        }
+        error => resource_unavailable_response(
+            route_name,
+            format!("relay upstream unavailable before dispatch: {error}"),
+        ),
+    }
 }
 
 fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
@@ -1697,15 +1891,6 @@ fn semantic_withdrawal_reason(error: &c2_ipc::IpcError) -> Option<&'static str> 
         c2_ipc::IpcError::RouteNotFound(_) => Some("route-missing"),
         c2_ipc::IpcError::RouteRemoved { .. } => Some("route-removed"),
         c2_ipc::IpcError::RouteClosed { .. } => Some("route-closed"),
-        _ => None,
-    }
-}
-
-fn semantic_not_found_route(error: &c2_ipc::IpcError) -> Option<&str> {
-    match error {
-        c2_ipc::IpcError::RouteNotFound(route) => Some(route.as_str()),
-        c2_ipc::IpcError::RouteRemoved { route_name, .. }
-        | c2_ipc::IpcError::RouteClosed { route_name, .. } => Some(route_name.as_str()),
         _ => None,
     }
 }
@@ -1853,13 +2038,6 @@ mod tests {
             }),
             Some("route-closed")
         );
-        assert_eq!(
-            semantic_not_found_route(&c2_ipc::IpcError::RouteRemoved {
-                route_name: "grid".into(),
-                route_uid: Some("grid-uid".into()),
-            }),
-            Some("grid")
-        );
 
         assert_eq!(
             semantic_withdrawal_reason(&c2_ipc::IpcError::Io(std::io::Error::from(
@@ -1887,6 +2065,115 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn ipc_route_errors_preserve_exact_relay_semantics() {
+        use c2_error::ErrorCode;
+
+        let cases = [
+            (
+                c2_ipc::IpcError::RouteNotFound("grid".into()),
+                StatusCode::NOT_FOUND,
+                ErrorCode::ResourceNotFound,
+            ),
+            (
+                c2_ipc::IpcError::RouteRemoved {
+                    route_name: "grid".into(),
+                    route_uid: Some("grid-uid".into()),
+                },
+                StatusCode::GONE,
+                ErrorCode::ResourceRemoved,
+            ),
+            (
+                c2_ipc::IpcError::RouteClosed {
+                    route_name: "grid".into(),
+                    route_uid: "grid-uid".into(),
+                    reason: "shutdown".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::ResourceClosed,
+            ),
+            (
+                c2_ipc::IpcError::RouteStale {
+                    route_name: "grid".into(),
+                    current_route_uid: "grid-uid-v2".into(),
+                    current_route_revision: 2,
+                },
+                StatusCode::CONFLICT,
+                ErrorCode::RouteStale,
+            ),
+            (
+                c2_ipc::IpcError::ContractMismatch("wrong contract".into()),
+                StatusCode::CONFLICT,
+                ErrorCode::ContractMismatch,
+            ),
+            (
+                c2_ipc::IpcError::IdentityMismatch {
+                    expected_server_id: "expected".into(),
+                    expected_server_instance_id: "expected-instance".into(),
+                    actual_server_id: "actual".into(),
+                    actual_server_instance_id: "actual-instance".into(),
+                },
+                StatusCode::CONFLICT,
+                ErrorCode::IdentityMismatch,
+            ),
+            (
+                c2_ipc::IpcError::CatalogCompacted {
+                    compacted_revision: 4,
+                    current_revision: 8,
+                },
+                StatusCode::CONFLICT,
+                ErrorCode::RouteCatalogCompacted,
+            ),
+            (
+                c2_ipc::IpcError::WatchUnavailable("watch disconnected".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::RouteWatchUnavailable,
+            ),
+            (
+                c2_ipc::IpcError::MethodNotFound {
+                    route_name: "grid".into(),
+                    method_name: "missing".into(),
+                },
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::ProtocolViolation,
+            ),
+            (
+                c2_ipc::IpcError::Protocol("malformed reply".into()),
+                StatusCode::BAD_GATEWAY,
+                ErrorCode::ProtocolViolation,
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let response = ipc_route_error_response("grid", &error);
+            assert_eq!(response.status(), expected_status, "error={error}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["code"],
+                u16::from(expected_code),
+                "unexpected code for error={error}"
+            );
+            assert_eq!(
+                body["name"],
+                expected_code.name(),
+                "unexpected name for error={error}"
+            );
+            assert_ne!(
+                body["name"], "ResourceUnavailable",
+                "semantic error was flattened: {error}"
+            );
+        }
+
+        let response =
+            ipc_route_error_response("grid", &c2_ipc::IpcError::Config("offline".into()));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["name"], "ResourceUnavailable");
+        assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[test]
@@ -1927,7 +2214,8 @@ mod tests {
         let state = test_state();
         let address = "ipc://identity-mismatch-owner";
         for route_name in ["manager", "builder"] {
-            match state.commit_register_upstream(
+            match test_commit_registration!(
+                &state,
                 route_name.into(),
                 "server-grid".into(),
                 "server-grid-instance".into(),
@@ -1946,7 +2234,8 @@ mod tests {
                 _ => panic!("unexpected registration result for {route_name}"),
             }
         }
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "other-endpoint".into(),
             "server-grid".into(),
             "server-grid-other-instance".into(),
@@ -2010,12 +2299,13 @@ mod tests {
                 RequestData::Shm {
                     pool,
                     seg_idx,
+                    generation,
                     offset,
                     data_size,
                     is_dedicated,
                 } => {
                     let mut pool = pool.write();
-                    let _ = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                    let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
                     "shm"
                 }
                 RequestData::Handle { handle, pool } => {
@@ -2242,28 +2532,49 @@ mod tests {
             );
         }
         assert!(
-            body.contains(".call_bound_sized_stream("),
-            "relay data-plane must use route-bound sized streaming for Content-Length requests"
+            body.contains(".call_bound_sized_stream_phased("),
+            "relay data-plane must use phased route-bound sized streaming for Content-Length requests"
         );
         assert!(
-            body.contains(".call_bound("),
-            "relay data-plane must use route-bound call for bounded unknown-length fallback"
+            body.contains(".call_bound_phased("),
+            "relay data-plane must use phased route-bound call for bounded unknown-length fallback"
         );
     }
 
     #[tokio::test]
     async fn materialized_response_error_is_not_silently_returned_as_empty_success() {
-        let response = materialized_response_or_error(
-            "grid",
-            Err("server pool not initialised".to_string()),
-            c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
-        );
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"], "UpstreamResponseUnavailable");
-        assert_eq!(payload["route"], "grid");
+        for (result, chunk_size, expected_message) in [
+            (
+                Err("server pool not initialised".to_string()),
+                c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+                "server pool not initialised",
+            ),
+            (
+                Err("response SHM release failed: backing unavailable".to_string()),
+                c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+                "response SHM release failed: backing unavailable",
+            ),
+            (
+                Ok(b"already dispatched".to_vec()),
+                0,
+                "remote_payload_chunk_size",
+            ),
+        ] {
+            let response = materialized_response_or_error("grid", result, chunk_size);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body)
+                .expect("relay failures must decode through the canonical HTTP error envelope");
+            let error = c2_error::C2Error::from_envelope(envelope).unwrap();
+            assert_eq!(error.code, c2_error::ErrorCode::ResourceUnavailable);
+            assert_eq!(error.details["route"], "grid");
+            assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
+            assert!(
+                error.message.contains(expected_message),
+                "{}",
+                error.message
+            );
+        }
     }
 
     fn test_state() -> Arc<RelayState> {
@@ -2369,10 +2680,9 @@ mod tests {
         server_id: &str,
         address: &str,
         registration_token: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
+        crm: (&str, &str, &str),
     ) -> StatusCode {
+        let (crm_ns, crm_name, crm_ver) = crm;
         let app = build_router(state);
         let response = app
             .oneshot(
@@ -3067,7 +3377,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_exposes_ipc_address_only_to_loopback_clients() {
         let state = test_state();
-        state.commit_register_upstream(
+        test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "inst-grid".into(),
@@ -3258,9 +3569,7 @@ mod tests {
                 "server-grid",
                 &address,
                 &registration_token,
-                "test.echo",
-                "Echo",
-                "0.1.0",
+                ("test.echo", "Echo", "0.1.0"),
             )
             .await,
             StatusCode::BAD_REQUEST
@@ -3459,7 +3768,8 @@ mod tests {
             std::process::id(),
             unique_suffix()
         );
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -3524,7 +3834,8 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
 
-        state.commit_register_upstream(
+        test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "inst-grid".into(),
@@ -3582,7 +3893,8 @@ mod tests {
         )
         .await;
 
-        state.commit_register_upstream(
+        test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "inst-grid".into(),
@@ -3968,12 +4280,12 @@ mod tests {
         set_data_plane_after_precheck_hook(route_name.to_string(), move || {
             if let crate::relay::state::UnregisterResult::Removed { client, .. } =
                 state_for_hook.unregister_upstream(&route_for_hook, "server-old")
+                && let Some(client) = client
             {
-                if let Some(client) = client {
-                    tokio::spawn(async move { client.close_shared().await });
-                }
+                tokio::spawn(async move { client.close_shared().await });
             }
-            match state_for_hook.commit_register_upstream(
+            match test_commit_registration!(
+                &state_for_hook,
                 route_for_hook.clone(),
                 "server-new".into(),
                 "server-new-instance".into(),
@@ -4014,12 +4326,12 @@ mod tests {
         set_data_plane_after_precheck_hook(route_name.to_string(), move || {
             if let crate::relay::state::UnregisterResult::Removed { client, .. } =
                 state_for_hook.unregister_upstream(&route_for_hook, "server-old")
+                && let Some(client) = client
             {
-                if let Some(client) = client {
-                    tokio::spawn(async move { client.close_shared().await });
-                }
+                tokio::spawn(async move { client.close_shared().await });
             }
-            match state_for_hook.commit_register_upstream(
+            match test_commit_registration!(
+                &state_for_hook,
                 route_for_hook.clone(),
                 "server-new".into(),
                 "server-new-instance".into(),
@@ -4452,31 +4764,127 @@ mod tests {
     #[tokio::test]
     async fn probe_missing_upstream_route_removes_stale_local_route() {
         let state = test_state();
-        let stale_address = format!(
+        let owner_address = format!(
             "ipc://relay_probe_missing_route_{}_{}",
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address, "server-grid").await;
+        // The owner is alive and answers catalog lookups but never served this
+        // route, so the authoritative lookup must answer never-found. The
+        // local route is committed directly so the background control watch
+        // cannot withdraw it first: the data-plane acquisition is the only
+        // actor that observes the stale route.
+        let owner_server =
+            start_live_server_with_routes(&owner_address, "server-grid", &["other"]).await;
 
-        assert_eq!(
-            post_register(state.clone(), "grid", "server-grid", &stale_address).await,
-            StatusCode::CREATED
-        );
-        state.evict_connection("grid");
-        assert!(stale_server.unregister_route("grid").await);
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            1024,
+            "grid-never-served-uid".into(),
+            1,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for never-found stale route"),
+        }
 
-        assert_eq!(
-            get_probe(state.clone(), "grid").await,
-            StatusCode::NOT_FOUND
+        let (status, body) = get_probe_response(state.clone(), "grid").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], 701);
+        assert_eq!(body["name"], "ResourceNotFound");
+        assert_eq!(body["message"], "route not found: grid");
+        assert_eq!(body["details"]["route"], "grid");
+        assert!(
+            state.local_route("grid").is_none(),
+            "never-found upstream route is semantic withdrawal evidence"
         );
-        assert!(state.local_route("grid").is_none());
         assert_eq!(
             get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
             StatusCode::NOT_FOUND
         );
 
-        shutdown_live_server(&stale_server).await;
+        shutdown_live_server(&owner_server).await;
+    }
+
+    #[tokio::test]
+    async fn probe_known_removed_upstream_route_removes_stale_local_route() {
+        let state = test_state();
+        let owner_address = format!(
+            "ipc://relay_probe_removed_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let owner_server = start_live_server(&owner_address, "server-grid").await;
+
+        // Capture the live route identity before removal. The server
+        // tombstone keeps this uid, so the withdrawal response can be pinned
+        // to the exact removed incarnation.
+        let mut attested =
+            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default());
+        attested
+            .connect()
+            .await
+            .expect("attestation client connects");
+        let table = attested.route_table("grid").expect("server exports grid");
+        let route_uid = table.route_uid().to_string();
+        let route_revision = table.route_revision();
+        let max_payload_size = table.max_payload_size();
+        attested.close().await;
+
+        assert!(owner_server.unregister_route("grid").await);
+
+        // An explicit unregister leaves a tombstone, so the authoritative
+        // lookup answers known-removed (410), not never-found (404). The
+        // local route is committed after the removal so the data-plane
+        // acquisition deterministically observes the tombstone.
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            max_payload_size,
+            route_uid.clone(),
+            route_revision,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for known-removed stale route"),
+        }
+
+        let (status, body) = get_probe_response(state.clone(), "grid").await;
+        assert_eq!(status, StatusCode::GONE);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], 708);
+        assert_eq!(body["name"], "ResourceRemoved");
+        assert_eq!(body["message"], "route removed: grid");
+        assert_eq!(body["details"]["route"], "grid");
+        assert_eq!(body["details"]["route_uid"], route_uid);
+        assert!(
+            state.local_route("grid").is_none(),
+            "known-removed upstream route is semantic withdrawal evidence"
+        );
+        assert_eq!(
+            get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
+            StatusCode::NOT_FOUND
+        );
+
+        shutdown_live_server(&owner_server).await;
     }
 
     #[tokio::test]
@@ -4566,32 +4974,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_missing_upstream_route_removes_stale_local_route() {
+    async fn call_known_removed_upstream_route_removes_stale_local_route() {
         let state = test_state();
-        let stale_address = format!(
-            "ipc://relay_call_missing_route_{}_{}",
+        let owner_address = format!(
+            "ipc://relay_call_removed_route_{}_{}",
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address, "server-grid").await;
+        let owner_server = start_live_server(&owner_address, "server-grid").await;
 
-        assert_eq!(
-            post_register(state.clone(), "grid", "server-grid", &stale_address).await,
-            StatusCode::CREATED
-        );
-        assert!(stale_server.unregister_route("grid").await);
+        let mut attested =
+            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default());
+        attested
+            .connect()
+            .await
+            .expect("attestation client connects");
+        let table = attested.route_table("grid").expect("server exports grid");
+        let route_uid = table.route_uid().to_string();
+        let route_revision = table.route_revision();
+        let max_payload_size = table.max_payload_size();
+        attested.close().await;
 
-        assert_eq!(
-            post_call(state.clone(), "grid", "ping").await,
-            StatusCode::NOT_FOUND
+        assert!(owner_server.unregister_route("grid").await);
+
+        // The explicit unregister leaves a tombstone, so the call acquisition
+        // fails pre-dispatch with known-removed evidence and withdraws the
+        // stale local route. Committing the local route after the removal
+        // keeps the fixture independent of control-watch timing.
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            max_payload_size,
+            route_uid.clone(),
+            route_revision,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for known-removed stale route"),
+        }
+
+        // The canonical ResourceRemoved envelope is also the no-dispatch
+        // proof: a dispatched call would have returned 200 with the echo body.
+        let (status, body) = post_call_response(state.clone(), "grid", "ping").await;
+        assert_eq!(status, StatusCode::GONE);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], 708);
+        assert_eq!(body["name"], "ResourceRemoved");
+        assert_eq!(body["message"], "route removed: grid");
+        assert_eq!(body["details"]["route"], "grid");
+        assert_eq!(body["details"]["route_uid"], route_uid);
+        assert!(
+            state.local_route("grid").is_none(),
+            "known-removed upstream route is semantic withdrawal evidence"
         );
-        assert!(state.local_route("grid").is_none());
         assert_eq!(
             get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
             StatusCode::NOT_FOUND
         );
 
-        shutdown_live_server(&stale_server).await;
+        shutdown_live_server(&owner_server).await;
     }
 
     #[tokio::test]
@@ -4780,7 +5229,8 @@ mod tests {
         assert!(stale_client.has_route("manager"));
         assert!(!stale_client.has_route("builder"));
 
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "builder".into(),
             "server-grid".into(),
             "server-grid-instance".into(),
@@ -4885,7 +5335,8 @@ mod tests {
         let table = attested.route_table("grid").expect("server exports grid");
         attested.close().await;
 
-        match state.commit_register_upstream(
+        match test_commit_registration!(
+            &state,
             "grid".into(),
             "server-grid".into(),
             "server-grid-instance".into(),

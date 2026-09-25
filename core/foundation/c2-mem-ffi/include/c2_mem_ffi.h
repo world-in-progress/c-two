@@ -8,9 +8,9 @@
 extern "C" {
 #endif
 
-#define C2_MEM_FFI_MAX_SHM_PREFIX_LEN 24u
+#define C2_MEM_FFI_MAX_SHM_PREFIX_LEN 255u
 #define C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS 16u
-#define C2_MEM_FFI_ABI_VERSION 1u
+#define C2_MEM_FFI_ABI_VERSION 2u
 
 typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_OK = 0,
@@ -20,20 +20,22 @@ typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4,
 } C2MemFfiStatus;
 
-/* Non-dedicated buddy block descriptor. is_dedicated must be 0. */
+/* Backing descriptor: buddy generation > 0; dedicated generation and offset are 0. */
 typedef struct C2MemFfiRequestBlock {
     uint16_t segment_index;
     uint8_t is_dedicated;
     uint8_t reserved;
+    uint32_t generation;
     uint32_t offset;
     uint32_t byte_length;
 } C2MemFfiRequestBlock;
 
-/* Non-dedicated buddy block descriptor. is_dedicated must be 0. */
+/* Backing descriptor: buddy generation > 0; dedicated generation and offset are 0. */
 typedef struct C2MemFfiResponseBlock {
     uint16_t segment_index;
     uint8_t is_dedicated;
     uint8_t reserved;
+    uint32_t generation;
     uint32_t offset;
     uint32_t byte_length;
 } C2MemFfiResponseBlock;
@@ -43,7 +45,12 @@ typedef struct C2MemFfiResponsePool C2MemFfiResponsePool;
 
 uint32_t c2_mem_ffi_abi_version(void);
 
-/* Creates a non-dedicated buddy request pool. max_segments must be 1..16. */
+/* Resolve a logical ipc:// address through c2-config's native endpoint owner. */
+C2MemFfiStatus c2_mem_ffi_local_endpoint_len(const char *address, size_t *out_len);
+C2MemFfiStatus c2_mem_ffi_local_endpoint_copy(
+    const char *address, char *dst, size_t dst_len, size_t *out_written);
+
+/* Creates a native buddy/dedicated request pool. max_segments must be 1..16. */
 C2MemFfiStatus c2_mem_ffi_request_pool_new(
     const char *prefix,
     uint32_t segment_size,
@@ -105,7 +112,7 @@ C2MemFfiStatus c2_mem_ffi_request_pool_forget_consumed(
     C2MemFfiRequestPool *pool,
     C2MemFfiRequestBlock block);
 
-/* Opens a non-dedicated buddy response pool over Rust server segments. */
+/* Opens a native response pool over Rust server segments. */
 C2MemFfiStatus c2_mem_ffi_response_pool_new(
     const char *prefix,
     uint32_t segment_size,
@@ -116,7 +123,7 @@ C2MemFfiStatus c2_mem_ffi_response_pool_new(
 void c2_mem_ffi_response_pool_destroy(C2MemFfiResponsePool *pool);
 
 /*
- * Copies a valid non-dedicated response block from the Rust server buddy pool
+ * Copies a valid response block from the Rust server native pool
  * into caller-owned memory. Successfully read blocks are tracked so destroy can
  * release them as a leak guardrail when callers forget to release explicitly.
  */
@@ -128,7 +135,7 @@ C2MemFfiStatus c2_mem_ffi_response_pool_read(
     size_t *out_read);
 
 /*
- * Releases a valid read or unread non-dedicated response block exactly once.
+ * Releases a valid read or unread response block exactly once.
  * This is valid before read when the caller cannot allocate or copy the
  * response payload after receiving block metadata.
  */

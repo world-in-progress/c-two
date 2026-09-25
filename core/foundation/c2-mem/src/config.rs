@@ -7,6 +7,8 @@ pub use c2_config::PoolConfig;
 pub struct PoolAllocation {
     /// Index of the segment (buddy or dedicated).
     pub seg_idx: u32,
+    /// Concrete backing incarnation within this segment slot; dedicated is 0.
+    pub generation: u32,
     /// Offset within the segment's data region.
     pub offset: u32,
     /// Actual allocated size.

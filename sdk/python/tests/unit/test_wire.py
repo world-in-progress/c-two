@@ -253,3 +253,13 @@ class TestHandshakePrefixExchange:
         encoded = encode_client_handshake(segments, CAP_CALL)
         hs = decode_handshake(encoded)
         assert hs.prefix == ""
+
+
+def test_buddy_wire_preserves_generation_and_rejects_old_layout():
+    from c_two._native import decode_buddy_payload, encode_buddy_payload
+
+    canonical = bytes.fromhex('020007000000001000000002000000')
+    assert encode_buddy_payload(2, 7, 4096, 512, False) == canonical
+    assert decode_buddy_payload(canonical) == (2, 7, 4096, 512, False)
+    with pytest.raises(ValueError):
+        decode_buddy_payload(bytes.fromhex('0200001000000002000000'))

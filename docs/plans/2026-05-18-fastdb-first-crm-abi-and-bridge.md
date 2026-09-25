@@ -1,5 +1,7 @@
 # FastDB-First CRM ABI And Resource Bridge Plan
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 > **Status:** Superseded for integration-boundary purposes by `docs/superpowers/specs/2026-05-20-c-two-fastdb-first-contract-boundary-redesign.md`
 > **Date:** 2026-05-18
 > **Scope:** Make fastdb the required portable CRM payload ABI for cross-language C-Two contracts, while keeping Python-native CRM annotations available only for Python-only prototype and test flows.

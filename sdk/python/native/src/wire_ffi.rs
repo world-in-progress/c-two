@@ -70,6 +70,7 @@ pub struct PyRouteInfo {
 impl PyRouteInfo {
     #[new]
     #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size, route_uid, route_revision))]
+    #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         name: String,
         methods: Vec<Py<PyMethodEntry>>,
@@ -235,6 +236,7 @@ fn decode_frame(body: &[u8]) -> PyResult<(u64, u32, Vec<u8>)> {
 
 #[pyfunction]
 #[pyo3(signature = (route_name, route_uid, observed_route_revision, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, method_idx))]
+#[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
 fn encode_call_control(
     route_name: &str,
     route_uid: &str,
@@ -263,11 +265,7 @@ fn encode_call_control(
 ///
 /// Returns `(route_name, route_uid, observed_route_revision, crm_ns, crm_name,
 /// crm_ver, abi_hash, signature_hash, method_idx, bytes_consumed)`.
-#[pyfunction]
-fn decode_call_control(
-    data: &[u8],
-    offset: usize,
-) -> PyResult<(
+type DecodedCallControlParts = (
     String,
     String,
     u64,
@@ -278,7 +276,10 @@ fn decode_call_control(
     String,
     u16,
     usize,
-)> {
+);
+
+#[pyfunction]
+fn decode_call_control(data: &[u8], offset: usize) -> PyResult<DecodedCallControlParts> {
     let (ctrl, consumed) =
         c2_wire::control::decode_call_control(data, offset).map_err(decode_err)?;
     Ok((
@@ -339,11 +340,18 @@ fn decode_reply_control(data: &[u8], offset: usize) -> PyResult<(u8, Option<Vec<
 
 // ── Buddy payload ───────────────────────────────────────────────────────
 
-/// Encode buddy SHM pointer: `[2B seg_idx][4B offset][4B size][1B flags]`.
+/// Encode buddy SHM pointer: `[2B seg_idx][4B generation][4B offset][4B size][1B flags]`.
 #[pyfunction]
-fn encode_buddy_payload(seg_idx: u16, offset: u32, data_size: u32, is_dedicated: bool) -> Vec<u8> {
+fn encode_buddy_payload(
+    seg_idx: u16,
+    generation: u32,
+    offset: u32,
+    data_size: u32,
+    is_dedicated: bool,
+) -> Vec<u8> {
     let bp = c2_wire::buddy::BuddyPayload {
         seg_idx,
+        generation,
         offset,
         data_size,
         is_dedicated,
@@ -353,11 +361,17 @@ fn encode_buddy_payload(seg_idx: u16, offset: u32, data_size: u32, is_dedicated:
 
 /// Decode buddy SHM pointer.
 ///
-/// Returns `(seg_idx, offset, data_size, is_dedicated)`.
+/// Returns `(seg_idx, generation, offset, data_size, is_dedicated)`.
 #[pyfunction]
-fn decode_buddy_payload(payload: &[u8]) -> PyResult<(u16, u32, u32, bool)> {
+fn decode_buddy_payload(payload: &[u8]) -> PyResult<(u16, u32, u32, u32, bool)> {
     let (bp, _) = c2_wire::buddy::decode_buddy_payload(payload).map_err(decode_err)?;
-    Ok((bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated))
+    Ok((
+        bp.seg_idx,
+        bp.generation,
+        bp.offset,
+        bp.data_size,
+        bp.is_dedicated,
+    ))
 }
 
 // ── Chunk header ────────────────────────────────────────────────────────
@@ -558,6 +572,18 @@ fn validate_portable_contract_descriptor(payload: &[u8]) -> PyResult<()> {
 }
 
 #[pyfunction]
+fn derive_portable_contract_fingerprints(payload: &[u8]) -> PyResult<(String, String)> {
+    c2_contract::derive_contract_fingerprints_json(payload)
+        .map(|fingerprints| {
+            (
+                fingerprints.abi_hash().to_string(),
+                fingerprints.signature_hash().to_string(),
+            )
+        })
+        .map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+#[pyfunction]
 fn canonicalize_portable_contract_descriptor(payload: &[u8]) -> PyResult<String> {
     c2_contract::ContractRelease::from_descriptor_json(payload)
         .map(|release| release.canonical_descriptor_json().to_string())
@@ -612,6 +638,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(contract_descriptor_sha256_hex, m)?)?;
     m.add_function(wrap_pyfunction!(validate_portable_contract_descriptor, m)?)?;
+    m.add_function(wrap_pyfunction!(derive_portable_contract_fingerprints, m)?)?;
     m.add_function(wrap_pyfunction!(
         canonicalize_portable_contract_descriptor,
         m

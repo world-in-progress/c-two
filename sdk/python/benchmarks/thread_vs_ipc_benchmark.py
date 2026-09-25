@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 
 import c_two as cc
-from c_two.transport.client.util import _socket_path_from_address
+from c_two.transport.client.util import ping
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +123,10 @@ def bench_ipc(payload_size: int) -> float:
     cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
 
-    # Wait for server socket.
-    sock_path = _socket_path_from_address(address)
+    # Probe native server readiness.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
+        if ping(address, timeout=0.5):
             break
         time.sleep(0.05)
 

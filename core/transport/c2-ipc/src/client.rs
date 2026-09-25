@@ -1,22 +1,22 @@
-//! Async IPC client — connects to a C-Two IPC server via UDS.
+//! Async IPC client — connects to a C-Two IPC server through a local OS stream.
 //!
 //! Performs handshake, then multiplexes concurrent requests over
-//! a single UDS connection using request IDs.
+//! a single local connection using request IDs.
 
 use parking_lot::{Mutex as StdMutex, RwLock};
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use c2_local::{
+    AbortHandle, DEFAULT_CONNECT_TIMEOUT, LocalEndpoint, LocalReadHalf, LocalStream, LocalWriteHalf,
+};
 use futures_util::{Stream, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, oneshot};
 
 use c2_error::ErrorCode;
-use c2_mem::FreeResult;
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
@@ -64,33 +64,6 @@ pub struct ServerPoolState {
 }
 
 impl ServerPoolState {
-    fn buddy_segment_name(prefix: &str, idx: usize) -> String {
-        format!("{}_{}{:04x}", prefix, "b", idx)
-    }
-
-    fn dedicated_segment_name(prefix: &str, idx: u32) -> String {
-        format!("{}_{}{:04x}", prefix, "d", idx)
-    }
-
-    /// Ensure the pool has the buddy segment at `seg_idx` open.
-    fn ensure_buddy_segment(&mut self, seg_idx: u16) -> Result<(), String> {
-        let idx = seg_idx as usize;
-        if idx < self.pool.segment_count() {
-            return Ok(());
-        }
-        for i in self.pool.segment_count()..=idx {
-            let name = Self::buddy_segment_name(&self.prefix, i);
-            self.pool.open_segment(&name, self.buddy_segment_size)?;
-        }
-        Ok(())
-    }
-
-    /// Ensure a dedicated segment is open at the specific index.
-    fn ensure_dedicated_segment(&mut self, seg_idx: u16, min_size: usize) -> Result<(), String> {
-        let name = Self::dedicated_segment_name(&self.prefix, seg_idx as u32);
-        self.pool.open_dedicated_at(seg_idx as u32, &name, min_size)
-    }
-
     /// Lazy-open the segment for the given coordinates if not yet mapped.
     ///
     /// Called transparently by language binding response buffers before any
@@ -99,47 +72,88 @@ impl ServerPoolState {
     pub fn ensure_segment(
         &mut self,
         seg_idx: u16,
+        generation: u32,
         data_size: u32,
         is_dedicated: bool,
     ) -> Result<(), String> {
         if is_dedicated {
-            self.ensure_dedicated_segment(seg_idx, data_size as usize)
+            if generation != 0 {
+                return Err("dedicated generation must be zero".into());
+            }
+            let name = MemPool::dedicated_segment_name(&self.prefix, u32::from(seg_idx));
+            self.pool
+                .open_dedicated_at(u32::from(seg_idx), &name, data_size as usize)
         } else {
-            self.ensure_buddy_segment(seg_idx)
+            self.pool.ensure_peer_segment(
+                u32::from(seg_idx),
+                generation,
+                self.buddy_segment_size.max(data_size as usize),
+            )
         }
     }
 
-    /// Read data from server SHM and free the allocation.
-    pub fn read_and_free(
+    /// Copy response bytes after lazily opening and validating the advertised
+    /// shared-memory span. Transport ownership is unchanged.
+    pub fn copy_response(
         &mut self,
         seg_idx: u16,
+        generation: u32,
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
-    ) -> Result<(Vec<u8>, FreeResult), String> {
-        if is_dedicated {
-            self.ensure_dedicated_segment(seg_idx, data_size as usize)?;
-        } else {
-            self.ensure_buddy_segment(seg_idx)?;
+    ) -> Result<Vec<u8>, String> {
+        self.ensure_segment(seg_idx, generation, data_size, is_dedicated)?;
+        self.pool
+            .copy_data_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            )
+            .map_err(|error| format!("response SHM copy failed: {error}"))
+    }
+
+    /// Release response storage only after validating the complete advertised
+    /// span. This prevents an invalid size from deriving a different buddy
+    /// allocation level.
+    pub fn release_response(
+        &mut self,
+        seg_idx: u16,
+        generation: u32,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<(), String> {
+        self.ensure_segment(seg_idx, generation, data_size, is_dedicated)?;
+        self.pool
+            .validate_data_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            )
+            .map_err(|error| format!("response SHM release failed: validation failed: {error}"))?;
+        self.pool
+            .free_at(
+                u32::from(seg_idx),
+                generation,
+                offset,
+                data_size,
+                is_dedicated,
+            )
+            .map_err(|error| format!("response SHM release failed: {error}"))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pool_for_test(buddy_segment_size: usize, pool: MemPool) -> Self {
+        Self {
+            prefix: pool.prefix().to_string(),
+            buddy_segment_size,
+            pool,
         }
-
-        let ptr = self
-            .pool
-            .data_ptr_at(seg_idx as u32, offset, is_dedicated)?;
-        let data = unsafe { std::slice::from_raw_parts(ptr, data_size as usize) }.to_vec();
-
-        let free_result = match self
-            .pool
-            .free_at(seg_idx as u32, offset, data_size, is_dedicated)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Warning: server SHM free_at failed: {e}");
-                FreeResult::Normal
-            }
-        };
-
-        Ok((data, free_result))
     }
 }
 
@@ -148,7 +162,7 @@ impl ServerPoolState {
 /// IPC client error.
 #[derive(Debug)]
 pub enum IpcError {
-    /// I/O error on the UDS connection.
+    /// I/O error on the local connection.
     Io(std::io::Error),
     /// Invalid client configuration or IPC address.
     Config(String),
@@ -320,28 +334,23 @@ impl MethodTable {
     fn from_route(route: &RouteInfo) -> Self {
         Self::from_entries(
             &route.methods,
-            route.name.clone(),
-            route.route_uid.clone(),
-            route.route_revision,
-            route.crm_ns.clone(),
-            route.crm_name.clone(),
-            route.crm_ver.clone(),
-            route.abi_hash.clone(),
-            route.signature_hash.clone(),
+            RouteCallIdentity {
+                route_name: route.name.clone(),
+                route_uid: route.route_uid.clone(),
+                observed_route_revision: route.route_revision,
+                crm_ns: route.crm_ns.clone(),
+                crm_name: route.crm_name.clone(),
+                crm_ver: route.crm_ver.clone(),
+                abi_hash: route.abi_hash.clone(),
+                signature_hash: route.signature_hash.clone(),
+            },
             route.max_payload_size,
         )
     }
 
     pub(crate) fn from_entries(
         entries: &[MethodEntry],
-        route_name: String,
-        route_uid: String,
-        route_revision: u64,
-        crm_ns: String,
-        crm_name: String,
-        crm_ver: String,
-        abi_hash: String,
-        signature_hash: String,
+        identity: RouteCallIdentity,
         max_payload_size: u64,
     ) -> Self {
         let mut name_to_idx = HashMap::with_capacity(entries.len());
@@ -349,14 +358,14 @@ impl MethodTable {
             name_to_idx.insert(e.name.clone(), e.index);
         }
         Self {
-            route_name,
-            route_uid,
-            route_revision,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
+            route_name: identity.route_name,
+            route_uid: identity.route_uid,
+            route_revision: identity.observed_route_revision,
+            crm_ns: identity.crm_ns,
+            crm_name: identity.crm_name,
+            crm_ver: identity.crm_ver,
+            abi_hash: identity.abi_hash,
+            signature_hash: identity.signature_hash,
             max_payload_size,
             name_to_idx,
         }
@@ -563,14 +572,16 @@ impl MethodTable {
             .collect::<Vec<_>>();
         Self::from_entries(
             &methods,
-            record.route_name.clone(),
-            record.route_uid.clone(),
-            record.route_revision,
-            record.contract.crm_ns.clone(),
-            record.contract.crm_name.clone(),
-            record.contract.crm_ver.clone(),
-            record.contract.abi_hash.clone(),
-            record.contract.signature_hash.clone(),
+            RouteCallIdentity {
+                route_name: record.route_name.clone(),
+                route_uid: record.route_uid.clone(),
+                observed_route_revision: record.route_revision,
+                crm_ns: record.contract.crm_ns.clone(),
+                crm_name: record.contract.crm_name.clone(),
+                crm_ver: record.contract.crm_ver.clone(),
+                abi_hash: record.contract.abi_hash.clone(),
+                signature_hash: record.contract.signature_hash.clone(),
+            },
             record.max_payload_size,
         )
     }
@@ -632,10 +643,35 @@ pub(crate) fn request_chunk_count(data_len: usize, chunk_size: usize) -> Result<
 }
 
 fn stream_error<E: Display>(err: E) -> IpcError {
-    IpcError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!("request body stream error: {err}"),
-    ))
+    IpcError::Io(std::io::Error::other(format!(
+        "request body stream error: {err}"
+    )))
+}
+
+fn pre_dispatch_call_error(source: IpcError) -> crate::sync_client::IpcCallError {
+    crate::sync_client::IpcCallError::new(crate::sync_client::TransportPhase::PreDispatch, source)
+}
+
+fn dispatch_uncertain_call_error(source: IpcError) -> crate::sync_client::IpcCallError {
+    crate::sync_client::IpcCallError::new(
+        crate::sync_client::TransportPhase::DispatchUncertain,
+        source,
+    )
+}
+
+fn classified_call_error(source: IpcError) -> crate::sync_client::IpcCallError {
+    crate::sync_client::IpcCallError::new(crate::sync_client::call_error_phase(&source), source)
+}
+
+fn stream_call_error(
+    source: IpcError,
+    sent_or_attempted: bool,
+) -> crate::sync_client::IpcCallError {
+    if sent_or_attempted {
+        dispatch_uncertain_call_error(source)
+    } else {
+        pre_dispatch_call_error(source)
+    }
 }
 
 async fn collect_exact_stream<S, B, E>(data_size: usize, chunks: S) -> Result<Vec<u8>, IpcError>
@@ -675,12 +711,12 @@ where
 
 /// Async IPC client for the C-Two relay.
 ///
-/// Connects to a C-Two IPC server via Unix Domain Socket, performs
+/// Connects to a C-Two IPC server through its local OS endpoint, performs
 /// handshake, and multiplexes concurrent CRM calls.
 pub struct IpcClient {
-    socket_path: PathBuf,
-    address_error: Option<String>,
-    writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+    endpoint: Result<LocalEndpoint, String>,
+    abort: Arc<StdMutex<Option<AbortHandle>>>,
+    writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     pending: Arc<StdMutex<PendingMap>>,
     rid_counter: Arc<AtomicU32>,
     pub(crate) route_directory: Arc<RwLock<RouteDirectory>>,
@@ -711,23 +747,13 @@ const _: () = {
     }
 };
 
-/// Monotonic counter so each reassembly MemPool gets a unique SHM prefix.
-/// Format: `/cc3a{pid:08x}{counter:08x}` — 32-bit range, 27 chars max.
+/// Label counter for reassembly pools. MemPool adds its incarnation and owns
+/// platform segment-name derivation.
 static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic counter so each IpcClient gets a unique conn_id.
 static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLIENT_OWN_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn socket_path_from_address(address: &str) -> (PathBuf, Option<String>) {
-    match crate::control::socket_path_from_ipc_address(address) {
-        Ok(path) => (path, None),
-        Err(error) => (
-            PathBuf::from("/tmp/c_two_ipc").join("invalid.sock"),
-            Some(error.to_string()),
-        ),
-    }
-}
 
 impl IpcClient {
     fn own_pool_from_config(config: &ClientIpcConfig) -> Option<Arc<StdMutex<MemPool>>> {
@@ -752,11 +778,12 @@ impl IpcClient {
         pool: Option<Arc<StdMutex<MemPool>>>,
         config: ClientIpcConfig,
     ) -> Self {
-        let (socket_path, address_error) = socket_path_from_address(address);
+        let endpoint = crate::control::local_endpoint_from_ipc_address(address)
+            .map_err(|error| error.to_string());
 
         Self {
-            socket_path,
-            address_error,
+            endpoint,
+            abort: Arc::new(StdMutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: Arc::new(AtomicU32::new(1)),
@@ -792,8 +819,7 @@ impl IpcClient {
 
     /// Create a new IPC client targeting the given address.
     ///
-    /// The address should be like `ipc://name` — the socket path is
-    /// derived as `/tmp/c_two_ipc/{name}.sock`.
+    /// The address is logical (`ipc://name`); Rust derives the local OS endpoint.
     pub fn new(address: &str) -> Self {
         Self::from_parts(address, None, ClientIpcConfig::default())
     }
@@ -818,21 +844,33 @@ impl IpcClient {
 
     /// Connect and perform handshake.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
-        if let Some(error) = self.address_error.clone() {
-            return Err(IpcError::Config(error));
-        }
-        let stream = UnixStream::connect(&self.socket_path).await?;
-        let (reader, mut writer) = tokio::io::split(stream);
+        let endpoint = self
+            .endpoint
+            .as_ref()
+            .map_err(|error| IpcError::Config(error.clone()))?;
+        let stream = LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT).await?;
+        *self.abort.lock() = Some(stream.abort_handle());
+        let (reader, mut writer) = stream.into_split();
 
         // Pre-allocate first SHM segment so handshake announces it.
         if let Some(ref pool_arc) = self.pool {
             let mut pool = pool_arc.lock();
             pool.ensure_ready()
-                .map_err(|e| IpcError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
         }
 
         // Perform handshake.
-        let hs = self.do_handshake(&mut writer, reader).await?;
+        let hs = tokio::time::timeout(
+            DEFAULT_CONNECT_TIMEOUT,
+            self.do_handshake(&mut writer, reader),
+        )
+        .await
+        .map_err(|_| {
+            IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "local handshake deadline expired",
+            ))
+        })??;
         let server_identity = hs
             .server_identity
             .clone()
@@ -843,8 +881,12 @@ impl IpcClient {
         self.server_identity = Some(server_identity);
 
         // Open server SHM segments into a ServerPoolState for buddy response reads.
-        if !hs.segments.is_empty() {
-            let buddy_seg_size = hs.segments[0].1 as usize;
+        {
+            let buddy_seg_size = hs
+                .segments
+                .first()
+                .map(|(_, size)| *size as usize)
+                .unwrap_or(self.config.pool_segment_size as usize);
             let cfg = c2_mem::config::PoolConfig {
                 segment_size: buddy_seg_size,
                 min_block_size: 4096,
@@ -853,14 +895,9 @@ impl IpcClient {
                 dedicated_crash_timeout_secs: 60.0,
                 buddy_idle_decay_secs: 60.0,
                 spill_threshold: 1.0,
-                spill_dir: std::path::PathBuf::from("/tmp"),
+                spill_dir: std::env::temp_dir().join("c_two_response_cache"),
             };
-            let mut pool = MemPool::new_with_prefix(cfg, hs.prefix.clone());
-            for (name, size) in &hs.segments {
-                if let Err(e) = pool.open_segment(name, *size as usize) {
-                    eprintln!("Warning: failed to open server SHM segment ({name}): {e}");
-                }
-            }
+            let pool = MemPool::open_peer(cfg, hs.prefix.clone());
             *self.server_pool.lock() = Some(ServerPoolState {
                 prefix: hs.prefix.clone(),
                 buddy_segment_size: buddy_seg_size,
@@ -882,8 +919,8 @@ impl IpcClient {
 
     async fn do_handshake(
         &self,
-        writer: &mut tokio::io::WriteHalf<UnixStream>,
-        mut reader: tokio::io::ReadHalf<UnixStream>,
+        writer: &mut LocalWriteHalf,
+        mut reader: LocalReadHalf,
     ) -> Result<Handshake, IpcError> {
         // Build segment list and prefix from pool (if available).
         let (segments, prefix, cap_flags) = if let Some(ref pool_arc) = self.pool {
@@ -1038,7 +1075,7 @@ impl IpcClient {
     }
 
     async fn send_control_unary_raw(
-        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
         payload: Vec<u8>,
@@ -1076,7 +1113,7 @@ impl IpcClient {
     }
 
     async fn list_routes_raw(
-        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
         selector: RouteSelector,
@@ -1097,7 +1134,7 @@ impl IpcClient {
     }
 
     async fn rebuild_directory_raw(
-        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        writer: Arc<Mutex<Option<LocalWriteHalf>>>,
         pending: Arc<StdMutex<PendingMap>>,
         rid_counter: Arc<AtomicU32>,
         directory: Arc<RwLock<RouteDirectory>>,
@@ -1176,6 +1213,23 @@ impl IpcClient {
         .await
     }
 
+    /// Send a route-bound call with an explicit dispatch-safety phase.
+    pub async fn call_bound_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError> {
+        self.call_bound(binding, method_name, data)
+            .await
+            .map_err(|source| {
+                crate::sync_client::IpcCallError::new(
+                    crate::sync_client::call_error_phase(&source),
+                    source,
+                )
+            })
+    }
+
     /// Send a CRM call from a known-size body stream through a previously
     /// acquired immutable route binding.
     pub async fn call_bound_sized_stream<S, B, E>(
@@ -1190,59 +1244,95 @@ impl IpcClient {
         B: AsRef<[u8]>,
         E: Display,
     {
-        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
-        if data_len > max_payload_size {
-            return Err(IpcError::Config(format!(
-                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
-                binding.route_name()
-            )));
-        }
-        self.call_sized_stream_resolved_target(method_idx, identity, data_len, chunks)
+        self.call_bound_sized_stream_phased(binding, method_name, data_len, chunks)
             .await
+            .map_err(crate::sync_client::IpcCallError::into_source)
     }
 
-    async fn call_sized_stream_resolved_target<S, B, E>(
+    /// Send a route-bound streaming call with an explicit dispatch-safety
+    /// phase.
+    pub async fn call_bound_sized_stream_phased<S, B, E>(
         &self,
-        method_idx: u16,
-        identity: RouteCallIdentity,
+        binding: &RouteBinding,
+        method_name: &str,
         data_len: u64,
         chunks: S,
-    ) -> Result<ResponseData, IpcError>
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>>,
         B: AsRef<[u8]>,
         E: Display,
     {
-        let data_len = checked_payload_len_usize(data_len)?;
+        let (method_idx, identity, max_payload_size) = binding
+            .call_target_for(method_name)
+            .map_err(pre_dispatch_call_error)?;
+        if data_len > max_payload_size {
+            return Err(pre_dispatch_call_error(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
+                binding.route_name()
+            ))));
+        }
+        self.call_sized_stream_resolved_target_phased(method_idx, identity, data_len, chunks)
+            .await
+    }
+
+    async fn call_sized_stream_resolved_target_phased<S, B, E>(
+        &self,
+        method_idx: u16,
+        identity: RouteCallIdentity,
+        data_len: u64,
+        chunks: S,
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
+        let data_len = checked_payload_len_usize(data_len).map_err(pre_dispatch_call_error)?;
         if data_len == 0 {
-            return self.call_inline(&identity, method_idx, &[]).await;
+            return self
+                .call_inline(&identity, method_idx, &[])
+                .await
+                .map_err(classified_call_error);
         }
 
         match choose_request_transport(&self.config, self.pool.is_some(), data_len) {
             RequestTransportKind::Buddy => {
-                if let Some(alloc) = self.try_alloc_request_block(data_len)? {
+                if let Some(alloc) = self
+                    .try_alloc_request_block(data_len)
+                    .map_err(pre_dispatch_call_error)?
+                {
                     return self
                         .call_buddy_stream(&identity, method_idx, alloc, data_len, chunks)
-                        .await;
+                        .await
+                        .map_err(classified_call_error);
                 }
                 match choose_request_transport(&self.config, false, data_len) {
                     RequestTransportKind::Chunked => {
-                        self.call_chunked_stream(&identity, method_idx, data_len, chunks)
+                        self.call_chunked_stream_phased(&identity, method_idx, data_len, chunks)
                             .await
                     }
                     RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                        let data = collect_exact_stream(data_len, chunks).await?;
-                        self.call_inline(&identity, method_idx, &data).await
+                        let data = collect_exact_stream(data_len, chunks)
+                            .await
+                            .map_err(pre_dispatch_call_error)?;
+                        self.call_inline(&identity, method_idx, &data)
+                            .await
+                            .map_err(classified_call_error)
                     }
                 }
             }
             RequestTransportKind::Chunked => {
-                self.call_chunked_stream(&identity, method_idx, data_len, chunks)
+                self.call_chunked_stream_phased(&identity, method_idx, data_len, chunks)
                     .await
             }
             RequestTransportKind::Inline => {
-                let data = collect_exact_stream(data_len, chunks).await?;
-                self.call_inline(&identity, method_idx, &data).await
+                let data = collect_exact_stream(data_len, chunks)
+                    .await
+                    .map_err(pre_dispatch_call_error)?;
+                self.call_inline(&identity, method_idx, &data)
+                    .await
+                    .map_err(classified_call_error)
             }
         }
     }
@@ -1358,6 +1448,7 @@ impl IpcClient {
         // Build buddy payload.
         let bp = BuddyPayload {
             seg_idx: alloc.seg_idx as u16,
+            generation: alloc.generation,
             offset: alloc.offset,
             data_size: data.len() as u32,
             is_dedicated: alloc.is_dedicated,
@@ -1533,6 +1624,7 @@ impl IpcClient {
         // Build buddy payload from pre-allocated coordinates.
         let bp = BuddyPayload {
             seg_idx: alloc.seg_idx as u16,
+            generation: alloc.generation,
             offset: alloc.offset,
             data_size: data_size as u32,
             is_dedicated: alloc.is_dedicated,
@@ -1671,22 +1763,26 @@ impl IpcClient {
         }
     }
 
-    async fn call_chunked_stream<S, B, E>(
+    async fn call_chunked_stream_phased<S, B, E>(
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
         data_size: usize,
         chunks: S,
-    ) -> Result<ResponseData, IpcError>
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>>,
         B: AsRef<[u8]>,
         E: Display,
     {
         let chunk_size = self.config.chunk_size as usize;
-        let total_chunks = request_chunk_count(data_size, chunk_size)?;
+        let total_chunks =
+            request_chunk_count(data_size, chunk_size).map_err(pre_dispatch_call_error)?;
         if total_chunks == 0 {
-            return self.call_inline(identity, method_idx, &[]).await;
+            return self
+                .call_inline(identity, method_idx, &[])
+                .await
+                .map_err(classified_call_error);
         }
 
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
@@ -1695,7 +1791,8 @@ impl IpcClient {
             self.pending.lock().insert(rid, PendingResponse::Unary(tx));
         }
 
-        let ctrl = encode_call_control(identity, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)
+            .map_err(|error| pre_dispatch_call_error(error.into()))?;
         let send_result = self
             .send_chunked_stream_frames(rid, total_chunks, chunk_size, data_size, &ctrl, chunks)
             .await;
@@ -1705,8 +1802,8 @@ impl IpcClient {
         }
 
         match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(IpcError::Closed),
+            Ok(result) => result.map_err(classified_call_error),
+            Err(_) => Err(dispatch_uncertain_call_error(IpcError::Closed)),
         }
     }
 
@@ -1718,7 +1815,7 @@ impl IpcClient {
         data_size: usize,
         ctrl: &[u8],
         chunks: S,
-    ) -> Result<(), IpcError>
+    ) -> Result<(), crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>>,
         B: AsRef<[u8]>,
@@ -1737,7 +1834,7 @@ impl IpcClient {
                     if sent_or_attempted {
                         self.close_shared().await;
                     }
-                    return Err(stream_error(err));
+                    return Err(stream_call_error(stream_error(err), sent_or_attempted));
                 }
             };
             let mut data = chunk.as_ref();
@@ -1748,17 +1845,21 @@ impl IpcClient {
                 if sent_or_attempted {
                     self.close_shared().await;
                 }
-                return Err(IpcError::Config(
-                    "request body size overflow while streaming chunks".into(),
+                return Err(stream_call_error(
+                    IpcError::Config("request body size overflow while streaming chunks".into()),
+                    sent_or_attempted,
                 ));
             };
             if next_written > data_size {
                 if sent_or_attempted {
                     self.close_shared().await;
                 }
-                return Err(IpcError::Config(format!(
-                    "request body exceeded declared content length {data_size}"
-                )));
+                return Err(stream_call_error(
+                    IpcError::Config(format!(
+                        "request body exceeded declared content length {data_size}"
+                    )),
+                    sent_or_attempted,
+                ));
             }
 
             while !data.is_empty() {
@@ -1782,7 +1883,7 @@ impl IpcClient {
                         .await
                     {
                         self.close_shared().await;
-                        return Err(err);
+                        return Err(dispatch_uncertain_call_error(err));
                     }
                     pending_chunk.clear();
                     chunk_idx += 1;
@@ -1796,9 +1897,12 @@ impl IpcClient {
             if sent_or_attempted {
                 self.close_shared().await;
             }
-            return Err(IpcError::Config(format!(
-                "request body ended at {written} bytes, expected {data_size}"
-            )));
+            return Err(stream_call_error(
+                IpcError::Config(format!(
+                    "request body ended at {written} bytes, expected {data_size}"
+                )),
+                sent_or_attempted,
+            ));
         }
 
         if !pending_chunk.is_empty() {
@@ -1816,7 +1920,7 @@ impl IpcClient {
                 .await
             {
                 self.close_shared().await;
-                return Err(err);
+                return Err(dispatch_uncertain_call_error(err));
             }
             chunk_idx += 1;
         }
@@ -1825,9 +1929,12 @@ impl IpcClient {
             if sent_or_attempted {
                 self.close_shared().await;
             }
-            return Err(IpcError::Config(format!(
-                "request stream emitted {chunk_idx} chunks, expected {total_chunks}"
-            )));
+            return Err(stream_call_error(
+                IpcError::Config(format!(
+                    "request stream emitted {chunk_idx} chunks, expected {total_chunks}"
+                )),
+                sent_or_attempted,
+            ));
         }
         Ok(())
     }
@@ -1902,14 +2009,16 @@ impl IpcClient {
             .collect::<Vec<_>>();
         MethodTable::from_entries(
             &method_entries,
-            contract.route_name.clone(),
-            contract.route_uid.clone(),
-            contract.route_revision,
-            contract.crm_ns.clone(),
-            contract.crm_name.clone(),
-            contract.crm_ver.clone(),
-            contract.abi_hash.clone(),
-            contract.signature_hash.clone(),
+            RouteCallIdentity {
+                route_name: contract.route_name.clone(),
+                route_uid: contract.route_uid.clone(),
+                observed_route_revision: contract.route_revision,
+                crm_ns: contract.crm_ns.clone(),
+                crm_name: contract.crm_name.clone(),
+                crm_ver: contract.crm_ver.clone(),
+                abi_hash: contract.abi_hash.clone(),
+                signature_hash: contract.signature_hash.clone(),
+            },
             contract.max_payload_size,
         )
     }
@@ -2105,14 +2214,12 @@ impl IpcClient {
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
         {
             let directory = self.route_directory.read();
-            if !directory.is_dirty() {
-                if let Some(table) = directory.route_table(&expected.route_name) {
-                    if Self::validate_method_table_contract(&expected.route_name, &table, expected)
-                        .is_ok()
-                    {
-                        return Ok(());
-                    }
-                }
+            if !directory.is_dirty()
+                && let Some(table) = directory.route_table(&expected.route_name)
+                && Self::validate_method_table_contract(&expected.route_name, &table, expected)
+                    .is_ok()
+            {
+                return Ok(());
             }
         }
 
@@ -2120,12 +2227,11 @@ impl IpcClient {
             self.rebuild_route_directory().await?;
             {
                 let directory = self.route_directory.read();
-                if let Some(table) = directory.route_table(&expected.route_name) {
-                    if Self::validate_method_table_contract(&expected.route_name, &table, expected)
+                if let Some(table) = directory.route_table(&expected.route_name)
+                    && Self::validate_method_table_contract(&expected.route_name, &table, expected)
                         .is_ok()
-                    {
-                        return Ok(());
-                    }
+                {
+                    return Ok(());
                 }
             }
         }
@@ -2157,23 +2263,28 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<RouteBinding, IpcError> {
-        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
         let mut last_unbound = None;
 
-        for attempt in 0..attempts {
+        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route(expected) {
                 Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::RouteNotFound(route_name));
                 }
-                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::WatchUnavailable(reason));
                 }
                 Err(err) => return Err(err),
             }
-            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if let Some(delay_ms) = delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
         }
 
         Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
@@ -2289,23 +2400,28 @@ impl IpcClient {
             }
         }
 
-        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
         let mut last_unbound = None;
 
-        for attempt in 0..attempts {
+        for delay_ms in ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
             self.lookup_route_contract_for_acquire(expected).await?;
             match self.bind_cached_route_token(expected, route_uid, route_revision) {
                 Ok(binding) => return Ok(binding),
-                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                Err(IpcError::RouteNotFound(route_name)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::RouteNotFound(route_name));
                 }
-                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                Err(IpcError::WatchUnavailable(reason)) if delay_ms.is_some() => {
                     last_unbound = Some(IpcError::WatchUnavailable(reason));
                 }
                 Err(err) => return Err(err),
             }
-            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if let Some(delay_ms) = delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
         }
 
         Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
@@ -2398,24 +2514,35 @@ impl IpcClient {
     /// cannot prove unique ownership at shutdown time.
     pub async fn close_shared(&self) {
         self.connected.store(false, Ordering::Release);
-        // Best-effort: send DISCONNECT signal so the server can clean up
-        // immediately instead of waiting for heartbeat timeout.
-        {
+        // Bound both writer-lock acquisition and the control exchange. A
+        // cancelled partial write aborts its stream instead of leaving a frame
+        // prefix for a later writer to reuse.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             let mut guard = self.writer.lock().await;
-            if let Some(w) = guard.as_mut() {
-                let disconnect_frame =
-                    frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
-                let _ = w.write_all(&disconnect_frame).await;
+            if let Some(writer) = guard.as_mut() {
+                let frame = frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
+                let _ = writer.write_all(&frame).await;
+            }
+        })
+        .await;
+        let receiver = self.recv_handle.lock().take();
+        if let Some(mut receiver) = receiver {
+            // The receive loop ends on DISCONNECT_ACK or peer EOF.
+            if tokio::time::timeout(std::time::Duration::from_millis(100), &mut receiver)
+                .await
+                .is_err()
+            {
+                if let Some(abort) = self.abort.lock().as_ref() {
+                    abort.abort();
+                }
+                receiver.abort();
+                let _ = receiver.await;
             }
         }
-        // Brief grace period for the server to reply DISCONNECT_ACK.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        // Drop writer to close the write half.
-        *self.writer.lock().await = None;
-        // Abort recv task in case the peer does not close promptly.
-        if let Some(handle) = self.recv_handle.lock().take() {
-            handle.abort();
+        if let Some(abort) = self.abort.lock().take() {
+            abort.abort();
         }
+        *self.writer.lock().await = None;
         // Wake pending callers.
         let mut pending = self.pending.lock();
         for (_, pending) in pending.drain() {
@@ -2443,10 +2570,10 @@ fn complete_unary_pending(
 }
 
 async fn recv_loop(
-    mut reader: tokio::io::ReadHalf<UnixStream>,
+    mut reader: LocalReadHalf,
     pending: Arc<StdMutex<PendingMap>>,
     _server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
-    writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+    writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     chunk_registry: Arc<ChunkRegistry>,
     conn_id: u64,
 ) {
@@ -2473,10 +2600,8 @@ async fn recv_loop(
             recv_buf.reserve(payload_len - recv_buf.capacity());
         }
         recv_buf.resize(payload_len, 0);
-        if payload_len > 0 {
-            if reader.read_exact(&mut recv_buf).await.is_err() {
-                break;
-            }
+        if payload_len > 0 && reader.read_exact(&mut recv_buf).await.is_err() {
+            break;
         }
 
         // Handle signal frames.
@@ -2625,6 +2750,7 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
         match ctrl {
             ReplyControl::Success => Ok(ResponseData::Shm {
                 seg_idx: bp.seg_idx,
+                generation: bp.generation,
                 offset: bp.offset,
                 data_size: bp.data_size,
                 is_dedicated: bp.is_dedicated,
@@ -2647,6 +2773,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn streamed_call_failure_phase_depends_on_frame_attempt_not_error_variant() {
+        let before_dispatch = stream_call_error(IpcError::Config("short body".into()), false);
+        let after_frame_attempt = stream_call_error(IpcError::Config("short body".into()), true);
+
+        assert_eq!(
+            before_dispatch.phase(),
+            crate::sync_client::TransportPhase::PreDispatch
+        );
+        assert_eq!(
+            after_frame_attempt.phase(),
+            crate::sync_client::TransportPhase::DispatchUncertain
+        );
+        assert!(before_dispatch.is_retry_safe());
+        assert!(!after_frame_attempt.is_retry_safe());
+    }
+
+    #[test]
     fn reassembly_pool_unique_prefixes() {
         let cfg = ClientIpcConfig::default();
         let r1 = IpcClient::make_chunk_registry(&cfg);
@@ -2660,8 +2803,8 @@ mod tests {
         assert_ne!(prefix1, prefix3);
         assert!(prefix1.starts_with("/cc3a"), "unexpected prefix: {prefix1}");
         assert!(
-            prefix1.len() <= 24,
-            "prefix exceeds SHM name limit: {}",
+            prefix1.len() <= c2_contract::MAX_WIRE_TEXT_BYTES,
+            "prefix exceeds handshake text limit: {}",
             prefix1.len()
         );
     }
@@ -2709,14 +2852,16 @@ mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
-                "grid".to_string(),
-                "grid-route-uid-0001".to_string(),
-                1,
-                "test.grid".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                ABI_HASH.to_string(),
-                SIG_HASH.to_string(),
+                RouteCallIdentity {
+                    route_name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0001".to_string(),
+                    observed_route_revision: 1,
+                    crm_ns: "test.grid".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: ABI_HASH.to_string(),
+                    signature_hash: SIG_HASH.to_string(),
+                },
                 1024,
             ),
         );
@@ -2739,14 +2884,16 @@ mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
-                "grid".to_string(),
-                "grid-route-uid-0002".to_string(),
-                2,
-                "test.grid".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                ABI_HASH.to_string(),
-                SIG_HASH.to_string(),
+                RouteCallIdentity {
+                    route_name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0002".to_string(),
+                    observed_route_revision: 2,
+                    crm_ns: "test.grid".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: ABI_HASH.to_string(),
+                    signature_hash: SIG_HASH.to_string(),
+                },
                 1024,
             ),
         );
@@ -2775,14 +2922,16 @@ mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
-                "grid".to_string(),
-                "grid-route-uid-0002".to_string(),
-                2,
-                "test.grid".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                ABI_HASH.to_string(),
-                SIG_HASH.to_string(),
+                RouteCallIdentity {
+                    route_name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0002".to_string(),
+                    observed_route_revision: 2,
+                    crm_ns: "test.grid".to_string(),
+                    crm_name: "Grid".to_string(),
+                    crm_ver: "0.1.0".to_string(),
+                    abi_hash: ABI_HASH.to_string(),
+                    signature_hash: SIG_HASH.to_string(),
+                },
                 1024,
             ),
         );

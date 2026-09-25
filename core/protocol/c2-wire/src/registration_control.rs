@@ -186,7 +186,7 @@ fn validate_attested_contract(contract: &PendingRouteAttestation) -> Result<(), 
         ));
     }
     for method_name in &contract.method_names {
-        let len = method_name.as_bytes().len();
+        let len = method_name.len();
         if len > u8::MAX as usize {
             return Err(format!("method name is too long: {len} bytes > 255"));
         }

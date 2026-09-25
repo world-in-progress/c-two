@@ -190,6 +190,27 @@ class CRMProxy:
         return self._name
 
     @property
+    def observed_path(self) -> str:
+        """Core-observed transport path for this remote proxy."""
+        if self._mode == 'thread':
+            return 'thread_local'
+        return self._client.observed_path
+
+    @property
+    def route_uid(self) -> str:
+        """Immutable route identity observed when this remote proxy connected."""
+        if self._mode == 'thread':
+            raise RuntimeError('thread-local proxy has no remote route token')
+        return self._client.route_uid
+
+    @property
+    def route_revision(self) -> int:
+        """Route revision observed when this remote proxy connected."""
+        if self._mode == 'thread':
+            raise RuntimeError('thread-local proxy has no remote route token')
+        return self._client.route_revision
+
+    @property
     def lease_tracker(self) -> Any:
         """Native retained-buffer lease tracker for this process session."""
         return self._lease_tracker

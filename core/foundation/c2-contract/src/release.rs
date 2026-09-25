@@ -1,7 +1,8 @@
 use crate::descriptor::canonical_json;
 use crate::{
-    ContractError, ExpectedRouteContract, ValidatedContractDescriptor, validate_contract_hash,
-    validate_contract_text_field, validate_expected_route_contract,
+    ContractError, ContractLimits, ExpectedRouteContract, ValidatedContractDescriptor,
+    admission::{JsonDocumentKind, parse_bounded_json},
+    validate_contract_hash, validate_contract_text_field, validate_expected_route_contract,
 };
 use serde_json::Value;
 use std::fmt;
@@ -66,9 +67,20 @@ pub struct ContractRelease {
 
 impl ContractRelease {
     pub fn from_descriptor_json(bytes: &[u8]) -> Result<Self, ContractError> {
+        Self::from_descriptor_json_with_limits(bytes, ContractLimits::default())
+    }
+
+    pub fn from_descriptor_json_with_limits(
+        bytes: &[u8],
+        limits: ContractLimits,
+    ) -> Result<Self, ContractError> {
         Ok(Self {
-            descriptor: ValidatedContractDescriptor::from_json(bytes)?,
+            descriptor: ValidatedContractDescriptor::from_json_with_limits(bytes, limits)?,
         })
+    }
+
+    pub fn descriptor(&self) -> &ValidatedContractDescriptor {
+        &self.descriptor
     }
 
     pub fn canonical_descriptor_json(&self) -> &str {
@@ -117,8 +129,14 @@ pub struct ContractReleaseRef {
 
 impl ContractReleaseRef {
     pub fn from_json(bytes: &[u8]) -> Result<Self, ContractError> {
-        let value: Value = serde_json::from_slice(bytes)
-            .map_err(|error| ContractError::InvalidReleaseRefJson(error.to_string()))?;
+        Self::from_json_with_limits(bytes, ContractLimits::default())
+    }
+
+    pub fn from_json_with_limits(
+        bytes: &[u8],
+        limits: ContractLimits,
+    ) -> Result<Self, ContractError> {
+        let value = parse_bounded_json(bytes, limits, JsonDocumentKind::ContractReleaseRef)?;
         let root = ref_object_at(&value, "$")?;
         ensure_ref_keys(
             root,

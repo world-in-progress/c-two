@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -9,7 +11,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport import Server
-from c_two.transport.client.util import _socket_path_from_address, ping
+from c_two.transport.client.util import _endpoint_name_from_address, ping
 
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
@@ -112,7 +114,6 @@ class TestHeartbeatIntegration:
         This tests low-level transport behavior — the server must detect
         and clean up dead connections without crashing.
         """
-        import socket
         address = f'ipc://{_unique_region()}'
         server = _hello_server(
             address,
@@ -121,19 +122,46 @@ class TestHeartbeatIntegration:
         server.start()
         try:
             _wait_for_server(address)
-            sock_path = _socket_path_from_address(address)
-            raw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            raw_sock.connect(sock_path)
-            raw_sock.settimeout(1.0)
-            # Wait for heartbeat timeout + margin
-            time.sleep(0.6)
-            # Server should have closed the connection
-            try:
-                data = raw_sock.recv(4096)
-            except (ConnectionResetError, BrokenPipeError, OSError):
-                pass
-            finally:
-                raw_sock.close()
+            # A separate process bounds blocking named-pipe reads on Windows.
+            result = subprocess.run(
+                [sys.executable, '-c', r"""
+import errno
+import socket
+import sys
+
+if sys.platform == 'win32':
+    connection = open(sys.argv[1], 'r+b', buffering=0)
+    read = connection.read
+else:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(2.0)
+    connection.connect(sys.argv[1])
+    read = connection.recv
+received = bytearray()
+try:
+    while True:
+        try:
+            chunk = read(4096)
+        except TimeoutError as error:
+            raise AssertionError(f"connection stayed open after {len(received)} bytes: {received.hex()}") from error
+        except OSError as error:
+            if error.errno in (errno.EPIPE, errno.ECONNRESET) or getattr(error, 'winerror', None) in (109, 233):
+                break
+            raise
+        if not chunk:
+            break
+        received.extend(chunk)
+finally:
+    connection.close()
+# The server sent a PING before retiring the non-responsive connection.
+assert len(received) >= 17, received
+assert received[16] == 1, received
+""", _endpoint_name_from_address(address)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
 
             # Server should still be functional for new clients
             assert ping(address, timeout=1.0)

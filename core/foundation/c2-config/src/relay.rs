@@ -108,7 +108,7 @@ impl RelayConfig {
         }
 
         let max_host_bytes = 255usize.saturating_sub(tail.len()).max(1);
-        if host.as_bytes().len() > max_host_bytes {
+        if host.len() > max_host_bytes {
             let mut end = max_host_bytes;
             while !host.is_char_boundary(end) {
                 end -= 1;
@@ -148,8 +148,10 @@ mod tests {
 
     #[test]
     fn idle_timeout_must_fit_milliseconds() {
-        let mut config = RelayConfig::default();
-        config.idle_timeout_secs = u64::MAX;
+        let config = RelayConfig {
+            idle_timeout_secs: u64::MAX,
+            ..RelayConfig::default()
+        };
 
         let err = config
             .validate()
@@ -161,8 +163,10 @@ mod tests {
 
     #[test]
     fn relay_config_rejects_invalid_relay_id() {
-        let mut config = RelayConfig::default();
-        config.relay_id = "bad\nrelay".to_string();
+        let config = RelayConfig {
+            relay_id: "bad\nrelay".to_string(),
+            ..RelayConfig::default()
+        };
 
         let err = config
             .validate()
@@ -173,8 +177,10 @@ mod tests {
 
     #[test]
     fn relay_config_rejects_invalid_remote_payload_chunk_size() {
-        let mut config = RelayConfig::default();
-        config.remote_payload_chunk_size = 0;
+        let config = RelayConfig {
+            remote_payload_chunk_size: 0,
+            ..RelayConfig::default()
+        };
 
         let err = config
             .validate()
@@ -190,7 +196,7 @@ mod tests {
         let relay_id = RelayConfig::build_generated_relay_id(&host, 1234, "abcd1234");
 
         assert!(relay_id.ends_with("_1234_abcd1234"));
-        assert!(relay_id.as_bytes().len() <= 255);
+        assert!(relay_id.len() <= 255);
         crate::validate_relay_id(&relay_id).unwrap();
     }
 

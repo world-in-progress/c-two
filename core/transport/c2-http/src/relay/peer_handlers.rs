@@ -16,7 +16,7 @@ fn current_full_sync_envelope(state: &RelayState) -> FullSyncEnvelope {
     let mut snapshot = state.full_snapshot();
     snapshot
         .tombstones
-        .retain(|tombstone| tombstone.relay_id != "");
+        .retain(|tombstone| !tombstone.relay_id.is_empty());
     if !snapshot
         .peers
         .iter()
@@ -94,7 +94,7 @@ pub async fn handle_peer_announce(
             // route storage scrubbed as a second local invariant.
             let _ = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
                 sender_relay_id,
-                entry: RouteEntry {
+                entry: Box::new(RouteEntry {
                     name,
                     relay_id,
                     relay_url,
@@ -111,7 +111,7 @@ pub async fn handle_peer_announce(
                     route_revision,
                     locality: Locality::Peer,
                     registered_at,
-                },
+                }),
             });
         }
         PeerMessage::RouteWithdraw {
@@ -307,25 +307,23 @@ pub async fn handle_peer_digest(
             }
 
             for peer_entry in digest {
-                if peer_entry.relay_id == state.relay_id() && !peer_entry.deleted {
-                    if state
+                if peer_entry.relay_id == state.relay_id()
+                    && !peer_entry.deleted
+                    && state
                         .route_state_for_diff(&peer_entry.name, &peer_entry.relay_id, false)
                         .is_none()
-                    {
-                        let tombstone = state.authoritative_missing_tombstone(
-                            &peer_entry.name,
-                            &peer_entry.relay_id,
-                        );
-                        if let Some(tombstone) = tombstone {
-                            let hash = tombstone_digest_hash(&tombstone);
-                            diff_entries.push(DigestDiffEntry::Deleted {
-                                name: tombstone.name,
-                                relay_id: tombstone.relay_id,
-                                removed_at: tombstone.removed_at,
-                                removed_revision: tombstone.removed_revision,
-                                hash,
-                            });
-                        }
+                {
+                    let tombstone = state
+                        .authoritative_missing_tombstone(&peer_entry.name, &peer_entry.relay_id);
+                    if let Some(tombstone) = tombstone {
+                        let hash = tombstone_digest_hash(&tombstone);
+                        diff_entries.push(DigestDiffEntry::Deleted {
+                            name: tombstone.name,
+                            relay_id: tombstone.relay_id,
+                            removed_at: tombstone.removed_at,
+                            removed_revision: tombstone.removed_revision,
+                            hash,
+                        });
                     }
                 }
             }
@@ -348,7 +346,7 @@ pub async fn handle_peer_digest(
                         let entry = active.into();
                         let _ = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
                             sender_relay_id: sender_relay_id.clone(),
-                            entry,
+                            entry: Box::new(entry),
                         });
                     }
                     ValidatedDigestDiffEntry::Deleted(deleted) => {
@@ -482,7 +480,7 @@ mod tests {
         RouteAuthority::new(state)
             .execute(RouteCommand::AnnouncePeer {
                 sender_relay_id,
-                entry,
+                entry: Box::new(entry),
             })
             .unwrap();
     }

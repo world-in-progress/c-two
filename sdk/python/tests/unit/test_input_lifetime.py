@@ -15,7 +15,6 @@ def test_borrowed_dispatch_requires_fdb_payload_binding():
         kind=PayloadPlanKind.PYTHON_PICKLE,
         serialize=lambda *values: b'',
         deserialize=lambda data: (),
-        view_from_buffer=lambda data: (),
         label='fake.python_pickle.with_view',
     )
 
@@ -34,7 +33,7 @@ def test_borrowed_dispatch_requires_fdb_payload_binding():
         input_lifetime={'total': InputLifetime.BORROWED},
     )
 
-    with pytest.raises(ValueError, match='requires a buffer-view FDB input payload'):
+    with pytest.raises(ValueError, match='explicit FastDB Payload input binding'):
         slot.build_dispatch_table()
 
 
@@ -54,7 +53,6 @@ def test_borrowed_transfer_wrapper_rejects_non_fdb_payload_binding():
         kind=PayloadPlanKind.PYTHON_PICKLE,
         serialize=lambda *values: b'',
         deserialize=lambda data: (),
-        view_from_buffer=lambda data: (),
         label='fake.python_pickle.with_view',
     )
     wrapped = _build_transfer_wrapper(
@@ -74,4 +72,4 @@ def test_borrowed_transfer_wrapper_rejects_non_fdb_payload_binding():
     assert released == [True]
     assert payload == b''
     assert b'constructing resource input from buffer' in err_bytes
-    assert b'buffer-view FDB input payload' in err_bytes
+    assert b'explicit FastDB Payload binding' in err_bytes

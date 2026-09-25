@@ -157,12 +157,11 @@ impl HttpClientPool {
         let mut entries = self.entries.lock();
         let grace = self.grace_period;
         entries.retain(|_url, entry| {
-            if entry.ref_count == 0 {
-                if let Some(released_at) = entry.last_release {
-                    if released_at.elapsed() >= grace {
-                        return false;
-                    }
-                }
+            if entry.ref_count == 0
+                && let Some(released_at) = entry.last_release
+                && released_at.elapsed() >= grace
+            {
+                return false;
             }
             true
         });

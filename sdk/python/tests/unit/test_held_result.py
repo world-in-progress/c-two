@@ -64,12 +64,13 @@ class TestHeldResultBasic:
             hr.__del__()
             assert len(w) == 0
 
-    def test_release_cb_exception_swallowed(self):
+    def test_release_cb_exception_is_propagated_after_owner_is_closed(self):
         from c_two.crm.transferable import HeldResult
         def bad_cb():
             raise RuntimeError('boom')
         hr = HeldResult('err', release_cb=bad_cb)
-        hr.release()  # should not raise
+        with pytest.raises(RuntimeError, match='boom'):
+            hr.release()
         with pytest.raises(Exception):
             _ = hr.value
 
@@ -80,36 +81,51 @@ class TestHeldResultBasic:
         hr = HeldResult('value', release_cb=raw.release, buffer=raw)
 
         assert bytes(hr.unsafe_buffer) == b'abc'
-        assert bytes(hr.buffer) == b'abc'
+        assert not hasattr(type(hr), 'buffer')
         assert hr.value == 'value'
 
         hr.release()
 
         with pytest.raises(Exception):
             _ = hr.unsafe_buffer
-        with pytest.raises(Exception):
-            _ = hr.buffer
 
-    def test_release_does_not_invalidate_external_fastdb_owner_by_default(self):
-        fdb = pytest.importorskip('fastdb4py', reason='fastdb owner lifecycle requires fastdb4py')
-        from fastdb4py.column_engine import ColumnEngine
+    def test_release_does_not_invalidate_external_owner_by_default(self):
         from c_two.crm.transferable import HeldResult
 
-        @fdb.feature
-        class Point:
-            x: fdb.F64
+        class Owner:
+            invalidated = False
 
-        engine = ColumnEngine.create()
-        engine.push(Point(x=1.0), table_name='points')
-        engine.combine()
-        owner = fdb.FdbViewOwner(checked=True, writeable=False)
-        table = engine.table(Point, name='points', owner=owner, writeable=False)
-        row = table[0]
+            def invalidate(self):
+                self.invalidated = True
 
-        HeldResult(table, release_cb=None).release()
+        owner = Owner()
+        HeldResult(owner, release_cb=None).release()
+        assert owner.invalidated is False
 
-        assert owner.alive is True
-        assert row.x == pytest.approx(1.0)
+    def test_invalidation_failure_does_not_skip_transport_release(self):
+        from c_two.crm.transferable import HeldResult
+
+        events = []
+
+        def invalidate(_value):
+            events.append('invalidate')
+            raise RuntimeError('invalidate failed')
+
+        def release():
+            events.append('release')
+
+        held = HeldResult(
+            'value',
+            release_cb=release,
+            invalidate_cb=invalidate,
+        )
+
+        with pytest.raises(RuntimeError, match='invalidate failed'):
+            held.release()
+
+        assert events == ['invalidate', 'release']
+        with pytest.raises(RuntimeError, match='no longer accessible'):
+            _ = held.value
 
 
 class TestHoldFunction:

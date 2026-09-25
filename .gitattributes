@@ -1,0 +1,2 @@
+# Keep code, generated-text fixtures, and canonical inputs byte-stable on every OS.
+* text=auto eol=lf

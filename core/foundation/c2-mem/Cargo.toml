@@ -2,12 +2,28 @@
 name = "c2-mem"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "C-Two shared memory subsystem: buddy allocator, SHM regions, and unified pool"
 
 [lib]
 name = "c2_mem"
 
 [dependencies]
-c2-config = { path = "../c2-config" }
+c2-config = { version = "0.1.0", path = "../c2-config" }
 libc = "0.2"
 memmap2 = "0.9"
+base64 = "0.22"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+c2-local-security = { version = "0.1.0", path = "../c2-local-security" }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

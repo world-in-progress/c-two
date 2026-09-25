@@ -13,12 +13,8 @@ use std::time::{Duration, Instant};
 
 use c2_mem::{MemPool, PoolConfig};
 
-/// Monotonic counter so each client MemPool gets a unique SHM prefix
-/// within the same process.  Format: `/cc3c{pid:08x}{counter:08x}`.
-///
-/// Uses 32-bit range (~4 billion unique prefixes per process).
-/// Combined with `_b{idx:04x}` suffix, max SHM name length is 27 chars
-/// (within POSIX 31-char limit on macOS).
+/// Label counter for client pools. MemPool adds its incarnation and owns
+/// platform segment-name derivation.
 static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 const CONNECT_TRANSIENT_RETRY_ATTEMPTS: usize = 3;
 
@@ -162,12 +158,12 @@ impl ClientPool {
         let mut entries = self.entries.lock();
 
         // Another thread may have raced and inserted the same address.
-        if let Some(entry) = entries.get_mut(address) {
-            if entry.client.is_connected() {
-                entry.ref_count += 1;
-                entry.last_release = None;
-                return Ok(Arc::clone(&entry.client));
-            }
+        if let Some(entry) = entries.get_mut(address)
+            && entry.client.is_connected()
+        {
+            entry.ref_count += 1;
+            entry.last_release = None;
+            return Ok(Arc::clone(&entry.client));
             // Stale racing entry — replace below.
         }
 
@@ -201,6 +197,43 @@ impl ClientPool {
         }
     }
 
+    /// Release one reference only when the pool still contains the acquired client.
+    ///
+    /// This identity check prevents a late drop from an evicted connection
+    /// decrementing the reference count of a replacement at the same address.
+    pub fn release_if_same(&self, address: &str, observed: &Arc<SyncClient>) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(address) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&entry.client, observed) {
+            return false;
+        }
+        if entry.ref_count == 0 {
+            return false;
+        }
+        entry.ref_count -= 1;
+        if entry.ref_count == 0 {
+            entry.last_release = Some(Instant::now());
+        }
+        true
+    }
+
+    /// Remove one observed unusable client without evicting a racing replacement.
+    ///
+    /// Callers must use this only after a pre-dispatch operation proves that
+    /// the exact acquired connection can no longer serve requests.
+    pub fn discard_if_same(&self, address: &str, observed: &Arc<SyncClient>) -> bool {
+        let mut entries = self.entries.lock();
+        let is_same = entries
+            .get(address)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.client, observed));
+        if is_same {
+            entries.remove(address);
+        }
+        is_same
+    }
+
     /// Sweep expired entries that have been unreferenced longer than
     /// `grace_period`. Call this periodically from SDK bindings or before
     /// acquire.
@@ -208,13 +241,12 @@ impl ClientPool {
         let mut entries = self.entries.lock();
         let grace = self.grace_period;
         entries.retain(|_addr, entry| {
-            if entry.ref_count == 0 {
-                if let Some(released_at) = entry.last_release {
-                    if released_at.elapsed() >= grace {
-                        // Drop the Arc — connection closes when last ref is gone.
-                        return false;
-                    }
-                }
+            if entry.ref_count == 0
+                && let Some(released_at) = entry.last_release
+                && released_at.elapsed() >= grace
+            {
+                // Drop the Arc — connection closes when last ref is gone.
+                return false;
             }
             true
         });
@@ -267,11 +299,11 @@ impl ClientPool {
 mod tests {
     use super::*;
     use crate::client::IpcClient;
+    use c2_local::{LocalEndpoint, LocalListener};
     use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixListener;
     use std::sync::Arc;
     use std::thread;
+    use tokio::io::AsyncReadExt;
 
     use c2_server::{
         ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
@@ -468,6 +500,50 @@ mod tests {
     }
 
     #[test]
+    fn discard_if_same_removes_only_the_observed_stale_client() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let address = "ipc://stale";
+        let observed = Arc::new(make_disconnected_client());
+        let raced_replacement = Arc::new(make_disconnected_client());
+
+        pool.entries.lock().insert(
+            address.to_string(),
+            PoolEntry {
+                client: Arc::clone(&observed),
+                ref_count: 1,
+                last_release: None,
+            },
+        );
+
+        assert!(!pool.discard_if_same(address, &raced_replacement));
+        assert!(pool.has_client(address));
+        assert!(pool.discard_if_same(address, &observed));
+        assert!(!pool.has_client(address));
+    }
+
+    #[test]
+    fn release_if_same_cannot_decrement_a_racing_replacement() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let address = "ipc://replacement";
+        let observed = Arc::new(make_disconnected_client());
+        let replacement = Arc::new(make_disconnected_client());
+
+        pool.entries.lock().insert(
+            address.to_string(),
+            PoolEntry {
+                client: Arc::clone(&replacement),
+                ref_count: 1,
+                last_release: None,
+            },
+        );
+
+        assert!(!pool.release_if_same(address, &observed));
+        assert_eq!(pool.refcount(address), 1);
+        assert!(pool.release_if_same(address, &replacement));
+        assert_eq!(pool.refcount(address), 0);
+    }
+
+    #[test]
     fn test_pool_shutdown_all() {
         let pool = ClientPool::new(Duration::from_secs(30));
 
@@ -509,78 +585,92 @@ mod tests {
     #[test]
     fn acquire_retries_transient_handshake_eof() {
         let address = format!("ipc://pool_retry_{}", std::process::id());
-        let socket_path = crate::socket_path_from_ipc_address(&address).unwrap();
-        if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = LocalEndpoint::from_address(&address).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let server_thread = thread::spawn(move || {
-            for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-
-                let mut len_buf = [0_u8; 4];
-                stream.read_exact(&mut len_buf).unwrap();
-                let body_len = u32::from_le_bytes(len_buf) as usize;
-                let mut body = vec![0_u8; body_len];
-                stream.read_exact(&mut body).unwrap();
-
-                if attempt == 0 {
-                    continue;
-                }
-
-                let route = c2_wire::handshake::RouteInfo {
-                    name: "grid".to_string(),
-                    route_uid: "grid-route-uid-0001".to_string(),
-                    route_revision: 1,
-                    crm_ns: "test.pool".to_string(),
-                    crm_name: "Grid".to_string(),
-                    crm_ver: "0.1.0".to_string(),
-                    abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        .to_string(),
-                    signature_hash:
-                        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                            .to_string(),
-                    max_payload_size: 1024,
-                    methods: vec![c2_wire::handshake::MethodEntry {
-                        name: "ping".to_string(),
-                        index: 0,
-                    }],
-                };
-                let identity = c2_wire::handshake::ServerIdentity {
-                    server_id: "pool-retry-server".to_string(),
-                    server_instance_id: "pool-retry-instance".to_string(),
-                };
-                let payload = c2_wire::handshake::encode_server_handshake(
-                    &[],
-                    c2_wire::handshake::CAP_CALL_V2
-                        | c2_wire::handshake::CAP_METHOD_IDX
-                        | c2_wire::handshake::CAP_CHUNKED,
-                    &[route],
-                    "",
-                    &identity,
-                )
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .unwrap();
-                let frame = c2_wire::frame::encode_frame(
-                    0,
-                    c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
-                    &payload,
-                );
-                stream.write_all(&frame).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(150)))
-                    .unwrap();
-                let mut extra_len = [0_u8; 4];
-                match stream.read_exact(&mut extra_len) {
-                    Err(err)
-                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-                    Ok(()) => panic!("direct IPC connect must not open a route-watch stream"),
-                    Err(err) => panic!("unexpected post-handshake read error: {err}"),
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            runtime.block_on(async move {
+                let mut listener = LocalListener::bind(&endpoint).unwrap();
+                ready_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    for attempt in 0..2 {
+                        let mut stream = listener.accept().await.unwrap();
+
+                        let mut len_buf = [0_u8; 4];
+                        stream.read_exact(&mut len_buf).await.unwrap();
+                        let body_len = u32::from_le_bytes(len_buf) as usize;
+                        let mut body = vec![0_u8; body_len];
+                        stream.read_exact(&mut body).await.unwrap();
+
+                        if attempt == 0 {
+                            continue;
+                        }
+
+                        let route = c2_wire::handshake::RouteInfo {
+                            name: "grid".to_string(),
+                            route_uid: "grid-route-uid-0001".to_string(),
+                            route_revision: 1,
+                            crm_ns: "test.pool".to_string(),
+                            crm_name: "Grid".to_string(),
+                            crm_ver: "0.1.0".to_string(),
+                            abi_hash:
+                                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                                    .to_string(),
+                            signature_hash:
+                                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                                    .to_string(),
+                            max_payload_size: 1024,
+                            methods: vec![c2_wire::handshake::MethodEntry {
+                                name: "ping".to_string(),
+                                index: 0,
+                            }],
+                        };
+                        let identity = c2_wire::handshake::ServerIdentity {
+                            server_id: "pool-retry-server".to_string(),
+                            server_instance_id: "pool-retry-instance".to_string(),
+                        };
+                        let payload = c2_wire::handshake::encode_server_handshake(
+                            &[],
+                            c2_wire::handshake::CAP_CALL_V2
+                                | c2_wire::handshake::CAP_METHOD_IDX
+                                | c2_wire::handshake::CAP_CHUNKED,
+                            &[route],
+                            "",
+                            &identity,
+                        )
+                        .unwrap();
+                        let frame = c2_wire::frame::encode_frame(
+                            0,
+                            c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
+                            &payload,
+                        );
+                        stream.write_all(&frame).await.unwrap();
+                        let mut extra_len = [0_u8; 4];
+                        match tokio::time::timeout(
+                            Duration::from_millis(150),
+                            stream.read_exact(&mut extra_len),
+                        )
+                        .await
+                        {
+                            Err(_) => {}
+                            Ok(Ok(_)) => {
+                                panic!("direct IPC connect must not open a route-watch stream")
+                            }
+                            Ok(Err(err)) => panic!("unexpected post-handshake read error: {err}"),
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .expect("retry handshake fixture must finish");
+            });
         });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retry listener readiness");
 
         let pool = ClientPool::new(Duration::from_secs(60));
         let client = pool.acquire(&address, None).unwrap();
@@ -588,7 +678,6 @@ mod tests {
         pool.release(&address);
 
         server_thread.join().unwrap();
-        let _ = std::fs::remove_file(socket_path);
     }
 
     #[test]
@@ -758,12 +847,15 @@ mod tests {
         let c2 = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let p2 = format!("/cc3c{:08x}{:08x}", std::process::id(), c2);
         assert_ne!(p1, p2, "consecutive prefixes must differ");
-        assert!(p1.len() <= 24, "prefix must fit SHM name limit");
         // Verify the pools can be created with these prefixes.
         let pool1 = MemPool::new_with_prefix(pc.clone(), p1.clone());
-        let pool2 = MemPool::new_with_prefix(pc, p2.clone());
-        assert_eq!(pool1.prefix(), &p1);
-        assert_eq!(pool2.prefix(), &p2);
+        let pool2 = MemPool::new_with_prefix(pc.clone(), p2.clone());
+        let repeated_label = MemPool::new_with_prefix(pc, p1.clone());
+        assert!(pool1.prefix().starts_with(&format!("{p1}_")));
+        assert!(pool2.prefix().starts_with(&format!("{p2}_")));
+        assert_ne!(pool1.prefix(), repeated_label.prefix());
+        assert_ne!(pool1.prefix(), pool2.prefix());
+        assert!(pool1.prefix().len() <= c2_contract::MAX_WIRE_TEXT_BYTES);
     }
 
     /// Create a disconnected SyncClient for testing pool bookkeeping.

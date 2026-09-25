@@ -5,7 +5,7 @@
 <h1 align="center">C-Two</h1>
 
 <p align="center">
-  面向资源的 RPC runtime — 将有状态对象转变为位置透明的分布式资源。
+  面向资源的 RPC runtime — 将有状态类转变为位置透明的分布式资源。
 </p>
 
 <p align="center">
@@ -22,523 +22,334 @@
 
 ---
 
-## 基本理念
+## C-Two 是什么
 
-- **面向资源的 RPC** — C-Two 通过语言 SDK 暴露有状态 resource object。Python SDK 让 Python 类在保持面向对象特性的同时具备远程访问能力。
+C-Two 是面向分布式科学计算的 resource-oriented RPC runtime。它不要求把对象中的状态拆成无状态服务，而是保留有状态的类 — 模拟器、索引、仪器控制器 — 并通过 CRM（Core Resource Model）契约暴露。任何 client 都可以像访问本地对象一样调用 resource，无论它在同进程、同主机还是其他机器上。
 
-- **从进程到数据的零拷贝** — 同进程调用完全跳过序列化。跨进程 IPC 可以保持共享内存缓冲区存活，让 FastDB checked view 在调用方显式 retained response 时直接读取 SHM 上的列式数据。
+- **面向 resource 而非 service** — CRM 契约类声明 resource 暴露*哪些*方法；普通 Python 类带着真实状态实现它们；任何调用 `cc.connect(...)` 的代码都是 client。
+- **显式 transport** — 同进程调用直接传递 Python 对象、零序列化；同主机 IPC 使用 Unix domain socket 或 Windows Named Pipe，载荷字节可经原生共享内存传输；跨机器调用经由独立 `c3` CLI 运行的 HTTP relay。
+- **Portable 载荷** — 需要跨语言的方法用 `@cc.transfer(...)` 显式绑定官方 FastDB `Payload`；普通 Python 值仍可用于 Python 范围内的原型开发。
+- **单一 Rust core** — 路由、client/host 调用、重试分类、wire codec、共享内存、relay transport 和配置都实现在语言中立的 Rust crate 中；Python 与 Rust SDK 只是同一 runtime 的 facade。
 
-- **为科学计算而生** — portable CRM payload 使用 FastDB；Python-only prototype 仍可使用普通 Python 值。超过 256 MB 的大体量载荷使用分块传输。runtime 面向计算工作流和有状态科学资源设计。
+## 现状
 
-- **Rust 驱动的 runtime core** — 共享 transport、memory、wire codec、route-contract validation、relay 和配置解析都在 Rust 中实现，让后续 SDK 复用同一套 runtime contract。
+C-Two 是处于活跃开发中的 0.x 软件。以下事实截至 2026-09-25：
 
----
+| 方面 | 状态 |
+| --- | --- |
+| 已发布 Python 包 | `pip install c-two` 安装 0.5.x 稳定线（最新 0.5.1）。它早于下文描述的 portable FastDB 载荷面、原生 Windows IPC 和 Rust SDK。 |
+| 本仓库 | 正在准备 `c-two` 0.6.0 与 `c3` 0.2.0。尚未发布；release-candidate CI 仍在进行中。见 [docs/releases/0.6.0.md](docs/releases/0.6.0.md)。 |
+| FastDB 依赖 | [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) 已正式发布；本 checkout 固定 `fastdb4py==0.2.1` 与 Rust `fastdb = "=0.2.1"`。 |
+| Windows | 源码构建已在 Windows Server 2022/2025 x64（CPython 3.12）上按固定旧版源码组合完成验证 — 见[验证报告](docs/reports/windows-native-final-validation.md)。尚未发布 Windows wheel 或 CLI 二进制；Windows 11 桌面、ARM64 与 Windows 服务仍是未验证目标。 |
+| Rust SDK | `sdk/rust` 是 Cargo 包 `c-two` 0.1.0，`publish = false`。没有 crates.io 上的 C-Two 发布。 |
+| 基准测试 | portable `Payload` API 尚无经过评审的吞吐基准。来自已移除集成的历史数字不能作为当前架构的性能声明。 |
 
-## 性能
+0.x 版本线优先干净切割而非兼容垫片：portable 契约为 `c-two.contract.v2`，相互通信的 client、host 与 relay 必须一起升级。
 
-端到端跨进程 IPC 基准测试，Kostya-style 坐标 schema：`row_id u32`、`x/y/z f64`、`name STR`。每次调用从远端进程返回缓存坐标表，客户端计算 `sum(x + y + z)`。
+## 安装
 
-| 行数 | FDB control default (ms) | FDB recommended default (ms) | FDB control retained (ms) | FDB recommended retained (ms) | Ray arrays (ms) | C-Two pickle arrays (ms) | **Recommended retained vs Ray arrays** |
-|-----:|---:|---:|---:|---:|---:|---:|---:|
-| 1 K | 1.28 | 1.33 | 1.30 | **1.12** | 6.51 | 0.57 | **5.8×** |
-| 10 K | 1.83 | 1.27 | 1.52 | **1.26** | 7.42 | 1.24 | **5.9×** |
-| 100 K | 5.10 | 2.64 | 4.91 | **1.91** | 8.22 | 9.69 | **4.3×** |
-| 1 M | 36.39 | 12.29 | 29.85 | **8.36** | 48.59 | 130.65 | **5.8×** |
-| 3 M | 147.89 | 39.08 | 93.80 | **23.29** | 164.32 | 529.47 | **7.1×** |
-
-Row-oriented fallback 路径在大规模数据下明显更慢，这里只用于展示 Python object materialization 成本：
-
-| 行数 | C-Two pickle records (ms) | Ray records (ms) | **Recommended retained vs Ray records** |
-|-----:|---:|---:|---:|
-| 1 K | 0.95 | 6.23 | **5.6×** |
-| 10 K | 6.09 | 11.62 | **9.2×** |
-| 100 K | 67.25 | 56.31 | **29.5×** |
-| 1 M | 861.50 | 546.27 | **65.3×** |
-| 3 M | SKIP | SKIP | - |
-
-- **FDB control** — 普通 `fdb.Batch.allocate(...)` 资源实现；作为 benchmark control 保留，用来展示资源输出在 CRM call envelope 外构建时的 call-db repack 成本。
-- **FDB recommended** — 资源实现使用 `fdb.require(fdb.batch(...))`；3M 行 default-call p50 从 147.89 ms 降到 39.08 ms。
-- **Default / retained** — default call 会在脱离 transport buffer 后返回 owned logical value；retained call 使用 `cc.hold(...)`，让 FastDB checked view 在 release 前直接读取 retained response buffer。
-- **Ray arrays** — Ray object store 传输 NumPy 列和 `name` 字符串列表。
-- **Pickle arrays / records** — Python-only fallback baselines；records 特意覆盖 row-oriented Python object 开销。
-
-上表中的 FastDB 行比较同一套 C-Two 资源模型内的不同构造路径：CRM contract -> resource instance -> typed client proxy。
-
-> Apple M1 Max · measured May 27, 2026 · C-Two: Python 3.14.3 + NumPy 2.4.4 · Ray: Python 3.12 + NumPy 2.4.6 + Ray 2.55.1 · 完整方法见 [`sdk/python/benchmarks/kostya_ctwo_benchmark.py`](sdk/python/benchmarks/kostya_ctwo_benchmark.py)、[`sdk/python/benchmarks/kostya_ray_benchmark.py`](sdk/python/benchmarks/kostya_ray_benchmark.py) 和 [`sdk/python/benchmarks/run_kostya_sweep.sh`](sdk/python/benchmarks/run_kostya_sweep.sh)。
-
----
-
-## 快速开始
+### 稳定线（PyPI）
 
 ```bash
 pip install c-two
 ```
 
-### 定义 FastDB-first 资源契约
+安装已发布的 0.5.x runtime。预编译 wheel 覆盖 manylinux x86_64/aarch64 与 macOS aarch64/x86_64 上的 CPython 3.10–3.14 及自由线程 3.14t，其他平台使用 sdist（源码构建需要 [Rust 工具链](https://rustup.rs)）；`fastdb4py` 依赖会自动安装。
 
-```python
-import c_two as cc
-import fastdb4py as fdb
-import numpy as np
+> 0.5.x 早于本 README 描述的 portable FastDB 载荷面、原生 Windows IPC transport 和 Rust SDK。这些能力目前可从源码 checkout 使用，并正在为 0.6.0 发布做准备；`pip install` 成功不代表它们已经发布。
 
+### 开发环境（源码 checkout）
 
-@fdb.feature
-class Vertex:
-    vertex_id: fdb.U32
-    x: fdb.F64
-    y: fdb.F64
-    z: fdb.F64
-
-
-@fdb.feature
-class Node:
-    node_id: fdb.U32
-    weight: fdb.F64
-    anchor: Vertex
-    neighbors: list[Vertex]
-
-
-@cc.crm(namespace='demo.geometry', version='0.1.0')
-class Geometry:
-    @cc.read
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
-        ...
-
-    @cc.read
-    def nodes(self) -> fdb.Batch[Node]:
-        ...
+```bash
+git clone --branch dev-feature https://github.com/Dsssyc/c-two.git
+cd c-two
+# 完整互操作测试、golden fixture 与 TypeScript fixture 还需要将固定版本的
+# FastDB 源码 checkout 放在同级目录：
+git clone --branch v0.2.1 --depth 1 https://github.com/world-in-progress/fastdb.git ../fastdb
+# Core 与 Rust SDK 测试使用已发布的 Rust binding 和 system 链接模式。
+# 请先从 FastDB 0.2.1 发布页解压匹配平台的 Core SDK：
+export FASTDB_PAYLOAD_LINK_MODE=system
+export FASTDB_PAYLOAD_SYSTEM_LIB_DIR=/absolute/path/to/fastdb-core-sdk/lib
+case "$(uname -s)" in
+  Darwin) export DYLD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
+  Linux) export LD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+esac
+uv sync                                       # 安装依赖 + 编译 Rust 扩展
+uv sync --group examples                      # 可选：示例所需的 pandas/pyarrow
+python tools/dev/c3_tool.py --build --link    # 构建并链接原生 c3 CLI
+cp .env.example .env                          # 可选：本地环境配置
 ```
 
-`vertices()` 是固定规模列式路径；`nodes()` 是表达嵌套资源数据的对象图路径。
+需要 [uv](https://github.com/astral-sh/uv) 和 Rust 工具链。上面的配置用于通过 Core SDK 开发和测试。用于分发的 CLI 与 Python 扩展构建选择 `FASTDB_PAYLOAD_LINK_MODE=source`，静态链接同一份固定的 FastDB 0.2.1 源码；Core/Rust SDK 则保留 system 链接约定。用 `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q` 运行 Python 测试，用 `cargo test --manifest-path core/Cargo.toml --workspace` 与 `cargo test --manifest-path sdk/rust/Cargo.toml --all-features` 运行 Rust 测试。Python 3.10 仍是最小支持版本。Windows 请改用 [Windows 构建指南](docs/windows-native-usage.md)。
 
-### 实现资源对象
+完整互操作测试还需要 Node 22、CMake/Ninja 和 Emscripten 5.0.2（`PATH`
+中可执行 `emcmake`）。运行这些测试前，安装两套 TypeScript 依赖和最低支持的
+Python 解释器：
 
-```python
-class GeometryResource:
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
-        n = int(count)
-        batch = fdb.require(fdb.batch(Vertex, rows=n))
-        idx = np.arange(n, dtype=np.uint32)
-        xyz = idx.astype(np.float64)
-        batch.fill(vertex_id=idx, x=xyz, y=xyz + 10.0, z=xyz + 20.0)
-        return batch
-
-    def nodes(self) -> fdb.Batch[Node]:
-        vertices = [
-            Vertex(vertex_id=0, x=0.0, y=10.0, z=20.0),
-            Vertex(vertex_id=1, x=1.0, y=11.0, z=21.0),
-            Vertex(vertex_id=2, x=2.0, y=12.0, z=22.0),
-        ]
-
-        batch = fdb.Batch.allocate(Node, 0)
-        batch.append(Node(
-            node_id=100,
-            weight=0.5,
-            anchor=vertices[0],
-            neighbors=[vertices[1], vertices[2]],
-        ))
-        return batch
+```bash
+npm ci --prefix ../fastdb/ts/fastdb4ts
+npm ci --prefix core/foundation/c2-mem-ffi/bindings/typescript
+uv python install 3.10
 ```
 
-### 本地使用（零序列化）
+[CI 配置](.github/workflows/ci.yml)记录了固定版本的 Emscripten 安装步骤，
+并将 FastDB system 链接环境限定于 Rust 消费者。Python 扩展构建完成后，
+若在该 system 链接环境下运行测试，请使用 `uv run --no-sync pytest ...`，
+避免测试命令重新构建扩展。
 
-```python
-cc.register(Geometry, GeometryResource(), name='geometry')
+### c3 CLI
 
-with cc.connect(Geometry, name='geometry') as geometry:
-    vertices = geometry.vertices(1_000)
-    nodes = geometry.nodes()
-```
-
-### 跨进程使用同一套客户端 API
-
-```python
-# 服务端进程
-cc.set_relay_anchor('http://relay-host:8080')
-cc.register(Geometry, GeometryResource(), name='geometry')
-
-# 客户端进程（另一个终端）
-cc.set_relay_anchor('http://relay-host:8080')
-with cc.connect(Geometry, name='geometry') as geometry:
-    vertices = geometry.vertices(1_000_000)
-```
-
-同一个 CRM contract 可以用于进程内调用、IPC 调用或 relay 调用。Client code 在这些模式下都调用 typed proxy。Portable payload 使用 FastDB 类型编写；普通 Python 值可用于本地 Python-only prototype。
-
----
-
-## 核心概念
-
-### CRM — 契约
-
-**CRM**（Core Resource Model）声明远程资源暴露*哪些*方法。使用 `@cc.crm()` 装饰，方法体为 `...`（纯接口，无实现）。
-
-```python
-@cc.crm(namespace='demo.geometry', version='0.1.0')
-class Geometry:
-    @cc.read
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]:
-        ...
-
-    @cc.read
-    def nodes(self) -> fdb.Batch[Node]:
-        ...
-```
-
-方法可标注 `@cc.read`（允许并发访问）或保持默认的 write（独占访问）。Portable 方法输入输出使用 FastDB scalar alias、`fdb.Array[...]`、`fdb.Batch[...]` 和 FastDB feature class。
-
-### Resource — 运行时实例
-
-**Resource** 是实现 CRM 契约的普通 Python 类，持有状态和领域逻辑。它无需装饰器；框架通过注册时绑定的 CRM 契约发现其方法。命名应体现领域语义，例如 `GeometryResource`。
-
-上方示例中的 `GeometryResource` 就是 resource object。CRM contract 保持 FastDB-first；resource implementation 只是返回 FastDB 值的普通 Python 代码。
-
-### Client — 消费者
-
-任何调用 `cc.connect(...)` 的代码都是 **client**（即 consumer / 应用代码）。返回的代理是位置透明的 — 无论资源运行在同进程还是远程机器，用法完全相同。
-
-```python
-geometry = cc.connect(Geometry, name='geometry')
-vertices = geometry.vertices(1_000)
-cc.close(geometry)
-
-# 或使用上下文管理器：
-with cc.connect(Geometry, name='geometry') as geometry:
-    nodes = geometry.nodes()
-```
-
-### Server — 资源宿主
-
-**Server** 是调用 `cc.register(...)` 托管一个或多个资源、并通常调用 `cc.serve()` 进入请求循环的进程。单个 server 进程可以托管任意多的资源（每个使用唯一的 `name`），并在首次注册时自动绑定一个 IPC 端点。
-
-```python
-import c_two as cc
-
-cc.register(Geometry, GeometryResource(), name='geometry')
-cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关闭
-```
-
-- **Server ID** 标识本地 IPC server 实例。C-Two 会在首次注册时自动生成；也可以在注册前调用 `cc.set_server(server_id=...)` 显式设置。
-- **地址**（`ipc://...`）是由 Server ID 推导出的内部本地传输端点；只有同主机进程需要直连时才需要用 `cc.server_address()` 查看。
-- **`cc.serve()` 是可选的** — 如果宿主进程已有自己的事件循环（Web 服务、GUI、模拟器），你可以只注册资源，让它们在后台服务，同时你的主循环照常运行。
-- 一个进程可以**同时**是 server 和 client（注册一些资源，同时连接另一些）。
-
-### Relay — 分布式发现
-
-**HTTP 中继**（`c3 relay`）是一个轻量级代理，让客户端可以按**路由名和 CRM 契约**跨机器访问服务端。服务端在注册时向中继通告自己的 IPC 地址、CRM tag 和契约指纹；客户端使用路由名以及从 `cc.connect(CRMClass, name='...')` 派生出的预期 CRM 契约查询中继。
-
-`c3` 是 C-Two 的跨语言原生 CLI。从源码 checkout 开发时，可以用 `python tools/dev/c3_tool.py --build --link` 构建并链接本地开发二进制。正式发布版可以通过 installer 安装最新 `c3`：
+`c3` CLI 运行 relay server 与契约工具。最新已发布版本是 c3 0.1.4，附带 Linux 与 macOS 二进制：
 
 ```bash
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
 ```
 
-Python SDK 将 relay 生命周期交给 `c3 relay`、Docker Compose 或编排系统。Python 代码通过 `C2_RELAY_ANCHOR_ADDRESS` 或 `cc.set_relay_anchor()` 连接 relay anchor。anchor 是控制面注册和名称解析端点；远程 HTTP 调用仍会直连解析得到的 `relay_url`，只有 anchor 是 loopback/local 端点时才会选择本地 direct IPC。relay-aware 客户端会在首次调用前预检 route，并在收到结构化 stale-route 响应时重新解析路由；可通过 `C2_RELAY_ROUTE_MAX_ATTEMPTS` 调整最大 route acquisition 尝试次数（默认 `3`，有效范围 `1..=32`，`0` 按 `1` 处理）。可通过 `C2_RELAY_CALL_TIMEOUT` 调整 CRM 调用超时秒数（默认 `300`；`0` 禁用 reqwest 总超时）。可通过 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 调整 relay HTTP 和未来远程协议的 C-Two 远程载荷批大小（默认 `1048576`；最大 `134217728`）。这个设置控制 C-Two payload batching，独立于 TCP packet、HTTP/1 chunk 或 HTTP/2 DATA frame 边界。语义不明确的数据面失败需要调用方自定义 retry policy。relay resolve、probe 和 call 路径要求 route name 与 CRM contract 同时匹配，并拒绝契约不匹配的路由。
+尚无已发布的 Windows 二进制 — 请按 [Windows 构建指南](docs/windows-native-usage.md)从源码构建。源码 checkout 可用 `python tools/dev/c3_tool.py --build --link` 构建并链接当前开发版 CLI。
+
+## 快速开始
+
+将以下内容保存为 `counter.py`：
+
+```python
+import c_two as cc
+
+
+@cc.crm(namespace='demo.counter', version='0.1.0')
+class Counter:
+    def increment(self, amount: int) -> int: ...
+
+    @cc.read
+    def value(self) -> int: ...
+
+
+class CounterResource:
+    """普通 Python 类 — 状态 + 领域逻辑，无需装饰器。"""
+
+    def __init__(self, initial: int = 0):
+        self._value = initial
+
+    def increment(self, amount: int) -> int:
+        self._value += amount
+        return self._value
+
+    def value(self) -> int:
+        return self._value
+
+
+cc.register(Counter, CounterResource(initial=10), name='counter')
+
+with cc.connect(Counter, name='counter') as counter:
+    print(counter.increment(3))   # 13
+    print(counter.increment(4))   # 17
+    print(counter.value())        # 17
+
+cc.unregister('counter')
+cc.shutdown()
+```
+
+运行方式：
 
 ```bash
-# 在网络可达的任意节点启动中继
+pip install c-two
+python counter.py
+```
+
+预期输出：
+
+```text
+13
+17
+17
+```
+
+该示例假定未配置 relay。如果你的环境设置了 `C2_RELAY_ANCHOR_ADDRESS` 而 relay 未运行，请用 `C2_RELAY_ANCHOR_ADDRESS= python counter.py` 启动，使注册保持本地。
+
+各部分与模型的对应关系：
+
+- **CRM 契约** — `Counter` 是接口：用 `@cc.crm(namespace=..., version=...)` 装饰，方法体为 `...`。只有契约中的方法可被远程调用。`@cc.read` 标记方法允许并发访问；未标记的方法取独占写访问。
+- **Resource** — `CounterResource` 是持有真实状态（`self._value`）的普通类。框架通过注册时绑定的 CRM 契约发现其方法；不需要装饰器。
+- **Server** — `cc.register(...)` 以路由 `name` 托管 resource 并自动绑定 IPC 端点；若要为其他进程提供服务，可调用 `cc.serve()` 阻塞在请求循环上。一个进程可以同时注册一些 resource 并连接另一些。
+- **Client** — `cc.connect(Counter, name='counter')` 返回类型化、位置透明的代理。不带地址且无 relay 时，它解析到同进程 resource 并直接传递 Python 对象，完全跳过序列化。
+
+同一个 CRM 契约可原样用于 IPC 或 relay：
+
+```python
+# 同主机直连 IPC — 地址来自托管进程（cc.server_address()）或你自己的 ipc:// 指定：
+counter = cc.connect(Counter, name='counter', address='ipc://my_server')
+
+# 跨机器 — 两端指向同一个 relay，然后按名称连接：
+cc.set_relay_anchor('http://relay-host:8080')
+counter = cc.connect(Counter, name='counter')
+```
+
+完整的双进程与 relay mesh 布局见[可运行示例](#可运行示例)。
+
+## 传输方式
+
+| 模式 | 选择方式 | 传输 | 适用场景 |
+| --- | --- | --- | --- |
+| 同进程 | `cc.connect(...)` 不带地址且无 relay，目标已在本地注册 | 直接调用，零序列化 | 测试、单进程内组合 resource |
+| IPC | 显式 `address='ipc://...'` | Unix domain socket / Windows Named Pipe；载荷字节可经原生共享内存 | 同主机多进程 |
+| HTTP relay | `cc.set_relay_anchor(...)` 或 `C2_RELAY_ANCHOR_ADDRESS`，然后按名称连接 | HTTP 连向 relay 解析出的路由 | 跨机器调用与基于名称的发现 |
+
+直连 IPC 不依赖 relay：显式 `ipc://` 地址会绕过 relay 发现，在未配置 relay 时也可用。使用 relay 时，解析是契约作用域的 — client 从其 CRM 类派生预期路由契约，runtime 在任何调用前匹配路由名、CRM tag、ABI hash 与 signature hash。relay 响应默认选择 HTTP，仅当 anchor 是 loopback 时才可能在通过身份验证后选择直连 IPC 快路径。
+
+relay 是你自己运行和监控的独立进程 — `c3 relay`、Docker Compose 或你的编排系统；Python SDK 不会内嵌 relay。多个 relay 可通过 gossip 组成 mesh，mesh 内任意 relay 都能解析整个集群注册的路由。relay 端点面向可信网络边界：请用私有网络、防火墙等基础设施限制访问。完整调优面（超时、分块大小、内存池上限、路由尝试次数等）见 [.env.example](.env.example)。
+
+大体量载荷在 IPC 与 relay 路径上以有界分块传输。这是请求/响应模型下的传输分批，不是 streaming-RPC API — 流式调用语义尚未实现。
+
+## Portable 载荷（FastDB）
+
+本节需要正在准备 0.6.0 的开发分支。已发布的 0.5.1 包没有 `cc.transfer`；前面的 Counter 快速开始示例也可用于该已发布版本。
+
+需要跨语言传递结构化数据的方法显式绑定 FastDB specification。FastDB Core 拥有嵌套载荷语义 — 校验、canonical identity、二进制布局、builder、view、失效与 payload-only codegen — C-Two 拥有外层契约、路由、transport 与生命周期：
+
+```python
+import json
+
+import c_two as cc
+from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload
+
+VALUE_SPEC = {
+    "schema": "fastdb.payload.v1",
+    "profile": "record.v1",
+    "entries": [
+        {"id": "value", "cardinality": "one",
+         "type": {"kind": "u8", "nullable": False}},
+    ],
+    "components": [],
+}
+
+
+@cc.crm(namespace='demo.payload', version='0.1.0')
+class Echo:
+    @cc.transfer(input=VALUE_SPEC, output=VALUE_SPEC)
+    def echo(self, payload: Payload) -> Payload: ...
+
+
+def build_value(value: int) -> Payload:
+    spec = CompiledSpec.compile(json.dumps(VALUE_SPEC).encode())
+    builder = Builder.create(spec)
+    builder.entry_begin(0, 1).value_u8(value)
+    plan = builder.freeze()
+    builder.close()
+    try:
+        return plan.execute(BuildPolicy.ALLOW_STAGING).payload
+    finally:
+        plan.close()
+        spec.close()
+
+
+class EchoResource:
+    def echo(self, payload: Payload) -> Payload:
+        return payload
+
+
+cc.register(Echo, EchoResource(), name='echo')
+source = build_value(7)
+try:
+    with cc.connect(Echo, name='echo') as echo:
+        result = echo.echo(source)
+        result.close()
+finally:
+    source.close()
+    cc.unregister('echo')
+    cc.shutdown()
+```
+
+portable 方法在每个方向承载零或一个 `Payload` envelope；C-Two 将每个嵌套 specification 作为 opaque JSON value 嵌入，绝不重新解释它。没有显式绑定的方法仍可使用普通 Python 值做 Python 范围的原型开发，但 portable descriptor export 与 codegen 会诊断并拒绝它们。
+
+## 载荷生命周期
+
+已证明的 portable 接收路径打开 **copy-backed** FastDB owner。`cc.hold()` 是生命周期契约，不是零拷贝声明：它将 C-Two response lease 与 payload owner 一起保留，并保证释放时*先*使 FastDB owner 及其 checked view 失效，再归还 lease。
+
+```python
+with cc.hold(echo.echo)(source) as held:
+    payload = held.value                    # FastDB Payload owner；checked view 保持有效
+    ...
+# 离开 with 块（或 held.release()）会先失效 owner 与 view，再释放 lease
+```
+
+释放机制分层：显式 `.release()`、`with` 上下文管理器，以及两者都遗漏时发出警告的 `__del__` 兜底。`cc.hold_stats()` 报告活跃 hold，用于监控。
+
+`held.unsafe_buffer` 将保留的原始 wire buffer 作为 `memoryview` escape hatch 暴露。由此派生的 NumPy array 或指针会绕过 FastDB 的 checked owner/view 模型，**无法被机械撤销** — 需要跨越 hold 作用域保存的逻辑值，请先通过 FastDB materialize。
+
+服务端 portable 输入默认为 owned。注册时使用 `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})` 可让指定方法选择 call-scoped borrowed input：调用返回或抛错时，C-Two 会先使该 payload 及其 checked view 失效，再释放 request lease。不得在方法返回后保留 borrowed payload 或 view。
+
+## 入口
+
+### Python SDK
+
+主要用户面，即本 README 各处展示的用法。顶层 `cc` 命名空间按功能分组：
+
+- 契约编写：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`、`cc.InputLifetime`
+- 注册与连接：`cc.register`、`cc.connect`、`cc.close`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.set_transport_policy`
+- 契约工具：`cc.export_contract_descriptor`、`cc.export_contract_release_ref`、`cc.compile_contract_artifacts`、`cc.infer_crm_from_resource`
+- 监控：`cc.hold_stats`
+
+### Rust SDK
+
+用户面 Rust SDK 位于 [`sdk/rust`](sdk/rust/README.md)：Cargo 包 `c-two`，导入为 `c_two`，版本 0.1.0，`publish = false`（本地候选 — 没有 crates.io 发布）。它与 Python 复用同一个 `c2-core` runtime 进行直连 IPC、显式 relay 与 relay-aware 调用，并提供生成的类型化 client 与 service trait。portable 值保持官方 `fastdb::Payload` owner 身份：
+
+```rust
+use c_two::{Connect, ContractLimits, ContractRelease, Runtime};
+use fastdb::Payload;
+```
+
+构建它与上方开发环境使用相同的 FastDB Core SDK system-link 环境变量。在 C-Two checkout 中：
+
+```bash
+cargo test --manifest-path sdk/rust/Cargo.toml --all-features
+cargo run --manifest-path sdk/rust/Cargo.toml --example client
+cargo run --manifest-path sdk/rust/Cargo.toml --example host
+```
+
+### c3 CLI
+
+`c3` 是跨语言原生 CLI（由根目录 `cli/` 包构建）：
+
+```bash
+# 在网络可达的任意节点启动 relay
 c3 relay --bind 0.0.0.0:8080
+# 预注册 upstream：NAME=SERVER_ID@ADDRESS（ID 必须与 IPC handshake 一致）
+c3 relay --upstream grid=my_server@ipc://my_server
+
+# 契约工具 — 从 Python CRM 类导出、校验、派生身份、生成代码
+c3 contract export mypkg.contracts:Geometry --python .venv/bin/python --out geometry.contract.json
+c3 contract validate geometry.contract.json
+c3 contract release-ref geometry.contract.json
+c3 contract codegen rust geometry.contract.json --out-dir generated-rust   # 亦支持：python、typescript
 ```
 
-Relay HTTP 与 mesh 端点应只暴露在可信网络边界内。生产部署应通过私有网络、防火墙、Kubernetes NetworkPolicy、service mesh 策略或 ingress 认证等基础设施限制访问。
-
-```python
-# 服务端 — 将资源通告给中继
-cc.set_relay_anchor('http://relay-host:8080')
-cc.register(Geometry, GeometryResource(), name='geometry')
-cc.serve()
-
-# 客户端 — 按路由名和 CRM 契约解析，无需显式地址
-cc.set_relay_anchor('http://relay-host:8080')
-geometry = cc.connect(Geometry, name='geometry')
-```
-
-多个中继可以通过 gossip 协议组成**网格集群** — 网格中任意中继都能解析整个集群内注册的任何资源。可运行示例见 [可运行示例](#可运行示例)。
-
-> **何时需要中继？** 跨机器访问或按路由名与 CRM 契约发现时使用 relay。同进程和同主机 IPC 可以直接连接。
-
-### FastDB-first payload
-
-Portable CRM payload 使用 `fastdb4py` 声明。CRM 签名保持逻辑类型：`fdb.I32`、`fdb.Array[...]`、`fdb.Batch[...]` 和 `@fdb.feature` 会规划成 FastDB call-db ABI；未标记的 Python 类型可在 Python-only prototype 路径中走 pickle，strict portable export/codegen 会拒绝它。
-
-Payload ABI 位于 C-Two resource-first 架构之下。FastDB 拥有 schema、storage layout、view 和面向 allocator 的 payload 构建语义。C-Two 拥有 CRM route contract、transport、retained-buffer lease 以及 contract/codegen orchestration；runtime 的 route/relay/IPC/scheduler 层把 FastDB payload 视作 opaque ABI-backed bytes，不解析 FastDB 存储内部结构。
-
-这里聚焦两种 FastDB CRM 形态：
-
-- `vertices() -> fdb.Batch[Vertex]`：固定规模列式 feature batch，是 retained-view、高吞吐路径。
-- `nodes() -> fdb.Batch[Node]`：包含 nested feature 和 list 的对象图 batch，仍是 portable FastDB call-db data，retained-view profile 与固定列式数据不同。
-
-```python
-@fdb.feature
-class Vertex: ...
-
-@fdb.feature
-class Node:
-    anchor: Vertex
-    neighbors: list[Vertex]
-
-@cc.crm(namespace='demo.geometry', version='0.1.0')
-class Geometry:
-    def vertices(self, count: fdb.I32) -> fdb.Batch[Vertex]: ...
-    def nodes(self) -> fdb.Batch[Node]: ...
-```
-
-固定规模列式输出的具体写法见快速开始中的 `GeometryResource.vertices()`。
-
-C-Two 会把 CRM 推导出的 FastDB binding 交给 FastDB；用户代码保持在逻辑 `Batch`、`Array`、scalar 和 feature 类型层面。
-
-Python-only resource 仍可使用普通 Python annotation 和 pickle 做本地 prototype。这类方法会被 strict contract export/codegen 诊断为 nonportable。
-
-### cc.hold() — 客户端零拷贝
-
-在客户端，普通 FastDB CRM 调用会先把响应 payload copy 到进程自有缓冲区，再暴露逻辑 FastDB 值并立即释放 transport buffer。`cc.hold()` 显式请求保留响应缓冲区，使支持 retained view 的 FDB 输出可以零拷贝读取。返回的 `cc.Held[R]` 包装 CRM 逻辑返回值，并把保留中的原始 wire buffer 作为 `.unsafe_buffer` 暴露给高级用户。
-
-1. **显式 `.release()`** — 推荐用于同时持有多个缓冲区的复杂工作流
-2. **上下文管理器（`with`）** — 推荐用于单缓冲区作用域
-3. **`__del__` 兜底** — 最后手段，若忘记释放会触发 `ResourceWarning`
-
-```python
-geometry = cc.connect(Geometry, name='geometry', address='ipc://server')
-
-# Normal call — transport release 后暴露 owned logical value。
-vertices = geometry.vertices(1_000_000)
-
-# Retained call — columnar FastDB view 直接读取 retained response。
-with cc.hold(geometry.vertices)(1_000_000) as held:
-    vertices = held.value
-    z_mean = vertices.column.z.to_numpy().mean()
-```
-
-`held.value` 是普通 API，会尽量使用 FastDB checked views；`held.release()` 后，子行和列视图会 fail fast。`held.unsafe_buffer` 是原始 `memoryview` escape hatch；从该 buffer 派生出的 NumPy/raw pointer 会绕过 FastDB owner check。需要跨越 hold 生命周期保存数据时，用 `fdb.materialize(...)` 物化。
-
-`nodes()` 这类对象图 response 仍是 portable FastDB payload。当前 runtime 会返回 materialized logical values，并且没有 retained columnar `held.unsafe_buffer`。
-
-> **何时使用持有模式：** 适用于反序列化开销占主导的大型数组/列式数据。对于小载荷（< 1 MB），跟踪共享内存生命周期的开销超过拷贝成本。
-
----
-
-### InputLifetime — 服务端 borrowed input
-
-服务端 FastDB input 默认会在调用 resource method 前物化。只有当 resource method 的 FDB input 签名和 CRM 一致，并且明确准备把参数当作 call-scoped borrowed data 处理时，才使用 `input_lifetime={...}`。
-
-`cc.InputLifetime.BORROWED` 只适用于支持 buffer-view 的 FDB payload。它与 `bridge.input` 分开使用；调用结束后仍需保留的数据必须先用 `fastdb4py.materialize(value)` 或 `value.to_owned()` 拷贝。旧的 transfer/hold 装饰器不参与这个 registration policy。
-
----
+`c3 contract diagnose` 会在 portable export 失败前报告哪些方法仍是 Python-only。生成目录包含校验过的契约元数据与 FastDB Core 拥有的 payload 模块；目标目录必须尚不存在。完整选项见 `c3 --help` 与 `c3 relay --help`。
 
 ## 可运行示例
-
-快速开始已经展示完整 authoring pattern。仓库中的 examples 提供可直接运行的进程布局：
 
 | 场景 | 入口 |
 | --- | --- |
 | 同进程本地调用 | [`examples/python/local.py`](examples/python/local.py) |
-| Direct IPC resource/client | [`examples/python/ipc_resource.py`](examples/python/ipc_resource.py), [`examples/python/ipc_client.py`](examples/python/ipc_client.py) |
-| FastDB CRM 与 relay client | [`examples/python/fastdb_relay_resource.py`](examples/python/fastdb_relay_resource.py), [`examples/python/fastdb_relay_client.py`](examples/python/fastdb_relay_client.py) |
+| 直连 IPC resource/client | [`examples/python/ipc_resource.py`](examples/python/ipc_resource.py), [`examples/python/ipc_client.py`](examples/python/ipc_client.py) |
+| Relay resource/client | [`examples/python/relay_resource.py`](examples/python/relay_resource.py), [`examples/python/relay_client.py`](examples/python/relay_client.py) |
 | Relay mesh | [`examples/python/relay_mesh/`](examples/python/relay_mesh/) |
-| FastDB bridge 示例 | [`examples/python/grid/`](examples/python/grid/) |
+| Python-only grid 原型 | [`examples/python/grid/`](examples/python/grid/) |
+| portable 载荷 runtime 与生命周期证明 | [`sdk/python/tests/integration/test_portable_payload_runtime.py`](sdk/python/tests/integration/test_portable_payload_runtime.py) |
+| Rust/Python 生成物互操作证明 | [`sdk/python/tests/integration/test_portable_payload_cross_language.py`](sdk/python/tests/integration/test_portable_payload_cross_language.py) |
 
-### 服务端监控
+## 文档
 
-使用 `cc.hold_stats()` 监控持有模式下资源方法所持有的共享内存缓冲区：
-
-```python
-stats = cc.hold_stats()
-# {'active_holds': 3, 'total_held_bytes': 52428800, 'oldest_hold_seconds': 12.5}
-```
-
----
-
-## 架构
-
-**C-Two 围绕 resource 组织分布式程序。**
-
-在科学计算中，封装复杂状态和领域特定操作的资源需要被组织为内聚的单元。我们称描述这些资源的契约为 **核心资源模型（CRM）**。应用程序以 *如何与资源交互* 为中心，同时由 C-Two 处理资源所在位置带来的访问差异。C-Two 提供位置透明和统一的资源访问，使任何 **client** 都能像访问本地对象一样与资源交互。
-
-<p align="center">
-  <img src="docs/images/architecture.png" alt="C-Two 架构图" width="100%">
-</p>
-
-### 客户端层
-
-调用 `cc.connect(...)` 消费资源的任何代码。返回的代理提供完整的类型安全和位置透明性，client code 可以在不跟踪进程或机器位置的情况下使用 resource。
-
-- `cc.connect(CRMClass, name='...', address='...')` 返回类型化的 CRM 代理
-- 代理支持上下文管理：`with cc.connect(...) as x:` 自动关闭
-- 对 IPC 与 relay 路径，SDK 从 CRM class 推导 expected route contract，native 层在调用前校验 route name、CRM tag、ABI hash 和 signature hash。
-
-### 资源层
-
-服务端有状态的实例，通过标准化的 CRM 契约暴露。
-
-- **CRM 契约**：使用 `@cc.crm()` 装饰的接口类。只有在此声明的方法才可被远程访问。
-- **Resource**：实现契约的普通 Python 类 — 状态 + 领域逻辑，无需装饰器。
-- **FastDB payload**：使用 `fastdb4py` feature、scalar、`Array[...]` 和 `Batch[...]` 作为 portable CRM ABI。
-- **Python fallback**：普通 Python 类型可用于 Python-only prototype，但 portable export/codegen 会拒绝 pickle fallback。
-- **`@cc.read` / `@cc.write`**：并发注解 — 并行读取，独占写入。
-- **`@cc.on_shutdown`**：生命周期回调，在资源被注销时调用；它位于 RPC surface 之外。
-
-### 传输层
-
-协议无关的通信，基于地址方案自动检测协议：
-
-| 协议方案 | 传输方式 | 适用场景 |
-|----------|----------|----------|
-| `thread://` | 进程内直接调用 | 零序列化、测试 |
-| `ipc:///path` | Unix 域套接字 + 共享内存 | 多进程、同主机 |
-| `http://host:port` | HTTP 中继 | 跨机器、Web 兼容 |
-
-IPC 传输采用 **控制面 / 数据面分离**：方法路由通过 UDS 内联帧传输，载荷字节通过共享内存交换。`cc.hold()` 可以在客户端显式保留响应缓冲区，使 FastDB checked views 直接映射在 transport buffer 上；服务端 borrowed input 只能通过 `cc.register(..., input_lifetime={...})` 显式启用。
-
-### Rust 原生层
-
-核心 runtime 是语言中立的 Rust，SDK 绑定到同一套 core contract。性能关键组件通过 [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) 暴露给 Python：
-
-Rust 工作空间包含 9 个 core crates，按 4 层组织（foundation → protocol → transport → runtime），Python PyO3 extension 位于 `sdk/python/native/`：
-
-- **Contract Core (`c2-contract`)** — 语言中立的 CRM route contract validation 和 canonical descriptor hashing。
-- **伙伴分配器** — IPC 传输的零系统调用共享内存分配。跨进程，快速路径上无锁。
-- **线协议** — 帧编码、分块组装和分块注册表，管理大载荷的生命周期。
-- **HTTP 中继** — 基于 [axum](https://github.com/tokio-rs/axum) 的高吞吐网关，桥接 HTTP 到 IPC。处理连接池和请求多路复用。
-
-Rust 扩展在 `pip install c-two`（从预编译 wheel）或 `uv sync`（从源码）时自动编译。
-
-`c3` 作为原生 CLI 二进制分发，并由根目录下的 `cli/` 包构建。正式发布版可以通过 installer 安装：
-
-```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
-```
-
-源码 checkout 开发时可以通过 `python tools/dev/c3_tool.py --build --link` 链接本地开发二进制；正式 CLI 产物由独立的 CLI release 流水线负责。
-
-Portable CRM descriptor 可以从 Python CRM 类导出，并在作为 codegen 输入前交给 Rust CLI 校验：
-
-```bash
-uv run python -m c_two.cli.contract export mypkg.contracts:Geometry --out geometry.contract.json
-c3 contract artifacts mypkg.contracts:Geometry --python .venv/bin/python --out geometry.payload-abi-artifacts.json
-c3 contract diagnose mypkg.contracts:Geometry --python .venv/bin/python --pretty
-c3 contract export mypkg.contracts:Geometry --python .venv/bin/python --out geometry.contract.json
-c3 contract validate geometry.contract.json
-```
-
-`c3 contract diagnose` 会在严格跨语言工作流失败前报告 fastdb-first portability warning，例如 Python-only pickle fallback 或非 FastDB 的 `PayloadAbiRef`；Rust CLI 写出 diagnostics 前会要求 Python diagnostics 是 JSON object array。`c3 contract artifacts` 导出 FastDB ABI sidecar descriptor，例如 `fastdb.call-db.schema.v1` 以及 root/dependency `fastdb.schema.v1` 对象；C-Two runtime 的 route/relay/IPC/scheduler/lease 层继续把 FastDB 存储内部结构视为 opaque。把这个 artifact bundle 直接交给 C-Two codegen 的 `--fastdb-schema` 和 `--fastdb-out`：
-
-```bash
-c3 contract codegen typescript \
-  geometry.contract.json \
-  --out geometry.client.ts \
-  --fastdb-schema geometry.payload-abi-artifacts.json \
-  --fastdb-out geometry.fastdb.ts
-```
-
-通过校验的 descriptor 可以生成 TypeScript client。FastDB-backed payload 会生成 method wire specs、route fingerprints、codec transport factory、显式 relay URL 的 `createHttpRelayEncodedTransport(...)`，以及带 contract-scoped relay resolve、完整 contract-key route cache、current-route preference、payload-limit guardrail、stale-route invalidation/re-resolve、resolve transport-error/5xx retry、data-plane transport-error classification、`maxAttempts`、`routeCacheTtlMs`、`callTimeoutMs`、`resolveTimeoutMs`、HTTP option/base URL/fetch/header 构造期校验和 C-Two expected-contract 保留 header 保护的 `createRelayAwareHttpEncodedTransport(...)`。如果 CI 需要在所有 FastDB ABI requirement 都有 generated TypeScript 支持前失败，可以使用 `--strict-codecs`：
-
-```bash
-c3 contract codegen typescript geometry.contract.json --out geometry.client.ts
-c3 contract codegen typescript geometry.contract.json --strict-codecs
-```
-
-对于资源优先项目，`infer` 可以从显式选择的 Python 资源方法构造 CRM 投影 descriptor。推断只暴露被选择的方法，并且 fastdb-first portable 工作流要求每个被选择的方法 payload 解析为 FastDB call-db `PayloadAbiRef` 或无 payload。Python-native primitive/container 适合 Python-only prototype；它们会回退到 `python-pickle-default` 并被 portable export 拒绝。显式的非 FastDB `PayloadAbiRef` 属于内部诊断场景。可以先用 `c3 contract infer --diagnose` 查看 inferred projection 上的 diagnostics，再用 `c3 contract infer --artifacts` 从同一 inferred projection 导出 FastDB ABI artifacts 给 C-Two codegen 使用，最后导出 portable descriptor：
-
-```bash
-c3 contract infer mypkg.resources:GeometryResource \
-  --python .venv/bin/python \
-  --namespace mypkg.geometry \
-  --version 0.1.0 \
-  --name Geometry \
-  --method vertices \
-  --method nodes \
-  --diagnose \
-  --pretty
-
-c3 contract infer mypkg.resources:GeometryResource \
-  --python .venv/bin/python \
-  --namespace mypkg.geometry \
-  --version 0.1.0 \
-  --name Geometry \
-  --method vertices \
-  --method nodes \
-  --artifacts \
-  --out geometry.payload-abi-artifacts.json
-
-c3 contract infer mypkg.resources:GeometryResource \
-  --python .venv/bin/python \
-  --namespace mypkg.geometry \
-  --version 0.1.0 \
-  --name Geometry \
-  --method vertices \
-  --method nodes \
-  --out geometry.contract.json
-```
-
-FastDB call-db 是 portable CRM payload ABI。Python fallback 路径使用普通 Python annotation 和 pickle，只面向本地或 Python-only IPC prototype；strict portable export/codegen 会明确拒绝它。公开包 surface 省略可选 payload registry module 和公开 codec registry。
-
-如果要让方法进入 portable 路径，请使用 `fastdb4py` scalar、`Array[...]`、`Batch[...]` 和 FastDB feature class，让方法规划为 FastDB call-db。未标记的 Python payload 仍可在非 portable 的本地/IPC prototype 路径中通过 pickle 使用；strict portable export 会拒绝 pickle 和非 FastDB `PayloadAbiRef`。扩展 schema 代码位于可运行 FastDB 示例中。
-
----
-
-## 安装
-
-### 从 PyPI 安装
-
-```bash
-pip install c-two
-```
-
-预编译 wheel 支持：
-- **Linux**：x86_64、aarch64
-- **macOS**：Apple Silicon (aarch64)、Intel (x86_64)
-- **Python**：3.10、3.11、3.12、3.13、3.14、3.14t（自由线程）
-
-如果没有适合你平台的预编译 wheel，pip 将从源码编译（需要 [Rust 工具链](https://rustup.rs)）。
-
-### 开发环境
-
-```bash
-git clone https://github.com/world-in-progress/c-two.git
-cd c-two
-cp .env.example .env               # 配置环境变量（可选）
-uv sync                            # 安装依赖 + 编译 Rust 扩展
-uv sync --group examples           # 安装示例依赖（pandas、pyarrow）
-python tools/dev/c3_tool.py --build --link  # 在源码检出中构建并链接原生 c3 CLI
-uv run pytest                      # 运行测试套件
-
-# Python 3.10 compatibility check. 下游 Taichi 等栈仍可能固定在 3.10。
-uv python install 3.10
-uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
-```
-
-> 需要 [uv](https://github.com/astral-sh/uv) 和 Rust 工具链。
-
----
-
-## 路线图
-
-| 能力 | 状态 |
-|------|------|
-| 核心 RPC 框架（CRM + Resource + Client） | ✅ 稳定 |
-| IPC 传输 + SHM 伙伴分配器 | ✅ 稳定 |
-| HTTP 中继（Rust 驱动） | ✅ 稳定 |
-| 中继网格与 gossip 路由发现 | ✅ 稳定 |
-| 分块载荷传输（载荷 > 256 MB） | ✅ 稳定 |
-| 心跳与连接管理 | ✅ 稳定 |
-| 读/写并发控制 | ✅ 稳定 |
-| 统一配置架构（Rust resolver 单一事实源） | ✅ 稳定 |
-| CI/CD 与多平台 PyPI 发布 | ✅ 稳定 |
-| 极端载荷磁盘溢出 | ✅ 稳定 |
-| `cc.hold()` 与 FastDB retained views | ✅ 稳定 |
-| 共享内存驻留监控（`cc.hold_stats()`） | ✅ 稳定 |
-| 契约版本兼容协商 | 🔜 规划中 |
-| `auth_hook` 与 call metadata | 🔜 规划中 |
-| dry-run 钩子 | 🔜 规划中 |
-| 异步接口 | 🔜 规划中 |
-| 自适应内存生命周期策略 | 🔜 规划中 |
-| Streaming RPC / pipeline 语义 | 🔜 规划中 |
-| 跨语言客户端（Rust 优先，TypeScript 随后） | 🔮 远期 |
-| 全局发现与命名空间治理 | 🔮 远期 |
-
-详见[当前路线图](docs/roadmap.zh-CN.md)。历史路线图笔记仍归档在 `docs/plans/` 下。
-
----
+| 主题 | 文档 |
+| --- | --- |
+| 贡献指南 | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| 面向 agent 与维护者的仓库指南 | [AGENTS.md](AGENTS.md) |
+| 路线图 | [docs/roadmap.md](docs/roadmap.md) · [中文](docs/roadmap.zh-CN.md) |
+| 变更日志 | [CHANGELOG.md](CHANGELOG.md) |
+| 0.6.0 / c3 0.2.0 发布准备 | [docs/releases/0.6.0.md](docs/releases/0.6.0.md) |
+| Windows 构建与使用 | [docs/windows-native-usage.md](docs/windows-native-usage.md) |
+| Windows 实现记录 | [docs/windows-native-implementation.md](docs/windows-native-implementation.md) |
+| 环境变量参考 | [.env.example](.env.example) |
+| Rust SDK 边界 | [sdk/rust/README.md](sdk/rust/README.md) |
+| 延后能力与开放边界 | [docs/issues/contract-release-deferred-capabilities.md](docs/issues/contract-release-deferred-capabilities.md) |
 
 ## 开源协议
 
@@ -546,4 +357,4 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 
 ---
 
-<p align="center">为科学计算而生，由 Rust 驱动。</p>
+<p align="center">为资源导向的计算而生，由 Rust 驱动。</p>

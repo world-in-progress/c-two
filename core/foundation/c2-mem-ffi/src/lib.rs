@@ -1,5 +1,6 @@
 //! C ABI substrate for foreign runtime adapters that need C-Two shared memory.
 
+use c2_config::LocalEndpoint;
 use c2_mem::{MemPool, PoolConfig};
 use std::collections::HashSet;
 use std::ffi::CStr;
@@ -8,9 +9,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::Mutex;
 
-const MAX_SHM_PREFIX_LEN: usize = 24;
+const MAX_SHM_PREFIX_LEN: usize = 255;
+const OWNER_INCARNATION_SUFFIX_LEN: usize = 41;
 const MAX_IPC_SHM_SEGMENTS: u16 = 16;
-const C2_MEM_FFI_ABI_VERSION: u32 = 1;
+const C2_MEM_FFI_ABI_VERSION: u32 = 2;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +30,7 @@ pub struct C2MemFfiRequestBlock {
     pub segment_index: u16,
     pub is_dedicated: u8,
     pub reserved: u8,
+    pub generation: u32,
     pub offset: u32,
     pub byte_length: u32,
 }
@@ -38,6 +41,7 @@ pub struct C2MemFfiResponseBlock {
     pub segment_index: u16,
     pub is_dedicated: u8,
     pub reserved: u8,
+    pub generation: u32,
     pub offset: u32,
     pub byte_length: u32,
 }
@@ -56,7 +60,6 @@ pub struct C2MemFfiResponsePool {
 }
 
 struct C2MemFfiResponsePoolState {
-    prefix: String,
     buddy_segment_size: usize,
     max_segments: usize,
     pool: MemPool,
@@ -70,9 +73,10 @@ impl Drop for C2MemFfiResponsePool {
             for block in blocks {
                 let _ = state.pool.free_at(
                     block.segment_index as u32,
+                    block.generation,
                     block.offset,
                     block.byte_length,
-                    false,
+                    block.is_dedicated,
                 );
             }
         }
@@ -82,8 +86,10 @@ impl Drop for C2MemFfiResponsePool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct C2MemFfiBlockKey {
     segment_index: u16,
+    generation: u32,
     offset: u32,
     byte_length: u32,
+    is_dedicated: bool,
 }
 
 fn guard_status(action: impl FnOnce() -> Result<(), C2MemFfiStatus>) -> C2MemFfiStatus {
@@ -154,7 +160,6 @@ fn request_pool_config(
         segment_size: segment_size as usize,
         min_block_size: min_block_size as usize,
         max_segments: max_segments as usize,
-        max_dedicated_segments: 0,
         ..PoolConfig::default()
     };
     MemPool::validate_config(&config).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
@@ -196,7 +201,11 @@ fn copy_c_string(
 }
 
 fn validate_block(block: C2MemFfiRequestBlock) -> Result<(), C2MemFfiStatus> {
-    if block.is_dedicated != 0 || block.byte_length == 0 {
+    if block.is_dedicated > 1
+        || block.byte_length == 0
+        || (block.is_dedicated == 1 && (block.generation != 0 || block.offset != 0))
+        || (block.is_dedicated == 0 && block.generation == 0)
+    {
         return Err(C2MemFfiStatus::InvalidArgument);
     }
     Ok(())
@@ -206,13 +215,19 @@ fn block_key(block: C2MemFfiRequestBlock) -> Result<C2MemFfiBlockKey, C2MemFfiSt
     validate_block(block)?;
     Ok(C2MemFfiBlockKey {
         segment_index: block.segment_index,
+        generation: block.generation,
         offset: block.offset,
         byte_length: block.byte_length,
+        is_dedicated: block.is_dedicated != 0,
     })
 }
 
 fn validate_response_block(block: C2MemFfiResponseBlock) -> Result<(), C2MemFfiStatus> {
-    if block.is_dedicated != 0 || block.byte_length == 0 {
+    if block.is_dedicated > 1
+        || block.byte_length == 0
+        || (block.is_dedicated == 1 && (block.generation != 0 || block.offset != 0))
+        || (block.is_dedicated == 0 && block.generation == 0)
+    {
         return Err(C2MemFfiStatus::InvalidArgument);
     }
     Ok(())
@@ -222,54 +237,96 @@ fn response_block_key(block: C2MemFfiResponseBlock) -> Result<C2MemFfiBlockKey, 
     validate_response_block(block)?;
     Ok(C2MemFfiBlockKey {
         segment_index: block.segment_index,
+        generation: block.generation,
         offset: block.offset,
         byte_length: block.byte_length,
+        is_dedicated: block.is_dedicated != 0,
     })
 }
 
-fn buddy_segment_name(prefix: &str, idx: usize) -> String {
-    format!("{prefix}_b{idx:04x}")
-}
-
-fn ensure_response_buddy_segment(
+fn ensure_response_segment(
     state: &mut C2MemFfiResponsePoolState,
-    segment_index: u16,
+    block: C2MemFfiResponseBlock,
 ) -> Result<(), C2MemFfiStatus> {
-    let target = segment_index as usize;
-    if target >= state.max_segments {
+    if block.is_dedicated != 0 {
+        return state
+            .pool
+            .ensure_peer_dedicated(block.segment_index as u32, block.byte_length as usize)
+            .map_err(|_| C2MemFfiStatus::PoolError);
+    }
+    if block.segment_index as usize >= state.max_segments {
         return Err(C2MemFfiStatus::InvalidArgument);
     }
-    while state.pool.segment_count() <= target {
-        let idx = state.pool.segment_count();
-        let name = buddy_segment_name(&state.prefix, idx);
-        state
-            .pool
-            .open_segment(&name, state.buddy_segment_size)
-            .map_err(|_| C2MemFfiStatus::PoolError)?;
-    }
-    Ok(())
+    state
+        .pool
+        .ensure_peer_segment(
+            block.segment_index as u32,
+            block.generation,
+            state.buddy_segment_size,
+        )
+        .map_err(|_| C2MemFfiStatus::PoolError)
 }
 
 fn validate_response_range(
     state: &C2MemFfiResponsePoolState,
     block: C2MemFfiResponseBlock,
 ) -> Result<(), C2MemFfiStatus> {
-    let (_, data_size) = state
+    state
         .pool
-        .seg_data_info(block.segment_index as u32)
-        .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
-    let end = (block.offset as usize)
-        .checked_add(block.byte_length as usize)
-        .ok_or(C2MemFfiStatus::InvalidArgument)?;
-    if end > data_size {
-        return Err(C2MemFfiStatus::InvalidArgument);
-    }
-    Ok(())
+        .validate_data_at(
+            block.segment_index as u32,
+            block.generation,
+            block.offset,
+            block.byte_length,
+            block.is_dedicated != 0,
+        )
+        .map_err(|_| C2MemFfiStatus::InvalidArgument)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn c2_mem_ffi_abi_version() -> u32 {
     C2_MEM_FFI_ABI_VERSION
+}
+
+fn local_endpoint_name(address: *const c_char) -> Result<String, C2MemFfiStatus> {
+    if address.is_null() {
+        return Err(C2MemFfiStatus::NullPointer);
+    }
+    let address = unsafe { CStr::from_ptr(address) }
+        .to_str()
+        .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+    let endpoint =
+        LocalEndpoint::from_address(address).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+    endpoint
+        .os_name()
+        .to_str()
+        .map(str::to_owned)
+        .ok_or(C2MemFfiStatus::InvalidArgument)
+}
+
+/// Project the native local endpoint name without duplicating platform rules.
+///
+/// # Safety
+/// `address` must be NUL-terminated and `out_len` valid for one `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_len(
+    address: *const c_char,
+    out_len: *mut usize,
+) -> C2MemFfiStatus {
+    guard_status(|| write_len(out_len, local_endpoint_name(address)?.len()))
+}
+
+/// # Safety
+/// `address` must be NUL-terminated; `dst` and `out_written` must be writable
+/// for `dst_len` bytes and one `usize`, respectively.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_copy(
+    address: *const c_char,
+    dst: *mut c_char,
+    dst_len: usize,
+    out_written: *mut usize,
+) -> C2MemFfiStatus {
+    guard_status(|| copy_c_string(&local_endpoint_name(address)?, dst, dst_len, out_written))
 }
 
 /// # Safety
@@ -292,6 +349,9 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_new(
             *out_pool = ptr::null_mut();
         }
         let prefix = parse_prefix(prefix)?;
+        if prefix.len() > MAX_SHM_PREFIX_LEN - OWNER_INCARNATION_SUFFIX_LEN {
+            return Err(C2MemFfiStatus::InvalidArgument);
+        }
         let config = request_pool_config(segment_size, max_segments, min_block_size)?;
         let mut pool = MemPool::new_with_prefix(config, prefix);
         pool.ensure_buddy_segments(max_segments as usize)
@@ -436,7 +496,13 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_segment_data_size(
             u32::try_from(segment_index).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
         let (_, size) = state
             .pool
-            .seg_data_info(segment_index)
+            .seg_data_info(
+                segment_index,
+                state
+                    .pool
+                    .segment_generation(segment_index as usize)
+                    .ok_or(C2MemFfiStatus::InvalidArgument)?,
+            )
             .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
         let size = u32::try_from(size).map_err(|_| C2MemFfiStatus::PoolError)?;
         unsafe {
@@ -473,10 +539,6 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
             .pool
             .alloc(data_len)
             .map_err(|_| C2MemFfiStatus::PoolError)?;
-        if alloc.is_dedicated {
-            let _ = state.pool.free(&alloc);
-            return Err(C2MemFfiStatus::PoolError);
-        }
         let copy_result = state
             .pool
             .data_ptr(&alloc)
@@ -490,8 +552,9 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
                 unsafe {
                     *out_block = C2MemFfiRequestBlock {
                         segment_index,
-                        is_dedicated: 0,
+                        is_dedicated: u8::from(alloc.is_dedicated),
                         reserved: 0,
+                        generation: alloc.generation,
                         offset: alloc.offset,
                         byte_length: data_len as u32,
                     };
@@ -505,8 +568,10 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
                 u16::try_from(alloc.seg_idx).map_err(|_| C2MemFfiStatus::PoolError)?;
             let inserted = state.local_blocks.insert(C2MemFfiBlockKey {
                 segment_index,
+                generation: alloc.generation,
                 offset: alloc.offset,
                 byte_length: data_len as u32,
+                is_dedicated: alloc.is_dedicated,
             });
             if !inserted {
                 let _ = state.pool.free(&alloc);
@@ -548,7 +613,12 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_read_local(
         }
         let ptr = state
             .pool
-            .data_ptr_at(block.segment_index as u32, block.offset, false)
+            .data_ptr_at(
+                block.segment_index as u32,
+                block.generation,
+                block.offset,
+                block.is_dedicated != 0,
+            )
             .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
         unsafe {
             ptr::copy_nonoverlapping(ptr.cast_const(), dst, data_len);
@@ -561,7 +631,7 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_read_local(
 /// # Safety
 ///
 /// `pool` must be a valid request-pool pointer. `block` must describe a live
-/// non-dedicated allocation still owned by the local writer.
+/// allocation still owned by the local writer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_request_pool_release(
     pool: *mut C2MemFfiRequestPool,
@@ -578,9 +648,10 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_release(
             .pool
             .free_at(
                 block.segment_index as u32,
+                block.generation,
                 block.offset,
                 block.byte_length,
-                false,
+                block.is_dedicated != 0,
             )
             .is_err()
         {
@@ -594,8 +665,8 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_release(
 /// # Safety
 ///
 /// `pool` must be a valid request-pool pointer. `block` must describe a live
-/// non-dedicated allocation that has been accepted by the Rust server, so local
-/// writer release authority must be dropped without freeing the block locally.
+/// allocation accepted by the Rust server. Buddy ownership transfers to the
+/// reader; a dedicated creator records completion and waits for read_done.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_request_pool_forget_consumed(
     pool: *mut C2MemFfiRequestPool,
@@ -607,6 +678,23 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_forget_consumed(
         let mut state = pool.inner.lock().map_err(|_| C2MemFfiStatus::PoolError)?;
         if !state.local_blocks.remove(&key) {
             return Err(C2MemFfiStatus::InvalidArgument);
+        }
+        if block.is_dedicated != 0 {
+            if state
+                .pool
+                .free_at(
+                    block.segment_index as u32,
+                    block.generation,
+                    block.offset,
+                    block.byte_length,
+                    true,
+                )
+                .is_err()
+            {
+                state.local_blocks.insert(key);
+                return Err(C2MemFfiStatus::InvalidArgument);
+            }
+            state.pool.gc_dedicated();
         }
         Ok(())
     })
@@ -633,10 +721,9 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_new(
         }
         let prefix = parse_prefix(prefix)?;
         let config = request_pool_config(segment_size, max_segments, min_block_size)?;
-        let pool = MemPool::new_with_prefix(config, prefix.clone());
+        let pool = MemPool::open_peer(config, prefix);
         let handle = Box::new(C2MemFfiResponsePool {
             inner: Mutex::new(C2MemFfiResponsePoolState {
-                prefix,
                 buddy_segment_size: segment_size as usize,
                 max_segments: max_segments as usize,
                 pool,
@@ -692,11 +779,16 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_read(
         if state.read_blocks.contains(&key) {
             return Err(C2MemFfiStatus::InvalidArgument);
         }
-        ensure_response_buddy_segment(&mut state, block.segment_index)?;
+        ensure_response_segment(&mut state, block)?;
         validate_response_range(&state, block)?;
         let ptr = state
             .pool
-            .data_ptr_at(block.segment_index as u32, block.offset, false)
+            .data_ptr_at(
+                block.segment_index as u32,
+                block.generation,
+                block.offset,
+                block.is_dedicated != 0,
+            )
             .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
         unsafe {
             ptr::copy_nonoverlapping(ptr.cast_const(), dst, data_len);
@@ -710,7 +802,7 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_read(
 /// # Safety
 ///
 /// `pool` must be a valid response-pool pointer. `block` must describe a valid
-/// non-dedicated response block from this pool's server prefix that has not
+/// response block from this pool's server prefix that has not
 /// already been released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_response_pool_release(
@@ -723,15 +815,16 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_release(
         let mut state = pool.inner.lock().map_err(|_| C2MemFfiStatus::PoolError)?;
         let was_read = state.read_blocks.remove(&key);
         let result = (|| {
-            ensure_response_buddy_segment(&mut state, block.segment_index)?;
+            ensure_response_segment(&mut state, block)?;
             validate_response_range(&state, block)?;
             if state
                 .pool
                 .free_at(
                     block.segment_index as u32,
+                    block.generation,
                     block.offset,
                     block.byte_length,
-                    false,
+                    block.is_dedicated != 0,
                 )
                 .is_err()
             {
@@ -741,6 +834,9 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_release(
         })();
         if result.is_err() && was_read {
             state.read_blocks.insert(key);
+        }
+        if result.is_ok() {
+            state.pool.gc_dedicated();
         }
         result
     })
@@ -836,7 +932,7 @@ mod tests {
                 c2_mem_ffi_request_pool_segment_name_copy(handle.0, 0, dst, len, out)
             },
         );
-        assert_eq!(name, format!("{prefix}_b0000"));
+        assert_eq!(name, MemPool::buddy_segment_name(&prefix, 0, 1));
 
         let mut data_size = 0u32;
         assert_eq!(
@@ -1023,17 +1119,100 @@ mod tests {
     }
 
     #[test]
-    fn request_pool_rejects_oversized_non_dedicated_payloads() {
-        let handle = PoolHandle::new();
-        let payload = vec![7_u8; 128 * 1024];
-        let mut block = C2MemFfiRequestBlock::default();
-
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_request_pool_write(handle.0, payload.as_ptr(), payload.len(), &mut block)
-            },
-            C2MemFfiStatus::PoolError
-        );
+    fn dedicated_completion_waits_for_reader_ack_and_reclaims_owner_mapping() {
+        for release_by_drop in [false, true] {
+            let owner = PoolHandle::new();
+            let payload = vec![7_u8; 128 * 1024 + 3];
+            let mut block = C2MemFfiRequestBlock::default();
+            assert_eq!(
+                unsafe {
+                    c2_mem_ffi_request_pool_write(
+                        owner.0,
+                        payload.as_ptr(),
+                        payload.len(),
+                        &mut block,
+                    )
+                },
+                C2MemFfiStatus::Ok
+            );
+            assert_eq!(block.is_dedicated, 1);
+            assert_eq!(block.generation, 0);
+            let prefix = copy_string(
+                |out| unsafe { c2_mem_ffi_request_pool_prefix_len(owner.0, out) },
+                |dst, len, out| unsafe {
+                    c2_mem_ffi_request_pool_prefix_copy(owner.0, dst, len, out)
+                },
+            );
+            assert_eq!(
+                unsafe { c2_mem_ffi_request_pool_forget_consumed(owner.0, block) },
+                C2MemFfiStatus::Ok
+            );
+            {
+                let mut state = pool_ref(owner.0).unwrap().inner.lock().unwrap();
+                state.pool.gc_dedicated();
+                assert_eq!(
+                    state.pool.stats().dedicated_segments,
+                    1,
+                    "creator must retain the unacknowledged mapping"
+                );
+            }
+            let response = C2MemFfiResponseBlock {
+                segment_index: block.segment_index,
+                is_dedicated: 1,
+                reserved: 0,
+                generation: block.generation,
+                offset: block.offset,
+                byte_length: block.byte_length,
+            };
+            {
+                let peer = ResponsePoolHandle::new(&CString::new(prefix).unwrap());
+                let mut out = vec![0; payload.len()];
+                let mut read = 0;
+                assert_eq!(
+                    unsafe {
+                        c2_mem_ffi_response_pool_read(
+                            peer.0,
+                            response,
+                            out.as_mut_ptr(),
+                            out.len(),
+                            &mut read,
+                        )
+                    },
+                    C2MemFfiStatus::Ok
+                );
+                assert_eq!(out, payload);
+                assert_eq!(read, payload.len());
+                if !release_by_drop {
+                    assert_eq!(
+                        unsafe { c2_mem_ffi_response_pool_release(peer.0, response) },
+                        C2MemFfiStatus::Ok
+                    );
+                    assert_ne!(
+                        unsafe { c2_mem_ffi_response_pool_release(peer.0, response) },
+                        C2MemFfiStatus::Ok
+                    );
+                    assert_ne!(
+                        unsafe {
+                            c2_mem_ffi_response_pool_read(
+                                peer.0,
+                                response,
+                                out.as_mut_ptr(),
+                                out.len(),
+                                &mut read,
+                            )
+                        },
+                        C2MemFfiStatus::Ok
+                    );
+                }
+            }
+            let mut state = pool_ref(owner.0).unwrap().inner.lock().unwrap();
+            state.pool.gc_dedicated();
+            assert_eq!(
+                state.pool.stats().dedicated_segments,
+                0,
+                "read_done must make the creator mapping reclaimable"
+            );
+        }
     }
 
     #[test]
@@ -1068,7 +1247,11 @@ mod tests {
             CString::new("/").unwrap(),
             CString::new("cc2ffi_no_slash").unwrap(),
             CString::new("/cc2ffi/extra").unwrap(),
-            CString::new("/cc2ffi_prefix_that_is_way_too_long").unwrap(),
+            CString::new(format!(
+                "/{}",
+                "x".repeat(MAX_SHM_PREFIX_LEN - OWNER_INCARNATION_SUFFIX_LEN)
+            ))
+            .unwrap(),
         ] {
             let mut pool = ptr::null_mut();
             assert_eq!(
@@ -1097,7 +1280,7 @@ mod tests {
 
     #[test]
     fn public_abi_version_is_exported() {
-        assert_eq!(c2_mem_ffi_abi_version(), 1);
+        assert_eq!(c2_mem_ffi_abi_version(), 2);
     }
 
     #[test]
@@ -1123,19 +1306,21 @@ mod tests {
 
 _Static_assert(C2_MEM_FFI_STATUS_OK == 0, "status ok value");
 _Static_assert(C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER == 4, "status buffer value");
-_Static_assert(C2_MEM_FFI_MAX_SHM_PREFIX_LEN == 24u, "prefix length limit");
+_Static_assert(C2_MEM_FFI_MAX_SHM_PREFIX_LEN == 255u, "prefix length limit");
 _Static_assert(C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS == 16u, "segment count limit");
-_Static_assert(C2_MEM_FFI_ABI_VERSION == 1u, "abi version");
-_Static_assert(sizeof(C2MemFfiRequestBlock) == 12, "request block size");
+_Static_assert(C2_MEM_FFI_ABI_VERSION == 2u, "abi version");
+_Static_assert(sizeof(C2MemFfiRequestBlock) == 16, "request block size");
 _Static_assert(offsetof(C2MemFfiRequestBlock, segment_index) == 0, "request segment_index offset");
 _Static_assert(offsetof(C2MemFfiRequestBlock, is_dedicated) == 2, "request dedicated offset");
-_Static_assert(offsetof(C2MemFfiRequestBlock, offset) == 4, "request offset offset");
-_Static_assert(offsetof(C2MemFfiRequestBlock, byte_length) == 8, "request byte_length offset");
-_Static_assert(sizeof(C2MemFfiResponseBlock) == 12, "response block size");
+_Static_assert(offsetof(C2MemFfiRequestBlock, generation) == 4, "generation offset");
+_Static_assert(offsetof(C2MemFfiRequestBlock, offset) == 8, "request offset offset");
+_Static_assert(offsetof(C2MemFfiRequestBlock, byte_length) == 12, "request byte_length offset");
+_Static_assert(sizeof(C2MemFfiResponseBlock) == 16, "response block size");
 _Static_assert(offsetof(C2MemFfiResponseBlock, segment_index) == 0, "response segment_index offset");
 _Static_assert(offsetof(C2MemFfiResponseBlock, is_dedicated) == 2, "response dedicated offset");
-_Static_assert(offsetof(C2MemFfiResponseBlock, offset) == 4, "response offset offset");
-_Static_assert(offsetof(C2MemFfiResponseBlock, byte_length) == 8, "response byte_length offset");
+_Static_assert(offsetof(C2MemFfiResponseBlock, generation) == 4, "generation offset");
+_Static_assert(offsetof(C2MemFfiResponseBlock, offset) == 8, "response offset offset");
+_Static_assert(offsetof(C2MemFfiResponseBlock, byte_length) == 12, "response byte_length offset");
 
 static void use_request_api(void) {
     C2MemFfiRequestPool *pool = NULL;
@@ -1171,11 +1356,24 @@ static void use_response_api(void) {
         )
         .unwrap();
 
-        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let output = Command::new(&compiler)
-            .arg("-std=c11")
-            .arg("-fsyntax-only")
-            .arg("-I")
+        let compiler = std::env::var("CC").unwrap_or_else(|_| {
+            if cfg!(target_env = "msvc") {
+                "cl.exe"
+            } else {
+                "cc"
+            }
+            .to_string()
+        });
+        let mut command = Command::new(&compiler);
+        if std::path::Path::new(&compiler)
+            .file_stem()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("cl"))
+        {
+            command.args(["/nologo", "/std:c11", "/Zs", "/I"]);
+        } else {
+            command.args(["-std=c11", "-fsyntax-only", "-I"]);
+        }
+        let output = command
             .arg(manifest_dir.join("include"))
             .arg(&source)
             .output()
@@ -1213,6 +1411,7 @@ static void use_response_api(void) {
                 segment_index: alloc.seg_idx as u16,
                 is_dedicated: 0,
                 reserved: 0,
+                generation: alloc.generation,
                 offset: alloc.offset,
                 byte_length: payload.len() as u32,
             },
@@ -1246,7 +1445,7 @@ static void use_response_api(void) {
         let prefix = test_prefix();
         let payload = b"server response payload";
         let (mut server, block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
-        let handle = ResponsePoolHandle::new(&prefix);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
 
         let mut out = vec![0_u8; payload.len()];
         let mut read = 0usize;
@@ -1273,9 +1472,10 @@ static void use_response_api(void) {
             server
                 .free_at(
                     block.segment_index as u32,
+                    block.generation,
                     block.offset,
                     block.byte_length,
-                    false,
+                    block.is_dedicated != 0,
                 )
                 .is_err()
         );
@@ -1292,7 +1492,7 @@ static void use_response_api(void) {
         let (mut server, block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
 
         {
-            let handle = ResponsePoolHandle::new(&prefix);
+            let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
             let mut out = vec![0_u8; payload.len()];
             let mut read = 0usize;
             assert_eq!(
@@ -1315,9 +1515,10 @@ static void use_response_api(void) {
             server
                 .free_at(
                     block.segment_index as u32,
+                    block.generation,
                     block.offset,
                     block.byte_length,
-                    false,
+                    block.is_dedicated != 0,
                 )
                 .is_err()
         );
@@ -1328,7 +1529,7 @@ static void use_response_api(void) {
         let prefix = test_prefix();
         let payload = b"unread response";
         let (mut server, block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
-        let handle = ResponsePoolHandle::new(&prefix);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
 
         assert_eq!(
             unsafe { c2_mem_ffi_response_pool_release(handle.0, block) },
@@ -1338,9 +1539,10 @@ static void use_response_api(void) {
             server
                 .free_at(
                     block.segment_index as u32,
+                    block.generation,
                     block.offset,
                     block.byte_length,
-                    false,
+                    block.is_dedicated != 0,
                 )
                 .is_err()
         );
@@ -1355,7 +1557,7 @@ static void use_response_api(void) {
         let prefix = test_prefix();
         let payload = b"short destination response";
         let (mut server, block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
-        let handle = ResponsePoolHandle::new(&prefix);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
         let mut out = vec![0_u8; payload.len() - 1];
         let mut read = usize::MAX;
 
@@ -1380,21 +1582,22 @@ static void use_response_api(void) {
             server
                 .free_at(
                     block.segment_index as u32,
+                    block.generation,
                     block.offset,
                     block.byte_length,
-                    false,
+                    block.is_dedicated != 0,
                 )
                 .is_err()
         );
     }
 
     #[test]
-    fn response_pool_rejects_dedicated_blocks() {
+    fn response_pool_rejects_dedicated_blocks_with_buddy_generation() {
         let prefix = test_prefix();
-        let payload = b"dedicated is not native buddy";
-        let (_server, mut block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
+        let payload = b"dedicated generation must be zero";
+        let (server, mut block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
         block.is_dedicated = 1;
-        let handle = ResponsePoolHandle::new(&prefix);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
         let mut out = vec![0_u8; payload.len()];
         let mut read = usize::MAX;
 
@@ -1417,9 +1620,9 @@ static void use_response_api(void) {
     fn response_pool_rejects_out_of_range_blocks_without_release_authority() {
         let prefix = test_prefix();
         let payload = b"range guarded response";
-        let (_server, mut block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
+        let (server, mut block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
         block.offset = 65_536;
-        let handle = ResponsePoolHandle::new(&prefix);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
         let mut out = vec![0_u8; payload.len()];
         let mut read = usize::MAX;
 
@@ -1446,9 +1649,9 @@ static void use_response_api(void) {
     fn response_pool_rejects_segment_indexes_beyond_configured_limit() {
         let prefix = test_prefix();
         let payload = b"segment guard response";
-        let (_server, mut block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
+        let (server, mut block) = server_pool_with_payload(prefix.to_str().unwrap(), payload);
         block.segment_index = 2;
-        let handle = ResponsePoolHandle::new(&prefix);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
         let mut out = vec![0_u8; payload.len()];
         let mut read = usize::MAX;
 
@@ -1495,10 +1698,11 @@ static void use_response_api(void) {
             segment_index: 1,
             is_dedicated: 0,
             reserved: 0,
+            generation: second.generation,
             offset: second.offset,
             byte_length: payload.len() as u32,
         };
-        let handle = ResponsePoolHandle::new(&prefix);
+        let handle = ResponsePoolHandle::new(&CString::new(server.prefix()).unwrap());
         let mut out = vec![0_u8; payload.len()];
         let mut read = 0usize;
 

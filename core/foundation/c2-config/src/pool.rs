@@ -22,7 +22,7 @@ pub struct PoolConfig {
     /// Spill threshold ratio: when `requested > available_ram * threshold`,
     /// use file-backed mmap.  Default 0.8 (80%).
     pub spill_threshold: f64,
-    /// Directory for spill files.  Default: `/tmp/c_two_spill/`.
+    /// Directory for spill files, beneath the platform's temporary directory.
     pub spill_dir: std::path::PathBuf,
 }
 
@@ -36,7 +36,22 @@ impl Default for PoolConfig {
             dedicated_crash_timeout_secs: 60.0,
             buddy_idle_decay_secs: 60.0,
             spill_threshold: 0.8,
-            spill_dir: std::path::PathBuf::from("/tmp/c_two_spill/"),
+            spill_dir: default_spill_dir(),
         }
+    }
+}
+
+/// The single native default used by pool configuration and SDK projections.
+pub fn default_spill_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("c_two_spill")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_default_uses_platform_temporary_directory() {
+        assert_eq!(PoolConfig::default().spill_dir, std::env::temp_dir().join("c_two_spill"));
     }
 }

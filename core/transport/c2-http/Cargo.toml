@@ -2,6 +2,8 @@
 name = "c2-http"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "C-Two HTTP transport layer (client + relay server)"
 
 [features]
@@ -27,21 +29,21 @@ percent-encoding = "2"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
-c2-contract = { path = "../../foundation/c2-contract" }
-c2-config = { path = "../../foundation/c2-config" }
-c2-error = { path = "../../foundation/c2-error" }
+c2-contract = { version = "0.1.0", path = "../../foundation/c2-contract" }
+c2-config = { version = "0.1.0", path = "../../foundation/c2-config" }
+c2-error = { version = "0.1.0", path = "../../foundation/c2-error" }
 futures = { version = "0.3" }
 
 # Relay-only dependencies (behind feature gate)
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.7", features = ["cors"], optional = true }
-c2-wire = { path = "../../protocol/c2-wire", optional = true }
-c2-ipc = { path = "../c2-ipc", optional = true }
+c2-wire = { version = "0.1.0", path = "../../protocol/c2-wire", optional = true }
+c2-ipc = { version = "0.1.0", path = "../c2-ipc", optional = true }
 tracing = { version = "0.1", optional = true }
 sha2 = { version = "0.11", optional = true }
 hex = { version = "0.4", optional = true }
 
 [dev-dependencies]
-c2-mem = { path = "../../foundation/c2-mem" }
-c2-server = { path = "../c2-server" }
+c2-mem = { version = "0.1.0", path = "../../foundation/c2-mem" }
+c2-server = { version = "0.1.0", path = "../c2-server" }
 tower = { version = "0.5", features = ["util"] }

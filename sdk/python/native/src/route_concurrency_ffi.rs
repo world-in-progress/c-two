@@ -2,16 +2,18 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use c2_server::{RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerSnapshot};
+use c2_core::{
+    RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot,
+};
 
 #[pyclass(name = "RouteConcurrency", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyRouteConcurrency {
-    pub(crate) inner: RouteConcurrencyHandle,
+    pub(crate) inner: RouteConcurrency,
 }
 
 impl PyRouteConcurrency {
-    pub(crate) fn new(inner: RouteConcurrencyHandle) -> Self {
+    pub(crate) fn new(inner: RouteConcurrency) -> Self {
         Self { inner }
     }
 }
@@ -36,11 +38,11 @@ pub struct PyRouteConcurrencySnapshot {
 
 #[pyclass(name = "RouteConcurrencyGuard")]
 pub struct PyRouteConcurrencyGuard {
-    inner: Option<SchedulerGuard>,
+    inner: Option<RouteConcurrencyGuard>,
 }
 
-impl From<SchedulerSnapshot> for PyRouteConcurrencySnapshot {
-    fn from(snapshot: SchedulerSnapshot) -> Self {
+impl From<RouteConcurrencySnapshot> for PyRouteConcurrencySnapshot {
+    fn from(snapshot: RouteConcurrencySnapshot) -> Self {
         Self {
             mode: snapshot.mode.as_str().to_string(),
             max_pending: snapshot.max_pending,
@@ -53,9 +55,9 @@ impl From<SchedulerSnapshot> for PyRouteConcurrencySnapshot {
     }
 }
 
-fn acquire_error_to_py(py: Python<'_>, err: SchedulerAcquireError) -> PyErr {
+fn acquire_error_to_py(py: Python<'_>, err: RouteConcurrencyError) -> PyErr {
     match err {
-        SchedulerAcquireError::Closed => {
+        RouteConcurrencyError::Closed => {
             let exc = PyRuntimeError::new_err("route closed");
             let error_bytes =
                 c2_error::C2Error::new(c2_error::ErrorCode::ResourceClosed, "route closed")
@@ -68,7 +70,7 @@ fn acquire_error_to_py(py: Python<'_>, err: SchedulerAcquireError) -> PyErr {
             }
             exc
         }
-        SchedulerAcquireError::Capacity { field, limit } => PyRuntimeError::new_err(format!(
+        RouteConcurrencyError::Capacity { field, limit } => PyRuntimeError::new_err(format!(
             "route concurrency capacity exceeded: {field}={limit}"
         )),
     }

@@ -1,7 +1,9 @@
 [package]
 name = "c2-cli"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/world-in-progress/c-two"
 description = "Cross-language command-line interface for C-Two"
 
 [[bin]]
@@ -12,10 +14,10 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
-c2-config = { path = "../core/foundation/c2-config" }
-c2-codegen = { path = "../core/foundation/c2-codegen" }
-c2-contract = { path = "../core/foundation/c2-contract" }
-c2-http = { path = "../core/transport/c2-http", features = ["relay"] }
+c2-config = { version = "0.1.0", path = "../core/foundation/c2-config" }
+c2-codegen = { version = "0.1.0", path = "../core/foundation/c2-codegen" }
+c2-contract = { version = "0.1.0", path = "../core/foundation/c2-contract" }
+c2-http = { version = "0.1.0", path = "../core/transport/c2-http", features = ["relay"] }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"
@@ -25,3 +27,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+
+# Deployable c3 builds statically link the FastDB payload Core from the official
+# FastDB repository checkout instead of requiring a system-installed libfastdb.
+# The safe fastdb crate itself still comes from crates.io; this patch reroutes
+# only the raw fastdb-sys bindings to the immutable v0.2.1 source at this rev,
+# whose checkout layout lets its build script drive source-mode CMake builds.
+[patch.crates-io]
+fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "4f99f86a662b0e950a0dd29800c25a1c9fca4def" }

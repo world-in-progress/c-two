@@ -1,11 +1,12 @@
 {
   "name": "@c-two/c2-mem-ffi",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -20,15 +21,19 @@
       "import": "./dist/index.js"
     }
   },
+  "devDependencies": {
+    "node-gyp": "12.2.0",
+    "typescript": "5.9.3"
+  },
   "scripts": {
-    "build": "$NODE scripts/build-types.mjs",
-    "build:node-addon": "$NODE scripts/build-node-addon.mjs",
-    "build:rust": "$NODE scripts/build-rust.mjs",
-    "pretest": "$NODE scripts/build-runtime.mjs",
-    "prepack": "$NODE scripts/build-runtime.mjs",
-    "pack:check": "$NODE scripts/pack-check.mjs",
-    "test:node-addon": "$NODE scripts/test-node-addon.mjs",
-    "typecheck": "$NODE scripts/build-types.mjs --no-emit",
-    "test": "$NODE --test tests/*.test.mjs"
+    "build": "node scripts/build-types.mjs",
+    "build:node-addon": "node scripts/build-node-addon.mjs",
+    "build:rust": "node scripts/build-rust.mjs",
+    "pretest": "node scripts/build-runtime.mjs",
+    "prepack": "node scripts/build-runtime.mjs",
+    "pack:check": "node scripts/pack-check.mjs",
+    "test:node-addon": "node scripts/test-node-addon.mjs",
+    "typecheck": "node scripts/build-types.mjs --no-emit",
+    "test": "node --test tests/*.test.mjs"
   }
 }

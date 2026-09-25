@@ -1,5 +1,7 @@
 # C-Two FastDB Require Envelope Integration Plan
 
+> **Historical / superseded:** Retained as implementation evidence only. The current portable-payload authority is the [`2026-07-24 design`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md) and [`implementation plan`](../superpowers/plans/2026-07-24-portable-payload-contract-composition.md). API names and ownership claims below are historical and must not guide new work.
+
 > **For agentic workers:** This is a C-Two integration plan. Do not implement FastDB binary layout parsing, direct DB section writers, or `fdb.require(...)` semantics in C-Two. Those belong in the sibling FastDB repository. Use this plan together with `/Users/soku/Desktop/codespace/WorldInProgress/fastdb/docs/superpowers/plans/2026-05-27-require-envelope-neutral-allocator.md`.
 
 **Date:** 2026-05-27

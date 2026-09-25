@@ -60,6 +60,16 @@ def validate_input_lifetime_resource_contract(
             raise ValueError(
                 f'input_lifetime BORROWED for {method_name!r} cannot be combined with bridge.input',
             )
+        binding = getattr(
+            getattr(crm_class, method_name),
+            '_input_payload_binding',
+            None,
+        )
+        if not getattr(binding, 'supports_scoped_owner', False):
+            raise ValueError(
+                f'input_lifetime BORROWED for {method_name!r} requires '
+                'an explicit FastDB Payload input binding',
+            )
         _validate_borrowed_signature(crm_class, resource, method_name)
 
 

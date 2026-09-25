@@ -1,9 +1,9 @@
 [project]
 name = "c-two"
-version = "0.5.1"
+version = "0.6.0"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "licenses/fastdb/LICENSE", "licenses/fastdb/THIRD_PARTY_NOTICES.txt"]
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -16,11 +16,12 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: Scientific/Engineering",
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "fastdb4py>=0.1.22",
+    "fastdb4py==0.2.1",
 ]
 
 [build-system]
@@ -32,7 +33,8 @@ manifest-path = "native/Cargo.toml"
 module-name = "c_two._native"
 python-source = "src"
 features = ["pyo3/extension-module"]
-include = ["LICENSE"]
+auditwheel = "repair"
+include = ["LICENSE", "licenses/fastdb/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

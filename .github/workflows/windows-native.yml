@@ -1,0 +1,166 @@
+name: Windows Native
+
+on:
+  push:
+    branches: [socu/windows-native-ipc, main]
+  pull_request:
+    paths:
+      - "core/**"
+      - "sdk/**"
+      - "cli/**"
+      - "tools/ci/**"
+      - ".github/scripts/prepare_fastdb_sdk.py"
+      - ".github/workflows/windows-native.yml"
+      - ".gitattributes"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FASTDB_SOURCE_SHA: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
+  C2_ENV_FILE: ""
+  C2_RELAY_ANCHOR_ADDRESS: ""
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  PYTHONUTF8: "1"
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.scope }} / MSVC x64
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+        scope: [local-platform, full]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: c-two
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: world-in-progress/fastdb
+          ref: ${{ env.FASTDB_SOURCE_SHA }}
+          path: fastdb
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      # Core and the Rust SDK consume the registry fastdb-sys package, which
+      # links only against the published CoreSDK in system mode. App CLI and
+      # Python extension gates opt back into source mode inside
+      # tools/ci/windows_native.py through their fastdb-sys Git patches.
+      - name: Prepare official FastDB CoreSDK
+        id: fastdb_sdk
+        run: >-
+          python c-two/.github/scripts/prepare_fastdb_sdk.py
+          --target x86_64-pc-windows-msvc
+          --output "${{ runner.temp }}/fastdb-core-sdk"
+          --emit-github
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: astral-sh/setup-uv@v6
+        if: matrix.scope == 'full'
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: matrix.scope == 'full'
+        with:
+          node-version: "22"
+          check-latest: true
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: matrix.scope == 'full'
+        with:
+          repository: emscripten-core/emsdk
+          ref: c817c0ca4ba889ee24a185fd954cff7de1bd8afa # 5.0.2
+          path: emsdk
+
+      - name: Install Emscripten 5.0.2 for native Windows builds
+        if: matrix.scope == 'full'
+        shell: pwsh
+        working-directory: emsdk
+        run: |
+          $evidence = Join-Path $env:GITHUB_WORKSPACE "c-two/artifacts/windows-native/full"
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          Start-Transcript -Path (Join-Path $evidence "emsdk-setup.log")
+          try {
+            $nodeVersion = & node --version
+            if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v22\.') { throw "Node 22 is required: $nodeVersion" }
+            Write-Output "Application Node: $nodeVersion"
+            # FastDB's npm build scripts use POSIX shell syntax. Git Bash
+            # invokes native Windows Python/CMake/emcc; do not select WSL bash.
+            $gitBash = Join-Path $env:ProgramFiles "Git/bin/bash.exe"
+            if (-not (Test-Path $gitBash -PathType Leaf)) { throw "Git Bash is required: $gitBash" }
+            "C2_FASTDB_NPM_SCRIPT_SHELL=$gitBash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            & $gitBash --version
+            if ($LASTEXITCODE -ne 0) { throw "Git Bash probe failed with $LASTEXITCODE" }
+            & ninja --version
+            if ($LASTEXITCODE -ne 0) { throw "Ninja is required for the Windows WASM build" }
+            & .\emsdk.ps1 install 5.0.2
+            if ($LASTEXITCODE -ne 0) { throw "emsdk install failed with $LASTEXITCODE" }
+            & .\emsdk.ps1 activate 5.0.2
+            if ($LASTEXITCODE -ne 0) { throw "emsdk activate failed with $LASTEXITCODE" }
+            & .\emsdk_env.ps1
+            if ($LASTEXITCODE -ne 0) { throw "emsdk environment setup failed with $LASTEXITCODE" }
+            foreach ($name in @("EMSDK", "EMSDK_NODE", "EMSDK_PYTHON")) {
+              $value = [Environment]::GetEnvironmentVariable($name)
+              if ($value) { "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+            }
+            # Export only compiler paths: Node 22 from setup-node remains the
+            # application runtime, while emcc uses its configured SDK Node.
+            (Get-Location).Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            (Join-Path (Get-Location).Path "upstream/emscripten") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            & .\upstream\emscripten\emcc.bat --version
+            if ($LASTEXITCODE -ne 0) { throw "emcc version probe failed with $LASTEXITCODE" }
+          } finally {
+            Stop-Transcript
+          }
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            c-two/core -> target
+            c-two/cli -> target
+            c-two/sdk/rust -> target
+            c-two/sdk/python/native -> target
+            fastdb/bindings/rust -> target
+          key: ${{ matrix.os }}-${{ matrix.scope }}-msvc-${{ env.FASTDB_SOURCE_SHA }}-coresdk021
+
+      - name: Collect native build and test evidence
+        working-directory: c-two
+        env:
+          C2_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          C2_RUNNER_LABEL: ${{ matrix.os }}
+        run: >-
+          python tools/ci/windows_native.py
+          --expected-c-two-sha "${{ github.event.pull_request.head.sha || github.sha }}"
+          --expected-fastdb-sha "${{ env.FASTDB_SOURCE_SHA }}"
+          --fastdb-system-lib-dir "${{ steps.fastdb_sdk.outputs.lib-dir }}"
+          --scope "${{ matrix.scope }}"
+          --output "artifacts/windows-native/${{ matrix.scope }}"
+
+      - name: Upload logs and run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-${{ matrix.os }}-${{ matrix.scope }}-${{ github.sha }}
+          path: c-two/artifacts/windows-native/${{ matrix.scope }}/
+          if-no-files-found: error
+          retention-days: 14

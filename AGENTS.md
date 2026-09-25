@@ -45,6 +45,19 @@ uv run pytest sdk/python/tests/unit/test_held_result.py::TestHeldResultBasic::te
 # Rust core tests
 cargo test --manifest-path core/Cargo.toml --workspace
 
+# User-facing Rust SDK, including real route-bound examples
+cargo test --manifest-path sdk/rust/Cargo.toml --all-features
+cargo run --manifest-path sdk/rust/Cargo.toml --example client
+cargo run --manifest-path sdk/rust/Cargo.toml --example host
+
+# Compiled Rust/Python portable proof and exact 18-row direct/relay matrix.
+# These are normal gates, not opt-in tests.
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
+  sdk/python/tests/integration/test_portable_payload_cross_language.py \
+  sdk/python/tests/integration/test_portable_payload_matrix.py \
+  -q --timeout=300
+uv run pytest tests/repo/test_portable_matrix_receipt.py -q
+
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
@@ -76,9 +89,19 @@ Tests use `pytest` with a 30-second per-test timeout. Tests live under `sdk/pyth
 UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ANCHOR_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
 ```
 
+## Local Release-Candidate Evidence
+
+The complete Phase 0B upstream local candidate is recorded in [`docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md`](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md). Package inputs are C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02` and FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487`; later documentation-only commits are never artifact source commits.
+
+The retained canonical manifest and receipts under `docs/reports/evidence/` prove 42 exact artifacts, 4/4 isolated Rust/Python/Node consumers, 18/18 Rust/Python direct/relay rows, 12/12 generated TypeScript Node rows, and the 12-row SDK parity inventory. They are evidence records only. Do not add package archives, local registries, wheelhouses, native libraries, generated trees, or build outputs to Git.
+
+FastDB 0.2.0 is now published separately; its release does not change these historical candidate inputs or prove C-Two publication. Current Windows source builds pin the additional MSVC repair documented in `docs/windows-native-implementation.md`. Official C-Two portable-package distribution, browser runtime, C++ C-Two SDK, compatibility ranges, trust/signature/revocation, streaming, post-dispatch retry/deduplication, and Toodle consumption remain open. Hosted evidence must name its actual source pair and passing gates; never infer it from the local candidate.
+
 ## Architecture
 
-C-Two has a language-neutral Rust core and language SDKs. Python is the current SDK surface, not the canonical home for generic runtime mechanisms. The Python SDK owns Python domain logic, CRM contracts, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust owns shared transport, memory, wire codec, CRM route contract validation and fingerprints, route concurrency enforcement and state, HTTP relay, and configuration resolution. PyO3/maturin bridges Rust into Python as `c_two._native`.
+C-Two has a language-neutral Rust core and user-facing Rust and Python SDKs. Neither SDK is the canonical home for generic runtime mechanisms. The Rust SDK at `sdk/rust` is package `c-two`, imported as `c_two`, and is a thin facade over Core plus generated typed clients/services. The Python SDK owns Python domain logic, CRM authoring, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust `c2-core` is the single shared owner of route selection, client/host calls, retry classification, error normalization, transport lease ordering, and runtime lifecycle; the lower Core crates own memory, wire, contract, relay, and configuration mechanisms. PyO3/maturin projects that same Core into Python as `c_two._native`.
+
+The Rust SDK may depend on the official `fastdb` Rust binding to adapt portable payloads, but `c2-core` must remain payload-owner-neutral. Rust users continue to name `fastdb::Payload`; do not re-export it under a C-Two semantic namespace. Rust and Python must expose the same portable route, payload, error, and lifetime capabilities even when their language-level syntax differs.
 
 ### CRM Layer
 
@@ -87,12 +110,13 @@ Path: `sdk/python/src/c_two/crm/`
 - CRM contracts are interface classes decorated with `@cc.crm(namespace='...', version='...')`.
 - Only methods in the contract are exposed remotely.
 - CRM route contracts are identified by route name plus the CRM namespace, CRM name, CRM version, ABI hash, and signature hash. Python may compute the descriptor/fingerprints from the CRM class, but Rust `c2-contract` validates the complete expected route contract at IPC and relay boundaries.
-- A persistent CRM contract release is a Rust-validated `ContractReleaseRef` derived from canonical `c-two.contract.v1` content. It never contains a route name. `ExpectedRouteContract` is derived later from a validated release plus a runtime route name.
+- A persistent CRM contract release is a Rust-validated `ContractReleaseRef` derived from canonical `c-two.contract.v2` content. It never contains a route name. `ExpectedRouteContract` is derived later from a validated release plus a runtime route name.
 - Resource implementations are plain Python classes and are not decorated.
-- Portable FastDB CRM payloads are inferred from `fastdb4py` annotations and represented by `PayloadAbiRef` values. Python-only fallback values use pickle and must not be treated as portable schema/codegen inputs.
-- FastDB retained response views are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
+- Portable methods declare zero or one input and zero or one output with `@cc.transfer(input=FASTDB_SPEC, output=FASTDB_SPEC)`. Their Python parameter and return type is `fastdb4py.payload.Payload`; C-Two embeds each nested specification as an opaque JSON value and delegates it to FastDB Core.
+- Python-only fallback values use pickle and must not be treated as portable descriptor or codegen inputs.
+- FastDB retained response owners are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.
 - CRM methods can use `@cc.read` or `@cc.write`; writes are the default.
-- `@cc.transfer(input=..., output=...)`, `@cc.transferable`, and `@cc.transfer(buffer='hold')` are obsolete for the FDB-first path and must not be reintroduced as codec or lifetime selection mechanisms.
+- `@cc.transfer(input=..., output=...)` is the only portable FastDB binding authoring surface. `@cc.transferable` and `@cc.transfer(buffer='hold')` are obsolete and must not be reintroduced as codec or lifetime selection mechanisms.
 - `@on_shutdown` marks one public method as a shutdown callback. It is not exposed through RPC.
 
 ### Client Layer
@@ -129,7 +153,7 @@ Do not reintroduce Python-side default validation for IPC or relay internals. SD
 
 Scheduler-related config follows the same boundary. Python may expose `ConcurrencyConfig` and SDK-level enums, but Rust now owns the resolved route concurrency handle, including mode, `max_pending`, `max_workers`, and close state. Python must pass the full typed config into Rust, then treat the native handle as the source of truth for both same-process direct calls and remote dispatch. Do not keep a second Python-owned scheduler state or hidden default policy alive after registration.
 
-Runtime-session config follows the same ownership rule. Rust `c2-runtime::RuntimeSession` owns process server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python may expose typed override facades and forward them into the native session, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
+Runtime config follows the same ownership rule. Rust `c2-core::Runtime` owns process server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python exposes that authority through its native `RuntimeSession` projection and may expose typed override facades, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
 
 ### Transport Layer
 
@@ -153,7 +177,7 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 Transport modes:
 
 - Thread-local: same-process `cc.connect()` returns a zero-serialization proxy. It passes Python objects directly and may use the native route-concurrency handle through a thin Python adapter; do not route this path through Rust bytes dispatch for symmetry.
-- IPC (`ipc://`): UDS control channel plus POSIX SHM data plane through Rust. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls.
+- IPC (`ipc://`): Rust `c2-local` owns local streams (Unix UDS or Windows byte-mode Named Pipes), while `c2-mem` owns POSIX SHM or Windows named mappings. `c2-config::LocalEndpoint` derives the OS endpoint from the logical address; SDKs must use that authority. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls.
 - HTTP (`http://`): relay-based cross-machine transport through Rust.
 
 Direct IPC is a complete standalone mode. `cc.connect(..., address='ipc://...')` must bypass relay discovery and remain usable when no relay is configured or a relay environment variable points at an unavailable server. Relay is only a discovery/forwarding projection above IPC; do not make relay the owner of IPC registration, scheduling, or connection establishment.
@@ -186,15 +210,18 @@ Paths: `core/`, `sdk/python/native/`
 
 | Layer | Crate | Purpose |
 | --- | --- | --- |
-| foundation | `c2-contract` | Route contract validation and canonical descriptor hashing |
+| foundation | `c2-contract` | `c-two.contract.v2` validation, canonical descriptor hashing, release identity, and opaque nested-spec extraction |
+| foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and new-tree publication |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
 | foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
 | protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
-| transport | `c2-ipc` | Async IPC client, UDS, SHM, chunked transfer |
-| transport | `c2-server` | Tokio UDS server with per-connection state and peer SHM lazy-open |
+| transport | `c2-local` | Async Unix UDS / Windows Named Pipe streams, listener ownership and cancellation |
+| transport | `c2-ipc` | Async IPC client, local streams, SHM, chunked transfer |
+| transport | `c2-server` | Local server with per-connection state and peer SHM lazy-open |
 | transport | `c2-http` | HTTP client, relay-aware client, and HTTP relay server behind `relay` feature |
-| runtime | `c2-runtime` | Process runtime session, route transactions, client pools, relay projection |
+| runtime | `c2-core` | Language-neutral runtime, route transactions, client pools, relay projection, and error normalization |
+| sdk/rust | `c-two` / `c_two` | User-facing Rust facade, FastDB adapter, and checked held/borrowed owners |
 | sdk/python/native | `c2-python-native` | PyO3 bindings for `c_two._native` |
 
 Memory subsystem:
@@ -202,8 +229,12 @@ Memory subsystem:
 - Allocation tiers: buddy SHM, dedicated SHM, file spill.
 - `MemHandle` abstracts buddy, dedicated, and file-spill handles.
 - `c2-mem` owns SDK-visible buffer lease accounting. Lease tracking records metadata and retention state only; it must not read payload bytes, allocate a second buffer, or replace `MemPool::free_at()` / `release_handle()` as the memory release authority.
-- SHM segment names are deterministic: `{prefix}_b{idx:04x}` for buddy and `{prefix}_d{idx:04x}` for dedicated.
-- Server lazy-opens peer segments from prefix and index. There is no explicit segment announcement protocol.
+- Each owner pool appends a fresh PID/UUID incarnation to its logical label. `MemPool` alone derives bounded OS backing names; SDKs must not concatenate prefix/index suffixes.
+- Buddy references include a checked `u32` backing generation in handshake protocol version 11. Receiver pools use `MemPool::open_peer()` and lazy-open the exact prefix/index/generation; handshake segment names are descriptive metadata. Older generations cannot read or free a new backing, and a live allocation prevents retirement.
+- The last peer free drops an idle cached view. Owner GC observes remote frees and preserves slot generation counters across reclamation. Dedicated indices never wrap past the wire's `u16` range. There is no separate segment announcement protocol.
+- Shared allocator header version 2 preserves the full PID in a 64-bit lock word. Death observers refuse access without changing that PID-only word; a panicking holder poisons its own backing. Never steal a dead holder's lock or infer retirement from independently sampled lock/count fields. Retirement checks the allocation count while holding the same SHM lock, with one nonblocking acquisition attempt.
+- Windows pipes and mappings share a current-logon SID access policy, use local namespaces, and do not require global mapping privileges. File spill has an owner that closes its mapping before the backing file, with Windows delete-on-close cleanup.
+- Windows listener exclusivity belongs to a separate non-inheritable kernel existence lease, held only by the listener. Connected streams must not retain it. This allows restart while old client handles still exist. Unix listeners own a persistent rendezvous lock and recorded socket identity; only matching orphaned sockets may be reclaimed.
 
 ### CLI
 
@@ -232,11 +263,23 @@ Relay-aware clients use `C2_RELAY_ROUTE_MAX_ATTEMPTS` to cap route acquisition a
 
 ### Import Style
 
-Import the package as `c_two` and alias it as `cc`:
+Python imports the package as `c_two` and commonly aliases it as `cc`:
 
 ```python
 import c_two as cc
 ```
+
+Rust users import the user-facing package as `c_two`, not by a Core or
+transport crate name:
+
+```rust
+use c_two::{Connect, ContractRelease, Runtime};
+use fastdb::Payload;
+```
+
+Generated Rust modules may use the hidden `c_two::generated` seam. Ordinary
+application code must not assemble `c2-ipc`, `c2-http`, `c2-server`,
+`SyncClient`, or route bindings directly.
 
 ### CRM Contract Pattern
 
@@ -251,30 +294,39 @@ class Grid:
 
 ### FastDB CRM Pattern
 
-Author portable FDB-first CRM value types with `fastdb4py`, not `c_two.fastdb`. Keep `c_two.fastdb` for C-Two-owned integration helpers such as bridge derivation, call-db planning, and TypeScript helper generation.
+Author the nested payload specification with FastDB's `fastdb.payload.v1` schema and bind it explicitly with `@cc.transfer(...)`. The method surface carries one `fastdb4py.payload.Payload` envelope; C-Two must not infer payload structure from annotations or add a second FastDB helper module.
 
 ```python
 import c_two as cc
-import fastdb4py as fdb
+from fastdb4py.payload import Payload
 
-@fdb.feature
-class GridCell:
-    global_id: fdb.I32
-    level: fdb.I32
+CELL_SPEC = {
+    "schema": "fastdb.payload.v1",
+    "profile": "record.v1",
+    "entries": [
+        {
+            "id": "value",
+            "cardinality": "one",
+            "type": {"kind": "u8", "nullable": False},
+        },
+    ],
+    "components": [],
+}
 
 @cc.crm(namespace='demo.grid', version='0.1.0')
 class Grid:
-    def get_cells(self, ids: fdb.Array[fdb.I32]) -> fdb.Batch[GridCell]:
+    @cc.transfer(input=CELL_SPEC, output=CELL_SPEC)
+    def echo(self, payload: Payload) -> Payload:
         ...
 ```
 
-`@cc.transfer(input=..., output=...)`, `@cc.transferable`, and `@cc.transfer(buffer='hold')` are not the portable FDB-first authoring path. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
+FastDB Core is the sole authority for nested parsing, canonical identity, digest, binary layout, build/open/view/materialize/invalidate behavior, and payload-only codegen. C-Two validates only the outer contract and binding relationship. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
 
 ### Hold Mode Pattern
 
 `cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It returns `HeldResult` with `.value`, `.unsafe_buffer`, and `.release()`. Safety layers are explicit release, context manager, and `__del__` fallback.
 
-Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For FastDB call-db payloads, `held.value` is the logical CRM return value such as `fdb.Batch[T]`, `fdb.Array[T]`, a single feature, a scalar, or a tuple of those values; do not expose the internal call-db envelope as the public held API. `held.unsafe_buffer` is a raw `memoryview` escape hatch for advanced users and cannot mechanically invalidate raw NumPy or pointer aliases created from it; normal code should use checked FastDB views from `held.value` and call `fdb.materialize(...)` before storing data beyond the hold scope.
+Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle, and file-spill buffers can all be retained leases; do not special-case hold as SHM-only and do not reintroduce Python weakref registries for held buffers. For a portable method, `held.value` is a FastDB `Payload` owner. Releasing the hold invalidates that owner and its checked views before releasing the C-Two lease. The proven receive path is copy-backed; hold is a lifetime contract, not proof of direct response-SHM construction or zero-copy decoding. `held.unsafe_buffer` is a raw `memoryview` escape hatch for advanced users and cannot mechanically invalidate raw NumPy or pointer aliases created from it; normal code should use FastDB checked views and materialize values before storing them beyond the hold scope.
 
 ```python
 with cc.hold(proxy.method)(args) as held:
@@ -291,7 +343,7 @@ finally:
 
 ### FastDB View Lifetime Boundary
 
-FastDB can enforce stale-use detection only at the FastDB view layer. In FastDB 0.1.18, checked `FdbViewOwner` instances track alive state and generation; `fdb.invalidate(...)` recursively finds owners through FastDB-managed containers and invalidates table, row, checked numeric column, string column, and bytes column views. C-Two must bind held responses and borrowed inputs to checked read-only owners, invalidate them before releasing the transport buffer, and use `fdb.materialize(...)` / `.to_owned()` when data must outlive the lease.
+FastDB can enforce stale-use detection only through its public `Payload` owner and checked-view contract. C-Two must invalidate held responses and borrowed inputs before releasing the associated transport lease. Values that must outlive that lease must be materialized through the official FastDB API.
 
 FastDB cannot reliably invalidate every raw pointer a user deliberately extracts from a view. In particular, unsafe NumPy access can produce an ndarray or pointer that no longer consults the FastDB owner on later reads. Treat such APIs as explicit unsafe escapes: tests should assert normal FastDB view invalidation after release, but do not claim that a leaked raw NumPy pointer can be made mechanically impossible in Python.
 
@@ -404,6 +456,8 @@ Requires Python 3.10 or newer. Keep Python 3.10 compatibility intentional: downs
 - Do not treat the Python SDK as the reference implementation for generic runtime behavior. If behavior is language-neutral, prefer a Rust-core owner with thin SDK facades.
 - Preserve direct IPC as relay-independent. If touching registration, client routing, or runtime session code, include checks for explicit `ipc://` connections with relay unset or unavailable.
 - Preserve zero-copy boundaries. If touching wire, SHM, scheduler, or native callback code, include checks that large SHM-backed payloads are not converted to Python `bytes` on the remote IPC path.
+- Do not turn a transport-level SHM proof into a FastDB direct-backing claim. The current portable receive adapters are copy-backed; stronger wording requires resource-time construction into the final C-Two backing, truthful FastDB direct/staged reports, and Rust/Python proof.
+- Keep local-candidate truth separate from official release truth. Reused version metadata identifies an artifact only together with its source commit and SHA-256; do not substitute registry packages for the retained candidate or call documentation-only commits package inputs.
 - For bug fixes and behavior changes, add or update focused tests first when feasible, then implement the correct production-grade code change needed to satisfy the verified behavior; do not use phase boundaries to justify temporary shims or lower-quality shortcuts.
 - When work is split into phases, treat the split as sequencing only. Write the phase boundaries, exit criteria, and follow-up items into the plan document before implementation, keep that plan updated as the authoritative record, and finish each phase with docs that make the remaining work explicit.
 - Do not revert unrelated user changes in a dirty worktree.

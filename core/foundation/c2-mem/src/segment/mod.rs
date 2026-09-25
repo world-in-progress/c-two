@@ -1,4 +1,4 @@
-//! POSIX shared memory region lifecycle management.
+//! Platform-owned shared memory region lifecycle management.
 
 pub mod shm;
 

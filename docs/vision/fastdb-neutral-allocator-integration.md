@@ -1,8 +1,10 @@
-# FastDB Neutral Allocator Integration Vision
+# Historical Allocator Integration Vision
+
+> **Historical / superseded:** This May 2026 proposal is retained only as evidence of the earlier allocator investigation. Its integration model and API names are not current guidance. The current authority is [`2026-07-24 portable-payload contract composition`](../superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md), and the still-unimplemented direct-final-backing capability is tracked in [`contract-release deferred capabilities`](../issues/contract-release-deferred-capabilities.md). Do not implement from the body below.
 
 **Date:** 2026-05-28
-**Status:** P0 architectural direction
-**Weight:** This document is higher priority than existing direct-sink or prepared-payload plans. If a C-Two plan conflicts with this document, update that plan or explicitly mark the conflict.
+**Status:** Historical evidence; superseded 2026-07-24
+**Weight:** None for current implementation
 
 ## Purpose
 

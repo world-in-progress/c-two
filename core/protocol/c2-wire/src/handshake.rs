@@ -3,7 +3,7 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=10]
+//! [1B version=11]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -37,7 +37,7 @@ use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 10;
+pub const HANDSHAKE_VERSION: u8 = 11;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -54,7 +54,7 @@ pub const CAP_CHUNKED: u16 = 1 << 2;
 
 pub const MAX_SEGMENTS: usize = 16;
 pub const MAX_ROUTES: usize = 64;
-pub const MAX_METHODS: usize = 256;
+pub const MAX_METHODS: usize = c2_contract::MAX_CONTRACT_METHODS;
 const MAX_HANDSHAKE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
 
 // ── Data types ───────────────────────────────────────────────────────────
@@ -228,7 +228,7 @@ pub fn encode_server_handshake(
 }
 
 fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
-    let actual = value.as_bytes().len();
+    let actual = value.len();
     if actual > MAX_HANDSHAKE_NAME_BYTES {
         return Err(EncodeError::FieldTooLong {
             field,
@@ -256,10 +256,10 @@ fn validate_route_uid(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("must not be empty".to_string());
     }
-    if value.as_bytes().len() > MAX_HANDSHAKE_NAME_BYTES {
+    if value.len() > MAX_HANDSHAKE_NAME_BYTES {
         return Err(format!(
             "is too long: {} bytes > {}",
-            value.as_bytes().len(),
+            value.len(),
             MAX_HANDSHAKE_NAME_BYTES
         ));
     }

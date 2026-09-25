@@ -1,12 +1,74 @@
 #include <node_api.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "c2_mem_ffi.h"
+
+static void close_library(void *library) {
+#ifdef _WIN32
+    FreeLibrary((HMODULE)library);
+#else
+    dlclose(library);
+#endif
+}
+
+static void *open_library(const char *path, char *error, size_t error_size) {
+#ifdef _WIN32
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (length == 0) {
+        snprintf(error, error_size, "Invalid UTF-8 library path (Windows error %lu)", GetLastError());
+        return NULL;
+    }
+    wchar_t *wide = (wchar_t *)calloc((size_t)length, sizeof(wchar_t));
+    if (wide == NULL) {
+        snprintf(error, error_size, "Out of memory.");
+        return NULL;
+    }
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, length) == 0) {
+        snprintf(error, error_size, "Invalid UTF-8 library path (Windows error %lu)", GetLastError());
+        free(wide);
+        return NULL;
+    }
+    DWORD capacity = GetFullPathNameW(wide, 0, NULL, NULL);
+    wchar_t *absolute = capacity == 0 ? NULL : (wchar_t *)calloc(capacity, sizeof(wchar_t));
+    if (absolute == NULL) {
+        snprintf(error, error_size, "Cannot resolve library path (Windows error %lu)", GetLastError());
+        free(wide);
+        return NULL;
+    }
+    DWORD written = GetFullPathNameW(wide, capacity, absolute, NULL);
+    free(wide);
+    if (written == 0 || written >= capacity) {
+        snprintf(error, error_size, "Cannot resolve library path (Windows error %lu)", GetLastError());
+        free(absolute);
+        return NULL;
+    }
+    // Restrict dependency lookup to this library's directory and system defaults.
+    HMODULE library = LoadLibraryExW(absolute, NULL,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    DWORD code = library == NULL ? GetLastError() : 0;
+    free(absolute);
+    if (library == NULL) {
+        snprintf(error, error_size, "Windows error %lu", code);
+    }
+    return (void *)library;
+#else
+    void *library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (library == NULL) {
+        snprintf(error, error_size, "%s", dlerror());
+    }
+    return library;
+#endif
+}
 
 typedef C2MemFfiStatus (*request_pool_new_fn)(
     const char *,
@@ -35,10 +97,14 @@ typedef void (*response_pool_destroy_fn)(C2MemFfiResponsePool *);
 typedef C2MemFfiStatus (*response_pool_read_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock, uint8_t *, size_t, size_t *);
 typedef C2MemFfiStatus (*response_pool_release_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock);
 typedef uint32_t (*abi_version_fn)(void);
+typedef C2MemFfiStatus (*local_endpoint_len_fn)(const char *, size_t *);
+typedef C2MemFfiStatus (*local_endpoint_copy_fn)(const char *, char *, size_t, size_t *);
 
 typedef struct C2MemFfiNodeSymbols {
     void *library;
     abi_version_fn abi_version;
+    local_endpoint_len_fn local_endpoint_len;
+    local_endpoint_copy_fn local_endpoint_copy;
     request_pool_new_fn request_pool_new;
     request_pool_destroy_fn request_pool_destroy;
     request_pool_prefix_len_fn request_pool_prefix_len;
@@ -144,6 +210,11 @@ static char *read_string_arg(napi_env env, napi_value value, const char *label) 
         return NULL;
     }
     buffer[written] = '\0';
+    if (memchr(buffer, '\0', written) != NULL) {
+        free(buffer);
+        throw_type_error(env, "Native string arguments cannot contain NUL characters.");
+        return NULL;
+    }
     return buffer;
 }
 
@@ -250,6 +321,7 @@ static bool read_block_common(
     napi_value value,
     uint16_t *segment_index,
     uint8_t *is_dedicated,
+    uint32_t *generation,
     uint32_t *offset,
     uint32_t *byte_length) {
     napi_value property;
@@ -270,6 +342,10 @@ static bool read_block_common(
         return false;
     }
     *is_dedicated = temp_bool ? 1 : 0;
+    if (!get_named_property(env, value, "generation", &property) ||
+        !read_uint32_arg(env, property, "block.generation must be a u32 integer.", generation)) {
+        return false;
+    }
     if (!get_named_property(env, value, "offset", &property) ||
         !read_uint32_arg(env, property, "block.offset must be a u32 integer.", offset)) {
         return false;
@@ -284,14 +360,16 @@ static bool read_block_common(
 static bool read_request_block(napi_env env, napi_value value, C2MemFfiRequestBlock *block) {
     uint16_t segment_index = 0;
     uint8_t is_dedicated = 0;
+    uint32_t generation = 0;
     uint32_t offset = 0;
     uint32_t byte_length = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &offset, &byte_length)) {
+    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length)) {
         return false;
     }
     block->segment_index = segment_index;
     block->is_dedicated = is_dedicated;
     block->reserved = 0;
+    block->generation = generation;
     block->offset = offset;
     block->byte_length = byte_length;
     return true;
@@ -300,14 +378,16 @@ static bool read_request_block(napi_env env, napi_value value, C2MemFfiRequestBl
 static bool read_response_block(napi_env env, napi_value value, C2MemFfiResponseBlock *block) {
     uint16_t segment_index = 0;
     uint8_t is_dedicated = 0;
+    uint32_t generation = 0;
     uint32_t offset = 0;
     uint32_t byte_length = 0;
-    if (!read_block_common(env, value, &segment_index, &is_dedicated, &offset, &byte_length)) {
+    if (!read_block_common(env, value, &segment_index, &is_dedicated, &generation, &offset, &byte_length)) {
         return false;
     }
     block->segment_index = segment_index;
     block->is_dedicated = is_dedicated;
     block->reserved = 0;
+    block->generation = generation;
     block->offset = offset;
     block->byte_length = byte_length;
     return true;
@@ -319,6 +399,7 @@ static napi_value make_request_block(napi_env env, C2MemFfiRequestBlock block) {
         return NULL;
     }
     if (!set_named_uint32(env, object, "segmentIndex", block.segment_index) ||
+        !set_named_uint32(env, object, "generation", block.generation) ||
         !set_named_uint32(env, object, "offset", block.offset) ||
         !set_named_uint32(env, object, "byteLength", block.byte_length) ||
         !set_named_bool(env, object, "dedicated", block.is_dedicated != 0)) {
@@ -695,7 +776,54 @@ static napi_value response_pool_release(napi_env env, napi_callback_info info) {
     return make_status_result(env, status, NULL);
 }
 
+static napi_value local_endpoint(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    C2MemFfiNodeSymbols *symbols = NULL;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc < 1) {
+        return throw_type_error(env, "c2_mem_ffi_local_endpoint expects an ipc:// address.");
+    }
+    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
+    if (address == NULL) {
+        return NULL;
+    }
+    size_t length = 0;
+    C2MemFfiStatus status = symbols->local_endpoint_len(address, &length);
+    if (status != C2_MEM_FFI_STATUS_OK) {
+        free(address);
+        return make_status_result(env, status, NULL);
+    }
+    if (length == SIZE_MAX) {
+        free(address);
+        return throw_error(env, "IPC endpoint name is too large.");
+    }
+    char *buffer = (char *)malloc(length + 1);
+    if (buffer == NULL) {
+        free(address);
+        return throw_error(env, "Out of memory.");
+    }
+    size_t written = 0;
+    status = symbols->local_endpoint_copy(address, buffer, length + 1, &written);
+    free(address);
+    napi_value value = NULL;
+    if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_string_utf8(env, buffer, written, &value))) {
+        free(buffer);
+        return NULL;
+    }
+    free(buffer);
+    return make_status_result(env, status, value);
+}
+
 static bool load_symbol(napi_env env, void *library, const char *name, void **out) {
+#ifdef _WIN32
+    void *symbol = (void *)GetProcAddress((HMODULE)library, name);
+    if (symbol == NULL) {
+        char message[512];
+        snprintf(message, sizeof(message), "Failed to load c2-mem-ffi symbol %s (Windows error %lu)", name, GetLastError());
+        throw_error(env, message);
+        return false;
+    }
+#else
     dlerror();
     void *symbol = dlsym(library, name);
     const char *error = dlerror();
@@ -705,6 +833,7 @@ static bool load_symbol(napi_env env, void *library, const char *name, void **ou
         throw_error(env, message);
         return false;
     }
+#endif
     *out = symbol;
     return true;
 }
@@ -717,6 +846,8 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
         } \
     } while (0)
     LOAD_REQUIRED(abi_version, "c2_mem_ffi_abi_version");
+    LOAD_REQUIRED(local_endpoint_len, "c2_mem_ffi_local_endpoint_len");
+    LOAD_REQUIRED(local_endpoint_copy, "c2_mem_ffi_local_endpoint_copy");
     LOAD_REQUIRED(request_pool_new, "c2_mem_ffi_request_pool_new");
     LOAD_REQUIRED(request_pool_destroy, "c2_mem_ffi_request_pool_destroy");
     LOAD_REQUIRED(request_pool_prefix_len, "c2_mem_ffi_request_pool_prefix_len");
@@ -755,22 +886,23 @@ static napi_value load(napi_env env, napi_callback_info info) {
     if (library_path == NULL) {
         return NULL;
     }
-    void *library = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
+    char loader_error[384] = {0};
+    void *library = open_library(library_path, loader_error, sizeof(loader_error));
     if (library == NULL) {
         char message[512];
-        snprintf(message, sizeof(message), "Failed to load c2_mem_ffi shared library: %s", dlerror());
+        snprintf(message, sizeof(message), "Failed to load c2_mem_ffi shared library: %s", loader_error);
         free(library_path);
         return throw_error(env, message);
     }
     free(library_path);
     C2MemFfiNodeSymbols *symbols = (C2MemFfiNodeSymbols *)calloc(1, sizeof(C2MemFfiNodeSymbols));
     if (symbols == NULL) {
-        dlclose(library);
+        close_library(library);
         return throw_error(env, "Out of memory.");
     }
     symbols->library = library;
     if (!load_all_symbols(env, symbols)) {
-        dlclose(library);
+        close_library(library);
         free(symbols);
         return NULL;
     }
@@ -778,18 +910,19 @@ static napi_value load(napi_env env, napi_callback_info info) {
     if (loaded_abi_version != C2_MEM_FFI_ABI_VERSION) {
         char message[256];
         snprintf(message, sizeof(message), "c2_mem_ffi ABI version %u is incompatible with expected version %u.", loaded_abi_version, C2_MEM_FFI_ABI_VERSION);
-        dlclose(library);
+        close_library(library);
         free(symbols);
         return throw_error(env, message);
     }
     napi_value object;
     if (!check_napi(napi_create_object(env, &object))) {
-        dlclose(library);
+        close_library(library);
         free(symbols);
         return NULL;
     }
     if (!set_function(env, object, "c2_mem_ffi_request_pool_new", request_pool_new, symbols) ||
         !set_function(env, object, "c2_mem_ffi_abi_version", abi_version_callback, symbols) ||
+        !set_function(env, object, "c2_mem_ffi_local_endpoint", local_endpoint, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_destroy", request_pool_destroy, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_prefix", request_pool_prefix, symbols) ||
         !set_function(env, object, "c2_mem_ffi_request_pool_segment_count", request_pool_segment_count, symbols) ||
@@ -803,7 +936,7 @@ static napi_value load(napi_env env, napi_callback_info info) {
         !set_function(env, object, "c2_mem_ffi_response_pool_destroy", response_pool_destroy, symbols) ||
         !set_function(env, object, "c2_mem_ffi_response_pool_read", response_pool_read, symbols) ||
         !set_function(env, object, "c2_mem_ffi_response_pool_release", response_pool_release, symbols)) {
-        dlclose(library);
+        close_library(library);
         free(symbols);
         return NULL;
     }

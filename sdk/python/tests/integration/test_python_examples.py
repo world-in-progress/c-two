@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
+
+from tests.fixtures.process_control import interrupt_python_process, python_process_options
 from c_two.transport.client.util import ping
 
 
@@ -59,7 +60,7 @@ def _wait_for_ipc_ready(address: str, timeout: float = 10.0) -> None:
 def _stop_process(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is not None:
         return
-    proc.send_signal(signal.SIGINT)
+    interrupt_python_process(proc)
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -95,6 +96,7 @@ def test_ipc_example():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **python_process_options(),
         )
         output = _wait_for_stdout(crm_proc, "Grid CRM registered")
         ipc_address = _extract_ipc_address(output)
@@ -147,6 +149,7 @@ def test_relay_example(start_c3_relay):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **python_process_options(),
         )
         _wait_for_stdout(crm_proc, "Grid CRM registered")
 
@@ -172,53 +175,6 @@ def test_relay_example(start_c3_relay):
             _stop_process(crm_proc)
 
 
-def test_fastdb_relay_example(start_c3_relay):
-    pytest.importorskip("fastdb4py", reason="FastDB grid examples require fastdb4py")
-    pytest.importorskip("pandas", reason="Python grid examples require examples dependencies")
-    pytest.importorskip("pyarrow", reason="Python grid examples require examples dependencies")
-
-    root = _repo_root()
-    relay = start_c3_relay()
-    relay_url = relay.url
-
-    crm_proc: subprocess.Popen[str] | None = None
-    try:
-        crm_proc = subprocess.Popen(
-            [
-                sys.executable,
-                str(root / "examples/python/fastdb_relay_resource.py"),
-                "--relay-url",
-                relay_url,
-            ],
-            cwd=root,
-            env=_example_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        _wait_for_stdout(crm_proc, "FastDB Grid CRM registered")
-
-        client = subprocess.run(
-            [
-                sys.executable,
-                str(root / "examples/python/fastdb_relay_client.py"),
-                "--relay-url",
-                relay_url,
-            ],
-            cwd=root,
-            env=_example_env(),
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-
-        assert client.returncode == 0, client.stderr
-        assert "[FastDB Client] Done." in client.stdout
-        assert "Held active IDs" in client.stdout
-    finally:
-        if crm_proc is not None:
-            _stop_process(crm_proc)
 
 
 def test_ipc_client_requires_address():

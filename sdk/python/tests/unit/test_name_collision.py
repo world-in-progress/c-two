@@ -7,7 +7,6 @@ Verifies that:
 """
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
@@ -25,9 +24,6 @@ from tests.fixtures.counter import Counter, CounterImpl
 
 ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
-
-
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
 
 def _unique_addr() -> str:
@@ -94,7 +90,7 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def unregister_route(self, rust_server, name, relay_anchor_address=None):  # noqa: ANN001, ARG002
+            def unregister_route(self, name, relay_anchor_address=None):  # noqa: ANN001
                 events.append(f'native_unregister:{name}:{relay_anchor_address}')
                 return {
                     'route_name': name,
@@ -137,8 +133,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._rust_server = object()  # noqa: SLF001
-
         bridge.unregister_crm(
             'grid',
             runtime_session=FakeRuntimeSession(),
@@ -156,7 +150,7 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def unregister_route(self, rust_server, name, relay_anchor_address=None):  # noqa: ANN001, ARG002
+            def unregister_route(self, name, relay_anchor_address=None):  # noqa: ANN001
                 events.append('native_unregister_missing')
                 return {
                     'route_name': name,
@@ -199,8 +193,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._rust_server = object()  # noqa: SLF001
-
         with pytest.raises(KeyError, match='Name not registered in native server'):
             bridge.unregister_crm('grid', runtime_session=FakeRuntimeSession())
 
@@ -214,7 +206,6 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                rust_server,
                 route_names=None,
                 relay_anchor_address=None,
                 timeout_seconds=None,
@@ -278,8 +269,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._rust_server = FakeRustServer()  # noqa: SLF001
-
         bridge.shutdown(
             runtime_session=FakeRuntimeSession(),
             relay_anchor_address='http://relay.test',
@@ -297,7 +286,6 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(
                 self,
-                rust_server,
                 route_names=None,
                 relay_anchor_address=None,
                 timeout_seconds=None,
@@ -358,8 +346,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._rust_server = FakeRustServer()  # noqa: SLF001
-
         bridge.shutdown(runtime_session=FakeRuntimeSession(), timeout=1.25)
 
         assert events == [
@@ -374,7 +360,6 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                rust_server,
                 route_names=None,
                 relay_anchor_address=None,
                 timeout_seconds=None,
@@ -427,8 +412,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._rust_server = FakeRustServer()  # noqa: SLF001
-
         bridge.shutdown(runtime_session=FakeRuntimeSession())
 
         assert events == ["native_shutdown:['grid']"]
@@ -441,7 +424,6 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                rust_server,
                 route_names=None,
                 relay_anchor_address=None,
                 timeout_seconds=None,
@@ -469,8 +451,6 @@ class TestServerNameCollision:
         bridge = object.__new__(NativeServerBridge)
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._rust_server = FakeRustServer()  # noqa: SLF001
-
         bridge.shutdown(runtime_session=FakeRuntimeSession())
 
         assert events == ['native_shutdown:[]']
@@ -481,7 +461,6 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def shutdown(  # noqa: ANN001, ARG002
                 self,
-                rust_server,
                 route_names=None,
                 relay_anchor_address=None,
                 timeout_seconds=None,
@@ -539,8 +518,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._rust_server = FakeRustServer()  # noqa: SLF001
-
         bridge.shutdown(runtime_session=FakeRuntimeSession())
 
         assert events == ["native_shutdown:['grid']"]
@@ -557,7 +534,6 @@ class TestServerNameCollision:
         class FakeRuntimeSession:
             def register_route(
                 self,
-                rust_server,
                 name,
                 dispatcher,
                 methods,
@@ -570,6 +546,7 @@ class TestServerNameCollision:
                 crm_ver,
                 abi_hash,
                 signature_hash,
+                descriptor_json,
                 relay_anchor_address,
             ):  # noqa: ARG002
                 events.append(
@@ -585,8 +562,6 @@ class TestServerNameCollision:
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
         bridge._shm_threshold = 1024  # noqa: SLF001
-        bridge._rust_server = FakeRustServer()  # noqa: SLF001
-
         def fake_create(_crm_class, crm_instance):
             return crm_instance
 

@@ -3,20 +3,24 @@ resolver = "2"
 members = [
     "foundation/c2-contract",
     "foundation/c2-config",
+    "foundation/c2-local-security",
     "foundation/c2-codegen",
     "foundation/c2-error",
     "foundation/c2-mem",
     "foundation/c2-mem-ffi",
     "protocol/c2-wire",
     "transport/c2-ipc",
+    "transport/c2-local",
     "transport/c2-http",
     "transport/c2-server",
-    "runtime/c2-runtime",
+    "runtime/c2-core",
 ]
 
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/world-in-progress/c-two"
 
 [workspace.dependencies]
 parking_lot = "0.12"

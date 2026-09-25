@@ -4,6 +4,12 @@
 //! Each level represents blocks of a specific size (level 0 = full segment,
 //! level N = min_block_size). Allocation rounds up to the nearest power of two
 //! and searches the appropriate level. Free merges buddy pairs recursively.
+//!
+//! Crash safety is fail closed: when the segment lock reports an unavailable
+//! backing (an observed-dead holder, a panicked critical section, or
+//! contention that exhausts the bounded spin budget), `alloc` returns
+//! `None` and `free` returns a descriptive `Err` without touching allocator
+//! state. See `alloc::spinlock` for the lock word encoding.
 
 use crate::alloc::bitmap::LevelBitmap;
 use crate::alloc::spinlock::ShmSpinlock;
@@ -12,7 +18,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// Magic number for segment validation.
 pub const SEGMENT_MAGIC: u32 = 0xCC20_0001;
 /// Current allocator version.
-pub const SEGMENT_VERSION: u16 = 1;
+///
+/// Version 2 widens the spinlock word from `u32` to `u64` (full `u32` holder
+/// PID plus a high panic-poison bit) and shifts the fields after offset 28.
+/// This is a 0.x clean cut: `attach` rejects every other version, including
+/// the version 1 `u32`-word layout.
+pub const SEGMENT_VERSION: u16 = 2;
 /// Header is page-aligned (4KB).
 pub const HEADER_ALIGN: usize = 4096;
 
@@ -28,11 +39,15 @@ pub const HEADER_ALIGN: usize = 4096;
 /// 20      4     min_block (u32)
 /// 24      2     max_levels (u16)
 /// 26      2     _pad1 (u16)
-/// 28      4     spinlock (u32) - atomic
-/// 32      4     alloc_count (u32) - atomic, active allocations
-/// 36      4     _pad2 (u32)
-/// 40      8     free_bytes (u64) - atomic, available bytes
-/// 48      ...   bitmap data (variable length, tightly packed)
+/// 28      4     _pad2 (u32) - keeps the lock word 8-byte aligned
+/// 32      8     spinlock (u64) - atomic lock/poison word; 0 = unlocked,
+///               otherwise the full holder PID in the lower 32 bits, or a
+///               poison-flagged word that makes the backing refuse all
+///               further allocator mutation (see `alloc::spinlock`)
+/// 40      4     alloc_count (u32) - atomic, active allocations
+/// 44      4     _pad3 (u32)
+/// 48      8     free_bytes (u64) - atomic, available bytes
+/// 56      ...   bitmap data (variable length, tightly packed)
 /// ```
 #[repr(C)]
 pub struct SegmentHeader {
@@ -44,12 +59,23 @@ pub struct SegmentHeader {
     pub min_block: u32,
     pub max_levels: u16,
     _pad1: u16,
-    pub spinlock: u32,
-    pub alloc_count: AtomicU32,
     _pad2: u32,
+    pub spinlock: u64,
+    pub alloc_count: AtomicU32,
+    _pad3: u32,
     pub free_bytes: AtomicU64,
     // Bitmap data follows immediately after this struct.
 }
+
+// The lock word is a cross-process AtomicU64: verify the documented layout so
+// the spinlock and both shared counters land on 8-byte-aligned offsets in the
+// shared mapping on every supported backend (x64, arm64).
+const _: () = {
+    assert!(std::mem::size_of::<SegmentHeader>() == 56);
+    assert!(std::mem::offset_of!(SegmentHeader, spinlock) == 32);
+    assert!(std::mem::offset_of!(SegmentHeader, spinlock) % std::mem::align_of::<u64>() == 0);
+    assert!(std::mem::offset_of!(SegmentHeader, free_bytes) % std::mem::align_of::<u64>() == 0);
+};
 
 /// Result of a successful buddy allocation.
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +123,7 @@ impl BuddyAllocator {
 
         // R-C3: Verify SHM base address is properly aligned for SegmentHeader.
         assert!(
-            base as usize % std::mem::align_of::<SegmentHeader>() == 0,
+            (base as usize).is_multiple_of(std::mem::align_of::<SegmentHeader>()),
             "SHM base address must be aligned to SegmentHeader requirements"
         );
 
@@ -167,7 +193,7 @@ impl BuddyAllocator {
     pub unsafe fn attach(base: *mut u8, total_size: usize) -> Result<Self, &'static str> {
         // R-C3: Verify alignment for SegmentHeader access in attach path too.
         assert!(
-            base as usize % std::mem::align_of::<SegmentHeader>() == 0,
+            (base as usize).is_multiple_of(std::mem::align_of::<SegmentHeader>()),
             "SHM base address must be aligned to SegmentHeader requirements"
         );
 
@@ -177,7 +203,7 @@ impl BuddyAllocator {
             return Err("invalid segment magic");
         }
         if header.version != SEGMENT_VERSION {
-            return Err("unsupported segment version");
+            return Err("unsupported segment version (expected 2)");
         }
 
         let data_offset = header.data_offset as usize;
@@ -202,7 +228,12 @@ impl BuddyAllocator {
         })
     }
 
-    /// Allocate a block of at least `size` bytes. Returns None if segment is full.
+    /// Allocate a block of at least `size` bytes.
+    ///
+    /// Returns `None` when the segment is full or when the backing is
+    /// unavailable: held by an observed-dead process, poisoned by panic, or contended past
+    /// the bounded spin budget. A refused allocation never mutates allocator
+    /// state.
     pub fn alloc(&self, size: usize) -> Option<Allocation> {
         if size == 0 || size > self.data_size {
             return None;
@@ -211,13 +242,49 @@ impl BuddyAllocator {
         let actual_size = size.next_power_of_two().max(self.min_block);
         let target_level = self.size_to_level(actual_size)?;
 
-        self.lock
+        match self
+            .lock
             .with_lock(|| self.alloc_with_split(target_level, actual_size))
+        {
+            Ok(allocation) => allocation,
+            Err(_) => None,
+        }
     }
 
     /// Free a previously allocated block.
+    ///
+    /// Returns a descriptive `Err` — never a panic — when the backing is
+    /// unavailable (poisoned or contended past the bounded spin budget) or
+    /// when the free itself is invalid (bad level/offset, double free).
     pub fn free(&self, offset: u32, level: u16) -> Result<(), String> {
-        self.lock.with_lock(|| self.free_and_merge(offset, level))
+        match self.lock.with_lock(|| self.free_and_merge(offset, level)) {
+            Ok(result) => result,
+            Err(err) => Err(format!("buddy free refused: {err}")),
+        }
+    }
+
+    /// Poisoned counters may reflect an interrupted mutation and cannot
+    /// authorize backing retirement, even when they currently report zero.
+    pub fn is_poisoned(&self) -> bool {
+        self.lock.is_poisoned()
+    }
+
+    /// Called under the pool's allocation/cache lock. A busy or poisoned
+    /// allocator cannot authorize retirement through an intermediate counter.
+    pub fn can_retire(&self) -> bool {
+        // One CAS attempt, with no spin, yield, or process-liveness probe.
+        // Observing an unlocked word and then loading the counter separately
+        // would race a peer's last free before its bitmap merge completes.
+        if self
+            .lock
+            .try_lock_budget(std::process::id(), 1, u32::MAX)
+            .is_err()
+        {
+            return false;
+        }
+        let idle = self.alloc_count() == 0;
+        self.lock.unlock();
+        idle
     }
 
     /// Get a pointer to the data at the given offset within the data region.
@@ -307,7 +374,7 @@ impl BuddyAllocator {
         let block_size = self.level_block_size(level);
 
         // R-I4: Validate offset alignment.
-        if (offset as usize) % block_size != 0 {
+        if !(offset as usize).is_multiple_of(block_size) {
             return Err(format!(
                 "free: offset {} not aligned to block size {} at level {}",
                 offset, block_size, level
@@ -452,8 +519,7 @@ impl BuddyAllocator {
         let bitmap_bytes = crate::alloc::bitmap::total_bitmap_bytes(data_candidate, min_block);
         let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
         // Round up to page alignment.
-        let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
-        data_offset
+        (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1)
     }
 
     /// Compute the minimum total SHM size needed so that the usable data region
@@ -671,5 +737,337 @@ mod tests {
         }
         assert_eq!(alloc.free_bytes(), initial_free);
         assert_eq!(alloc.alloc_count(), 0);
+    }
+
+    #[test]
+    fn test_attach_rejects_old_layout_version() {
+        let total_size = 64 * 1024;
+        let mut buffer = vec![0u8; total_size];
+        let alloc = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), total_size, 4096) };
+        drop(alloc);
+
+        // Simulate the version 1 layout, whose lock word was a u32 at a
+        // different offset. Attach must reject it before constructing a
+        // spinlock over the mismatched field.
+        let header = unsafe { &mut *(buffer.as_mut_ptr() as *mut SegmentHeader) };
+        assert_eq!(header.version, SEGMENT_VERSION);
+        header.version = 1;
+
+        let err = unsafe { BuddyAllocator::attach(buffer.as_mut_ptr(), total_size) }
+            .err()
+            .expect("attach must reject the old layout version");
+        assert!(
+            err.contains("version"),
+            "attach must reject the old layout: {err}"
+        );
+    }
+
+    #[test]
+    fn test_alloc_returns_none_and_free_err_when_poisoned() {
+        use crate::alloc::spinlock::PID_MASK;
+
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+        alloc.lock.poison_panicked(std::process::id());
+
+        let free_before = alloc.free_bytes();
+        let count_before = alloc.alloc_count();
+
+        assert!(
+            alloc.alloc(4096).is_none(),
+            "alloc must refuse poisoned backing"
+        );
+        let err = alloc.free(0, 1).unwrap_err();
+        assert!(
+            err.contains("buddy free refused") && err.contains("poisoned"),
+            "free should describe the refusal: {err}"
+        );
+
+        assert_eq!(
+            alloc.free_bytes(),
+            free_before,
+            "refusal must not mutate stats"
+        );
+        assert_eq!(
+            alloc.alloc_count(),
+            count_before,
+            "refusal must not mutate stats"
+        );
+        assert_eq!(
+            alloc.lock.load_word_for_test() & PID_MASK,
+            std::process::id() as u64,
+            "poison must preserve the holder PID"
+        );
+    }
+
+    #[test]
+    fn test_contended_acquire_leaves_allocator_untouched() {
+        let (mut alloc, _buf) = make_allocator(64 * 1024, 4096);
+        // Recovery threshold beyond the budget: expiry must happen without
+        // ever probing (and without ever touching) the live holder.
+        alloc.lock.force_budgets(1_000, 2_000);
+        let alloc = std::sync::Arc::new(alloc);
+
+        let holder_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let holder = {
+            let alloc = std::sync::Arc::clone(&alloc);
+            let started = std::sync::Arc::clone(&holder_started);
+            let stop = std::sync::Arc::clone(&holder_stop);
+            std::thread::spawn(move || {
+                alloc
+                    .lock
+                    .try_lock()
+                    .expect("holder acquires an uncontended lock");
+                started.store(true, std::sync::atomic::Ordering::Release);
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                alloc.lock.unlock();
+            })
+        };
+
+        while !holder_started.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let free_before = alloc.free_bytes();
+        let count_before = alloc.alloc_count();
+
+        assert!(
+            alloc.alloc(4096).is_none(),
+            "bounded acquire must refuse while the holder is alive"
+        );
+        assert_eq!(
+            alloc.free_bytes(),
+            free_before,
+            "refused alloc must mutate nothing"
+        );
+        assert_eq!(
+            alloc.alloc_count(),
+            count_before,
+            "refused alloc must mutate nothing"
+        );
+        assert!(
+            !alloc.lock.is_poisoned(),
+            "a live same-process holder must never be poisoned"
+        );
+
+        holder_stop.store(true, std::sync::atomic::Ordering::Release);
+        holder.join().unwrap();
+
+        // After the holder releases, the untouched allocator still works and
+        // its bitmaps behave exactly as if the refusal never happened.
+        let a = alloc
+            .alloc(4096)
+            .expect("alloc succeeds after holder releases");
+        alloc.free(a.offset, a.level).unwrap();
+        assert_eq!(alloc.alloc_count(), 0);
+    }
+
+    #[test]
+    fn test_panic_in_critical_section_poisons_allocator() {
+        let (alloc, _buf) = make_allocator(64 * 1024, 4096);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = alloc
+                .lock
+                .with_lock(|| -> u32 { panic!("allocator bug inside critical section") });
+        }));
+        assert!(result.is_err(), "panic must propagate after poisoning");
+
+        assert!(alloc.lock.is_poisoned(), "panic must poison the backing");
+
+        let free_before = alloc.free_bytes();
+        assert!(
+            alloc.alloc(4096).is_none(),
+            "alloc refuses a panicked backing"
+        );
+        let err = alloc.free(0, 1).unwrap_err();
+        assert!(
+            err.contains("panicked"),
+            "free should name the panic poison: {err}"
+        );
+        assert_eq!(
+            alloc.free_bytes(),
+            free_before,
+            "refusal must not mutate stats"
+        );
+    }
+
+    #[test]
+    fn test_poison_visible_to_newly_attached_allocator() {
+        let total_size = 64 * 1024;
+        let mut buffer = vec![0u8; total_size];
+        let creator = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), total_size, 4096) };
+        creator.lock.poison_panicked(std::process::id());
+        drop(creator);
+
+        // The poison lives in the shared word, so a fresh attach observes it.
+        let attached = unsafe { BuddyAllocator::attach(buffer.as_mut_ptr(), total_size).unwrap() };
+        assert!(attached.lock.is_poisoned());
+        assert!(
+            attached.alloc(4096).is_none(),
+            "attached allocator must refuse"
+        );
+        assert!(
+            attached.free(0, 1).unwrap_err().contains("poisoned"),
+            "attached allocator free must refuse descriptively"
+        );
+    }
+
+    /// Environment variable that switches a re-invoked test binary into
+    /// holder-child mode; the value is the SHM region name to attach to.
+    const CRASH_CHILD_ENV: &str = "C2_MEM_CRASH_TEST_SHM";
+    /// Shared region data capacity used by the killed-holder test.
+    const CRASH_TEST_DATA_CAPACITY: usize = 64 * 1024;
+
+    #[cfg(unix)]
+    fn unlink_shm_region(name: &str) {
+        if let Ok(c_name) = std::ffi::CString::new(name) {
+            unsafe { libc::shm_unlink(c_name.as_ptr()) };
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unlink_shm_region(_name: &str) {}
+
+    /// Body of the holder child: attach to the shared segment, acquire the
+    /// shared lock, signal readiness through the first data byte, then stay
+    /// alive until the parent kills it (or a safety expiry fires so a leaked
+    /// child can never linger).
+    fn crash_child_main(name: &str) {
+        use crate::ShmRegion;
+
+        let total_size = BuddyAllocator::required_shm_size(CRASH_TEST_DATA_CAPACITY, 4096);
+        let region = ShmRegion::open(name, total_size).expect("holder child opens shared region");
+        let alloc = unsafe {
+            BuddyAllocator::attach(region.base_ptr(), region.size()).expect("child attach")
+        };
+        alloc
+            .lock
+            .try_lock()
+            .expect("child acquires the shared lock");
+        // Readiness signal while holding the lock: byte 0 of the data region
+        // is plain test-protocol storage, not allocator state.
+        let ready = unsafe { &*alloc.data_ptr(0).cast::<std::sync::atomic::AtomicU8>() };
+        ready.store(1, Ordering::Release);
+        let expiry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < expiry {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn test_killed_holder_refuses_shared_segment_without_mutation() {
+        if let Ok(name) = std::env::var(CRASH_CHILD_ENV) {
+            crash_child_main(&name);
+            return;
+        }
+
+        use crate::ShmRegion;
+        use crate::alloc::spinlock::SpinlockError;
+
+        let name = format!(
+            "/c2mem-crash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        );
+        let total_size = BuddyAllocator::required_shm_size(CRASH_TEST_DATA_CAPACITY, 4096);
+        let region = ShmRegion::create(&name, total_size).expect("parent creates shared region");
+        let mut alloc = unsafe { BuddyAllocator::init(region.base_ptr(), total_size, 4096) };
+        alloc.lock.force_budgets(100_000, 1_000);
+
+        // Genuine two-process setup: the holder is a real child process that
+        // maps the same SHM region and acquires the shared lock. `--exact`
+        // needs the full test path so the child harness runs only this test,
+        // which detects the child-mode env var and becomes the holder.
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "alloc::buddy::tests::test_killed_holder_refuses_shared_segment_without_mutation",
+                ])
+                .env(CRASH_CHILD_ENV, &name)
+                .spawn()
+                .expect("spawn holder child"),
+        );
+        let child_pid = child.0.id();
+
+        // Wait until the child holds the shared lock and signals readiness.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let ready = unsafe { &*alloc.data_ptr(0).cast::<std::sync::atomic::AtomicU8>() };
+        while ready.load(Ordering::Acquire) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "holder child never signaled readiness"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let free_before = alloc.free_bytes();
+        let count_before = alloc.alloc_count();
+
+        // Simulate the crash: kill (SIGKILL / TerminateProcess) and reap the
+        // child while it holds the shared lock.
+        child.0.kill().expect("kill the holder child");
+        let status = child.0.wait().expect("reap killed holder child");
+        assert!(
+            !status.success(),
+            "holder must be killed while holding the lock"
+        );
+
+        // Refuse the dead holder without rewriting the shared lock word.
+        // Its nonzero word continues to block allocation and retirement.
+        let err = alloc
+            .lock
+            .try_lock_budget(std::process::id(), 100_000, 1_000)
+            .unwrap_err();
+        assert_eq!(err, SpinlockError::DeadHolder { holder: child_pid });
+        assert!(!alloc.lock.is_poisoned());
+        assert!(!alloc.can_retire());
+        assert_eq!(
+            alloc.lock.load_word_for_test(),
+            child_pid as u64,
+            "observer must leave the killed child's lock word untouched"
+        );
+
+        // The allocator surface refuses with unchanged allocator state.
+        assert_eq!(
+            alloc.free_bytes(),
+            free_before,
+            "refusal must not mutate allocator state"
+        );
+        assert_eq!(
+            alloc.alloc_count(),
+            count_before,
+            "refusal must not mutate allocator state"
+        );
+        assert!(
+            alloc.alloc(4096).is_none(),
+            "alloc refuses the dead-held shared segment"
+        );
+        let free_err = alloc.free(0, 1).unwrap_err();
+        assert!(
+            free_err.contains("dead holder"),
+            "free describes the dead-holder refusal: {free_err}"
+        );
+        assert_eq!(alloc.lock.load_word_for_test(), child_pid as u64);
+        assert_eq!(alloc.alloc_count(), count_before);
+        assert_eq!(alloc.free_bytes(), free_before);
+
+        unlink_shm_region(&name);
     }
 }
