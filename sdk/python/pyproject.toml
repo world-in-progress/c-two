@@ -3,7 +3,7 @@ name = "c-two"
 version = "0.6.0"
 description = "C-Two is a resource-RPC framework that enables resource-oriented classes to be remotely invoked across different processes or machines."
 readme = "README.md"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "licenses/fastdb/LICENSE", "licenses/fastdb/THIRD_PARTY_NOTICES.txt"]
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -34,7 +34,7 @@ module-name = "c_two._native"
 python-source = "src"
 features = ["pyo3/extension-module"]
 auditwheel = "repair"
-include = ["LICENSE"]
+include = ["LICENSE", "licenses/fastdb/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
