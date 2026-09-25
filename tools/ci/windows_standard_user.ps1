@@ -244,3 +244,4 @@ runpy.run_path(staged["helper"], run_name="__main__")
 }
 Write-Output "Standard-user wheel consumer: $($report.status)"
 if ($report.status -ne 'passed') { exit 1 }
+exit 0

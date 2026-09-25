@@ -113,3 +113,21 @@ def test_standard_user_driver_forwards_source_identity(tmp_path):
     args = json.loads(receipt.read_text())
     assert args[args.index("--source-sha") + 1] == "a" * 40
     assert args[args.index("--c3") + 1] == "c3-platform.exe"
+
+
+@pytest.mark.parametrize("status,expected", [("passed", 0), ("failed", 1)])
+def test_standard_user_wrapper_sets_its_own_exit_code(tmp_path, status, expected):
+    import shutil
+    from pathlib import Path
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell is required for wrapper exit-code execution")
+    source = (Path(__file__).resolve().parents[2] / "tools/ci/windows_standard_user.ps1").read_text()
+    tail = source[source.rindex('Write-Output "Standard-user wheel consumer:'):]
+    wrapper = tmp_path / "wrapper.ps1"
+    wrapper.write_text('$report = @{ status = $args[0] }\n' + tail)
+    caller = tmp_path / "caller.ps1"
+    caller.write_text('param($Wrapper, $Status)\n$global:LASTEXITCODE = 71\n& $Wrapper $Status\nexit $LASTEXITCODE\n')
+    result = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(caller), str(wrapper), status],
+                            capture_output=True, text=True)
+    assert result.returncode == expected, result.stdout + result.stderr
