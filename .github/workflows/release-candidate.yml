@@ -47,8 +47,62 @@ env:
   PYTHONUTF8: "1"
 
 jobs:
+  # A lockfile-only or documentation PR cannot change a publishable archive.
+  # Keep the workflow visible on every PR, but spend the artifact matrix only
+  # on inputs that can affect the release or its validation. Every main push
+  # and manual dispatch still builds the complete candidate.
+  scope:
+    name: release scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      build: ${{ steps.select.outputs.build }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        if: github.event_name == 'pull_request'
+        id: paths
+        with:
+          filters: |
+            candidate:
+              - 'core/**'
+              - 'cli/**'
+              - 'sdk/**'
+              - 'examples/**'
+              - 'tools/**'
+              - 'tests/**'
+              - '.github/**'
+              - 'pyproject.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain*'
+              - '.cargo/**'
+              - '.gitattributes'
+              - '.gitignore'
+              - 'LICENSE'
+
+      - name: Select candidate matrix
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CANDIDATE_PATHS: ${{ steps.paths.outputs.candidate }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files || 0 }}
+        run: |
+          # GitHub's PR files API stops after 3,000 files. Run the complete
+          # matrix when the path result could be incomplete.
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$CANDIDATE_PATHS" = "true" ] || [ "$CHANGED_FILES" -ge 3000 ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Building the complete release candidate."
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "No release inputs changed; CI remains the PR gate."
+          fi
+
   # ── Source-bound context: versions, commit, official FastDB byte identities ──
   context:
+    needs: scope
+    if: needs.scope.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
