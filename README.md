@@ -82,6 +82,21 @@ cp .env.example .env                          # optional: local environment conf
 
 Requires [uv](https://github.com/astral-sh/uv) and a Rust toolchain. The setup above uses the Core SDK for development and testing. Deployable CLI and Python-extension builds select `FASTDB_PAYLOAD_LINK_MODE=source` and statically link the same immutable FastDB 0.2.1 source; this is separate from the Core/Rust SDK system-link contract. Run the Python suite with `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q`, and the Rust suites with `cargo test --manifest-path core/Cargo.toml --workspace` and `cargo test --manifest-path sdk/rust/Cargo.toml --all-features`. Python 3.10 remains the supported minimum. On Windows, follow the [Windows build guide](docs/windows-native-usage.md) instead of the script above.
 
+Full interoperability tests also require Node 22, CMake/Ninja and Emscripten
+5.0.2 (with `emcmake` on `PATH`). Install both sets of TypeScript dependencies
+and the minimum Python interpreter before running those suites:
+
+```bash
+npm ci --prefix ../fastdb/ts/fastdb4ts
+npm ci --prefix core/foundation/c2-mem-ffi/bindings/typescript
+uv python install 3.10
+```
+
+The [CI setup](.github/workflows/ci.yml) records the pinned Emscripten setup and
+scopes FastDB system linking to Rust consumers. After building the Python
+extension, use `uv run --no-sync pytest ...` when running with that system-link
+environment so the test command does not rebuild the extension.
+
 ### c3 CLI
 
 The `c3` CLI runs the relay server and contract tooling. The latest published release is c3 0.1.4 with Linux and macOS binaries; install it with:

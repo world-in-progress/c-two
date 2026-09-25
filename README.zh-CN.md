@@ -82,6 +82,21 @@ cp .env.example .env                          # 可选：本地环境配置
 
 需要 [uv](https://github.com/astral-sh/uv) 和 Rust 工具链。上面的配置用于通过 Core SDK 开发和测试。用于分发的 CLI 与 Python 扩展构建选择 `FASTDB_PAYLOAD_LINK_MODE=source`，静态链接同一份固定的 FastDB 0.2.1 源码；Core/Rust SDK 则保留 system 链接约定。用 `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q` 运行 Python 测试，用 `cargo test --manifest-path core/Cargo.toml --workspace` 与 `cargo test --manifest-path sdk/rust/Cargo.toml --all-features` 运行 Rust 测试。Python 3.10 仍是最小支持版本。Windows 请改用 [Windows 构建指南](docs/windows-native-usage.md)。
 
+完整互操作测试还需要 Node 22、CMake/Ninja 和 Emscripten 5.0.2（`PATH`
+中可执行 `emcmake`）。运行这些测试前，安装两套 TypeScript 依赖和最低支持的
+Python 解释器：
+
+```bash
+npm ci --prefix ../fastdb/ts/fastdb4ts
+npm ci --prefix core/foundation/c2-mem-ffi/bindings/typescript
+uv python install 3.10
+```
+
+[CI 配置](.github/workflows/ci.yml)记录了固定版本的 Emscripten 安装步骤，
+并将 FastDB system 链接环境限定于 Rust 消费者。Python 扩展构建完成后，
+若在该 system 链接环境下运行测试，请使用 `uv run --no-sync pytest ...`，
+避免测试命令重新构建扩展。
+
 ### c3 CLI
 
 `c3` CLI 运行 relay server 与契约工具。最新已发布版本是 c3 0.1.4，附带 Linux 与 macOS 二进制：

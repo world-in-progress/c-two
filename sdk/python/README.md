@@ -83,7 +83,7 @@ Run Rust core checks when validating shared native runtime changes:
 cargo test --manifest-path core/Cargo.toml --workspace
 ```
 
-For CLI build, link, and test commands, see [`../../cli/README.md`](../../cli/README.md).
+For CLI build, link, and test commands, see [the CLI guide](https://github.com/Dsssyc/c-two/blob/dev-feature/cli/README.md).
 
 ## Examples
 
