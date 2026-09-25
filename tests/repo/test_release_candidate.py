@@ -689,3 +689,33 @@ def test_checksum_commands_need_only_the_standard_library(tmp_path):
     for command in ("checksum", "verify"):
         subprocess.run([sys.executable, "-S", str(helper), command, str(artifact)],
                        check=True, capture_output=True, text=True)
+
+
+def test_sdist_workflow_enables_maturin_pep517_repair(tmp_path, monkeypatch):
+    import maturin
+    import shlex
+    import subprocess
+    import yaml
+    workflow = yaml.safe_load((Path(__file__).resolve().parents[2] /
+                               ".github/workflows/release-candidate.yml").read_text())
+    step = next(s for s in workflow["jobs"]["sdist"]["steps"]
+                if s.get("name") == "Isolated build of the wheel from the extracted sdist contents")
+    setting = next(arg for arg in shlex.split(step["run"])
+                   if arg.startswith("build-args="))
+    name, value = setting.split("=", 1)
+    built = tmp_path / "c_two-0.6.0-cp312-cp312-manylinux_2_39_x86_64.whl"
+    built.write_bytes(b"backend command fixture")
+    out = tmp_path / "out"
+    out.mkdir()
+    commands = []
+    def invoke(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=(str(built) + "\n").encode())
+    monkeypatch.setattr(maturin.subprocess, "run", invoke)
+    monkeypatch.setattr(maturin, "_additional_pep517_args", lambda: [])
+    maturin.build_wheel(str(out), {name: value})
+    command = commands[-1]
+    assert command[command.index("--compatibility") + 1] == "manylinux_2_39"
+    assert command[command.index("--auditwheel") + 1] == "repair"
+    assert "off" not in command
+    assert (out / built.name).read_bytes() == built.read_bytes()

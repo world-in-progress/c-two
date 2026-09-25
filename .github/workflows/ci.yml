@@ -151,6 +151,8 @@ jobs:
           --with pytest
           --with pytest-timeout
           --with packaging
+          --with pyyaml
+          --with maturin
           pytest
           --confcutdir=tests/repo
           tests/repo/test_cli_release_workflow.py

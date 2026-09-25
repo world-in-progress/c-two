@@ -606,7 +606,7 @@ jobs:
   # ── sdist: member-tree inspection plus isolated build/install/lifecycle ────
   sdist:
     needs: [context, cli]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       FASTDB_VERSION: ${{ needs.context.outputs.fastdb_version }}
@@ -668,7 +668,12 @@ jobs:
           set -euxo pipefail
           mkdir -p isolated
           tar -xzf dist/c_two-*.tar.gz -C isolated
-          python -m build --wheel --outdir isolated-dist isolated/c_two-*
+          python -m pip install --quiet patchelf
+          # The PEP 517 backend defaults to --compatibility off; explicitly
+          # enable the Ubuntu 24.04/glibc 2.39 policy so repair is performed.
+          python -m build --wheel --outdir isolated-dist \
+            -C "build-args=--compatibility manylinux_2_39 --auditwheel repair" \
+            isolated/c_two-*
 
       # Keep maturin's auditwheel repair: the isolated wheel must bundle the
       # core library itself with an $ORIGIN runpath and no SDK path leakage.
@@ -1162,7 +1167,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $files = Get-ChildItem cli, wheels, fastdb -File | Where-Object { $_.Name -notlike '*.sha256' }
+          $files = @(Get-Item -LiteralPath cli/c3-x86_64-pc-windows-msvc.exe) + @(Get-ChildItem wheels, fastdb -File | Where-Object { $_.Name -notlike '*.sha256' })
           python .github/scripts/release_candidate.py verify @($files | ForEach-Object { $_.FullName })
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
@@ -1170,7 +1175,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $c3 = (Get-ChildItem cli -File | Where-Object { $_.Name -like 'c3-*' -and $_.Name -notlike '*.sha256' }).FullName
+          $c3 = (Get-Item -LiteralPath cli/c3-x86_64-pc-windows-msvc.exe).FullName
           $ctwo = (Get-ChildItem wheels -Filter *.whl -File).FullName
           $fastdb = (Get-ChildItem fastdb -Filter *.whl -File).FullName
           & "$PWD/tools/ci/windows_standard_user.ps1" `
