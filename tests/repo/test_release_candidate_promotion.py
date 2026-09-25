@@ -22,7 +22,9 @@ import re
 import stat
 import subprocess
 import urllib.error
+import urllib.request
 import zipfile
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -842,6 +844,125 @@ def run_prepare(
     argv += ["--source-sha", SOURCE_SHA]
     argv += extra or []
     return promote.main(argv), plan, body
+
+
+# ── Authenticated GitHub API redirects ────────────────────────────────────────
+
+
+class RedirectResponse(io.BytesIO):
+    def __init__(self, url: str, status: int, headers: dict[str, str], body: bytes) -> None:
+        super().__init__(body)
+        self.url = url
+        self.status = self.code = status
+        self.msg = "redirect" if status == 302 else "response"
+        self.headers = Message()
+        for name, value in headers.items():
+            self.headers[name] = value
+
+    def info(self) -> Message:
+        return self.headers
+
+    def geturl(self) -> str:
+        return self.url
+
+
+class RedirectTransport(urllib.request.BaseHandler):
+    """Keep urllib's real redirect machinery while replacing network I/O."""
+
+    handler_order = 0
+
+    def __init__(self, reply) -> None:
+        self.reply = reply
+        self.requests: list[tuple[str, str | None]] = []
+
+    def https_open(self, request: urllib.request.Request) -> RedirectResponse:
+        authorization = request.get_header("Authorization")
+        self.requests.append((request.full_url, authorization))
+        status, headers, body = self.reply(request.full_url, authorization)
+        return RedirectResponse(request.full_url, status, headers, body)
+
+    http_open = https_open
+
+
+def _install_redirect_transport(monkeypatch: pytest.MonkeyPatch, transport: RedirectTransport) -> None:
+    build_opener = urllib.request.build_opener
+    # Route either urllib entry point through the fake transport without network access.
+    monkeypatch.setattr(urllib.request, "urlopen", build_opener(transport).open)
+    monkeypatch.setattr(
+        urllib.request, "build_opener",
+        lambda *handlers: build_opener(transport, *handlers),
+    )
+
+
+def test_github_api_preserves_authentication_on_same_origin_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_url = "https://api.github.com/repos/world-in-progress/c-two/actions/runs/123"
+    redirected_url = "https://api.github.com/repos/world-in-progress/c-two/actions/runs/123?next=1"
+
+    def reply(url: str, authorization: str | None):
+        if url == api_url:
+            return 302, {"Location": redirected_url}, b""
+        assert url == redirected_url
+        assert authorization == "Bearer test-token"
+        return 200, {}, b'{"ok": true}'
+
+    transport = RedirectTransport(reply)
+    _install_redirect_transport(monkeypatch, transport)
+    api = promote.GitHubApi("https://api.github.com", REPOSITORY, "test-token")
+
+    assert api.get_json(f"/repos/{REPOSITORY}/actions/runs/123") == (200, {"ok": True})
+    assert transport.requests == [
+        (api_url, "Bearer test-token"),
+        (redirected_url, "Bearer test-token"),
+    ]
+
+
+def test_github_artifact_redirect_strips_auth_and_accepts_signed_zip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_url = f"https://api.github.com/repos/{REPOSITORY}/actions/artifacts/123/zip"
+    signed_url = "https://productionresultssa11.blob.core.windows.net/results/signed.zip?sig=example"
+    blob = _zip_bytes({"smoke.txt": b"signed artifact bytes"})
+
+    def reply(url: str, authorization: str | None):
+        if url == api_url:
+            return 302, {"Location": signed_url}, b""
+        assert url == signed_url
+        if authorization is not None:
+            return 401, {}, b"InvalidAuthenticationInfo"
+        return 200, {}, blob
+
+    transport = RedirectTransport(reply)
+    _install_redirect_transport(monkeypatch, transport)
+    api = promote.GitHubApi("https://api.github.com", REPOSITORY, "test-token")
+    artifact = {"name": "rc-smoke-x86_64-apple-darwin", "id": 123,
+                "digest": f"sha256:{_sha(blob)}"}
+
+    assert api.get_bytes(f"/repos/{REPOSITORY}/actions/artifacts/123/zip") == (200, blob)
+    promote.download_and_extract_artifact(api, artifact, tmp_path, {})
+
+    assert transport.requests == 2 * [(api_url, "Bearer test-token"), (signed_url, None)]
+    assert (tmp_path / "smoke.txt").read_bytes() == b"signed artifact bytes"
+
+
+def test_github_artifact_redirect_refuses_http_downgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_url = f"https://api.github.com/repos/{REPOSITORY}/actions/artifacts/123/zip"
+    insecure_url = "http://productionresultssa11.blob.core.windows.net/results/signed.zip"
+
+    def reply(url: str, authorization: str | None):
+        assert url == api_url, "downgraded URL must never be requested"
+        return 302, {"Location": insecure_url}, b""
+
+    transport = RedirectTransport(reply)
+    _install_redirect_transport(monkeypatch, transport)
+    api = promote.GitHubApi("https://api.github.com", REPOSITORY, "test-token")
+
+    with pytest.raises(promote.PromotionError, match="HTTPS"):
+        api.get_bytes(f"/repos/{REPOSITORY}/actions/artifacts/123/zip")
+    assert transport.requests == [(api_url, "Bearer test-token")]
 
 
 # ── Sequencing and provenance ────────────────────────────────────────────────
