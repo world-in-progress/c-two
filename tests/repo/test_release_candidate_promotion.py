@@ -368,12 +368,20 @@ class CandidateBuilder:
                 for name, sha in sorted(self.published_listing.items())
             ],
         })
-        self._record_receipt("fastdb-sdist.json", {"mode": "sdist"})
+        base = {"schema": "c-two.fastdb-release.resolution.v1",
+                "project": "fastdb4py", "version": FASTDB_VERSION}
+        self._record_receipt("fastdb-sdist.json", {
+            **base, "mode": "sdist", "filename": self.fastdb_sdist_name,
+            "sha256": _sha(self.fastdb_sdist_data)})
         for target in CLI_TARGETS:
-            self._record_receipt(
-                f"fastdb-{target}.json",
-                {"mode": "sdist" if target in SDIST_MODE_TARGETS else "wheel",
-                 "version": FASTDB_VERSION})
+            retained = self.retained_fastdb[target]
+            if target in SDIST_MODE_TARGETS:
+                decision = {**base, "mode": "sdist", "filename": self.fastdb_sdist_name,
+                            "sha256": _sha(self.fastdb_sdist_data),
+                            "built_wheel": {**retained, "derived_from_sdist_sha256": _sha(self.fastdb_sdist_data)}}
+            else:
+                decision = {**base, "mode": "wheel", "filename": retained["name"], "sha256": retained["sha256"]}
+            self._record_receipt(f"fastdb-{target}.json", decision)
 
         # 30 executed ABI rows: installed-wheel-smoke receipts bound to rows.
         for target in CLI_TARGETS:
@@ -383,12 +391,11 @@ class CandidateBuilder:
                 ctwo_data = self.wheel_data[ctwo_name]
                 if target in SDIST_MODE_TARGETS:
                     built_name = _fastdb_wheel_name(target, python)
-                    if python == "3.12":
-                        built = self.retained_fastdb[target]
-                    else:
-                        built_data = f"built-{target}-{python}".encode()
-                        built = {"name": built_name, "sha256": _sha(built_data),
-                                 "bytes": len(built_data)}
+                    # Independent per-ABI builds need not reproduce the
+                    # provisioning job's cp312 wheel bytes.
+                    built_data = f"built-{target}-{python}".encode()
+                    built = {"name": built_name, "sha256": _sha(built_data),
+                             "bytes": len(built_data)}
                     fastdb_artifact = {
                         "name": built["name"], "sha256": built["sha256"],
                         "bytes": built["bytes"], "distribution": "fastdb4py",
@@ -1737,3 +1744,13 @@ def test_publish_rechecks_downloaded_staging_bytes(tmp_path, workflow_name, grou
     assert subprocess.run(command, cwd=tmp_path, capture_output=True).returncode == 0
     path.write_bytes(b"forged bytes")
     assert subprocess.run(command, cwd=tmp_path, capture_output=True).returncode != 0
+
+
+def test_provisioning_receipt_must_derive_from_the_retained_source(tmp_path, environment, capsys):
+    world = _mutated_receipt_world(
+        "fastdb-aarch64-unknown-linux-gnu.json",
+        lambda payload: payload["built_wheel"].update(derived_from_sdist_sha256=_digest("0")))
+    environment(world)
+    code, _, _ = run_prepare(tmp_path)
+    assert code == 1
+    assert "built-wheel derivation" in capsys.readouterr().err

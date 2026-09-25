@@ -385,6 +385,11 @@ def _validate_candidate_bindings(options: argparse.Namespace, problems: list[str
         if not isinstance(payload, dict):
             continue
         decision = payload.get("fastdb")
+        if name.startswith("fastdb-"):
+            if payload.get("schema") != "c-two.fastdb-release.resolution.v1":
+                problems.append(f"provisioning receipt {name} has an invalid schema")
+                continue
+            decision = payload
         if isinstance(decision, dict) and "sha256" in decision:
             decisions.append((name, decision))
             built = decision.get("built_wheel")

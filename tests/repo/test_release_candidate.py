@@ -372,6 +372,10 @@ def candidate_tree(tmp_path: Path) -> Path:
         for python in PYTHONS:
             tag = "cp" + python.replace(".", "")
             decision = fastdb_decision(target, python)
+            if decision["mode"] == "sdist" and python == "3.12":
+                # This ABI job rebuilt the same sdist independently; it is
+                # not the byte-identical wheel retained by provisioning.
+                decision["built_wheel"]["sha256"] = digest_of(b"independent ABI build")
             if decision["mode"] == "wheel":
                 fastdb_name, fastdb_sha = decision["filename"], decision["sha256"]
             else:
@@ -403,10 +407,10 @@ def candidate_tree(tmp_path: Path) -> Path:
     # Provisioning receipts: the wheel-mode target's published decision and
     # the sdist-mode target's built-wheel decision (which legitimizes the
     # retained built FastDB wheel in the proof inventory).
-    retain("fastdb-x86_64-unknown-linux-gnu.json", json.dumps(fastdb_decision(
-        "x86_64-unknown-linux-gnu", "3.12"), indent=2).encode())
-    retain("fastdb-aarch64-apple-darwin.json", json.dumps(fastdb_decision(
-        "aarch64-apple-darwin", "3.12"), indent=2).encode())
+    retain("fastdb-x86_64-unknown-linux-gnu.json", json.dumps({"schema": "c-two.fastdb-release.resolution.v1", **fastdb_decision(
+        "x86_64-unknown-linux-gnu", "3.12")}, indent=2).encode())
+    retain("fastdb-aarch64-apple-darwin.json", json.dumps({"schema": "c-two.fastdb-release.resolution.v1", **fastdb_decision(
+        "aarch64-apple-darwin", "3.12")}, indent=2).encode())
 
     retain("rc-context.json", json.dumps(
         {"schema": "c-two.release-candidate.context.v1",
@@ -719,3 +723,11 @@ def test_sdist_workflow_enables_maturin_pep517_repair(tmp_path, monkeypatch):
     assert command[command.index("--auditwheel") + 1] == "repair"
     assert "off" not in command
     assert (out / built.name).read_bytes() == built.read_bytes()
+
+
+def test_provisioning_receipt_cannot_change_its_sdist_derivation(rc, tmp_path, capsys):
+    root = candidate_tree(tmp_path)
+    rewrite_receipt(root, "fastdb-aarch64-apple-darwin.json",
+                    lambda payload: payload["built_wheel"].update(derived_from_sdist_sha256="0" * 64))
+    assert rc.main(manifest_args(root, root / "rc-manifest.json")) == 1
+    assert "built-wheel derivation" in capsys.readouterr().err

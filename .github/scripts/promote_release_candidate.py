@@ -720,6 +720,24 @@ def verify_candidate_receipts(
         _require(isinstance(payload, dict), f"receipt {name} is not an object")
         return payload
 
+    # Provisioning wheels and per-ABI wheels are separate builds. Bind each
+    # retained provisioning wheel to its own source-checked decision receipt.
+    for path in sorted(extraction.glob("fastdb-*.json")):
+        decision = load(path.name)
+        _require(decision.get("schema") == "c-two.fastdb-release.resolution.v1"
+                 and decision.get("project") == "fastdb4py"
+                 and decision.get("version") == manifest["meta"]["fastdb_version"],
+                 f"{path.name} provisioning identity mismatch")
+        if path.name == "fastdb-sdist.json":
+            _require(decision.get("mode") == "sdist" and
+                     decision.get("sha256") == context["retained_fastdb_sdist"]["sha256"],
+                     "source-only FastDB receipt does not bind the retained sdist")
+        else:
+            _validate_fastdb_decision(path.name, decision, context)
+            if decision["mode"] == "sdist":
+                built = decision["built_wheel"]
+                built_identities.add((built["name"], built["sha256"]))
+
     # 30 executed ABI rows: installed-wheel-smoke receipts bound to their row.
     rows: dict[tuple[str, str], str] = {}
     for path in sorted(extraction.glob("abi-*.json")):
