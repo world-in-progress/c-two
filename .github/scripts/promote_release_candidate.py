@@ -66,6 +66,7 @@ import re
 import stat
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -167,6 +168,32 @@ class DeferredPromotion(RuntimeError):
     """The other gate is still running; a later event re-triggers promotion."""
 
 
+def _url_origin(url: str) -> tuple[str, str | None, int | None]:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise PromotionError("GitHub API redirect has an invalid origin") from error
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parsed.scheme)
+    return parsed.scheme, parsed.hostname, port
+
+
+class _GitHubApiRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep API auth on its origin and use signed artifact URLs without it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source_origin = _url_origin(req.full_url)
+        target_origin = _url_origin(newurl)
+        cross_origin = source_origin != target_origin
+        if cross_origin and (source_origin[0] != "https" or target_origin[0] != "https"):
+            raise PromotionError("GitHub API cross-origin redirect requires HTTPS")
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if cross_origin and redirected is not None:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
 class GitHubApi:
     """Read-only authenticated access to the canonical repository's Actions API."""
 
@@ -174,6 +201,7 @@ class GitHubApi:
         self.base_url = base_url.rstrip("/")
         self.repository = repository
         self.token = token
+        self._opener = urllib.request.build_opener(_GitHubApiRedirectHandler())
 
     def _request(self, path: str, accept: str) -> tuple[int, bytes]:
         if not path.startswith("/"):
@@ -189,7 +217,7 @@ class GitHubApi:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with self._opener.open(request, timeout=120) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as error:
             return error.code, error.read()
