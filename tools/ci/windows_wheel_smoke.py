@@ -198,8 +198,10 @@ def clean_environment() -> dict[str, str]:
                    if not key.startswith(excluded) and key != "VIRTUAL_ENV"}
     sdk_roots: list[Path] = []
     for key in os.environ:
-        if key.startswith("FASTDB_") and key.endswith(("_SDK", "_HOME", "_ROOT")):
+        if key.startswith("FASTDB_") and key.endswith(("_SDK", "_HOME", "_ROOT", "_LIB_DIR")):
             value = os.environ.get(key) or ""
+            if not value:
+                continue
             candidate = Path(value).expanduser()
             try:
                 candidate = candidate.resolve()

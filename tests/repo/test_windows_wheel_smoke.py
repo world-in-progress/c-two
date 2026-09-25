@@ -78,3 +78,15 @@ def test_clean_environment_keeps_path_when_no_fastdb_sdk_is_exported(monkeypatch
     cleaned = smoke.clean_environment()
     assert cleaned["PATH"] == "/usr/local/bin:/usr/bin"
     assert cleaned["HOME"] == str(tmp_path)
+
+
+def test_clean_environment_removes_the_core_sdk_library_directory(tmp_path, monkeypatch):
+    smoke = load_smoke()
+    sdk_lib = str(tmp_path / "sdk" / "lib")
+    monkeypatch.setattr(smoke.os, "environ", {
+        "FASTDB_PAYLOAD_SYSTEM_LIB_DIR": sdk_lib,
+        "PATH": sdk_lib + os.pathsep + "/system/bin",
+    })
+    cleaned = smoke.clean_environment()
+    assert cleaned["PATH"] == "/system/bin"
+    assert "FASTDB_PAYLOAD_SYSTEM_LIB_DIR" not in cleaned

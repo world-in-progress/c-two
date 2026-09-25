@@ -368,7 +368,7 @@ jobs:
             python3.13 python3.14 python3.14t
           manylinux: 2014
           docker-options: -e FASTDB_PAYLOAD_LINK_MODE=source
-          before-script: >-
+          before-script-linux: >-
             command -v cmake >/dev/null 2>&1 || python3 -m pip install --quiet cmake;
             export PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_path("scripts"))'):$PATH";
             cmake --version | head -1
@@ -377,13 +377,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Checksum wheels
-        run: python .github/scripts/release_candidate.py checksum sdk/python/dist/*.whl
+      - name: Stage and checksum the container-built wheels
+        run: |
+          mkdir -p linux-wheel-dist
+          cp sdk/python/dist/*.whl linux-wheel-dist/
+          python .github/scripts/release_candidate.py checksum linux-wheel-dist/*.whl
 
       - uses: actions/upload-artifact@v4
         with:
           name: rc-wheels-${{ matrix.target }}
-          path: sdk/python/dist/
+          path: linux-wheel-dist/
 
   # ── macOS/Windows wheels: one explicit interpreter row per advertised ABI ──
   # Every row builds its wheel with its own setup-python interpreter, proves
