@@ -190,12 +190,6 @@ fn generated_rust_project_compiles_against_public_c_two_and_fastdb_apis() {
         .ancestors()
         .nth(3)
         .unwrap();
-    let fastdb = repository.parent().unwrap().join("fastdb");
-    if !fastdb.join("bindings/rust/fastdb/Cargo.toml").is_file() {
-        eprintln!("skipping sibling composition check because FastDB source is unavailable");
-        return;
-    }
-
     let tempdir = tempfile::tempdir().unwrap();
     let generated = tempdir.path().join("generated");
     compile_contract_artifacts(
@@ -216,10 +210,9 @@ publish = false
 
 [dependencies]
 c-two = {{ version = "0.1.0", path = {c_two:?} }}
-fastdb = {{ path = {fastdb:?} }}
+fastdb = "=0.2.1"
 "#,
         c_two = repository.join("sdk/rust"),
-        fastdb = fastdb.join("bindings/rust/fastdb"),
     );
     std::fs::write(tempdir.path().join("Cargo.toml"), manifest).unwrap();
     // Reuse the graph available to the enclosing Core test invocation, rather
