@@ -25,3 +25,12 @@ c2-core = { version = "0.1.0", path = "../../../core/runtime/c2-core" }
 parking_lot = "0.12"
 pyo3 = { version = "0.29", optional = true }
 serde_json = "1"
+
+# Deployable Python extension builds statically link the FastDB payload Core
+# from the official FastDB repository checkout instead of requiring a
+# system-installed libfastdb. The safe fastdb crate itself still comes from
+# crates.io; this patch reroutes only the raw fastdb-sys bindings to the
+# immutable v0.2.1 source at this rev, whose checkout layout lets its build
+# script drive source-mode CMake builds.
+[patch.crates-io]
+fastdb-sys = { git = "https://github.com/world-in-progress/fastdb", rev = "4f99f86a662b0e950a0dd29800c25a1c9fca4def" }
