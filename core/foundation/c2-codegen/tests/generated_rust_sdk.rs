@@ -176,14 +176,6 @@ fn rust_generation_is_transport_neutral_for_no_payload_record_and_object_graph_c
 #[test]
 fn generated_rust_consumer_needs_only_versioned_c_two_and_fastdb_dependencies() {
     let repository = repository();
-    let fastdb = repository
-        .parent()
-        .expect("workspace parent")
-        .join("fastdb");
-    if !fastdb.join("bindings/rust/fastdb/Cargo.toml").is_file() {
-        eprintln!("skipping generated Rust consumer because FastDB source is unavailable");
-        return;
-    }
 
     let temp = tempfile::tempdir().expect("temporary consumer");
     generate(DESCRIPTOR.as_bytes())
@@ -192,7 +184,7 @@ fn generated_rust_consumer_needs_only_versioned_c_two_and_fastdb_dependencies() 
     generate(&alternate_descriptor())
         .publish_new_tree(&temp.path().join("generated-wrong"))
         .expect("publish alternate generated contract");
-    write_consumer_manifest(temp.path(), &repository, &fastdb);
+    write_consumer_manifest(temp.path(), &repository);
     std::fs::create_dir(temp.path().join("src")).expect("consumer source directory");
     std::fs::write(temp.path().join("src/main.rs"), valid_consumer_source())
         .expect("consumer source");
@@ -210,20 +202,12 @@ fn generated_rust_consumer_needs_only_versioned_c_two_and_fastdb_dependencies() 
 #[test]
 fn generated_service_trait_rejects_the_wrong_payload_shape() {
     let repository = repository();
-    let fastdb = repository
-        .parent()
-        .expect("workspace parent")
-        .join("fastdb");
-    if !fastdb.join("bindings/rust/fastdb/Cargo.toml").is_file() {
-        eprintln!("skipping generated Rust compile failure because FastDB source is unavailable");
-        return;
-    }
 
     let temp = tempfile::tempdir().expect("temporary compile-fail consumer");
     generate(DESCRIPTOR.as_bytes())
         .publish_new_tree(&temp.path().join("generated"))
         .expect("publish generated contract");
-    write_consumer_manifest(temp.path(), &repository, &fastdb);
+    write_consumer_manifest(temp.path(), &repository);
     std::fs::create_dir(temp.path().join("src")).expect("consumer source directory");
     let source_path = temp.path().join("src/lib.rs");
     std::fs::write(
@@ -271,14 +255,6 @@ impl contract::Service for WrongShape {
 #[test]
 fn portable_interop_fixture_compiles_with_only_the_rust_sdk_and_fastdb() {
     let repository = repository();
-    let fastdb = repository
-        .parent()
-        .expect("workspace parent")
-        .join("fastdb");
-    if !fastdb.join("bindings/rust/fastdb/Cargo.toml").is_file() {
-        eprintln!("skipping portable interop fixture because FastDB source is unavailable");
-        return;
-    }
 
     for forbidden in [
         "c2_config",
@@ -299,7 +275,7 @@ fn portable_interop_fixture_compiles_with_only_the_rust_sdk_and_fastdb() {
     generate(&portable_interop_descriptor())
         .publish_new_tree(&temp.path().join("generated"))
         .expect("publish portable interop contract");
-    write_consumer_manifest(temp.path(), &repository, &fastdb);
+    write_consumer_manifest(temp.path(), &repository);
     std::fs::create_dir_all(temp.path().join("src")).expect("fixture source directory");
     std::fs::create_dir_all(temp.path().join("fixtures")).expect("fixture data directory");
     std::fs::write(temp.path().join("src/main.rs"), PORTABLE_INTEROP_RUST).expect("fixture source");
@@ -323,7 +299,7 @@ fn portable_interop_fixture_compiles_with_only_the_rust_sdk_and_fastdb() {
     );
 }
 
-fn write_consumer_manifest(root: &Path, repository: &Path, fastdb: &Path) {
+fn write_consumer_manifest(root: &Path, repository: &Path) {
     let manifest = format!(
         r#"[package]
 name = "generated-rust-sdk-consumer"
@@ -333,10 +309,9 @@ publish = false
 
 [dependencies]
 c-two = {{ version = "0.1.0", path = {c_two:?} }}
-fastdb = {{ version = "0.2.0", path = {fastdb:?} }}
+fastdb = "=0.2.1"
 "#,
         c_two = repository.join("sdk/rust"),
-        fastdb = fastdb.join("bindings/rust/fastdb"),
     );
     std::fs::write(root.join("Cargo.toml"), manifest).expect("consumer manifest");
     // The outer Core build populated this dependency graph. Preserve its

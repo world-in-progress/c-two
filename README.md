@@ -448,16 +448,24 @@ Pre-built wheels are available for:
 - **macOS**: Apple Silicon (aarch64), Intel (x86_64)
 - **Python**: 3.10, 3.11, 3.12, 3.13, 3.14, 3.14t (free-threading)
 
-If no pre-built wheel is available for your platform, pip will build from source (requires a [Rust toolchain](https://rustup.rs)).
+If no pre-built wheel is available for your platform, pip will build from source. This requires a [Rust toolchain](https://rustup.rs) and the matching [FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1), configured with the system-link settings below.
 
 ### Development Setup
 
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
-# Place a FastDB 0.2.0 source checkout at ../fastdb.
-# Windows requires the additional exact MSVC repair source documented in
-# docs/windows-native-usage.md and pinned by windows-native.yml.
+# Python and Rust dependencies resolve the published FastDB 0.2.1 packages.
+# The full source-based interoperability tests also need its fixtures and
+# TypeScript sources in a sibling checkout:
+git clone --branch v0.2.1 --depth 1 https://github.com/world-in-progress/fastdb.git ../fastdb
+# Extract the matching FastDB Core SDK release archive first.
+export FASTDB_PAYLOAD_LINK_MODE=system
+export FASTDB_PAYLOAD_SYSTEM_LIB_DIR=/absolute/path/to/fastdb-core-sdk/lib
+case "$(uname -s)" in
+  Darwin) export DYLD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
+  Linux) export LD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+esac
 cp .env.example .env               # configure environment (optional)
 uv sync                            # install dependencies + compile Rust extensions
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)

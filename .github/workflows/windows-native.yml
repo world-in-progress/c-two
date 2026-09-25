@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FASTDB_SOURCE_SHA: 6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4
+  FASTDB_SOURCE_SHA: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
   C2_ENV_FILE: ""
   C2_RELAY_ANCHOR_ADDRESS: ""
   CARGO_TERM_COLOR: never

@@ -6,7 +6,7 @@ The [Windows Native workflow](https://github.com/Dsssyc/c-two/actions/workflows/
 
 [Run 36034972057](https://github.com/Dsssyc/c-two/actions/runs/36034972057) passes all required gates on both runners, including separate non-administrator wheel consumers. Its [final validation report](reports/windows-native-final-validation.md) identifies the exact tested source pair, downloadable artifacts and hashes. The artifact API reports expiry on 2026-10-08 UTC.
 
-These are development artifacts. The existing C-Two 0.5.1 and FastDB 0.2.0 registry releases do not contain these Windows wheels. The pinned FastDB MSVC repair is tracked by [FastDB PR #37](https://github.com/world-in-progress/fastdb/pull/37); producing a new official Windows distribution requires new release versions and their publication gates. Candidate wheels must not be uploaded over the existing releases.
+These C-Two artifacts are development builds. [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) now supplies official Windows wheels and a native Core SDK; the current C-Two branch consumes its published packages. C-Two's own 0.6.0 Windows distribution is still being prepared. The historical run above retains its original source pair and does not prove the updated dependency pair or a C-Two publication. Candidate wheels must not be uploaded over existing releases.
 
 ## Use a matching artifact pair
 
@@ -28,13 +28,16 @@ Python resource servers using `cc.serve()` accept Ctrl+C; automated subprocess s
 
 ## Build from source
 
-Use an x64 Developer PowerShell with the MSVC C++ toolchain, CMake, SWIG, Git, stable Rust and uv available. Keep the repositories as siblings because development Cargo and uv dependencies use the FastDB checkout:
+Use an x64 Developer PowerShell with the MSVC C++ toolchain, CMake, Git, stable Rust and uv available. Python and Rust resolve FastDB 0.2.1 from their registries. The Rust binding also requires the matching Core SDK: extract `fastdb-core-0.2.1-x86_64-pc-windows-msvc.tar.gz` from that release and configure its absolute `lib` directory below. The full source-based interoperability checks additionally use the sibling FastDB release checkout for fixtures and TypeScript sources, and require SWIG 4.4 or later when building its Python package:
 
 ```powershell
 git clone https://github.com/world-in-progress/fastdb.git
-git -C fastdb checkout 6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4
-git clone --branch socu/windows-native-ipc https://github.com/Dsssyc/c-two.git
+git -C fastdb checkout v0.2.1
+git clone --branch dev-feature https://github.com/Dsssyc/c-two.git
 Set-Location c-two
+$env:FASTDB_PAYLOAD_LINK_MODE = 'system'
+$env:FASTDB_PAYLOAD_SYSTEM_LIB_DIR = 'C:\path\to\fastdb-core-sdk\lib'
+$env:PATH = "$env:FASTDB_PAYLOAD_SYSTEM_LIB_DIR;$env:PATH"
 uv sync --python 3.12
 cargo build --locked --manifest-path cli/Cargo.toml --bin c3
 .\cli\target\debug\c3.exe --version

@@ -42,7 +42,6 @@ from tests.fixtures.portable_interop import (
 
 
 REPOSITORY = Path(__file__).resolve().parents[4]
-FASTDB_REPOSITORY = REPOSITORY.parent / "fastdb"
 RUST_HARNESS_SOURCE = (
     REPOSITORY / "sdk/python/tests/fixtures/portable_matrix_rust.rs"
 )
@@ -299,12 +298,12 @@ class MatrixArtifacts:
         if candidate_cargo_home:
             dependencies = """\
 c-two = "=0.1.0"
-fastdb = "=0.2.0"
+fastdb = "=0.2.1"
 """
         else:
             dependencies = f"""\
 c-two = {{ version = "0.1.0", path = {_path_dependency(REPOSITORY / "sdk/rust")} }}
-fastdb = {{ path = {_path_dependency(FASTDB_REPOSITORY / "bindings/rust/fastdb")} }}
+fastdb = "=0.2.1"
 """
         manifest = f"""\
 [package]

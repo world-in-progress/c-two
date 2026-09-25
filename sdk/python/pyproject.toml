@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "fastdb4py>=0.2.0",
+    "fastdb4py==0.2.1",
 ]
 
 [build-system]
