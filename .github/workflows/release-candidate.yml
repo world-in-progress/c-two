@@ -184,7 +184,8 @@ jobs:
           PY
 
       - name: Checksum context receipts and proof inputs
-        run: python .github/scripts/release_candidate.py checksum \
+        run: |
+          python .github/scripts/release_candidate.py checksum \
               rc-context.json rc-fastdb-public.json fastdb-sdist.json \
               fastdb4py-*.tar.gz \
               fastdb-LICENSE fastdb-THIRD_PARTY_NOTICES.txt \
