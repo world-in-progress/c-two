@@ -1,17 +1,73 @@
 name: Python Package Release
 
+# Exact-tested-candidate promotion (step 2 of the release plan). This workflow
+# never rebuilds: it promotes the 30 byte-exact wheels and the sdist retained
+# by the Release Candidate workflow, and only after BOTH same-source main-push
+# gates succeeded — the Release Candidate run itself and the Windows Native
+# full-scope runs on windows-2022 and windows-2025. Whichever gate completes
+# first defers; the late completion re-triggers promotion. Only c_two
+# distribution files are ever staged; FastDB dependency-proof inputs are never
+# published as C-Two packages. PyPI idempotency is byte-exact: a rerun skips
+# only registry files whose SHA-256 already matches (the staging directory
+# holds exactly the missing files), and any differing bytes fail closed
+# instead of being skipped or clobbered. The prepare job checks out the
+# current main workflow code (never the candidate SHA) and must run on
+# refs/heads/main of the canonical repository; dry_run performs the identical
+# read-only verification without publishing.
+
 on:
-  push:
+  workflow_run:
+    workflows: [Release Candidate, Windows Native]
+    types: [completed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: "Release Candidate run id to promote (or leave empty with source_sha)"
+        default: ""
+        type: string
+      source_sha:
+        description: "Candidate source SHA from a canonical main push (or leave empty with candidate_run_id)"
+        default: ""
+        type: string
+      dry_run:
+        description: "Prepare and verify the promotion without publishing"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Promotions must not race each other: the second run re-checks the registry
+# and skips only byte-identical files.
+concurrency:
+  group: python-package-release-promotion
+  cancel-in-progress: false
 
 jobs:
-  # ── Version comparison ──────────────────────────────────────
-  version-check:
+  prepare:
+    name: verify tested candidate
+    # Fail closed outside the canonical repository/main ref and for
+    # pull_request candidate runs: fork PR artifacts and off-main dispatches
+    # must never reach publish authority.
+    if: >-
+      github.repository == 'world-in-progress/c-two' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      should_release: ${{ steps.check.outputs.should_release }}
-      version: ${{ steps.check.outputs.version }}
+      deferred: ${{ steps.prepare.outputs.deferred }}
+      action: ${{ steps.prepare.outputs.action }}
+      source_sha: ${{ steps.prepare.outputs.source_sha }}
     steps:
+      # The default checkout is the current main code: the promotion trusts
+      # the reviewed validators on main, never the candidate's input SHA.
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
@@ -19,99 +75,113 @@ jobs:
           python-version: "3.12"
 
       - name: Install packaging
-        run: pip install packaging
+        run: python -m pip install --quiet packaging
 
-      - name: Check version against PyPI
-        id: check
-        run: python .github/scripts/check_version.py
-
-  # ── Build wheels (4 platforms × 6 interpreters) ─────────────
-  build-wheels:
-    needs: version-check
-    if: needs.version-check.outputs.should_release == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            manylinux-image: quay.io/pypa/manylinux2014_x86_64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            manylinux-image: quay.io/pypa/manylinux2014_aarch64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
-    name: wheel (${{ matrix.target }})
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          working-directory: sdk/python
-          target: ${{ matrix.target }}
-          args: >-
-            --release --out dist
-            --interpreter python3.10 python3.11 python3.12
-            python3.13 python3.14 python3.14t
-          manylinux: 2014
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.target }}
-          path: sdk/python/dist/*.whl
-
-  # ── Build source distribution ───────────────────────────────
-  build-sdist:
-    needs: version-check
-    if: needs.version-check.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
-    name: sdist
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Build sdist
+      - name: Verify the tested candidate and stage distribution files
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || inputs.source_sha }}
+          CANDIDATE_RUN_ID: ${{ (github.event.workflow_run.name == 'Release Candidate' && github.event.workflow_run.id) || inputs.candidate_run_id }}
+          DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
-          python -m pip install build
-          python -m build --sdist --outdir dist sdk/python
+          set -euo pipefail
+          args=(
+            --target pypi
+            --download-dir candidate-download
+            --plan-output promotion-plan.json
+          )
+          if [ -n "$SOURCE_SHA" ]; then args+=(--source-sha "$SOURCE_SHA"); fi
+          if [ -n "$CANDIDATE_RUN_ID" ]; then args+=(--candidate-run-id "$CANDIDATE_RUN_ID"); fi
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          code=0
+          python .github/scripts/promote_release_candidate.py prepare "${args[@]}" || code=$?
+          if [ "$code" -eq 75 ]; then
+            {
+              echo "deferred=true"
+              echo "action=deferred"
+            } >> "$GITHUB_OUTPUT"
+            echo "Deferring: the other same-source gate is still running; its completion re-triggers promotion."
+            exit 0
+          fi
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          python - <<'PY'
+          import json, os, pathlib
+          plan = json.loads(pathlib.Path("promotion-plan.json").read_text(encoding="utf-8"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("deferred=false\n")
+              output.write(f"action={plan['pypi']['action']}\n")
+              output.write(f"source_sha={plan['source_sha']}\n")
+          PY
 
-      - uses: actions/upload-artifact@v4
+      # The upload's least-common ancestor is the staging directory itself, so
+      # the artifact members are dist/<name> under the staging root;
+      # downloading into ./staging restores the plan's staging/dist layout.
+      - name: Retain the staged, verified distribution files
+        if: steps.prepare.outputs.deferred != 'true'
+        uses: actions/upload-artifact@v4
         with:
-          name: sdist
-          path: dist/*.tar.gz
+          name: promotion-staging
+          path: candidate-download/staging
 
-  # ── Publish to PyPI via OIDC ────────────────────────────────
+      - name: Retain the promotion plan
+        if: steps.prepare.outputs.deferred != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: promotion-plan
+          path: promotion-plan.json
+
   publish:
-    needs: [build-wheels, build-sdist]
+    name: publish verified candidate
+    needs: prepare
+    if: >-
+      needs.prepare.outputs.deferred == 'false' &&
+      needs.prepare.outputs.action == 'upload' &&
+      inputs.dry_run != true
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: pypi
     permissions:
       id-token: write
-    name: publish
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
+          name: promotion-staging
+          path: staging
 
       - uses: actions/download-artifact@v4
         with:
-          name: sdist
-          path: dist
+          name: promotion-plan
+          path: .
 
+      - name: Recheck staged bytes before publication
+        run: |
+          python - <<'PY'
+          import hashlib, json, pathlib
+          plan = json.loads(pathlib.Path("promotion-plan.json").read_text())
+          group = plan.get("github_release") or plan["pypi"]
+          entries = group.get("assets", group.get("files", []))
+          root = pathlib.Path("staging").resolve()
+          selected = set()
+          for entry in entries:
+              if entry["disposition"] != "upload":
+                  continue
+              path = pathlib.Path(entry["staged_path"]).resolve()
+              assert path.is_relative_to(root) and path.is_file(), path
+              assert path.stat().st_size == entry["bytes"], path
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"], path
+              selected.add(path)
+          assert selected, "nothing verified for publication"
+          if "pypi" in plan:
+              assert selected == {p.resolve() for p in (root / "dist").rglob("*") if p.is_file()}
+          PY
+
+      # The staged directory holds exactly the registry-missing files (the
+      # prepare job proved every already-published file byte-identical and
+      # removed those copies), so no skip-existing escape hatch is used: an
+      # unexpected registry collision must fail loudly instead of being
+      # silently accepted.
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          packages-dir: staging/dist
           verbose: true
-          skip-existing: true

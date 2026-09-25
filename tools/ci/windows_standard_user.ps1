@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory)][string]$CTwoWheel,
     [Parameter(Mandatory)][string]$C3,
     [Parameter(Mandatory)][string]$Receipt,
+    [ValidatePattern('^[0-9a-f]{40}$')][string]$SourceSha,
     [ValidateRange(30, 900)][int]$TimeoutSeconds = 900
 )
 
@@ -19,6 +20,7 @@ $report = [ordered]@{
     cleanup = [ordered]@{}
     errors = [Collections.Generic.List[string]]::new()
 }
+if ($SourceSha) { $report['source_commit_sha'] = $SourceSha }
 $testAccount = $testSid = $credential = $secret = $child = $workspace = $accountName = $null
 $workspaceCreated = $false
 $consumerPassed = $false
@@ -118,7 +120,7 @@ try {
             @('uv', $uvPath, 'tools/uv.exe'),
             @('fastdb', $fastdbPath, ('artifacts/' + [IO.Path]::GetFileName($fastdbPath))),
             @('ctwo', $ctwoPath, ('artifacts/' + [IO.Path]::GetFileName($ctwoPath))),
-            @('cli', $cliPath, 'artifacts/c3.exe'))) {
+            @('cli', $cliPath, ('artifacts/' + [IO.Path]::GetFileName($cliPath))))) {
         $destination = Join-Path $workspace $entry[2]
         Copy-Item -LiteralPath $entry[1] -Destination $destination
         if ((Get-FileHash -LiteralPath $entry[1]).Hash -ne (Get-FileHash -LiteralPath $destination).Hash) {
@@ -126,7 +128,7 @@ try {
         }
         $staged[$entry[0]] = $destination
     }
-    $config = @{ workspace = $workspace; staged = $staged; receipt = (Join-Path $workspace 'consumer-receipt.json') }
+    $config = @{ workspace = $workspace; staged = $staged; source_sha = $SourceSha; receipt = (Join-Path $workspace 'consumer-receipt.json') }
     $configPath = Join-Path $workspace 'inputs.json'
     $config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configPath -Encoding utf8
     $driverPath = Join-Path $workspace 'driver.py'
@@ -153,6 +155,8 @@ staged = config["staged"]
 sys.argv = [staged["helper"], "--fastdb-wheel", staged["fastdb"],
             "--c-two-wheel", staged["ctwo"], "--c3", staged["cli"],
             "--receipt", config["receipt"], "--require-standard-user"]
+if config.get("source_sha"):
+    sys.argv.extend(["--source-sha", config["source_sha"]])
 runpy.run_path(staged["helper"], run_name="__main__")
 '@ | Set-Content -LiteralPath $driverPath -Encoding utf8
 

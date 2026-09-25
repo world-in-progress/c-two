@@ -777,12 +777,7 @@ jobs:
               "bundled_fastdb_libs": tree["bundled_fastdb_libs"],
               "elf_dynamic": elf,
               "standalone_import": "passed",
-              "lifecycle": {"status": lifecycle["status"],
-                            "helper_schema": lifecycle["schema"],
-                            "cli_version": lifecycle.get("cli_version"),
-                            "checks": len(lifecycle.get("checks", [])),
-                            "borrowed_inputs_invalidated":
-                                lifecycle.get("borrowed_inputs_invalidated")},
+              "lifecycle": lifecycle,
               "checks": ["build from extracted contents",
                          "auditwheel-repaired wheel bundles libfastdb",
                          "$ORIGIN runpath without SDK paths",
@@ -1131,6 +1126,8 @@ jobs:
   # ── Windows standard-user lifecycle/cleanup with the same exact bytes ──────
   windows-standard-user:
     needs: [context, cli, build-wheels-native, fastdb]
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -1185,6 +1182,7 @@ jobs:
             -FastdbWheel $fastdb `
             -CTwoWheel $ctwo `
             -C3 $c3 `
+            -SourceSha $env:SOURCE_SHA `
             -Receipt "$PWD/standard-user-x86_64-pc-windows-msvc.json"
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $wrapper = Get-Content standard-user-x86_64-pc-windows-msvc.json.wrapper.json -Raw | ConvertFrom-Json

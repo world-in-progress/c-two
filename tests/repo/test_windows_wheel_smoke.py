@@ -90,3 +90,26 @@ def test_clean_environment_removes_the_core_sdk_library_directory(tmp_path, monk
     cleaned = smoke.clean_environment()
     assert cleaned["PATH"] == "/system/bin"
     assert "FASTDB_PAYLOAD_SYSTEM_LIB_DIR" not in cleaned
+
+
+def test_standard_user_driver_forwards_source_identity(tmp_path):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    wrapper = (Path(__file__).resolve().parents[2] / "tools/ci/windows_standard_user.ps1").read_text()
+    driver_source = wrapper.split("    @'\n", 1)[1].split("\n'@ | Set-Content", 1)[0]
+    helper = tmp_path / "helper.py"
+    receipt = tmp_path / "receipt.json"
+    helper.write_text("import json, pathlib, sys\npathlib.Path(sys.argv[sys.argv.index('--receipt')+1]).write_text(json.dumps(sys.argv))\n")
+    config = {"workspace": str(tmp_path), "staged": {"helper": str(helper), "fastdb": "fastdb.whl", "ctwo": "ctwo.whl", "cli": "c3-platform.exe"},
+              "receipt": str(receipt), "source_sha": "a" * 40}
+    config_path = tmp_path / "inputs.json"
+    config_path.write_text(json.dumps(config))
+    driver = tmp_path / "driver.py"
+    driver.write_text(driver_source)
+    environment = dict(os.environ, SystemRoot=str(tmp_path / "windows"))
+    subprocess.run([sys.executable, "-I", str(driver), str(config_path)], check=True, env=environment)
+    args = json.loads(receipt.read_text())
+    assert args[args.index("--source-sha") + 1] == "a" * 40
+    assert args[args.index("--c3") + 1] == "c3-platform.exe"

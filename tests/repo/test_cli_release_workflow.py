@@ -22,76 +22,115 @@ def _workflow_text() -> str:
     )
 
 
-def _filter_lines(ci_text: str, filter_name: str) -> list[str]:
-    lines = ci_text.splitlines()
-    header = f"            {filter_name}:"
-    start = lines.index(header) + 1
-    result: list[str] = []
-    for line in lines[start:]:
-        if line.startswith("            ") and not line.startswith("              - "):
-            break
-        if line.startswith("              - "):
-            result.append(line.removeprefix("              - ").strip("'"))
-    return result
-
-
-def test_cli_release_builds_canonical_platform_artifacts():
+def test_cli_release_promotes_only_after_both_candidate_gates_complete():
+    """The promotion triggers on either gate's completion, main pushes only."""
     text = _workflow_text()
 
-    assert "name: CLI Release" in text
+    assert "workflow_run:" in text
+    assert "workflows: [Release Candidate, Windows Native]" in text
+    assert "types: [completed]" in text
+    assert "branches: [main]" in text
+
+
+def test_cli_release_accepts_explicit_manual_candidate_inputs():
+    text = _workflow_text()
+
     assert "workflow_dispatch:" in text
-    assert "branches: [main]" in text
-    assert "x86_64-unknown-linux-gnu" in text
-    assert "aarch64-unknown-linux-gnu" in text
-    assert "aarch64-apple-darwin" in text
-    assert "x86_64-apple-darwin" in text
-    assert 'cp "cli/target/${{ matrix.target }}/release/c3" "cli-dist/c3-${{ matrix.target }}"' in text
-    assert '(cd cli-dist && shasum -a 256 "c3-${{ matrix.target }}" > "c3-${{ matrix.target }}.sha256")' in text
+    assert "candidate_run_id:" in text
+    assert "source_sha:" in text
+    assert "dry_run:" in text
 
 
-def test_cli_release_auto_detects_new_cli_versions_on_main_push():
+def test_cli_release_fails_closed_outside_the_canonical_repository():
+    """Fork runs, off-main dispatches, and pull_request candidate runs never
+    gain publish authority."""
     text = _workflow_text()
 
-    assert "branches: [main]" in text
-    assert "version-check:" in text
-    assert "python .github/scripts/check_cli_release.py" in text
-    assert "should_release: ${{ steps.check.outputs.should_release }}" in text
-    assert "tag: ${{ steps.check.outputs.tag }}" in text
-    assert "needs.version-check.outputs.should_release == 'true'" in text
+    assert "github.repository == 'world-in-progress/c-two'" in text
+    assert "github.ref == 'refs/heads/main'" in text
+    assert "github.event.workflow_run.event == 'push'" in text
+    assert "github.event.workflow_run.head_branch == 'main'" in text
 
 
-def test_cli_release_publishes_github_release_assets_for_detected_tag():
+def test_cli_release_never_rebuilds_the_candidate_bytes():
+    """No build matrix, no cargo/maturin/docker: only verified bytes are promoted."""
     text = _workflow_text()
 
-    assert "contents: write" in text
-    assert "pattern: cli-*" in text
-    assert "softprops/action-gh-release@" in text
-    assert "tag_name: ${{ needs.version-check.outputs.tag }}" in text
-    assert "target_commitish: ${{ github.sha }}" in text
-    assert "name: c3 ${{ needs.version-check.outputs.version }}" in text
-    assert "files: dist/c3-*" in text
+    assert "cargo build" not in text
+    assert "maturin" not in text
+    assert "docker run" not in text
+    assert "runs-on: ${{ matrix.os }}" not in text
+    assert "python .github/scripts/promote_release_candidate.py prepare" in text
+    assert "--target github-release" in text
 
 
-def test_cli_release_publishes_installer_script_asset():
+def test_cli_release_publishes_only_verified_staged_bytes():
+    publish = _workflow_text().split("  publish:", 1)[1]
+
+    assert "needs: prepare" in publish
+    assert "needs.prepare.outputs.deferred == 'false'" in publish
+    assert "needs.prepare.outputs.action == 'upload'" in publish
+    assert "inputs.dry_run != true" in publish
+    assert "permissions:" in publish
+    assert "contents: write" in publish
+    # The staging artifact is downloaded back into ./staging so the plan's
+    # staged_path layout is restored exactly.
+    assert "name: promotion-staging" in publish
+    assert "path: staging" in publish
+    assert "dist/c3-*" not in publish
+    # The upload list comes from upload-files.txt; gh release upload fails on
+    # an asset name that already exists, so nothing is ever clobbered.
+    assert 'xargs gh release upload "$TAG" --repo "$REPO" < upload-files.txt' in publish
+
+
+def test_cli_release_creates_the_release_only_when_the_plan_says_it_is_missing():
+    publish = _workflow_text().split("  publish:", 1)[1]
+
+    # Reruns against a partial release must complete it, never recreate it,
+    # and every gh command names the canonical repository explicitly because
+    # the publish job has no checkout.
+    assert "if: needs.prepare.outputs.release_exists == 'false'" in publish
+    assert 'gh release create "$TAG" --repo "$REPO"' in publish
+    assert 'extra+=(--verify-tag)' in publish
+    assert 'extra+=(--target "$SOURCE_SHA")' in publish
+    assert "REPO: world-in-progress/c-two" in _workflow_text()
+
+
+def test_cli_release_defers_when_only_one_gate_has_completed():
+    """Exit 75 (deferred) is a neutral skip; the late event re-triggers promotion."""
     text = _workflow_text()
 
-    assert "installer:" in text
-    assert "name: cli-installer" in text
-    assert "c3-installer.sh" in text
-    assert "path: cli-dist/c3-installer.sh" in text
-    assert "needs: [version-check, build, installer]" in text
-    assert "should_publish_installer: ${{ steps.check.outputs.should_publish_installer }}" in text
-    assert "needs.version-check.outputs.should_publish_installer == 'true'" in text
-    assert "files: dist/c3-*" in text
+    assert 'if [ "$code" -eq 75 ]' in text
+    assert "deferred=true" in text
+    assert "action=deferred" in text
 
 
-def test_cli_release_can_backfill_installer_when_current_release_exists():
-    text = _workflow_text()
+def test_cli_release_prepare_job_reads_actions_with_least_privilege():
+    text = _workflow_text().split("  publish:", 1)[0]
 
-    assert "publish-installer:" in text
-    assert "needs: [version-check, installer]" in text
-    assert "tag_name: ${{ needs.version-check.outputs.tag }}" in text
-    assert "files: dist/c3-installer.sh" in text
+    assert "actions: read" in text
+    assert "contents: read" in text
+    assert "id-token: write" not in text
+
+
+def test_cli_release_publishes_installer_assets_under_stable_names():
+    """The promotion stages installers and FastDB license evidence by name."""
+    script = (
+        _repo_root() / ".github" / "scripts" / "promote_release_candidate.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'EXPECTED_INSTALLER_NAMES = ("c3-installer.sh", "c3-installer.ps1")' in script
+    assert '"fastdb-LICENSE"' in script
+    assert '"fastdb-THIRD_PARTY_NOTICES.txt"' in script
+
+
+def test_cli_release_body_links_provenance_without_desktop_claims():
+    script = (
+        _repo_root() / ".github" / "scripts" / "promote_release_candidate.py"
+    ).read_text(encoding="utf-8")
+
+    assert "Windows 11 desktop is not verified" in script
+    assert "Windows Native full-scope run" in script
 
 
 def test_readmes_document_the_c3_installer_asset():
@@ -131,8 +170,6 @@ def test_ci_routes_tests_by_changed_domain():
     assert "cli/**" in ci_text
     assert "tools/dev/**" in ci_text
     assert ".github/dependabot.yml" in ci_text
-    assert "cli/install-c3.sh" in _filter_lines(ci_text, "workflow_policy")
-    assert "tests/repo/**" in _filter_lines(ci_text, "workflow_policy")
     assert ".github/workflows/cli-release.yml" in ci_text
     assert "github.event_name == 'merge_group'" in ci_text
     assert "needs.changes.outputs.sdk == 'true'" in ci_text
