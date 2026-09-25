@@ -19,11 +19,10 @@ import pytest
 import c_two as cc
 from c_two.config.settings import settings
 from c_two.transport.registry import _ProcessRegistry
-from tests.fixtures.portable_interop import logical_result_sha256
+from tests.fixtures.portable_interop import FASTDB_REPOSITORY, logical_result_sha256
 from tests.fixtures.portable_matrix import (
     CRM_CLASSES,
     DESCRIPTOR_PATHS,
-    FASTDB_REPOSITORY,
     MatrixArtifacts,
     MatrixRelay,
     RustHost,

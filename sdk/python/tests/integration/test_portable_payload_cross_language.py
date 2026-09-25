@@ -37,7 +37,6 @@ from tests.fixtures.portable_interop import (
 )
 
 REPOSITORY = Path(__file__).resolve().parents[4]
-FASTDB_REPOSITORY = REPOSITORY.parent / "fastdb"
 RUST_HARNESS_SOURCE = (
     REPOSITORY
     / "sdk/python/tests/fixtures/portable_interop_rust.rs"
