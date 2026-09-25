@@ -185,9 +185,41 @@ def wheel(path: Path, distribution: str) -> tuple[Path, dict[str, object]]:
 
 
 def clean_environment() -> dict[str, str]:
+    """Build the subprocess environment for the isolated consumer.
+
+    External FastDB hints are removed so the self-contained app claim is
+    actually tested: FASTDB_* variables (including FASTDB_SDK), macOS DYLD_*
+    loaders, LD_LIBRARY_PATH, and PATH entries that live inside an exported
+    FastDB SDK are dropped. Every other OS/Python PATH entry is preserved
+    because Windows system DLLs and the toolchain still need them.
+    """
     excluded = ("PYTHON", "C2_", "FASTDB_", "DYLD_", "LD_LIBRARY_PATH", "UV_", "PIP_", "CONDA_")
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith(excluded) and key != "VIRTUAL_ENV"}
+    sdk_roots: list[Path] = []
+    for key in os.environ:
+        if key.startswith("FASTDB_") and key.endswith(("_SDK", "_HOME", "_ROOT")):
+            value = os.environ.get(key) or ""
+            candidate = Path(value).expanduser()
+            try:
+                candidate = candidate.resolve()
+            except OSError:
+                pass
+            sdk_roots.append(candidate)
+    if sdk_roots and environment.get("PATH"):
+        kept = []
+        for entry in environment["PATH"].split(os.pathsep):
+            if not entry:
+                continue
+            candidate = Path(entry).expanduser()
+            try:
+                candidate = candidate.resolve()
+            except OSError:
+                pass
+            if any(candidate == root or root in candidate.parents for root in sdk_roots):
+                continue
+            kept.append(entry)
+        environment["PATH"] = os.pathsep.join(kept)
     environment.update({"C2_ENV_FILE":"", "C2_RELAY_ANCHOR_ADDRESS":"", "PYTHONUTF8":"1"})
     return environment
 
@@ -284,9 +316,14 @@ def main() -> int:
     parser.add_argument("--c3", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--require-standard-user", action="store_true")
+    parser.add_argument("--source-sha", default=None,
+                        help="Source commit sha this gate's bytes were built from; "
+                             "recorded so the candidate manifest can cross-bind receipts")
     options = parser.parse_args()
     receipt = {"schema":"c-two.installed-wheel-smoke.v1", "status":"failed",
                "platform":platform.platform(), "interpreter":sys.version, "checks":[], "cleanup":{}}
+    if options.source_sha:
+        receipt["source_commit_sha"] = options.source_sha
     options.receipt = options.receipt.resolve()
     options.receipt.parent.mkdir(parents=True, exist_ok=True)
     host = relay = reader = None
@@ -317,6 +354,10 @@ def main() -> int:
             script.write_text(CONSUMER, encoding="utf-8")
             executable = work / c3.name
             shutil.copy2(c3, executable)
+            if os.name != "nt":
+                # A downloaded artifact may arrive without the executable bit;
+                # restoring it never changes the bytes the sidecar digest binds.
+                executable.chmod(executable.stat().st_mode | 0o111)
             receipt["cli_version"] = run([str(executable), "--version"], work, environment).strip()
             if not receipt["cli_version"].startswith("c3 "):
                 raise RuntimeError(f"Invalid c3 version response: {receipt['cli_version']!r}")
