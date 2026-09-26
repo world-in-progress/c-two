@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -386,9 +387,15 @@ impl PyRuntimeSession {
             }
         }
         let host = self.host.lock().take();
+        let timeout = Duration::from_secs_f64(timeout_seconds.max(0.0));
         let outcome = py.detach(move || {
-            host.as_ref()
-                .map_or_else(ShutdownOutcome::default, Host::shutdown)
+            // Hostless sessions still own outgoing IPC clients; the Core
+            // client-only shutdown detaches and closes them through the same
+            // bounded barrier as the hosted path.
+            host.as_ref().map_or_else(
+                || self.inner.shutdown_without_host(timeout),
+                Host::shutdown,
+            )
         });
         self.registrations.lock().clear();
         self.server_bridge.lock().take();
@@ -711,6 +718,7 @@ fn shutdown_outcome_to_dict<'py>(
     dict.set_item("http_clients_drained", outcome.http_clients_drained)?;
     dict.set_item("route_close_error", outcome.route_close_error)?;
     dict.set_item("runtime_barrier_error", outcome.runtime_barrier_error)?;
+    dict.set_item("ipc_client_close_error", outcome.ipc_client_close_error)?;
     Ok(dict)
 }
 

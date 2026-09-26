@@ -159,6 +159,10 @@ impl ServerPoolState {
 
 // ── Error type ───────────────────────────────────────────────────────────
 
+/// Default deadline for one client close barrier (writer lock, receive join,
+/// final writer clear).
+const DEFAULT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// IPC client error.
 #[derive(Debug)]
 pub enum IpcError {
@@ -725,6 +729,11 @@ pub struct IpcClient {
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Serializes close barriers. Only one closer at a time may manipulate
+    /// the writer slot and the receive-task handle, so a concurrent close
+    /// can never observe a taken handle and mistake it for a terminal task
+    /// state.
+    close_gate: tokio::sync::Mutex<()>,
     connected: Arc<AtomicBool>,
     pub(crate) pool: Option<Arc<StdMutex<MemPool>>>,
     pub(crate) config: ClientIpcConfig,
@@ -792,6 +801,7 @@ impl IpcClient {
             server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
+            close_gate: tokio::sync::Mutex::new(()),
             connected: Arc::new(AtomicBool::new(false)),
             pool,
             chunk_registry: Self::make_chunk_registry(&config),
@@ -2506,48 +2516,142 @@ impl IpcClient {
         self.close_shared().await;
     }
 
-    /// Close the client through shared ownership.
+    /// Close the client through shared ownership with the default deadline.
     ///
     /// This is intentionally best-effort: it marks the connection closed,
     /// sends a disconnect signal when possible, drops the writer, and wakes
     /// pending callers. It is used by owners that hold an `Arc<IpcClient>` and
     /// cannot prove unique ownership at shutdown time.
     pub async fn close_shared(&self) {
+        let _ = self.close_shared_bounded(DEFAULT_CLOSE_TIMEOUT).await;
+    }
+
+    /// Close through shared ownership with every barrier phase bounded by one
+    /// deadline, reporting honestly whether the close was confirmed.
+    ///
+    /// `true` means the receive task finished (or none existed) and the writer
+    /// slot was cleared, all within `timeout`. A `false` result reports an
+    /// unconfirmed close: tasks may still be draining, and no backing memory
+    /// is force-released. Concurrent callers serialize through a close gate:
+    /// a caller that cannot enter the gate before its deadline expires, or
+    /// that arrives while another barrier is still running, reports an honest
+    /// unconfirmed close instead of observing a torn intermediate state.
+    ///
+    /// Every phase, including the final writer-lock clear and the
+    /// receive-task join, derives its budget from the single absolute
+    /// deadline; an unconfirmed join aborts the task and waits once more
+    /// within the time still remaining (capped at one second) so an abort
+    /// can still be observed finishing without ever exceeding the caller's
+    /// budget. If even that expires, the aborted task's handle is restored
+    /// so it stays observable and a later close can retry the join — a
+    /// missing handle always means "no live receive task".
+    pub async fn close_shared_bounded(&self, timeout: std::time::Duration) -> bool {
+        use tokio::time::timeout_at;
+
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365));
         self.connected.store(false, Ordering::Release);
-        // Bound both writer-lock acquisition and the control exchange. A
+
+        // Serialize close barriers: only one closer manipulates the writer
+        // slot and the receive-task handle at a time. Waiting for the gate is
+        // itself bounded by the same deadline.
+        let close_guard = match timeout_at(deadline, self.close_gate.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Another close barrier held the gate for the whole budget.
+                // Report honestly; this close is retryable.
+                return false;
+            }
+        };
+        let mut confirmed = true;
+
+        // Bound both writer-lock acquisition and the disconnect exchange. A
         // cancelled partial write aborts its stream instead of leaving a frame
         // prefix for a later writer to reuse.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        if timeout_at(deadline, async {
             let mut guard = self.writer.lock().await;
             if let Some(writer) = guard.as_mut() {
                 let frame = frame::encode_frame(0, flags::FLAG_SIGNAL, &[SIG_DISCONNECT]);
                 let _ = writer.write_all(&frame).await;
             }
         })
-        .await;
+        .await
+        .is_err()
+        {
+            confirmed = false;
+            // The writer slot is stuck (for example a blocked bulk write
+            // holding the lock). Abort the stream now so that writer fails
+            // and releases the lock instead of pinning the whole deadline.
+            if let Some(abort) = self.abort.lock().as_ref() {
+                abort.abort();
+            }
+        }
+
         let receiver = self.recv_handle.lock().take();
         if let Some(mut receiver) = receiver {
             // The receive loop ends on DISCONNECT_ACK or peer EOF.
-            if tokio::time::timeout(std::time::Duration::from_millis(100), &mut receiver)
-                .await
-                .is_err()
-            {
+            if timeout_at(deadline, &mut receiver).await.is_err() {
+                // Abort the stream and the task, then wait once more within
+                // the time still remaining to the absolute deadline (capped
+                // at one second). Aborted tasks finish at their next await
+                // point; if even that budget expires the handle is restored
+                // (kept observable, retryable by a later close) and the
+                // close stays unconfirmed.
                 if let Some(abort) = self.abort.lock().as_ref() {
                     abort.abort();
                 }
                 receiver.abort();
-                let _ = receiver.await;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let join_budget = remaining.min(std::time::Duration::from_secs(1));
+                if tokio::time::timeout(join_budget, &mut receiver)
+                    .await
+                    .is_err()
+                {
+                    confirmed = false;
+                    *self.recv_handle.lock() = Some(receiver);
+                }
             }
         }
         if let Some(abort) = self.abort.lock().take() {
             abort.abort();
         }
-        *self.writer.lock().await = None;
+        if timeout_at(deadline, async {
+            *self.writer.lock().await = None;
+        })
+        .await
+        .is_err()
+        {
+            confirmed = false;
+        }
         // Wake pending callers.
         let mut pending = self.pending.lock();
         for (_, pending) in pending.drain() {
             let PendingResponse::Unary(tx) = pending;
             let _ = tx.send(Err(IpcError::Closed));
+        }
+        drop(pending);
+        drop(close_guard);
+        confirmed
+    }
+
+    /// Test-only handle to the writer slot so tests can deterministically
+    /// model a writer stuck on a non-reading peer (a blocked bulk write
+    /// holding the writer lock) without timing-dependent pipe pressure.
+    #[cfg(test)]
+    pub(crate) fn writer_slot_for_test(&self) -> Arc<Mutex<Option<LocalWriteHalf>>> {
+        Arc::clone(&self.writer)
+    }
+}
+
+impl Drop for IpcClient {
+    fn drop(&mut self) {
+        // Non-blocking best effort: abort the stream so an abandoned receive
+        // task cannot keep pool Arcs alive indefinitely when an owner drops
+        // without an explicit close. Confirmed bounded shutdown is
+        // `close_shared_bounded`; this never blocks or joins.
+        if let Some(abort) = self.abort.lock().take() {
+            abort.abort();
         }
     }
 }

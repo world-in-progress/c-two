@@ -608,6 +608,22 @@ class _ProcessRegistry:
                     message,
                 )
 
+        # Surface unconfirmed native cleanup barriers instead of silently
+        # returning apparent full cleanup. These outcome keys report closes
+        # whose bounded barrier did not confirm; shutdown stays best-effort
+        # (no return-type change), so a warning is the failure policy.
+        for key, description in (
+            ('ipc_client_close_error', 'IPC client cache'),
+            ('runtime_barrier_error', 'runtime barrier'),
+        ):
+            message = outcome.get(key)
+            if message:
+                log.warning(
+                    'Shutdown could not confirm %s cleanup: %s',
+                    description,
+                    message,
+                )
+
     # ------------------------------------------------------------------
     # Serve (daemon mode)
     # ------------------------------------------------------------------

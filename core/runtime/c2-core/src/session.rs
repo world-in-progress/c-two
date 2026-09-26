@@ -134,6 +134,13 @@ struct RuntimeState {
     shm_threshold: Option<u64>,
     remote_payload_chunk_size: Option<u64>,
     client_config_frozen: bool,
+    /// Resolved client IPC config fixed by the first valid connection
+    /// attempt. Later acquires reuse it verbatim so one Runtime can never
+    /// run two competing client configurations.
+    frozen_client_config: Option<c2_config::ClientIpcConfig>,
+    /// Outgoing IPC client cache owned by this Runtime. Clones of the
+    /// Runtime share it; distinct Runtimes are isolated.
+    client_pool: Arc<c2_ipc::ClientPool>,
     identity: Option<RuntimeIdentity>,
     relay_anchor_address_override: Option<String>,
     use_process_relay_anchor: bool,
@@ -182,6 +189,8 @@ impl Runtime {
                 shm_threshold: options.shm_threshold,
                 remote_payload_chunk_size: options.remote_payload_chunk_size,
                 client_config_frozen: false,
+                frozen_client_config: None,
+                client_pool: Arc::new(c2_ipc::ClientPool::new(Duration::from_secs(60))),
                 identity: None,
                 relay_anchor_address_override: options
                     .relay_anchor_address
@@ -282,10 +291,6 @@ impl Runtime {
         self.state.lock().client_config_frozen
     }
 
-    pub fn mark_client_config_frozen(&self) {
-        self.state.lock().client_config_frozen = true;
-    }
-
     pub fn path_counters(&self) -> PathCounters {
         self.state.lock().path_counters
     }
@@ -294,38 +299,45 @@ impl Runtime {
         self.state.lock().path_counters.record(path);
     }
 
+    /// Acquire an outgoing IPC client from this Runtime's cache.
+    ///
+    /// The resolved client config freezes atomically under the RuntimeState
+    /// lock before any connection I/O: the first valid connection attempt —
+    /// including one that later fails — fixes the config for this Runtime's
+    /// lifetime, and a setter racing a stalled first connect observes
+    /// `LifecycleError::ClientConfigFrozen` instead of producing a second
+    /// configuration. The connect itself runs outside the state lock through
+    /// the cache's epoch fence.
     pub(crate) fn acquire_ipc_client(
         &self,
         address: &str,
     ) -> Result<Arc<c2_ipc::SyncClient>, c2_ipc::IpcError> {
-        let config = self
-            .client_ipc_config()
-            .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
-        let client = c2_ipc::ClientPool::instance().acquire(address, Some(&config))?;
-        self.mark_client_config_frozen();
-        Ok(client)
+        let (config, pool) = {
+            let mut state = self.state.lock();
+            let config = match state.frozen_client_config.clone() {
+                Some(config) => config,
+                None => {
+                    let config = resolve_client_config_locked(&state)
+                        .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+                    state.frozen_client_config = Some(config.clone());
+                    state.client_config_frozen = true;
+                    config
+                }
+            };
+            (config, Arc::clone(&state.client_pool))
+        };
+        // Connect outside the RuntimeState lock.
+        pool.acquire(address, Some(&config))
     }
 
     pub(crate) fn release_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        c2_ipc::ClientPool::instance().release_if_same(address, client);
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.release_if_same(address, client);
     }
 
     pub(crate) fn discard_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        c2_ipc::ClientPool::instance().discard_if_same(address, client);
-    }
-
-    pub(crate) fn client_ipc_config(&self) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
-        let runtime_overrides = c2_config::RuntimeConfigOverrides {
-            client_ipc: self.client_ipc_overrides().unwrap_or_default(),
-            shm_threshold: self.shm_threshold_override(),
-            ..Default::default()
-        };
-        c2_config::ConfigResolver::resolve_client_ipc(
-            runtime_overrides.client_ipc.clone(),
-            runtime_overrides,
-            c2_config::ConfigSources::from_process(),
-        )
-        .map_err(|error| LifecycleError::Configuration(error.to_string()))
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.discard_if_same(address, client);
     }
 
     pub(crate) fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
@@ -744,6 +756,31 @@ impl Runtime {
             }
         }
 
+        // Close this Runtime's outgoing IPC client cache before touching the
+        // server, in both hosted and hostless lifecycles. The cache handle is
+        // cloned under the state lock; every connect and close barrier runs
+        // outside it. Other Runtimes keep their own caches untouched. The
+        // drain report is only a completed claim when every detached client
+        // confirmed its bounded close AND the drain was not blocked behind a
+        // concurrent drain transaction or in-flight detached-close barriers.
+        let client_pool = Arc::clone(&self.state.lock().client_pool);
+        let client_close = client_pool.close_all(shutdown_timeout);
+        outcome.ipc_clients_drained =
+            client_close.unconfirmed.is_empty() && client_close.error.is_none();
+        if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {
+            let mut detail = client_close.error.unwrap_or_default();
+            if !client_close.unconfirmed.is_empty() {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!(
+                    "unconfirmed IPC client cache closes for {:?}",
+                    client_close.unconfirmed
+                ));
+            }
+            outcome.ipc_client_close_error = Some(detail);
+        }
+
         if let Some(server) = server {
             let recorded_direct_shutdown_outcomes = if matches!(
                 server.lifecycle_state(),
@@ -856,6 +893,16 @@ impl Runtime {
         }
 
         outcome
+    }
+
+    /// Shut down a client-only (hostless) Runtime.
+    ///
+    /// Rust and native SDK lifecycles without a Host/server use this path so
+    /// outgoing IPC clients owned by this Runtime are still detached and
+    /// closed through the bounded shared-ownership barrier. Relay routes and
+    /// server state are not involved; nothing process-global is reset.
+    pub fn shutdown_without_host(&self, shutdown_timeout: Duration) -> ShutdownOutcome {
+        self.shutdown(None, Vec::new(), None, false, None, shutdown_timeout)
     }
 
     pub(crate) fn resolve_relay_connection(
@@ -1049,6 +1096,26 @@ impl Runtime {
 
 fn canonical_relay_anchor_address(address: &str) -> String {
     address.trim().trim_end_matches('/').to_string()
+}
+
+/// Resolve the client IPC config from one consistent RuntimeState snapshot.
+///
+/// Called with the state lock held so the first connection attempt resolves
+/// and freezes the config atomically before any connect I/O.
+fn resolve_client_config_locked(
+    state: &RuntimeState,
+) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
+    let runtime_overrides = c2_config::RuntimeConfigOverrides {
+        client_ipc: state.client_ipc_overrides.clone().unwrap_or_default(),
+        shm_threshold: state.shm_threshold,
+        ..Default::default()
+    };
+    c2_config::ConfigResolver::resolve_client_ipc(
+        runtime_overrides.client_ipc.clone(),
+        runtime_overrides,
+        c2_config::ConfigSources::from_process(),
+    )
+    .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
 fn runtime_http_error(err: HttpError) -> LifecycleError {

@@ -72,4 +72,8 @@ pub struct ShutdownOutcome {
     pub http_clients_drained: bool,
     pub route_close_error: Option<String>,
     pub runtime_barrier_error: Option<String>,
+    /// Addresses in this Runtime's outgoing IPC client cache whose close
+    /// barrier was unconfirmed within the shutdown deadline. `None` means
+    /// every detached client confirmed its close.
+    pub ipc_client_close_error: Option<String>,
 }

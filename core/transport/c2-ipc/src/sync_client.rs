@@ -302,7 +302,18 @@ impl SyncClient {
 
     /// Synchronous close.
     pub fn close(&mut self) {
-        self.rt.block_on(self.inner.close());
+        self.rt.block_on(self.inner.close_shared());
+    }
+
+    /// Synchronous shared-ownership close with a bounded close barrier.
+    ///
+    /// Usable through `Arc<SyncClient>` when unique ownership cannot be
+    /// proven. Returns `true` only when the receive task finished and the
+    /// writer slot cleared within `timeout`; `false` reports an unconfirmed
+    /// close honestly — nothing is force-stopped or force-released beyond the
+    /// bounded abort attempts made inside the barrier.
+    pub fn close_shared(&self, timeout: std::time::Duration) -> bool {
+        self.rt.block_on(self.inner.close_shared_bounded(timeout))
     }
 
     /// Whether the client is connected.
@@ -393,6 +404,26 @@ impl SyncClient {
             inner,
             rt: rt.handle().clone(),
         }
+    }
+
+    /// Deterministically occupy the writer slot exactly like a bulk write
+    /// stuck on a non-reading peer would, signalling `acquired` once the
+    /// slot is held and releasing it when `release` resolves.
+    ///
+    /// This replaces timing-dependent blocked-pipe fixtures: the close
+    /// barrier's writer phase observes an unavailable writer slot without
+    /// any 32 MiB stack buffers or kernel pipe-buffer pressure.
+    pub(crate) fn hold_writer_slot_for_test(
+        &self,
+        acquired: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let writer = self.inner.writer_slot_for_test();
+        self.rt.spawn(async move {
+            let _guard = writer.lock().await;
+            let _ = acquired.send(());
+            let _ = release.await;
+        });
     }
 }
 

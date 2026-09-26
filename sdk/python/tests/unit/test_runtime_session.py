@@ -780,3 +780,46 @@ def test_registry_restores_native_error_bytes_before_wrapping() -> None:
 
     assert isinstance(restored, FallbackDenied)
     assert restored.details == {'route': 'grid'}
+
+def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> None:
+    from c_two.transport.registry import _ProcessRegistry
+
+    class FakeSession:
+        def __init__(self, outcome: dict) -> None:
+            self._outcome = outcome
+
+        def shutdown(self, *, route_names, relay_anchor_address):
+            return self._outcome
+
+    def hostless_registry(outcome: dict) -> _ProcessRegistry:
+        registry = _ProcessRegistry()
+        registry._runtime_session = FakeSession(outcome)  # noqa: SLF001
+        registry._server = None  # noqa: SLF001
+        return registry
+
+    logger_name = 'c_two.transport.registry'
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        hostless_registry({
+            'relay_errors': [],
+            'ipc_client_close_error': (
+                'unconfirmed IPC client cache closes for ["ipc://blocked"]'
+            ),
+        }).shutdown()
+        hostless_registry({
+            'relay_errors': [],
+            'runtime_barrier_error': 'runtime barrier did not quiesce',
+        }).shutdown()
+        # Absent keys stay silent: apparent full cleanup is only reported
+        # when the native outcome actually reports a failure.
+        hostless_registry({'relay_errors': []}).shutdown()
+
+    messages = [record.getMessage() for record in caplog.records]
+    ipc_warnings = [
+        message for message in messages if 'IPC client cache' in message
+    ]
+    assert ipc_warnings, 'an unconfirmed native IPC client close must be surfaced'
+    assert any('ipc://blocked' in message for message in ipc_warnings)
+    assert any(
+        'runtime barrier' in message for message in messages
+    ), 'an unconfirmed runtime barrier must be surfaced'
+    assert len(messages) == 2, f'clean outcomes must stay silent, saw {messages!r}'
