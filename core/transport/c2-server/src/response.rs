@@ -108,6 +108,7 @@ mod tests {
                 buddy_idle_decay_secs: 60.0,
                 spill_threshold: 0.8,
                 spill_dir: std::env::temp_dir().join("c2_response_helper_test"),
+                ..PoolConfig::default()
             },
             unique_prefix("a"),
         ))
@@ -182,6 +183,9 @@ mod tests {
                 buddy_idle_decay_secs: 60.0,
                 spill_threshold: 0.8,
                 spill_dir: std::env::temp_dir().join("c2_response_helper_alloc_fail"),
+                // max_segments 0 requires a zero retirement floor.
+                min_retained_segments: 0,
+                ..PoolConfig::default()
             },
             unique_prefix("b"),
         ));

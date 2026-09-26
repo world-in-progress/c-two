@@ -11,6 +11,7 @@ use std::time::Instant;
 use tokio::sync::Notify;
 use tracing::warn;
 
+use c2_config::MAX_IPC_POOL_SEGMENTS;
 use c2_mem::config::PoolConfig;
 use c2_mem::{FreeResult, MemPool};
 
@@ -18,11 +19,17 @@ use c2_mem::{FreeResult, MemPool};
 // Peer SHM state (set once during handshake, read concurrently)
 // ---------------------------------------------------------------------------
 
+/// Minimum buddy segment size required by the allocator (2 × min_block_size).
+const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
+
 struct PeerShmState {
     prefix: String,
     segment_names: Vec<String>,
     segment_sizes: Vec<u32>,
-    /// Buddy segment size for lazy-open derivation.
+    /// First buddy segment size the peer announced, if any. Diagnostic only:
+    /// backings are opened with the frame's advertised data span and the true
+    /// geometry comes from the SHM mapping header, so no local default is ever
+    /// substituted for actual peer geometry.
     buddy_segment_size: usize,
     /// MemPool opened over the client's SHM segments for data access + free.
     pool: Option<Arc<RwLock<MemPool>>>,
@@ -34,7 +41,7 @@ impl PeerShmState {
             prefix: String::new(),
             segment_names: Vec::new(),
             segment_sizes: Vec::new(),
-            buddy_segment_size: 256 * 1024 * 1024,
+            buddy_segment_size: MIN_BUDDY_SEGMENT_SIZE,
             pool: None,
         }
     }
@@ -55,7 +62,10 @@ impl PeerShmState {
             let name = MemPool::dedicated_segment_name(&self.prefix, seg_idx);
             pool.open_dedicated_at(seg_idx, &name, data_size)
         } else {
-            pool.ensure_peer_segment(seg_idx, generation, self.buddy_segment_size.max(data_size))
+            // Open with exactly the frame's data span: the mapped region must
+            // hold the advertised payload, and the allocator header supplies
+            // the real segment geometry. Never clamp up to a local guess.
+            pool.ensure_peer_segment(seg_idx, generation, data_size)
         }
     }
 }
@@ -176,9 +186,6 @@ impl Connection {
     /// Always creates a `MemPool` with the peer's prefix so that later
     /// `read_peer_data` / `free_peer_block` can lazy-open segments by
     /// resolving names through MemPool's prefix, index, and generation authority.
-    /// Minimum buddy segment size required by the allocator (2 × min_block_size).
-    const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
-
     pub fn init_peer_shm(&self, prefix: String, segments: Vec<(String, u32)>) {
         let mut state = self.peer_shm.lock();
         state.prefix = prefix;
@@ -191,25 +198,34 @@ impl Connection {
         }
 
         // Defend against undersized segments from peer handshake.
-        if state.buddy_segment_size < Self::MIN_BUDDY_SEGMENT_SIZE {
+        if state.buddy_segment_size < MIN_BUDDY_SEGMENT_SIZE {
             warn!(
                 conn_id = self.conn_id,
                 segment_size = state.buddy_segment_size,
-                min_required = Self::MIN_BUDDY_SEGMENT_SIZE,
+                min_required = MIN_BUDDY_SEGMENT_SIZE,
                 "peer buddy segment too small, clamping to minimum",
             );
-            state.buddy_segment_size = Self::MIN_BUDDY_SEGMENT_SIZE;
+            state.buddy_segment_size = MIN_BUDDY_SEGMENT_SIZE;
         }
 
+        // Receive-side cache: `buddy_enabled` is irrelevant (peer pools never
+        // allocate) and `min_retained_segments` is 0 so cached views retire as
+        // soon as their peer frees — matching MemPool's peer-cache behavior.
+        // The segment bound is the canonical IPC buddy segment bound, so any
+        // index a legitimately configured peer may reference (config caps
+        // `max_pool_segments` at the same constant) is accepted here while
+        // arbitrary counts stay rejected by `ensure_peer_segment`.
         let cfg = PoolConfig {
             segment_size: state.buddy_segment_size,
             min_block_size: 4096,
-            max_segments: 16,
+            max_segments: MAX_IPC_POOL_SEGMENTS as usize,
             max_dedicated_segments: 4,
             dedicated_crash_timeout_secs: 0.0,
             buddy_idle_decay_secs: 60.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c_two_request_cache"),
+            buddy_enabled: true,
+            min_retained_segments: 0,
         };
         let peer_prefix = state.prefix.clone();
         let pool = MemPool::open_peer(cfg, peer_prefix);
@@ -443,7 +459,7 @@ mod tests {
         assert_eq!(conn.remote_segment_names(), vec!["seg0"]);
         assert_eq!(
             conn.buddy_segment_size(),
-            Connection::MIN_BUDDY_SEGMENT_SIZE,
+            MIN_BUDDY_SEGMENT_SIZE,
             "undersized segment must be clamped to MIN_BUDDY_SEGMENT_SIZE",
         );
     }
@@ -454,7 +470,7 @@ mod tests {
         conn.init_peer_shm("/cc3b_zero".into(), vec![("z0".into(), 0)]);
         assert_eq!(
             conn.buddy_segment_size(),
-            Connection::MIN_BUDDY_SEGMENT_SIZE,
+            MIN_BUDDY_SEGMENT_SIZE,
         );
     }
 
@@ -465,7 +481,7 @@ mod tests {
         conn.init_peer_shm("/cc3b_8191".into(), vec![("s0".into(), 8191)]);
         assert_eq!(
             conn.buddy_segment_size(),
-            Connection::MIN_BUDDY_SEGMENT_SIZE,
+            MIN_BUDDY_SEGMENT_SIZE,
         );
     }
 

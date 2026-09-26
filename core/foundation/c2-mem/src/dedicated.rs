@@ -182,4 +182,57 @@ mod tests {
 
         drop(seg);
     }
+
+    #[test]
+    fn test_required_region_size_rejects_overflow_before_mapping() {
+        // Header addition alone overflows.
+        assert_eq!(DedicatedSegment::required_shm_size(usize::MAX), None);
+        // data + header == usize::MAX: the page round-up overflows even though
+        // the addition itself fits.
+        assert_eq!(
+            DedicatedSegment::required_shm_size(usize::MAX - DEDICATED_HEADER_SIZE),
+            None
+        );
+
+        // Largest representable input: (data + header) + (PAGE_SIZE - 1) lands
+        // exactly below usize::MAX, but exceeds the addressable isize mapping span.
+        let last = usize::MAX - (PAGE_SIZE - 1) - DEDICATED_HEADER_SIZE;
+        assert_eq!(DedicatedSegment::required_shm_size(last), None);
+        // One byte past that boundary overflows the round-up.
+        assert_eq!(DedicatedSegment::required_shm_size(last + 1), None);
+
+        // Sanity for ordinary sizes: unchanged behavior.
+        assert_eq!(DedicatedSegment::required_shm_size(8192), Some(12288));
+        assert_eq!(DedicatedSegment::required_shm_size(1), Some(PAGE_SIZE));
+    }
+
+    #[test]
+    fn test_create_and_open_reject_unrepresentable_sizes_via_checked_logic() {
+        let name = format!("/c2ded_ovf_{}", std::process::id());
+        // `usize::MAX - HEADER_SIZE` overflows during page alignment; the
+        // checked helper must reject it before any mapping attempt in both
+        // debug and release builds (no wrapping arithmetic anywhere).
+        for size in [
+            usize::MAX,
+            usize::MAX - DEDICATED_HEADER_SIZE,
+            usize::MAX - (PAGE_SIZE - 1) - DEDICATED_HEADER_SIZE + 1,
+        ] {
+            let err = match DedicatedSegment::create(&name, size) {
+                Err(err) => err,
+                Ok(_) => panic!("create({size}) must fail the checked guard"),
+            };
+            assert!(
+                err.contains("geometry unsupported"),
+                "create({size}) must fail the checked guard, got: {err}"
+            );
+            let err = match DedicatedSegment::open(&name, size) {
+                Err(err) => err,
+                Ok(_) => panic!("open({size}) must fail the checked guard"),
+            };
+            assert!(
+                err.contains("geometry unsupported"),
+                "open({size}) must fail the checked guard, got: {err}"
+            );
+        }
+    }
 }

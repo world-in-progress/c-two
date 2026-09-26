@@ -6,8 +6,8 @@
 use parking_lot::{Mutex as StdMutex, RwLock};
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use c2_local::{
     AbortHandle, DEFAULT_CONNECT_TIMEOUT, LocalEndpoint, LocalReadHalf, LocalStream, LocalWriteHalf,
@@ -59,16 +59,20 @@ const ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200]
 /// Mirrors `PeerShmState` in c2-server/connection.rs.
 pub struct ServerPoolState {
     prefix: String,
-    buddy_segment_size: usize,
     pub pool: MemPool,
 }
 
 impl ServerPoolState {
-    /// Lazy-open the segment for the given coordinates if not yet mapped.
+    /// Minimum size accepted by buddy-pool config validation
+    /// (`2 × min_block_size`).
+    const MIN_PEER_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
+
+    /// Lazy-open the segment for the given coordinates if not already mapped.
     ///
     /// Called transparently by language binding response buffers before any
     /// SHM access. SDKs do not need to know about segment management; this
-    /// keeps it entirely inside Rust.
+    /// keeps it entirely inside Rust. Backing geometry comes from the frame's
+    /// advertised data span — never from a locally configured segment size.
     pub fn ensure_segment(
         &mut self,
         seg_idx: u16,
@@ -84,11 +88,8 @@ impl ServerPoolState {
             self.pool
                 .open_dedicated_at(u32::from(seg_idx), &name, data_size as usize)
         } else {
-            self.pool.ensure_peer_segment(
-                u32::from(seg_idx),
-                generation,
-                self.buddy_segment_size.max(data_size as usize),
-            )
+            self.pool
+                .ensure_peer_segment(u32::from(seg_idx), generation, data_size as usize)
         }
     }
 
@@ -148,10 +149,9 @@ impl ServerPoolState {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_pool_for_test(buddy_segment_size: usize, pool: MemPool) -> Self {
+    pub(crate) fn from_pool_for_test(pool: MemPool) -> Self {
         Self {
             prefix: pool.prefix().to_string(),
-            buddy_segment_size,
             pool,
         }
     }
@@ -736,11 +736,33 @@ pub struct IpcClient {
     close_gate: tokio::sync::Mutex<()>,
     connected: Arc<AtomicBool>,
     pub(crate) pool: Option<Arc<StdMutex<MemPool>>>,
+    /// `true` when the pool was injected through [`IpcClient::with_pool`] /
+    /// `SyncClient::connect(.., Some(pool), ..)` rather than derived from the
+    /// config. Injected pools are externally owned: the transport validates
+    /// them against the configured buddy policy at connect and never prewarms
+    /// or mutates their configuration.
+    pool_injected: bool,
     pub(crate) config: ClientIpcConfig,
     /// Client-side chunk registry for reassembling chunked responses.
     pub(crate) chunk_registry: Arc<ChunkRegistry>,
     /// Unique connection identifier for the chunk registry.
     conn_id: u64,
+    /// At most one cancellable maintenance task per connection; `None` while
+    /// disconnected and after `close_shared`. The task holds a [`Weak`]
+    /// reference to this state as its liveness probe, so dropping the client
+    /// terminates the task on its next tick without a strong `Arc` cycle.
+    pub(crate) maintenance: Arc<StdMutex<Option<MaintenanceTask>>>,
+    /// Maintenance tick counter (test-only liveness probe).
+    #[cfg(test)]
+    pub(crate) maintenance_ticks: Arc<AtomicU64>,
+}
+
+/// Handle for the per-connection client maintenance task. Constructing,
+/// signalling, and joining happen only inside the `client` module; the
+/// `pub(crate)` visibility exists so the state field can be probed by tests.
+pub(crate) struct MaintenanceTask {
+    stop: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 // Compile-time assertion: IpcClient is Send+Sync because all fields are
@@ -765,27 +787,22 @@ static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLIENT_OWN_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl IpcClient {
-    fn own_pool_from_config(config: &ClientIpcConfig) -> Option<Arc<StdMutex<MemPool>>> {
-        if !config.pool_enabled {
-            return None;
-        }
-        let pool_config = PoolConfig {
-            segment_size: config.pool_segment_size as usize,
-            max_segments: config.max_pool_segments as usize,
-            ..PoolConfig::default()
-        };
+    /// Config-owned request pool. Always a real `MemPool`: with buddy disabled
+    /// it still serves dedicated SHM requests (and announces the wire prefix),
+    /// only the buddy tiers are policy-disabled. The client's idle window
+    /// (`pool_decay_seconds`) rides in through the role tuning.
+    fn own_pool_from_config(config: &ClientIpcConfig) -> Arc<StdMutex<MemPool>> {
+        let pool_config = config.base.primary_pool_config(&config.pool_tuning());
         let counter = CLIENT_OWN_POOL_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3d{:08x}{:08x}", std::process::id(), counter);
-        Some(Arc::new(StdMutex::new(MemPool::new_with_prefix(
-            pool_config,
-            prefix,
-        ))))
+        Arc::new(StdMutex::new(MemPool::new_with_prefix(pool_config, prefix)))
     }
 
     fn from_parts(
         address: &str,
         pool: Option<Arc<StdMutex<MemPool>>>,
         config: ClientIpcConfig,
+        pool_injected: bool,
     ) -> Self {
         let endpoint = crate::control::local_endpoint_from_ipc_address(address)
             .map_err(|error| error.to_string());
@@ -804,23 +821,24 @@ impl IpcClient {
             close_gate: tokio::sync::Mutex::new(()),
             connected: Arc::new(AtomicBool::new(false)),
             pool,
+            pool_injected,
             chunk_registry: Self::make_chunk_registry(&config),
             conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
             config,
+            maintenance: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            maintenance_ticks: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn make_chunk_registry(config: &ClientIpcConfig) -> Arc<ChunkRegistry> {
-        let seg_size = config.reassembly_segment_size as usize;
-        let max_segs = config.reassembly_max_segments as usize;
         let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3a{:08x}{:08x}", std::process::id(), counter);
+        // Reassembly follows the same buddy policy: with buddy disabled the
+        // assembler stores into dedicated SHM (file spill as last resort)
+        // instead of skipping chunked reception.
         let pool = Arc::new(RwLock::new(MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: seg_size,
-                max_segments: max_segs,
-                ..PoolConfig::default()
-            },
+            config.base.reassembly_pool_config(&config.pool_tuning()),
             prefix,
         )));
         let chunk_config = ChunkConfig::from_base(config);
@@ -831,42 +849,113 @@ impl IpcClient {
     ///
     /// The address is logical (`ipc://name`); Rust derives the local OS endpoint.
     pub fn new(address: &str) -> Self {
-        Self::from_parts(address, None, ClientIpcConfig::default())
+        Self::from_parts(address, None, ClientIpcConfig::default(), false)
     }
 
-    /// Create a new IPC client with a config-owned SHM pool when enabled.
+    /// Create a new IPC client with a config-owned SHM pool.
     ///
     /// This keeps async callers such as the HTTP relay on the canonical
     /// `IpcClient` API while still allowing large request streams to be written
-    /// directly into client SHM.
+    /// directly into client SHM. The pool follows the config's buddy policy:
+    /// dedicated SHM requests stay available when buddy is disabled.
     pub fn with_config(address: &str, config: ClientIpcConfig) -> Self {
         let pool = Self::own_pool_from_config(&config);
-        Self::from_parts(address, pool, config)
+        Self::from_parts(address, Some(pool), config, false)
     }
 
-    /// Create a new IPC client with a buddy pool for SHM transfers.
+    /// Create a new IPC client with an externally owned SHM pool.
     ///
-    /// The pool is used for outgoing buddy allocations when data exceeds
-    /// `config.shm_threshold`.
+    /// The pool is used for outgoing SHM allocations when data exceeds
+    /// `config.shm_threshold`. Because the pool is shared state the transport
+    /// does not own, [`connect`](Self::connect) validates it against the
+    /// configured buddy policy *before* any connection I/O: a config that
+    /// disables `pool_enabled` rejects a buddy-enabled pool (the policy must
+    /// not be bypassed), and `pool_prewarm_segments` is rejected because the
+    /// transport never maps memory into a pool it does not own — prewarm
+    /// external pools explicitly with `MemPool::ensure_buddy_segments`. A
+    /// policy-matching pool (including a buddy-disabled one, which keeps
+    /// dedicated SHM requests) connects normally. The pool's own configuration
+    /// and allocations are never mutated or destroyed by the transport;
+    /// maintenance only calls the pool's public GC API.
     pub fn with_pool(address: &str, pool: Arc<StdMutex<MemPool>>, config: ClientIpcConfig) -> Self {
-        Self::from_parts(address, Some(pool), config)
+        Self::from_parts(address, Some(pool), config, true)
+    }
+
+    /// Create a client around a transport-internal pool built from `config`
+    /// (pooled-client acquire path). The pool is owned solely by the resulting
+    /// client, so connect-time policy validation and explicit prewarm apply
+    /// exactly as for [`with_config`](Self::with_config).
+    pub(crate) fn with_transport_pool(
+        address: &str,
+        pool: Arc<StdMutex<MemPool>>,
+        config: ClientIpcConfig,
+    ) -> Self {
+        Self::from_parts(address, Some(pool), config, false)
     }
 
     /// Connect and perform handshake.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
+        // Reconnect only after the previous close barrier has accounted for
+        // both background tasks. Replacing either handle here would detach
+        // its task from the client's close and Drop ownership.
+        if self.is_connected()
+            || self.recv_handle.lock().is_some()
+            || self.maintenance.lock().is_some()
+        {
+            return Err(IpcError::Pool(
+                "client must finish closing before reconnect".to_string(),
+            ));
+        }
         let endpoint = self
             .endpoint
             .as_ref()
             .map_err(|error| IpcError::Config(error.clone()))?;
+
+        // Policy gate for injected pools, checked before any connection I/O so
+        // an incompatible pool can never silently bypass the configured buddy
+        // policy or be mutated behind its other users.
+        if self.pool_injected {
+            if let Some(pool_arc) = self.pool.as_ref() {
+                let rejection = {
+                    let pool = pool_arc.lock();
+                    if !self.config.base.pool_enabled && pool.config().buddy_enabled {
+                        Some(IpcError::Pool(
+                            "injected pool has buddy enabled but the client config disables \
+                             pool_enabled; inject a policy-matching pool (buddy_enabled=false \
+                             still serves dedicated SHM requests)"
+                                .into(),
+                        ))
+                    } else if self.config.base.pool_prewarm_segments > 0 {
+                        Some(IpcError::Pool(format!(
+                            "pool_prewarm_segments={} cannot be applied to an injected pool; \
+                             prewarm external pools explicitly with \
+                             MemPool::ensure_buddy_segments before connect",
+                            self.config.base.pool_prewarm_segments
+                        )))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(error) = rejection {
+                    return Err(error);
+                }
+            }
+        }
+
         let stream = LocalStream::connect(endpoint, DEFAULT_CONNECT_TIMEOUT).await?;
         *self.abort.lock() = Some(stream.abort_handle());
         let (reader, mut writer) = stream.into_split();
 
-        // Pre-allocate first SHM segment so handshake announces it.
+        // Explicit prewarm only: buddy memory is mapped at connect time solely
+        // when `pool_prewarm_segments` asks for it; the default stays fully
+        // lazy and announces an empty segment list.
         if let Some(ref pool_arc) = self.pool {
-            let mut pool = pool_arc.lock();
-            pool.ensure_ready()
-                .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
+            let prewarm = self.config.pool_prewarm_segments as usize;
+            if prewarm > 0 {
+                let mut pool = pool_arc.lock();
+                pool.ensure_buddy_segments(prewarm)
+                    .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
+            }
         }
 
         // Perform handshake.
@@ -891,26 +980,34 @@ impl IpcClient {
         self.server_identity = Some(server_identity);
 
         // Open server SHM segments into a ServerPoolState for buddy response reads.
+        // With a lazy server pool the announcement may be empty; actual backing
+        // geometry is then derived per-frame when a response references it, so
+        // the local default below is only the minimum legal validation size —
+        // never a fabricated stand-in for real peer geometry.
         {
             let buddy_seg_size = hs
                 .segments
                 .first()
-                .map(|(_, size)| *size as usize)
-                .unwrap_or(self.config.pool_segment_size as usize);
+                .map(|(_, size)| (*size as usize).max(ServerPoolState::MIN_PEER_BUDDY_SEGMENT_SIZE))
+                .unwrap_or(ServerPoolState::MIN_PEER_BUDDY_SEGMENT_SIZE);
             let cfg = c2_mem::config::PoolConfig {
                 segment_size: buddy_seg_size,
                 min_block_size: 4096,
-                max_segments: 16,
+                // Canonical IPC buddy segment bound: a legitimately configured
+                // peer may reference any index below it (config caps
+                // `max_pool_segments` at the same constant), while arbitrary
+                // counts stay rejected by `MemPool::ensure_peer_segment`.
+                max_segments: c2_config::MAX_IPC_POOL_SEGMENTS as usize,
                 max_dedicated_segments: 8,
                 dedicated_crash_timeout_secs: 60.0,
                 buddy_idle_decay_secs: 60.0,
                 spill_threshold: 1.0,
                 spill_dir: std::env::temp_dir().join("c_two_response_cache"),
+                ..PoolConfig::default()
             };
             let pool = MemPool::open_peer(cfg, hs.prefix.clone());
             *self.server_pool.lock() = Some(ServerPoolState {
                 prefix: hs.prefix.clone(),
-                buddy_segment_size: buddy_seg_size,
                 pool,
             });
         }
@@ -919,10 +1016,9 @@ impl IpcClient {
 
         self.connected.store(true, Ordering::Release);
 
-        // Spawn the receive loop — replaced below in `do_handshake`.
-        // Actually, we need to spawn it with the reader after handshake.
-        // The reader was consumed by do_handshake, so we get it back.
-        // This is handled inside do_handshake which returns a new reader.
+        // One cancellable maintenance task per connection: periodic idle
+        // retirement for the client's owner pools plus stale chunk sweeps.
+        self.spawn_maintenance();
 
         Ok(())
     }
@@ -932,8 +1028,12 @@ impl IpcClient {
         writer: &mut LocalWriteHalf,
         mut reader: LocalReadHalf,
     ) -> Result<Handshake, IpcError> {
-        // Build segment list and prefix from pool (if available).
-        let (segments, prefix, cap_flags) = if let Some(ref pool_arc) = self.pool {
+        // Build segment list and prefix from pool (if available). The list may
+        // legitimately be empty: lazy pools announce no backings and the server
+        // lazy-opens by prefix/index/generation when a frame references one.
+        // CAP_CHUNKED is independent of pool state — chunked response
+        // reassembly always exists (reassembly pool + chunk registry).
+        let (segments, prefix) = if let Some(ref pool_arc) = self.pool {
             let pool = pool_arc.lock();
             let count = pool.segment_count();
             let mut segs = Vec::with_capacity(count);
@@ -943,10 +1043,11 @@ impl IpcClient {
                 }
             }
             let pfx = pool.prefix().to_string();
-            (segs, pfx, CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED)
+            (segs, pfx)
         } else {
-            (vec![], String::new(), CAP_CALL_V2 | CAP_METHOD_IDX)
+            (vec![], String::new())
         };
+        let cap_flags = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
 
         let payload = encode_client_handshake(&segments, cap_flags, &prefix)
             .map_err(|e| IpcError::Protocol(e.to_string()))?;
@@ -1006,6 +1107,90 @@ impl IpcClient {
         *self.recv_handle.lock() = Some(recv_handle);
 
         Ok(hs)
+    }
+
+    /// Maintenance cadence: fast enough to notice either the stale-chunk sweep
+    /// window or the client pool idle-decay window, bounded below to avoid a
+    /// busy loop when both are configured near zero.
+    fn maintenance_interval(config: &ClientIpcConfig) -> std::time::Duration {
+        let decay = config.pool_decay_seconds.max(0.0);
+        let secs = config.base.chunk_gc_interval_secs.min(decay).max(0.005);
+        std::time::Duration::from_secs_f64(secs)
+    }
+
+    /// Spawn the connection's single maintenance task. An existing task
+    /// remains owned by its handle; connect rejects a new attempt until the
+    /// previous close has joined it.
+    ///
+    /// Mirrors the server's periodic GC sweep: each tick sweeps stale chunk
+    /// assemblies in the client's chunk registry and reclaims both storage
+    /// tiers of the reassembly and request pools — idle buddy segments retire
+    /// down to each pool's configured minimum (`MemPool::gc_buddy`) and
+    /// dedicated segments whose peer set `read_done` are unmapped
+    /// (`MemPool::gc_dedicated`), so a dedicated-only lightweight connection
+    /// releases its mappings without waiting for another allocation. The pool
+    /// stays the release authority and live allocations are never touched.
+    /// The task holds only weak references plus a shutdown watch channel:
+    ///
+    /// - `close_shared` stops it immediately through the watch channel.
+    /// - Dropping the client stops it on the next tick: the `Weak` probe of
+    ///   the maintenance state fails to upgrade once the client is gone.
+    /// - It never selects on the recv loop's `read_exact`, which is not
+    ///   cancellation safe — the reader stays owned exclusively by the recv
+    ///   loop.
+    fn spawn_maintenance(&self) {
+        let mut maintenance = self.maintenance.lock();
+        if maintenance.is_some() {
+            return;
+        }
+        let state_probe = Arc::downgrade(&self.maintenance);
+        let request_pool = self.pool.as_ref().map(Arc::downgrade);
+        let registry = Arc::downgrade(&self.chunk_registry);
+        #[cfg(test)]
+        let tick_counter = Arc::clone(&self.maintenance_ticks);
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let interval = Self::maintenance_interval(&self.config);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    // Sender dropped also resolves as a stop signal.
+                    _ = stop_rx.changed() => break,
+                    _ = ticker.tick() => {
+                        #[cfg(test)]
+                        tick_counter.fetch_add(1, Ordering::Relaxed);
+                        // Liveness probe: stop once the owning client is gone
+                        // (or has closed and taken the task out of the state).
+                        let client_alive = match state_probe.upgrade() {
+                            Some(state) => {
+                                let alive = state.lock().is_some();
+                                alive
+                            }
+                            None => false,
+                        };
+                        if !client_alive {
+                            break;
+                        }
+                        if let Some(registry) = registry.upgrade() {
+                            registry.gc_sweep();
+                            let mut pool = registry.pool().write();
+                            pool.gc_buddy();
+                            pool.gc_dedicated();
+                        }
+                        if let Some(pool) = request_pool.as_ref().and_then(Weak::upgrade) {
+                            let mut pool = pool.lock();
+                            pool.gc_buddy();
+                            pool.gc_dedicated();
+                        }
+                    }
+                }
+            }
+        });
+        *maintenance = Some(MaintenanceTask {
+            stop: stop_tx,
+            handle,
+        });
     }
 
     /// Get a reference to the server SHM pool (for materialising SHM responses).
@@ -2529,28 +2714,27 @@ impl IpcClient {
     /// Close through shared ownership with every barrier phase bounded by one
     /// deadline, reporting honestly whether the close was confirmed.
     ///
-    /// `true` means the receive task finished (or none existed) and the writer
-    /// slot was cleared, all within `timeout`. A `false` result reports an
-    /// unconfirmed close: tasks may still be draining, and no backing memory
+    /// `true` means the maintenance and receive tasks finished (or none
+    /// existed) and the writer slot was cleared, all within `timeout`. A
+    /// `false` result reports an unconfirmed close: tasks may still be draining, and no backing memory
     /// is force-released. Concurrent callers serialize through a close gate:
     /// a caller that cannot enter the gate before its deadline expires, or
     /// that arrives while another barrier is still running, reports an honest
     /// unconfirmed close instead of observing a torn intermediate state.
     ///
     /// Every phase, including the final writer-lock clear and the
-    /// receive-task join, derives its budget from the single absolute
-    /// deadline; an unconfirmed join aborts the task and waits once more
-    /// within the time still remaining (capped at one second) so an abort
-    /// can still be observed finishing without ever exceeding the caller's
-    /// budget. If even that expires, the aborted task's handle is restored
-    /// so it stays observable and a later close can retry the join — a
-    /// missing handle always means "no live receive task".
+    /// maintenance and receive-task joins, derives its budget from the single
+    /// absolute deadline. An unconfirmed task is aborted and its handle is
+    /// restored, so a later close can retry the join; a missing handle means
+    /// the task has finished or never existed.
     pub async fn close_shared_bounded(&self, timeout: std::time::Duration) -> bool {
         use tokio::time::timeout_at;
 
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
-            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365));
+            .unwrap_or_else(|| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(86400 * 365)
+            });
         self.connected.store(false, Ordering::Release);
 
         // Serialize close barriers: only one closer manipulates the writer
@@ -2565,6 +2749,20 @@ impl IpcClient {
             }
         };
         let mut confirmed = true;
+
+        // Stop maintenance inside the same close transaction. The watch
+        // signal permits a clean exit; a task still running at the deadline
+        // is aborted and kept reachable for a later join. Never hold the
+        // synchronous maintenance mutex across an await.
+        let maintenance = { self.maintenance.lock().take() };
+        if let Some(mut task) = maintenance {
+            let _ = task.stop.send(true);
+            if timeout_at(deadline, &mut task.handle).await.is_err() {
+                task.handle.abort();
+                confirmed = false;
+                *self.maintenance.lock() = Some(task);
+            }
+        }
 
         // Bound both writer-lock acquisition and the disconnect exchange. A
         // cancelled partial write aborts its stream instead of leaving a frame
@@ -2646,12 +2844,19 @@ impl IpcClient {
 
 impl Drop for IpcClient {
     fn drop(&mut self) {
-        // Non-blocking best effort: abort the stream so an abandoned receive
-        // task cannot keep pool Arcs alive indefinitely when an owner drops
-        // without an explicit close. Confirmed bounded shutdown is
-        // `close_shared_bounded`; this never blocks or joins.
+        // Non-blocking best effort. The receive task owns the reader; abort
+        // the stream and maintenance task so neither can keep pool Arcs alive
+        // indefinitely after the client owner disappears. Confirmed shutdown
+        // uses `close_shared_bounded` and never relies on Drop.
         if let Some(abort) = self.abort.lock().take() {
             abort.abort();
+        }
+        if let Some(receiver) = self.recv_handle.lock().take() {
+            receiver.abort();
+        }
+        if let Some(task) = self.maintenance.lock().take() {
+            let _ = task.stop.send(true);
+            task.handle.abort();
         }
     }
 }
@@ -2673,6 +2878,20 @@ fn complete_unary_pending(
     }
 }
 
+/// Owns cleanup for partial replies even when the receive future is aborted
+/// before it reaches its normal footer. Completed response handles are no
+/// longer in the registry and remain owned by their response leases.
+struct ConnectionAssemblyCleanup {
+    registry: Arc<ChunkRegistry>,
+    conn_id: u64,
+}
+
+impl Drop for ConnectionAssemblyCleanup {
+    fn drop(&mut self) {
+        self.registry.cleanup_connection(self.conn_id);
+    }
+}
+
 async fn recv_loop(
     mut reader: LocalReadHalf,
     pending: Arc<StdMutex<PendingMap>>,
@@ -2681,6 +2900,10 @@ async fn recv_loop(
     chunk_registry: Arc<ChunkRegistry>,
     conn_id: u64,
 ) {
+    let cleanup = ConnectionAssemblyCleanup {
+        registry: Arc::clone(&chunk_registry),
+        conn_id,
+    };
     let mut header_buf = [0u8; HEADER_SIZE];
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
     loop {
@@ -2821,8 +3044,8 @@ async fn recv_loop(
         complete_unary_pending(tx, result);
     }
 
-    // Connection lost — cleanup all in-flight assemblies for this connection.
-    chunk_registry.cleanup_connection(conn_id);
+    // The guard also runs this cleanup when a close or Drop aborts the task.
+    drop(cleanup);
 
     // Connection lost — wake all pending callers.
     let mut pending_guard = pending.lock();
@@ -2875,6 +3098,165 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn aborted_receive_cleans_partial_reply_before_reconnect_and_after_drop() {
+        static ADDRESS_GEN: AtomicU64 = AtomicU64::new(0);
+        let address = format!(
+            "ipc://partial_reply_abort_{}_{}",
+            std::process::id(),
+            ADDRESS_GEN.fetch_add(1, Ordering::Relaxed)
+        );
+        let endpoint = LocalEndpoint::from_address(&address).expect("test endpoint");
+        let mut listener = c2_local::LocalListener::bind(&endpoint).expect("test listener");
+        let (release_peer, peer_released) = oneshot::channel::<()>();
+        let peer = tokio::spawn(async move {
+            let identity = c2_wire::handshake::ServerIdentity {
+                server_id: "partial-reply-server".into(),
+                server_instance_id: "partial-reply-instance".into(),
+            };
+            let handshake = c2_wire::handshake::encode_server_handshake(
+                &[],
+                CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+                &[],
+                "",
+                &identity,
+            )
+            .expect("server handshake");
+            let handshake =
+                frame::encode_frame(0, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, &handshake);
+            let mut chunk = c2_wire::chunk::encode_reply_chunk_meta(8, 2, 0).to_vec();
+            chunk.extend_from_slice(b"abcd");
+            let first_chunk = frame::encode_frame(
+                77,
+                flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_CHUNKED,
+                &chunk,
+            );
+
+            // Keep both connections open and silent after the first chunk:
+            // neither receive task can reach its normal EOF cleanup footer.
+            let mut streams = Vec::new();
+            for _ in 0..2 {
+                let mut stream = listener.accept().await.expect("accept client");
+                let mut len_buf = [0_u8; 4];
+                stream
+                    .read_exact(&mut len_buf)
+                    .await
+                    .expect("handshake length");
+                let mut body = vec![0_u8; u32::from_le_bytes(len_buf) as usize];
+                stream.read_exact(&mut body).await.expect("handshake body");
+                stream.write_all(&handshake).await.expect("send handshake");
+                stream
+                    .write_all(&first_chunk)
+                    .await
+                    .expect("send first chunk");
+                streams.push(stream);
+            }
+            let _ = peer_released.await;
+        });
+
+        let mut client = IpcClient::new(&address);
+        let registry = Arc::clone(&client.chunk_registry);
+        let reassembly_pool = client.reassembly_pool_arc();
+        client.connect().await.expect("first connect");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.active_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first partial reply was received");
+        assert!(registry.total_bytes() > 0);
+        assert!(reassembly_pool.read().stats().alloc_count > 0);
+
+        // The peer does not acknowledge disconnect, forcing the receive task
+        // through abort. A short barrier may need a second bounded join.
+        if !client
+            .close_shared_bounded(std::time::Duration::from_millis(100))
+            .await
+        {
+            assert!(
+                client
+                    .close_shared_bounded(std::time::Duration::from_secs(2))
+                    .await,
+                "retry must join the aborted receive task"
+            );
+        }
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.total_bytes(), 0);
+        assert_eq!(reassembly_pool.read().stats().alloc_count, 0);
+
+        // Reconnect the same client (and conn_id); the second first chunk must
+        // start a fresh assembly rather than collide with the prior reply.
+        client
+            .connect()
+            .await
+            .expect("reconnect after confirmed close");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.active_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second partial reply was received");
+        assert!(registry.contains(client.conn_id, 77));
+
+        // Drop aborts the second receive task. Keep external registry and pool
+        // Arcs to prove its cancellation cleanup, independent of owner drop.
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.active_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop-aborted receive cleaned its assembly");
+        assert_eq!(registry.total_bytes(), 0);
+        assert_eq!(reassembly_pool.read().stats().alloc_count, 0);
+
+        let _ = release_peer.send(());
+        peer.await.expect("peer task");
+    }
+
+    #[tokio::test]
+    async fn bounded_close_keeps_stalled_maintenance_join_reachable_for_retry() {
+        // Model a maintenance sweep stalled in synchronous pool work:
+        // aborting a running spawn_blocking task cannot complete its join.
+        let client = IpcClient::new("ipc://maintenance-close-test");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = tokio::task::spawn_blocking(move || {
+            ready_tx.send(()).expect("sweep readiness");
+            let _ = release_rx.recv();
+        });
+        let (stop, _stop_rx) = tokio::sync::watch::channel(false);
+        *client.maintenance.lock() = Some(MaintenanceTask { stop, handle });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("sweep started");
+
+        let started = std::time::Instant::now();
+        assert!(
+            !client
+                .close_shared_bounded(std::time::Duration::from_millis(100))
+                .await,
+            "a still-running maintenance task must prevent close confirmation"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            client.maintenance.lock().is_some(),
+            "the unconfirmed task handle must remain available for retry"
+        );
+
+        release_tx.send(()).expect("release stalled sweep");
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_secs(2))
+                .await,
+            "the retry must confirm after maintenance finishes"
+        );
+        assert!(client.maintenance.lock().is_none());
+    }
 
     #[test]
     fn streamed_call_failure_phase_depends_on_frame_attempt_not_error_variant() {
@@ -3195,6 +3577,7 @@ mod tests {
                 max_pool_segments: 1,
                 ..c2_config::BaseIpcConfig::default()
             },
+            ..ClientIpcConfig::default()
         };
         let client = IpcClient::with_config("ipc://stream_length_mismatch", cfg);
         let mut methods = HashMap::new();

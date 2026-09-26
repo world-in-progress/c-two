@@ -187,6 +187,7 @@ mod tests {
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_asm_test"),
+            ..PoolConfig::default()
         })
     }
 

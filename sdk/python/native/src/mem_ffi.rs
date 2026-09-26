@@ -123,6 +123,8 @@ fn validate_duration_secs(name: &str, secs: f64) -> PyResult<()> {
 
 impl From<&PyPoolConfig> for PoolConfig {
     fn from(py: &PyPoolConfig) -> Self {
+        // Buddy policy is owned by the IPC config resolver; this low-level
+        // mem facade always builds a default-policy pool.
         PoolConfig {
             segment_size: py.segment_size,
             min_block_size: py.min_block_size,
@@ -132,6 +134,7 @@ impl From<&PyPoolConfig> for PoolConfig {
             buddy_idle_decay_secs: py.buddy_idle_decay_secs,
             spill_threshold: py.spill_threshold,
             spill_dir: std::path::PathBuf::from(&py.spill_dir),
+            ..PoolConfig::default()
         }
     }
 }

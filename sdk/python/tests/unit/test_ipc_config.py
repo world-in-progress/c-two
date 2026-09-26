@@ -41,6 +41,9 @@ def _reset_registry_and_settings(monkeypatch):
         'C2_REMOTE_PAYLOAD_CHUNK_SIZE',
         'C2_IPC_POOL_SEGMENT_SIZE',
         'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
+        'C2_IPC_POOL_PREWARM_SEGMENTS',
+        'C2_IPC_POOL_MIN_RETAINED_SEGMENTS',
+        'C2_IPC_POOL_DECAY_SECONDS',
         'C2_RELAY_ANCHOR_ADDRESS',
         'C2_RELAY_USE_PROXY',
         'C2_RELAY_ROUTE_MAX_ATTEMPTS',
@@ -85,11 +88,15 @@ def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields(
 
     assert base['pool_enabled'] is bool
     assert base['pool_segment_size'] is int
+    assert base['pool_prewarm_segments'] is int
+    assert base['pool_min_retained_segments'] is int
     assert base['chunk_gc_interval'] is float
     assert server['heartbeat_interval'] is float
     assert server['max_pending_requests'] is int
     assert server['max_execution_workers'] is int
+    assert server['pool_decay_seconds'] is float
     assert client['reassembly_segment_size'] is int
+    assert client['pool_decay_seconds'] is float
 
     for hints in (base, server, client):
         assert 'shm_threshold' not in hints
@@ -245,6 +252,120 @@ def test_client_ipc_overrides_beat_env(monkeypatch):
     registry = _ProcessRegistry.get()
 
     assert registry._runtime_session.client_ipc_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
+
+
+def test_client_pool_decay_defaults_and_projects_into_resolved_config():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    client_cfg = native.resolve_client_ipc_config(None, None)
+    assert client_cfg['pool_decay_seconds'] == 60.0
+
+    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 2.5}, None)
+    assert client_cfg['pool_decay_seconds'] == 2.5
+
+
+def test_client_pool_decay_zero_is_immediate_retirement_and_negative_is_rejected():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 0.0}, None)
+    assert client_cfg['pool_decay_seconds'] == 0.0
+
+    with pytest.raises(ValueError, match='pool_decay_seconds'):
+        native.resolve_client_ipc_config({'pool_decay_seconds': -1.0}, None)
+
+
+def test_client_pool_decay_env_resolves_and_override_beats_env(monkeypatch):
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', '12.5')
+
+    client_cfg = native.resolve_client_ipc_config(None, None)
+    assert client_cfg['pool_decay_seconds'] == 12.5
+
+    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 7.5}, None)
+    assert client_cfg['pool_decay_seconds'] == 7.5
+
+
+def test_buddy_policy_defaults_are_lazy_and_retire_to_zero():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    server_cfg = native.resolve_server_ipc_config(None, None)
+    client_cfg = native.resolve_client_ipc_config(None, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['pool_enabled'] is True
+        assert cfg['pool_prewarm_segments'] == 0
+        assert cfg['pool_min_retained_segments'] == 0
+
+
+def test_buddy_policy_overrides_beat_env(monkeypatch):
+    monkeypatch.setenv('C2_IPC_POOL_PREWARM_SEGMENTS', '1')
+    monkeypatch.setenv('C2_IPC_POOL_MIN_RETAINED_SEGMENTS', '1')
+
+    server = Server(
+        bind_address='ipc://unit_buddy_policy_override',
+        ipc_overrides={'pool_prewarm_segments': 2, 'pool_min_retained_segments': 3},
+    )
+    try:
+        assert server._config['pool_prewarm_segments'] == 2  # noqa: SLF001
+        assert server._config['pool_min_retained_segments'] == 3  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    client_cfg = native.resolve_client_ipc_config(
+        {'pool_prewarm_segments': 0, 'pool_min_retained_segments': 2}, None
+    )
+    assert client_cfg['pool_prewarm_segments'] == 0
+    assert client_cfg['pool_min_retained_segments'] == 2
+
+
+def test_buddy_policy_env_resolution(monkeypatch):
+    monkeypatch.setenv('C2_IPC_POOL_PREWARM_SEGMENTS', '1')
+    monkeypatch.setenv('C2_IPC_POOL_MIN_RETAINED_SEGMENTS', '2')
+
+    server = Server(bind_address='ipc://unit_buddy_policy_env')
+    try:
+        assert server._config['pool_prewarm_segments'] == 1  # noqa: SLF001
+        assert server._config['pool_min_retained_segments'] == 2  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+
+def test_prewarm_with_buddy_disabled_is_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    with pytest.raises(ValueError, match='pool_prewarm_segments'):
+        native.resolve_server_ipc_config(
+            {'pool_enabled': False, 'pool_prewarm_segments': 1}, None
+        )
+
+    with pytest.raises(ValueError, match='pool_prewarm_segments'):
+        native.resolve_client_ipc_config(
+            {'pool_enabled': False, 'pool_prewarm_segments': 1}, None
+        )
+
+
+def test_prewarm_exceeding_max_pool_segments_is_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    with pytest.raises(ValueError, match='pool_prewarm_segments'):
+        native.resolve_server_ipc_config(
+            {'max_pool_segments': 2, 'pool_prewarm_segments': 3}, None
+        )
+
+
+def test_min_retained_exceeding_limits_is_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    with pytest.raises(ValueError, match='pool_min_retained_segments'):
+        native.resolve_client_ipc_config(
+            {'max_pool_segments': 2, 'pool_min_retained_segments': 3}, None
+        )
+
+    with pytest.raises(ValueError, match='reassembly_max_segments'):
+        native.resolve_client_ipc_config(
+            {'reassembly_max_segments': 2, 'pool_min_retained_segments': 3}, None
+        )
 
 
 @pytest.mark.parametrize('key', ['shm_threshold'])

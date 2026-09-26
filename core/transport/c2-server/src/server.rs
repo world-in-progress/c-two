@@ -10,7 +10,6 @@
 //! - `parking_lot::RwLock` — sync lock for `MemPool` (blocking, no `.await`)
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -29,6 +28,7 @@ static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::MemPool;
+#[cfg(test)]
 use c2_mem::config::PoolConfig;
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
@@ -293,46 +293,47 @@ impl Server {
         validate_server_identity(&identity)?;
         let endpoint = parse_local_endpoint(address)?;
         let (shutdown_tx, _) = watch::channel(false);
-        let reassembly_cfg = PoolConfig {
-            segment_size: config.reassembly_segment_size as usize,
-            min_block_size: 4096,
-            max_segments: config.reassembly_max_segments as usize,
-            max_dedicated_segments: 4,
-            dedicated_crash_timeout_secs: 5.0,
-            buddy_idle_decay_secs: config.pool_decay_seconds,
-            spill_threshold: 0.8,
-            spill_dir: PathBuf::from("/tmp/c_two_reassembly"),
-        };
         let reassembly_pool = {
             let pid = std::process::id();
             let ra_gen = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
             let prefix = format!("/cc3s{:08x}{:08x}", pid, ra_gen);
-            MemPool::new_with_prefix(reassembly_cfg, prefix)
+            // Centralized projection: reassembly follows the same buddy policy
+            // as every other pool role (disabled buddy → dedicated/file storage).
+            MemPool::new_with_prefix(
+                config
+                    .base
+                    .reassembly_pool_config(&config.reassembly_pool_tuning()),
+                prefix,
+            )
         };
         let chunk_config = c2_wire::chunk::ChunkConfig::from_base(&config);
         let chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
             Arc::new(parking_lot::RwLock::new(reassembly_pool)),
             chunk_config,
         ));
-        let response_cfg = PoolConfig {
-            segment_size: config.pool_segment_size as usize,
-            min_block_size: 4096,
-            max_segments: config.max_pool_segments as usize,
-            max_dedicated_segments: 4,
-            dedicated_crash_timeout_secs: 5.0,
-            buddy_idle_decay_secs: config.pool_decay_seconds,
-            spill_threshold: 0.8,
-            spill_dir: PathBuf::from("/tmp/c_two_response_spill"),
-        };
-        let mut response_pool = {
+        let response_pool = {
             let pid = std::process::id();
             let generation = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed);
             let prefix = format!("/cc3r{:08x}{:08x}", pid, generation as u32);
-            MemPool::new_with_prefix(response_cfg, prefix)
+            // Centralized projection: the response pool keeps dedicated SHM
+            // replies available even when the buddy tiers are disabled.
+            MemPool::new_with_prefix(
+                config
+                    .base
+                    .primary_pool_config(&config.response_pool_tuning()),
+                prefix,
+            )
         };
-        response_pool
-            .ensure_ready()
-            .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
+        // Explicit prewarm only. The response pool stays unmapped at
+        // construction; buddy segments are created lazily by the first large
+        // reply (or mapped here when `pool_prewarm_segments` asks for them).
+        let prewarm_segments = config.pool_prewarm_segments as usize;
+        let mut response_pool = response_pool;
+        if prewarm_segments > 0 {
+            response_pool
+                .ensure_buddy_segments(prewarm_segments)
+                .map_err(|e| ServerError::Config(format!("response pool prewarm: {e}")))?;
+        }
         let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
         let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
         let chunk_processing_permits = Arc::new(Semaphore::new(config.max_total_chunks as usize));
@@ -1018,7 +1019,13 @@ impl Server {
         self.set_lifecycle_state(ServerLifecycleState::Ready);
         info!(endpoint = ?self.endpoint.os_name(), "server listening");
 
-        // Spawn periodic GC sweep for expired chunk assemblies.
+        // Spawn periodic GC sweep for expired chunk assemblies. The same
+        // bounded task reclaims both storage tiers of the server's owner
+        // pools: idle buddy segments retire down to the configured minimum
+        // retained segments (`gc_buddy`) and dedicated segments whose reader
+        // set `read_done` are unmapped (`gc_dedicated`), so dedicated-only
+        // traffic releases its mappings without waiting for another
+        // allocation. No per-allocation thread or task is ever spawned.
         let gc_server = Arc::clone(self);
         let gc_interval = self.chunk_registry.config().gc_interval;
         let mut gc_shutdown_rx = self.shutdown_tx.subscribe();
@@ -1030,6 +1037,16 @@ impl Server {
                     _ = interval.tick() => {
                         let stats = gc_server.chunk_registry.gc_sweep();
                         let released_route_pending = gc_server.sweep_stale_chunk_route_pending();
+                        {
+                            let mut response_pool = gc_server.response_pool.write();
+                            response_pool.gc_buddy();
+                            response_pool.gc_dedicated();
+                        }
+                        {
+                            let mut reassembly_pool = gc_server.chunk_registry.pool().write();
+                            reassembly_pool.gc_buddy();
+                            reassembly_pool.gc_dedicated();
+                        }
                         if stats.expired > 0 {
                             info!(
                                 expired = stats.expired,
@@ -6253,6 +6270,7 @@ mod tests {
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_srv_chunk_test"),
+            ..PoolConfig::default()
         };
         let pool = Arc::new(RwLock::new(c2_mem::MemPool::new(reassembly_cfg)));
         let registry = c2_wire::chunk::ChunkRegistry::new(

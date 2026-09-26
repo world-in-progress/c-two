@@ -153,6 +153,25 @@ impl SyncClient {
         })
     }
 
+    /// Connect with a transport-internal pool (pooled-client acquire path).
+    ///
+    /// The pool was built from `config` by the caller inside this crate and is
+    /// owned solely by the resulting client, so it is not subject to the
+    /// injected-pool policy gate.
+    pub(crate) fn connect_transport_pool(
+        address: &str,
+        pool: Arc<Mutex<MemPool>>,
+        config: ClientIpcConfig,
+    ) -> Result<Self, IpcError> {
+        let rt = get_or_create_runtime();
+        let mut client = IpcClient::with_transport_pool(address, pool, config);
+        rt.block_on(client.connect())?;
+        Ok(Self {
+            inner: client,
+            rt: rt.handle().clone(),
+        })
+    }
+
     /// Synchronous CRM call through an immutable route binding.
     pub fn call_bound(
         &self,
@@ -491,6 +510,7 @@ pub(crate) mod tests {
                 chunk_size: 500,
                 ..c2_config::BaseIpcConfig::default()
             },
+            ..ClientIpcConfig::default()
         };
         let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
         let client = SyncClient {

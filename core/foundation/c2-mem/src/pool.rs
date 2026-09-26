@@ -33,8 +33,8 @@ pub enum FreeResult {
 ///
 /// Budget rejections are separable from other creation errors so the single
 /// fallback chain can still try a smaller eligible tier (for example a
-/// dedicated backing that fits when a full buddy segment does not); other
-/// errors keep their original abort semantics.
+/// dedicated backing that fits when a full buddy segment does not). Creation
+/// failures may also continue through the same eligible fallback tiers.
 enum BackingError {
     Budget(BudgetError),
     Other(String),
@@ -200,6 +200,12 @@ impl MemPool {
         if config.max_segments > u16::MAX as usize + 1 {
             return Err("max_segments exceeds the wire segment-index range".into());
         }
+        if config.min_retained_segments > config.max_segments {
+            return Err(format!(
+                "min_retained_segments ({}) must not exceed max_segments ({})",
+                config.min_retained_segments, config.max_segments
+            ));
+        }
         validate_duration_secs(
             "dedicated_crash_timeout_secs",
             config.dedicated_crash_timeout_secs,
@@ -273,13 +279,13 @@ impl MemPool {
             return Err("cannot allocate 0 bytes".into());
         }
 
-        let max_buddy_block = self.max_buddy_block_size();
+        let max_buddy_block = self.buddy_block_limit();
 
         if max_buddy_block > 0 && size <= max_buddy_block {
             // Try buddy allocation.
             self.alloc_buddy(size).map_err(BackingError::into_message)
         } else {
-            // Too large for buddy → dedicated segment.
+            // Too large for buddy or buddy disabled → dedicated segment.
             self.alloc_dedicated(size).map_err(BackingError::into_message)
         }
     }
@@ -354,8 +360,11 @@ impl MemPool {
     /// Reclaim idle buddy segments from the end of the segment list.
     ///
     /// Only pops trailing empty segments to avoid index remapping (segment
-    /// indices are encoded in wire frames). Always retains at least one segment.
-    /// Returns the number of segments reclaimed.
+    /// indices are encoded in wire frames). Retires down to the configured
+    /// `min_retained_segments` (which may be zero); generation counters are
+    /// never truncated, so a later re-created slot gets a fresh generation and
+    /// stale peer references to retired backings are rejected. Returns the
+    /// number of segments reclaimed.
     pub fn gc_buddy(&mut self) -> usize {
         if self.is_peer {
             let mut removed = 0;
@@ -380,7 +389,7 @@ impl MemPool {
         let mut removed = 0;
 
         // Pop from the end while segments are idle and past the delay.
-        while self.segments.len() > 1 {
+        while self.segments.len() > self.config.min_retained_segments {
             let last = self.segments.len() - 1;
             let seg = self.segments[last].as_ref().expect("owner segment slot");
             if !seg.allocator().can_retire() {
@@ -446,10 +455,11 @@ impl MemPool {
 
     /// Ensure at least one buddy segment exists.
     ///
-    /// Called before handshake so the client can announce its SHM segments
-    /// to the server.  Does nothing if segments already exist.
+    /// No-op when the buddy tiers are policy-disabled; transports prewarm only
+    /// through [`MemPool::ensure_buddy_segments`] so laziness stays explicit.
+    /// Does nothing if segments already exist.
     pub fn ensure_ready(&mut self) -> Result<(), String> {
-        if self.config.max_segments > 0 {
+        if self.config.buddy_enabled && self.config.max_segments > 0 {
             self.ensure_buddy_segments(1)?;
         }
         Ok(())
@@ -460,9 +470,14 @@ impl MemPool {
     /// Runtime adapters that advertise their client buddy pool in an IPC
     /// handshake should call this before exposing segment metadata. This avoids
     /// later lazy allocation from returning a segment index the peer never saw.
+    /// This is also the only prewarm entry point; it is rejected outright when
+    /// the buddy tiers are disabled so a disabled pool never maps buddy memory.
     pub fn ensure_buddy_segments(&mut self, count: usize) -> Result<(), String> {
         if self.is_peer {
             return Err("cannot create backings in a peer pool".into());
+        }
+        if !self.config.buddy_enabled {
+            return Err("cannot prewarm buddy segments while the buddy pool is disabled".into());
         }
         if count > self.config.max_segments {
             return Err(format!(
@@ -481,6 +496,12 @@ impl MemPool {
     /// Get the number of buddy segments.
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Read-only view of the effective pool configuration, including the
+    /// buddy policy projected from IPC config.
+    pub fn config(&self) -> &PoolConfig {
+        &self.config
     }
 
     /// Get a specific segment by index.
@@ -865,8 +886,9 @@ impl MemPool {
     /// Decision flow (optimised — RAM check only when creating new mappings):
     /// 1. size fits buddy AND existing segments have space → Buddy (no RAM check)
     /// 2. Else: should_spill() → FileSpill if RAM scarce
-    /// 3. Else: expand buddy or create dedicated SHM
-    /// 4. If SHM creation fails → FileSpill fallback
+    /// 3. Else: expand buddy (policy permitting) or create dedicated SHM
+    /// 4. Buddy expansion failure falls through to dedicated SHM
+    /// 5. If dedicated creation fails → FileSpill fallback
     pub fn alloc_handle(&mut self, size: usize) -> Result<MemHandle, String> {
         if self.is_peer {
             return Err("cannot allocate from a peer pool".into());
@@ -874,7 +896,7 @@ impl MemPool {
         if size == 0 {
             return Err("cannot allocate 0 bytes".into());
         }
-        let max_buddy = self.max_buddy_block_size();
+        let max_buddy = self.buddy_block_limit();
 
         // Fast path: existing buddy segments (bitmap only, no RAM query).
         if max_buddy > 0 && size <= max_buddy {
@@ -907,7 +929,8 @@ impl MemPool {
                 .map_err(BackingError::into_message);
         }
 
-        // RAM fine: try buddy expansion.
+        // RAM fine: try buddy expansion. A creation failure falls through to
+        // dedicated SHM below rather than jumping straight to file spill.
         if max_buddy > 0 && size <= max_buddy && self.segments.len() < self.config.max_segments {
             // GC before expanding — may free trailing idle segments
             let reclaimed = self.gc_buddy();
@@ -935,34 +958,29 @@ impl MemPool {
                 }
             }
 
-            match self.create_segment() {
-                Ok(seg) => {
-                    let idx = self.segments.len();
-                    self.segments.push(Some(seg));
-                    self.idle_since.push(None);
-                    if let Some(a) = self
-                        .segment(idx)
-                        .expect("owner segment slot")
-                        .allocator()
-                        .alloc(size)
-                    {
-                        return Ok(MemHandle::Buddy {
-                            seg_idx: idx as u16,
-                            generation: self.generations[idx],
-                            offset: a.offset,
-                            allocation_size: a.actual_size,
-                            len: size,
-                        });
-                    }
+            if let Ok(seg) = self.create_segment() {
+                let idx = self.segments.len();
+                self.segments.push(Some(seg));
+                self.idle_since.push(None);
+                if let Some(a) = self
+                    .segment(idx)
+                    .expect("owner segment slot")
+                    .allocator()
+                    .alloc(size)
+                {
+                    return Ok(MemHandle::Buddy {
+                        seg_idx: idx as u16,
+                        generation: self.generations[idx],
+                        offset: a.offset,
+                        allocation_size: a.actual_size,
+                        len: size,
+                    });
                 }
-                // Single fallback order: failed buddy expansion (including
-                // SHM-budget rejection) first tries a smaller dedicated
-                // backing below, and only then falls to file.
-                Err(_) => {}
             }
         }
 
-        // Large → dedicated SHM, file spill fallback.
+        // Large (or buddy policy-disabled / buddy expansion failed) → dedicated
+        // SHM, with file spill only as the final fallback.
         match self.alloc_dedicated(size) {
             Ok(alloc) => Ok(MemHandle::Dedicated {
                 seg_idx: alloc.seg_idx as u16,
@@ -976,6 +994,7 @@ impl MemPool {
     ///
     /// For callers that require a shared-memory handle rather than file storage.
     /// Returns `Err` if neither buddy nor dedicated has capacity.
+    /// A failed buddy expansion still tries dedicated storage.
     pub fn try_alloc_shm(&mut self, size: usize) -> Result<MemHandle, String> {
         if self.is_peer {
             return Err("cannot allocate from a peer pool".into());
@@ -983,7 +1002,7 @@ impl MemPool {
         if size == 0 {
             return Err("cannot allocate 0 bytes".into());
         }
-        let max_buddy = self.max_buddy_block_size();
+        let max_buddy = self.buddy_block_limit();
 
         // Try existing buddy segments.
         if max_buddy > 0 && size <= max_buddy {
@@ -1284,6 +1303,16 @@ impl MemPool {
             .unwrap_or(0)
     }
 
+    /// Policy-gated buddy capacity: `0` when the buddy tiers are disabled, so
+    /// every allocation API — including reuse of cached existing segments —
+    /// skips straight to dedicated SHM (or the caller's file-spill fallback).
+    fn buddy_block_limit(&self) -> usize {
+        if !self.config.buddy_enabled {
+            return 0;
+        }
+        self.max_buddy_block_size()
+    }
+
     fn alloc_buddy(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
         // Layer 1: Try existing segments. Skip segments with insufficient free space
         // to avoid unnecessary spinlock acquisition.
@@ -1337,34 +1366,29 @@ impl MemPool {
             }
         }
 
-        // Layer 2: Create new segment. A SHM-budget rejection here is a
-        // capacity signal, not a hard failure: a smaller dedicated backing
-        // may still fit, so fall through to Layer 3. Other creation errors
-        // keep their abort semantics.
+        // Layer 2: Create new segment. A creation failure (for example the
+        // SHM object cannot be mapped) falls through to Layer 3 dedicated
+        // storage instead of failing the allocation outright.
         if self.segments.len() < self.config.max_segments {
-            match self.create_segment() {
-                Ok(seg) => {
-                    let idx = self.segments.len();
-                    self.segments.push(Some(seg));
-                    self.idle_since.push(None);
-                    if let Some(a) = self
-                        .segment(idx)
-                        .expect("owner segment slot")
-                        .allocator()
-                        .alloc(size)
-                    {
-                        return Ok(PoolAllocation {
-                            seg_idx: idx as u32,
-                            generation: self.generations[idx],
-                            offset: a.offset,
-                            actual_size: a.actual_size,
-                            level: a.level,
-                            is_dedicated: false,
-                        });
-                    }
+            if let Ok(seg) = self.create_segment() {
+                let idx = self.segments.len();
+                self.segments.push(Some(seg));
+                self.idle_since.push(None);
+                if let Some(a) = self
+                    .segment(idx)
+                    .expect("owner segment slot")
+                    .allocator()
+                    .alloc(size)
+                {
+                    return Ok(PoolAllocation {
+                        seg_idx: idx as u32,
+                        generation: self.generations[idx],
+                        offset: a.offset,
+                        actual_size: a.actual_size,
+                        level: a.level,
+                        is_dedicated: false,
+                    });
                 }
-                Err(BackingError::Budget(_)) => {}
-                Err(other) => return Err(other),
             }
         }
 
@@ -2208,12 +2232,12 @@ mod tests {
         owner.free(&old).unwrap();
         owner.gc_buddy();
         owner.generations[1] = u32::MAX;
-        assert!(
-            owner
-                .alloc(size)
-                .unwrap_err()
-                .contains("generation exhausted")
-        );
+        // Buddy generation exhaustion is a buddy-tier failure: the allocation
+        // must fall through to dedicated storage rather than fail outright.
+        let exhausted = owner.alloc(size).unwrap();
+        assert!(exhausted.is_dedicated);
+        owner.free(&exhausted).unwrap();
+        owner.gc_dedicated();
         owner.next_dedicated_idx = u16::MAX as u32;
         let last = owner.alloc(size * 2).unwrap();
         assert_eq!(last.seg_idx, u16::MAX as u32);
@@ -2505,6 +2529,7 @@ mod tests {
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_try_shm_test"),
+            ..PoolConfig::default()
         };
         let mut pool = test_pool(cfg);
         // Fill the single buddy segment completely
@@ -2523,6 +2548,233 @@ mod tests {
         let result = pool.try_alloc_shm(4096);
         assert!(result.is_err());
     }
+
+    // ── Buddy policy enforcement (Phase 1A) ─────────────────────────────
+
+    fn buddy_disabled_config() -> PoolConfig {
+        PoolConfig {
+            max_dedicated_segments: 4,
+            spill_dir: std::env::temp_dir().join("c2_buddy_disabled_test"),
+            buddy_enabled: false,
+            min_retained_segments: 0,
+            ..test_config()
+        }
+    }
+
+    fn collision_test_config() -> PoolConfig {
+        PoolConfig {
+            max_segments: 2,
+            max_dedicated_segments: 4,
+            spill_dir: std::env::temp_dir().join("c2_collision_test"),
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn disabled_buddy_skips_buddy_tiers_in_every_allocation_api() {
+        let mut pool = test_pool(buddy_disabled_config());
+
+        // Small request that would normally land in a buddy block.
+        let a = pool.alloc(4096).unwrap();
+        assert!(a.is_dedicated);
+
+        let h = pool.alloc_handle(4096).unwrap();
+        assert!(h.is_dedicated());
+
+        let s = pool.try_alloc_shm(4096).unwrap();
+        assert!(s.is_dedicated());
+
+        // No buddy segment may ever be mapped, including through prewarm.
+        assert_eq!(pool.segment_count(), 0);
+        assert!(pool.ensure_ready().is_ok());
+        assert_eq!(pool.segment_count(), 0);
+        assert!(
+            pool.ensure_buddy_segments(1)
+                .unwrap_err()
+                .contains("buddy pool is disabled")
+        );
+        assert_eq!(pool.segment_count(), 0);
+
+        pool.free(&a).unwrap();
+        pool.release_handle(h);
+        pool.release_handle(s);
+    }
+
+    #[test]
+    fn disabled_buddy_keeps_file_spill_fallback() {
+        let dir = std::env::temp_dir().join("c2_disabled_spill_test");
+        let config = PoolConfig {
+            spill_threshold: 0.0, // force spill decisions
+            spill_dir: dir.clone(),
+            ..buddy_disabled_config()
+        };
+        let mut pool = test_pool(config);
+        let handle = pool.alloc_handle(4096).unwrap();
+        assert!(handle.is_file_spill());
+        assert_eq!(pool.segment_count(), 0);
+        pool.release_handle(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buddy_backing_name_collision_falls_through_to_dedicated() {
+        let mut pool = test_pool(collision_test_config());
+
+        // Pre-create the exact backing name segment 0 / generation 1 will use,
+        // so the pool's own create_segment fails with EEXIST. The allocation
+        // must still succeed through the dedicated tier, not fail or spill.
+        let name = MemPool::buddy_segment_name(pool.prefix(), 0, 1);
+        let squatter = BuddySegment::create(&name, 64 * 1024, 4096).unwrap();
+
+        let a = pool.alloc(4096).unwrap();
+        assert!(a.is_dedicated);
+
+        let h = pool.alloc_handle(4096).unwrap();
+        assert!(h.is_dedicated());
+
+        let s = pool.try_alloc_shm(4096).unwrap();
+        assert!(s.is_dedicated());
+
+        drop(squatter);
+        pool.free(&a).unwrap();
+        pool.release_handle(h);
+        pool.release_handle(s);
+    }
+
+    #[test]
+    fn gc_buddy_retires_to_zero_when_min_retained_is_zero() {
+        let config = PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 0,
+            dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
+            spill_threshold: 1.0,
+            spill_dir: std::env::temp_dir().join("c2_retire_zero_test"),
+            buddy_enabled: true,
+            min_retained_segments: 0,
+        };
+        let mut pool = test_pool(config);
+
+        let a = pool.alloc(4096).unwrap();
+        assert!(!a.is_dedicated);
+        let old_generation = a.generation;
+        let old_name = pool.segment_name(0).unwrap().to_owned();
+        pool.free(&a).unwrap();
+
+        // Idle decay 0 → GC may retire the last idle segment.
+        assert_eq!(pool.gc_buddy(), 1);
+        assert_eq!(pool.segment_count(), 0);
+
+        // Re-creation reuses the slot with a fresh generation; stale
+        // coordinates naming the retired backing must be rejected.
+        let b = pool.alloc(4096).unwrap();
+        assert_eq!(b.seg_idx, a.seg_idx);
+        assert!(b.generation > old_generation);
+        assert_ne!(pool.segment_name(0).unwrap(), old_name);
+        assert!(pool.data_ptr(&a).is_err());
+        assert!(pool.free(&a).is_err());
+
+        pool.free(&b).unwrap();
+    }
+
+    #[test]
+    fn gc_buddy_retires_only_down_to_configured_min() {
+        let config = PoolConfig {
+            segment_size: 32 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 0,
+            dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
+            spill_threshold: 1.0,
+            spill_dir: std::env::temp_dir().join("c2_retire_min_test"),
+            buddy_enabled: true,
+            min_retained_segments: 2,
+        };
+        let mut pool = test_pool(config);
+
+        let mut allocs = Vec::new();
+        for _ in 0..6 {
+            allocs.push(pool.alloc(16 * 1024).unwrap());
+        }
+        assert!(pool.segment_count() >= 3);
+        for a in &allocs {
+            pool.free(a).unwrap();
+        }
+
+        assert!(pool.gc_buddy() > 0);
+        assert_eq!(pool.segment_count(), 2);
+        // A second sweep cannot go below the floor.
+        assert_eq!(pool.gc_buddy(), 0);
+        assert_eq!(pool.segment_count(), 2);
+    }
+
+    #[test]
+    fn live_allocations_survive_idle_gc() {
+        let config = PoolConfig {
+            segment_size: 32 * 1024,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 0,
+            dedicated_crash_timeout_secs: 0.0,
+            buddy_idle_decay_secs: 0.0,
+            spill_threshold: 1.0,
+            spill_dir: std::env::temp_dir().join("c2_live_gc_test"),
+            buddy_enabled: true,
+            min_retained_segments: 0,
+        };
+        let mut pool = test_pool(config);
+
+        let held = pool.alloc(32 * 1024).unwrap();
+        let filler = pool.alloc(32 * 1024).unwrap();
+        assert!(pool.segment_count() >= 2);
+
+        // Free only the trailing segment's block; the first stays live.
+        pool.free(&filler).unwrap();
+        assert!(pool.gc_buddy() >= 1);
+        // Segment 0 still backs a live allocation.
+        assert!(pool.data_ptr(&held).is_ok());
+        unsafe {
+            *pool.data_ptr(&held).unwrap() = 0x7A;
+        }
+
+        // A fully-live segment is never retired even with min_retained 0.
+        assert_eq!(pool.gc_buddy(), 0);
+        assert_eq!(pool.segment_count(), 1);
+        assert_eq!(unsafe { *pool.data_ptr(&held).unwrap() }, 0x7A);
+
+        pool.free(&held).unwrap();
+        assert_eq!(pool.gc_buddy(), 1);
+        assert_eq!(pool.segment_count(), 0);
+    }
+
+    #[test]
+    fn validate_rejects_min_retained_above_max_segments() {
+        let config = PoolConfig {
+            max_segments: 2,
+            min_retained_segments: 3,
+            ..test_config()
+        };
+        assert!(
+            MemPool::validate_config(&config)
+                .unwrap_err()
+                .contains("min_retained_segments")
+        );
+    }
+
+    #[test]
+    fn dedicated_size_representability_is_checked_before_mapping() {
+        let mut pool = test_pool(test_config());
+        // A payload whose page-aligned region (data + 64B header) exceeds
+        // u32::MAX must be rejected before any mapping is created.
+        let oversized = u32::MAX as usize - 4096;
+        let err = pool.alloc(oversized).unwrap_err();
+        assert!(err.contains("4GB limit"), "got: {err}");
+        // No dedicated entry may exist after the rejection.
+        assert_eq!(pool.stats().dedicated_segments, 0);
+    }
 }
 
 #[cfg(test)]
@@ -2540,6 +2792,7 @@ mod handle_tests {
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0, // disable spill
             spill_dir: std::env::temp_dir().join("c2_pool_handle_test"),
+            ..PoolConfig::default()
         }
     }
 
@@ -2685,6 +2938,7 @@ mod budget_tests {
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_budget_spill"),
+            ..PoolConfig::default()
         }
     }
 
@@ -3140,6 +3394,7 @@ mod geometry_and_guard_tests {
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_geometry_spill"),
+            ..PoolConfig::default()
         }
     }
 

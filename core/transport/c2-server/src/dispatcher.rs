@@ -573,6 +573,7 @@ mod tests {
                 buddy_idle_decay_secs: 1.0,
                 spill_threshold: 0.8,
                 spill_dir: std::env::temp_dir().join("c_two_request_data_test_spill"),
+                ..PoolConfig::default()
             },
             format!(
                 "/c2rq{:08x}{:04x}",

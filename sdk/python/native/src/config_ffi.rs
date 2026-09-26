@@ -111,6 +111,8 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
         pool_enabled: get_opt(dict, "pool_enabled")?,
         pool_segment_size: get_opt(dict, "pool_segment_size")?,
         max_pool_segments: get_opt(dict, "max_pool_segments")?,
+        pool_prewarm_segments: get_opt(dict, "pool_prewarm_segments")?,
+        pool_min_retained_segments: get_opt(dict, "pool_min_retained_segments")?,
         reassembly_segment_size: get_opt(dict, "reassembly_segment_size")?,
         reassembly_max_segments: get_opt(dict, "reassembly_max_segments")?,
         max_total_chunks: get_opt(dict, "max_total_chunks")?,
@@ -150,6 +152,12 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.base.max_pool_segments {
         dict.set_item("max_pool_segments", value)?;
     }
+    if let Some(value) = overrides.base.pool_prewarm_segments {
+        dict.set_item("pool_prewarm_segments", value)?;
+    }
+    if let Some(value) = overrides.base.pool_min_retained_segments {
+        dict.set_item("pool_min_retained_segments", value)?;
+    }
     if let Some(value) = overrides.base.reassembly_segment_size {
         dict.set_item("reassembly_segment_size", value)?;
     }
@@ -182,6 +190,12 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     }
     if let Some(value) = overrides.max_pool_segments {
         dict.set_item("max_pool_segments", value)?;
+    }
+    if let Some(value) = overrides.pool_prewarm_segments {
+        dict.set_item("pool_prewarm_segments", value)?;
+    }
+    if let Some(value) = overrides.pool_min_retained_segments {
+        dict.set_item("pool_min_retained_segments", value)?;
     }
     if let Some(value) = overrides.reassembly_segment_size {
         dict.set_item("reassembly_segment_size", value)?;
@@ -245,6 +259,12 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.base.max_pool_segments {
         dict.set_item("max_pool_segments", value)?;
     }
+    if let Some(value) = overrides.base.pool_prewarm_segments {
+        dict.set_item("pool_prewarm_segments", value)?;
+    }
+    if let Some(value) = overrides.base.pool_min_retained_segments {
+        dict.set_item("pool_min_retained_segments", value)?;
+    }
     if let Some(value) = overrides.base.reassembly_segment_size {
         dict.set_item("reassembly_segment_size", value)?;
     }
@@ -278,6 +298,12 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.max_pool_segments {
         dict.set_item("max_pool_segments", value)?;
     }
+    if let Some(value) = overrides.pool_prewarm_segments {
+        dict.set_item("pool_prewarm_segments", value)?;
+    }
+    if let Some(value) = overrides.pool_min_retained_segments {
+        dict.set_item("pool_min_retained_segments", value)?;
+    }
     if let Some(value) = overrides.reassembly_segment_size {
         dict.set_item("reassembly_segment_size", value)?;
     }
@@ -301,6 +327,9 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     }
     if let Some(value) = overrides.chunk_size {
         dict.set_item("chunk_size", value)?;
+    }
+    if let Some(value) = overrides.pool_decay_seconds {
+        dict.set_item("pool_decay_seconds", value)?;
     }
     Ok(dict)
 }
@@ -333,6 +362,8 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
         pool_enabled: get_opt(&dict, "pool_enabled")?,
         pool_segment_size: get_opt(&dict, "pool_segment_size")?,
         max_pool_segments: get_opt(&dict, "max_pool_segments")?,
+        pool_prewarm_segments: get_opt(&dict, "pool_prewarm_segments")?,
+        pool_min_retained_segments: get_opt(&dict, "pool_min_retained_segments")?,
         reassembly_segment_size: get_opt(&dict, "reassembly_segment_size")?,
         reassembly_max_segments: get_opt(&dict, "reassembly_max_segments")?,
         max_total_chunks: get_opt(&dict, "max_total_chunks")?,
@@ -341,6 +372,7 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
         chunk_assembler_timeout_secs: get_opt(&dict, "chunk_assembler_timeout")?,
         max_reassembly_bytes: get_opt(&dict, "max_reassembly_bytes")?,
         chunk_size: get_opt(&dict, "chunk_size")?,
+        pool_decay_seconds: get_opt(&dict, "pool_decay_seconds")?,
         ..Default::default()
     })
 }
@@ -405,6 +437,7 @@ pub(crate) fn client_ipc_to_dict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = base_ipc_to_dict(py, &cfg.base)?;
     dict.set_item("shm_threshold", cfg.shm_threshold)?;
+    dict.set_item("pool_decay_seconds", cfg.pool_decay_seconds)?;
     Ok(dict)
 }
 
@@ -417,6 +450,8 @@ fn base_ipc_to_dict<'py>(
     dict.set_item("pool_segment_size", cfg.pool_segment_size)?;
     dict.set_item("max_pool_segments", cfg.max_pool_segments)?;
     dict.set_item("max_pool_memory", cfg.max_pool_memory)?;
+    dict.set_item("pool_prewarm_segments", cfg.pool_prewarm_segments)?;
+    dict.set_item("pool_min_retained_segments", cfg.pool_min_retained_segments)?;
     dict.set_item("reassembly_segment_size", cfg.reassembly_segment_size)?;
     dict.set_item("reassembly_max_segments", cfg.reassembly_max_segments)?;
     dict.set_item("max_total_chunks", cfg.max_total_chunks)?;

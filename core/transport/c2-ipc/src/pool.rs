@@ -22,11 +22,11 @@ use crate::client::{ClientIpcConfig, IpcError};
 use crate::sync_client::SyncClient;
 
 pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfig {
-    PoolConfig {
-        segment_size: cfg.pool_segment_size as usize,
-        max_segments: cfg.max_pool_segments as usize,
-        ..PoolConfig::default()
-    }
+    // Centralized projection: the pooled-client acquire path must follow the
+    // same buddy policy and client idle window as `with_config`. A disabled
+    // buddy pool is still a real `MemPool` — it keeps serving dedicated SHM
+    // requests and the wire prefix, only the buddy tiers are policy-disabled.
+    cfg.base.primary_pool_config(&cfg.pool_tuning())
 }
 
 fn is_transient_connect_error(error: &IpcError) -> bool {
@@ -49,6 +49,7 @@ fn connect_with_transient_retry(
     cfg: &ClientIpcConfig,
 ) -> Result<SyncClient, IpcError> {
     let pool_config = pool_config_from_client_config(cfg);
+    let prewarm_segments = cfg.pool_prewarm_segments as usize;
 
     for attempt in 0..CONNECT_TRANSIENT_RETRY_ATTEMPTS {
         let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
@@ -57,8 +58,16 @@ fn connect_with_transient_retry(
             pool_config.clone(),
             prefix,
         )));
+        // Explicit prewarm only: without it the pool stays unmapped until the
+        // first allocation (config validation rejects prewarm with buddy
+        // disabled).
+        if prewarm_segments > 0 {
+            pool.lock()
+                .ensure_buddy_segments(prewarm_segments)
+                .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
+        }
 
-        match SyncClient::connect(address, Some(pool), cfg.clone()) {
+        match SyncClient::connect_transport_pool(address, pool, cfg.clone()) {
             Ok(client) => return Ok(client),
             Err(error)
                 if attempt + 1 < CONNECT_TRANSIENT_RETRY_ATTEMPTS
@@ -2222,6 +2231,7 @@ mod tests {
                 ..c2_config::BaseIpcConfig::default()
             },
             shm_threshold: 1024,
+            ..ClientIpcConfig::default()
         };
         pool.set_default_config(cfg);
         // Verify the config is stored (indirectly — acquire would use it).
@@ -2241,12 +2251,25 @@ mod tests {
                 ..c2_config::BaseIpcConfig::default()
             },
             shm_threshold: 1024,
+            ..ClientIpcConfig::default()
         };
 
         let pc = pool_config_from_client_config(&cfg);
 
         assert_eq!(pc.segment_size, 65_536);
         assert_eq!(pc.max_segments, 3);
+    }
+
+    #[test]
+    fn pool_config_from_client_config_projects_client_decay() {
+        let cfg = ClientIpcConfig {
+            pool_decay_seconds: 3.25,
+            ..ClientIpcConfig::default()
+        };
+        assert_eq!(
+            pool_config_from_client_config(&cfg).buddy_idle_decay_secs,
+            3.25
+        );
     }
 
     // ── Helper ───────────────────────────────────────────────────────────

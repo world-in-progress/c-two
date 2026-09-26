@@ -16,10 +16,11 @@ pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id
 pub use local::LocalEndpoint;
 pub use ipc::{
     BASE_IPC_OVERRIDE_KEYS, BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig,
-    FORBIDDEN_IPC_OVERRIDE_KEYS, SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
+    FORBIDDEN_IPC_OVERRIDE_KEYS, MAX_IPC_POOL_SEGMENTS, MAX_EXECUTION_WORKERS, PoolRoleTuning,
+    SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
 };
 pub use memory::MemoryBudgetLimits;
-pub use pool::PoolConfig;
+pub use pool::{PoolConfig, default_spill_dir};
 pub use relay::RelayConfig;
 pub use remote::{
     DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE, MAX_REMOTE_PAYLOAD_CHUNK_SIZE,

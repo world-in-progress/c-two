@@ -79,6 +79,8 @@ pub struct BaseIpcConfigOverrides {
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
+    pub pool_prewarm_segments: Option<u32>,
+    pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
     pub max_total_chunks: Option<u32>,
@@ -95,6 +97,8 @@ pub struct ServerIpcConfigOverrides {
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
+    pub pool_prewarm_segments: Option<u32>,
+    pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
     pub max_total_chunks: Option<u32>,
@@ -118,6 +122,8 @@ pub struct ClientIpcConfigOverrides {
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
+    pub pool_prewarm_segments: Option<u32>,
+    pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
     pub max_total_chunks: Option<u32>,
@@ -126,6 +132,7 @@ pub struct ClientIpcConfigOverrides {
     pub chunk_assembler_timeout_secs: Option<f64>,
     pub max_reassembly_bytes: Option<u64>,
     pub chunk_size: Option<u64>,
+    pub pool_decay_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -578,8 +585,17 @@ fn resolve_client_ipc_config(
     };
 
     apply_base_env(&mut cfg.base, catalog)?;
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_POOL_DECAY_SECONDS")
+        .transpose()?
+    {
+        cfg.pool_decay_seconds = v;
+    }
     apply_base_overrides(&mut cfg.base, &overrides.base);
     apply_flat_base_overrides_to_client(&mut cfg, &overrides);
+    if let Some(v) = overrides.pool_decay_seconds {
+        cfg.pool_decay_seconds = v;
+    }
 
     derive_base(&mut cfg.base)?;
     cfg.validate().map_err(ConfigError::new)?;
@@ -601,6 +617,18 @@ fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), C
         .transpose()?
     {
         cfg.max_pool_segments = v;
+    }
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_POOL_PREWARM_SEGMENTS")
+        .transpose()?
+    {
+        cfg.pool_prewarm_segments = v;
+    }
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_POOL_MIN_RETAINED_SEGMENTS")
+        .transpose()?
+    {
+        cfg.pool_min_retained_segments = v;
     }
     if let Some(v) = catalog
         .optional_u64("C2_IPC_REASSEMBLY_SEGMENT_SIZE")
@@ -660,6 +688,12 @@ fn apply_base_overrides(cfg: &mut BaseIpcConfig, overrides: &BaseIpcConfigOverri
     if let Some(v) = overrides.max_pool_segments {
         cfg.max_pool_segments = v;
     }
+    if let Some(v) = overrides.pool_prewarm_segments {
+        cfg.pool_prewarm_segments = v;
+    }
+    if let Some(v) = overrides.pool_min_retained_segments {
+        cfg.pool_min_retained_segments = v;
+    }
     if let Some(v) = overrides.reassembly_segment_size {
         cfg.reassembly_segment_size = v;
     }
@@ -716,6 +750,12 @@ fn apply_flat_base_overrides_to_server(
     if let Some(v) = overrides.max_pool_segments {
         cfg.base.max_pool_segments = v;
     }
+    if let Some(v) = overrides.pool_prewarm_segments {
+        cfg.base.pool_prewarm_segments = v;
+    }
+    if let Some(v) = overrides.pool_min_retained_segments {
+        cfg.base.pool_min_retained_segments = v;
+    }
     if let Some(v) = overrides.reassembly_segment_size {
         cfg.base.reassembly_segment_size = v;
     }
@@ -754,6 +794,12 @@ fn apply_flat_base_overrides_to_client(
     }
     if let Some(v) = overrides.max_pool_segments {
         cfg.base.max_pool_segments = v;
+    }
+    if let Some(v) = overrides.pool_prewarm_segments {
+        cfg.base.pool_prewarm_segments = v;
+    }
+    if let Some(v) = overrides.pool_min_retained_segments {
+        cfg.base.pool_min_retained_segments = v;
     }
     if let Some(v) = overrides.reassembly_segment_size {
         cfg.base.reassembly_segment_size = v;
@@ -1137,6 +1183,74 @@ mod tests {
         .expect_err("oversized explicit execution worker override should fail");
         assert!(override_err.to_string().contains("max_execution_workers"));
         assert!(override_err.to_string().contains("64"));
+    }
+
+    #[test]
+    fn client_ipc_pool_decay_env_and_override_are_resolved() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_POOL_DECAY_SECONDS", "12.5")]),
+        };
+
+        let from_env = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            sources,
+        )
+        .expect("env pool decay should resolve");
+        assert_eq!(from_env.pool_decay_seconds, 12.5);
+
+        // Zero is the explicit immediate-retirement window and stays valid.
+        let immediate = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides {
+                pool_decay_seconds: Some(0.0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect("zero pool decay should resolve as immediate retirement");
+        assert_eq!(immediate.pool_decay_seconds, 0.0);
+
+        // Explicit code-level overrides beat the shared environment variable.
+        let from_override = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides {
+                pool_decay_seconds: Some(7.5),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_POOL_DECAY_SECONDS", "12.5")]),
+            },
+        )
+        .expect("explicit pool decay override should beat env");
+        assert_eq!(from_override.pool_decay_seconds, 7.5);
+    }
+
+    #[test]
+    fn client_ipc_pool_decay_rejects_negative_env_and_override() {
+        let env_err = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_POOL_DECAY_SECONDS", "-1")]),
+            },
+        )
+        .expect_err("negative env pool decay should fail like the server");
+        assert!(env_err.to_string().contains("pool_decay_seconds"));
+
+        let override_err = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides {
+                pool_decay_seconds: Some(-1.0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("negative explicit pool decay should fail like the server");
+        assert!(override_err.to_string().contains("pool_decay_seconds"));
     }
 
     #[test]
