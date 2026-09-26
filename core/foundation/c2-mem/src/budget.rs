@@ -233,6 +233,19 @@ impl MemoryBudget {
         }
     }
 
+    /// Creates a budget from the canonical [`c2_config::MemoryBudgetLimits`].
+    ///
+    /// The plain-data limits live in `c2-config`; this one-way conversion in
+    /// `c2-mem` (which already depends on `c2-config`) keeps the reservation
+    /// primitive out of configuration code and avoids a dependency cycle.
+    pub fn from_limits(limits: &c2_config::MemoryBudgetLimits) -> Self {
+        Self::new(
+            limits.shm_backing_budget_bytes,
+            limits.file_backing_budget_bytes,
+            limits.live_reassembly_budget_bytes,
+        )
+    }
+
     /// Admits a byte charge against one cell and returns its guard, or
     /// rejects the attempt before any allocation happens.
     ///
@@ -309,6 +322,25 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn from_limits_builds_the_canonical_cells() {
+        let limits = c2_config::MemoryBudgetLimits {
+            shm_backing_budget_bytes: 7,
+            file_backing_budget_bytes: 11,
+            live_reassembly_budget_bytes: 13,
+        };
+        let budget = MemoryBudget::from_limits(&limits);
+        let snap = budget.snapshot();
+        assert_eq!(snap.shm.limit_bytes, 7);
+        assert_eq!(snap.file.limit_bytes, 11);
+        assert_eq!(snap.reassembly.limit_bytes, 13);
+        assert_eq!(snap.shm.used_bytes, 0);
+
+        // Zeroed canonical limits reject rather than mean unlimited.
+        let zeroed = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::zeroed());
+        assert!(zeroed.reserve(BudgetKind::File, 1).is_err());
+    }
 
     #[test]
     fn cells_are_independent() {

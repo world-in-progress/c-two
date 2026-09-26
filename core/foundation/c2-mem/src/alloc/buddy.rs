@@ -88,6 +88,25 @@ pub struct Allocation {
     pub level: u16,
 }
 
+/// Validated geometry for one buddy backing, derived only by
+/// [`BuddyAllocator::checked_layout`].
+///
+/// `data_size` is the usable power-of-two data region, bounded by the wire's
+/// `u32` buddy coordinates; `total_size` additionally includes the page-
+/// aligned segment header and level bitmaps and is bounded by one addressable
+/// `isize` mapping span. The header layout/ABI is unchanged — this is the
+/// same formula the previous unchecked computation produced for every
+/// supported geometry, now computed with checked arithmetic and rejected
+/// before any mapping instead of wrapping or panicking inside
+/// [`BuddyAllocator::init`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuddyLayout {
+    /// Usable data region size (power of two, `<= u32::MAX`).
+    pub data_size: usize,
+    /// Total SHM mapping size: header + bitmaps + data (`<= isize::MAX`).
+    pub total_size: usize,
+}
+
 /// Buddy allocator for a single SHM segment.
 pub struct BuddyAllocator {
     /// Pointer to the beginning of the SHM mapping.
@@ -522,19 +541,57 @@ impl BuddyAllocator {
         (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1)
     }
 
-    /// Compute the minimum total SHM size needed so that the usable data region
-    /// is at least `min_data_capacity` bytes (after buddy power-of-2 rounding).
+    /// Checked next power of two; `usize::next_power_of_two` would wrap or
+    /// panic near `usize::MAX`.
+    fn checked_next_pow2(n: usize) -> Option<usize> {
+        if n <= 1 {
+            return Some(1);
+        }
+        let bits = usize::BITS - n.leading_zeros();
+        if n.is_power_of_two() {
+            1usize.checked_shl(bits - 1)
+        } else {
+            1usize.checked_shl(bits)
+        }
+    }
+
+    /// Compute the minimum validated layout whose data region holds at least
+    /// `min_data_capacity` bytes (after buddy power-of-two rounding), or
+    /// `None` when the geometry is unsupported.
     ///
-    /// Use this to avoid the 50% waste when `segment_size` is an exact power of
-    /// two (e.g. 1 GB) — the header pushes the data region below the next
-    /// power-of-two boundary.
-    pub fn required_shm_size(min_data_capacity: usize, min_block: usize) -> usize {
-        // Target data_size is the smallest power-of-2 >= min_data_capacity.
-        let data_size = min_data_capacity.next_power_of_two();
+    /// This is the single owner of the segment-geometry formula; creation and
+    /// budget charging must both consume a layout derived from it so the
+    /// charged bytes always equal the mapped bytes. Rejections cover:
+    /// non-power-of-two or non-positive `min_block`, `min_block` larger than
+    /// the data region, a next-power-of-two overflow, a data region above the
+    /// wire's `u32` buddy coordinates, and header/bitmap/alignment additions
+    /// or the final size overflowing the addressable `isize` mapping span.
+    ///
+    /// With `data_size` a validated power of two `<= u32::MAX` and
+    /// `min_block` a dividing power of two, `total_bitmap_bytes` is bounded
+    /// by roughly `data_size / 4` and cannot overflow; every subsequent
+    /// addition is checked regardless.
+    pub fn checked_layout(min_data_capacity: usize, min_block: usize) -> Option<BuddyLayout> {
+        if min_block == 0 || !min_block.is_power_of_two() {
+            return None;
+        }
+        let data_size = Self::checked_next_pow2(min_data_capacity)?;
+        // The wire's buddy coordinates (offset, block size) are u32.
+        if data_size > u32::MAX as usize || min_block > data_size {
+            return None;
+        }
         let bitmap_bytes = crate::alloc::bitmap::total_bitmap_bytes(data_size, min_block);
-        let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
-        let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
-        data_offset + data_size
+        let header_need = std::mem::size_of::<SegmentHeader>().checked_add(bitmap_bytes)?;
+        let align_mask = HEADER_ALIGN - 1;
+        let data_offset = header_need.checked_add(align_mask)? & !align_mask;
+        let total_size = data_offset.checked_add(data_size)?;
+        if total_size > isize::MAX as usize {
+            return None;
+        }
+        Some(BuddyLayout {
+            data_size,
+            total_size,
+        })
     }
 
     fn count_levels(data_size: usize, min_block: usize) -> usize {
@@ -561,6 +618,62 @@ mod tests {
         let mut buffer = vec![0u8; total_size];
         let alloc = unsafe { BuddyAllocator::init(buffer.as_mut_ptr(), total_size, min_block) };
         (alloc, buffer)
+    }
+
+    #[test]
+    fn checked_layout_preserves_previously_valid_geometries() {
+        // Supported layouts — including the 256 MB pool default — must keep
+        // producing exactly the values the legacy unchecked formula produced.
+        for (capacity, min_block) in [
+            (8192, 4096),
+            (8192, 8192),
+            (64 * 1024, 4096),
+            (256 * 1024 * 1024, 4096),
+            (1usize << 30, 4096),
+        ] {
+            let layout = BuddyAllocator::checked_layout(capacity, min_block)
+                .unwrap_or_else(|| panic!("supported geometry {capacity}/{min_block}"));
+            assert!(layout.data_size.is_power_of_two());
+            assert!(layout.data_size >= capacity);
+            assert!(layout.total_size > layout.data_size);
+            assert!(layout.total_size <= isize::MAX as usize);
+
+            // Independent reconstruction of the legacy formula.
+            let bitmap_bytes =
+                crate::alloc::bitmap::total_bitmap_bytes(layout.data_size, min_block);
+            let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
+            let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
+            assert_eq!(layout.total_size, data_offset + layout.data_size);
+
+            // init() recovers the same data region from the validated total,
+            // so the header ABI and attach path are unchanged.
+            let init_offset = BuddyAllocator::compute_data_offset(layout.total_size, min_block);
+            assert_eq!(
+                BuddyAllocator::round_down_pow2(layout.total_size - init_offset),
+                layout.data_size
+            );
+        }
+    }
+
+    #[test]
+    fn checked_layout_rejects_unsupported_geometries_pure_preflight() {
+        // min_block must be a positive power of two that divides the data region.
+        assert!(BuddyAllocator::checked_layout(8192, 0).is_none());
+        assert!(BuddyAllocator::checked_layout(8192, 3000).is_none());
+        assert!(BuddyAllocator::checked_layout(4096, 8192).is_none());
+
+        // Near-u32 and near-usize bounds: pure arithmetic, no mapping.
+        if usize::BITS >= 64 {
+            // 4 GiB data capacity leaves the wire's u32 buddy coordinates.
+            let four_gib = 1usize << 32;
+            assert!(BuddyAllocator::checked_layout(four_gib, 4096).is_none());
+            assert!(BuddyAllocator::checked_layout(four_gib + 5, 4096).is_none());
+            // The largest supported power-of-two capacity still validates.
+            assert!(BuddyAllocator::checked_layout(1usize << 31, 4096).is_some());
+            // Next power of two overflows near usize::MAX.
+            assert!(BuddyAllocator::checked_layout(usize::MAX, 4096).is_none());
+            assert!(BuddyAllocator::checked_layout((1usize << 63) + 1, 4096).is_none());
+        }
     }
 
     #[test]
@@ -939,7 +1052,9 @@ mod tests {
     fn crash_child_main(name: &str) {
         use crate::ShmRegion;
 
-        let total_size = BuddyAllocator::required_shm_size(CRASH_TEST_DATA_CAPACITY, 4096);
+        let total_size = BuddyAllocator::checked_layout(CRASH_TEST_DATA_CAPACITY, 4096)
+            .expect("supported crash-test geometry")
+            .total_size;
         let region = ShmRegion::open(name, total_size).expect("holder child opens shared region");
         let alloc = unsafe {
             BuddyAllocator::attach(region.base_ptr(), region.size()).expect("child attach")
@@ -976,7 +1091,9 @@ mod tests {
                 .unwrap()
                 .subsec_nanos()
         );
-        let total_size = BuddyAllocator::required_shm_size(CRASH_TEST_DATA_CAPACITY, 4096);
+        let total_size = BuddyAllocator::checked_layout(CRASH_TEST_DATA_CAPACITY, 4096)
+            .expect("supported crash-test geometry")
+            .total_size;
         let region = ShmRegion::create(&name, total_size).expect("parent creates shared region");
         let mut alloc = unsafe { BuddyAllocator::init(region.base_ptr(), total_size, 4096) };
         alloc.lock.force_budgets(100_000, 1_000);

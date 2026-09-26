@@ -18,7 +18,7 @@ pub mod pool;
 pub mod segment;
 pub mod spill;
 
-pub use alloc::{Allocation, BuddyAllocator, SegmentHeader, ShmSpinlock};
+pub use alloc::{Allocation, BuddyAllocator, BuddyLayout, SegmentHeader, ShmSpinlock};
 pub use buddy_segment::BuddySegment;
 pub use budget::{
     BudgetCellSnapshot, BudgetError, BudgetKind, BudgetReservation, BudgetSnapshot, MemoryBudget,

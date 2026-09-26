@@ -6,6 +6,7 @@
 mod identity;
 mod ipc;
 mod local;
+mod memory;
 mod pool;
 mod relay;
 mod remote;
@@ -17,6 +18,7 @@ pub use ipc::{
     BASE_IPC_OVERRIDE_KEYS, BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig,
     FORBIDDEN_IPC_OVERRIDE_KEYS, SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
 };
+pub use memory::MemoryBudgetLimits;
 pub use pool::PoolConfig;
 pub use relay::RelayConfig;
 pub use remote::{
