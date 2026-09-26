@@ -186,6 +186,11 @@ impl From<PoolAllocation> for PyPoolAlloc {
 }
 
 /// Python-visible pool statistics.
+///
+/// Scope notes mirror the Rust `PoolStats`: byte fields describe the pool's
+/// own backing capacities, never whole-process RSS. Buddy fields cover the
+/// data region only; dedicated fields include freed-but-pending-GC entries.
+/// File and live-reassembly bytes belong to the memory-budget cells.
 #[pyclass(name = "PoolStats", frozen, skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyPoolStats {
@@ -194,26 +199,53 @@ pub struct PyPoolStats {
     #[pyo3(get)]
     pub dedicated_segments: usize,
     #[pyo3(get)]
-    pub total_bytes: u64,
-    #[pyo3(get)]
-    pub free_bytes: u64,
-    #[pyo3(get)]
     pub alloc_count: u32,
     #[pyo3(get)]
-    pub fragmentation_ratio: f64,
+    pub buddy_data_bytes: u64,
+    #[pyo3(get)]
+    pub buddy_occupied_bytes: u64,
+    #[pyo3(get)]
+    pub buddy_idle_bytes: u64,
+    #[pyo3(get)]
+    pub dedicated_mapped_bytes: u64,
+    #[pyo3(get)]
+    pub dedicated_active_count: usize,
+    #[pyo3(get)]
+    pub dedicated_active_bytes: u64,
+    #[pyo3(get)]
+    pub dedicated_pending_free_bytes: u64,
+    #[pyo3(get)]
+    pub buddy_reused_allocs: u64,
+    #[pyo3(get)]
+    pub buddy_expanded_allocs: u64,
+    #[pyo3(get)]
+    pub dedicated_allocs: u64,
+    #[pyo3(get)]
+    pub file_spill_allocs: u64,
+    #[pyo3(get)]
+    pub pressure_denied_backings: u64,
+    #[pyo3(get)]
+    pub utilization_ratio: f64,
 }
 
 #[pymethods]
 impl PyPoolStats {
     fn __repr__(&self) -> String {
         format!(
-            "PoolStats(segs={}, ded={}, total={}MB, free={}MB, allocs={}, frag={:.2}%)",
+            "PoolStats(segs={}, ded={}, allocs={}, buddy={}/{} occupied, ded_mapped={}B ({} pending), reused={}, expanded={}, dedicated={}, file={}, pressure_denied={}, util={:.2}%)",
             self.total_segments,
             self.dedicated_segments,
-            self.total_bytes / (1024 * 1024),
-            self.free_bytes / (1024 * 1024),
             self.alloc_count,
-            self.fragmentation_ratio * 100.0
+            self.buddy_occupied_bytes,
+            self.buddy_data_bytes,
+            self.dedicated_mapped_bytes,
+            self.dedicated_pending_free_bytes,
+            self.buddy_reused_allocs,
+            self.buddy_expanded_allocs,
+            self.dedicated_allocs,
+            self.file_spill_allocs,
+            self.pressure_denied_backings,
+            self.utilization_ratio * 100.0
         )
     }
 }
@@ -422,10 +454,20 @@ impl PyMemPool {
         Ok(PyPoolStats {
             total_segments: s.total_segments,
             dedicated_segments: s.dedicated_segments,
-            total_bytes: s.total_bytes,
-            free_bytes: s.free_bytes,
             alloc_count: s.alloc_count,
-            fragmentation_ratio: s.fragmentation_ratio,
+            buddy_data_bytes: s.buddy_data_bytes,
+            buddy_occupied_bytes: s.buddy_occupied_bytes,
+            buddy_idle_bytes: s.buddy_idle_bytes,
+            dedicated_mapped_bytes: s.dedicated_mapped_bytes,
+            dedicated_active_count: s.dedicated_active_count,
+            dedicated_active_bytes: s.dedicated_active_bytes,
+            dedicated_pending_free_bytes: s.dedicated_pending_free_bytes,
+            buddy_reused_allocs: s.buddy_reused_allocs,
+            buddy_expanded_allocs: s.buddy_expanded_allocs,
+            dedicated_allocs: s.dedicated_allocs,
+            file_spill_allocs: s.file_spill_allocs,
+            pressure_denied_backings: s.pressure_denied_backings,
+            utilization_ratio: s.utilization_ratio,
         })
     }
 

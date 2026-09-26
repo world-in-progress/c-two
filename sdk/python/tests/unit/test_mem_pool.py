@@ -296,10 +296,68 @@ class TestPoolStats:
             stats = pool.stats()
             assert stats.total_segments == 1
             assert stats.alloc_count >= 1
-            assert stats.total_bytes > 0
+            assert stats.buddy_data_bytes > 0
+            assert (
+                stats.buddy_occupied_bytes + stats.buddy_idle_bytes
+                == stats.buddy_data_bytes
+            )
+            assert stats.buddy_occupied_bytes > 0
+            assert 0.0 < stats.utilization_ratio <= 1.0
+            assert stats.buddy_expanded_allocs == 1
+            assert stats.buddy_reused_allocs == 0
+            assert stats.dedicated_mapped_bytes == 0
+            assert stats.pressure_denied_backings == 0
             pool.free(a)
             stats = pool.stats()
             assert stats.alloc_count == 0
+            assert stats.buddy_occupied_bytes == 0
+            assert stats.buddy_idle_bytes == stats.buddy_data_bytes
+            assert stats.utilization_ratio == 0.0
+        finally:
+            pool.destroy()
+
+    def test_stats_dedicated_includes_pending_free(self):
+        pool = MemPool(PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+            max_segments=1,
+            max_dedicated_segments=2,
+            dedicated_crash_timeout_secs=0.0,
+        ))
+        try:
+            alloc = pool.alloc(128 * 1024)  # > segment_size → dedicated
+            stats = pool.stats()
+            assert stats.dedicated_segments == 1
+            assert stats.dedicated_active_count == 1
+            assert stats.dedicated_active_bytes == stats.dedicated_mapped_bytes
+            assert stats.dedicated_pending_free_bytes == 0
+            assert stats.dedicated_allocs == 1
+            pool.free(alloc)
+            # Freed-but-pending-GC dedicated backings stay mapped and counted.
+            stats = pool.stats()
+            assert stats.dedicated_active_count == 0
+            assert stats.dedicated_active_bytes == 0
+            assert stats.dedicated_pending_free_bytes == stats.dedicated_mapped_bytes
+            assert stats.alloc_count == 0
+            pool.gc()
+            stats = pool.stats()
+            assert stats.dedicated_mapped_bytes == 0
+            assert stats.dedicated_pending_free_bytes == 0
+        finally:
+            pool.destroy()
+
+    def test_stats_utilization_is_not_fragmentation(self):
+        """utilization_ratio is the occupied share of buddy data capacity."""
+        pool = MemPool(PoolConfig(
+            segment_size=64 * 1024,
+            min_block_size=4096,
+        ))
+        try:
+            assert pool.stats().utilization_ratio == 0.0
+            a = pool.alloc(64 * 1024)
+            assert pool.stats().utilization_ratio == 1.0
+            pool.free(a)
+            assert pool.stats().utilization_ratio == 0.0
         finally:
             pool.destroy()
 
@@ -418,7 +476,7 @@ class TestBuddyMerge:
 
             # Verify stats match initial
             final_stats = pool.stats()
-            assert final_stats.free_bytes == initial_stats.free_bytes
+            assert final_stats.buddy_idle_bytes == initial_stats.buddy_idle_bytes
             assert final_stats.alloc_count == 0
 
             # Verify large alloc works (buddies merged back)

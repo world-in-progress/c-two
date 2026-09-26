@@ -40,7 +40,8 @@ impl BuddySegment {
         })?;
         let region = ShmRegion::create(name, layout.total_size)?;
 
-        let allocator = unsafe { BuddyAllocator::init(region.base_ptr(), layout.total_size, min_block) };
+        let allocator =
+            unsafe { BuddyAllocator::init(region.base_ptr(), layout.total_size, min_block) };
 
         Ok(Self {
             region,

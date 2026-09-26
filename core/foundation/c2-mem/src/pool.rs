@@ -12,6 +12,7 @@ use crate::budget::{BudgetError, BudgetKind, BudgetReservation, MemoryBudget};
 use crate::config::{PoolAllocation, PoolConfig, PoolStats};
 use crate::dedicated::DedicatedSegment;
 use crate::handle::MemHandle;
+use crate::pressure::{PressureDecision, PressureEngine};
 use crate::spill;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -29,14 +30,16 @@ pub enum FreeResult {
     DedicatedFreed { seg_idx: u16 },
 }
 
-/// Backing-creation failure at a budget-enforced seam.
+/// Backing-creation failure at a policy-enforced seam.
 ///
-/// Budget rejections are separable from other creation errors so the single
-/// fallback chain can still try a smaller eligible tier (for example a
-/// dedicated backing that fits when a full buddy segment does not). Creation
-/// failures may also continue through the same eligible fallback tiers.
+/// Budget rejections and OS-memory pressure denials are separable from other
+/// creation errors so the single fallback chain can still try a smaller
+/// eligible tier (for example a dedicated backing that fits when a full buddy
+/// segment does not). Creation failures may also continue through the same
+/// eligible fallback tiers.
 enum BackingError {
     Budget(BudgetError),
+    Pressure(String),
     Other(String),
 }
 
@@ -44,9 +47,19 @@ impl BackingError {
     fn into_message(self) -> String {
         match self {
             BackingError::Budget(e) => e.to_string(),
+            BackingError::Pressure(message) => message,
             BackingError::Other(message) => message,
         }
     }
+}
+
+/// Lifetime tier-selection counters behind [`PoolStats`].
+#[derive(Default, Debug, Clone, Copy)]
+struct TierCounters {
+    buddy_reused_allocs: u64,
+    buddy_expanded_allocs: u64,
+    dedicated_allocs: u64,
+    file_spill_allocs: u64,
 }
 
 /// Tracking info for a dedicated segment.
@@ -78,6 +91,11 @@ pub struct MemPool {
     /// Owner-creation budget context. Owner pools always carry one (shared or
     /// private); peer pools never charge owner-creation budget and carry none.
     budget: Option<MemoryBudget>,
+    /// Creation-time OS-memory pressure decisions for owner backing seams.
+    /// Peer pools never create backings, so theirs stays idle.
+    pressure: PressureEngine,
+    /// Lifetime tier-selection counters surfaced read-only through `stats()`.
+    counters: TierCounters,
 }
 
 impl MemPool {
@@ -162,6 +180,7 @@ impl MemPool {
             Self::MAX_SHM_PREFIX_LEN,
         );
         Self::validate_config(&config).expect("invalid PoolConfig");
+        let pressure = PressureEngine::new(config.spill_threshold);
         Self {
             config,
             segments: Vec::new(),
@@ -172,6 +191,8 @@ impl MemPool {
             next_dedicated_idx: 256,
             idle_since: Vec::new(),
             budget,
+            pressure,
+            counters: TierCounters::default(),
         }
     }
 
@@ -270,6 +291,13 @@ impl MemPool {
     }
 
     /// Allocate memory from the pool.
+    ///
+    /// Tier order: reuse an existing buddy segment, expand the buddy pool,
+    /// then create a dedicated backing. Buddy expansion and dedicated
+    /// creation are the policy-enforced seams: both validate their total
+    /// mapped bytes and consult the pressure engine and the finite budget
+    /// before mapping anything. Reusing already-mapped buddy blocks is
+    /// always permitted and takes no new charge.
     pub fn alloc(&mut self, size: usize) -> Result<PoolAllocation, String> {
         if self.is_peer {
             return Err("cannot allocate from a peer pool".into());
@@ -286,7 +314,8 @@ impl MemPool {
             self.alloc_buddy(size).map_err(BackingError::into_message)
         } else {
             // Too large for buddy or buddy disabled → dedicated segment.
-            self.alloc_dedicated(size).map_err(BackingError::into_message)
+            self.alloc_dedicated(size)
+                .map_err(BackingError::into_message)
         }
     }
 
@@ -322,38 +351,66 @@ impl MemPool {
     }
 
     /// Get pool statistics.
+    ///
+    /// Read-only observations over this pool's own backing: buddy data-region
+    /// capacities, dedicated mapped capacities including pending-free
+    /// entries, tier-selection counters, and the pressure-denial count. The
+    /// values never claim whole-process RSS; file and live-reassembly bytes
+    /// belong to the budget cells.
     pub fn stats(&self) -> PoolStats {
-        let mut total_bytes = 0u64;
-        let mut free_bytes = 0u64;
+        let mut buddy_segments = 0usize;
+        let mut buddy_data = 0u64;
+        let mut buddy_idle = 0u64;
         let mut alloc_count = 0u32;
 
         for seg in self.segments.iter().flatten() {
             let a = seg.allocator();
-            total_bytes += a.data_size() as u64;
-            free_bytes += a.free_bytes();
+            buddy_segments += 1;
+            buddy_data += a.data_size() as u64;
+            buddy_idle += a.free_bytes();
             alloc_count += a.alloc_count();
         }
+        let buddy_occupied = buddy_data.saturating_sub(buddy_idle);
 
+        let mut dedicated_mapped = 0u64;
+        let mut dedicated_active_count = 0usize;
+        let mut dedicated_active = 0u64;
+        let mut dedicated_pending_free = 0u64;
         for entry in self.dedicated.values() {
-            total_bytes += entry.segment.size() as u64;
+            let bytes = entry.segment.size() as u64;
+            dedicated_mapped += bytes;
             if entry.freed_at.is_none() {
+                dedicated_active_count += 1;
+                dedicated_active += bytes;
                 alloc_count += 1;
+            } else {
+                dedicated_pending_free += bytes;
             }
         }
 
-        let fragmentation_ratio = if total_bytes > 0 {
-            1.0 - (free_bytes as f64 / total_bytes as f64)
+        let utilization_ratio = if buddy_data > 0 {
+            buddy_occupied as f64 / buddy_data as f64
         } else {
             0.0
         };
 
         PoolStats {
-            total_segments: self.segments.iter().flatten().count(),
+            total_segments: buddy_segments,
             dedicated_segments: self.dedicated.len(),
-            total_bytes,
-            free_bytes,
             alloc_count,
-            fragmentation_ratio,
+            buddy_data_bytes: buddy_data,
+            buddy_occupied_bytes: buddy_occupied,
+            buddy_idle_bytes: buddy_idle,
+            dedicated_mapped_bytes: dedicated_mapped,
+            dedicated_active_count,
+            dedicated_active_bytes: dedicated_active,
+            dedicated_pending_free_bytes: dedicated_pending_free,
+            buddy_reused_allocs: self.counters.buddy_reused_allocs,
+            buddy_expanded_allocs: self.counters.buddy_expanded_allocs,
+            dedicated_allocs: self.counters.dedicated_allocs,
+            file_spill_allocs: self.counters.file_spill_allocs,
+            pressure_denied_backings: self.pressure.denials(),
+            utilization_ratio,
         }
     }
 
@@ -883,12 +940,16 @@ impl MemPool {
 
     /// Unified allocation returning a [`MemHandle`].
     ///
-    /// Decision flow (optimised — RAM check only when creating new mappings):
-    /// 1. size fits buddy AND existing segments have space → Buddy (no RAM check)
-    /// 2. Else: should_spill() → FileSpill if RAM scarce
-    /// 3. Else: expand buddy (policy permitting) or create dedicated SHM
-    /// 4. Buddy expansion failure falls through to dedicated SHM
-    /// 5. If dedicated creation fails → FileSpill fallback
+    /// Decision flow (pressure decisions live at the backing-creation seams,
+    /// on validated total mapped bytes — never on the payload size):
+    /// 1. size fits buddy AND existing segments have space → Buddy (reuse,
+    ///    no pressure query, no new backing charge)
+    /// 2. Else: buddy expansion if policy permits (seam checks pressure and
+    ///    budget with the full segment's total mapped bytes)
+    /// 3. Else: dedicated backing (seam checks pressure and budget with its
+    ///    own, smaller, mapped size — a pressure-denied buddy segment does
+    ///    not suppress a dedicated backing that fits)
+    /// 4. Else: FileSpill, if the file budget admits the requested length
     pub fn alloc_handle(&mut self, size: usize) -> Result<MemHandle, String> {
         if self.is_peer {
             return Err("cannot allocate from a peer pool".into());
@@ -898,103 +959,42 @@ impl MemPool {
         }
         let max_buddy = self.buddy_block_limit();
 
-        // Fast path: existing buddy segments (bitmap only, no RAM query).
         if max_buddy > 0 && size <= max_buddy {
-            for (idx, seg) in self.segments.iter().enumerate() {
-                let Some(seg) = seg else {
-                    continue;
-                };
-                if (seg.allocator().free_bytes() as usize) < size {
-                    continue;
+            if let Some(a) = self.try_buddy_reuse(size) {
+                return Ok(a.into_buddy_handle(size));
+            }
+            if self.gc_buddy() > 0 {
+                if let Some(a) = self.try_buddy_reuse(size) {
+                    return Ok(a.into_buddy_handle(size));
                 }
-                if let Some(a) = seg.allocator().alloc(size) {
-                    if idx < self.idle_since.len() {
-                        self.idle_since[idx] = None;
-                    }
-                    return Ok(MemHandle::Buddy {
-                        seg_idx: idx as u16,
-                        generation: self.generations[idx],
-                        offset: a.offset,
-                        allocation_size: a.actual_size,
-                        len: size,
-                    });
+            }
+            if self.segments.len() < self.config.max_segments {
+                if let Some(a) = self.expand_buddy(size) {
+                    return Ok(a.into_buddy_handle(size));
                 }
             }
         }
 
-        // Slow path: need new mapping — check RAM.
-        if spill::should_spill(size, self.config.spill_threshold) {
-            return self
-                .alloc_file_spill(size)
-                .map_err(BackingError::into_message);
-        }
-
-        // RAM fine: try buddy expansion. A creation failure falls through to
-        // dedicated SHM below rather than jumping straight to file spill.
-        if max_buddy > 0 && size <= max_buddy && self.segments.len() < self.config.max_segments {
-            // GC before expanding — may free trailing idle segments
-            let reclaimed = self.gc_buddy();
-            if reclaimed > 0 {
-                // Retry existing segments after GC
-                for (idx, seg) in self.segments.iter().enumerate() {
-                    let Some(seg) = seg else {
-                        continue;
-                    };
-                    if (seg.allocator().free_bytes() as usize) < size {
-                        continue;
-                    }
-                    if let Some(a) = seg.allocator().alloc(size) {
-                        if idx < self.idle_since.len() {
-                            self.idle_since[idx] = None;
-                        }
-                        return Ok(MemHandle::Buddy {
-                            seg_idx: idx as u16,
-                            generation: self.generations[idx],
-                            offset: a.offset,
-                            allocation_size: a.actual_size,
-                            len: size,
-                        });
-                    }
-                }
-            }
-
-            if let Ok(seg) = self.create_segment() {
-                let idx = self.segments.len();
-                self.segments.push(Some(seg));
-                self.idle_since.push(None);
-                if let Some(a) = self
-                    .segment(idx)
-                    .expect("owner segment slot")
-                    .allocator()
-                    .alloc(size)
-                {
-                    return Ok(MemHandle::Buddy {
-                        seg_idx: idx as u16,
-                        generation: self.generations[idx],
-                        offset: a.offset,
-                        allocation_size: a.actual_size,
-                        len: size,
-                    });
-                }
-            }
-        }
-
-        // Large (or buddy policy-disabled / buddy expansion failed) → dedicated
+        // Buddy ineligible, pressure-denied, or creation-failed → dedicated
         // SHM, with file spill only as the final fallback.
         match self.alloc_dedicated(size) {
             Ok(alloc) => Ok(MemHandle::Dedicated {
                 seg_idx: alloc.seg_idx as u16,
                 len: size,
             }),
-            Err(_) => self.alloc_file_spill(size).map_err(BackingError::into_message),
+            Err(_) => self
+                .alloc_file_spill(size)
+                .map_err(BackingError::into_message),
         }
     }
 
     /// Allocate from Buddy or Dedicated SHM only — no FileSpill fallback.
     ///
     /// For callers that require a shared-memory handle rather than file storage.
-    /// Returns `Err` if neither buddy nor dedicated has capacity.
-    /// A failed buddy expansion still tries dedicated storage.
+    /// Returns `Err` if neither buddy nor dedicated has capacity: SHM pressure
+    /// denials and budget rejections surface as this error so transport can
+    /// choose its existing checked chunk fallback. A failed buddy expansion
+    /// still tries dedicated storage.
     pub fn try_alloc_shm(&mut self, size: usize) -> Result<MemHandle, String> {
         if self.is_peer {
             return Err("cannot allocate from a peer pool".into());
@@ -1004,79 +1004,23 @@ impl MemPool {
         }
         let max_buddy = self.buddy_block_limit();
 
-        // Try existing buddy segments.
         if max_buddy > 0 && size <= max_buddy {
-            for (idx, seg) in self.segments.iter().enumerate() {
-                let Some(seg) = seg else {
-                    continue;
-                };
-                if (seg.allocator().free_bytes() as usize) < size {
-                    continue;
+            if let Some(a) = self.try_buddy_reuse(size) {
+                return Ok(a.into_buddy_handle(size));
+            }
+            if self.gc_buddy() > 0 {
+                if let Some(a) = self.try_buddy_reuse(size) {
+                    return Ok(a.into_buddy_handle(size));
                 }
-                if let Some(a) = seg.allocator().alloc(size) {
-                    if idx < self.idle_since.len() {
-                        self.idle_since[idx] = None;
-                    }
-                    return Ok(MemHandle::Buddy {
-                        seg_idx: idx as u16,
-                        generation: self.generations[idx],
-                        offset: a.offset,
-                        allocation_size: a.actual_size,
-                        len: size,
-                    });
+            }
+            if self.segments.len() < self.config.max_segments {
+                if let Some(a) = self.expand_buddy(size) {
+                    return Ok(a.into_buddy_handle(size));
                 }
             }
         }
 
-        // Try buddy expansion (no RAM check — caller already has data in RAM).
-        if max_buddy > 0 && size <= max_buddy && self.segments.len() < self.config.max_segments {
-            let reclaimed = self.gc_buddy();
-            if reclaimed > 0 {
-                for (idx, seg) in self.segments.iter().enumerate() {
-                    let Some(seg) = seg else {
-                        continue;
-                    };
-                    if (seg.allocator().free_bytes() as usize) < size {
-                        continue;
-                    }
-                    if let Some(a) = seg.allocator().alloc(size) {
-                        if idx < self.idle_since.len() {
-                            self.idle_since[idx] = None;
-                        }
-                        return Ok(MemHandle::Buddy {
-                            seg_idx: idx as u16,
-                            generation: self.generations[idx],
-                            offset: a.offset,
-                            allocation_size: a.actual_size,
-                            len: size,
-                        });
-                    }
-                }
-            }
-            if let Ok(seg) = self.create_segment() {
-                let idx = self.segments.len();
-                self.segments.push(Some(seg));
-                self.idle_since.push(None);
-                if let Some(a) = self
-                    .segment(idx)
-                    .expect("owner segment slot")
-                    .allocator()
-                    .alloc(size)
-                {
-                    return Ok(MemHandle::Buddy {
-                        seg_idx: idx as u16,
-                        generation: self.generations[idx],
-                        offset: a.offset,
-                        allocation_size: a.actual_size,
-                        len: size,
-                    });
-                }
-            }
-        }
-
-        // Try dedicated SHM — NO FileSpill fallback. A SHM-budget rejection is
-        // reported as an error so transport can choose its existing chunked
-        // fallback; this path never silently spills to file.
+        // Dedicated SHM only — never FileSpill.
         match self.alloc_dedicated(size) {
             Ok(alloc) => Ok(MemHandle::Dedicated {
                 seg_idx: alloc.seg_idx as u16,
@@ -1086,9 +1030,10 @@ impl MemPool {
         }
     }
 
-    fn alloc_file_spill(&self, size: usize) -> Result<MemHandle, BackingError> {
+    fn alloc_file_spill(&mut self, size: usize) -> Result<MemHandle, BackingError> {
         // Charge the requested file backing length before creating anything;
-        // a rejection must not touch the filesystem.
+        // a rejection must not touch the filesystem. File backing is the
+        // pressure escape hatch: it is budget-gated but never pressure-denied.
         let backing_bytes = u64::try_from(size).map_err(|_| {
             BackingError::Other("file spill size exceeds budget accounting range".into())
         })?;
@@ -1100,6 +1045,7 @@ impl MemPool {
             // Guard drops here, releasing the reservation on creation failure.
             Err(e) => return Err(BackingError::Other(format!("file spill failed: {e}"))),
         };
+        self.counters.file_spill_allocs = self.counters.file_spill_allocs.saturating_add(1);
         Ok(MemHandle::FileSpill {
             mmap: mmap.with_budget_guard(guard),
             path,
@@ -1314,12 +1260,45 @@ impl MemPool {
     }
 
     fn alloc_buddy(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
-        // Layer 1: Try existing segments. Skip segments with insufficient free space
-        // to avoid unnecessary spinlock acquisition.
+        // Layer 1: Reuse an already-mapped segment — permitted under
+        // pressure, with no new backing charge and no OS query.
+        if let Some(a) = self.try_buddy_reuse(size) {
+            return Ok(a);
+        }
+
+        // Layer 1.5: GC before expansion — reclaim idle trailing segments,
+        // then retry reuse.
+        if self.gc_buddy() > 0 {
+            if let Some(a) = self.try_buddy_reuse(size) {
+                return Ok(a);
+            }
+        }
+
+        // Layer 2: Create a new segment (the pressure/budget-enforced seam).
+        // A creation failure (for example the SHM object cannot be mapped or
+        // pressure denies the full segment) falls through to Layer 3
+        // dedicated storage instead of failing the allocation outright.
+        if self.segments.len() < self.config.max_segments {
+            if let Some(a) = self.expand_buddy(size) {
+                return Ok(a);
+            }
+        }
+
+        // Layer 3: Dedicated segment fallback (its own, smaller, seam checks).
+        self.alloc_dedicated(size)
+    }
+
+    /// Try to serve `size` from an already-mapped buddy segment.
+    ///
+    /// Reuse is always permitted — including under OS-memory pressure —
+    /// because it maps nothing and charges nothing.
+    fn try_buddy_reuse(&mut self, size: usize) -> Option<PoolAllocation> {
         for (idx, seg) in self.segments.iter().enumerate() {
             let Some(seg) = seg else {
                 continue;
             };
+            // Skip segments with insufficient free space to avoid unnecessary
+            // spinlock acquisition.
             if (seg.allocator().free_bytes() as usize) < size {
                 continue;
             }
@@ -1328,7 +1307,9 @@ impl MemPool {
                 if idx < self.idle_since.len() {
                     self.idle_since[idx] = None;
                 }
-                return Ok(PoolAllocation {
+                self.counters.buddy_reused_allocs =
+                    self.counters.buddy_reused_allocs.saturating_add(1);
+                return Some(PoolAllocation {
                     seg_idx: idx as u32,
                     generation: self.generations[idx],
                     offset: a.offset,
@@ -1338,62 +1319,36 @@ impl MemPool {
                 });
             }
         }
+        None
+    }
 
-        // Layer 1.5: GC before expansion — reclaim idle trailing segments
-        let reclaimed = self.gc_buddy();
-        if reclaimed > 0 {
-            // Retry existing segments after GC freed some
-            for (idx, seg) in self.segments.iter().enumerate() {
-                let Some(seg) = seg else {
-                    continue;
-                };
-                if (seg.allocator().free_bytes() as usize) < size {
-                    continue;
-                }
-                if let Some(a) = seg.allocator().alloc(size) {
-                    if idx < self.idle_since.len() {
-                        self.idle_since[idx] = None;
-                    }
-                    return Ok(PoolAllocation {
-                        seg_idx: idx as u32,
-                        generation: self.generations[idx],
-                        offset: a.offset,
-                        actual_size: a.actual_size,
-                        level: a.level,
-                        is_dedicated: false,
-                    });
-                }
-            }
+    /// Create one new buddy segment and allocate `size` from it.
+    ///
+    /// Returns `None` when creation fails for any reason (geometry,
+    /// pressure, budget, or OS); callers fall through to the next tier.
+    fn expand_buddy(&mut self, size: usize) -> Option<PoolAllocation> {
+        let seg = self.create_segment().ok()?;
+        let idx = self.segments.len();
+        self.segments.push(Some(seg));
+        self.idle_since.push(None);
+        if let Some(a) = self
+            .segment(idx)
+            .expect("owner segment slot")
+            .allocator()
+            .alloc(size)
+        {
+            self.counters.buddy_expanded_allocs =
+                self.counters.buddy_expanded_allocs.saturating_add(1);
+            return Some(PoolAllocation {
+                seg_idx: idx as u32,
+                generation: self.generations[idx],
+                offset: a.offset,
+                actual_size: a.actual_size,
+                level: a.level,
+                is_dedicated: false,
+            });
         }
-
-        // Layer 2: Create new segment. A creation failure (for example the
-        // SHM object cannot be mapped) falls through to Layer 3 dedicated
-        // storage instead of failing the allocation outright.
-        if self.segments.len() < self.config.max_segments {
-            if let Ok(seg) = self.create_segment() {
-                let idx = self.segments.len();
-                self.segments.push(Some(seg));
-                self.idle_since.push(None);
-                if let Some(a) = self
-                    .segment(idx)
-                    .expect("owner segment slot")
-                    .allocator()
-                    .alloc(size)
-                {
-                    return Ok(PoolAllocation {
-                        seg_idx: idx as u32,
-                        generation: self.generations[idx],
-                        offset: a.offset,
-                        actual_size: a.actual_size,
-                        level: a.level,
-                        is_dedicated: false,
-                    });
-                }
-            }
-        }
-
-        // Layer 3: Dedicated segment fallback.
-        self.alloc_dedicated(size)
+        None
     }
 
     fn alloc_dedicated(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
@@ -1416,7 +1371,9 @@ impl MemPool {
 
         let idx = self.next_dedicated_idx;
         if idx > u16::MAX as u32 {
-            return Err(BackingError::Other("dedicated segment index exhausted".into()));
+            return Err(BackingError::Other(
+                "dedicated segment index exhausted".into(),
+            ));
         }
 
         // Checked geometry and wire-representability before any charge or
@@ -1432,6 +1389,16 @@ impl MemPool {
             )));
         }
         let backing_bytes = u64::try_from(backing).expect("u32 range fits u64");
+        // Creation seam: judge this backing's own validated mapped size
+        // against OS-memory pressure before the budget reservation. A
+        // pressure-denied buddy segment does not suppress this smaller
+        // backing — the decision is per candidate, never a pool-global bit.
+        if let PressureDecision::Deny { reason } = self
+            .pressure
+            .evaluate(backing_bytes, "dedicated shared-memory backing")
+        {
+            return Err(BackingError::Pressure(reason));
+        }
         let guard = self
             .reserve_backing(BudgetKind::Shm, backing_bytes)
             .map_err(BackingError::Budget)?;
@@ -1446,6 +1413,7 @@ impl MemPool {
             .next_dedicated_idx
             .checked_add(1)
             .expect("dedicated segment index overflow");
+        self.counters.dedicated_allocs = self.counters.dedicated_allocs.saturating_add(1);
         let alloc_size = seg.size() as u32;
         self.dedicated.insert(
             idx,
@@ -1542,23 +1510,54 @@ impl MemPool {
         let backing_bytes = u64::try_from(layout.total_size).map_err(|_| {
             BackingError::Other("buddy backing size exceeds budget accounting range".into())
         })?;
+        // Creation seam: judge the full segment's validated total mapped
+        // bytes — never the payload size — against OS-memory pressure before
+        // the budget reservation. Reuse of existing segments never reaches
+        // this seam. A pressure denial here falls through to a smaller
+        // dedicated backing when one fits.
+        if let PressureDecision::Deny { reason } = self
+            .pressure
+            .evaluate(backing_bytes, "buddy segment backing")
+        {
+            return Err(BackingError::Pressure(reason));
+        }
         let guard = self
             .reserve_backing(BudgetKind::Shm, backing_bytes)
             .map_err(BackingError::Budget)?;
-        let segment = match BuddySegment::create(
-            &name,
-            self.config.segment_size,
-            self.config.min_block_size,
-        ) {
-            Ok(segment) => segment.with_budget_guard(guard),
-            // Guard drops here, releasing the reservation on creation failure.
-            Err(e) => return Err(BackingError::Other(e)),
-        };
+        let segment =
+            match BuddySegment::create(&name, self.config.segment_size, self.config.min_block_size)
+            {
+                Ok(segment) => segment.with_budget_guard(guard),
+                // Guard drops here, releasing the reservation on creation failure.
+                Err(e) => return Err(BackingError::Other(e)),
+            };
         if self.generations.len() <= idx {
             self.generations.resize(idx + 1, 0);
         }
         self.generations[idx] = generation;
         Ok(segment)
+    }
+
+    /// Install deterministic availability/clock sources for pressure tests.
+    ///
+    /// Test-only: shipped builds always sample the raw OS availability query
+    /// and the real clock. Installing hooks drops any cached observation.
+    #[cfg(test)]
+    pub(crate) fn install_pressure_hooks(&mut self, hooks: crate::pressure::PressureHooks) {
+        self.pressure.install_hooks(hooks);
+    }
+}
+
+impl PoolAllocation {
+    fn into_buddy_handle(self, len: usize) -> MemHandle {
+        debug_assert!(!self.is_dedicated);
+        MemHandle::Buddy {
+            seg_idx: self.seg_idx as u16,
+            generation: self.generation,
+            offset: self.offset,
+            allocation_size: self.actual_size,
+            len,
+        }
     }
 }
 
@@ -1697,9 +1696,17 @@ mod tests {
         let mut pool = test_pool(small_config());
         let a = pool.alloc(4096).unwrap();
         let stats = pool.stats();
-        assert!(stats.total_bytes > 0);
+        assert!(stats.buddy_data_bytes > 0);
+        assert_eq!(
+            stats.buddy_idle_bytes + stats.buddy_occupied_bytes,
+            stats.buddy_data_bytes
+        );
         assert!(stats.alloc_count >= 1);
+        assert!(stats.utilization_ratio > 0.0);
         pool.free(&a).unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.buddy_occupied_bytes, 0);
+        assert_eq!(stats.utilization_ratio, 0.0);
     }
 
     #[test]
@@ -2908,7 +2915,7 @@ mod handle_tests {
             assert_eq!(pool.copy_handle_data(&handle).unwrap().len(), length);
             pool.release_handle(handle);
             assert_eq!(pool.stats().alloc_count, 0);
-            assert_eq!(pool.stats().free_bytes, capacity);
+            assert_eq!(pool.stats().buddy_idle_bytes, capacity);
         }
     }
 }
@@ -2955,9 +2962,10 @@ mod budget_tests {
     #[test]
     fn zero_budget_rejects_before_any_mapping() {
         let config = budget_config();
-        let mut pool = budget_pool(config.clone(), MemoryBudget::from_limits(
-            &c2_config::MemoryBudgetLimits::zeroed(),
-        ));
+        let mut pool = budget_pool(
+            config.clone(),
+            MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::zeroed()),
+        );
 
         // Prewarm is a creation entry point and must reject before mapping.
         assert!(
@@ -2979,7 +2987,10 @@ mod budget_tests {
         );
         assert_eq!(pool.segment_count(), 0);
         assert!(pool.dedicated.is_empty());
-        assert_eq!(pool.budget().unwrap().snapshot().shm.rejected_allocations, 3);
+        assert_eq!(
+            pool.budget().unwrap().snapshot().shm.rejected_allocations,
+            3
+        );
 
         // The zeroed file cell rejects before touching the filesystem.
         let mut spill_config = config.clone();
@@ -2987,9 +2998,10 @@ mod budget_tests {
         let spill_dir = std::env::temp_dir().join(format!("c2_budget_zero_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&spill_dir);
         spill_config.spill_dir = spill_dir.clone();
-        let mut spiller = budget_pool(spill_config, MemoryBudget::from_limits(
-            &c2_config::MemoryBudgetLimits::zeroed(),
-        ));
+        let mut spiller = budget_pool(
+            spill_config,
+            MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::zeroed()),
+        );
         assert!(
             spiller
                 .alloc_handle(4096)
@@ -3020,8 +3032,7 @@ mod budget_tests {
         // Dedicated: page-aligned header + payload, exactly the mapped size.
         let dedicated = pool.alloc(20000).unwrap();
         assert!(dedicated.is_dedicated);
-        let dedicated_backing =
-            DedicatedSegment::required_shm_size(20000).unwrap() as u64;
+        let dedicated_backing = DedicatedSegment::required_shm_size(20000).unwrap() as u64;
         assert_eq!(
             budget.snapshot().shm.used_bytes,
             buddy_backing(&config) + dedicated_backing
@@ -3144,8 +3155,7 @@ mod budget_tests {
         // 20000 bytes exceeds the 8192 buddy ceiling: dedicated-only charge.
         let alloc = pool.alloc(20000).unwrap();
         assert!(alloc.is_dedicated);
-        let dedicated_backing =
-            DedicatedSegment::required_shm_size(20000).unwrap() as u64;
+        let dedicated_backing = DedicatedSegment::required_shm_size(20000).unwrap() as u64;
         assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
 
         // Creator free marks freed_at but waits for peer read_done / GC.
@@ -3172,10 +3182,8 @@ mod budget_tests {
     #[test]
     fn file_creation_failure_releases_reservation() {
         let config = budget_config();
-        let not_a_dir = std::env::temp_dir().join(format!(
-            "c2_budget_not_a_dir_{}",
-            std::process::id()
-        ));
+        let not_a_dir =
+            std::env::temp_dir().join(format!("c2_budget_not_a_dir_{}", std::process::id()));
         let _ = std::fs::remove_file(&not_a_dir);
         std::fs::write(&not_a_dir, b"occupies the path").unwrap();
 
@@ -3259,7 +3267,10 @@ mod budget_tests {
         // Every tier was attempted and none created a backing.
         assert_eq!(pool.segment_count(), 0);
         assert!(pool.dedicated.is_empty());
-        assert!(!dir.exists(), "no spill file may be created by a rejected tier");
+        assert!(
+            !dir.exists(),
+            "no spill file may be created by a rejected tier"
+        );
         let snap = budget.snapshot();
         assert_eq!(snap.shm.rejected_allocations, 2); // buddy expansion + dedicated
         assert_eq!(snap.file.rejected_allocations, 1);
@@ -3268,7 +3279,11 @@ mod budget_tests {
 
         // SHM-only allocation reports a capacity error for transport's
         // existing chunked fallback; it never silently spills.
-        assert!(pool.try_alloc_shm(4096).unwrap_err().contains("no SHM capacity"));
+        assert!(
+            pool.try_alloc_shm(4096)
+                .unwrap_err()
+                .contains("no SHM capacity")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3342,21 +3357,22 @@ mod budget_tests {
         // Dedicated pending-GC then reclaimed, then a file handle outliving
         // the pool itself: the charge persists until the mapping drops.
         let d = pool.alloc(20000).unwrap();
-        let dedicated_backing =
-            DedicatedSegment::required_shm_size(20000).unwrap() as u64;
+        let dedicated_backing = DedicatedSegment::required_shm_size(20000).unwrap() as u64;
         assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
         pool.free(&d).unwrap();
         assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
-        pool.dedicated.get(&d.seg_idx).unwrap().segment.mark_read_done();
+        pool.dedicated
+            .get(&d.seg_idx)
+            .unwrap()
+            .segment
+            .mark_read_done();
         pool.gc_dedicated();
         assert_eq!(budget.snapshot().shm.used_bytes, 0);
 
         let mut spill_config = config;
         spill_config.spill_threshold = 0.0;
-        spill_config.spill_dir = std::env::temp_dir().join(format!(
-            "c2_budget_teardown_{}",
-            std::process::id()
-        ));
+        spill_config.spill_dir =
+            std::env::temp_dir().join(format!("c2_budget_teardown_{}", std::process::id()));
         let mut spiller = budget_pool(spill_config, budget.clone());
         let handle = spiller.alloc_handle(4096).unwrap();
         drop(spiller);
@@ -3368,7 +3384,10 @@ mod budget_tests {
         assert_eq!(snap.shm.used_bytes, 0);
         assert_eq!(snap.file.used_bytes, 0);
         assert_eq!(snap.reassembly.used_bytes, 0);
-        assert!(snap.shm.peak_bytes > 0, "peaks persist; counters are never reset");
+        assert!(
+            snap.shm.peak_bytes > 0,
+            "peaks persist; counters are never reset"
+        );
     }
 }
 
@@ -3426,8 +3445,7 @@ mod geometry_and_guard_tests {
             config.segment_size = segment_size;
             MemPool::validate_config(&config).expect("validation accepts; the seam preflights");
 
-            let budget =
-                MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+            let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
             let mut pool =
                 MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone());
             let error = pool.ensure_ready().unwrap_err();
@@ -3441,7 +3459,10 @@ mod geometry_and_guard_tests {
             // geometry preflight rejects before the reservation.
             let snap = budget.snapshot();
             assert_eq!(snap.shm.used_bytes, 0, "segment_size {segment_size}");
-            assert_eq!(snap.shm.rejected_allocations, 0, "segment_size {segment_size}");
+            assert_eq!(
+                snap.shm.rejected_allocations, 0,
+                "segment_size {segment_size}"
+            );
 
             // No named region exists: derive the name segment 0 would have
             // used and prove nothing is registered under it.
@@ -3474,8 +3495,7 @@ mod geometry_and_guard_tests {
         // remove the named POSIX SHM objects, not just the pool's containers.
         let config = geometry_config();
         let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
-        let mut pool =
-            MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone());
+        let mut pool = MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone());
 
         let block = pool.alloc(4096).unwrap();
         let dedicated = pool.alloc(20000).unwrap();
@@ -3499,5 +3519,388 @@ mod geometry_and_guard_tests {
             "dedicated region {dedicated_name} must not survive owner teardown"
         );
         assert_eq!(budget.snapshot().shm.used_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod pressure_seam_tests {
+    use super::*;
+    use crate::pressure::PressureHooks;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtOrd};
+
+    static PRESSURE_TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_prefix() -> String {
+        let id = PRESSURE_TEST_COUNTER.fetch_add(1, AtOrd::Relaxed);
+        format!("/cc3bp{:04x}{:04x}", std::process::id() as u16, id)
+    }
+
+    /// Tiny geometry with the heuristic active: buddy data region 8192,
+    /// buddy total backing larger, dedicated backing for a 4096-byte payload
+    /// is page_align(4096+64) = 8192.
+    fn pressure_config() -> PoolConfig {
+        PoolConfig {
+            segment_size: 8192,
+            min_block_size: 4096,
+            max_segments: 4,
+            max_dedicated_segments: 4,
+            dedicated_crash_timeout_secs: 60.0,
+            buddy_idle_decay_secs: 0.0,
+            spill_threshold: 0.5,
+            spill_dir: std::env::temp_dir().join("c2_pressure_seam"),
+            ..PoolConfig::default()
+        }
+    }
+
+    fn buddy_total(config: &PoolConfig) -> u64 {
+        BuddyAllocator::checked_layout(config.segment_size, config.min_block_size)
+            .expect("test config geometry is supported")
+            .total_size as u64
+    }
+
+    fn dedicated_backing(payload: usize) -> u64 {
+        DedicatedSegment::required_shm_size(payload).unwrap() as u64
+    }
+
+    fn default_budget() -> MemoryBudget {
+        MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default())
+    }
+
+    /// Scripted availability (bytes), sample counter, and clock (ms).
+    struct Script {
+        available: Arc<AtomicU64>,
+        samples: Arc<AtomicU64>,
+        clock_ms: Arc<AtomicU64>,
+    }
+
+    impl Script {
+        fn install(pool: &mut MemPool, available: u64) -> Self {
+            let script = Self {
+                available: Arc::new(AtomicU64::new(available)),
+                samples: Arc::new(AtomicU64::new(0)),
+                clock_ms: Arc::new(AtomicU64::new(0)),
+            };
+            pool.install_pressure_hooks(PressureHooks::scripted(
+                Arc::clone(&script.available),
+                Arc::clone(&script.samples),
+                Arc::clone(&script.clock_ms),
+            ));
+            script
+        }
+
+        fn set_available(&self, bytes: u64) {
+            self.available.store(bytes, AtOrd::SeqCst);
+        }
+
+        fn advance_ms(&self, millis: u64) {
+            self.clock_ms.fetch_add(millis, AtOrd::SeqCst);
+        }
+
+        fn samples(&self) -> u64 {
+            self.samples.load(AtOrd::SeqCst)
+        }
+    }
+
+    #[test]
+    fn tiny_payload_is_pressure_denied_before_map_and_smaller_dedicated_fits() {
+        let config = pressure_config();
+        let budget = default_budget();
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone());
+        let buddy = buddy_total(&config);
+        let dedicated = dedicated_backing(4096);
+        assert!(
+            dedicated < buddy,
+            "test geometry needs a smaller dedicated tier"
+        );
+        // Availability that admits an 8192-byte dedicated backing at the 50%
+        // bar but not the larger full buddy segment.
+        Script::install(&mut pool, 2 * dedicated);
+
+        let alloc = pool.alloc(4096).unwrap();
+        assert!(
+            alloc.is_dedicated,
+            "a tiny payload must not create the oversized buddy backing under pressure"
+        );
+        assert_eq!(pool.segment_count(), 0, "buddy backing denied before map");
+        assert_eq!(budget.snapshot().shm.used_bytes, dedicated);
+        let stats = pool.stats();
+        assert_eq!(stats.pressure_denied_backings, 1);
+        assert_eq!(stats.dedicated_allocs, 1);
+        assert_eq!(stats.buddy_expanded_allocs, 0);
+        pool.free(&alloc).unwrap();
+    }
+
+    #[test]
+    fn entrypoints_agree_on_backing_policy_under_pressure() {
+        let config = pressure_config();
+        let dedicated = dedicated_backing(4096);
+
+        // Pressure denies the buddy segment but a dedicated backing fits:
+        // every entry point selects dedicated, none errors or spills.
+        let budget = default_budget();
+        let mut pool = MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget);
+        Script::install(&mut pool, 2 * dedicated);
+        assert!(
+            pool.ensure_ready()
+                .unwrap_err()
+                .contains("OS memory pressure"),
+            "explicit prewarm obeys the same backing policy"
+        );
+        assert_eq!(pool.segment_count(), 0);
+        let a = pool.alloc(4096).unwrap();
+        assert!(a.is_dedicated);
+        let h = pool.alloc_handle(4096).unwrap();
+        assert!(
+            h.is_dedicated(),
+            "alloc_handle must not spill while SHM fits"
+        );
+        let s = pool.try_alloc_shm(4096).unwrap();
+        assert!(s.is_dedicated());
+        pool.free(&a).unwrap();
+        pool.release_handle(h);
+        pool.release_handle(s);
+
+        // Forced threshold zero: SHM creation always denied. alloc_handle
+        // takes file backing; SHM-only entry points return capacity errors.
+        let mut forced_config = config;
+        forced_config.spill_threshold = 0.0;
+        let mut forced =
+            MemPool::new_with_prefix_and_budget(forced_config, unique_prefix(), default_budget());
+        Script::install(&mut forced, u64::MAX);
+        assert!(
+            forced
+                .ensure_ready()
+                .unwrap_err()
+                .contains("forces new shared-memory backings")
+        );
+        assert!(
+            forced
+                .alloc(4096)
+                .unwrap_err()
+                .contains("forces new shared-memory backings")
+        );
+        assert!(
+            forced
+                .try_alloc_shm(4096)
+                .unwrap_err()
+                .contains("no SHM capacity")
+        );
+        let spilled = forced.alloc_handle(4096).unwrap();
+        assert!(spilled.is_file_spill());
+        assert_eq!(forced.segment_count(), 0);
+        // ensure_ready(1) + alloc(buddy+dedicated) + try_alloc_shm(2) +
+        // alloc_handle(2) pressure denials in total.
+        assert_eq!(forced.stats().pressure_denied_backings, 7);
+        assert_eq!(forced.stats().file_spill_allocs, 1);
+        drop(spilled);
+    }
+
+    #[test]
+    fn existing_buddy_reuse_succeeds_under_pressure_with_no_new_charge() {
+        let config = pressure_config();
+        let budget = default_budget();
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone());
+
+        // Ample availability maps one buddy segment holding two blocks.
+        Script::install(&mut pool, 1 << 40);
+        let a = pool.alloc(4096).unwrap();
+        let b = pool.alloc(4096).unwrap();
+        assert!(!a.is_dedicated && !b.is_dedicated);
+        pool.free(&a).unwrap();
+        pool.free(&b).unwrap();
+        let charged = budget.snapshot().shm.used_bytes;
+        assert_eq!(charged, buddy_total(&config));
+
+        // Zero observed availability: reuse of the already-mapped segment is
+        // still permitted, takes no new charge, and never consults pressure.
+        Script::install(&mut pool, 0);
+        let reused = pool.alloc(4096).unwrap();
+        assert!(!reused.is_dedicated);
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        let stats = pool.stats();
+        assert_eq!(stats.buddy_reused_allocs, 2);
+        assert_eq!(stats.buddy_expanded_allocs, 1);
+        assert_eq!(stats.pressure_denied_backings, 0);
+        pool.free(&reused).unwrap();
+    }
+
+    #[test]
+    fn cached_observation_bounds_os_sampling_at_the_seams() {
+        let mut pool = MemPool::new_with_prefix_and_budget(
+            pressure_config(),
+            unique_prefix(),
+            default_budget(),
+        );
+        // Zero availability denies every creation seam deterministically.
+        let script = Script::install(&mut pool, 0);
+
+        for _ in 0..5 {
+            assert!(
+                pool.ensure_ready()
+                    .unwrap_err()
+                    .contains("OS memory pressure")
+            );
+        }
+        assert_eq!(
+            script.samples(),
+            1,
+            "repeated decisions inside one TTL must share a single OS sample"
+        );
+
+        // After the TTL a fresh sample is taken.
+        script.advance_ms(1_001);
+        assert!(
+            pool.ensure_ready()
+                .unwrap_err()
+                .contains("OS memory pressure")
+        );
+        assert_eq!(script.samples(), 2);
+    }
+
+    #[test]
+    fn recovery_band_gates_buddy_creation_until_genuine_recovery() {
+        let config = pressure_config();
+        let buddy = buddy_total(&config);
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config, unique_prefix(), default_budget());
+        // Direct bar: buddy needs 2*buddy observed bytes at threshold 0.5.
+        let script = Script::install(&mut pool, 2 * buddy - 1);
+        assert!(
+            pool.ensure_ready()
+                .unwrap_err()
+                .contains("OS memory pressure")
+        );
+
+        // Just past the direct bar but inside the recovery band (which needs
+        // 2.5*buddy): without hysteresis this would flip to admitting.
+        script.advance_ms(1_001);
+        script.set_available(2 * buddy + 2);
+        assert!(
+            pool.ensure_ready()
+                .unwrap_err()
+                .contains("OS memory pressure"),
+            "availability inside the recovery band must stay denied"
+        );
+        assert_eq!(pool.segment_count(), 0);
+
+        // Genuine recovery admits the same tier again.
+        script.advance_ms(1_001);
+        script.set_available(3 * buddy);
+        pool.ensure_ready().unwrap();
+        assert_eq!(pool.segment_count(), 1);
+    }
+
+    #[test]
+    fn pressure_denied_shm_escapes_to_file_backing() {
+        let config = pressure_config();
+        let budget = MemoryBudget::new(u64::MAX, u64::MAX, u64::MAX);
+        let mut pool = MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone());
+        // A failed (zero) availability observation denies every SHM seam.
+        Script::install(&mut pool, 0);
+        let handle = pool.alloc_handle(4096).unwrap();
+        assert!(handle.is_file_spill());
+        assert_eq!(pool.stats().pressure_denied_backings, 2);
+        assert_eq!(budget.snapshot().file.used_bytes, 4096);
+        drop(handle);
+        assert_eq!(budget.snapshot().file.used_bytes, 0);
+    }
+
+    #[test]
+    fn exhausted_file_backing_yields_a_clear_terminal_failure() {
+        let mut config = pressure_config();
+        config.spill_threshold = 0.0;
+        let budget = MemoryBudget::new(u64::MAX, 0, u64::MAX);
+        let mut pool = MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget);
+        Script::install(&mut pool, u64::MAX);
+
+        let error = pool.alloc_handle(4096).unwrap_err();
+        assert!(
+            error.contains("memory budget cell 'file'"),
+            "terminal failure should name the exhausted file cell: {error}"
+        );
+        assert_eq!(pool.segment_count(), 0);
+        assert_eq!(pool.stats().dedicated_segments, 0);
+        assert_eq!(pool.stats().pressure_denied_backings, 2);
+    }
+
+    #[test]
+    fn counters_and_utilization_reflect_the_actually_selected_tiers() {
+        let config = pressure_config();
+        let budget = default_budget();
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone());
+        Script::install(&mut pool, 1 << 40);
+
+        // First small allocation expands the buddy pool; the next reuses it.
+        let block = pool.alloc(4096).unwrap();
+        let mut stats = pool.stats();
+        assert_eq!(stats.buddy_expanded_allocs, 1);
+        assert_eq!(stats.buddy_reused_allocs, 0);
+        assert_eq!(stats.buddy_occupied_bytes, 4096);
+        assert_eq!(stats.buddy_idle_bytes, 4096);
+        assert_eq!(stats.buddy_data_bytes, 8192);
+        assert!((stats.utilization_ratio - 0.5).abs() < 1e-9);
+        pool.free(&block).unwrap();
+        assert_eq!(pool.stats().utilization_ratio, 0.0);
+
+        let reused = pool.alloc(4096).unwrap();
+        assert_eq!(pool.stats().buddy_reused_allocs, 1);
+        pool.free(&reused).unwrap();
+
+        // Dedicated lifecycle: active, then pending-free (read_done unset),
+        // then reclaimed — mapped capacity must include pending entries.
+        let dedicated_alloc = pool.alloc(20000).unwrap();
+        assert!(dedicated_alloc.is_dedicated);
+        let backing = dedicated_backing(20000);
+        stats = pool.stats();
+        assert_eq!(stats.dedicated_allocs, 1);
+        assert_eq!(stats.dedicated_active_count, 1);
+        assert_eq!(stats.dedicated_active_bytes, backing);
+        assert_eq!(stats.dedicated_pending_free_bytes, 0);
+        assert_eq!(stats.dedicated_mapped_bytes, backing);
+        assert_eq!(stats.alloc_count, 1);
+
+        pool.free(&dedicated_alloc).unwrap();
+        stats = pool.stats();
+        assert_eq!(stats.dedicated_active_count, 0);
+        assert_eq!(stats.dedicated_active_bytes, 0);
+        assert_eq!(stats.dedicated_pending_free_bytes, backing);
+        assert_eq!(
+            stats.dedicated_mapped_bytes, backing,
+            "pending-free dedicated entries stay mapped until read_done/GC"
+        );
+        assert_eq!(stats.alloc_count, 0);
+
+        pool.dedicated
+            .get(&dedicated_alloc.seg_idx)
+            .unwrap()
+            .segment
+            .mark_read_done();
+        pool.gc_dedicated();
+        stats = pool.stats();
+        assert_eq!(stats.dedicated_mapped_bytes, 0);
+        assert_eq!(stats.dedicated_pending_free_bytes, 0);
+
+        // File tier through the forced-threshold route.
+        let mut forced_config = config;
+        forced_config.spill_threshold = 0.0;
+        let spill_dir =
+            std::env::temp_dir().join(format!("c2_pressure_count_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&spill_dir);
+        forced_config.spill_dir = spill_dir.clone();
+        let mut spiller =
+            MemPool::new_with_prefix_and_budget(forced_config, unique_prefix(), budget.clone());
+        let handle = spiller.alloc_handle(4096).unwrap();
+        assert!(handle.is_file_spill());
+        stats = spiller.stats();
+        assert_eq!(stats.file_spill_allocs, 1);
+        assert_eq!(stats.buddy_expanded_allocs, 0);
+        assert_eq!(stats.buddy_reused_allocs, 0);
+        assert_eq!(stats.dedicated_allocs, 0);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&spill_dir);
     }
 }

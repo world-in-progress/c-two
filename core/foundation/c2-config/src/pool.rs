@@ -18,8 +18,14 @@ pub struct PoolConfig {
     /// `alloc_count` has been zero for at least this duration becomes eligible
     /// for reclamation by `gc_buddy()`. Only trailing idle segments are popped.
     pub buddy_idle_decay_secs: f64,
-    /// Spill threshold ratio: when `requested > available_ram * threshold`,
-    /// use file-backed mmap.  Default 0.8 (80%).
+    /// OS-memory pressure threshold ratio for creating new shared-memory
+    /// backings, evaluated at the buddy-segment and dedicated-backing
+    /// creation seams against each candidate's validated total mapped bytes
+    /// (default 0.8). `0.0` (or any non-positive/non-finite value) forces
+    /// every new SHM mapping away from SHM — file spill where the API has
+    /// that fallback, an explicit error otherwise. `1.0` or greater disables
+    /// the heuristic. Reusing already-mapped buddy blocks is always allowed
+    /// and finite budget limits remain enforced regardless of this value.
     pub spill_threshold: f64,
     /// Directory for spill files, beneath the platform's temporary directory.
     pub spill_dir: std::path::PathBuf,
@@ -67,7 +73,10 @@ mod tests {
 
     #[test]
     fn pool_default_uses_platform_temporary_directory() {
-        assert_eq!(PoolConfig::default().spill_dir, std::env::temp_dir().join("c_two_spill"));
+        assert_eq!(
+            PoolConfig::default().spill_dir,
+            std::env::temp_dir().join("c_two_spill")
+        );
     }
 
     #[test]

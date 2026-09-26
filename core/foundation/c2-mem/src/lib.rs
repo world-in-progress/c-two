@@ -15,6 +15,7 @@ pub mod dedicated;
 pub mod handle;
 pub mod lease;
 pub mod pool;
+mod pressure;
 pub mod segment;
 pub mod spill;
 
@@ -32,4 +33,4 @@ pub use lease::{
 };
 pub use pool::{FreeResult, MemPool};
 pub use segment::ShmRegion;
-pub use spill::{available_physical_memory, create_file_spill, should_spill};
+pub use spill::{available_physical_memory, create_file_spill};

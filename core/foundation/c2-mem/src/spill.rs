@@ -128,22 +128,11 @@ pub fn available_physical_memory() -> u64 {
 
 // ── Spill decision ─────────────────────────────────────────────────
 
-/// Returns `true` when the requested allocation should use file-backed
-/// mmap instead of shared memory.
-///
-/// The heuristic: if `requested > available_ram * threshold`, spill.
-/// A threshold of 0.0 forces all allocations to spill (useful for tests).
-/// A threshold of 1.0 effectively disables spilling.
-pub fn should_spill(requested: usize, threshold: f64) -> bool {
-    if threshold <= 0.0 {
-        return true;
-    }
-    if threshold >= 1.0 {
-        return false;
-    }
-    let available = available_physical_memory();
-    requested as u64 > (available as f64 * threshold) as u64
-}
+// The spill decision itself lives in `pressure.rs`: owner pools judge each
+// candidate backing's validated total mapped bytes at the buddy and dedicated
+// creation seams, with a cached OS observation and a recovery band. This
+// module remains the raw OS surface — availability query and file mapping
+// creator — and stays uncharged by design; pool entrypoints own all policy.
 
 // ── File-backed mmap ───────────────────────────────────────────────
 
@@ -215,21 +204,6 @@ mod tests {
         let mem = available_physical_memory();
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         assert!(mem > 0, "expected nonzero available memory, got {mem}");
-    }
-
-    #[test]
-    fn test_should_spill_threshold_zero_always_spills() {
-        assert!(should_spill(1, 0.0));
-    }
-
-    #[test]
-    fn test_should_spill_threshold_one_never_spills() {
-        assert!(!should_spill(usize::MAX, 1.0));
-    }
-
-    #[test]
-    fn test_should_spill_small_allocation_does_not_spill() {
-        assert!(!should_spill(1, 0.8));
     }
 
     #[test]
