@@ -45,6 +45,16 @@ class BaseIPCOverrides(TypedDict, total=False):
     max_reassembly_bytes: int
     # Byte size of each chunk when chunked transfer is used.
     chunk_size: int
+    # Finite budget for owner-created SHM backing (buddy and dedicated),
+    # including header and alignment overhead. Zero rejects positive
+    # reservations in this cell; it is not unlimited.
+    shm_backing_budget_bytes: int
+    # Finite budget for owner-created file backing length. Zero rejects
+    # positive reservations in this cell; it is not unlimited.
+    file_backing_budget_bytes: int
+    # Finite budget for allocated capacity of live chunk reassembly storage.
+    # Zero rejects positive reservations in this cell; it is not unlimited.
+    live_reassembly_budget_bytes: int
 
 
 class ServerIPCOverrides(BaseIPCOverrides, total=False):

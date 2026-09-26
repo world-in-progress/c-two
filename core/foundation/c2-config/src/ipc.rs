@@ -37,6 +37,9 @@ pub const BASE_IPC_OVERRIDE_KEYS: &[&str] = &[
     "chunk_assembler_timeout",
     "max_reassembly_bytes",
     "chunk_size",
+    "shm_backing_budget_bytes",
+    "file_backing_budget_bytes",
+    "live_reassembly_budget_bytes",
 ];
 
 /// Code-level IPC override fields accepted for server config resolution.
@@ -54,6 +57,9 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "chunk_assembler_timeout",
     "max_reassembly_bytes",
     "chunk_size",
+    "shm_backing_budget_bytes",
+    "file_backing_budget_bytes",
+    "live_reassembly_budget_bytes",
     "max_frame_size",
     "max_payload_size",
     "max_pending_requests",
@@ -78,6 +84,9 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
     "chunk_assembler_timeout",
     "max_reassembly_bytes",
     "chunk_size",
+    "shm_backing_budget_bytes",
+    "file_backing_budget_bytes",
+    "live_reassembly_budget_bytes",
     "pool_decay_seconds",
 ];
 
@@ -117,6 +126,11 @@ pub struct BaseIpcConfig {
     pub chunk_assembler_timeout_secs: f64,
     pub max_reassembly_bytes: u64,
     pub chunk_size: u64,
+
+    // ── Finite memory budget limits ──────────────────────────────────────
+    pub shm_backing_budget_bytes: u64,
+    pub file_backing_budget_bytes: u64,
+    pub live_reassembly_budget_bytes: u64,
 }
 
 // ─── Server ──────────────────────────────────────────────────────────────────
@@ -155,6 +169,7 @@ pub struct ClientIpcConfig {
 
 impl Default for BaseIpcConfig {
     fn default() -> Self {
+        let budget_limits = crate::MemoryBudgetLimits::default();
         Self {
             pool_enabled: true,
             pool_segment_size: 268_435_456, // 256 MB
@@ -172,6 +187,10 @@ impl Default for BaseIpcConfig {
             chunk_assembler_timeout_secs: 60.0,
             max_reassembly_bytes: 8_589_934_592, // 8 GB
             chunk_size: 131_072,                 // 128 KB
+
+            shm_backing_budget_bytes: budget_limits.shm_backing_budget_bytes,
+            file_backing_budget_bytes: budget_limits.file_backing_budget_bytes,
+            live_reassembly_budget_bytes: budget_limits.live_reassembly_budget_bytes,
         }
     }
 }
@@ -319,6 +338,20 @@ impl ServerIpcConfig {
 // ─── Validation ──────────────────────────────────────────────────────────────
 
 impl BaseIpcConfig {
+    /// Projects the resolved finite memory budget limits onto the canonical
+    /// [`MemoryBudgetLimits`] value.
+    ///
+    /// Transport owners use this to build a `c2_mem::MemoryBudget` (for
+    /// example through `MemoryBudget::from_limits`) without this config crate
+    /// holding the reservation primitive or a second defaults table.
+    pub fn memory_budget_limits(&self) -> crate::MemoryBudgetLimits {
+        crate::MemoryBudgetLimits {
+            shm_backing_budget_bytes: self.shm_backing_budget_bytes,
+            file_backing_budget_bytes: self.file_backing_budget_bytes,
+            live_reassembly_budget_bytes: self.live_reassembly_budget_bytes,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.pool_segment_size == 0 {
             return Err("pool_segment_size must be > 0".into());
@@ -426,6 +459,10 @@ impl BaseIpcConfig {
         if self.max_reassembly_bytes == 0 {
             return Err("max_reassembly_bytes must be > 0".into());
         }
+        // Memory budget limits are u64 and therefore cannot be negative; zero
+        // is a valid finite limit that rejects positive reservations (it is
+        // not unlimited), and the full u64 range is accepted. No cross-field
+        // budget validation exists by design.
         Ok(())
     }
 }
@@ -703,6 +740,94 @@ mod tests {
             ..ServerIpcConfig::default()
         };
         assert!(cfg.validate().unwrap_err().contains("shm_threshold"));
+    }
+
+    // ── Memory budget limits ─────────────────────────────────────────────
+
+    #[test]
+    fn base_defaults_come_from_memory_budget_limits() {
+        let cfg = BaseIpcConfig::default();
+        let limits = crate::MemoryBudgetLimits::default();
+
+        assert_eq!(cfg.shm_backing_budget_bytes, limits.shm_backing_budget_bytes);
+        assert_eq!(
+            cfg.file_backing_budget_bytes,
+            limits.file_backing_budget_bytes
+        );
+        assert_eq!(
+            cfg.live_reassembly_budget_bytes,
+            limits.live_reassembly_budget_bytes
+        );
+        assert_eq!(cfg.shm_backing_budget_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.file_backing_budget_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.live_reassembly_budget_bytes, 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn server_and_client_defaults_project_memory_budget_limits() {
+        assert_eq!(
+            ServerIpcConfig::default().memory_budget_limits(),
+            crate::MemoryBudgetLimits::default()
+        );
+        assert_eq!(
+            ClientIpcConfig::default().memory_budget_limits(),
+            crate::MemoryBudgetLimits::default()
+        );
+    }
+
+    #[test]
+    fn memory_budget_limits_projection_is_pure_field_copy() {
+        let cfg = BaseIpcConfig {
+            shm_backing_budget_bytes: 1,
+            file_backing_budget_bytes: u64::MAX,
+            live_reassembly_budget_bytes: 0,
+            ..BaseIpcConfig::default()
+        };
+
+        assert_eq!(
+            cfg.memory_budget_limits(),
+            crate::MemoryBudgetLimits {
+                shm_backing_budget_bytes: 1,
+                file_backing_budget_bytes: u64::MAX,
+                live_reassembly_budget_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_budget_limits_are_valid_finite_configuration() {
+        let cfg = BaseIpcConfig {
+            shm_backing_budget_bytes: 0,
+            file_backing_budget_bytes: 0,
+            live_reassembly_budget_bytes: 0,
+            ..BaseIpcConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.memory_budget_limits(), crate::MemoryBudgetLimits::zeroed());
+    }
+
+    #[test]
+    fn full_range_budget_limits_are_valid() {
+        let cfg = BaseIpcConfig {
+            shm_backing_budget_bytes: u64::MAX,
+            file_backing_budget_bytes: u64::MAX,
+            live_reassembly_budget_bytes: u64::MAX,
+            ..BaseIpcConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn budget_override_keys_are_role_visible() {
+        for key in [
+            "shm_backing_budget_bytes",
+            "file_backing_budget_bytes",
+            "live_reassembly_budget_bytes",
+        ] {
+            assert!(BASE_IPC_OVERRIDE_KEYS.contains(&key));
+            assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&key));
+            assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(&key));
+        }
     }
 
     // ── Deref ────────────────────────────────────────────────────────────

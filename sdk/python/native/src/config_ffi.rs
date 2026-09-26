@@ -121,6 +121,9 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
         chunk_assembler_timeout_secs: get_opt(dict, "chunk_assembler_timeout")?,
         max_reassembly_bytes: get_opt(dict, "max_reassembly_bytes")?,
         chunk_size: get_opt(dict, "chunk_size")?,
+        shm_backing_budget_bytes: get_opt(dict, "shm_backing_budget_bytes")?,
+        file_backing_budget_bytes: get_opt(dict, "file_backing_budget_bytes")?,
+        live_reassembly_budget_bytes: get_opt(dict, "live_reassembly_budget_bytes")?,
         max_frame_size: get_opt(dict, "max_frame_size")?,
         max_payload_size: get_opt(dict, "max_payload_size")?,
         max_pending_requests: get_opt(dict, "max_pending_requests")?,
@@ -182,6 +185,15 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.base.chunk_size {
         dict.set_item("chunk_size", value)?;
     }
+    if let Some(value) = overrides.base.shm_backing_budget_bytes {
+        dict.set_item("shm_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.base.file_backing_budget_bytes {
+        dict.set_item("file_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.base.live_reassembly_budget_bytes {
+        dict.set_item("live_reassembly_budget_bytes", value)?;
+    }
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -220,6 +232,15 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     }
     if let Some(value) = overrides.chunk_size {
         dict.set_item("chunk_size", value)?;
+    }
+    if let Some(value) = overrides.shm_backing_budget_bytes {
+        dict.set_item("shm_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.file_backing_budget_bytes {
+        dict.set_item("file_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.live_reassembly_budget_bytes {
+        dict.set_item("live_reassembly_budget_bytes", value)?;
     }
     if let Some(value) = overrides.max_frame_size {
         dict.set_item("max_frame_size", value)?;
@@ -289,6 +310,15 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.base.chunk_size {
         dict.set_item("chunk_size", value)?;
     }
+    if let Some(value) = overrides.base.shm_backing_budget_bytes {
+        dict.set_item("shm_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.base.file_backing_budget_bytes {
+        dict.set_item("file_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.base.live_reassembly_budget_bytes {
+        dict.set_item("live_reassembly_budget_bytes", value)?;
+    }
     if let Some(value) = overrides.pool_enabled {
         dict.set_item("pool_enabled", value)?;
     }
@@ -330,6 +360,15 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     }
     if let Some(value) = overrides.pool_decay_seconds {
         dict.set_item("pool_decay_seconds", value)?;
+    }
+    if let Some(value) = overrides.shm_backing_budget_bytes {
+        dict.set_item("shm_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.file_backing_budget_bytes {
+        dict.set_item("file_backing_budget_bytes", value)?;
+    }
+    if let Some(value) = overrides.live_reassembly_budget_bytes {
+        dict.set_item("live_reassembly_budget_bytes", value)?;
     }
     Ok(dict)
 }
@@ -373,6 +412,9 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
         max_reassembly_bytes: get_opt(&dict, "max_reassembly_bytes")?,
         chunk_size: get_opt(&dict, "chunk_size")?,
         pool_decay_seconds: get_opt(&dict, "pool_decay_seconds")?,
+        shm_backing_budget_bytes: get_opt(&dict, "shm_backing_budget_bytes")?,
+        file_backing_budget_bytes: get_opt(&dict, "file_backing_budget_bytes")?,
+        live_reassembly_budget_bytes: get_opt(&dict, "live_reassembly_budget_bytes")?,
         ..Default::default()
     })
 }
@@ -460,6 +502,9 @@ fn base_ipc_to_dict<'py>(
     dict.set_item("chunk_assembler_timeout", cfg.chunk_assembler_timeout_secs)?;
     dict.set_item("max_reassembly_bytes", cfg.max_reassembly_bytes)?;
     dict.set_item("chunk_size", cfg.chunk_size)?;
+    dict.set_item("shm_backing_budget_bytes", cfg.shm_backing_budget_bytes)?;
+    dict.set_item("file_backing_budget_bytes", cfg.file_backing_budget_bytes)?;
+    dict.set_item("live_reassembly_budget_bytes", cfg.live_reassembly_budget_bytes)?;
     Ok(dict)
 }
 

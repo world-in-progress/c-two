@@ -44,6 +44,9 @@ def _reset_registry_and_settings(monkeypatch):
         'C2_IPC_POOL_PREWARM_SEGMENTS',
         'C2_IPC_POOL_MIN_RETAINED_SEGMENTS',
         'C2_IPC_POOL_DECAY_SECONDS',
+        'C2_IPC_SHM_BACKING_BUDGET_BYTES',
+        'C2_IPC_FILE_BACKING_BUDGET_BYTES',
+        'C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES',
         'C2_RELAY_ANCHOR_ADDRESS',
         'C2_RELAY_USE_PROXY',
         'C2_RELAY_ROUTE_MAX_ATTEMPTS',
@@ -91,6 +94,9 @@ def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields(
     assert base['pool_prewarm_segments'] is int
     assert base['pool_min_retained_segments'] is int
     assert base['chunk_gc_interval'] is float
+    assert base['shm_backing_budget_bytes'] is int
+    assert base['file_backing_budget_bytes'] is int
+    assert base['live_reassembly_budget_bytes'] is int
     assert server['heartbeat_interval'] is float
     assert server['max_pending_requests'] is int
     assert server['max_execution_workers'] is int
@@ -243,6 +249,150 @@ def test_server_execution_workers_above_hard_limit_rejected(monkeypatch):
             bind_address='ipc://unit_execution_workers_oversized_override',
             ipc_overrides={'max_execution_workers': 65},
         )
+
+
+GIB = 1024 ** 3
+U64_MAX = 2 ** 64 - 1
+
+
+def test_resolved_ipc_config_exposes_canonical_memory_budget_defaults():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    server_cfg = native.resolve_server_ipc_config(None, None)
+    client_cfg = native.resolve_client_ipc_config(None, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == 8 * GIB
+        assert cfg['file_backing_budget_bytes'] == 16 * GIB
+        assert cfg['live_reassembly_budget_bytes'] == 8 * GIB
+
+
+def test_ipc_overrides_roundtrip_memory_budget_bytes():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = {
+        'shm_backing_budget_bytes': 3 * GIB,
+        'file_backing_budget_bytes': 5 * GIB,
+        'live_reassembly_budget_bytes': GIB,
+    }
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == 3 * GIB
+        assert cfg['file_backing_budget_bytes'] == 5 * GIB
+        assert cfg['live_reassembly_budget_bytes'] == GIB
+
+
+def test_memory_budget_zero_override_is_retained_not_unlimited():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = {
+        'shm_backing_budget_bytes': 0,
+        'file_backing_budget_bytes': 0,
+        'live_reassembly_budget_bytes': 0,
+    }
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == 0
+        assert cfg['file_backing_budget_bytes'] == 0
+        assert cfg['live_reassembly_budget_bytes'] == 0
+
+
+def test_memory_budget_full_u64_range_override_is_retained():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = {
+        'shm_backing_budget_bytes': U64_MAX,
+        'file_backing_budget_bytes': U64_MAX,
+        'live_reassembly_budget_bytes': U64_MAX,
+    }
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == U64_MAX
+        assert cfg['file_backing_budget_bytes'] == U64_MAX
+        assert cfg['live_reassembly_budget_bytes'] == U64_MAX
+
+
+def test_memory_budget_env_resolves_and_explicit_overrides_win(monkeypatch):
+    monkeypatch.setenv('C2_IPC_SHM_BACKING_BUDGET_BYTES', str(GIB))
+    monkeypatch.setenv('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(2 * GIB))
+    monkeypatch.setenv('C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', str(4 * GIB))
+
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    from_env = native.resolve_client_ipc_config(None, None)
+    assert from_env['shm_backing_budget_bytes'] == GIB
+    assert from_env['file_backing_budget_bytes'] == 2 * GIB
+    assert from_env['live_reassembly_budget_bytes'] == 4 * GIB
+
+    from_env_server = native.resolve_server_ipc_config(None, None)
+    assert from_env_server['shm_backing_budget_bytes'] == GIB
+    assert from_env_server['live_reassembly_budget_bytes'] == 4 * GIB
+
+    overrides = {
+        'shm_backing_budget_bytes': 7 * GIB,
+        'file_backing_budget_bytes': 0,
+        'live_reassembly_budget_bytes': 8 * GIB,
+    }
+    from_explicit = native.resolve_client_ipc_config(overrides, None)
+    assert from_explicit['shm_backing_budget_bytes'] == 7 * GIB
+    assert from_explicit['file_backing_budget_bytes'] == 0
+    assert from_explicit['live_reassembly_budget_bytes'] == 8 * GIB
+
+
+def test_memory_budget_negative_and_overflow_overrides_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    for bad_value in (-1, 2 ** 64):
+        with pytest.raises(OverflowError):
+            native.resolve_client_ipc_config(
+                {'shm_backing_budget_bytes': bad_value}, None
+            )
+        with pytest.raises(OverflowError):
+            native.resolve_server_ipc_config(
+                {'live_reassembly_budget_bytes': bad_value}, None
+            )
+
+
+def test_memory_budget_invalid_env_value_rejected_by_native(monkeypatch):
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    for key, bad_value in (
+        ('C2_IPC_SHM_BACKING_BUDGET_BYTES', '-1'),
+        ('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(2 ** 64)),
+        ('C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', 'not-a-number'),
+    ):
+        monkeypatch.setenv(key, bad_value)
+        with pytest.raises(ValueError, match=key):
+            native.resolve_server_ipc_config(None, None)
+        with pytest.raises(ValueError, match=key):
+            native.resolve_client_ipc_config(None, None)
+        monkeypatch.delenv(key)
+
+
+def test_client_session_projects_memory_budget_overrides():
+    cc.set_client(ipc_overrides={'shm_backing_budget_bytes': 2 * GIB})
+    registry = _ProcessRegistry.get()
+
+    client_config = registry._runtime_session.client_ipc_config  # noqa: SLF001
+    assert client_config['shm_backing_budget_bytes'] == 2 * GIB
+    assert client_config['file_backing_budget_bytes'] == 16 * GIB
+
+
+def test_low_level_server_projects_memory_budget_env(monkeypatch):
+    monkeypatch.setenv('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(32 * GIB))
+
+    server = Server(bind_address='ipc://unit_budget_env_server')
+    try:
+        assert server._config['file_backing_budget_bytes'] == 32 * GIB  # noqa: SLF001
+        assert server._config['shm_backing_budget_bytes'] == 8 * GIB  # noqa: SLF001
+    finally:
+        server.shutdown()
 
 
 def test_client_ipc_overrides_beat_env(monkeypatch):
