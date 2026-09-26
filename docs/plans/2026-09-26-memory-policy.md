@@ -64,7 +64,7 @@ PyPI：https://pypi.org/project/c-two/0.6.0/
 - `/tmp/c2-memory-060-wire-drop-probe.py` 与 `.log`：补充 proxy drop/GC 检查。
 - 两个探针中服务端 backing 在 shutdown 后消失，客户端 backing 在探针退出后仍可打开；这些探针使用了透明 socket 转发器，尚未做无转发器对照及清理根因定位，列为待核实生命周期现象，不外推为所有正式客户端必现泄漏。
 - Host 仅删除了两个已退出探针自身产生的剩余命名映射，清理回执为 `/tmp/c2-memory-060-wire-cleanup.json`、`/tmp/c2-memory-060-wire-drop-cleanup.json`。
-- 本次未修改 C-Two 生产代码或运行完整工程测试。独立 Buddy 审查已完成，Host 的复核与修正记录见下。
+- 初次分析未修改生产代码。当前实施状态及验收记录见下。
 
 
 
@@ -73,8 +73,8 @@ PyPI：https://pypi.org/project/c-two/0.6.0/
 用户已批准按上述方案实现。集成分支为 `socu/memory-policy`；实现提交与分析基线分别记录。
 
 - 待验收：统一 buddy 策略、惰性创建、明确预热和空闲温存配置。
-- 待验收：文件重组保留 backing，移除自动提升和整包临时复制。
-- 待验收：明确预算的所有者和共享范围，预留、转移及释放贯穿真实分配生命周期。
+- 已验收并提交 `ab9224d`：文件重组保留 backing，移除自动提升和整包临时复制；相关 319 项测试及新增 2 项 FileSpill 消费测试通过。Windows 条件断言仍待 CI。
+- 设计已复核，实施待验收：预算由 Runtime 客户端域、Server 域或显式低层上下文持有，明确有限默认值及生命周期；见 [预算契约](../reports/memory-budget-contract.md)。首轮设计已拒收，当前版本包含 Host 修正和独立审查补充。
 - 待验收：预算、各层回退和清理的负向测试，以及低负载/大消息基准。
 - 待验收：集成的 Unix、本机 Python 与 Windows CI 验证。
 
