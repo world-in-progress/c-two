@@ -229,6 +229,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
         ("python-build", ["uv", "sync", "--locked", "--python", python], ()),
         ("windows-harness-tests", ["uv", "run", "--no-sync", "pytest",
                                    "tests/repo/test_windows_native_runner.py", "tests/repo/test_windows_wheel_smoke.py",
+                                   "tests/repo/test_ipc_memory_benchmark.py",
                                    "-q", "--timeout=30", f"--junitxml={output / 'windows-harness-tests.xml'}"],
          ("python-build",)),
         ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build",)),
