@@ -1,8 +1,8 @@
 //! `ShmBuffer` — zero-copy Python buffer backed by shared memory.
 //!
-//! Wraps SHM coordinates (PeerShm), reassembly handles (Handle),
-//! or inline bytes (Inline) and exposes them via `__getbuffer__`
-//! for `memoryview()` zero-copy access.
+//! Wraps SHM coordinates (PeerShm) or inline bytes (Inline) and exposes
+//! them via `__getbuffer__` for `memoryview()` zero-copy access. Reassembled
+//! responses reach Python through their own lease projections, not here.
 
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use crate::lease_ffi::PyBufferLeaseTracker;
-use c2_mem::{BufferLeaseGuard, MemHandle, MemPool};
+use c2_mem::{BufferLeaseGuard, MemPool};
 
 // ---------------------------------------------------------------------------
 // Inner enum
@@ -30,11 +30,6 @@ enum ShmBufferInner {
         offset: u32,
         data_size: u32,
         is_dedicated: bool,
-    },
-    /// Reassembled handle from the local pool.
-    Handle {
-        handle: MemHandle,
-        pool: Arc<RwLock<MemPool>>,
     },
 }
 
@@ -95,28 +90,10 @@ impl PyShmBuffer {
         }
     }
 
-    /// Wrap a reassembled `MemHandle`.
-    pub fn from_handle(handle: MemHandle, pool: Arc<RwLock<MemPool>>) -> Self {
-        let data_len = handle.len();
-        Self {
-            inner: Mutex::new(Some(ShmBufferInner::Handle { handle, pool })),
-            lease: Mutex::new(None),
-            data_len,
-            exports: AtomicU32::new(0),
-        }
-    }
-
     fn storage_label_for_inner(inner: &ShmBufferInner) -> &'static str {
         match inner {
             ShmBufferInner::Inline(_) => "inline",
             ShmBufferInner::PeerShm { .. } => "shm",
-            ShmBufferInner::Handle { handle, .. } => {
-                if handle.is_file_spill() {
-                    "file_spill"
-                } else {
-                    "handle"
-                }
-            }
         }
     }
 }
@@ -190,11 +167,6 @@ impl PyShmBuffer {
                 let _ = p.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
                 Ok(())
             }
-            Some(ShmBufferInner::Handle { handle, pool }) => {
-                let mut p = pool.write();
-                let _ = p.release_handle(handle);
-                Ok(())
-            }
             Some(ShmBufferInner::Inline(_)) => Ok(()),
             None => Ok(()), // already released — idempotent
         }
@@ -254,11 +226,7 @@ impl PyShmBuffer {
                     .map_err(|e| PyBufferError::new_err(format!("SHM access: {e}")))?;
                 (raw_ptr as *const u8, *data_size as usize)
             }
-            ShmBufferInner::Handle { handle, pool } => {
-                let pool_guard = pool.read();
-                let slice = pool_guard.handle_slice(handle);
-                (slice.as_ptr(), slice.len())
-            }
+
         };
 
         // SAFETY: `pool_guard` (read lock) is released after extracting the raw pointer,
@@ -327,10 +295,6 @@ impl Drop for PyShmBuffer {
                 } => {
                     let mut p = pool.write();
                     let _ = p.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
-                }
-                ShmBufferInner::Handle { handle, pool } => {
-                    let mut p = pool.write();
-                    let _ = p.release_handle(handle);
                 }
                 ShmBufferInner::Inline(_) => {}
             }

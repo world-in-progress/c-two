@@ -1,4 +1,5 @@
 mod catalog;
+mod chunk_ordering;
 pub mod config;
 pub mod connection;
 mod dispatcher;

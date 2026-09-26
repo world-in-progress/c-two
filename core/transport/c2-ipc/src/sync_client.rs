@@ -3,7 +3,7 @@
 //! Wraps [`IpcClient`] for blocking calls from SDK bindings.
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 
 use c2_mem::{MemPool, PoolAllocation};
@@ -309,14 +309,12 @@ impl SyncClient {
         self.inner.server_pool.clone()
     }
 
-    /// Get a reference to the client reassembly pool (for FFI layer).
-    pub fn reassembly_pool_arc(&self) -> Arc<RwLock<MemPool>> {
-        self.inner.reassembly_pool_arc()
-    }
-
-    /// Bind a response to the exact transport pools that own its backing.
+    /// Bind a response to the exact transport pool that owns its backing.
+    ///
+    /// Reassembled handles carry their own pool and budget charge inside the
+    /// [`c2_wire::chunk::ReassemblyBacking`] carrier.
     pub fn lease_response(&self, response: ResponseData) -> ResponseLease {
-        ResponseLease::new(response, self.server_pool_arc(), self.reassembly_pool_arc())
+        ResponseLease::new(response, self.server_pool_arc())
     }
 
     /// Synchronous close.

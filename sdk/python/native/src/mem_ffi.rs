@@ -6,8 +6,8 @@
 //! - PoolConfig: configuration dataclass
 //! - PoolStats: statistics dataclass
 
-use c2_mem::handle::MemHandle;
 use c2_mem::{MemPool, PoolAllocation, PoolConfig};
+use c2_wire::chunk::ReassemblyBacking;
 use c2_wire::assembler::ChunkAssembler;
 use parking_lot::{Mutex, RwLock};
 use pyo3::buffer::PyBuffer;
@@ -580,8 +580,7 @@ pub struct PyMemHandle {
 }
 
 struct MemHandleInner {
-    handle: Option<MemHandle>,
-    pool: Arc<RwLock<MemPool>>,
+    backing: Option<ReassemblyBacking>,
 }
 
 #[pymethods]
@@ -590,9 +589,9 @@ impl PyMemHandle {
     fn len(&self) -> PyResult<usize> {
         let state = self.state.lock();
         state
-            .handle
+            .backing
             .as_ref()
-            .map(|h| h.len())
+            .map(|b| b.len())
             .ok_or_else(|| PyRuntimeError::new_err("handle released"))
     }
 
@@ -600,25 +599,29 @@ impl PyMemHandle {
     fn is_file_spill(&self) -> bool {
         let state = self.state.lock();
         state
-            .handle
+            .backing
             .as_ref()
-            .map(|h| h.is_file_spill())
+            .map(|b| b.is_file_spill())
             .unwrap_or(false)
     }
 
     #[getter]
     fn is_buddy(&self) -> bool {
         let state = self.state.lock();
-        state.handle.as_ref().map(|h| h.is_buddy()).unwrap_or(false)
+        state
+            .backing
+            .as_ref()
+            .map(|b| b.is_buddy())
+            .unwrap_or(false)
     }
 
     #[getter]
     fn is_dedicated(&self) -> bool {
         let state = self.state.lock();
         state
-            .handle
+            .backing
             .as_ref()
-            .map(|h| h.is_dedicated())
+            .map(|b| b.is_dedicated())
             .unwrap_or(false)
     }
 
@@ -626,39 +629,43 @@ impl PyMemHandle {
     #[pyo3(signature = (data, offset = 0))]
     fn write_at(&self, data: &[u8], offset: usize) -> PyResult<()> {
         let mut state = self.state.lock();
-        let inner = &mut *state; // reborrow for split field access
-        let h = inner
-            .handle
+        let backing = state
+            .backing
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("handle released"))?;
-        if offset + data.len() > h.len() {
-            return Err(PyRuntimeError::new_err("write_at out of bounds"));
-        }
-        let pool = inner.pool.read();
-        pool.handle_slice_mut(h)[offset..offset + data.len()].copy_from_slice(data);
-        Ok(())
+        backing
+            .write_at(offset, data)
+            .map_err(|e| PyRuntimeError::new_err(format!("write_at: {e}")))
     }
 
     /// Get raw pointer + length for memoryview construction.
     /// Returns (address, length) tuple.
     fn buffer_info(&self) -> PyResult<(usize, usize)> {
         let state = self.state.lock();
-        let h = state
-            .handle
+        let backing = state
+            .backing
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("handle released"))?;
-        let pool = state.pool.read();
-        let slice = pool.handle_slice(h);
-        Ok((slice.as_ptr() as usize, slice.len()))
+        backing
+            .with_slice(|slice| (slice.as_ptr() as usize, slice.len()))
+            .map_err(|e| PyRuntimeError::new_err(format!("buffer_info: {e}")))
     }
 
-    /// Release the underlying memory. Idempotent.
+    /// Release the underlying memory (storage first, then its budget
+    /// charge). Idempotent.
     fn release(&self) -> PyResult<()> {
         let mut state = self.state.lock();
-        if let Some(h) = state.handle.take() {
-            let mut pool = state.pool.write();
-            pool.release_handle(h);
-        }
+        let Some(backing) = state.backing.as_mut() else {
+            return Ok(());
+        };
+        backing
+            .release()
+            .map_err(|e| PyRuntimeError::new_err(format!("release: {e}")))?;
+        // Released-state contract: the wrapper must not keep a carrier that
+        // only looks live (a released carrier reports len 0 and a live-looking
+        // repr). Take and drop it only after the pool authority accepted the
+        // release; on error it stays for retry.
+        state.backing.take();
         Ok(())
     }
 
@@ -668,13 +675,13 @@ impl PyMemHandle {
 
     fn __repr__(&self) -> String {
         let state = self.state.lock();
-        match &state.handle {
-            Some(h) => format!(
+        match &state.backing {
+            Some(b) => format!(
                 "MemHandle(len={}, type={})",
-                h.len(),
-                if h.is_buddy() {
+                b.len(),
+                if b.is_buddy() {
                     "buddy"
-                } else if h.is_dedicated() {
+                } else if b.is_dedicated() {
                     "dedicated"
                 } else {
                     "file_spill"
@@ -687,11 +694,10 @@ impl PyMemHandle {
 
 impl Drop for PyMemHandle {
     fn drop(&mut self) {
+        // ReassemblyBacking::drop releases storage through the pool
+        // authority first, then refunds the reassembly budget charge.
         let mut state = self.state.lock();
-        if let Some(h) = state.handle.take() {
-            let mut pool = state.pool.write();
-            pool.release_handle(h);
-        }
+        drop(state.backing.take());
     }
 }
 
@@ -705,7 +711,6 @@ pub struct PyChunkAssembler {
 
 struct AssemblerInner {
     inner: Option<ChunkAssembler>,
-    pool: Arc<RwLock<MemPool>>,
 }
 
 #[pymethods]
@@ -713,22 +718,18 @@ impl PyChunkAssembler {
     #[new]
     fn new(pool_handle: &PyMemPool, total_chunks: usize, chunk_size: usize) -> PyResult<Self> {
         let pool_arc = pool_handle.pool_arc();
-        let asm = {
-            let mut pool = pool_arc.write();
-            ChunkAssembler::new(
-                &mut pool,
-                total_chunks,
-                chunk_size,
-                512,           // TODO: pass from config
-                8 * (1 << 30), // TODO: pass from config
-            )
-            .map_err(PyRuntimeError::new_err)?
-        };
+        // Admission (reassembly budget reservation before allocation) happens
+        // inside the constructor.
+        let asm = ChunkAssembler::new(
+            pool_arc,
+            total_chunks,
+            chunk_size,
+            512,           // TODO: pass from config
+            8 * (1 << 30), // TODO: pass from config
+        )
+        .map_err(PyRuntimeError::new_err)?;
         Ok(Self {
-            state: Mutex::new(AssemblerInner {
-                inner: Some(asm),
-                pool: pool_arc,
-            }),
+            state: Mutex::new(AssemblerInner { inner: Some(asm) }),
         })
     }
 
@@ -769,13 +770,11 @@ impl PyChunkAssembler {
     /// Feed a chunk. Returns True when all chunks received.
     fn feed_chunk(&self, chunk_idx: usize, data: &[u8]) -> PyResult<bool> {
         let mut state = self.state.lock();
-        let inner = &mut *state; // reborrow for split field access
-        let asm = inner
+        let asm = state
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
-        let pool = inner.pool.read();
-        asm.feed_chunk(&pool, chunk_idx, data)
+        asm.feed_chunk(chunk_idx, data)
             .map_err(PyRuntimeError::new_err)
     }
 
@@ -795,29 +794,25 @@ impl PyChunkAssembler {
         state.inner.as_ref().map(|a| a.received()).unwrap_or(0)
     }
 
-    /// Finish reassembly → PyMemHandle.
+    /// Finish reassembly → PyMemHandle owning the backing carrier.
     fn finish(&self) -> PyResult<PyMemHandle> {
         let mut state = self.state.lock();
         let asm = state
             .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
-        let handle = asm.finish().map_err(PyRuntimeError::new_err)?;
+        let backing = asm.finish().map_err(PyRuntimeError::new_err)?;
         Ok(PyMemHandle {
             state: Mutex::new(MemHandleInner {
-                handle: Some(handle),
-                pool: Arc::clone(&state.pool),
+                backing: Some(backing),
             }),
         })
     }
 
-    /// Abort reassembly, releasing buffer.
+    /// Abort reassembly, releasing buffer and its budget charge.
     fn abort(&self) -> PyResult<()> {
         let mut state = self.state.lock();
-        if let Some(asm) = state.inner.take() {
-            let mut pool = state.pool.write();
-            asm.abort(&mut pool);
-        }
+        drop(state.inner.take());
         Ok(())
     }
 }
@@ -825,10 +820,7 @@ impl PyChunkAssembler {
 impl Drop for PyChunkAssembler {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        if let Some(asm) = state.inner.take() {
-            let mut pool = state.pool.write();
-            asm.abort(&mut pool);
-        }
+        drop(state.inner.take());
     }
 }
 

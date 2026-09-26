@@ -64,6 +64,10 @@ use c2_wire::route_catalog_control::{
 use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_initiate, encode_shutdown_ack};
 
 use crate::catalog::{RouteCatalog, RouteWatchBatch};
+use crate::chunk_ordering::{
+    ChunkAdmissionGate, ChunkAdmissionOutcome, ChunkAdmissionOwner, ChunkAdmissionWaiter,
+    ChunkOrderingError,
+};
 use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{
@@ -185,6 +189,10 @@ pub struct Server {
     pending_requests: Arc<Semaphore>,
     chunk_processing_permits: Arc<Semaphore>,
     chunk_route_pending: parking_lot::Mutex<HashMap<(u64, u64), ChunkRouteAdmission>>,
+    /// Bounded per-request first-chunk admission ordering (see
+    /// [`crate::chunk_ordering`]). Created at frame dispatch and resolved by the
+    /// first chunk's task, its abort paths, or connection cleanup.
+    chunk_admission_gate: ChunkAdmissionGate,
     active_connections: parking_lot::Mutex<HashMap<u64, Arc<Connection>>>,
     active_connections_notify: Notify,
     shutdown_route_outcomes: parking_lot::Mutex<Vec<ServerRouteCloseOutcome>>,
@@ -291,8 +299,7 @@ impl Server {
     ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
         validate_server_identity(&identity)?;
-        let endpoint = parse_local_endpoint(address)?;
-        let (shutdown_tx, _) = watch::channel(false);
+        parse_local_endpoint(address)?;
         let reassembly_pool = {
             let pid = std::process::id();
             let ra_gen = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
@@ -306,9 +313,33 @@ impl Server {
                 prefix,
             )
         };
+        Self::with_reassembly_pool(
+            address,
+            config,
+            identity,
+            Arc::new(parking_lot::RwLock::new(reassembly_pool)),
+        )
+    }
+
+    /// Build a server around an explicitly owned reassembly pool.
+    ///
+    /// The pool's `MemPool::budget()` reassembly cell is the server-side
+    /// admission authority for chunked request reassembly. Production callers
+    /// pass the config-derived pool through [`Server::new_with_identity`];
+    /// tests use this seam to inject pools with tiny finite budgets.
+    fn with_reassembly_pool(
+        address: &str,
+        config: ServerIpcConfig,
+        identity: ServerIdentity,
+        reassembly_pool: Arc<parking_lot::RwLock<MemPool>>,
+    ) -> Result<Self, ServerError> {
+        config.validate().map_err(ServerError::Config)?;
+        validate_server_identity(&identity)?;
+        let endpoint = parse_local_endpoint(address)?;
+        let (shutdown_tx, _) = watch::channel(false);
         let chunk_config = c2_wire::chunk::ChunkConfig::from_base(&config);
         let chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
-            Arc::new(parking_lot::RwLock::new(reassembly_pool)),
+            reassembly_pool,
             chunk_config,
         ));
         let response_pool = {
@@ -334,6 +365,7 @@ impl Server {
                 .ensure_buddy_segments(prewarm_segments)
                 .map_err(|e| ServerError::Config(format!("response pool prewarm: {e}")))?;
         }
+        let chunk_admission_gate = ChunkAdmissionGate::new(config.max_total_chunks as usize);
         let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
         let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
         let chunk_processing_permits = Arc::new(Semaphore::new(config.max_total_chunks as usize));
@@ -361,6 +393,7 @@ impl Server {
             pending_requests,
             chunk_processing_permits,
             chunk_route_pending: parking_lot::Mutex::new(HashMap::new()),
+            chunk_admission_gate,
             active_connections: parking_lot::Mutex::new(HashMap::new()),
             active_connections_notify: Notify::new(),
             shutdown_route_outcomes: parking_lot::Mutex::new(Vec::new()),
@@ -407,16 +440,61 @@ impl Server {
             .remove(&(conn_id, request_id))
     }
 
+    /// Tear down a failed/aborted chunk request.
+    ///
+    /// Order is the correctness argument:
+    /// 1. Publish the terminal ordering outcome and take a gate fence. A
+    ///    first-chunk task still parked in route admission wakes here and can
+    ///    no longer win the admission commit; the fence keeps the gate entry in
+    ///    place so a same-key successor generation cannot begin mid-teardown.
+    /// 2. Release the stored route admission, then abort exactly the assembly
+    ///    generation that stored it (identity-checked, so this cannot touch a
+    ///    successor's same-key assembly).
+    /// 3. Drop the fence, allowing a successor generation to begin.
     fn abort_chunk_request(&self, conn_id: u64, request_id: u64) {
-        self.chunk_registry.abort(conn_id, request_id);
-        self.take_chunk_route_pending(conn_id, request_id);
+        let reclaim = self.chunk_admission_gate.abort_key((conn_id, request_id));
+        if let Some(admission) = self.take_chunk_route_pending(conn_id, request_id) {
+            self.chunk_registry.abort_id(admission.assembly);
+        }
+        drop(reclaim);
+    }
+
+    /// Claim first-chunk admission ordering for an incoming chunked request.
+    fn begin_chunk_admission(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+    ) -> Result<ChunkAdmissionOwner, ChunkOrderingError> {
+        self.chunk_admission_gate.begin((conn_id, request_id))
+    }
+
+    /// Ordering waiter for a later chunk whose request is still being admitted.
+    fn chunk_admission_waiter(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+    ) -> Option<ChunkAdmissionWaiter> {
+        self.chunk_admission_gate.waiter((conn_id, request_id))
     }
 
     fn cleanup_chunk_requests_for_connection(&self, conn_id: u64) {
+        // Publish the terminal ordering outcome first and wake every later-chunk
+        // waiter (and any first chunk parked in route admission) of this
+        // connection, so a reservation that completes during this cleanup can
+        // no longer win the admission commit. The registry/route cleanup below
+        // then removes whatever was already published; a generation that loses
+        // the commit rolls itself back through its publication guard.
+        let aborted_ordering = self.chunk_admission_gate.abort_connection(conn_id);
         self.chunk_registry.cleanup_connection(conn_id);
         self.chunk_route_pending
             .lock()
             .retain(|(pending_conn_id, _), _| *pending_conn_id != conn_id);
+        if aborted_ordering > 0 {
+            debug!(
+                conn_id,
+                aborted_ordering, "aborted pending chunk admission ordering on disconnect"
+            );
+        }
     }
 
     fn sweep_stale_chunk_route_pending(&self) -> usize {
@@ -1512,26 +1590,68 @@ fn handle_connection(
                             if c2_wire::flags::is_buddy(flags) {
                                 cleanup_buddy_request_block(&conn, payload);
                             }
+                            // The frame cannot be processed, so the request is
+                            // terminal: publish the abort and release (or fence)
+                            // any pending admission, assembly, and route work
+                            // for this request before correlating the refusal.
+                            // A first-chunk task still parked in route
+                            // admission wakes and rolls back; it can never
+                            // publish after this terminal outcome.
+                            server.abort_chunk_request(conn.conn_id(), request_id);
                             write_chunk_processing_capacity_error(&writer, request_id, limit).await;
                             continue;
                         }
                     };
-                    let srv = Arc::clone(&server);
-                    let cn = Arc::clone(&conn);
-                    let wr = Arc::clone(&writer);
-                    let pl = payload.to_vec();
-                    tokio::spawn(async move {
-                        dispatch_chunked_call(
-                            &srv,
-                            &cn,
-                            request_id,
-                            flags,
-                            &pl,
-                            &wr,
-                            chunk_processing_permit,
-                        )
-                        .await;
-                    });
+                    // Frame dispatch is the wire-order point: establish (for a
+                    // first chunk) or join (for a later chunk) the request's
+                    // admission ordering before spawning the chunk task, so a
+                    // later chunk can never race ahead of first-chunk admission.
+                    let ordering = match chunk_frame_ordering(
+                        &server,
+                        conn.conn_id(),
+                        request_id,
+                        flags,
+                        payload,
+                    ) {
+                        Ok(ordering) => ordering,
+                        Err(error) => {
+                            if c2_wire::flags::is_buddy(flags) {
+                                cleanup_buddy_request_block(&conn, payload);
+                            }
+                            drop(chunk_processing_permit);
+                            warn!(
+                                conn_id = conn.conn_id(),
+                                request_id, %error, "chunk admission ordering rejected"
+                            );
+                            // A duplicate first chunk (AlreadyPending) or gate
+                            // capacity means this request cannot be admitted:
+                            // use the same terminal reasoning as the
+                            // chunk-processing capacity refusal above, which
+                            // also tears down an already-published assembly
+                            // and frees its stored route admission.
+                            server.abort_chunk_request(conn.conn_id(), request_id);
+                            write_reply(
+                                &writer,
+                                request_id,
+                                &ReplyControl::Error(error_wire(
+                                    ErrorCode::ResourceUnavailable,
+                                    error.to_string(),
+                                )),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+                    spawn_chunked_call(
+                        &server,
+                        &conn,
+                        request_id,
+                        flags,
+                        payload,
+                        &writer,
+                        chunk_processing_permit,
+                        ordering,
+                    );
                     continue;
                 }
                 if c2_wire::flags::is_buddy(flags) {
@@ -2044,6 +2164,10 @@ struct RouteExecutionAdmission {
 }
 
 struct ChunkRouteAdmission {
+    /// Identity of the assembly generation that stored this admission. Teardown
+    /// releases exactly this generation through `ChunkRegistry::abort_id`, so a
+    /// stale request teardown can never abort a successor's same-key assembly.
+    assembly: c2_wire::chunk::ChunkAssemblyId,
     route: Arc<CrmRoute>,
     method_idx: u16,
     pending_permit: SchedulerPendingPermit,
@@ -2694,6 +2818,190 @@ async fn dispatch_admitted_buddy_call(call: AdmittedBuddyCall<'_>) {
 // CRM call dispatch — chunked reassembly
 // ---------------------------------------------------------------------------
 
+/// How one chunked call frame relates to its request's first-chunk admission.
+enum ChunkFrameOrdering {
+    /// This frame is the first chunk and owns admission readiness.
+    First(ChunkAdmissionOwner),
+    /// A later chunk whose request is still being admitted.
+    Wait(ChunkAdmissionWaiter),
+    /// No ordering applies: feed directly (assembly already published, request
+    /// already terminal, or a malformed header the chunk task reports).
+    Direct,
+}
+
+/// Spawn the chunk task for one frame after dispatch claimed its permit and
+/// ordering. Kept separate from [`dispatch_chunked_call`] so the receive loop
+/// stays a wire-order dispatcher that never awaits a chunk's admission.
+#[allow(clippy::too_many_arguments)] // A chunk frame needs the full dispatch context.
+fn spawn_chunked_call(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    request_id: u64,
+    flags: u32,
+    payload: &[u8],
+    writer: &Arc<Mutex<LocalWriteHalf>>,
+    chunk_processing_permit: OwnedSemaphorePermit,
+    ordering: ChunkFrameOrdering,
+) {
+    let srv = Arc::clone(server);
+    let cn = Arc::clone(conn);
+    let wr = Arc::clone(writer);
+    let pl = payload.to_vec();
+    tokio::spawn(async move {
+        dispatch_chunked_call(
+            &srv,
+            &cn,
+            request_id,
+            flags,
+            &pl,
+            &wr,
+            chunk_processing_permit,
+            ordering,
+        )
+        .await;
+    });
+}
+
+/// Ordering decision for one chunked frame, made at frame dispatch.
+///
+/// The receive loop is the only place with wire order, so first-chunk ownership
+/// is claimed here — before the chunk task is spawned — and later chunks join
+/// the pending admission instead of feeding a not-yet-published assembly.
+fn chunk_frame_ordering(
+    server: &Server,
+    conn_id: u64,
+    request_id: u64,
+    flags: u32,
+    payload: &[u8],
+) -> Result<ChunkFrameOrdering, ChunkOrderingError> {
+    let offset = if c2_wire::flags::is_buddy(flags) {
+        BUDDY_PAYLOAD_SIZE
+    } else {
+        0
+    };
+    let (chunk_idx, _, _) = match decode_chunk_header(payload, offset) {
+        Ok(header) => header,
+        // Malformed chunk header: establish no ordering; the chunk task
+        // reports the malformed frame with a correlated error.
+        Err(_) => return Ok(ChunkFrameOrdering::Direct),
+    };
+    if chunk_idx == 0 {
+        server
+            .begin_chunk_admission(conn_id, request_id)
+            .map(ChunkFrameOrdering::First)
+    } else {
+        Ok(match server.chunk_admission_waiter(conn_id, request_id) {
+            Some(waiter) => ChunkFrameOrdering::Wait(waiter),
+            None => ChunkFrameOrdering::Direct,
+        })
+    }
+}
+
+/// Fail one chunked request: publish the terminal admission outcome first (so a
+/// first-chunk task still parked in route admission wakes and cannot publish
+/// afterwards), release the assembly, the stored route admission, and the
+/// ordering entry, then write the correlated structured error for the caller
+/// that is waiting on this request id. Every malformed/feed/admission failure
+/// path funnels through here so a caller can never be left waiting.
+async fn fail_chunked_request(
+    server: &Server,
+    conn: &Arc<Connection>,
+    writer: &Arc<Mutex<LocalWriteHalf>>,
+    request_id: u64,
+    mut admission_owner: Option<ChunkAdmissionOwner>,
+    code: ErrorCode,
+    message: String,
+) {
+    warn!(
+        conn_id = conn.conn_id(),
+        request_id, %message, "chunked call failed"
+    );
+    // Terminal outcome first: waiters stop, and the owner's late commit loses
+    // the atomic admission transition. The owner keeps the gate entry as a
+    // teardown fence until its release below.
+    if let Some(owner) = admission_owner.as_mut() {
+        owner.refuse();
+    }
+    server.abort_chunk_request(conn.conn_id(), request_id);
+    if let Some(owner) = admission_owner.as_mut() {
+        owner.release();
+    }
+    write_reply(
+        writer,
+        request_id,
+        &ReplyControl::Error(error_wire(code, message)),
+    )
+    .await;
+}
+
+/// Unpublished first-chunk admission publication.
+///
+/// A first chunk publishes two pieces of request state before it can commit its
+/// admission ordering entry: the registry assembly and the stored route
+/// admission (which owns the route pending permit). This guard owns both until
+/// [`ChunkPublicationGuard::commit`]; on any other exit (cancellation, panic, a
+/// concurrent terminal abort that wins the commit race, or a publish failure)
+/// Drop rolls them back exactly once.
+///
+/// Rollback order matters: the stored route admission is taken while the
+/// assembly is still registered, so the key-scoped permit take cannot reach a
+/// successor generation's record (a successor's insert cannot succeed until the
+/// assembly it would replace is gone). The assembly abort is identity-checked,
+/// so it can never release a successor's same-key assembly.
+struct ChunkPublicationGuard<'a> {
+    server: &'a Server,
+    conn_id: u64,
+    request_id: u64,
+    assembly: Option<c2_wire::chunk::ChunkAssemblyId>,
+    committed: bool,
+}
+
+impl<'a> ChunkPublicationGuard<'a> {
+    fn new(server: &'a Server, conn_id: u64, request_id: u64) -> Self {
+        Self {
+            server,
+            conn_id,
+            request_id,
+            assembly: None,
+            committed: false,
+        }
+    }
+
+    /// Note a successful registry admission. Until `commit`, Drop releases it.
+    fn publish_assembly(&mut self, assembly: c2_wire::chunk::ChunkAssemblyId) {
+        self.assembly = Some(assembly);
+    }
+
+    /// The admitted request now owns everything this guard published.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ChunkPublicationGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // A generation that never admitted an assembly has no published state
+        // of its own: leave whatever assembly / stored admission already exists
+        // for this key to the request-teardown path (`abort_chunk_request`),
+        // which releases it before this owner's gate entry disappears.
+        if self.assembly.is_some() {
+            // Take the stored route admission first: the assembly is still
+            // registered, so a same-key successor cannot have stored its own
+            // record yet. Then abort exactly this generation's assembly.
+            let _ = self
+                .server
+                .take_chunk_route_pending(self.conn_id, self.request_id);
+        }
+        if let Some(assembly) = self.assembly.take() {
+            self.server.chunk_registry.abort_id(assembly);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Chunk frames need the full dispatch context.
 async fn dispatch_chunked_call(
     server: &Server,
     conn: &Arc<Connection>,
@@ -2702,7 +3010,45 @@ async fn dispatch_chunked_call(
     payload: &[u8],
     writer: &Arc<Mutex<LocalWriteHalf>>,
     chunk_processing_permit: OwnedSemaphorePermit,
+    ordering: ChunkFrameOrdering,
 ) {
+    // Ordering: a later chunk waits for its request's first-chunk admission
+    // (route permit, registry assembly, stored route admission) before it can
+    // touch the registry. The wait is async and scoped to one request, so the
+    // receive loop, control frames, and other requests keep progressing.
+    let mut admission_owner = match ordering {
+        ChunkFrameOrdering::First(owner) => Some(owner),
+        ChunkFrameOrdering::Wait(waiter) => {
+            let discard = match waiter.wait().await {
+                ChunkAdmissionOutcome::Admitted => None,
+                // Refused: the admission owner already wrote the correlated
+                // error. Aborted: the request or connection is terminal.
+                // Either way this later chunk stops without a duplicate reply,
+                // but it must still release a buddy-backed frame's peer block
+                // instead of leaking the SHM allocation.
+                ChunkAdmissionOutcome::Refused | ChunkAdmissionOutcome::Aborted => Some(
+                    "chunk admission ended before this later chunk could feed",
+                ),
+                ChunkAdmissionOutcome::Pending => {
+                    debug_assert!(false, "chunk admission waiter returned while pending");
+                    Some("chunk admission waiter returned while still pending")
+                }
+            };
+            if let Some(reason) = discard {
+                if c2_wire::flags::is_buddy(flags) {
+                    debug!(
+                        conn_id = conn.conn_id(),
+                        request_id, reason, "releasing discarded buddy chunk frame"
+                    );
+                    cleanup_buddy_request_block(conn, payload);
+                }
+                return;
+            }
+            None
+        }
+        ChunkFrameOrdering::Direct => None,
+    };
+
     let is_buddy = c2_wire::flags::is_buddy(flags);
     let mut offset: usize = 0;
 
@@ -2714,8 +3060,16 @@ async fn dispatch_chunked_call(
         let (bp, bp_consumed) = match decode_buddy_payload(payload) {
             Ok(v) => v,
             Err(e) => {
-                warn!(conn_id = conn.conn_id(), ?e, "chunked buddy decode error");
-                server.abort_chunk_request(conn.conn_id(), request_id);
+                fail_chunked_request(
+                    server,
+                    conn,
+                    writer,
+                    request_id,
+                    admission_owner.take(),
+                    ErrorCode::ResourceInputDeserializing,
+                    format!("chunked call buddy payload decode failed: {e:?}"),
+                )
+                .await;
                 return;
             }
         };
@@ -2739,8 +3093,16 @@ async fn dispatch_chunked_call(
                 shm_data = Some(data);
             }
             Err(e) => {
-                warn!(conn_id = conn.conn_id(), %e, "chunked SHM read failed");
-                server.abort_chunk_request(conn.conn_id(), request_id);
+                fail_chunked_request(
+                    server,
+                    conn,
+                    writer,
+                    request_id,
+                    admission_owner.take(),
+                    ErrorCode::ResourceInputDeserializing,
+                    format!("chunked call SHM read failed: {e}"),
+                )
+                .await;
                 return;
             }
         }
@@ -2752,8 +3114,16 @@ async fn dispatch_chunked_call(
     let (chunk_idx, total_chunks, ch_consumed) = match decode_chunk_header(payload, offset) {
         Ok(v) => v,
         Err(e) => {
-            warn!(conn_id = conn.conn_id(), ?e, "chunk header decode error");
-            server.abort_chunk_request(conn.conn_id(), request_id);
+            fail_chunked_request(
+                server,
+                conn,
+                writer,
+                request_id,
+                admission_owner.take(),
+                ErrorCode::ResourceInputDeserializing,
+                format!("chunked call chunk header decode failed: {e:?}"),
+            )
+            .await;
             return;
         }
     };
@@ -2764,22 +3134,85 @@ async fn dispatch_chunked_call(
         let (ctrl, ctrl_consumed) = match decode_call_control(payload, offset) {
             Ok(v) => v,
             Err(e) => {
-                warn!(
-                    conn_id = conn.conn_id(),
-                    ?e,
-                    "chunked call control decode error"
-                );
+                fail_chunked_request(
+                    server,
+                    conn,
+                    writer,
+                    request_id,
+                    admission_owner.take(),
+                    ErrorCode::ResourceInputDeserializing,
+                    format!("chunked call control decode failed: {e:?}"),
+                )
+                .await;
                 return;
             }
         };
-        let route_admission =
-            match reserve_route_execution(server, &ctrl.identity, ctrl.method_idx).await {
-                Ok(admission) => admission,
-                Err(err) => {
+        let route_admission = {
+            // The route/dispatcher gate can stall (a route transaction holds
+            // the dispatcher write lock). A disconnect must not leave this
+            // task, its chunk permit, or its ordering entry alive behind that
+            // gate, so the wait is cancellable by the connection's teardown.
+            //
+            // The request's admission entry is the second fence: if another
+            // path publishes a terminal outcome while this wait is in flight
+            // (request abort, chunk-processing capacity refusal, duplicate
+            // first chunk, disconnect), the wait wakes immediately. The
+            // terminal publisher owns the caller reply, so this task publishes
+            // nothing; a reservation that completes at the same instant is
+            // rejected by the atomic admission commit below.
+            enum AdmissionWait {
+                Ready(Result<RouteExecutionAdmission, RouteAdmissionError>),
+                Terminal,
+                Cancelled,
+            }
+            let terminal_waiter = admission_owner
+                .as_ref()
+                .map(ChunkAdmissionOwner::terminal_waiter);
+            let terminal = async {
+                match terminal_waiter {
+                    Some(waiter) => waiter.wait().await,
+                    None => std::future::pending::<ChunkAdmissionOutcome>().await,
+                }
+            };
+            let waited = tokio::select! {
+                biased;
+                admission =
+                    reserve_route_execution(server, &ctrl.identity, ctrl.method_idx) => {
+                    AdmissionWait::Ready(admission)
+                }
+                _ = terminal => AdmissionWait::Terminal,
+                _ = conn.wait_cancelled() => AdmissionWait::Cancelled,
+            };
+            match waited {
+                AdmissionWait::Ready(Ok(admission)) => admission,
+                AdmissionWait::Ready(Err(err)) => {
+                    let owner_was_pending = admission_owner
+                        .as_mut()
+                        .map(|owner| {
+                            let refused = owner.refuse();
+                            owner.release();
+                            refused
+                        })
+                        .unwrap_or(true);
+                    if !owner_was_pending {
+                        // A concurrent terminal outcome already owns the
+                        // correlated reply; do not write a second one for the
+                        // same request id.
+                        return;
+                    }
                     write_route_admission_error(writer, request_id, err).await;
                     return;
                 }
-            };
+                AdmissionWait::Terminal => return,
+                AdmissionWait::Cancelled => {
+                    if let Some(owner) = admission_owner.as_mut() {
+                        owner.abort();
+                        owner.release();
+                    }
+                    return;
+                }
+            }
+        };
         offset += ctrl_consumed;
 
         // Determine chunk_size from this first chunk's data length.
@@ -2790,47 +3223,96 @@ async fn dispatch_chunked_call(
         };
         let chunk_size = first_data.len();
         if chunk_size == 0 {
-            warn!(
-                conn_id = conn.conn_id(),
-                "chunked: first chunk has zero data"
-            );
+            fail_chunked_request(
+                server,
+                conn,
+                writer,
+                request_id,
+                admission_owner.take(),
+                ErrorCode::ResourceUnavailable,
+                "chunked call rejected: first chunk carries no data".to_string(),
+            )
+            .await;
             return;
         }
 
-        if let Err(e) = server.chunk_registry.insert(
+        // Staged publication: the registry assembly and the stored route
+        // admission below are owned by this guard until the admission commit
+        // succeeds. Cancellation, panic, a losing commit race, or a publish
+        // failure rolls back exactly this generation (identity-checked assembly
+        // abort, stored route admission returned) so no unpublished work stays
+        // charged, and it can never touch a successor's same-key state.
+        let mut publication = ChunkPublicationGuard::new(server, conn.conn_id(), request_id);
+        let assembly = match server.chunk_registry.insert(
             conn.conn_id(),
             request_id,
             total_chunks as usize,
             chunk_size,
         ) {
-            warn!(conn_id = conn.conn_id(), %e, "chunk insert failed");
-            return;
-        }
+            Ok(assembly) => assembly,
+            Err(e) => {
+                // Correlate the admission failure back to the pending caller
+                // instead of logging and leaving it waiting. The message
+                // carries the budget cell and size detail from the admission
+                // error.
+                drop(publication);
+                fail_chunked_request(
+                    server,
+                    conn,
+                    writer,
+                    request_id,
+                    admission_owner.take(),
+                    ErrorCode::ResourceUnavailable,
+                    format!("chunked call reassembly admission failed: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+        publication.publish_assembly(assembly);
         server.chunk_registry.set_route_info(
             conn.conn_id(),
             request_id,
             ctrl.identity.route_name.clone(),
             ctrl.method_idx,
         );
-        if server
-            .store_chunk_route_pending(
-                conn.conn_id(),
+        let stored = server.store_chunk_route_pending(
+            conn.conn_id(),
+            request_id,
+            ChunkRouteAdmission {
+                assembly,
+                route: route_admission.route,
+                method_idx: ctrl.method_idx,
+                pending_permit: route_admission.pending_permit,
+            },
+        );
+        if stored.is_err() {
+            drop(publication);
+            fail_chunked_request(
+                server,
+                conn,
+                writer,
                 request_id,
-                ChunkRouteAdmission {
-                    route: route_admission.route,
-                    method_idx: ctrl.method_idx,
-                    pending_permit: route_admission.pending_permit,
-                },
+                admission_owner.take(),
+                ErrorCode::ResourceUnavailable,
+                "chunked call route admission was unexpectedly duplicated".to_string(),
             )
-            .is_err()
-        {
-            server.chunk_registry.abort(conn.conn_id(), request_id);
-            warn!(
-                conn_id = conn.conn_id(),
-                request_id, "chunk route pending permit unexpectedly duplicated"
-            );
+            .await;
             return;
         }
+        // Admission commit: the atomic Pending → Admitted transition is the
+        // linearization point. Losing it means a terminal outcome was published
+        // concurrently; the guard rolls this generation's publications back and
+        // the terminal publisher owns the caller's correlated error reply.
+        let admitted = admission_owner
+            .as_mut()
+            .map(ChunkAdmissionOwner::admit)
+            .unwrap_or(true);
+        if !admitted {
+            drop(publication);
+            return;
+        }
+        publication.commit();
     }
 
     // 4. Get chunk data.
@@ -2848,8 +3330,16 @@ async fn dispatch_chunked_call(
         {
             Ok(complete) => complete,
             Err(e) => {
-                warn!(conn_id = conn.conn_id(), %e, "chunk feed error");
-                server.abort_chunk_request(conn.conn_id(), request_id);
+                fail_chunked_request(
+                    server,
+                    conn,
+                    writer,
+                    request_id,
+                    admission_owner.take(),
+                    ErrorCode::ResourceUnavailable,
+                    format!("chunked call chunk feed failed: {e}"),
+                )
+                .await;
                 return;
             }
         };
@@ -2859,18 +3349,14 @@ async fn dispatch_chunked_call(
         let chunk_admission = match server.take_chunk_route_pending(conn.conn_id(), request_id) {
             Some(admission) => admission,
             None => {
-                server.abort_chunk_request(conn.conn_id(), request_id);
-                warn!(
-                    conn_id = conn.conn_id(),
-                    request_id, "chunked call missing stored route admission"
-                );
-                write_reply(
+                fail_chunked_request(
+                    server,
+                    conn,
                     writer,
                     request_id,
-                    &ReplyControl::Error(error_wire(
-                        ErrorCode::ResourceUnavailable,
-                        "chunked call missing route admission",
-                    )),
+                    admission_owner.take(),
+                    ErrorCode::ResourceUnavailable,
+                    "chunked call missing route admission".to_string(),
                 )
                 .await;
                 return;
@@ -2879,20 +3365,28 @@ async fn dispatch_chunked_call(
         let finished = match server.chunk_registry.finish(conn.conn_id(), request_id) {
             Ok(f) => f,
             Err(e) => {
-                warn!(conn_id = conn.conn_id(), %e, "chunk finish failed");
+                fail_chunked_request(
+                    server,
+                    conn,
+                    writer,
+                    request_id,
+                    admission_owner.take(),
+                    ErrorCode::ResourceUnavailable,
+                    format!("chunked call reassembly finish failed: {e}"),
+                )
+                .await;
                 return;
             }
         };
         let c2_wire::chunk::FinishedChunk {
-            handle,
+            backing,
             route_name,
             method_idx,
         } = finished;
-        let pool_arc = server.chunk_registry.pool().clone();
-        let request = RequestData::Handle {
-            handle,
-            pool: pool_arc,
-        };
+        // The carrier owns the reassembly pool, handle, and budget charge;
+        // its release ordering (storage through the pool authority first,
+        // charge refund after) applies on every path below.
+        let request = RequestData::Handle(backing);
         let _pending_permit = match server.try_acquire_pending_request() {
             Ok(permit) => permit,
             Err(limit) => {
@@ -3412,6 +3906,7 @@ mod tests {
 
     use crate::dispatcher::{CrmCallback, CrmError, CrmRoute};
     use crate::scheduler::{ConcurrencyMode, Scheduler};
+    use crate::RequestLease;
 
     // -- address parsing --
 
@@ -6294,17 +6789,17 @@ mod tests {
         assert!(registry.feed(conn_id, request_id, 2, b"cc").unwrap());
 
         // Finish.
-        let finished = registry.finish(conn_id, request_id).unwrap();
+        let mut finished = registry.finish(conn_id, request_id).unwrap();
         assert_eq!(finished.route_name.as_deref(), Some("grid"));
         assert_eq!(finished.method_idx, Some(0));
-        assert_eq!(finished.handle.len(), 18); // 8+8+2
-        let p = pool.read();
-        let slice = p.handle_slice(&finished.handle);
+        assert_eq!(finished.backing.len(), 18); // 8+8+2
+        let slice = finished.backing.copy_bytes().unwrap();
         assert_eq!(&slice[0..8], b"aaaaaaaa");
         assert_eq!(&slice[8..16], b"bbbbbbbb");
         assert_eq!(&slice[16..18], b"cc");
-        drop(p);
-        pool.write().release_handle(finished.handle);
+        // The carrier owns the pool; releasing it frees the backing.
+        finished.backing.release().unwrap();
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     #[tokio::test]
@@ -6349,6 +6844,8 @@ mod tests {
             &first_payload,
             &writer,
             chunk_permit,
+            chunk_frame_ordering(&server, conn.conn_id(), 42, FLAG_CHUNKED, &first_payload)
+                .unwrap(),
         )
         .await;
 
@@ -6373,6 +6870,14 @@ mod tests {
             &bad_second_payload,
             &writer,
             chunk_permit,
+            chunk_frame_ordering(
+                &server,
+                conn.conn_id(),
+                42,
+                FLAG_CHUNKED,
+                &bad_second_payload,
+            )
+            .unwrap(),
         )
         .await;
 
@@ -6425,6 +6930,7 @@ mod tests {
             &payload,
             &writer,
             chunk_permit,
+            chunk_frame_ordering(&server, conn.conn_id(), 9, FLAG_CHUNKED, &payload).unwrap(),
         )
         .await;
 
@@ -6444,6 +6950,1123 @@ mod tests {
             .try_acquire(0)
             .expect("connection cleanup should release route pending capacity");
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn chunked_request_admission_failure_writes_correlated_error_reply() {
+        use crate::scheduler::SchedulerLimits;
+        use c2_wire::chunk::encode_chunk_header;
+        use c2_wire::control::{decode_reply_control, encode_call_control, ReplyControl};
+        use std::num::NonZeroUsize;
+
+        // Tiny reassembly budget: a 1024-byte assembly cannot be admitted.
+        let budget = c2_mem::MemoryBudget::new(1 << 20, 1 << 20, 512);
+        let reassembly_pool = Arc::new(parking_lot::RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 2,
+                    max_dedicated_segments: 2,
+                    dedicated_crash_timeout_secs: 0.0,
+                    buddy_idle_decay_secs: 0.0,
+                    spill_threshold: 1.0,
+                    spill_dir: std::env::temp_dir().join("c2_srv_admission_test"),
+                    ..PoolConfig::default()
+                },
+                "/c2srv_adm_budget".to_string(),
+                budget,
+            ),
+        ));
+        let server = Arc::new(
+            Server::with_reassembly_pool(
+                "ipc://chunk_admission_budget",
+                ServerIpcConfig::default(),
+                ServerIdentity {
+                    server_id: "chunk_admission_budget".into(),
+                    server_instance_id: "chunk_admission_budget-instance".into(),
+                },
+                reassembly_pool,
+            )
+            .unwrap(),
+        );
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits {
+                max_pending: Some(NonZeroUsize::new(1).unwrap()),
+                max_workers: Some(NonZeroUsize::new(1).unwrap()),
+            },
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        server.register_route(route).await.unwrap();
+
+        // Open pair so the error reply can actually be read back.
+        let (client, server_side) = c2_local::LocalStream::pair().await.unwrap();
+        let (mut probe, _keep) = client.into_split();
+        let (_read_half, write_half) = server_side.into_split();
+        let writer = Arc::new(Mutex::new(write_half));
+
+        let conn = Arc::new(Connection::new(123));
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_chunk_header(0, 2));
+        payload.extend_from_slice(&encode_call_control(&call_identity("grid"), 0).unwrap());
+        payload.extend_from_slice(&[0x42u8; 512]);
+
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            21,
+            FLAG_CHUNKED,
+            &payload,
+            &writer,
+            chunk_permit,
+            chunk_frame_ordering(&server, conn.conn_id(), 21, FLAG_CHUNKED, &payload).unwrap(),
+        )
+        .await;
+
+        // No assembly was published and the route admission permit was
+        // released by the correlated rejection.
+        assert!(!server.chunk_registry.contains(conn.conn_id(), 21));
+        assert!(scheduler.try_acquire(0).is_ok());
+
+        // Read the correlated error reply frame for request 21.
+        let mut header = [0u8; c2_wire::frame::HEADER_SIZE];
+        tokio::time::timeout(std::time::Duration::from_secs(5), probe.read_exact(&mut header))
+            .await
+            .expect("error reply within timeout")
+            .unwrap();
+        // total_len counts everything after the 4-byte prefix: the 12-byte
+        // header (already read) plus the payload still to read.
+        let (total_len, _) = c2_wire::frame::decode_total_len(&header).unwrap();
+        let mut body = vec![0u8; total_len as usize - 12];
+        tokio::time::timeout(std::time::Duration::from_secs(5), probe.read_exact(&mut body))
+            .await
+            .expect("error body within timeout")
+            .unwrap();
+        let mut frame_bytes = header.to_vec();
+        frame_bytes.extend_from_slice(&body);
+        let (hdr, payload_out) = c2_wire::frame::decode_frame(&frame_bytes).unwrap();
+        assert_eq!(hdr.request_id, 21);
+        assert!(hdr.is_response());
+        let (control, _) = decode_reply_control(payload_out, 0).unwrap();
+        let ReplyControl::Error(err_bytes) = control else {
+            panic!("expected correlated error reply, got {control:?}");
+        };
+        let message = String::from_utf8_lossy(&err_bytes).to_string();
+        assert!(
+            message.contains("'reassembly'"),
+            "error must name the budget cell: {message}"
+        );
+        assert!(
+            message.contains("1024"),
+            "error must name the rejected size: {message}"
+        );
+    }
+
+    // -- Chunked first-chunk admission ordering (frame dispatch) --
+
+    /// Callback that echoes the reassembled request bytes and counts invocations.
+    struct EchoRequestBytes {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CrmCallback for EchoRequestBytes {
+        fn invoke(
+            &self,
+            _: &str,
+            _: u16,
+            request: RequestData,
+            _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let bytes = RequestLease::new(request)
+                .into_owned_bytes()
+                .map_err(CrmError::InternalError)?;
+            Ok(ResponseMeta::Inline(bytes))
+        }
+    }
+
+    /// Read one complete reply frame from the client side of a local pair.
+    async fn read_reply_frame(client: &mut LocalStream) -> (u64, u32, Vec<u8>) {
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut len_buf))
+            .await
+            .expect("reply length within timeout")
+            .expect("reply length");
+        let total_len = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; total_len];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut body))
+            .await
+            .expect("reply body within timeout")
+            .expect("reply body");
+        let mut frame_bytes = Vec::with_capacity(4 + total_len);
+        frame_bytes.extend_from_slice(&len_buf);
+        frame_bytes.extend_from_slice(&body);
+        let (header, payload) = c2_wire::frame::decode_frame(&frame_bytes).expect("decode reply");
+        (header.request_id, header.flags, payload.to_vec())
+    }
+
+    /// Poll until `check` holds, with a bounded wait so a regression fails the
+    /// test instead of hanging it.
+    async fn wait_until(label: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached within timeout: {label}");
+    }
+
+    fn chunked_call_frame(
+        request_id: u64,
+        chunk_idx: u16,
+        total_chunks: u16,
+        data: &[u8],
+        identity: &str,
+    ) -> Vec<u8> {
+        use c2_wire::chunk::encode_chunk_header;
+        use c2_wire::control::encode_call_control;
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_chunk_header(chunk_idx, total_chunks));
+        if chunk_idx == 0 {
+            payload.extend_from_slice(
+                &encode_call_control(&call_identity(identity), 0).expect("call control"),
+            );
+        }
+        payload.extend_from_slice(data);
+        let mut flags = c2_wire::flags::FLAG_CALL_V2 | FLAG_CHUNKED;
+        if chunk_idx + 1 == total_chunks {
+            flags |= c2_wire::flags::FLAG_CHUNK_LAST;
+        }
+        encode_frame(request_id, flags, &payload)
+    }
+
+    fn ordering_test_server(address: &str, max_total_chunks: u32) -> Arc<Server> {
+        let mut config = ServerIpcConfig::default();
+        config.base.max_total_chunks = max_total_chunks;
+        Arc::new(Server::new(address, config).unwrap())
+    }
+
+    /// Wire-order frame dispatch must not let later chunks run ahead of the
+    /// first chunk's route admission. Hold the route/dispatcher gate, push a
+    /// first chunk plus two later chunks through the real receive loop, prove
+    /// nothing was published or discarded while the gate is held, prove control
+    /// frames still work, then release the gate and prove every byte was
+    /// delivered exactly once with all ordering/registry/permit state cleaned.
+    #[tokio::test]
+    async fn later_chunks_wait_for_stalled_first_chunk_route_admission() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = ordering_test_server("ipc://chunked_ordering_hold", 3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            crate::scheduler::SchedulerLimits::try_from_usize(Some(1), Some(1)).unwrap(),
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        // Hold the route gate the first chunk must pass through.
+        let dispatcher_guard = server.dispatcher.write().await;
+
+        const TOTAL: usize = 3;
+        const CHUNK: usize = 64;
+        let data: Vec<u8> = (0..(2 * CHUNK + 7)).map(|i| (i % 251) as u8).collect();
+        for idx in 0..TOTAL {
+            let start = idx * CHUNK;
+            let end = usize::min(start + CHUNK, data.len());
+            client
+                .write_all(&chunked_call_frame(77, idx as u16, TOTAL as u16, &data[start..end], "grid"))
+                .await
+                .expect("write chunk frame");
+        }
+
+        // Everything is parked: first chunk on the held gate, later chunks on
+        // first-chunk admission, all three chunk-processing permits held.
+        wait_until("three chunk frames dispatched", || {
+            server.chunk_admission_gate.len() == 1
+                && server.chunk_processing_permits.available_permits() == 0
+        })
+        .await;
+        let conn_id = server.active_connection_ids()[0];
+        assert!(
+            !server.chunk_registry.contains(conn_id, 77),
+            "later chunks must not publish or discard an assembly before first-chunk admission"
+        );
+        assert_eq!(server.chunk_registry.active_count(), 0);
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Control liveness while the route gate is stalled: the receive loop
+        // still answers a ping on the same connection.
+        client
+            .write_all(&encode_frame(5, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .await
+            .expect("write ping");
+        let (ping_rid, ping_flags, ping_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(ping_rid, 5);
+        assert!(ping_flags & FLAG_SIGNAL != 0);
+        assert_eq!(ping_payload, PONG_BYTES);
+
+        // Release the gate: the first chunk admits, the later chunks feed, and
+        // the request is executed once with the exact reassembled bytes.
+        drop(dispatcher_guard);
+        let (reply_rid, reply_flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 77);
+        assert!(reply_flags & FLAG_RESPONSE != 0);
+        let (control, consumed) =
+            c2_wire::control::decode_reply_control(&reply_payload, 0).expect("reply control");
+        match control {
+            ReplyControl::Success => {}
+            other => panic!("expected successful reply, got {other:?}"),
+        }
+        assert_eq!(&reply_payload[consumed..], data.as_slice());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one execution");
+
+        // No ordering entry, assembly, stored admission, or permit is left.
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        assert_eq!(server.chunk_registry.active_count(), 0);
+        assert!(!server.chunk_registry.contains(conn_id, 77));
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert_eq!(server.chunk_processing_permits.available_permits(), 3);
+        assert!(scheduler.try_acquire(0).is_ok());
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    /// Route admission refusal while later chunks are parked on the ordering
+    /// gate must wake them, complete the caller with the structured canonical
+    /// error, and leave no ordering entry, assembly, or permit behind.
+    #[tokio::test]
+    async fn route_refusal_wakes_parked_later_chunks_and_releases_state() {
+        let server = ordering_test_server("ipc://chunked_ordering_refusal", 3);
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            crate::scheduler::SchedulerLimits::try_from_usize(Some(1), Some(1)).unwrap(),
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        // First chunk targets a route that is not in the catalog, so admission
+        // is refused immediately; later chunks must not feed anything.
+        client
+            .write_all(&chunked_call_frame(88, 0, 2, b"first-half", "missing"))
+            .await
+            .expect("write first chunk");
+        client
+            .write_all(&chunked_call_frame(88, 1, 2, b"second-half", "missing"))
+            .await
+            .expect("write later chunk");
+
+        let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 88);
+        let (control, _) = c2_wire::control::decode_reply_control(&reply_payload, 0)
+            .expect("reply control");
+        match control {
+            ReplyControl::RouteNotFound(route) => assert_eq!(route, "missing"),
+            other => panic!("expected structured route-not-found reply, got {other:?}"),
+        }
+
+        // The refused request leaves no ordering entry, assembly, or permit.
+        let conn_id = server.active_connection_ids()[0];
+        wait_until("ordering state released after refusal", || {
+            server.chunk_admission_gate.len() == 0
+                && server.chunk_registry.active_count() == 0
+                && server.chunk_processing_permits.available_permits() == 3
+        })
+        .await;
+        assert!(!server.chunk_registry.contains(conn_id, 88));
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert!(scheduler.try_acquire(0).is_ok());
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    /// Disconnect while the first chunk is parked behind the route gate must
+    /// tear the ordering state and every chunk permit down (cancellation), and
+    /// must not leave the caller's request charged in the registry.
+    #[tokio::test]
+    async fn disconnect_cancels_parked_first_chunk_and_releases_permits() {
+        let server = ordering_test_server("ipc://chunked_ordering_cancel", 3);
+        let mut route = make_route("grid");
+        route.scheduler = Arc::new(Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            crate::scheduler::SchedulerLimits::try_from_usize(Some(1), Some(1)).unwrap(),
+        ));
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        // Park the first chunk on the route gate and two later chunks on its
+        // admission; every chunk-processing permit is then held.
+        let dispatcher_guard = server.dispatcher.write().await;
+        for idx in 0..3usize {
+            client
+                .write_all(&chunked_call_frame(
+                    99,
+                    idx as u16,
+                    3,
+                    &[0x5au8; 32],
+                    "grid",
+                ))
+                .await
+                .expect("write chunk frame");
+        }
+        wait_until("chunk frames parked behind the route gate", || {
+            server.chunk_admission_gate.len() == 1
+                && server.chunk_processing_permits.available_permits() == 0
+        })
+        .await;
+        let conn_id = server.active_connection_ids()[0];
+
+        // Client disconnect: the receive loop cancels the connection, which
+        // cancels the parked first-chunk task behind the held gate.
+        drop(client);
+        handler.await.expect("connection handler completes");
+
+        wait_until("disconnect released ordering state and permits", || {
+            server.chunk_admission_gate.len() == 0
+                && server.chunk_registry.active_count() == 0
+                && server.chunk_processing_permits.available_permits() == 3
+        })
+        .await;
+        assert!(!server.chunk_registry.contains(conn_id, 99));
+        assert!(server.chunk_route_pending.lock().is_empty());
+        drop(dispatcher_guard);
+    }
+
+    /// An incomplete chunked request that expires on the assembler timeout must
+    /// release its assembly charge and its stored route pending permit, leave
+    /// no ordering state behind, keep answering control frames, and still serve
+    /// a complete request afterwards with every byte delivered once.
+    #[tokio::test]
+    async fn assembler_timeout_releases_charge_and_route_capacity_then_serves_again() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut config = ServerIpcConfig::default();
+        config.base.max_total_chunks = 3;
+        config.base.chunk_assembler_timeout_secs = 0.05;
+        let server = Arc::new(Server::new("ipc://chunked_ordering_timeout", config).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            crate::scheduler::SchedulerLimits::try_from_usize(Some(1), Some(1)).unwrap(),
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        // First chunk + middle chunk of a three-chunk request: the assembly
+        // stays incomplete and keeps the route pending permit while it waits.
+        for idx in 0..2usize {
+            client
+                .write_all(&chunked_call_frame(
+                    55,
+                    idx as u16,
+                    3,
+                    &[0x44u8; 32],
+                    "grid",
+                ))
+                .await
+                .expect("write chunk frame");
+        }
+        wait_until("incomplete assembly registered with route admission", || {
+            server.chunk_registry.active_count() == 1
+                && server.chunk_route_pending.lock().len() == 1
+                && server.chunk_admission_gate.len() == 0
+                && server.chunk_processing_permits.available_permits() == 3
+        })
+        .await;
+        let conn_id = server.active_connection_ids()[0];
+        assert!(matches!(
+            scheduler.try_acquire(0),
+            Err(crate::scheduler::SchedulerAcquireError::Capacity {
+                field: "max_pending",
+                limit: 1,
+            })
+        ));
+
+        // Control liveness while the incomplete assembly is still charged.
+        client
+            .write_all(&encode_frame(6, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .await
+            .expect("write ping");
+        let (ping_rid, _flags, ping_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(ping_rid, 6);
+        assert_eq!(ping_payload, PONG_BYTES);
+
+        // Let the assembler timeout elapse and run the same sweep the
+        // background GC task runs.
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let stats = server.chunk_registry.gc_sweep();
+        assert_eq!(stats.expired, 1);
+        let swept = server.sweep_stale_chunk_route_pending();
+        assert_eq!(swept, 1);
+
+        assert_eq!(server.chunk_registry.active_count(), 0);
+        assert!(!server.chunk_registry.contains(conn_id, 55));
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        assert_eq!(server.chunk_processing_permits.available_permits(), 3);
+        assert!(scheduler.try_acquire(0).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Control liveness after the timeout, and the connection still serves
+        // a complete request with every byte delivered once.
+        client
+            .write_all(&encode_frame(7, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .await
+            .expect("write ping");
+        let (ping_rid, _flags, ping_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(ping_rid, 7);
+        assert_eq!(ping_payload, PONG_BYTES);
+
+        let data: Vec<u8> = (0..90u16).map(|i| (i % 251) as u8).collect();
+        for idx in 0..3usize {
+            client
+                .write_all(&chunked_call_frame(
+                    56,
+                    idx as u16,
+                    3,
+                    &data[idx * 30..(idx + 1) * 30],
+                    "grid",
+                ))
+                .await
+                .expect("write chunk frame");
+        }
+        let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 56);
+        let (control, consumed) =
+            c2_wire::control::decode_reply_control(&reply_payload, 0).expect("reply control");
+        match control {
+            ReplyControl::Success => {}
+            other => panic!("expected successful reply after timeout cleanup, got {other:?}"),
+        }
+        assert_eq!(&reply_payload[consumed..], data.as_slice());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    // -- Reviewed server admission/ownership defects (recovery repair 2) --
+
+    /// Decode a reply payload's structured error message.
+    fn reply_error_message(payload: &[u8]) -> String {
+        let (control, _) =
+            c2_wire::control::decode_reply_control(payload, 0).expect("reply control");
+        match control {
+            ReplyControl::Error(err) => String::from_utf8_lossy(&err).to_string(),
+            other => panic!("expected a structured error reply, got {other:?}"),
+        }
+    }
+
+    /// A terminal chunk-processing capacity refusal while the first chunk is
+    /// still parked in route admission must wake and fence the owner: after the
+    /// stalled route gate is released there is no callback, no recreated
+    /// assembly, no stored route admission, and no leaked permit.
+    #[tokio::test]
+    async fn capacity_refusal_fences_stalled_first_admission_against_post_abort_publication() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = ordering_test_server("ipc://chunked_terminal_capacity", 2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            crate::scheduler::SchedulerLimits::try_from_usize(Some(1), Some(1)).unwrap(),
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        // Stall the first chunk's route admission and fill both chunk-processing
+        // permits: the first chunk parks on the held dispatcher gate, one later
+        // chunk parks on its admission.
+        let dispatcher_guard = server.dispatcher.write().await;
+        client
+            .write_all(&chunked_call_frame(61, 0, 3, &[0x11u8; 32], "grid"))
+            .await
+            .expect("write first chunk");
+        client
+            .write_all(&chunked_call_frame(61, 1, 3, &[0x22u8; 32], "grid"))
+            .await
+            .expect("write later chunk");
+        wait_until("chunk frames parked at capacity", || {
+            server.chunk_admission_gate.len() == 1
+                && server.chunk_processing_permits.available_permits() == 0
+        })
+        .await;
+
+        // This frame cannot get a chunk-processing permit, so the request is
+        // terminal: the refusal must fence the parked admission instead of
+        // letting it publish when the route gate opens.
+        client
+            .write_all(&chunked_call_frame(61, 2, 3, &[0x33u8; 32], "grid"))
+            .await
+            .expect("write capacity-refused frame");
+        let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 61);
+        let message = reply_error_message(&reply_payload);
+        assert!(
+            message.contains("max_total_chunks=2"),
+            "capacity refusal must name the chunk-processing bound: {message}"
+        );
+
+        // Release the stalled gate while the parked owner may still be inside
+        // its route-admission await: even if the reservation completes, the
+        // atomic admission commit must lose and the staged publication must
+        // roll back.
+        drop(dispatcher_guard);
+        wait_until("terminal refusal released the parked admission", || {
+            server.chunk_admission_gate.len() == 0
+                && server.chunk_registry.active_count() == 0
+                && server.chunk_processing_permits.available_permits() == 2
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let conn_id = server.active_connection_ids()[0];
+        assert!(!server.chunk_registry.contains(conn_id, 61));
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no callback after refusal");
+        assert!(
+            scheduler.try_acquire(0).is_ok(),
+            "the route pending permit must not stay charged"
+        );
+        assert_eq!(server.chunk_processing_permits.available_permits(), 2);
+
+        // Control liveness on the same connection after the terminal refusal.
+        client
+            .write_all(&encode_frame(5, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .await
+            .expect("write ping");
+        let (ping_rid, _flags, ping_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(ping_rid, 5);
+        assert_eq!(ping_payload, PONG_BYTES);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    /// A malformed later chunk frame is a terminal request failure: it must
+    /// publish the abort, wake the first chunk parked on its admission, release
+    /// everything, and prevent publication when the route gate finally opens.
+    #[tokio::test]
+    async fn malformed_later_chunk_failure_fences_stalled_first_admission() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = ordering_test_server("ipc://chunked_terminal_malformed", 3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        let dispatcher_guard = server.dispatcher.write().await;
+        client
+            .write_all(&chunked_call_frame(62, 0, 2, &[0x44u8; 32], "grid"))
+            .await
+            .expect("write first chunk");
+        wait_until("first chunk parked on the held route gate", || {
+            server.chunk_admission_gate.len() == 1
+        })
+        .await;
+
+        // A chunked frame too short to hold a chunk header is terminal: its
+        // dispatch reports the malformed frame and must tear the request down.
+        client
+            .write_all(&encode_frame(
+                62,
+                c2_wire::flags::FLAG_CALL_V2 | FLAG_CHUNKED,
+                &[0x01, 0x02],
+            ))
+            .await
+            .expect("write malformed later chunk");
+        let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 62);
+        let message = reply_error_message(&reply_payload);
+        assert!(
+            message.contains("chunk header decode failed"),
+            "malformed chunk must be correlated: {message}"
+        );
+
+        drop(dispatcher_guard);
+        wait_until("malformed-frame teardown released the parked admission", || {
+            server.chunk_admission_gate.len() == 0
+                && server.chunk_registry.active_count() == 0
+                && server.chunk_processing_permits.available_permits() == 3
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let conn_id = server.active_connection_ids()[0];
+        assert!(!server.chunk_registry.contains(conn_id, 62));
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    /// A duplicate first chunk over a pending admission refuses the duplicate
+    /// frame and tears the request down: the parked owner publishes nothing,
+    /// the caller gets exactly one correlated error, and every permit returns.
+    #[tokio::test]
+    async fn duplicate_first_chunk_refusal_aborts_pending_admission() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = ordering_test_server("ipc://chunked_duplicate_first", 3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        let dispatcher_guard = server.dispatcher.write().await;
+        client
+            .write_all(&chunked_call_frame(81, 0, 2, &[0x66u8; 32], "grid"))
+            .await
+            .expect("write first chunk");
+        wait_until("first admission pending", || {
+            server.chunk_admission_gate.len() == 1
+        })
+        .await;
+
+        client
+            .write_all(&chunked_call_frame(81, 0, 2, &[0x77u8; 32], "grid"))
+            .await
+            .expect("write duplicate first chunk");
+        let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 81);
+        let message = reply_error_message(&reply_payload);
+        assert!(
+            message.contains("duplicate first chunk"),
+            "duplicate first chunk must be refused: {message}"
+        );
+
+        drop(dispatcher_guard);
+        wait_until("duplicate refusal released the request", || {
+            server.chunk_admission_gate.len() == 0
+                && server.chunk_registry.active_count() == 0
+                && server.chunk_processing_permits.available_permits() == 3
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let conn_id = server.active_connection_ids()[0];
+        assert!(!server.chunk_registry.contains(conn_id, 81));
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    /// A duplicate first chunk over an already-admitted request refuses the
+    /// duplicate and tears the published generation down: the assembly is
+    /// released immediately (not left until its later chunks or the assembler
+    /// timeout) and its stored route admission returns.
+    #[tokio::test]
+    async fn duplicate_first_chunk_after_admission_aborts_the_published_assembly() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = ordering_test_server("ipc://chunked_duplicate_after_admission", 3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        // The first chunk of a two-chunk request is admitted and its assembly
+        // and stored route admission are published.
+        client
+            .write_all(&chunked_call_frame(82, 0, 2, &[0x21u8; 32], "grid"))
+            .await
+            .expect("write first chunk");
+        wait_until("assembly published after admission", || {
+            server.chunk_registry.active_count() == 1
+                && server.chunk_route_pending.lock().len() == 1
+        })
+        .await;
+        let conn_id = server.active_connection_ids()[0];
+        assert!(server.chunk_registry.contains(conn_id, 82));
+
+        // A duplicate first chunk for the same request id claims a fresh
+        // admission entry (the previous one was released on admission), then
+        // fails the registry duplicate check. The refusal must release the
+        // published generation instead of stranding it.
+        client
+            .write_all(&chunked_call_frame(82, 0, 2, &[0x22u8; 32], "grid"))
+            .await
+            .expect("write duplicate first chunk");
+        let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 82);
+        let message = reply_error_message(&reply_payload);
+        assert!(
+            message.contains("duplicate assembly"),
+            "duplicate admission must be correlated: {message}"
+        );
+
+        wait_until("duplicate refusal released the published generation", || {
+            server.chunk_registry.active_count() == 0
+                && server.chunk_route_pending.lock().is_empty()
+                && server.chunk_processing_permits.available_permits() == 3
+                && server.chunk_admission_gate.len() == 0
+        })
+        .await;
+        assert!(!server.chunk_registry.contains(conn_id, 82));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
+    }
+
+    /// Cancellation after the assembly/route publication but before the
+    /// admission commit must roll the staged publication back exactly once.
+    ///
+    /// The owner below is already torn down when its route wait completes (the
+    /// terminal abort won the atomic transition), which exercises the commit
+    /// fence directly rather than the wake-up path.
+    #[tokio::test]
+    async fn lost_admission_commit_rolls_back_staged_publication_exactly_once() {
+        use c2_mem::budget::BudgetKind;
+        use c2_wire::chunk::encode_chunk_header;
+        use c2_wire::control::encode_call_control;
+
+        let budget = c2_mem::MemoryBudget::new(1 << 20, 1 << 20, 4096);
+        let reassembly_pool = Arc::new(parking_lot::RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 2,
+                    max_dedicated_segments: 2,
+                    dedicated_crash_timeout_secs: 0.0,
+                    buddy_idle_decay_secs: 0.0,
+                    spill_threshold: 1.0,
+                    spill_dir: std::env::temp_dir().join("c2_srv_commit_fence_test"),
+                    ..PoolConfig::default()
+                },
+                "/c2srv_commit_fence".to_string(),
+                budget.clone(),
+            ),
+        ));
+        let mut config = ServerIpcConfig::default();
+        config.base.max_total_chunks = 4;
+        let server = Arc::new(
+            Server::with_reassembly_pool(
+                "ipc://chunk_commit_fence",
+                config,
+                ServerIdentity {
+                    server_id: "chunk_commit_fence".into(),
+                    server_instance_id: "chunk_commit_fence-instance".into(),
+                },
+                reassembly_pool,
+            )
+            .unwrap(),
+        );
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            crate::scheduler::SchedulerLimits::try_from_usize(Some(1), Some(1)).unwrap(),
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        server.register_route(route).await.unwrap();
+
+        let conn = Arc::new(Connection::new(321));
+        let writer = closed_writer().await;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_chunk_header(0, 2));
+        payload.extend_from_slice(&encode_call_control(&call_identity("grid"), 0).unwrap());
+        payload.extend_from_slice(&[0x5au8; 512]);
+
+        // Frame dispatch claimed this request's admission entry; a concurrent
+        // capacity/feed/malformed refusal then tore the request down while the
+        // owning task was still waiting for route admission.
+        let owner = server.begin_chunk_admission(conn.conn_id(), 31).unwrap();
+        server.abort_chunk_request(conn.conn_id(), 31);
+
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            31,
+            FLAG_CHUNKED,
+            &payload,
+            &writer,
+            chunk_permit,
+            ChunkFrameOrdering::First(owner),
+        )
+        .await;
+
+        // Route admission completed and the assembly + stored admission were
+        // published, but the atomic admission commit lost: the staged
+        // publication was rolled back exactly once.
+        let budget_used = budget.snapshot().cell(BudgetKind::Reassembly).used_bytes;
+        assert_eq!(
+            budget_used, 0,
+            "the rolled-back assembly must refund its reassembly charge"
+        );
+        assert!(!server.chunk_registry.contains(conn.conn_id(), 31));
+        assert_eq!(server.chunk_registry.active_count(), 0);
+        assert_eq!(server.chunk_registry.total_bytes(), 0);
+        assert!(server.chunk_route_pending.lock().is_empty());
+        assert!(
+            scheduler.try_acquire(0).is_ok(),
+            "the route pending permit must be returned"
+        );
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        assert_eq!(server.chunk_processing_permits.available_permits(), 4);
+    }
+
+    /// A later chunk whose admission ends in Refused/Aborted must still return
+    /// its buddy-backed peer block instead of leaking the SHM allocation.
+    #[tokio::test]
+    async fn discarded_waiting_buddy_chunk_returns_its_peer_block() {
+        use c2_mem::MemHandle;
+        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+        use c2_wire::chunk::encode_chunk_header;
+
+        fn peer_segments(pool: &MemPool) -> Vec<(String, u32)> {
+            (0..pool.segment_count())
+                .filter_map(|i| {
+                    let name = pool.segment_name(i)?.to_string();
+                    let size = pool.segment(i)?.allocator().data_size() as u32;
+                    Some((name, size))
+                })
+                .collect()
+        }
+
+        let mut peer_pool = MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 1,
+                dedicated_crash_timeout_secs: 0.0,
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix("discard"),
+        );
+        let allocate_buddy_frame = |peer_pool: &mut MemPool| -> Vec<u8> {
+            let handle = peer_pool.try_alloc_shm(128).unwrap();
+            let (seg_idx, generation, offset, len) = match handle {
+                MemHandle::Buddy {
+                    seg_idx,
+                    generation,
+                    offset,
+                    len,
+                    ..
+                } => (seg_idx, generation, offset, len),
+                other => panic!("expected buddy request block, got {other:?}"),
+            };
+            let mut payload = encode_buddy_payload(&BuddyPayload {
+                seg_idx,
+                generation,
+                offset,
+                data_size: len as u32,
+                is_dedicated: false,
+            })
+            .to_vec();
+            payload.extend_from_slice(&encode_chunk_header(1, 2));
+            payload.extend_from_slice(&[0u8; 16]);
+            payload
+        };
+
+        let conn = Arc::new(Connection::new(9));
+        let writer = closed_writer().await;
+        let server = ordering_test_server("ipc://chunked_discard_buddy", 4);
+
+        // Refused admission path: the waiting frame is discarded before it
+        // decodes its buddy payload, but the peer block must still be freed.
+        let refused_payload = allocate_buddy_frame(&mut peer_pool);
+        conn.init_peer_shm(peer_pool.prefix().to_string(), peer_segments(&peer_pool));
+        let mut owner = server.begin_chunk_admission(conn.conn_id(), 41).unwrap();
+        let waiter = server.chunk_admission_waiter(conn.conn_id(), 41).unwrap();
+        owner.refuse();
+        owner.release();
+        assert_eq!(peer_pool.stats().alloc_count, 1);
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            41,
+            FLAG_CHUNKED | FLAG_BUDDY,
+            &refused_payload,
+            &writer,
+            chunk_permit,
+            ChunkFrameOrdering::Wait(waiter),
+        )
+        .await;
+        assert_eq!(
+            peer_pool.stats().alloc_count,
+            0,
+            "a refused waiting buddy chunk must return its peer block"
+        );
+
+        // Aborted admission path: same discard, same peer-block return.
+        let aborted_payload = allocate_buddy_frame(&mut peer_pool);
+        conn.init_peer_shm(peer_pool.prefix().to_string(), peer_segments(&peer_pool));
+        let owner = server.begin_chunk_admission(conn.conn_id(), 42).unwrap();
+        let waiter = server.chunk_admission_waiter(conn.conn_id(), 42).unwrap();
+        server.abort_chunk_request(conn.conn_id(), 42);
+        assert_eq!(peer_pool.stats().alloc_count, 1);
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            42,
+            FLAG_CHUNKED | FLAG_BUDDY,
+            &aborted_payload,
+            &writer,
+            chunk_permit,
+            ChunkFrameOrdering::Wait(waiter),
+        )
+        .await;
+        assert_eq!(
+            peer_pool.stats().alloc_count,
+            0,
+            "an aborted waiting buddy chunk must return its peer block"
+        );
+        drop(owner);
+    }
+
+    /// Control frames keep working while every chunk-processing permit is held
+    /// by a stalled first chunk, and the stalled request still completes with
+    /// byte-equal delivery once the route gate opens.
+    #[tokio::test]
+    async fn ping_is_served_while_chunk_processing_capacity_is_exhausted() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = ordering_test_server("ipc://chunked_ping_at_capacity", 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let (mut client, server_stream) = LocalStream::pair().await.expect("local pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { handle_connection(server, server_stream).await })
+        };
+
+        let dispatcher_guard = server.dispatcher.write().await;
+        let data: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(7)).collect();
+        client
+            .write_all(&chunked_call_frame(71, 0, 1, &data, "grid"))
+            .await
+            .expect("write single chunk frame");
+        wait_until("the only chunk-processing permit is held", || {
+            server.chunk_processing_permits.available_permits() == 0
+                && server.chunk_admission_gate.len() == 1
+        })
+        .await;
+        assert_eq!(server.chunk_registry.active_count(), 0);
+
+        // Control liveness at full chunk-processing capacity.
+        client
+            .write_all(&encode_frame(9, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .await
+            .expect("write ping");
+        let (ping_rid, ping_flags, ping_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(ping_rid, 9);
+        assert!(ping_flags & FLAG_SIGNAL != 0);
+        assert_eq!(ping_payload, PONG_BYTES);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Release the gate: the same request completes with exactly its bytes.
+        drop(dispatcher_guard);
+        let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
+        assert_eq!(reply_rid, 71);
+        let (control, consumed) =
+            c2_wire::control::decode_reply_control(&reply_payload, 0).expect("reply control");
+        match control {
+            ReplyControl::Success => {}
+            other => panic!("expected successful reply after capacity stall, got {other:?}"),
+        }
+        assert_eq!(&reply_payload[consumed..], data.as_slice());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.chunk_processing_permits.available_permits(), 1);
+        assert_eq!(server.chunk_admission_gate.len(), 0);
+        assert_eq!(server.chunk_registry.active_count(), 0);
+
+        drop(client);
+        handler.await.expect("connection handler completes");
     }
 
     #[tokio::test]
@@ -6484,6 +8107,7 @@ mod tests {
             &payload,
             &writer,
             chunk_permit,
+            chunk_frame_ordering(&server, conn.conn_id(), 11, FLAG_CHUNKED, &payload).unwrap(),
         )
         .await;
 

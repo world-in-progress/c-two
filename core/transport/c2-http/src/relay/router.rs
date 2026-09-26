@@ -1568,7 +1568,7 @@ async fn call_handler(
     match call_result {
         Ok(result) => materialized_response_or_error(
             &route_name,
-            result.into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc()),
+            result.into_bytes_with_pool(client.server_pool_arc()),
             state.config().remote_payload_chunk_size,
         ),
         Err(error) => {
@@ -2308,8 +2308,9 @@ mod tests {
                     let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
                     "shm"
                 }
-                RequestData::Handle { handle, pool } => {
-                    pool.write().release_handle(handle);
+                RequestData::Handle(backing) => {
+                    let mut backing = backing;
+                    let _ = backing.release();
                     "handle"
                 }
             };

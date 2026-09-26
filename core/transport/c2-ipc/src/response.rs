@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use c2_mem::{MemHandle, MemPool};
-use parking_lot::{Mutex, RwLock};
+use c2_wire::chunk::ReassemblyBacking;
+use parking_lot::Mutex;
 
 use crate::client::ServerPoolState;
 
@@ -20,8 +20,10 @@ pub enum ResponseData {
         data_size: u32,
         is_dedicated: bool,
     },
-    /// Reassembled chunked response (owned by client's reassembly pool).
-    Handle(MemHandle),
+    /// Reassembled chunked response. The carrier owns the client's
+    /// reassembly pool, the handle, and the reassembly budget charge until
+    /// release; trimming and holding keep the full capacity charged.
+    Handle(ReassemblyBacking),
 }
 
 impl ResponseData {
@@ -58,10 +60,8 @@ impl ResponseData {
     pub fn into_bytes_with_pool(
         self,
         server_pool: &Arc<Mutex<Option<ServerPoolState>>>,
-        reassembly_pool: &Arc<RwLock<MemPool>>,
     ) -> Result<Vec<u8>, String> {
-        ResponseLease::new(self, Arc::clone(server_pool), Arc::clone(reassembly_pool))
-            .into_owned_bytes()
+        ResponseLease::new(self, Arc::clone(server_pool)).into_owned_bytes()
     }
 }
 
@@ -69,23 +69,18 @@ impl ResponseData {
 ///
 /// SDK callers obtain this through their Core client. The public constructor is
 /// the low-level boundary used by transport-independent Core orchestration and
-/// tests; it accepts only the exact pool owners associated with `response`.
+/// tests; reassembled handles carry their own pool and budget charge inside
+/// the [`ReassemblyBacking`] carrier.
 pub struct ResponseLease {
     response: Option<ResponseData>,
     server_pool: Arc<Mutex<Option<ServerPoolState>>>,
-    reassembly_pool: Arc<RwLock<MemPool>>,
 }
 
 impl ResponseLease {
-    pub fn new(
-        response: ResponseData,
-        server_pool: Arc<Mutex<Option<ServerPoolState>>>,
-        reassembly_pool: Arc<RwLock<MemPool>>,
-    ) -> Self {
+    pub fn new(response: ResponseData, server_pool: Arc<Mutex<Option<ServerPoolState>>>) -> Self {
         Self {
             response: Some(response),
             server_pool,
-            reassembly_pool,
         }
     }
 
@@ -110,18 +105,17 @@ impl ResponseLease {
                     .ok_or_else(|| "server pool not initialised".to_string())?;
                 state.copy_response(*seg_idx, *generation, *offset, *data_size, *is_dedicated)
             }
-            ResponseData::Handle(handle) => self
-                .reassembly_pool
-                .read()
-                .copy_handle_data(handle)
+            ResponseData::Handle(backing) => backing
+                .copy_bytes()
                 .map_err(|error| format!("response handle copy failed: {error}")),
         }
     }
 
     /// Release transport storage exactly once.
     ///
-    /// SHM coordinates and handles are validated before any coordinate-derived
-    /// free is attempted.
+    /// SHM coordinates are validated before any coordinate-derived free is
+    /// attempted; reassembly backing release (storage first, then budget
+    /// refund) is owned by the carrier.
     pub fn release(&mut self) -> Result<(), String> {
         let Some(response) = self.response.take() else {
             return Ok(());
@@ -141,13 +135,9 @@ impl ResponseLease {
                     .ok_or_else(|| "server pool not initialised".to_string())?;
                 state.release_response(seg_idx, generation, offset, data_size, is_dedicated)
             }
-            ResponseData::Handle(handle) => {
-                let mut pool = self.reassembly_pool.write();
-                pool.validate_handle(&handle).map_err(|error| {
-                    format!("response handle release failed: validation failed: {error}")
-                })?;
-                release_response_handle(&mut pool, handle)
-            }
+            ResponseData::Handle(mut backing) => backing
+                .release()
+                .map_err(|error| format!("response handle release failed: {error}")),
         }
     }
 
@@ -178,35 +168,6 @@ impl Drop for ResponseLease {
     fn drop(&mut self) {
         let _ = self.release();
     }
-}
-
-fn release_response_handle(pool: &mut MemPool, handle: MemHandle) -> Result<(), String> {
-    match handle {
-        MemHandle::Buddy {
-            seg_idx,
-            generation,
-            offset,
-            allocation_size,
-            ..
-        } => {
-            pool.free_at(
-                u32::from(seg_idx),
-                generation,
-                offset,
-                allocation_size,
-                false,
-            )
-            .map_err(|error| format!("response handle release failed: {error}"))?;
-        }
-        MemHandle::Dedicated { seg_idx, len } => {
-            let data_size = u32::try_from(len)
-                .map_err(|_| "response dedicated handle length exceeds the wire address space")?;
-            pool.free_at(u32::from(seg_idx), 0, 0, data_size, true)
-                .map_err(|error| format!("response handle release failed: {error}"))?;
-        }
-        MemHandle::FileSpill { .. } => {}
-    }
-    Ok(())
 }
 
 fn combine_copy_and_release(

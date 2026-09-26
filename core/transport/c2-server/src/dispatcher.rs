@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use c2_mem::{MemHandle, MemPool};
+use c2_mem::MemPool;
+use c2_wire::chunk::ReassemblyBacking;
 
 use crate::scheduler::{
     AccessLevel, ConcurrencyMode, RouteConcurrencyHandle, Scheduler, SchedulerLimits,
@@ -70,12 +71,10 @@ pub enum RequestData {
     },
     /// Inline bytes from a local IPC frame.
     Inline(Vec<u8>),
-    /// Reassembled MemHandle from chunked transfer.
-    /// ShmBuffer.release() returns handle to pool.
-    Handle {
-        handle: MemHandle,
-        pool: Arc<parking_lot::RwLock<MemPool>>,
-    },
+    /// Reassembled chunked transfer. The carrier owns the reassembly pool,
+    /// the handle, and the reassembly budget charge; release frees storage
+    /// through the pool authority first and refunds the charge after.
+    Handle(ReassemblyBacking),
 }
 
 impl RequestData {
@@ -99,9 +98,8 @@ impl RequestData {
                     *is_dedicated,
                 )
                 .map_err(|error| format!("request SHM copy failed: {error}")),
-            Self::Handle { handle, pool } => pool
-                .read()
-                .copy_handle_data(handle)
+            Self::Handle(backing) => backing
+                .copy_bytes()
                 .map_err(|error| format!("request handle copy failed: {error}")),
         }
     }
@@ -136,44 +134,11 @@ impl RequestData {
                 .map_err(|error| format!("request SHM release failed: {error}"))?;
                 Ok(())
             }
-            Self::Handle { handle, pool } => {
-                let mut pool = pool.write();
-                pool.validate_handle(&handle).map_err(|error| {
-                    format!("request handle release validation failed: {error}")
-                })?;
-                release_request_handle(&mut pool, handle)
-            }
+            Self::Handle(mut backing) => backing
+                .release()
+                .map_err(|error| format!("request handle release failed: {error}")),
         }
     }
-}
-
-fn release_request_handle(pool: &mut MemPool, handle: MemHandle) -> Result<(), String> {
-    match handle {
-        MemHandle::Buddy {
-            seg_idx,
-            generation,
-            offset,
-            allocation_size,
-            ..
-        } => {
-            pool.free_at(
-                u32::from(seg_idx),
-                generation,
-                offset,
-                allocation_size,
-                false,
-            )
-            .map_err(|error| format!("request handle release failed: {error}"))?;
-        }
-        MemHandle::Dedicated { seg_idx, len } => {
-            let data_size = u32::try_from(len)
-                .map_err(|_| "request dedicated handle length exceeds the wire address space")?;
-            pool.free_at(u32::from(seg_idx), 0, 0, data_size, true)
-                .map_err(|error| format!("request handle release failed: {error}"))?;
-        }
-        MemHandle::FileSpill { .. } => {}
-    }
-    Ok(())
 }
 
 /// Owns one request transport allocation until it is explicitly released.
@@ -264,7 +229,7 @@ impl std::fmt::Debug for RequestData {
                 "RequestData::Shm(seg={seg_idx}, gen={generation}, off={offset}, size={data_size}, ded={is_dedicated})"
             ),
             RequestData::Inline(v) => write!(f, "RequestData::Inline({} bytes)", v.len()),
-            RequestData::Handle { .. } => write!(f, "RequestData::Handle"),
+            RequestData::Handle(_) => write!(f, "RequestData::Handle"),
         }
     }
 }
@@ -677,17 +642,16 @@ mod tests {
 
     #[test]
     fn request_data_handle_materializes_and_releases_reassembly_allocation() {
+        use c2_wire::chunk::ReassemblyBacking;
+
         let payload = b"reassembled".repeat(512);
         for logical_len in [payload.len(), 4096, 1, 0] {
-            let mut pool = request_test_pool();
-            let mut handle = pool.alloc_handle(payload.len()).unwrap();
-            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
-            handle.set_len(logical_len);
-            let pool = Arc::new(parking_lot::RwLock::new(pool));
-            let request = RequestData::Handle {
-                handle,
-                pool: Arc::clone(&pool),
-            };
+            let pool = Arc::new(parking_lot::RwLock::new(request_test_pool()));
+            let mut backing =
+                ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
+            backing.write_at(0, &payload).unwrap();
+            backing.trim_to(logical_len).unwrap();
+            let request = RequestData::Handle(backing);
 
             assert_eq!(
                 RequestLease::new(request).into_owned_bytes().unwrap(),
@@ -699,26 +663,22 @@ mod tests {
 
     #[test]
     fn file_spill_request_lease_preserves_trim_and_release_state() {
+        use c2_wire::chunk::ReassemblyBacking;
+
         let payload = b"file-backed request".repeat(256);
         for logical_len in [payload.len(), 1, 0] {
-            let mut pool = MemPool::new(PoolConfig {
+            let pool = Arc::new(parking_lot::RwLock::new(MemPool::new(PoolConfig {
                 spill_threshold: 0.0,
                 ..PoolConfig::default()
-            });
-            let mut handle = pool.alloc_handle(payload.len()).unwrap();
-            assert!(handle.is_file_spill());
-            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
-            handle.set_len(logical_len);
+            })));
+            let mut backing =
+                ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
+            assert!(backing.is_file_spill());
+            backing.write_at(0, &payload).unwrap();
+            backing.trim_to(logical_len).unwrap();
             #[cfg(windows)]
-            let path = match &handle {
-                c2_mem::MemHandle::FileSpill { path, .. } => path.clone(),
-                _ => unreachable!(),
-            };
-            let pool = Arc::new(parking_lot::RwLock::new(pool));
-            let mut lease = RequestLease::new(RequestData::Handle {
-                handle,
-                pool: Arc::clone(&pool),
-            });
+            let path = backing.file_spill_path().unwrap();
+            let mut lease = RequestLease::new(RequestData::Handle(backing));
             #[cfg(windows)]
             assert!(path.exists());
             assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);

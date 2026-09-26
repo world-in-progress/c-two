@@ -593,11 +593,11 @@ impl MethodTable {
 
 // ── Pending call ─────────────────────────────────────────────────────────
 
-enum PendingResponse {
+pub(crate) enum PendingResponse {
     Unary(oneshot::Sender<Result<ResponseData, IpcError>>),
 }
 
-type PendingMap = HashMap<u32, PendingResponse>;
+pub(crate) type PendingMap = HashMap<u32, PendingResponse>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestTransportKind {
@@ -1196,11 +1196,6 @@ impl IpcClient {
     /// Get a reference to the server SHM pool (for materialising SHM responses).
     pub fn server_pool_arc(&self) -> &Arc<StdMutex<Option<ServerPoolState>>> {
         &self.server_pool
-    }
-
-    /// Get a reference to the reassembly pool (for materialising Handle responses).
-    pub fn reassembly_pool_arc(&self) -> Arc<RwLock<MemPool>> {
-        self.chunk_registry.pool().clone()
     }
 
     /// Identity announced by the connected IPC server handshake.
@@ -2892,7 +2887,7 @@ impl Drop for ConnectionAssemblyCleanup {
     }
 }
 
-async fn recv_loop(
+pub(crate) async fn recv_loop(
     mut reader: LocalReadHalf,
     pending: Arc<StdMutex<PendingMap>>,
     _server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
@@ -2972,13 +2967,23 @@ async fn recv_loop(
                 match decode_reply_chunk_meta(&recv_buf, 0) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("Warning: reply chunk meta decode error: {e:?}");
+                        // Malformed metadata for this request id: release any
+                        // assembly already charged for it and complete exactly
+                        // that pending caller instead of only logging and
+                        // leaving both stranded.
+                        let message = format!("chunked reply metadata decode error: {e:?}");
+                        eprintln!("Warning: {message}");
+                        chunk_registry.abort(conn_id, rid as u64);
+                        let tx = pending.lock().remove(&rid);
+                        complete_unary_pending(tx, Err(IpcError::Chunk(message)));
                         continue;
                     }
                 };
             let chunk_data = &recv_buf[meta_consumed..];
 
-            // First chunk: create assembler in registry.
+            // First chunk: create assembler in registry. Admission (budget
+            // reservation before allocation) happens inside insert; a
+            // rejection is correlated back to the pending caller below.
             if chunk_idx == 0 {
                 let chunk_size = if total_chunks > 1 {
                     chunk_data.len()
@@ -2988,12 +2993,17 @@ async fn recv_loop(
                 if let Err(e) =
                     chunk_registry.insert(conn_id, rid as u64, total_chunks as usize, chunk_size)
                 {
+                    // A rejected first chunk (budget/geometry, or a duplicate
+                    // first chunk for an assembly already in flight) poisons
+                    // this request: release whatever it may still hold for this
+                    // request id, then complete the correlated caller.
                     eprintln!("Warning: reply chunk assembler creation failed: {e}");
+                    chunk_registry.abort(conn_id, rid as u64);
                     let tx = pending.lock().remove(&rid);
                     complete_unary_pending(
                         tx,
                         Err(IpcError::Chunk(format!(
-                            "chunked reply assembler failed: {e}"
+                            "chunked reply reassembly admission failed: {e}"
                         ))),
                     );
                     continue;
@@ -3009,7 +3019,7 @@ async fn recv_loop(
                                 let tx = pending.lock().remove(&rid);
                                 complete_unary_pending(
                                     tx,
-                                    Ok(ResponseData::Handle(finished.handle)),
+                                    Ok(ResponseData::Handle(finished.backing)),
                                 );
                             }
                             Err(e) => {
@@ -3025,7 +3035,12 @@ async fn recv_loop(
                     }
                 }
                 Err(e) => {
+                    // A rejected chunk (duplicate, oversized, unknown index)
+                    // poisons this assembly: release its charged capacity
+                    // before completing the caller so the budget returns
+                    // immediately instead of waiting for GC or disconnect.
                     eprintln!("Warning: reply chunk feed error: {e}");
+                    chunk_registry.abort(conn_id, rid as u64);
                     let tx = pending.lock().remove(&rid);
                     complete_unary_pending(
                         tx,
@@ -3157,7 +3172,7 @@ mod tests {
 
         let mut client = IpcClient::new(&address);
         let registry = Arc::clone(&client.chunk_registry);
-        let reassembly_pool = client.reassembly_pool_arc();
+        let reassembly_pool = Arc::clone(client.chunk_registry.pool());
         client.connect().await.expect("first connect");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while registry.active_count() != 1 {
