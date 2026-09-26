@@ -1,8 +1,9 @@
 """Measure isolated, real IPC calls without treating mapping capacity as RSS.
 
-Run with the candidate environment's Python. Each worker owns a server and
-connects through an explicit ipc:// address; same-process direct dispatch is
-therefore excluded. Run separate invocations for cold/small and large payloads.
+Run with the candidate environment's Python. By default, worker processes
+connect to one shared server in the controller. The pairs topology gives each
+worker its own server. Explicit ipc:// addresses exclude direct dispatch.
+Run separate invocations for cold/small and large payloads.
 RSS is a process high-water mark, including Python and serialization; it is
 not an allocator byte counter. Windows reports null when resource is absent.
 """
@@ -30,12 +31,7 @@ def peak_rss_bytes() -> int | None:
     return int(rss if sys.platform == 'darwin' else rss * 1024)
 
 
-def measure(args: argparse.Namespace) -> dict:
-    os.environ['C2_ENV_FILE'] = ''
-    os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
-    import c_two as cc
-    from c_two import _native
-
+def echo_types(cc):
     @cc.crm(namespace='c_two.benchmark.memory', version='1.0.0')
     class Echo:
         def echo(self, value: bytes) -> bytes: ...
@@ -44,6 +40,10 @@ def measure(args: argparse.Namespace) -> dict:
         def echo(self, value: bytes) -> bytes:
             return value
 
+    return Echo, EchoResource
+
+
+def configure(cc, args: argparse.Namespace) -> dict:
     overrides = {
         'pool_enabled': args.pool_enabled,
         'pool_segment_size': args.segment_size,
@@ -53,13 +53,27 @@ def measure(args: argparse.Namespace) -> dict:
     cc.set_transport_policy(shm_threshold=args.shm_threshold)
     cc.set_server(ipc_overrides=overrides)
     cc.set_client(ipc_overrides=overrides)
+    return overrides
+
+
+def measure(args: argparse.Namespace) -> dict:
+    os.environ['C2_ENV_FILE'] = ''
+    os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
+    import c_two as cc
+    from c_two import _native
+
+    Echo, EchoResource = echo_types(cc)
+    overrides = configure(cc, args)
     rss = {'imported': peak_rss_bytes()}
     client = None
     started = time.perf_counter_ns()
     try:
-        cc.register(Echo, EchoResource(), name='echo')
-        rss['registered'] = peak_rss_bytes()
-        client = cc.connect(Echo, name='echo', address=cc.server_address())
+        address = args.address
+        if address is None:
+            cc.register(Echo, EchoResource(), name='echo')
+            rss['registered'] = peak_rss_bytes()
+            address = cc.server_address()
+        client = cc.connect(Echo, name='echo', address=address)
         connected_ns = time.perf_counter_ns() - started
         rss['connected'] = peak_rss_bytes()
         payload = b'm' * args.payload_bytes
@@ -123,9 +137,11 @@ def main() -> None:
     parser.add_argument('--shm-threshold', type=int, default=4096)
     parser.add_argument('--calls', type=int, default=200)
     parser.add_argument('--workers', type=int, default=1)
+    parser.add_argument('--topology', choices=['shared', 'pairs'], default='shared')
     parser.add_argument('--ipc-overrides', type=json.loads, default={}, help='Additional native IPC overrides as a JSON object')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--address', help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not isinstance(args.ipc_overrides, dict):
         parser.error('--ipc-overrides must be a JSON object')
@@ -145,7 +161,22 @@ def main() -> None:
     ]
     children: list[subprocess.Popen] = []
     results = []
+    server_cc = None
+    server_stats = None
     try:
+        if args.topology == 'shared':
+            os.environ['C2_ENV_FILE'] = ''
+            os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
+            import c_two as server_cc
+
+            Echo, EchoResource = echo_types(server_cc)
+            configure(server_cc, args)
+            server_cc.register(Echo, EchoResource(), name='echo')
+            command.extend(['--address', server_cc.server_address()])
+            server_stats = {
+                'pid': os.getpid(),
+                'rss_after_register_high_water_bytes': peak_rss_bytes(),
+            }
         for _ in range(args.workers):
             children.append(subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         for child in children:
@@ -153,15 +184,21 @@ def main() -> None:
             if child.returncode:
                 raise RuntimeError(f'benchmark child {child.pid} failed: {stderr}')
             results.append(json.loads(stdout))
+        if server_stats is not None:
+            server_stats['rss_after_calls_high_water_bytes'] = peak_rss_bytes()
     finally:
         for child in children:
             if child.poll() is None:
                 child.kill()
                 child.communicate()
+        if server_cc is not None:
+            server_cc.shutdown()
 
     report = {
         'schema': 'c-two.ipc-memory-benchmark.v1',
         'note': 'RSS is per-process peak, not summed shared backing or allocator usage; no baseline improvement is inferred.',
+        'topology': args.topology,
+        'server': server_stats,
         'workers': results,
     }
     text = json.dumps(report, indent=2) + '\n'
