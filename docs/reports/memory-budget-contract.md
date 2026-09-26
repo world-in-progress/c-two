@@ -60,6 +60,13 @@ Shutdown must detach and close this Runtime's cache entries through shared clien
 
 Drop/eviction must not leave receive/maintenance tasks holding pool Arcs forever. Provide explicit bounded shutdown for the supported Runtime lifecycle; check Drop cleanup without claiming Rust statics run destructors at process exit. A restart/new acquire must preserve stale-client identity fencing and must not let a late old-client release decrement a replacement entry.
 
+Independent review identified four required lifecycle cases before wiring budgets:
+
+- Native `RuntimeSession.shutdown()` must close client state even when no Host/server was ever created; currently its hostless branch skips Core shutdown. Rust's supported client-only lifecycle needs the same path.
+- Freeze the resolved client config/context atomically before connection I/O. A setter racing the first stalled connection cannot create two budget policies within one Runtime. Document whether failed first attempts remain frozen.
+- Fence acquire/insert against shutdown using a cache generation/closing state. A connection started before the shutdown fence cannot insert itself after the drain. Concurrent same-address losers, stale entries and evictions must detach under the cache lock and close outside it.
+- The entire close barrier needs a deadline, including writer-lock acquisition and receive-task joins. An unconfirmed timeout must be reported honestly; it cannot reset accounting or force-release backing still owned by tasks/leases. Explicit restart/new-acquire semantics must be covered by tests.
+
 ## Errors, control traffic and statistics
 
 Use the existing structured capacity/unavailability conventions (`ResourceUnavailable`) with a useful budget cell/size message. Reject immediately rather than adding cancellation-sensitive waits in this slice. A receiver must actually return a correlated error when admission fails, not only log and leave the sender waiting.
@@ -76,6 +83,7 @@ Expose consistent scope-labelled snapshots through Core/Server and native SDK pr
 4. Two outgoing connections in one Runtime share limits; independent Runtimes do not silently share config. Shutting down one leaves the other callable. Held file-backed responses remain valid across connection shutdown and keep file/reassembly charges until release.
 5. Small limits force the expected buddy/dedicated/chunk/file fallbacks. Exhausting all eligible tiers yields an explicit error while ping/shutdown still work.
 6. Unix and Windows tests check actual owner mapping/file cleanup and existing stale-generation rejection. Do not infer OS cleanup solely from registry counters.
+7. Deterministic barriers test client-only shutdown, acquire racing shutdown, concurrent same-address connection losers, stalled first-connect versus config mutation, and blocked writer/receiver cleanup. Existing held-buffer and independent-Runtime tests must still pass.
 
 ## Review provenance
 
