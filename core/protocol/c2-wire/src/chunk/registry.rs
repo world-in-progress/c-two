@@ -16,7 +16,6 @@ use c2_mem::handle::MemHandle;
 use tracing::warn;
 
 use crate::chunk::config::ChunkConfig;
-use crate::chunk::promote::promote_to_shm;
 
 const SHARD_COUNT: usize = 16;
 
@@ -195,6 +194,11 @@ impl ChunkRegistry {
     /// The entry is removed from the registry regardless of success or failure.
     /// On any error path after `take_handle()`, the handle is released back to
     /// the pool to prevent leaks.
+    ///
+    /// A file-spill backing is returned as-is. Consumers accept every
+    /// [`MemHandle`] variant (`RequestData::Handle` / `ResponseData::Handle`),
+    /// so completed reassembly storage stays where the memory-pressure
+    /// decision put it instead of being copied into SHM.
     pub fn finish(&self, conn_id: u64, request_id: u64) -> Result<FinishedChunk, String> {
         // Remove from shard and decrement counters first.
         let tracked = {
@@ -223,15 +227,6 @@ impl ChunkRegistry {
 
         // Trim logical length to actual written data (last chunk may be short).
         handle.set_len(inner.written_end());
-
-        // Try SHM promotion if this is a FileSpill.
-        if handle.is_file_spill() {
-            let mut pool = self.pool.write();
-            match promote_to_shm(&mut pool, handle) {
-                Ok(shm_handle) => handle = shm_handle,
-                Err(original) => handle = original,
-            }
-        }
 
         Ok(FinishedChunk {
             handle,
@@ -543,5 +538,140 @@ mod tests {
         }
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
+    }
+
+    // ── File-backing retention (spill_threshold = 0 forces file spill) ──
+
+    /// Pool where every mapping-backed allocation is forced to FileSpill:
+    /// `should_spill` returns true for any size when the threshold is 0.0,
+    /// and the pool starts with no pre-created buddy segments.
+    fn spill_pool() -> Arc<RwLock<MemPool>> {
+        let id = TEST_ID.fetch_add(1, TestOrdering::Relaxed);
+        let prefix = format!("/cc3g{:04x}{:04x}", std::process::id() as u16, id);
+        Arc::new(RwLock::new(MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 2,
+                max_dedicated_segments: 2,
+                dedicated_crash_timeout_secs: 0.0,
+                buddy_idle_decay_secs: 0.0,
+                spill_threshold: 0.0,
+                spill_dir: std::env::temp_dir().join("c2_reg_test"),
+            },
+            prefix,
+        )))
+    }
+
+    fn assert_no_shm_mappings(pool: &Arc<RwLock<MemPool>>) {
+        let stats = pool.read().stats();
+        assert_eq!(
+            stats.total_segments, 0,
+            "buddy segments must not be created"
+        );
+        assert_eq!(
+            stats.dedicated_segments, 0,
+            "dedicated SHM segments must not be created"
+        );
+    }
+
+    #[test]
+    fn finish_keeps_file_backing_without_shm_promotion() {
+        let pool = spill_pool();
+        let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
+        let chunk_size = 128;
+        reg.insert(1, 700, 3, chunk_size).unwrap();
+        // The reassembly allocation itself must already be file-backed.
+        assert_no_shm_mappings(&pool);
+
+        // Feed out of order with a short final chunk: 2 (short), 0, 1.
+        assert!(!reg.feed(1, 700, 2, &[2u8; 64]).unwrap());
+        assert!(!reg.feed(1, 700, 0, &[0u8; 128]).unwrap());
+        assert!(reg.feed(1, 700, 1, &[1u8; 128]).unwrap());
+
+        let finished = reg.finish(1, 700).unwrap();
+
+        // The completed reassembly must keep its file backing — no promotion.
+        assert!(finished.handle.is_file_spill());
+        // Logical length trimmed to actual data, not the full allocation.
+        assert_eq!(finished.handle.len(), 128 + 128 + 64);
+        // Data integrity across the file-backed mapping.
+        let p = pool.read();
+        let slice = p.handle_slice(&finished.handle);
+        assert_eq!(&slice[0..128], &[0u8; 128]);
+        assert_eq!(&slice[128..256], &[1u8; 128]);
+        assert_eq!(&slice[256..320], &[2u8; 64]);
+        drop(p);
+
+        // Finishing created no buddy or dedicated mappings either.
+        assert_no_shm_mappings(&pool);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+
+        pool.write().release_handle(finished.handle);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
+    fn abort_releases_file_backed_assembly() {
+        let pool = spill_pool();
+        let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
+        reg.insert(1, 710, 2, 1024).unwrap();
+        reg.feed(1, 710, 0, &[7u8; 1024]).unwrap();
+        reg.abort(1, 710);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        // The aborted file backing was the only storage; no SHM was mapped.
+        assert_no_shm_mappings(&pool);
+
+        // The pool remains usable for a fresh file-backed assembly.
+        reg.insert(1, 711, 1, 1024).unwrap();
+        assert!(reg.feed(1, 711, 0, &[9u8; 1024]).unwrap());
+        let finished = reg.finish(1, 711).unwrap();
+        assert!(finished.handle.is_file_spill());
+        let p = pool.read();
+        assert_eq!(p.handle_slice(&finished.handle), &[9u8; 1024]);
+        drop(p);
+        pool.write().release_handle(finished.handle);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
+    fn finish_error_path_releases_file_backed_assembly() {
+        let pool = spill_pool();
+        let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
+        reg.insert(1, 720, 3, 512).unwrap();
+        // Feed only 1 of 3 chunks — finish must fail without leaking storage.
+        reg.feed(1, 720, 0, &[3u8; 512]).unwrap();
+        assert!(reg.finish(1, 720).is_err());
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        assert_no_shm_mappings(&pool);
+
+        // A fresh assembly after the failed finish still works.
+        reg.insert(1, 721, 1, 512).unwrap();
+        assert!(reg.feed(1, 721, 0, &[4u8; 512]).unwrap());
+        let finished = reg.finish(1, 721).unwrap();
+        assert!(finished.handle.is_file_spill());
+        pool.write().release_handle(finished.handle);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
+    fn gc_timeout_releases_file_backed_assembly() {
+        let pool = spill_pool();
+        let cfg = ChunkConfig {
+            assembler_timeout: Duration::from_millis(50),
+            ..ChunkConfig::default()
+        };
+        let reg = ChunkRegistry::new(pool.clone(), cfg);
+        reg.insert(1, 730, 2, 512).unwrap();
+        reg.feed(1, 730, 0, &[5u8; 512]).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        let stats = reg.gc_sweep();
+        assert_eq!(stats.expired, 1);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        assert_no_shm_mappings(&pool);
     }
 }

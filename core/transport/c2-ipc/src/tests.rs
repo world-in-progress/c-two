@@ -545,6 +545,39 @@ mod response_lease_tests {
     }
 
     #[test]
+    fn file_spill_response_lease_preserves_trim_and_release_state() {
+        let payload = b"file-backed response".repeat(256);
+        for logical_len in [payload.len(), 1, 0] {
+            let mut config = pool_config();
+            config.spill_threshold = 0.0;
+            let mut owner = MemPool::new_with_prefix(config, unique_prefix('f'));
+            let mut handle = owner.alloc_handle(payload.len()).unwrap();
+            assert!(handle.is_file_spill());
+            owner.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+            handle.set_len(logical_len);
+            #[cfg(windows)]
+            let path = match &handle {
+                c2_mem::MemHandle::FileSpill { path, .. } => path.clone(),
+                _ => unreachable!(),
+            };
+            let mut lease = ResponseLease::new(
+                ResponseData::Handle(handle),
+                Arc::new(Mutex::new(None)),
+                Arc::new(RwLock::new(owner)),
+            );
+            #[cfg(windows)]
+            assert!(path.exists());
+            assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
+            lease.release().unwrap();
+            lease.release().unwrap();
+            assert!(lease.is_released());
+            assert!(lease.copy_bytes().unwrap_err().contains("already released"));
+            #[cfg(windows)]
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
     fn invalid_shm_span_fails_copy_and_drop_without_freeing_an_allocation() {
         let prefix = unique_prefix('x');
         let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());

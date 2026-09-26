@@ -697,6 +697,39 @@ mod tests {
     }
 
     #[test]
+    fn file_spill_request_lease_preserves_trim_and_release_state() {
+        let payload = b"file-backed request".repeat(256);
+        for logical_len in [payload.len(), 1, 0] {
+            let mut pool = MemPool::new(PoolConfig {
+                spill_threshold: 0.0,
+                ..PoolConfig::default()
+            });
+            let mut handle = pool.alloc_handle(payload.len()).unwrap();
+            assert!(handle.is_file_spill());
+            pool.handle_slice_mut(&mut handle).copy_from_slice(&payload);
+            handle.set_len(logical_len);
+            #[cfg(windows)]
+            let path = match &handle {
+                c2_mem::MemHandle::FileSpill { path, .. } => path.clone(),
+                _ => unreachable!(),
+            };
+            let pool = Arc::new(parking_lot::RwLock::new(pool));
+            let mut lease = RequestLease::new(RequestData::Handle {
+                handle,
+                pool: Arc::clone(&pool),
+            });
+            #[cfg(windows)]
+            assert!(path.exists());
+            assert_eq!(lease.copy_bytes().unwrap(), payload[..logical_len]);
+            lease.release().unwrap();
+            lease.release().unwrap();
+            assert!(lease.copy_bytes().unwrap_err().contains("already released"));
+            #[cfg(windows)]
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
     fn register_and_resolve() {
         let mut d = Dispatcher::new();
         d.register(make_route("grid"));

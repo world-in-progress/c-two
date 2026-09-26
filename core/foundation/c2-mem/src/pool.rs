@@ -888,7 +888,7 @@ impl MemPool {
 
     /// Allocate from Buddy or Dedicated SHM only — no FileSpill fallback.
     ///
-    /// Used by `promote_to_shm` when upgrading a FileSpill handle.
+    /// For callers that require a shared-memory handle rather than file storage.
     /// Returns `Err` if neither buddy nor dedicated has capacity.
     pub fn try_alloc_shm(&mut self, size: usize) -> Result<MemHandle, String> {
         if self.is_peer {
