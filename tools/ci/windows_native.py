@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -39,6 +40,19 @@ SOURCE_MODE_GATES = frozenset({
     "python-wheel-build",
     "python-build",
 })
+IPC_MEMORY_GATE = "ipc-memory-matrix"
+IPC_MEMORY_EVIDENCE_DIR = "ipc-memory-matrix"
+IPC_MEMORY_BENCHMARK = ROOT / "tools/benchmarks/ipc_memory.py"
+# Explicit finite join budgets for the benchmark's own validated --child-timeout
+# and --row-timeout interface; the driver rejects anything unbounded.
+IPC_MEMORY_CHILD_TIMEOUT_S = 120
+IPC_MEMORY_ROW_TIMEOUT_S = 300
+STEP_TIMEOUT_S = 1200
+# Nine rows can each consume the whole row budget, so the matrix step is
+# bounded above the summed row budget (9 x 300 s) plus startup margin instead
+# of by the single-command default.
+IPC_MEMORY_STEP_TIMEOUT_S = 3600
+GATE_TIMEOUT_S = {IPC_MEMORY_GATE: IPC_MEMORY_STEP_TIMEOUT_S}
 
 
 def capture(command: Sequence[str], cwd: Path) -> dict[str, Any]:
@@ -71,7 +85,7 @@ def stop_process_tree(process: subprocess.Popen[bytes]) -> None:
 
 def run_step(
     name: str, command: Sequence[str], *, cwd: Path, output: Path,
-    environment: dict[str, str], timeout: float = 1200,
+    environment: dict[str, str], timeout: float = STEP_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Execute one gate; a failed command remains a failed record and exit code."""
     log_path = output / f"{name}.log"
@@ -107,6 +121,121 @@ def run_step(
     print(f"{name}: {record['status']} (exit {record['exit_code']})", flush=True)
     print("::endgroup::", flush=True)
     return record
+
+
+def accepted_matrix_row_names() -> list[str] | None:
+    """Row names of the accepted benchmark's pure matrix_rows table.
+
+    Derived from tools/benchmarks/ipc_memory.py itself so acceptance and
+    execution share one row table instead of a drifting copy. Returns None
+    when the table cannot be loaded or is not uniquely named; acceptance
+    then fails closed.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "c-two-ipc-memory-benchmark-acceptance", IPC_MEMORY_BENCHMARK)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        names = [str(row["name"]) for row in module.matrix_rows()]
+    except Exception:
+        return None
+    if not names or len(names) != len(set(names)):
+        return None
+    return names
+
+
+def matrix_evidence_problem(evidence_dir: Path) -> str | None:
+    """Explain why retained matrix evidence is not the required full stats run.
+
+    A clean benchmark exit alone is not acceptance: an --only subset can also
+    exit 0, and header flags alone do not prove any row ran. The evidence must
+    carry the complete row table derived from the accepted benchmark, passing
+    strict-integer totals, one agreed native hash mapped to every row, and
+    existing per-row result files inside the evidence directory. Internal
+    memory-snapshot and workload semantics stay owned by the benchmark and its
+    harness tests; this is receipt validation, not a benchmark re-run.
+    """
+    expected = accepted_matrix_row_names()
+    if expected is None:
+        return "accepted benchmark row table is unavailable; cannot validate matrix completeness"
+    try:
+        matrix = json.loads((evidence_dir / "matrix.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return f"matrix evidence unreadable: {error}"
+    if not isinstance(matrix, dict):
+        return "matrix evidence is not a JSON object"
+    if matrix.get("schema") != "c-two.ipc-memory-matrix.v1":
+        return f"unexpected matrix evidence schema: {matrix.get('schema')!r}"
+    if matrix.get("complete") is not True:
+        return "matrix evidence is incomplete: an --only subset or interrupted rows must not pass"
+    if matrix.get("memory_stats") is not True or matrix.get("require_memory_stats") is not True:
+        return "matrix evidence was not produced with --memory-stats --require-memory-stats"
+    if matrix.get("allow_unavailable_stats_after_shutdown") is not False:
+        return "matrix evidence used the post-shutdown stats exemption"
+    rows = matrix.get("rows")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return "matrix evidence rows are not a list of objects"
+    names = [row.get("name") for row in rows]
+    if names != expected:
+        return f"matrix rows {names!r} are not the complete unique accepted table {expected!r}"
+    if matrix.get("rows_not_selected") != [] or matrix.get("failures") != []:
+        return (
+            "matrix evidence skipped rows or recorded driver failures: "
+            f"rows_not_selected={matrix.get('rows_not_selected')!r} failures={matrix.get('failures')!r}"
+        )
+    totals = matrix.get("totals")
+    if not isinstance(totals, dict):
+        return "matrix evidence carries no totals object"
+    for field, wanted in (
+        ("rows_total", len(expected)), ("rows_selected", len(expected)),
+        ("rows_not_selected", 0), ("passed", len(expected)), ("failed", 0),
+    ):
+        value = totals.get(field)
+        # Receipt validation reads strict integers: True is not 1 here.
+        if not isinstance(value, int) or isinstance(value, bool) or value != wanted:
+            return f"matrix totals[{field}] is {value!r}, not the strict integer {wanted}"
+    native = matrix.get("native")
+    if not isinstance(native, dict) or native.get("agreement") is not True:
+        return "matrix evidence lacks agreeing native provenance across rows"
+    digest = native.get("single_installed_hash")
+    if (
+        not isinstance(digest, str) or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return f"matrix native hash is not a SHA-256 digest: {digest!r}"
+    if native.get("rows_missing_provenance") != [] or native.get("rows_inconsistent") != []:
+        return "matrix evidence has rows with missing or inconsistent native provenance"
+    per_row = native.get("per_row")
+    if (
+        not isinstance(per_row, dict) or sorted(per_row) != sorted(expected)
+        or any(per_row.get(name) != digest for name in expected)
+    ):
+        return "matrix evidence does not map every row to the single agreed native hash"
+    evidence_root = evidence_dir.resolve()
+    for row in rows:
+        name = row["name"]
+        if row.get("ok") is not True:
+            return f"matrix row {name!r} did not pass"
+        exit_code = row.get("exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code != 0:
+            return f"matrix row {name!r} exit_code is {exit_code!r}, not integer 0"
+        if row.get("terminated_by_matrix") is not False:
+            return f"matrix row {name!r} was terminated by the matrix"
+        result_file = row.get("result_file")
+        expected_file = f"rows/{name}.json"
+        # The benchmark records str(Path.relative_to(...)), so Windows
+        # receipts use backslashes. Validate the exact portable relative
+        # name before resolving it, including when auditing them on Unix.
+        if not isinstance(result_file, str) or result_file.replace("\\", "/") != expected_file:
+            return f"matrix row {name!r} result_file is {result_file!r}, not {expected_file}"
+        result_path = evidence_dir / expected_file
+        if not result_path.resolve().is_relative_to(evidence_root):
+            return f"matrix row {name!r} result file is not inside the evidence directory: {result_file!r}"
+        if not result_path.is_file():
+            return f"matrix row {name!r} result file is missing: {result_file!r}"
+    return None
 
 
 def npm_command(*arguments: str) -> list[str]:
@@ -232,6 +361,17 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
                                    "tests/repo/test_ipc_memory_benchmark.py",
                                    "-q", "--timeout=30", f"--junitxml={output / 'windows-harness-tests.xml'}"],
          ("python-build",)),
+        # The matrix spawns real worker processes, so launch it only after the
+        # harness tests proved the worker-dispatch protections and python-build
+        # established the venv the driver passes to every child through its
+        # default --python (sys.executable). Evidence lands under the run
+        # output directory so the artifact manifest hashes bind it.
+        (IPC_MEMORY_GATE, ["uv", "run", "--no-sync", "python", str(IPC_MEMORY_BENCHMARK),
+                           "--mode", "matrix", "--output-dir", str(output / IPC_MEMORY_EVIDENCE_DIR),
+                           "--memory-stats", "--require-memory-stats",
+                           "--child-timeout", str(IPC_MEMORY_CHILD_TIMEOUT_S),
+                           "--row-timeout", str(IPC_MEMORY_ROW_TIMEOUT_S)],
+         ("python-build", "windows-harness-tests")),
         ("python-tests", ["uv", "run", "--no-sync", "pytest", "sdk/python/tests", "-q", "--timeout=30", *[f"--ignore={path}" for path in (*PORTABLE_TESTS, TYPESCRIPT_TEST)], f"--junitxml={output / 'python-tests.xml'}"], ("python-build",)),
         ("portable-tests", ["uv", "run", "--no-sync", "pytest", *PORTABLE_TESTS, "-q", "--timeout=300", f"--junitxml={output / 'portable-tests.xml'}"], ("python-build", "cli-artifact")),
         ("typescript-tests", ["uv", "run", "--no-sync", "pytest", TYPESCRIPT_TEST, "-q", "--timeout=600", f"--junitxml={output / 'typescript-tests.xml'}"], ("python-build", "fastdb-npm-install", "c2-mem-npm-install", "cli-artifact")),
@@ -345,7 +485,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 record = {"id": name, "command": command, "status": "not_run", "reason": f"prerequisites did not pass: {', '.join(missing)}"}
             else:
                 record = run_step(name, command, cwd=ROOT, output=output,
-                                  environment=gate_environment(name, environment, system_lib_dir))
+                                  environment=gate_environment(name, environment, system_lib_dir),
+                                  timeout=GATE_TIMEOUT_S.get(name, STEP_TIMEOUT_S))
+                if name == IPC_MEMORY_GATE and record["status"] == "passed":
+                    problem = matrix_evidence_problem(output / IPC_MEMORY_EVIDENCE_DIR)
+                    if problem is not None:
+                        record["status"] = "failed"
+                        record["evidence_problem"] = problem
             evidence["steps"].append(record)
             write_evidence(output, evidence)
     evidence["status"] = "passed" if evidence["steps"] and all(step["status"] == "passed" for step in evidence["steps"]) and "error" not in evidence else "failed"
