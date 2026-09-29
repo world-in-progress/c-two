@@ -27,9 +27,9 @@ use tracing::{debug, info, warn};
 static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 use c2_error::{C2Error, ErrorCode};
-use c2_mem::MemPool;
 #[cfg(test)]
 use c2_mem::config::PoolConfig;
+use c2_mem::{MemPool, MemoryBudget};
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
@@ -160,6 +160,27 @@ pub struct ServerRouteCloseOutcome {
     pub closed_reason: String,
 }
 
+/// Read-only snapshot of the server direction's shared memory budget.
+///
+/// The three cells are C-Two-owned accounting scopes — owner-created SHM
+/// backing, owner-created file backing, and live reassembly capacity — not
+/// process RSS. Their sum must never be presented as physical memory usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerMemorySnapshot {
+    /// Resolved limits the server budget enforces.
+    pub limits: c2_config::MemoryBudgetLimits,
+    /// Consistent view of the three budget cells.
+    pub budget: c2_mem::BudgetSnapshot,
+}
+
+impl ServerMemorySnapshot {
+    /// Scope label for the server direction.
+    ///
+    /// Use this to distinguish the server response/reassembly role from a
+    /// Runtime's outgoing client role when reporting more than one scope.
+    pub const SCOPE: &'static str = "server";
+}
+
 /// The main IPC server.
 ///
 /// Binds a local OS endpoint, accepts connections, and dispatches CRM calls through
@@ -185,6 +206,11 @@ pub struct Server {
     /// **parking_lot sync RwLock** — guards SHM memory pool; blocking `.read()`
     /// / `.write()` (no `.await`).  Safe to hold briefly inside tokio tasks.
     response_pool: Arc<parking_lot::RwLock<MemPool>>,
+    /// Shared transport memory context charged by the response pool, the
+    /// reassembly pool inside `chunk_registry`, and response prewarm. One
+    /// server direction, one budget; it owns only accounting counters and is
+    /// never reset by shutdown.
+    memory_budget: MemoryBudget,
     pending_routes: Arc<parking_lot::Mutex<HashMap<String, PendingRouteInfo>>>,
     pending_requests: Arc<Semaphore>,
     chunk_processing_permits: Arc<Semaphore>,
@@ -300,17 +326,25 @@ impl Server {
         config.validate().map_err(ServerError::Config)?;
         validate_server_identity(&identity)?;
         parse_local_endpoint(address)?;
+        // One server direction, one finite budget: the response pool, the
+        // chunk-reassembly pool, and response prewarm all charge the same
+        // context, so the server cannot double its configured cap by owning
+        // two pools. The context owns only accounting counters and is never
+        // reset by shutdown; charges retained by outstanding response data
+        // stay observable.
+        let memory_budget = MemoryBudget::from_limits(&config.memory_budget_limits());
         let reassembly_pool = {
             let pid = std::process::id();
             let ra_gen = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
             let prefix = format!("/cc3s{:08x}{:08x}", pid, ra_gen);
             // Centralized projection: reassembly follows the same buddy policy
             // as every other pool role (disabled buddy → dedicated/file storage).
-            MemPool::new_with_prefix(
+            MemPool::new_with_prefix_and_budget(
                 config
                     .base
                     .reassembly_pool_config(&config.reassembly_pool_tuning()),
                 prefix,
+                memory_budget.clone(),
             )
         };
         Self::with_reassembly_pool(
@@ -337,6 +371,14 @@ impl Server {
         validate_server_identity(&identity)?;
         let endpoint = parse_local_endpoint(address)?;
         let (shutdown_tx, _) = watch::channel(false);
+        // The injected test pool and the production reassembly pool both
+        // carry the server's accounting authority. Derive the response-pool
+        // budget from that exact owner so both directions share one context.
+        let memory_budget = reassembly_pool
+            .read()
+            .budget()
+            .cloned()
+            .ok_or_else(|| ServerError::Config("reassembly pool has no owner budget".into()))?;
         let chunk_config = c2_wire::chunk::ChunkConfig::from_base(&config);
         let chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
             reassembly_pool,
@@ -348,11 +390,12 @@ impl Server {
             let prefix = format!("/cc3r{:08x}{:08x}", pid, generation as u32);
             // Centralized projection: the response pool keeps dedicated SHM
             // replies available even when the buddy tiers are disabled.
-            MemPool::new_with_prefix(
+            MemPool::new_with_prefix_and_budget(
                 config
                     .base
                     .primary_pool_config(&config.response_pool_tuning()),
                 prefix,
+                memory_budget.clone(),
             )
         };
         // Explicit prewarm only. The response pool stays unmapped at
@@ -389,6 +432,7 @@ impl Server {
             route_registration: Mutex::new(()),
             chunk_registry,
             response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
+            memory_budget,
             pending_routes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_requests,
             chunk_processing_permits,
@@ -1052,6 +1096,31 @@ impl Server {
     /// Get a shared reference to the response pool (for zero-copy dispatch).
     pub fn response_pool_arc(&self) -> Arc<parking_lot::RwLock<MemPool>> {
         Arc::clone(&self.response_pool)
+    }
+
+    /// Read-only snapshot of the server direction's shared memory budget.
+    ///
+    /// This never allocates, maps, connects, or resets accounting: observing
+    /// the server memory context does not change its limits or usage. Charges
+    /// retained by outstanding response or reassembly data stay visible until
+    /// their backing is released.
+    pub fn memory_budget_snapshot(&self) -> ServerMemorySnapshot {
+        ServerMemorySnapshot {
+            limits: self.config.memory_budget_limits(),
+            budget: self.memory_budget.snapshot(),
+        }
+    }
+
+    /// Read-only observer of the server direction's shared budget.
+    ///
+    /// The handle shares only the accounting counters and resolved limits, so
+    /// a stopped server keeps its retained response/reassembly charges
+    /// observable without retaining pools, connections, or callbacks.
+    pub fn memory_budget_observer(&self) -> c2_mem::BudgetObserver {
+        c2_mem::BudgetObserver::new(
+            self.config.memory_budget_limits(),
+            self.memory_budget.clone(),
+        )
     }
 
     /// Return the configured response SHM threshold.
@@ -8268,6 +8337,142 @@ mod tests {
 
         assert!(err.to_string().contains("buddy reply write failed"));
         assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    // ── Shared server memory budget ──────────────────────────────────────
+
+    /// The response pool, the reassembly pool, and response prewarm all
+    /// charge one server-direction budget; observing the snapshot never
+    /// resets it.
+    #[test]
+    fn server_pools_and_prewarm_share_one_budget_context() {
+        let base = c2_config::BaseIpcConfig {
+            pool_segment_size: 64 * 1024,
+            max_pool_segments: 2,
+            max_pool_memory: 128 * 1024,
+            pool_prewarm_segments: 1,
+            ..c2_config::BaseIpcConfig::default()
+        };
+        let config = ServerIpcConfig {
+            base,
+            ..ServerIpcConfig::default()
+        };
+        let server = Server::new("ipc://server_budget_share", config).unwrap();
+
+        let snapshot = server.memory_budget_snapshot();
+        assert_eq!(ServerMemorySnapshot::SCOPE, "server");
+        assert_eq!(
+            snapshot.limits.shm_backing_budget_bytes,
+            c2_config::MemoryBudgetLimits::default().shm_backing_budget_bytes
+        );
+        assert!(
+            snapshot.budget.shm.used_bytes > 0,
+            "explicit prewarm must charge the server budget"
+        );
+
+        // Both owner pools report the same accounting object.
+        let response_pool = server.response_pool_arc();
+        assert_eq!(
+            response_pool.read().budget().unwrap().snapshot(),
+            snapshot.budget
+        );
+        assert_eq!(
+            server
+                .chunk_registry
+                .pool()
+                .read()
+                .budget()
+                .unwrap()
+                .snapshot(),
+            snapshot.budget
+        );
+
+        // Observing twice is stable and never resets usage.
+        assert_eq!(server.memory_budget_snapshot(), snapshot);
+    }
+
+    /// A server configured with zero shm backing admits no server-side
+    /// mapping, while the snapshot still reports the resolved zero limits.
+    #[test]
+    fn server_zero_shm_budget_admits_no_backing_and_reports_zero_limits() {
+        let base = c2_config::BaseIpcConfig {
+            pool_segment_size: 64 * 1024,
+            max_pool_segments: 2,
+            max_pool_memory: 128 * 1024,
+            shm_backing_budget_bytes: 0,
+            file_backing_budget_bytes: 0,
+            ..c2_config::BaseIpcConfig::default()
+        };
+        let server = Server::new(
+            "ipc://server_budget_zero",
+            ServerIpcConfig {
+                base,
+                ..ServerIpcConfig::default()
+            },
+        )
+        .unwrap();
+        let snapshot = server.memory_budget_snapshot();
+        assert_eq!(snapshot.limits.shm_backing_budget_bytes, 0);
+        assert_eq!(snapshot.limits.file_backing_budget_bytes, 0);
+        assert_eq!(snapshot.budget.shm.used_bytes, 0);
+        assert_eq!(server.response_pool_arc().read().segment_count(), 0);
+    }
+
+    /// A retained server budget observer must outlive the Server and report
+    /// charges held by an outstanding response owner until that owner
+    /// releases them. This is the read-only half of retired observability:
+    /// the handle carries counters only, never the Server or its pools.
+    #[test]
+    fn server_budget_observer_outlives_the_server_and_tracks_retained_charges() {
+        let base = c2_config::BaseIpcConfig {
+            pool_segment_size: 64 * 1024,
+            max_pool_segments: 2,
+            max_pool_memory: 128 * 1024,
+            ..c2_config::BaseIpcConfig::default()
+        };
+        let config = ServerIpcConfig {
+            base,
+            // Retire an idle segment at the next explicit GC so the release
+            // is deterministic without sleeping.
+            pool_decay_seconds: 0.0,
+            ..ServerIpcConfig::default()
+        };
+        let server = Server::new("ipc://server_budget_observer", config).unwrap();
+        let observer = server.memory_budget_observer();
+        assert_eq!(
+            *observer.limits(),
+            server.memory_budget_snapshot().limits,
+            "the observer must carry the server's resolved limits"
+        );
+
+        let response_pool = server.response_pool_arc();
+        let alloc = response_pool
+            .write()
+            .alloc(4096)
+            .expect("response allocation");
+        let charged = observer.used_bytes();
+        assert!(
+            charged > 0,
+            "a mapped response segment must charge the observed budget"
+        );
+        assert_eq!(
+            server.memory_budget_snapshot().budget.shm.used_bytes,
+            observer.snapshot().shm.used_bytes,
+            "observer and live snapshot must share one accounting object"
+        );
+
+        // The Server can be dropped while the outstanding response owner
+        // keeps the mapping (and its observed charge) alive.
+        drop(server);
+        assert_eq!(observer.used_bytes(), charged);
+
+        response_pool.write().free(&alloc).expect("release");
+        response_pool.write().gc_buddy();
+        assert_eq!(
+            observer.used_bytes(),
+            0,
+            "the retained observer must see the charge return after release"
+        );
     }
 
     // -- handshake extraction --

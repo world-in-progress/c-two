@@ -10,6 +10,7 @@ pub mod error;
 mod host;
 mod identity;
 mod lifetime;
+pub mod memory;
 mod outcome;
 mod session;
 
@@ -33,6 +34,10 @@ pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
 };
 pub use lifetime::HeldResponse;
+pub use memory::{
+    MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
+    RetirementHandoff, RuntimeMemoryStats, scope,
+};
 pub use outcome::{
     RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome, ShutdownOutcome,
     UnregisterOutcome,

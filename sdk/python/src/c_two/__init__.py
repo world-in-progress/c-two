@@ -19,6 +19,7 @@ from .crm.descriptor import (
 from .crm.infer import infer_crm_from_resource
 from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import hold, transfer, Held, HeldResult
+from .mem import MemoryCellStats, MemoryLimits, MemoryScopeStats, MemoryStats
 from .transport.input_lifetime import InputLifetime
 from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 from .transport.registry import (
@@ -35,6 +36,7 @@ from .transport.registry import (
     shutdown,
     serve,
     hold_stats,
+    memory_stats,
 )
 
 __all__ = [
@@ -62,6 +64,10 @@ __all__ = [
     'transfer',
     'Held',
     'HeldResult',
+    'MemoryCellStats',
+    'MemoryLimits',
+    'MemoryScopeStats',
+    'MemoryStats',
     'InputLifetime',
     'ConcurrencyConfig',
     'ConcurrencyMode',
@@ -78,4 +84,5 @@ __all__ = [
     'shutdown',
     'serve',
     'hold_stats',
+    'memory_stats',
 ]

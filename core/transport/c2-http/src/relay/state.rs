@@ -31,6 +31,18 @@ pub struct RelayState {
     upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+    /// One shared memory context for every data-plane upstream `IpcClient`
+    /// this relay owns. Each connection's request and reassembly pools charge
+    /// this budget, so the upstream pool cannot double the relay's finite
+    /// limits by opening more connections. Short-lived registration/owner
+    /// probes keep their own explicit private contexts; this context is the
+    /// relay process's own, never a process-global cache.
+    ///
+    /// Config scope: the relay constructs its upstream IPC clients from the
+    /// canonical [`ClientIpcConfig::default`] limits, because the relay
+    /// runtime has no client-IPC override surface of its own — the limits are
+    /// the resolved `c2-config` defaults, not a per-route or first-wins value.
+    upstream_memory_budget: c2_mem::MemoryBudget,
 }
 
 fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
@@ -119,6 +131,8 @@ impl RelayState {
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     ) -> Self {
         let owner_lease_duration = owner_lease_duration(&config);
+        let upstream_memory_budget =
+            c2_mem::MemoryBudget::from_limits(&ClientIpcConfig::default().memory_budget_limits());
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
@@ -126,7 +140,17 @@ impl RelayState {
             upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
+            upstream_memory_budget,
         }
+    }
+
+    /// Read-only snapshot of the relay's shared upstream memory context.
+    ///
+    /// Observing this never connects, maps, or resets accounting. Test-only
+    /// because the relay has no public stats surface yet.
+    #[cfg(test)]
+    pub fn upstream_memory_snapshot(&self) -> c2_mem::BudgetSnapshot {
+        self.upstream_memory_budget.snapshot()
     }
 
     pub fn disseminator(&self) -> &Arc<dyn crate::relay::disseminator::Disseminator> {
@@ -306,12 +330,18 @@ impl RelayState {
         };
         let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
+        // Every data-plane upstream client charges the relay's one upstream
+        // memory context; the per-connection config stays the canonical
+        // client default, so `with_shared_budget` validates the limits pair
+        // before any connection I/O.
+        let upstream_memory_budget = self.upstream_memory_budget.clone();
 
         let lease = match self
             .conn_pool
             .acquire_with(&endpoint_key, move |endpoint| {
                 let expected = expected_for_connect.clone();
                 let route_name = route_name.clone();
+                let upstream_memory_budget = upstream_memory_budget.clone();
                 async move {
                     if expected.ipc_address.as_deref() != Some(endpoint.address()) {
                         return Err(c2_ipc::IpcError::Protocol(format!(
@@ -331,8 +361,11 @@ impl RelayState {
                             expected.ipc_address
                         )));
                     }
-                    let mut client =
-                        IpcClient::with_config(endpoint.address(), ClientIpcConfig::default());
+                    let mut client = IpcClient::with_shared_budget(
+                        endpoint.address(),
+                        ClientIpcConfig::default(),
+                        upstream_memory_budget,
+                    );
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -802,6 +835,24 @@ mod tests {
         abi_hash: TEST_ABI_HASH,
         signature_hash: TEST_SIGNATURE_HASH,
     };
+
+    #[test]
+    fn relay_upstream_memory_context_starts_idle_with_canonical_limits() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let snapshot = state.upstream_memory_snapshot();
+        let limits = ClientIpcConfig::default().memory_budget_limits();
+        assert_eq!(snapshot.shm.limit_bytes, limits.shm_backing_budget_bytes);
+        assert_eq!(snapshot.file.limit_bytes, limits.file_backing_budget_bytes);
+        assert_eq!(
+            snapshot.reassembly.limit_bytes,
+            limits.live_reassembly_budget_bytes
+        );
+        assert_eq!(snapshot.shm.used_bytes, 0);
+        assert_eq!(snapshot.file.used_bytes, 0);
+        assert_eq!(snapshot.reassembly.used_bytes, 0);
+        // Observation is read-only and stable.
+        assert_eq!(state.upstream_memory_snapshot(), snapshot);
+    }
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {

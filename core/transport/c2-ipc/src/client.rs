@@ -157,6 +157,78 @@ impl ServerPoolState {
     }
 }
 
+// ── Request preallocation token ──────────────────────────────────────────
+
+/// One request allocation bound to the exact pool that issued its coordinates.
+///
+/// A preallocated request is written and released through this token, never
+/// through the client's current request-pool slot. A confirmed close may
+/// detach the client's pool and a reconnect may install a fresh pool
+/// incarnation while an allocation is still in flight; carrying the owner
+/// here makes that race benign, because writes and error release always
+/// address the backing that actually contains the coordinates. Coordinates
+/// can therefore never leak or free an unrelated allocation in a replacement
+/// pool that happens to have a matching segment index and generation.
+///
+/// The token deliberately has no `Drop` release: buddy allocations are freed
+/// cross-process by the receiving server, and releasing the client's local
+/// view again would corrupt the allocator. Call [`RequestBlock::release`]
+/// exactly on the client-side release paths (size rejection, send failure,
+/// data-pointer failure, fill failure, and the dedicated-segment response
+/// path). It is deliberately not `Clone`: one charge has exactly one release
+/// authority.
+pub struct RequestBlock {
+    pool: Arc<StdMutex<MemPool>>,
+    alloc: PoolAllocation,
+}
+
+impl std::fmt::Debug for RequestBlock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestBlock")
+            .field("allocation", &self.alloc)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RequestBlock {
+    pub(crate) fn new(pool: Arc<StdMutex<MemPool>>, alloc: PoolAllocation) -> Self {
+        Self { pool, alloc }
+    }
+
+    /// The allocation coordinates written to the wire.
+    pub fn allocation(&self) -> &PoolAllocation {
+        &self.alloc
+    }
+
+    /// Whether the allocation lives in a dedicated (non-buddy) segment.
+    pub fn is_dedicated(&self) -> bool {
+        self.alloc.is_dedicated
+    }
+
+    /// Copy `data` into the block at `offset` through the owning pool.
+    pub(crate) fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), IpcError> {
+        let pool = self.pool.lock();
+        let ptr = pool
+            .data_ptr(&self.alloc)
+            .map_err(|error| IpcError::Shm(format!("buddy data_ptr failed: {error}")))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+        }
+        Ok(())
+    }
+
+    /// Release the allocation in the pool that owns it.
+    ///
+    /// Returns the pool's error for diagnostics; error-path callers may ignore
+    /// it because ownership is carried by this token, not by the client slot.
+    pub fn release(&self) -> Result<(), IpcError> {
+        let mut pool = self.pool.lock();
+        pool.free(&self.alloc)
+            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))
+    }
+}
+
 // ── Error type ───────────────────────────────────────────────────────────
 
 /// Default deadline for one client close barrier (writer lock, receive join,
@@ -735,7 +807,20 @@ pub struct IpcClient {
     /// state.
     close_gate: tokio::sync::Mutex<()>,
     connected: Arc<AtomicBool>,
-    pub(crate) pool: Option<Arc<StdMutex<MemPool>>>,
+    /// Transport-owned request pool.
+    ///
+    /// `Some` while this client owns the pool. A confirmed close detaches an
+    /// idle pool so a closed-but-application-retained client stops pinning
+    /// unused mappings and their shared budget charge; a reconnect creates a
+    /// fresh incarnation on the same domain budget. Injected pools are owned
+    /// by the caller and are never detached here.
+    pub(crate) pool: StdMutex<Option<Arc<StdMutex<MemPool>>>>,
+    /// `true` when the request pool was created by the transport from this
+    /// client's config/domain budget (`with_config` / `with_shared_budget` /
+    /// `with_transport_pool`) rather than injected by the caller. Only
+    /// transport-created pools are detached on close and recreated on
+    /// reconnect.
+    pool_transport_owned: bool,
     /// `true` when the pool was injected through [`IpcClient::with_pool`] /
     /// `SyncClient::connect(.., Some(pool), ..)` rather than derived from the
     /// config. Injected pools are externally owned: the transport validates
@@ -743,8 +828,23 @@ pub struct IpcClient {
     /// or mutates their configuration.
     pool_injected: bool,
     pub(crate) config: ClientIpcConfig,
+    /// Shared transport memory context charged by this client's owner pools.
+    ///
+    /// When the request pool is self-created (`new`/`with_config`/
+    /// `with_shared_budget`/`with_transport_pool`) it charges the same
+    /// context; the reassembly pool always charges it. Injected pools keep
+    /// the budget they were constructed with — `connect` validates that its
+    /// limits match the configured limits before any connection I/O instead
+    /// of silently running a second budget policy. `None` means the injected
+    /// pool has no owner-creation budget at all (a peer pool); `connect`
+    /// rejects that pairing rather than inventing a second context.
+    memory_budget: Option<c2_mem::MemoryBudget>,
     /// Client-side chunk registry for reassembling chunked responses.
-    pub(crate) chunk_registry: Arc<ChunkRegistry>,
+    ///
+    /// `None` only for an injected pool without an owner-creation budget
+    /// before `connect` rejects that pairing; a confirmed close replaces an
+    /// idle registry with a fresh lazy incarnation on the same domain budget.
+    pub(crate) chunk_registry: StdMutex<Option<Arc<ChunkRegistry>>>,
     /// Unique connection identifier for the chunk registry.
     conn_id: u64,
     /// At most one cancellable maintenance task per connection; `None` while
@@ -755,6 +855,11 @@ pub struct IpcClient {
     /// Maintenance tick counter (test-only liveness probe).
     #[cfg(test)]
     pub(crate) maintenance_ticks: Arc<AtomicU64>,
+    /// One-shot hook fired after request-pool selection and before the
+    /// preallocation happens. Test-only seam for deterministically pausing in
+    /// the selection/allocation window; production never installs a hook.
+    #[cfg(test)]
+    prealloc_selection_hook: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// Handle for the per-connection client maintenance task. Constructing,
@@ -790,12 +895,21 @@ impl IpcClient {
     /// Config-owned request pool. Always a real `MemPool`: with buddy disabled
     /// it still serves dedicated SHM requests (and announces the wire prefix),
     /// only the buddy tiers are policy-disabled. The client's idle window
-    /// (`pool_decay_seconds`) rides in through the role tuning.
-    fn own_pool_from_config(config: &ClientIpcConfig) -> Arc<StdMutex<MemPool>> {
+    /// (`pool_decay_seconds`) rides in through the role tuning. The pool
+    /// charges `budget`, so a standalone client shares one memory context
+    /// between its request and reassembly pools.
+    fn own_pool_from_config(
+        config: &ClientIpcConfig,
+        budget: &c2_mem::MemoryBudget,
+    ) -> Arc<StdMutex<MemPool>> {
         let pool_config = config.base.primary_pool_config(&config.pool_tuning());
         let counter = CLIENT_OWN_POOL_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3d{:08x}{:08x}", std::process::id(), counter);
-        Arc::new(StdMutex::new(MemPool::new_with_prefix(pool_config, prefix)))
+        Arc::new(StdMutex::new(MemPool::new_with_prefix_and_budget(
+            pool_config,
+            prefix,
+            budget.clone(),
+        )))
     }
 
     fn from_parts(
@@ -803,6 +917,9 @@ impl IpcClient {
         pool: Option<Arc<StdMutex<MemPool>>>,
         config: ClientIpcConfig,
         pool_injected: bool,
+        pool_transport_owned: bool,
+        memory_budget: Option<c2_mem::MemoryBudget>,
+        chunk_registry: Option<Arc<ChunkRegistry>>,
     ) -> Self {
         let endpoint = crate::control::local_endpoint_from_ipc_address(address)
             .map_err(|error| error.to_string());
@@ -820,26 +937,115 @@ impl IpcClient {
             recv_handle: Arc::new(StdMutex::new(None)),
             close_gate: tokio::sync::Mutex::new(()),
             connected: Arc::new(AtomicBool::new(false)),
-            pool,
+            pool: StdMutex::new(pool),
+            pool_transport_owned,
             pool_injected,
-            chunk_registry: Self::make_chunk_registry(&config),
+            chunk_registry: StdMutex::new(chunk_registry),
             conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
             config,
+            memory_budget,
             maintenance: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             maintenance_ticks: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            prealloc_selection_hook: StdMutex::new(None),
         }
     }
 
-    fn make_chunk_registry(config: &ClientIpcConfig) -> Arc<ChunkRegistry> {
+    /// The transport-owned request pool, if this client currently holds it.
+    ///
+    /// Returns a clone so callers never hold the detach lock across I/O.
+    pub(crate) fn request_pool(&self) -> Option<Arc<StdMutex<MemPool>>> {
+        self.pool.lock().clone()
+    }
+
+    /// Select the request pool for one allocation.
+    ///
+    /// This is the exact selection/allocation seam: the returned `Arc` is
+    /// captured before the caller allocates, so it is also the release
+    /// authority for the coordinates regardless of what a concurrent
+    /// confirmed close does to the client's pool slot afterwards. The
+    /// test-only hook runs after selection and before the allocation, which
+    /// is the window in which a close can observe `alloc_count == 0` and
+    /// detach the pool (or a reconnect can install a fresh incarnation).
+    pub(crate) fn select_request_pool(&self) -> Option<Arc<StdMutex<MemPool>>> {
+        let pool = self.request_pool();
+        #[cfg(test)]
+        {
+            let hook = self.prealloc_selection_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        pool
+    }
+
+    /// Install the one-shot preallocation selection hook.
+    ///
+    /// Test-only: production never sets it, so [`select_request_pool`] is a
+    /// plain slot clone in real builds.
+    #[cfg(test)]
+    pub(crate) fn set_prealloc_selection_hook_for_test(
+        &self,
+        hook: Option<Box<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.prealloc_selection_hook.lock() = hook;
+    }
+
+    /// Install a replacement request-pool slot without connecting.
+    ///
+    /// Test-only: models the state `connect()` leaves after a confirmed close
+    /// detached the old incarnation, so a paused allocation can be raced
+    /// against a fresh pool at the same logical client.
+    #[cfg(test)]
+    pub(crate) fn replace_request_pool_for_test(&self, pool: Option<Arc<StdMutex<MemPool>>>) {
+        *self.pool.lock() = pool;
+    }
+
+    /// Whether the client currently owns a request pool.
+    pub(crate) fn has_request_pool(&self) -> bool {
+        self.pool.lock().is_some()
+    }
+
+    /// The complete resolved client configuration this connection was created
+    /// from, frozen at construction.
+    ///
+    /// The cache compares this against every later requested policy so a
+    /// same-address hit can never silently serve a connection built with
+    /// different chunking, threshold, prewarm, or buddy policy. Budget-limit
+    /// equality is tracked separately by the owning domain context.
+    pub(crate) fn config(&self) -> &ClientIpcConfig {
+        &self.config
+    }
+
+    /// The chunk registry, if a confirmed close has not detached it.
+    pub(crate) fn chunk_registry_arc(&self) -> Option<Arc<ChunkRegistry>> {
+        self.chunk_registry.lock().clone()
+    }
+
+    pub(crate) fn require_chunk_registry(&self) -> Arc<ChunkRegistry> {
+        self.chunk_registry_arc().expect(
+            "client chunk registry is unavailable: this client was built around an injected \
+             pool without an owner-creation memory budget, so connect is rejected; build it \
+             from a resolved config or an owner pool carrying a budget",
+        )
+    }
+
+    /// Build a fresh reassembly registry whose pool charges `budget`.
+    fn build_chunk_registry(
+        config: &ClientIpcConfig,
+        budget: &c2_mem::MemoryBudget,
+    ) -> Arc<ChunkRegistry> {
         let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3a{:08x}{:08x}", std::process::id(), counter);
         // Reassembly follows the same buddy policy: with buddy disabled the
         // assembler stores into dedicated SHM (file spill as last resort)
-        // instead of skipping chunked reception.
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix(
+        // instead of skipping chunked reception. The pool charges the same
+        // shared context as the request pool.
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
             config.base.reassembly_pool_config(&config.pool_tuning()),
             prefix,
+            budget.clone(),
         )));
         let chunk_config = ChunkConfig::from_base(config);
         Arc::new(ChunkRegistry::new(pool, chunk_config))
@@ -849,7 +1055,18 @@ impl IpcClient {
     ///
     /// The address is logical (`ipc://name`); Rust derives the local OS endpoint.
     pub fn new(address: &str) -> Self {
-        Self::from_parts(address, None, ClientIpcConfig::default(), false)
+        let config = ClientIpcConfig::default();
+        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        let registry = Self::build_chunk_registry(&config, &budget);
+        Self::from_parts(
+            address,
+            None,
+            config,
+            false,
+            false,
+            Some(budget),
+            Some(registry),
+        )
     }
 
     /// Create a new IPC client with a config-owned SHM pool.
@@ -857,10 +1074,40 @@ impl IpcClient {
     /// This keeps async callers such as the HTTP relay on the canonical
     /// `IpcClient` API while still allowing large request streams to be written
     /// directly into client SHM. The pool follows the config's buddy policy:
-    /// dedicated SHM requests stay available when buddy is disabled.
+    /// dedicated SHM requests stay available when buddy is disabled. One
+    /// finite budget derived from the config is shared by the request pool and
+    /// the reassembly pool for this client's lifetime.
     pub fn with_config(address: &str, config: ClientIpcConfig) -> Self {
-        let pool = Self::own_pool_from_config(&config);
-        Self::from_parts(address, Some(pool), config, false)
+        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        Self::with_shared_budget(address, config, budget)
+    }
+
+    /// Create a new IPC client whose request and reassembly pools both charge
+    /// `budget`.
+    ///
+    /// `budget` is shared by reference with every other pool or client handed
+    /// the same [`c2_mem::MemoryBudget`] clone, so one owning domain (a
+    /// Runtime's outgoing cache, a relay's upstream pool) can bound all of its
+    /// connections with one finite context. `connect` validates that the
+    /// budget's limits equal the configured `memory_budget_limits()` before
+    /// any connection I/O, so a mismatched pair is rejected instead of
+    /// silently running a second budget policy.
+    pub fn with_shared_budget(
+        address: &str,
+        config: ClientIpcConfig,
+        budget: c2_mem::MemoryBudget,
+    ) -> Self {
+        let pool = Self::own_pool_from_config(&config, &budget);
+        let registry = Self::build_chunk_registry(&config, &budget);
+        Self::from_parts(
+            address,
+            Some(pool),
+            config,
+            false,
+            true,
+            Some(budget),
+            Some(registry),
+        )
     }
 
     /// Create a new IPC client with an externally owned SHM pool.
@@ -868,29 +1115,52 @@ impl IpcClient {
     /// The pool is used for outgoing SHM allocations when data exceeds
     /// `config.shm_threshold`. Because the pool is shared state the transport
     /// does not own, [`connect`](Self::connect) validates it against the
-    /// configured buddy policy *before* any connection I/O: a config that
-    /// disables `pool_enabled` rejects a buddy-enabled pool (the policy must
-    /// not be bypassed), and `pool_prewarm_segments` is rejected because the
-    /// transport never maps memory into a pool it does not own — prewarm
-    /// external pools explicitly with `MemPool::ensure_buddy_segments`. A
-    /// policy-matching pool (including a buddy-disabled one, which keeps
-    /// dedicated SHM requests) connects normally. The pool's own configuration
-    /// and allocations are never mutated or destroyed by the transport;
+    /// configured buddy policy and memory-budget limits *before* any
+    /// connection I/O: a config that disables `pool_enabled` rejects a
+    /// buddy-enabled pool (the policy must not be bypassed),
+    /// `pool_prewarm_segments` is rejected because the transport never maps
+    /// memory into a pool it does not own — prewarm external pools explicitly
+    /// with `MemPool::ensure_buddy_segments` — and the pool must carry an
+    /// owner-creation budget whose limits equal the config's
+    /// `memory_budget_limits()`. The client's reassembly pool charges that
+    /// same budget, so one injected context stays the single policy for the
+    /// whole client instead of a second, silently different budget. An
+    /// injected peer pool carries no owner-creation budget and is rejected
+    /// rather than paired with a fresh invented context. A policy-matching
+    /// pool (including a buddy-disabled one, which keeps dedicated SHM
+    /// requests) connects normally. The pool's own configuration and
+    /// allocations are never mutated or destroyed by the transport;
     /// maintenance only calls the pool's public GC API.
     pub fn with_pool(address: &str, pool: Arc<StdMutex<MemPool>>, config: ClientIpcConfig) -> Self {
-        Self::from_parts(address, Some(pool), config, true)
+        let budget = pool.lock().budget().cloned();
+        let registry = budget
+            .as_ref()
+            .map(|budget| Self::build_chunk_registry(&config, budget));
+        Self::from_parts(address, Some(pool), config, true, false, budget, registry)
     }
 
     /// Create a client around a transport-internal pool built from `config`
     /// (pooled-client acquire path). The pool is owned solely by the resulting
     /// client, so connect-time policy validation and explicit prewarm apply
-    /// exactly as for [`with_config`](Self::with_config).
+    /// exactly as for [`with_config`](Self::with_config). `budget` is the
+    /// owning cache's shared domain context; the pool was already created with
+    /// it and the client's reassembly pool charges the same context.
     pub(crate) fn with_transport_pool(
         address: &str,
         pool: Arc<StdMutex<MemPool>>,
         config: ClientIpcConfig,
+        budget: c2_mem::MemoryBudget,
     ) -> Self {
-        Self::from_parts(address, Some(pool), config, false)
+        let registry = Self::build_chunk_registry(&config, &budget);
+        Self::from_parts(
+            address,
+            Some(pool),
+            config,
+            false,
+            true,
+            Some(budget),
+            Some(registry),
+        )
     }
 
     /// Connect and perform handshake.
@@ -911,11 +1181,61 @@ impl IpcClient {
             .as_ref()
             .map_err(|error| IpcError::Config(error.clone()))?;
 
+        // Memory-context gate, checked before any connection I/O: this client
+        // must enforce exactly the limits the config declares. An injected
+        // pool without an owner-creation budget, or a shared budget built from
+        // different limits, is rejected instead of silently running a second
+        // budget policy next to the configured one.
+        let budget = match self.memory_budget.as_ref() {
+            Some(budget) => budget.clone(),
+            None => {
+                return Err(IpcError::Pool(
+                    "injected pool has no owner-creation memory budget; inject an owner pool \
+                     created from the same resolved config (for example \
+                     MemPool::new_with_prefix_and_budget) so request and reassembly share one \
+                     finite context"
+                        .to_string(),
+                ));
+            }
+        };
+        {
+            let configured = self.config.memory_budget_limits();
+            let enforced = budget.snapshot();
+            if enforced.shm.limit_bytes != configured.shm_backing_budget_bytes
+                || enforced.file.limit_bytes != configured.file_backing_budget_bytes
+                || enforced.reassembly.limit_bytes != configured.live_reassembly_budget_bytes
+            {
+                return Err(IpcError::Pool(format!(
+                    "client memory budget limits (shm={}, file={}, reassembly={}) do not match \
+                     the configured limits (shm={}, file={}, reassembly={}); share a budget \
+                     built from the same configuration",
+                    enforced.shm.limit_bytes,
+                    enforced.file.limit_bytes,
+                    enforced.reassembly.limit_bytes,
+                    configured.shm_backing_budget_bytes,
+                    configured.file_backing_budget_bytes,
+                    configured.live_reassembly_budget_bytes,
+                )));
+            }
+        }
+
+        // A confirmed close detaches the transport-owned pools. Reconnect
+        // creates fresh incarnations on the same frozen domain budget.
+        if self.pool_transport_owned && self.pool.lock().is_none() {
+            let pool = Self::own_pool_from_config(&self.config, &budget);
+            *self.pool.lock() = Some(pool);
+        }
+        if self.chunk_registry.lock().is_none() {
+            let registry = Self::build_chunk_registry(&self.config, &budget);
+            *self.chunk_registry.lock() = Some(registry);
+        }
+
         // Policy gate for injected pools, checked before any connection I/O so
         // an incompatible pool can never silently bypass the configured buddy
         // policy or be mutated behind its other users.
         if self.pool_injected {
-            if let Some(pool_arc) = self.pool.as_ref() {
+            let injected_pool = self.pool.lock().clone();
+            if let Some(pool_arc) = injected_pool {
                 let rejection = {
                     let pool = pool_arc.lock();
                     if !self.config.base.pool_enabled && pool.config().buddy_enabled {
@@ -949,7 +1269,7 @@ impl IpcClient {
         // Explicit prewarm only: buddy memory is mapped at connect time solely
         // when `pool_prewarm_segments` asks for it; the default stays fully
         // lazy and announces an empty segment list.
-        if let Some(ref pool_arc) = self.pool {
+        if let Some(pool_arc) = self.request_pool() {
             let prewarm = self.config.pool_prewarm_segments as usize;
             if prewarm > 0 {
                 let mut pool = pool_arc.lock();
@@ -1033,7 +1353,7 @@ impl IpcClient {
         // lazy-opens by prefix/index/generation when a frame references one.
         // CAP_CHUNKED is independent of pool state — chunked response
         // reassembly always exists (reassembly pool + chunk registry).
-        let (segments, prefix) = if let Some(ref pool_arc) = self.pool {
+        let (segments, prefix) = if let Some(pool_arc) = self.request_pool() {
             let pool = pool_arc.lock();
             let count = pool.segment_count();
             let mut segs = Vec::with_capacity(count);
@@ -1090,7 +1410,7 @@ impl IpcClient {
         let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
         let connected = self.connected.clone();
-        let chunk_registry = self.chunk_registry.clone();
+        let chunk_registry = self.require_chunk_registry();
         let conn_id = self.conn_id;
         let recv_handle = tokio::spawn(async move {
             recv_loop(
@@ -1144,8 +1464,10 @@ impl IpcClient {
             return;
         }
         let state_probe = Arc::downgrade(&self.maintenance);
-        let request_pool = self.pool.as_ref().map(Arc::downgrade);
-        let registry = Arc::downgrade(&self.chunk_registry);
+        let request_pool = self.request_pool().map(|pool| Arc::downgrade(&pool));
+        let registry = self
+            .chunk_registry_arc()
+            .map(|registry| Arc::downgrade(&registry));
         #[cfg(test)]
         let tick_counter = Arc::clone(&self.maintenance_ticks);
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -1172,7 +1494,7 @@ impl IpcClient {
                         if !client_alive {
                             break;
                         }
-                        if let Some(registry) = registry.upgrade() {
+                        if let Some(registry) = registry.as_ref().and_then(Weak::upgrade) {
                             registry.gc_sweep();
                             let mut pool = registry.pool().write();
                             pool.gc_buddy();
@@ -1357,7 +1679,7 @@ impl IpcClient {
             )));
         }
 
-        match choose_request_transport(&self.config, self.pool.is_some(), data.len()) {
+        match choose_request_transport(&self.config, self.has_request_pool(), data.len()) {
             RequestTransportKind::Buddy => {
                 match self.call_buddy(&identity, method_idx, data).await {
                     Ok(result) => return Ok(result),
@@ -1486,14 +1808,14 @@ impl IpcClient {
                 .map_err(classified_call_error);
         }
 
-        match choose_request_transport(&self.config, self.pool.is_some(), data_len) {
+        match choose_request_transport(&self.config, self.has_request_pool(), data_len) {
             RequestTransportKind::Buddy => {
-                if let Some(alloc) = self
+                if let Some(block) = self
                     .try_alloc_request_block(data_len)
                     .map_err(pre_dispatch_call_error)?
                 {
                     return self
-                        .call_buddy_stream(&identity, method_idx, alloc, data_len, chunks)
+                        .call_buddy_stream(&identity, method_idx, block, data_len, chunks)
                         .await
                         .map_err(classified_call_error);
                 }
@@ -1610,7 +1932,16 @@ impl IpcClient {
                 u32::MAX
             )));
         }
-        let pool_arc = self.pool.as_ref().unwrap();
+        // The selector observed a pool, but a confirmed close may have
+        // detached it before this selection. That is a clean SHM-path
+        // failure, not a panic: report it so the caller can fall back to the
+        // non-buddy policy. From here on the local pool Arc is the release
+        // authority for this allocation.
+        let Some(pool_arc) = self.request_pool() else {
+            return Err(IpcError::Shm(
+                "client request pool was detached by a concurrent close".into(),
+            ));
+        };
 
         // Allocate and write data to SHM.
         let alloc = {
@@ -1699,24 +2030,22 @@ impl IpcClient {
         }
     }
 
-    fn try_alloc_request_block(
-        &self,
-        data_size: usize,
-    ) -> Result<Option<PoolAllocation>, IpcError> {
+    fn try_alloc_request_block(&self, data_size: usize) -> Result<Option<RequestBlock>, IpcError> {
         if data_size > u32::MAX as usize {
             return Ok(None);
         }
-        let Some(pool_arc) = self.pool.as_ref() else {
+        // Clone the owning pool and allocate while that exact owner is held:
+        // the returned token is the only release authority for the
+        // coordinates, so a concurrent confirmed close may detach the slot
+        // without stranding or misdirecting this allocation.
+        let Some(pool_arc) = self.select_request_pool() else {
             return Ok(None);
         };
-        let alloc = pool_arc.lock().alloc(data_size).ok();
-        Ok(alloc)
-    }
-
-    fn free_request_block(&self, alloc: &PoolAllocation) {
-        if let Some(pool_arc) = self.pool.as_ref() {
-            let mut pool = pool_arc.lock();
-            let _ = pool.free(alloc);
+        // The guard must drop before the owned `Arc` moves into the token.
+        let alloc = pool_arc.lock().alloc(data_size);
+        match alloc {
+            Ok(alloc) => Ok(Some(RequestBlock::new(pool_arc, alloc))),
+            Err(_) => Ok(None),
         }
     }
 
@@ -1724,7 +2053,7 @@ impl IpcClient {
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
-        alloc: PoolAllocation,
+        block: RequestBlock,
         data_size: usize,
         chunks: S,
     ) -> Result<ResponseData, IpcError>
@@ -1733,18 +2062,13 @@ impl IpcClient {
         B: AsRef<[u8]>,
         E: Display,
     {
-        let Some(pool_arc) = self.pool.as_ref() else {
-            self.free_request_block(&alloc);
-            return Err(IpcError::Pool("no client pool".into()));
-        };
-
         let mut written = 0usize;
         futures_util::pin_mut!(chunks);
         while let Some(next) = chunks.next().await {
             let chunk = match next {
                 Ok(chunk) => chunk,
                 Err(err) => {
-                    self.free_request_block(&alloc);
+                    let _ = block.release();
                     return Err(stream_error(err));
                 }
             };
@@ -1753,42 +2077,32 @@ impl IpcClient {
                 continue;
             }
             let Some(next_written) = written.checked_add(data.len()) else {
-                self.free_request_block(&alloc);
+                let _ = block.release();
                 return Err(IpcError::Config(
                     "request body size overflow while streaming to SHM".into(),
                 ));
             };
             if next_written > data_size {
-                self.free_request_block(&alloc);
+                let _ = block.release();
                 return Err(IpcError::Config(format!(
                     "request body exceeded declared content length {data_size}"
                 )));
             }
-            {
-                let pool = pool_arc.lock();
-                let ptr = match pool.data_ptr(&alloc) {
-                    Ok(ptr) => ptr,
-                    Err(err) => {
-                        drop(pool);
-                        self.free_request_block(&alloc);
-                        return Err(IpcError::Shm(format!("buddy data_ptr failed: {err}")));
-                    }
-                };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(written), data.len());
-                }
+            if let Err(err) = block.write_at(written, data) {
+                let _ = block.release();
+                return Err(err);
             }
             written = next_written;
         }
 
         if written != data_size {
-            self.free_request_block(&alloc);
+            let _ = block.release();
             return Err(IpcError::Config(format!(
                 "request body ended at {written} bytes, expected {data_size}"
             )));
         }
 
-        self.call_with_prealloc(identity, method_idx, &alloc, data_size)
+        self.call_with_prealloc(identity, method_idx, &block, data_size)
             .await
     }
 
@@ -1796,21 +2110,24 @@ impl IpcClient {
     /// data that was already written to the client's SHM pool.
     ///
     /// Unlike `call_buddy()`, this does NOT alloc or write — the caller
-    /// already did that. On send failure, frees the allocation from the pool.
+    /// already did that through a [`RequestBlock`]. Every release path uses
+    /// that token's owner, so a concurrent close/reconnect cannot redirect a
+    /// free into a replacement pool.
     pub(crate) async fn call_with_prealloc(
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
-        alloc: &PoolAllocation,
+        block: &RequestBlock,
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
         if data_size > u32::MAX as usize {
-            self.free_prealloc(alloc);
+            let _ = block.release();
             return Err(IpcError::Config(format!(
                 "buddy request payload size {data_size} exceeds wire limit {}",
                 u32::MAX
             )));
         }
+        let alloc = *block.allocation();
         // Build buddy payload from pre-allocated coordinates.
         let bp = BuddyPayload {
             seg_idx: alloc.seg_idx as u16,
@@ -1825,7 +2142,7 @@ impl IpcClient {
         let ctrl = match encode_call_control(identity, method_idx) {
             Ok(ctrl) => ctrl,
             Err(err) => {
-                self.free_prealloc(alloc);
+                let _ = block.release();
                 return Err(err.into());
             }
         };
@@ -1857,9 +2174,10 @@ impl IpcClient {
         .await;
 
         if let Err(e) = send_result {
-            // Send failed — server never saw the allocation. Free it.
+            // Send failed — server never saw the allocation. Free it through
+            // the owning pool (never the client's current slot).
             // This matches call_buddy() behavior.
-            self.free_prealloc(alloc);
+            let _ = block.release();
             self.pending.lock().remove(&rid);
             return Err(e);
         }
@@ -1870,19 +2188,12 @@ impl IpcClient {
         // segment can be GC'd and the slot reused.
         match rx.await {
             Ok(result) => {
-                if alloc.is_dedicated {
-                    self.free_prealloc(alloc);
+                if block.is_dedicated() {
+                    let _ = block.release();
                 }
                 result
             }
             Err(_) => Err(IpcError::Closed),
-        }
-    }
-
-    pub(crate) fn free_prealloc(&self, alloc: &PoolAllocation) {
-        if let Some(ref pool_arc) = self.pool {
-            let mut pool = pool_arc.lock();
-            let _ = pool.free(alloc);
         }
     }
 
@@ -2824,8 +3135,65 @@ impl IpcClient {
             let _ = tx.send(Err(IpcError::Closed));
         }
         drop(pending);
+        // Only a confirmed close (writer cleared, receive and maintenance
+        // tasks joined) proves that no assembly or request backing is still
+        // owned by background work, so only then may owner pools be detached.
+        if confirmed {
+            self.detach_idle_owner_pools();
+        }
         drop(close_guard);
         confirmed
+    }
+
+    /// Release transport-owned pool ownership once the connection is
+    /// confirmed closed.
+    ///
+    /// A closed client can remain referenced by the application (for example a
+    /// Python proxy that outlives `RuntimeSession.shutdown`). Its pools would
+    /// otherwise pin idle mappings and their shared-budget charges until the
+    /// last external reference disappears, starving a shared domain budget on
+    /// a later acquire. Detaching is deliberately conservative:
+    ///
+    /// - the request pool is dropped only when it has no live allocation, so
+    ///   an outstanding request backing is never freed under its user;
+    /// - the reassembly registry is replaced once it owns no in-flight
+    ///   assembly. Every finished handle carries the exact old pool and its
+    ///   charge in `ReassemblyBacking`, even before a response lease is
+    ///   constructed. Dropping the client's registry reference therefore
+    ///   preserves held data and lets the old pool disappear as soon as its
+    ///   last carrier is released, while the replacement starts lazy;
+    /// - injected pools are never detached: the transport does not own them.
+    ///
+    /// A reconnect creates fresh pool incarnations on the same frozen domain
+    /// budget. Nothing here resets budget accounting.
+    fn detach_idle_owner_pools(&self) {
+        if self.pool_transport_owned {
+            let mut slot = self.pool.lock();
+            let idle = slot
+                .as_ref()
+                .is_some_and(|pool| pool.lock().stats().alloc_count == 0);
+            if idle {
+                slot.take();
+            }
+        }
+        let mut slot = self.chunk_registry.lock();
+        let idle = slot
+            .as_ref()
+            .is_some_and(|registry| registry.active_count() == 0);
+        if idle {
+            // Replace instead of clearing: dropping the old registry releases
+            // the client's Arc to its pool. Each finished carrier keeps the
+            // exact old pool alive while needed and returns its reservation on
+            // release; the fresh lazy registry never frees old coordinates.
+            match self.memory_budget.clone() {
+                Some(budget) => {
+                    *slot = Some(Self::build_chunk_registry(&self.config, &budget));
+                }
+                None => {
+                    slot.take();
+                }
+            }
+        }
     }
 
     /// Test-only handle to the writer slot so tests can deterministically
@@ -3171,18 +3539,20 @@ mod tests {
         });
 
         let mut client = IpcClient::new(&address);
-        let registry = Arc::clone(&client.chunk_registry);
-        let reassembly_pool = Arc::clone(client.chunk_registry.pool());
+        let first_registry = client
+            .chunk_registry_arc()
+            .expect("fresh client owns a chunk registry");
+        let first_reassembly_pool = Arc::clone(first_registry.pool());
         client.connect().await.expect("first connect");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while registry.active_count() != 1 {
+            while first_registry.active_count() != 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("first partial reply was received");
-        assert!(registry.total_bytes() > 0);
-        assert!(reassembly_pool.read().stats().alloc_count > 0);
+        assert!(first_registry.total_bytes() > 0);
+        assert!(first_reassembly_pool.read().stats().alloc_count > 0);
 
         // The peer does not acknowledge disconnect, forcing the receive task
         // through abort. A short barrier may need a second bounded join.
@@ -3197,16 +3567,27 @@ mod tests {
                 "retry must join the aborted receive task"
             );
         }
-        assert_eq!(registry.active_count(), 0);
-        assert_eq!(registry.total_bytes(), 0);
-        assert_eq!(reassembly_pool.read().stats().alloc_count, 0);
+        assert_eq!(first_registry.active_count(), 0);
+        assert_eq!(first_registry.total_bytes(), 0);
+        assert_eq!(first_reassembly_pool.read().stats().alloc_count, 0);
 
-        // Reconnect the same client (and conn_id); the second first chunk must
-        // start a fresh assembly rather than collide with the prior reply.
+        // The confirmed close detached the now-idle owner pools. Reconnect
+        // must build a fresh registry incarnation on the same budget rather
+        // than reuse the detached one, so a second first chunk cannot collide
+        // with the prior reply even though the conn_id stays the same.
         client
             .connect()
             .await
             .expect("reconnect after confirmed close");
+        let registry = client
+            .chunk_registry_arc()
+            .expect("reconnect builds a fresh reassembly registry");
+        let reassembly_pool = Arc::clone(registry.pool());
+        assert!(
+            !Arc::ptr_eq(&registry, &first_registry),
+            "reconnect must not reuse the detached registry"
+        );
+        assert_eq!(first_registry.active_count(), 0);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while registry.active_count() != 1 {
                 tokio::task::yield_now().await;
@@ -3293,9 +3674,10 @@ mod tests {
     #[test]
     fn reassembly_pool_unique_prefixes() {
         let cfg = ClientIpcConfig::default();
-        let r1 = IpcClient::make_chunk_registry(&cfg);
-        let r2 = IpcClient::make_chunk_registry(&cfg);
-        let r3 = IpcClient::make_chunk_registry(&cfg);
+        let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
+        let r1 = IpcClient::build_chunk_registry(&cfg, &budget);
+        let r2 = IpcClient::build_chunk_registry(&cfg, &budget);
+        let r3 = IpcClient::build_chunk_registry(&cfg, &budget);
         let prefix1 = r1.pool().read().prefix().to_string();
         let prefix2 = r2.pool().read().prefix().to_string();
         let prefix3 = r3.pool().read().prefix().to_string();
@@ -3632,7 +4014,7 @@ mod tests {
             .expect_err("short stream should fail before sending a frame");
         assert!(err.to_string().contains("expected 200"));
 
-        let pool = client.pool.as_ref().expect("pool should be enabled");
+        let pool = client.request_pool().expect("pool should be enabled");
         assert_eq!(pool.lock().stats().alloc_count, 0);
 
         let long_stream = futures_util::stream::iter(vec![
@@ -3645,6 +4027,153 @@ mod tests {
             .expect_err("long stream should fail before sending a frame");
         assert!(err.to_string().contains("exceeded declared content length"));
         assert_eq!(pool.lock().stats().alloc_count, 0);
+    }
+
+    /// Deterministic pause after request-pool selection and before the
+    /// allocation, with a confirmed close and a fresh pool incarnation
+    /// installed while the caller is paused.
+    ///
+    /// This is the exact window in which close can observe `alloc_count == 0`
+    /// and detach the old pool. The prepared stream allocation must be written
+    /// and released through the original owner; the replacement pool's live
+    /// canary must never be touched, and the old allocation must not leak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prealloc_selection_race_releases_through_the_original_pool() {
+        let cfg = ClientIpcConfig {
+            shm_threshold: 1,
+            base: c2_config::BaseIpcConfig {
+                pool_segment_size: 65_536,
+                max_pool_segments: 1,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        };
+        let client = Arc::new(IpcClient::with_config("ipc://prealloc_selection_race", cfg));
+        let old_pool = client.request_pool().expect("transport-owned request pool");
+
+        let (selected_tx, selected_rx) = tokio::sync::oneshot::channel::<()>();
+        let selected_tx = std::sync::Mutex::new(Some(selected_tx));
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        client.set_prealloc_selection_hook_for_test(Some(Box::new(move || {
+            if let Some(selected) = selected_tx.lock().expect("selection lock").take() {
+                let _ = selected.send(());
+            }
+            // Bounded so a panicking companion fails the test instead of
+            // hanging the suite in this hook.
+            let _ = resume_rx
+                .lock()
+                .expect("resume lock")
+                .recv_timeout(std::time::Duration::from_secs(10));
+        })));
+
+        let fresh_config = old_pool.lock().config().clone();
+        let fresh_budget = old_pool
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let fresh_pool = Arc::new(StdMutex::new(MemPool::new_with_prefix_and_budget(
+            fresh_config,
+            format!("/cc3crace{:08x}", std::process::id()),
+            fresh_budget,
+        )));
+        let companion = {
+            let client = Arc::clone(&client);
+            let fresh_pool = Arc::clone(&fresh_pool);
+            tokio::spawn(async move {
+                selected_rx.await.expect("selection hook must fire");
+                assert!(
+                    client
+                        .close_shared_bounded(std::time::Duration::from_secs(2))
+                        .await,
+                    "an idle close must confirm"
+                );
+                assert!(
+                    client.request_pool().is_none(),
+                    "the confirmed close must detach the idle request pool"
+                );
+                // The state a reconnect leaves: a fresh pool incarnation on
+                // the same domain budget in the client slot.
+                client.replace_request_pool_for_test(Some(Arc::clone(&fresh_pool)));
+                // A live canary at the fresh pool's first allocation level. A
+                // stale-coordinate free aimed at the replacement pool would
+                // release it. `MemPool` frees are explicit, so the canary
+                // stays allocated for the whole test.
+                let _canary = fresh_pool.lock().alloc(32).expect("fresh-pool canary");
+                resume_tx.send(()).expect("main is waiting to resume");
+            })
+        };
+
+        let block = client
+            .try_alloc_request_block(32)
+            .expect("allocation cannot fail before the pool lock")
+            .expect("a request pool is selected");
+        assert_eq!(
+            old_pool.lock().stats().alloc_count,
+            1,
+            "the paused allocation must be charged to the originally selected pool"
+        );
+        assert_eq!(
+            fresh_pool.lock().stats().alloc_count,
+            1,
+            "the fresh pool must only hold its own canary"
+        );
+
+        // A short stream fails after the allocation: the release must address
+        // the block's owner even though the client slot now holds a
+        // replacement pool.
+        let short = futures_util::stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(vec![1; 8])]);
+        let err = client
+            .call_buddy_stream(&prealloc_race_identity(), 0, block, 32, short)
+            .await
+            .expect_err("a short stream must be rejected before sending");
+        assert!(err.to_string().contains("expected 32"), "{err}");
+
+        assert_eq!(
+            old_pool.lock().stats().alloc_count,
+            0,
+            "the old allocation must be released through its owner, not leaked"
+        );
+        assert_eq!(
+            fresh_pool.lock().stats().alloc_count,
+            1,
+            "the replacement pool's live canary must never be freed by stale coordinates"
+        );
+
+        // A send-failure release on the current slot also frees only its own
+        // pool: the canary survives and the new allocation returns to zero.
+        let current = client
+            .try_alloc_request_block(32)
+            .expect("allocation attempt")
+            .expect("the replacement pool serves the next allocation");
+        let err = client
+            .call_with_prealloc(&prealloc_race_identity(), 0, &current, 32)
+            .await
+            .expect_err("the confirmed close cleared the writer");
+        assert!(matches!(err, IpcError::Closed), "unexpected error: {err:?}");
+        assert_eq!(
+            fresh_pool.lock().stats().alloc_count,
+            1,
+            "the current pool's own allocation must return to only the canary"
+        );
+
+        companion.await.expect("companion task");
+    }
+
+    fn prealloc_race_identity() -> RouteCallIdentity {
+        RouteCallIdentity {
+            route_name: "grid".to_string(),
+            route_uid: "grid-route-uid-race".to_string(),
+            observed_route_revision: 1,
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
+        }
     }
 
     #[tokio::test]

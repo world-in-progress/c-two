@@ -6,11 +6,11 @@
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 
-use c2_mem::{MemPool, PoolAllocation};
+use c2_mem::MemPool;
 
 use crate::client::{
-    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestTransportKind, RouteBinding,
-    ServerPoolState, choose_request_transport,
+    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestBlock, RequestTransportKind,
+    RouteBinding, ServerPoolState, choose_request_transport,
 };
 use crate::response::{ResponseData, ResponseLease};
 
@@ -157,14 +157,17 @@ impl SyncClient {
     ///
     /// The pool was built from `config` by the caller inside this crate and is
     /// owned solely by the resulting client, so it is not subject to the
-    /// injected-pool policy gate.
+    /// injected-pool policy gate. `budget` is the owning cache's shared domain
+    /// context: the pool already charges it and the client's reassembly pool
+    /// charges the same context.
     pub(crate) fn connect_transport_pool(
         address: &str,
         pool: Arc<Mutex<MemPool>>,
         config: ClientIpcConfig,
+        budget: c2_mem::MemoryBudget,
     ) -> Result<Self, IpcError> {
         let rt = get_or_create_runtime();
-        let mut client = IpcClient::with_transport_pool(address, pool, config);
+        let mut client = IpcClient::with_transport_pool(address, pool, config, budget);
         rt.block_on(client.connect())?;
         Ok(Self {
             inner: client,
@@ -196,81 +199,89 @@ impl SyncClient {
 
     /// Whether the client has a SHM pool and data exceeds the threshold.
     pub fn should_use_shm(&self, data_len: usize) -> bool {
-        choose_request_transport(&self.inner.config, self.inner.pool.is_some(), data_len)
+        choose_request_transport(&self.inner.config, self.inner.has_request_pool(), data_len)
             == RequestTransportKind::Buddy
     }
 
     /// Allocate from the client SHM pool and write data in a single lock scope.
     ///
-    /// Returns the allocation coordinates. On error, the caller should fall
-    /// back to the canonical route-bound call path.
-    pub fn pool_alloc_and_write(&self, data: &[u8]) -> Result<PoolAllocation, IpcError> {
+    /// The returned [`RequestBlock`] carries the exact pool that owns the
+    /// allocation. Later writes and every release path go through that owner,
+    /// so a confirmed close that detaches the client's pool (or a reconnect
+    /// that installs a fresh incarnation) can never redirect the coordinates
+    /// into a replacement pool.
+    ///
+    /// On error, the caller should fall back to the canonical route-bound call
+    /// path.
+    pub fn pool_alloc_and_write(&self, data: &[u8]) -> Result<RequestBlock, IpcError> {
         let pool_arc = self
             .inner
-            .pool
-            .as_ref()
+            .select_request_pool()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
         let mut pool = pool_arc.lock();
         let alloc = pool
             .alloc(data.len())
             .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-        let ptr = pool.data_ptr(&alloc).map_err(|e| {
-            let _ = pool.free(&alloc);
-            IpcError::Pool(format!("data_ptr failed: {e}"))
-        })?;
+        let ptr = match pool.data_ptr(&alloc) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = pool.free(&alloc);
+                return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
+            }
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
-        Ok(alloc)
+        drop(pool);
+        Ok(RequestBlock::new(pool_arc, alloc))
     }
 
     /// Allocate from the client SHM pool and let the caller fill the block.
     ///
-    /// The fill callback receives exactly `data_size` bytes. On callback
-    /// failure the allocation is freed before the error is returned.
+    /// The fill callback receives exactly `data_size` bytes and runs without
+    /// any pool lock held; the returned [`RequestBlock`] keeps the owning pool
+    /// alive. On callback failure the allocation is released through that same
+    /// owner before the error is returned.
     pub fn pool_alloc_and_fill<F>(
         &self,
         data_size: usize,
         fill: F,
-    ) -> Result<PoolAllocation, IpcError>
+    ) -> Result<RequestBlock, IpcError>
     where
         F: FnOnce(&mut [u8]) -> Result<(), String>,
     {
         let pool_arc = self
             .inner
-            .pool
-            .as_ref()
+            .select_request_pool()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
-        let alloc = {
+        let (alloc, ptr) = {
             let mut pool = pool_arc.lock();
-            pool.alloc(data_size)
-                .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?
-        };
-        let ptr = {
-            let pool = pool_arc.lock();
+            let alloc = pool
+                .alloc(data_size)
+                .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
             match pool.data_ptr(&alloc) {
-                Ok(ptr) => ptr,
+                Ok(ptr) => (alloc, ptr),
                 Err(e) => {
-                    drop(pool);
-                    self.pool_free(&alloc);
+                    let _ = pool.free(&alloc);
                     return Err(IpcError::Pool(format!("data_ptr failed: {e}")));
                 }
             }
         };
+        let block = RequestBlock::new(pool_arc, alloc);
         let destination = unsafe { std::slice::from_raw_parts_mut(ptr, data_size) };
         if let Err(err) = fill(destination) {
-            self.pool_free(&alloc);
+            let _ = block.release();
             return Err(IpcError::Pool(format!("fill failed: {err}")));
         }
-        Ok(alloc)
+        Ok(block)
     }
 
-    /// Free a pool allocation (used on send failure for cleanup).
-    pub fn pool_free(&self, alloc: &PoolAllocation) {
-        if let Some(ref pool_arc) = self.inner.pool {
-            let mut pool = pool_arc.lock();
-            let _ = pool.free(alloc);
-        }
+    /// Release a request block through the exact pool that owns it.
+    ///
+    /// Used on send failure for cleanup. Never resolves the client's current
+    /// pool slot: the block already carries its owner.
+    pub fn pool_free(&self, block: &RequestBlock) {
+        let _ = block.release();
     }
 
     /// Synchronous CRM call with pre-allocated SHM data through an immutable route binding.
@@ -278,7 +289,7 @@ impl SyncClient {
         &self,
         binding: &RouteBinding,
         method_name: &str,
-        alloc: &PoolAllocation,
+        block: &RequestBlock,
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
         let (method_idx, identity) = match (|| {
@@ -294,19 +305,35 @@ impl SyncClient {
         })() {
             Ok(target) => target,
             Err(err) => {
-                self.inner.free_prealloc(alloc);
+                let _ = block.release();
                 return Err(err);
             }
         };
         self.rt.block_on(
             self.inner
-                .call_with_prealloc(&identity, method_idx, alloc, data_size),
+                .call_with_prealloc(&identity, method_idx, block, data_size),
         )
     }
 
     /// Get a reference to the server SHM pool (for FFI layer).
     pub fn server_pool_arc(&self) -> Arc<Mutex<Option<ServerPoolState>>> {
         self.inner.server_pool.clone()
+    }
+
+    /// The transport-owned request pool this client currently holds, if any.
+    ///
+    /// `None` for clients without a config-owned pool and after a confirmed
+    /// close detached an idle pool (`connect` recreates a fresh incarnation).
+    #[cfg(test)]
+    pub(crate) fn request_pool(&self) -> Option<Arc<Mutex<MemPool>>> {
+        self.inner.request_pool()
+    }
+
+    /// The complete resolved client configuration this connection was created
+    /// from. Used by the owning cache to reject a same-address hit whose
+    /// requested policy differs from the cached connection's policy.
+    pub(crate) fn config(&self) -> &ClientIpcConfig {
+        self.inner.config()
     }
 
     /// Bind a response to the exact transport pool that owns its backing.
@@ -519,7 +546,7 @@ pub(crate) mod tests {
         assert!(!client.should_use_shm(50));
         assert!(client.should_use_shm(200));
         assert_eq!(
-            choose_request_transport(&client.inner.config, client.inner.pool.is_some(), 200),
+            choose_request_transport(&client.inner.config, client.inner.has_request_pool(), 200),
             RequestTransportKind::Buddy
         );
     }
@@ -614,5 +641,191 @@ pub(crate) mod tests {
         assert!(!production.contains(concat!("pub fn ", "call_prealloc(")));
         assert!(production.contains("pub fn call_bound("));
         assert!(production.contains("pub fn call_bound_prealloc("));
+    }
+
+    // ── Owner affinity across close/reconnect ────────────────────────────
+
+    use c2_config::BaseIpcConfig;
+    use c2_server::{Server, ServerIpcConfig};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::Duration;
+
+    static RACE_ADDRESS_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn race_client_config() -> ClientIpcConfig {
+        ClientIpcConfig {
+            shm_threshold: 1,
+            base: BaseIpcConfig {
+                pool_segment_size: 65_536,
+                max_pool_segments: 1,
+                max_pool_memory: 65_536,
+                ..BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        }
+    }
+
+    /// Route-less IPC server plus the private runtime that keeps it running.
+    fn start_race_server(label: &str) -> (tokio::runtime::Runtime, Arc<Server>, String) {
+        let address = format!(
+            "ipc://{label}_{}_{}",
+            std::process::id(),
+            RACE_ADDRESS_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("race test runtime");
+        let server = runtime.block_on(async {
+            let server = Arc::new(
+                Server::new(&address, ServerIpcConfig::default()).expect("bind race test server"),
+            );
+            let running = Arc::clone(&server);
+            tokio::spawn(async move {
+                let _ = running.run().await;
+            });
+            server
+                .wait_until_ready(Duration::from_secs(5))
+                .await
+                .expect("race test server ready");
+            server
+        });
+        (runtime, server, address)
+    }
+
+    /// Deterministically race one preallocation against a confirmed close and
+    /// a fresh pool incarnation in the client slot.
+    ///
+    /// The selection hook pauses the calling thread after it has cloned the
+    /// old pool and before it allocates. The companion thread then confirms a
+    /// close (which detaches the idle old pool), installs the returned fresh
+    /// pool exactly as a reconnect would, and allocates a live canary in it.
+    /// `MemPool` frees are explicit, so the canary stays allocated while the
+    /// caller asserts on the block under test.
+    fn install_replacement_race(
+        client: &Arc<SyncClient>,
+        old_pool: &Arc<Mutex<MemPool>>,
+        canary_size: usize,
+    ) -> (Arc<Mutex<MemPool>>, std::thread::JoinHandle<()>) {
+        let fresh_config = old_pool.lock().config().clone();
+        let fresh_budget = old_pool
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let fresh = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            fresh_config,
+            format!(
+                "/cc3crace{:08x}{:08x}",
+                std::process::id(),
+                RACE_ADDRESS_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+            ),
+            fresh_budget,
+        )));
+        let (selected_tx, selected_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        client
+            .inner
+            .set_prealloc_selection_hook_for_test(Some(Box::new(move || {
+                let _ = selected_tx.send(());
+                // Bounded so a panicking companion fails the test instead of
+                // hanging the suite in this hook.
+                let _ = resume_rx
+                    .lock()
+                    .expect("resume lock")
+                    .recv_timeout(Duration::from_secs(10));
+            })));
+        let companion_client = Arc::clone(client);
+        let companion_fresh = Arc::clone(&fresh);
+        let join = std::thread::spawn(move || {
+            selected_rx.recv().expect("selection hook must fire");
+            assert!(
+                companion_client.close_shared(Duration::from_secs(5)),
+                "the race requires a confirmed close"
+            );
+            companion_client
+                .inner
+                .replace_request_pool_for_test(Some(Arc::clone(&companion_fresh)));
+            let _canary = companion_fresh
+                .lock()
+                .alloc(canary_size)
+                .expect("fresh-pool canary");
+            resume_tx.send(()).expect("main is paused in the hook");
+        });
+        (fresh, join)
+    }
+
+    #[test]
+    fn prealloc_selection_race_frees_only_the_owning_pool() {
+        let (_runtime, _server, address) = start_race_server("prealloc_race_pool_free");
+        let client = Arc::new(
+            SyncClient::connect(&address, None, race_client_config()).expect("connect race client"),
+        );
+        let old_pool = client
+            .inner
+            .request_pool()
+            .expect("transport-owned request pool");
+        let (fresh_pool, companion) = install_replacement_race(&client, &old_pool, 64);
+
+        let data = vec![7u8; 64];
+        let block = client
+            .pool_alloc_and_write(&data)
+            .expect("the originally selected pool serves the allocation");
+        assert_eq!(
+            old_pool.lock().stats().alloc_count,
+            1,
+            "the paused allocation must be charged to the originally selected pool"
+        );
+        assert_eq!(
+            fresh_pool.lock().stats().alloc_count,
+            1,
+            "the replacement pool must hold only its own live canary"
+        );
+
+        client.pool_free(&block);
+
+        assert_eq!(
+            old_pool.lock().stats().alloc_count,
+            0,
+            "pool_free must release through the owning pool, not leak the old coordinates"
+        );
+        assert_eq!(
+            fresh_pool.lock().stats().alloc_count,
+            1,
+            "the replacement pool's live canary must never be freed by stale coordinates"
+        );
+        companion.join().expect("companion thread");
+    }
+
+    #[test]
+    fn prealloc_selection_race_fill_failure_frees_only_the_owning_pool() {
+        let (_runtime, _server, address) = start_race_server("prealloc_race_fill");
+        let client = Arc::new(
+            SyncClient::connect(&address, None, race_client_config()).expect("connect race client"),
+        );
+        let old_pool = client
+            .inner
+            .request_pool()
+            .expect("transport-owned request pool");
+        let (fresh_pool, companion) = install_replacement_race(&client, &old_pool, 64);
+
+        let error = client
+            .pool_alloc_and_fill(64, |_buffer| Err("injected fill failure".to_string()))
+            .expect_err("a failing fill must fail the allocation");
+        assert!(error.to_string().contains("fill failed"), "{error}");
+
+        assert_eq!(
+            old_pool.lock().stats().alloc_count,
+            0,
+            "fill failure must release through the owning pool"
+        );
+        assert_eq!(
+            fresh_pool.lock().stats().alloc_count,
+            1,
+            "the replacement pool's live canary must never be freed by stale coordinates"
+        );
+        companion.join().expect("companion thread");
     }
 }

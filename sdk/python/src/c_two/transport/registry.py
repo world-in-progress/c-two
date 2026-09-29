@@ -38,7 +38,7 @@ import signal
 import sys
 import threading
 from collections.abc import Mapping
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from c_two.crm.bridge import ResourceBridge, normalize_bridge_map
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
@@ -60,6 +60,9 @@ from .input_lifetime import (
 )
 from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
+
+if TYPE_CHECKING:
+    from c_two.mem import MemoryStats
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
@@ -194,18 +197,73 @@ class _ProcessRegistry:
                 settings.shm_threshold = shm_threshold  # type: ignore[assignment]
             if remote_payload_chunk_size is not _UNSET:
                 settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
-            runtime_session_kwargs = _runtime_session_kwargs_from_settings()
-            runtime_session = self._runtime_session.__class__(
-                server_id=(
-                    self._runtime_session.server_id
-                    or self._runtime_session.server_id_override
-                ),
-                server_ipc_overrides=self._runtime_session.server_ipc_overrides,
-                client_ipc_overrides=self._runtime_session.client_ipc_overrides,
-                **runtime_session_kwargs,
+            old_session, _retired_observation = self._swap_runtime_session(
+                preserve_server_identity=True,
             )
-            runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
-            self._runtime_session = runtime_session
+
+        # Close the replaced session's client-only barrier outside the lock.
+        # The retirement observation needs no fence: it observes through weak
+        # handles, so its records stay reportable exactly while real owners
+        # (old proxies, in-flight responses, outstanding holds) keep the old
+        # session's accounting and lease metadata alive.
+        self._close_replaced_session(old_session)
+
+    def _swap_runtime_session(self, *, preserve_server_identity: bool):
+        """Retire the current session and publish its replacement atomically.
+
+        Must be called with ``self._lock`` held. Returns
+        ``(old_session, retired_observation)``.
+
+        The retirement observation is a pure re-capture that consumes nothing,
+        so a replacement that fails to construct or adopt leaves the old
+        session — and every observation it already carried — exactly as it
+        was, and a later retry re-captures the session's own domains and
+        tracker as they exist at that moment. The replacement adopts the
+        pending bundle and every earlier one in the same critical section that
+        publishes it, so the public session never shows a window in which
+        retired charges silently disappeared. Observation lifetime needs no
+        fence here: records stay reportable exactly while real owners keep
+        the old session's accounting and lease metadata alive.
+        """
+        runtime_session = self._runtime_session
+        retired_observation = runtime_session.retire_memory_observation()
+        kwargs = _runtime_session_kwargs_from_settings()
+        if preserve_server_identity:
+            kwargs = {
+                'server_id': (
+                    runtime_session.server_id
+                    or runtime_session.server_id_override
+                ),
+                'server_ipc_overrides': runtime_session.server_ipc_overrides,
+                'client_ipc_overrides': runtime_session.client_ipc_overrides,
+                **kwargs,
+            }
+        new_session = runtime_session.__class__(**kwargs)
+        new_session.adopt_retired_memory_observation(retired_observation)
+        if preserve_server_identity:
+            new_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
+        self._runtime_session = new_session
+        self._server = None
+        return runtime_session, retired_observation
+
+    def _close_replaced_session(self, old_session) -> None:
+        """Drive a replaced session's bounded client-only close barrier.
+
+        This releases the old session's outgoing IPC cache and runtime
+        barrier. The retirement observation needs no separate lifecycle step:
+        it observes through weak handles, so its records detach exactly when
+        the last real owner of the old session's accounting or lease metadata
+        — an old proxy, an in-flight response, an outstanding hold — is gone.
+        """
+        try:
+            old_session.shutdown(
+                route_names=[],
+                relay_anchor_address=None,
+            )
+        except Exception:
+            log.warning(
+                'Error shutting down replaced RuntimeSession', exc_info=True,
+            )
 
     def set_server(
         self,
@@ -564,10 +622,19 @@ class _ProcessRegistry:
         """
         with self._lock:
             server = self._server
-            runtime_session = self._runtime_session
-            from c_two._native import RuntimeSession
-            self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
-            self._server = None
+            # Swap in a replacement session that has already adopted the old
+            # session's retirement observation, atomically with publishing it.
+            # The observation holds only weak views of Rust-owned budget
+            # accounting and lease metadata, so retired domains and charges
+            # held by outstanding data stay observable for exactly as long as
+            # real owners (old proxies, in-flight responses, outstanding
+            # holds) keep them alive — never by retaining the old session's
+            # cache, pools, or callbacks — and memory_stats()/hold_stats() can
+            # never observe a window in which retired charges silently
+            # disappeared.
+            runtime_session, _retired_observation = self._swap_runtime_session(
+                preserve_server_identity=False,
+            )
 
         if server is not None:
             try:
@@ -611,7 +678,9 @@ class _ProcessRegistry:
         # Surface unconfirmed native cleanup barriers instead of silently
         # returning apparent full cleanup. These outcome keys report closes
         # whose bounded barrier did not confirm; shutdown stays best-effort
-        # (no return-type change), so a warning is the failure policy.
+        # (no return-type change), so a warning is the failure policy. They
+        # do not change observation lifetime: retirement records detach when
+        # their last real owner is gone, regardless of barrier confirmation.
         for key, description in (
             ('ipc_client_close_error', 'IPC client cache'),
             ('runtime_barrier_error', 'runtime barrier'),
@@ -865,6 +934,43 @@ def hold_stats() -> dict:
     """
     inst = _ProcessRegistry.get()
     return dict(inst._runtime_session.hold_stats())  # noqa: SLF001
+
+
+def memory_stats() -> MemoryStats:
+    """Return read-only, scope-labelled transport memory budget statistics.
+
+    Returns a small mapping with two independent scopes:
+
+    - ``runtime_outgoing``: this process Runtime's outgoing client domain.
+      Every cached connection's request pool and reassembly pool charges this
+      one budget. ``None`` until the first connection attempt freezes the
+      domain; observing the snapshot never freezes it.
+    - ``server``: the server direction of this process Core host (response
+      pool, reassembly pool, and response prewarm). ``None`` while no host
+      exists.
+
+    Each scope maps ``limits`` to the three resolved limit keys
+    (``shm_backing_bytes``, ``file_backing_bytes``,
+    ``live_reassembly_bytes``) and ``cells`` to ``shm``/``file``/
+    ``reassembly`` cells with ``limit_bytes``, ``used_bytes``,
+    ``peak_bytes``, ``rejected_allocations`` and ``rejected_bytes``.
+
+    ``retired`` lists scope-labelled domains from earlier sessions whose
+    accounting or lease metadata is still kept alive by a real owner — an old
+    proxy's native client, an in-flight response, or outstanding ``cc.hold()``
+    data. Retired entries carry ``state="retired"``; records detach
+    individually once their last owner is gone, so repeated empty session
+    swaps never accumulate, and a late held result published through an old
+    proxy stays visible. Observing them never retains the retired Runtime,
+    cache, pools, callbacks, or payloads.
+
+    ``holds`` carries the same Rust-owned retained-buffer counters as
+    :func:`hold_stats`, composed across the live and retired lease trackers.
+    The three cells are C-Two-owned backing/reassembly accounting, not process
+    RSS: never sum or present them as RAM usage.
+    """
+    inst = _ProcessRegistry.get()
+    return dict(inst._runtime_session.memory_stats())  # noqa: SLF001
 
 
 # Auto-cleanup on process exit.

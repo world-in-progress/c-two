@@ -21,5 +21,6 @@ pub use scheduler::{
     SchedulerLimits, SchedulerSnapshot,
 };
 pub use server::{
-    Server, ServerError, ServerIdentity, ServerLifecycleState, ServerRouteCloseOutcome,
+    Server, ServerError, ServerIdentity, ServerLifecycleState, ServerMemorySnapshot,
+    ServerRouteCloseOutcome,
 };

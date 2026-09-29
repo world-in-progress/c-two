@@ -784,12 +784,26 @@ def test_registry_restores_native_error_bytes_before_wrapping() -> None:
 def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> None:
     from c_two.transport.registry import _ProcessRegistry
 
+    class FakeRetiredObservation:
+        """Retirement bundle double: an opaque handoff token."""
+
+    retired_observations: list[FakeRetiredObservation] = []
+
     class FakeSession:
-        def __init__(self, outcome: dict) -> None:
-            self._outcome = outcome
+        def __init__(self, outcome: dict | None = None, **_kwargs) -> None:
+            self._outcome = outcome if outcome is not None else {'relay_errors': []}
+            self.adopted_observations: list[object] = []
 
         def shutdown(self, *, route_names, relay_anchor_address):
             return self._outcome
+
+        def retire_memory_observation(self) -> FakeRetiredObservation:
+            observation = FakeRetiredObservation()
+            retired_observations.append(observation)
+            return observation
+
+        def adopt_retired_memory_observation(self, observation: object) -> None:
+            self.adopted_observations.append(observation)
 
     def hostless_registry(outcome: dict) -> _ProcessRegistry:
         registry = _ProcessRegistry()
@@ -823,3 +837,17 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         'runtime barrier' in message for message in messages
     ), 'an unconfirmed runtime barrier must be surfaced'
     assert len(messages) == 2, f'clean outcomes must stay silent, saw {messages!r}'
+
+    # Barrier confirmation is transport cleanup reporting only: it never
+    # touches the retirement observation. Every retirement is handed to the
+    # replacement unchanged, and the observation interface exposes no fence
+    # the registry could mark — its lifetime is decided by real owners.
+    assert len(retired_observations) == 3
+    for observation in retired_observations:
+        surface = {name for name in dir(observation) if not name.startswith('_')}
+        assert not hasattr(observation, 'mark_close_confirmed')
+        assert not hasattr(observation, 'close_confirmed')
+        assert not surface & {
+            'track', 'track_retained', 'reserve', 'prune', 'scope_reports',
+            'lease_stats',
+        }, f'observation must stay an opaque handoff, saw {surface!r}'

@@ -96,7 +96,13 @@ pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &["shm_threshold"];
 // ─── Base ────────────────────────────────────────────────────────────────────
 
 /// Fields shared by both server and client IPC configs.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` compares the complete resolved policy field by field. It is
+/// the equality the transport uses to prove a cached connection was created
+/// from the same resolved policy as a new request; float fields compare by
+/// value, and every cache owner snapshots configs after resolution rather
+/// than mutating a shared value.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BaseIpcConfig {
     // ── Pool SHM settings ────────────────────────────────────────────────
     /// Buddy-pool policy switch. Disabling it skips only the buddy tiers
@@ -136,7 +142,7 @@ pub struct BaseIpcConfig {
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 /// Server-side IPC configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServerIpcConfig {
     pub base: BaseIpcConfig,
 
@@ -153,7 +159,13 @@ pub struct ServerIpcConfig {
 // ─── Client ──────────────────────────────────────────────────────────────────
 
 /// Client-side IPC configuration.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is the complete resolved-policy equality used by the client
+/// cache: a same-address hit is only valid when the cached client was created
+/// from exactly this configuration. Budget-limit equality alone is not
+/// sufficient because chunking, threshold, prewarm, and buddy-policy changes
+/// also change how the cached client transfers data.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClientIpcConfig {
     pub base: BaseIpcConfig,
     pub shm_threshold: u64,
@@ -1102,5 +1114,117 @@ mod tests {
             tuning.max_dedicated_segments,
             PoolRoleTuning::default().max_dedicated_segments
         );
+    }
+
+    // ── Complete resolved-config equality ────────────────────────────────
+
+    /// The client cache rejects a same-address hit when the requested resolved
+    /// policy differs, so `PartialEq` must cover every field a connection
+    /// actually uses — not just the budget identity.
+    #[test]
+    fn client_config_equality_covers_every_resolved_policy_field() {
+        let base = BaseIpcConfig::default();
+        let pristine = ClientIpcConfig {
+            base: base.clone(),
+            ..ClientIpcConfig::default()
+        };
+        assert_eq!(pristine, pristine.clone());
+
+        let base_mutations = [
+            BaseIpcConfig {
+                pool_enabled: !base.pool_enabled,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                pool_segment_size: base.pool_segment_size + 4096,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                max_pool_segments: base.max_pool_segments + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                max_pool_memory: base.max_pool_memory + 4096,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                pool_prewarm_segments: base.pool_prewarm_segments + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                pool_min_retained_segments: base.pool_min_retained_segments + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                reassembly_segment_size: base.reassembly_segment_size + 4096,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                reassembly_max_segments: base.reassembly_max_segments + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                max_total_chunks: base.max_total_chunks + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                chunk_gc_interval_secs: base.chunk_gc_interval_secs + 1.0,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                chunk_threshold_ratio: base.chunk_threshold_ratio - 0.1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                chunk_assembler_timeout_secs: base.chunk_assembler_timeout_secs + 1.0,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                max_reassembly_bytes: base.max_reassembly_bytes + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                chunk_size: base.chunk_size + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                shm_backing_budget_bytes: base.shm_backing_budget_bytes + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                file_backing_budget_bytes: base.file_backing_budget_bytes + 1,
+                ..base.clone()
+            },
+            BaseIpcConfig {
+                live_reassembly_budget_bytes: base.live_reassembly_budget_bytes + 1,
+                ..base.clone()
+            },
+        ];
+        for mutated in base_mutations {
+            let cfg = ClientIpcConfig {
+                base: mutated,
+                ..pristine.clone()
+            };
+            assert_ne!(
+                pristine, cfg,
+                "every base policy field must participate in client config equality"
+            );
+        }
+
+        for cfg in [
+            ClientIpcConfig {
+                shm_threshold: pristine.shm_threshold + 1,
+                ..pristine.clone()
+            },
+            ClientIpcConfig {
+                pool_decay_seconds: pristine.pool_decay_seconds + 1.0,
+                ..pristine.clone()
+            },
+        ] {
+            assert_ne!(
+                pristine, cfg,
+                "every client policy field must participate in client config equality"
+            );
+        }
     }
 }

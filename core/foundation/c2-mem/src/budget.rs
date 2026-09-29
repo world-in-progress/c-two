@@ -21,7 +21,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Which finite budget cell a reservation charges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -280,6 +280,110 @@ fn lock_cells(cells: &Mutex<BudgetCells>) -> std::sync::MutexGuard<'_, BudgetCel
         .expect("memory budget accounting mutex poisoned")
 }
 
+/// Read-only handle to one budget domain that can outlive its owner.
+///
+/// Retains only the shared accounting state and the resolved limits — never a
+/// pool, mapping, client cache, Runtime, connection, or callback — so a
+/// retired domain (a closed Runtime's outgoing context, a stopped Server) can
+/// stay observable without retaining live transport authority. Observing never
+/// allocates, maps, freezes, or resets accounting; charges held by outstanding
+/// owners stay visible through the shared counters until their guards release.
+///
+/// This is the public observation surface, so it deliberately exposes no way
+/// back to the mutable [`MemoryBudget`]: there is no accessor for the wrapped
+/// accounting handle, which means a holder of a retired observer cannot create
+/// new charges against the observed domain. [`MemoryBudget::reserve`] stays
+/// available only to the owner-side integration seams that constructed the
+/// domain.
+#[derive(Debug, Clone)]
+pub struct BudgetObserver {
+    limits: c2_config::MemoryBudgetLimits,
+    budget: MemoryBudget,
+}
+
+impl BudgetObserver {
+    /// Wraps the shared counters of one domain with its resolved limits.
+    pub fn new(limits: c2_config::MemoryBudgetLimits, budget: MemoryBudget) -> Self {
+        Self { limits, budget }
+    }
+
+    /// Resolved limits the observed domain enforces.
+    pub fn limits(&self) -> &c2_config::MemoryBudgetLimits {
+        &self.limits
+    }
+
+    /// Consistent snapshot of all three cells.
+    pub fn snapshot(&self) -> BudgetSnapshot {
+        self.budget.snapshot()
+    }
+
+    /// Live bytes across all three cells.
+    ///
+    /// Saturating so reporting can never wrap; the cells stay independent and
+    /// must never be presented as process RSS.
+    pub fn used_bytes(&self) -> u64 {
+        let snapshot = self.budget.snapshot();
+        snapshot
+            .shm
+            .used_bytes
+            .saturating_add(snapshot.file.used_bytes)
+            .saturating_add(snapshot.reassembly.used_bytes)
+    }
+
+    /// Weak, non-owning view of this observer's accounting state.
+    ///
+    /// A retired observation stores this instead of the observer itself, so
+    /// observing never keeps budget accounting alive: the record stays
+    /// reportable exactly while a real owner — the domain owner (Runtime
+    /// client pool, Server) or an outstanding [`BudgetReservation`] guard —
+    /// keeps the shared state alive, and becomes prunable the moment the last
+    /// such owner is gone.
+    pub fn downgrade(&self) -> BudgetObserverWeak {
+        BudgetObserverWeak {
+            limits: self.limits,
+            state: Arc::downgrade(&self.budget.state),
+        }
+    }
+}
+
+/// Weak, read-only view of one budget domain's shared accounting state.
+///
+/// Sharing only a [`Weak`] handle to the accounting state plus the resolved
+/// limits, this can never create charges and never keeps a retired domain's
+/// counters alive by itself. See [`BudgetObserver::downgrade`].
+#[derive(Debug, Clone)]
+pub struct BudgetObserverWeak {
+    limits: c2_config::MemoryBudgetLimits,
+    state: Weak<BudgetState>,
+}
+
+impl BudgetObserverWeak {
+    /// Whether a real owner still keeps this domain's accounting alive.
+    pub fn is_alive(&self) -> bool {
+        self.state.strong_count() > 0
+    }
+
+    /// Identity comparison for de-duplicating the same domain observed
+    /// through more than one record.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Reattach to the live accounting state, with its resolved limits.
+    ///
+    /// `None` once every owner of the domain is gone; such a record carries no
+    /// observable values anymore and may be pruned.
+    pub fn upgrade(&self) -> Option<BudgetObserver> {
+        let budget = MemoryBudget {
+            state: self.state.upgrade()?,
+        };
+        Some(BudgetObserver {
+            limits: self.limits,
+            budget,
+        })
+    }
+}
+
 /// Move-only ownership of one admitted charge.
 ///
 /// Not `Clone` or `Copy`: moving the guard transfers the charge, and the
@@ -514,6 +618,40 @@ mod tests {
             weak.upgrade().is_none(),
             "last guard must release its state"
         );
+    }
+
+    #[test]
+    fn weak_observer_follows_real_owner_lifetime_without_retaining_state() {
+        let limits = c2_config::MemoryBudgetLimits {
+            shm_backing_budget_bytes: 4096,
+            file_backing_budget_bytes: 4096,
+            live_reassembly_budget_bytes: 4096,
+        };
+        // The domain owner goes away, exactly like a retired session dropping
+        // its Runtime. An outstanding charge is itself a real owner, so the
+        // weak observation stays attached and keeps reporting live values.
+        let weak = {
+            let budget = MemoryBudget::from_limits(&limits);
+            let observer = BudgetObserver::new(limits, budget.clone());
+            let weak = observer.downgrade();
+            let _charge = budget.reserve(BudgetKind::File, 512).unwrap();
+            drop((budget, observer));
+            assert!(weak.is_alive());
+            let reattached = weak.upgrade().expect("charge keeps state alive");
+            assert_eq!(reattached.snapshot().file.used_bytes, 512);
+            assert_eq!(*reattached.limits(), limits);
+            weak
+        };
+        // The charge dropped with the scope above; no owner remains, so the
+        // weak record detaches and no longer offers observable values.
+        assert!(!weak.is_alive());
+        assert!(weak.upgrade().is_none());
+
+        // Identity distinguishes two domains even with equal limits.
+        let first = BudgetObserver::new(limits, MemoryBudget::from_limits(&limits)).downgrade();
+        let second = BudgetObserver::new(limits, MemoryBudget::from_limits(&limits)).downgrade();
+        assert!(first.ptr_eq(&first));
+        assert!(!first.ptr_eq(&second));
     }
 
     #[test]

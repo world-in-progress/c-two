@@ -299,6 +299,41 @@ impl Runtime {
         self.state.lock().path_counters.record(path);
     }
 
+    /// Read-only snapshot of this Runtime's outgoing client memory domain.
+    ///
+    /// `None` until the first valid connection attempt freezes the domain;
+    /// observing it never connects, maps memory, or freezes configuration.
+    /// Charges retained by completed or held data stay observable across a
+    /// shutdown for as long as the Runtime (or any budget guard) exists.
+    pub fn outgoing_memory_stats(&self) -> Option<crate::MemoryScopeStats> {
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.memory_budget_snapshot()
+            .map(|snapshot| crate::MemoryScopeStats::from_budget(snapshot.limits, snapshot.budget))
+    }
+
+    /// Read-only observer of this Runtime's frozen outgoing client domain.
+    ///
+    /// `None` until the first connection attempt freezes the domain. The
+    /// returned handle shares only the domain counters and resolved limits, so
+    /// a retired Runtime keeps charges held by outstanding owners observable
+    /// without retaining the cache, connections, or pools. Observing never
+    /// connects, maps memory, or freezes configuration.
+    pub fn outgoing_memory_observer(&self) -> Option<c2_mem::BudgetObserver> {
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.memory_budget_observer()
+    }
+
+    /// Read-only memory statistics for this Runtime without a host.
+    ///
+    /// The server scope is reported by [`Host::memory_stats`](crate::Host::memory_stats),
+    /// which composes this outgoing scope with its server direction.
+    pub fn memory_stats(&self) -> crate::RuntimeMemoryStats {
+        crate::RuntimeMemoryStats {
+            runtime_outgoing: self.outgoing_memory_stats(),
+            server: None,
+        }
+    }
+
     /// Acquire an outgoing IPC client from this Runtime's cache.
     ///
     /// The resolved client config freezes atomically under the RuntimeState
@@ -2110,5 +2145,124 @@ mod tests {
         );
 
         runner.join().unwrap().unwrap();
+    }
+
+    // ── Read-only memory-budget snapshots ────────────────────────────────
+
+    #[test]
+    fn runtime_memory_stats_observe_without_freezing_and_track_outgoing_domain() {
+        let session = Runtime::new(RuntimeOptions {
+            server_id: None,
+            server_ipc_overrides: None,
+            client_ipc_overrides: Some(ClientIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(4096),
+                file_backing_budget_bytes: Some(0),
+                live_reassembly_budget_bytes: Some(2048),
+                ..Default::default()
+            }),
+            shm_threshold: None,
+            remote_payload_chunk_size: None,
+            relay_anchor_address: None,
+            use_process_relay_anchor: false,
+        })
+        .expect("runtime");
+
+        // Observing an unused Runtime must not create or freeze a context.
+        let stats = session.memory_stats();
+        assert!(stats.runtime_outgoing.is_none());
+        assert!(stats.server.is_none());
+        assert!(!session.client_config_frozen());
+        assert!(session.outgoing_memory_observer().is_none());
+
+        // A failed first attempt still freezes the domain limits atomically.
+        assert!(
+            session
+                .acquire_ipc_client("ipc://nonexistent_runtime_memory_domain")
+                .is_err(),
+            "no server is listening on this address"
+        );
+        assert!(session.client_config_frozen());
+
+        let stats = session.memory_stats();
+        let outgoing = stats
+            .runtime_outgoing
+            .expect("a frozen domain is observable");
+        assert_eq!(outgoing.limits.shm_backing_budget_bytes, 4096);
+        assert_eq!(outgoing.limits.file_backing_budget_bytes, 0);
+        assert_eq!(outgoing.limits.live_reassembly_budget_bytes, 2048);
+        assert_eq!(outgoing.shm.used_bytes, 0);
+        assert_eq!(outgoing.file.used_bytes, 0);
+        assert_eq!(outgoing.reassembly.used_bytes, 0);
+        assert_eq!(outgoing.shm.peak_bytes, 0);
+        assert_eq!(outgoing.shm.rejected_allocations, 0);
+
+        // The retired-observation handle carries the same limits and counters
+        // without touching the live cache again.
+        let observer = session
+            .outgoing_memory_observer()
+            .expect("the frozen domain is observable");
+        assert_eq!(*observer.limits(), outgoing.limits);
+        assert_eq!(observer.used_bytes(), 0);
+    }
+
+    #[test]
+    fn outgoing_domain_observer_outlives_runtime_shutdown_without_touching_others() {
+        let runtime_a = Runtime::new(RuntimeOptions {
+            server_id: None,
+            server_ipc_overrides: None,
+            client_ipc_overrides: Some(ClientIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(1111),
+                ..Default::default()
+            }),
+            shm_threshold: None,
+            remote_payload_chunk_size: None,
+            relay_anchor_address: None,
+            use_process_relay_anchor: false,
+        })
+        .expect("runtime a");
+        let runtime_b = Runtime::new(RuntimeOptions {
+            server_id: None,
+            server_ipc_overrides: None,
+            client_ipc_overrides: Some(ClientIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(2222),
+                ..Default::default()
+            }),
+            shm_threshold: None,
+            remote_payload_chunk_size: None,
+            relay_anchor_address: None,
+            use_process_relay_anchor: false,
+        })
+        .expect("runtime b");
+
+        let _ = runtime_a.acquire_ipc_client("ipc://nonexistent_runtime_a");
+        let _ = runtime_b.acquire_ipc_client("ipc://nonexistent_runtime_b");
+        let a = runtime_a
+            .memory_stats()
+            .runtime_outgoing
+            .expect("runtime a domain");
+        let b = runtime_b
+            .memory_stats()
+            .runtime_outgoing
+            .expect("runtime b domain");
+        assert_eq!(a.limits.shm_backing_budget_bytes, 1111);
+        assert_eq!(b.limits.shm_backing_budget_bytes, 2222);
+
+        // A retired observation taken before shutdown keeps reporting exactly
+        // its own domain after the Runtime is gone.
+        let retired_a = runtime_a
+            .outgoing_memory_observer()
+            .expect("runtime a observer");
+
+        // Shutting one Runtime must not reset or change the other's domain.
+        let outcome = runtime_a.shutdown_without_host(Duration::from_secs(2));
+        assert!(outcome.ipc_clients_drained);
+        assert_eq!(*retired_a.limits(), a.limits);
+        assert_eq!(retired_a.used_bytes(), 0);
+        let b_after = runtime_b
+            .memory_stats()
+            .runtime_outgoing
+            .expect("runtime b domain stays observable");
+        assert_eq!(b_after.limits.shm_backing_budget_bytes, 2222);
+        assert_eq!(b_after.shm.limit_bytes, 2222);
     }
 }

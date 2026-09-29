@@ -13,6 +13,7 @@ relay = [
     "dep:tower-http",
     "dep:c2-wire",
     "dep:c2-ipc",
+    "dep:c2-mem",
     "dep:tracing",
     "dep:sha2",
     "dep:hex",
@@ -39,6 +40,7 @@ axum = { version = "0.8", optional = true }
 tower-http = { version = "0.7", features = ["cors"], optional = true }
 c2-wire = { version = "0.1.0", path = "../../protocol/c2-wire", optional = true }
 c2-ipc = { version = "0.1.0", path = "../c2-ipc", optional = true }
+c2-mem = { version = "0.1.0", path = "../../foundation/c2-mem", optional = true }
 tracing = { version = "0.1", optional = true }
 sha2 = { version = "0.11", optional = true }
 hex = { version = "0.4", optional = true }

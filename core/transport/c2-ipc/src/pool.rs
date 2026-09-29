@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use c2_config::MemoryBudgetLimits;
 use c2_mem::{MemPool, PoolConfig};
 
 /// Label counter for client pools. MemPool adds its incarnation and owns
@@ -27,6 +28,200 @@ pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfi
     // buddy pool is still a real `MemPool` — it keeps serving dedicated SHM
     // requests and the wire prefix, only the buddy tiers are policy-disabled.
     cfg.base.primary_pool_config(&cfg.pool_tuning())
+}
+
+/// The cache's shared transport memory context.
+///
+/// Installed from the resolved config of the first connection attempt —
+/// including one that later fails — and then frozen for the cache's lifetime.
+/// Every cached connection's request pool and reassembly pool charges this one
+/// budget, so one owning domain cannot double its cap by opening more
+/// connections. The context owns only accounting counters; pools, clients, and
+/// callbacks never cycle through it.
+struct DomainMemory {
+    limits: MemoryBudgetLimits,
+    budget: c2_mem::MemoryBudget,
+}
+
+impl DomainMemory {
+    fn from_config(cfg: &ClientIpcConfig) -> Self {
+        let limits = cfg.memory_budget_limits();
+        Self {
+            limits,
+            budget: c2_mem::MemoryBudget::from_limits(&limits),
+        }
+    }
+}
+
+/// Structured rejection for a configuration whose memory-budget limits
+/// diverge from an already-frozen domain context.
+fn budget_limits_mismatch(
+    frozen: &MemoryBudgetLimits,
+    requested: &MemoryBudgetLimits,
+    scope: &str,
+) -> IpcError {
+    IpcError::Pool(format!(
+        "client pool memory budget frozen at shm={}, file={}, reassembly={}; refusing {scope} \
+         configuration with divergent limits shm={}, file={}, reassembly={}",
+        frozen.shm_backing_budget_bytes,
+        frozen.file_backing_budget_bytes,
+        frozen.live_reassembly_budget_bytes,
+        requested.shm_backing_budget_bytes,
+        requested.file_backing_budget_bytes,
+        requested.live_reassembly_budget_bytes,
+    ))
+}
+
+/// Structured rejection for a same-address cache hit whose requested resolved
+/// client policy differs from the cached connection's policy.
+///
+/// Budget limits can be equal while transfer behavior still differs (buddy
+/// policy, prewarm, SHM threshold, chunking, reassembly geometry), so the
+/// cache must not silently reuse a connection built from a different resolved
+/// `ClientIpcConfig`. The cached entry is left untouched: existing callers
+/// keep their connection and the caller with the divergent policy gets a
+/// deterministic error instead of a wrong-policy client.
+fn client_policy_mismatch(
+    address: &str,
+    cached: &ClientIpcConfig,
+    requested: &ClientIpcConfig,
+) -> IpcError {
+    let differing = differing_client_policy_fields(cached, requested);
+    IpcError::Pool(format!(
+        "client cache at {address} already holds a connection created from a different resolved \
+         client policy; refusing to reuse it for a divergent configuration (differing fields: \
+         {}). Close the cached connection and reacquire, or request the identical resolved policy.",
+        differing.join(", ")
+    ))
+}
+
+/// Names of the resolved client-policy fields that differ between two configs.
+///
+/// Used in the rejection message so the caller can see exactly which policy
+/// knob changed instead of guessing from a truncated dump.
+fn differing_client_policy_fields(
+    cached: &ClientIpcConfig,
+    requested: &ClientIpcConfig,
+) -> Vec<&'static str> {
+    let mut differing = Vec::new();
+    macro_rules! compare {
+        ($name:literal, $cached:expr, $requested:expr) => {
+            if $cached != $requested {
+                differing.push($name);
+            }
+        };
+    }
+    compare!(
+        "pool_enabled",
+        cached.base.pool_enabled,
+        requested.base.pool_enabled
+    );
+    compare!(
+        "pool_segment_size",
+        cached.base.pool_segment_size,
+        requested.base.pool_segment_size
+    );
+    compare!(
+        "max_pool_segments",
+        cached.base.max_pool_segments,
+        requested.base.max_pool_segments
+    );
+    compare!(
+        "max_pool_memory",
+        cached.base.max_pool_memory,
+        requested.base.max_pool_memory
+    );
+    compare!(
+        "pool_prewarm_segments",
+        cached.base.pool_prewarm_segments,
+        requested.base.pool_prewarm_segments
+    );
+    compare!(
+        "pool_min_retained_segments",
+        cached.base.pool_min_retained_segments,
+        requested.base.pool_min_retained_segments
+    );
+    compare!(
+        "reassembly_segment_size",
+        cached.base.reassembly_segment_size,
+        requested.base.reassembly_segment_size
+    );
+    compare!(
+        "reassembly_max_segments",
+        cached.base.reassembly_max_segments,
+        requested.base.reassembly_max_segments
+    );
+    compare!(
+        "max_total_chunks",
+        cached.base.max_total_chunks,
+        requested.base.max_total_chunks
+    );
+    compare!(
+        "chunk_gc_interval_secs",
+        cached.base.chunk_gc_interval_secs,
+        requested.base.chunk_gc_interval_secs
+    );
+    compare!(
+        "chunk_threshold_ratio",
+        cached.base.chunk_threshold_ratio,
+        requested.base.chunk_threshold_ratio
+    );
+    compare!(
+        "chunk_assembler_timeout_secs",
+        cached.base.chunk_assembler_timeout_secs,
+        requested.base.chunk_assembler_timeout_secs
+    );
+    compare!(
+        "max_reassembly_bytes",
+        cached.base.max_reassembly_bytes,
+        requested.base.max_reassembly_bytes
+    );
+    compare!(
+        "chunk_size",
+        cached.base.chunk_size,
+        requested.base.chunk_size
+    );
+    compare!(
+        "shm_backing_budget_bytes",
+        cached.base.shm_backing_budget_bytes,
+        requested.base.shm_backing_budget_bytes
+    );
+    compare!(
+        "file_backing_budget_bytes",
+        cached.base.file_backing_budget_bytes,
+        requested.base.file_backing_budget_bytes
+    );
+    compare!(
+        "live_reassembly_budget_bytes",
+        cached.base.live_reassembly_budget_bytes,
+        requested.base.live_reassembly_budget_bytes
+    );
+    compare!(
+        "shm_threshold",
+        cached.shm_threshold,
+        requested.shm_threshold
+    );
+    compare!(
+        "pool_decay_seconds",
+        cached.pool_decay_seconds,
+        requested.pool_decay_seconds
+    );
+    if differing.is_empty() {
+        differing.push("none");
+    }
+    differing
+}
+
+/// Read-only snapshot of a [`ClientPool`]'s shared client memory context.
+///
+/// The pool reports `None` until the first connection attempt freezes the
+/// domain; observing the snapshot never creates the context or connects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientCacheMemorySnapshot {
+    /// Limits the domain budget enforces; frozen at the first attempt.
+    pub limits: MemoryBudgetLimits,
+    /// Consistent view of the three budget cells.
+    pub budget: c2_mem::BudgetSnapshot,
 }
 
 fn is_transient_connect_error(error: &IpcError) -> bool {
@@ -47,6 +242,7 @@ fn is_transient_connect_error(error: &IpcError) -> bool {
 fn connect_with_transient_retry(
     address: &str,
     cfg: &ClientIpcConfig,
+    budget: &c2_mem::MemoryBudget,
 ) -> Result<SyncClient, IpcError> {
     let pool_config = pool_config_from_client_config(cfg);
     let prewarm_segments = cfg.pool_prewarm_segments as usize;
@@ -54,9 +250,10 @@ fn connect_with_transient_retry(
     for attempt in 0..CONNECT_TRANSIENT_RETRY_ATTEMPTS {
         let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix(
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
             pool_config.clone(),
             prefix,
+            budget.clone(),
         )));
         // Explicit prewarm only: without it the pool stays unmapped until the
         // first allocation (config validation rejects prewarm with buddy
@@ -67,7 +264,7 @@ fn connect_with_transient_retry(
                 .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
         }
 
-        match SyncClient::connect_transport_pool(address, pool, cfg.clone()) {
+        match SyncClient::connect_transport_pool(address, pool, cfg.clone(), budget.clone()) {
             Ok(client) => return Ok(client),
             Err(error)
                 if attempt + 1 < CONNECT_TRANSIENT_RETRY_ATTEMPTS
@@ -109,6 +306,12 @@ struct CacheState {
     /// its fence and its epoch bump. Acquisitions started or observed in
     /// this window reject.
     closing_generation: Option<u64>,
+    /// Shared transport memory context, frozen by the first connection
+    /// attempt. Draining the cache closes connections but never uninstalls
+    /// or resets this context: charges retained by completed or held data
+    /// stay observable after shutdown, and reacquires under a new epoch keep
+    /// charging the same domain limits.
+    domain_memory: Option<DomainMemory>,
 }
 
 /// Lifecycle of one retired (detached) client record.
@@ -259,6 +462,7 @@ impl ClientPool {
                 entries: HashMap::new(),
                 epoch: 0,
                 closing_generation: None,
+                domain_memory: None,
             }),
             grace_period,
             default_config: Mutex::new(None),
@@ -275,8 +479,56 @@ impl ClientPool {
     }
 
     /// Set the default IPC config for newly created clients.
-    pub fn set_default_config(&self, config: ClientIpcConfig) {
+    ///
+    /// After the domain memory context freezes (first connection attempt), a
+    /// default whose budget limits diverge from the frozen domain is rejected:
+    /// the cache must not be able to acquire a second budget policy through
+    /// its default configuration path.
+    pub fn set_default_config(&self, config: ClientIpcConfig) -> Result<(), IpcError> {
+        let state = self.state.lock();
+        if let Some(domain) = state.domain_memory.as_ref() {
+            let limits = config.memory_budget_limits();
+            if domain.limits != limits {
+                return Err(budget_limits_mismatch(
+                    &domain.limits,
+                    &limits,
+                    "cache default",
+                ));
+            }
+        }
         *self.default_config.lock() = Some(config);
+        Ok(())
+    }
+
+    /// Read-only snapshot of this cache's shared client memory context.
+    ///
+    /// `None` until the first connection attempt freezes the domain. This
+    /// never connects, never creates the context, and never resets usage:
+    /// charges retained by completed or held data stay observable across
+    /// shutdowns for as long as the pool (or any budget guard) exists.
+    pub fn memory_budget_snapshot(&self) -> Option<ClientCacheMemorySnapshot> {
+        self.state
+            .lock()
+            .domain_memory
+            .as_ref()
+            .map(|domain| ClientCacheMemorySnapshot {
+                limits: domain.limits,
+                budget: domain.budget.snapshot(),
+            })
+    }
+
+    /// Read-only observer of this cache's frozen domain budget, if frozen.
+    ///
+    /// The returned handle shares only the accounting counters and the
+    /// resolved limits, so a retired cache can keep reporting charges held by
+    /// outstanding owners without retaining any client, pool, or callback
+    /// authority. Observing never connects and never installs a context.
+    pub fn memory_budget_observer(&self) -> Option<c2_mem::BudgetObserver> {
+        self.state
+            .lock()
+            .domain_memory
+            .as_ref()
+            .map(|domain| c2_mem::BudgetObserver::new(domain.limits, domain.budget.clone()))
     }
 
     /// Register one detached client as a pending bounded close.
@@ -311,6 +563,13 @@ impl ClientPool {
     /// concurrent `close_all` drains the cache while this acquire is
     /// connecting, the fresh connection is closed explicitly and the acquire
     /// fails instead of inserting an entry after the drain.
+    ///
+    /// The shared memory context freezes atomically under the pool lock with
+    /// the resolved config, before any connection I/O: the first attempt —
+    /// including one that later fails — installs the domain budget from that
+    /// config, and every later acquire must resolve the same budget limits or
+    /// reject, so per-address configuration can never bypass the domain's
+    /// limits or race a second budget policy into existence.
     pub fn acquire(
         &self,
         address: &str,
@@ -319,6 +578,8 @@ impl ClientPool {
         let mut retired: Vec<u64> = Vec::new();
         let epoch;
         let cfg;
+        let budget;
+        let mut rejection: Option<IpcError> = None;
         {
             let mut state = self.state.lock();
             if state.closing_generation.is_some() {
@@ -335,7 +596,55 @@ impl ClientPool {
             {
                 retired.push(self.retire_locked(&expired_address, client));
             }
-            if let Some(entry) = state.entries.get_mut(address) {
+            // Resolve config before any fast-path return: the domain budget
+            // gate below must see the same resolved config on a cache hit as
+            // on a fresh connect, so a per-address configuration can never
+            // bypass the frozen domain limits on the same-address fast path.
+            cfg = match config {
+                Some(c) => c.clone(),
+                None => self.default_config.lock().clone().unwrap_or_default(),
+            };
+            // First-connect-wins memory context, installed or validated in
+            // the same critical section that resolved the config so a racing
+            // acquire can never connect under a second budget policy.
+            let limits = cfg.memory_budget_limits();
+            match state.domain_memory.as_ref() {
+                Some(domain) if domain.limits != limits => {
+                    budget = domain.budget.clone();
+                    rejection = Some(budget_limits_mismatch(
+                        &domain.limits,
+                        &limits,
+                        "cache domain",
+                    ));
+                }
+                Some(domain) => {
+                    budget = domain.budget.clone();
+                }
+                None => {
+                    let domain = DomainMemory::from_config(&cfg);
+                    budget = domain.budget.clone();
+                    state.domain_memory = Some(domain);
+                }
+            }
+            // A same-address hit is only valid when the cached connection was
+            // created from the same complete resolved policy. The domain
+            // budget identity is shared, but buddy policy, prewarm, SHM
+            // threshold, chunking, and reassembly geometry must not be
+            // silently bypassed by returning an old client.
+            if rejection.is_none()
+                && let Some(entry) = state.entries.get(address)
+                && entry.client.is_connected()
+                && entry.client.config() != &cfg
+            {
+                rejection = Some(client_policy_mismatch(address, entry.client.config(), &cfg));
+            }
+            // A rejected acquire must not detach a live entry: the frozen
+            // domain or the cached policy already rejected the requested
+            // configuration, so the cache keeps serving existing callers
+            // unchanged.
+            if rejection.is_none()
+                && let Some(entry) = state.entries.get_mut(address)
+            {
                 if entry.client.is_connected() {
                     entry.ref_count += 1;
                     entry.last_release = None;
@@ -349,16 +658,16 @@ impl ClientPool {
                     retired.push(self.retire_locked(address, entry.client));
                 }
             }
-            // Resolve config: explicit > default > ClientIpcConfig::default().
-            cfg = match config {
-                Some(c) => c.clone(),
-                None => self.default_config.lock().clone().unwrap_or_default(),
-            };
         }
-        // Drop the pool lock before connecting (connect may block).
+        // Drop the pool lock before closing retired records or connecting
+        // (both may block). Retired tickets registered above are closed even
+        // when this acquire is rejected, so no detached client is stranded.
         run_retired_closes(&self.close_txn, &retired);
+        if let Some(error) = rejection {
+            return Err(error);
+        }
 
-        let client = Arc::new(connect_with_transient_retry(address, &cfg)?);
+        let client = Arc::new(connect_with_transient_retry(address, &cfg, &budget)?);
 
         let mut state = self.state.lock();
         if state.closing_generation.is_some() || state.epoch != epoch {
@@ -380,6 +689,22 @@ impl ClientPool {
         if let Some(entry) = state.entries.get_mut(address)
             && entry.client.is_connected()
         {
+            if entry.client.config() != &cfg {
+                // A racing acquire inserted a connection built from a
+                // different resolved policy. Its entry stays intact for its
+                // existing callers; this fresh connection is the loser and is
+                // closed explicitly, and the caller gets a deterministic
+                // mismatch instead of a wrong-policy client.
+                let winner_policy = entry.client.config().clone();
+                let loser_ticket = self.retire_locked(address, client);
+                drop(state);
+                let _ = close_retired_ticket(
+                    &self.close_txn,
+                    loser_ticket,
+                    Instant::now() + DETACHED_CLOSE_TIMEOUT,
+                );
+                return Err(client_policy_mismatch(address, &winner_policy, &cfg));
+            }
             // Another thread raced and inserted the same address; its client
             // wins and this fresh connection is the loser. Bump the winner
             // under the lock, register the loser's close, then run it
@@ -2233,13 +2558,248 @@ mod tests {
             shm_threshold: 1024,
             ..ClientIpcConfig::default()
         };
-        pool.set_default_config(cfg);
+        pool.set_default_config(cfg)
+            .expect("unfrozen pool accepts a default config");
         // Verify the config is stored (indirectly — acquire would use it).
         let stored = pool.default_config.lock();
         assert!(stored.is_some());
         let c = stored.as_ref().unwrap();
         assert_eq!(c.shm_threshold, 1024);
         assert_eq!(c.chunk_size, 65536);
+    }
+
+    #[test]
+    fn pool_rejects_default_config_with_divergent_budget_after_freeze() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        // Freeze the domain from a config with a distinctive budget cell.
+        let frozen = ClientIpcConfig {
+            base: c2_config::BaseIpcConfig {
+                shm_backing_budget_bytes: 1,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        };
+        let snapshot = pool.memory_budget_snapshot();
+        assert!(snapshot.is_none(), "snapshot must not create the context");
+        let _ = pool.acquire("ipc:///nonexistent_memory_context_freeze", Some(&frozen));
+        let snapshot = pool
+            .memory_budget_snapshot()
+            .expect("first attempt freezes the domain");
+        assert_eq!(snapshot.limits.shm_backing_budget_bytes, 1);
+
+        let divergent = ClientIpcConfig {
+            base: c2_config::BaseIpcConfig {
+                shm_backing_budget_bytes: 2,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        };
+        let error = pool
+            .set_default_config(divergent)
+            .expect_err("divergent default must be rejected after freeze");
+        assert!(
+            error.to_string().contains("memory budget frozen"),
+            "{error}"
+        );
+        // The frozen domain budget is unchanged and still observable.
+        let after = pool.memory_budget_snapshot().unwrap();
+        assert_eq!(after.limits.shm_backing_budget_bytes, 1);
+    }
+
+    /// The cache's frozen domain observer must survive a full drain: closing
+    /// every client never uninstalls or resets the domain, so retained charges
+    /// stay observable after shutdown.
+    #[test]
+    fn client_cache_budget_observer_reports_frozen_domain_across_close_all() {
+        let pool = ClientPool::new(Duration::from_secs(30));
+        let config = ClientIpcConfig {
+            base: c2_config::BaseIpcConfig {
+                shm_backing_budget_bytes: 4096,
+                file_backing_budget_bytes: 2048,
+                live_reassembly_budget_bytes: 1024,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        };
+        assert!(
+            pool.memory_budget_observer().is_none(),
+            "observing must not create or freeze a domain"
+        );
+        // A failed first attempt still freezes the domain atomically.
+        let _ = pool.acquire("ipc:///nonexistent_cache_budget_observer", Some(&config));
+        let observer = pool
+            .memory_budget_observer()
+            .expect("the first attempt freezes the domain");
+        assert_eq!(*observer.limits(), config.memory_budget_limits());
+        assert_eq!(observer.used_bytes(), 0);
+
+        let report = pool.close_all(Duration::from_secs(1));
+        assert!(report.error.is_none(), "{report:?}");
+
+        let after = pool
+            .memory_budget_observer()
+            .expect("draining clients must not uninstall the frozen domain");
+        assert_eq!(*after.limits(), config.memory_budget_limits());
+        assert_eq!(after.snapshot(), observer.snapshot());
+    }
+
+    /// A same-address cache hit must match the complete resolved client
+    /// policy, not only the shared budget limits: buddy policy, prewarm,
+    /// chunking, threshold, decay, and reassembly geometry all change how the
+    /// cached connection transfers data.
+    #[test]
+    fn same_address_hit_requires_the_complete_resolved_config() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let address = unique_ipc_address("same_address_full_config");
+        let (server, runner) = {
+            let address = address.clone();
+            rt.block_on(async move {
+                let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+                let runner = {
+                    let server = Arc::clone(&server);
+                    tokio::spawn(async move { server.run().await })
+                };
+                server
+                    .wait_until_responsive(Duration::from_secs(2))
+                    .await
+                    .expect("server should be responsive");
+                (server, runner)
+            })
+        };
+
+        // Pool acquires connect through the global sync client runtime, so
+        // they must run outside this test's `block_on` context.
+        let pool = ClientPool::new(Duration::from_secs(60));
+        let base = c2_config::BaseIpcConfig {
+            pool_segment_size: 65_536,
+            max_pool_segments: 1,
+            max_pool_memory: 65_536,
+            ..c2_config::BaseIpcConfig::default()
+        };
+        let canonical = ClientIpcConfig {
+            base: base.clone(),
+            shm_threshold: 1,
+            pool_decay_seconds: 30.0,
+        };
+
+        let first = pool
+            .acquire(&address, Some(&canonical))
+            .expect("first acquire connects");
+        let reused = pool
+            .acquire(&address, Some(&canonical))
+            .expect("an identical resolved config reuses the cached connection");
+        assert!(
+            Arc::ptr_eq(&first, &reused),
+            "identical resolved config must reuse the same client"
+        );
+
+        // Every variant keeps the budget limits identical to `canonical`
+        // and changes exactly one resolved policy field.
+        let variants: Vec<(&str, ClientIpcConfig)> = vec![
+            (
+                "chunk_size",
+                ClientIpcConfig {
+                    base: c2_config::BaseIpcConfig {
+                        chunk_size: 65_536,
+                        ..base.clone()
+                    },
+                    ..canonical.clone()
+                },
+            ),
+            (
+                "shm_threshold",
+                ClientIpcConfig {
+                    shm_threshold: 4_096,
+                    ..canonical.clone()
+                },
+            ),
+            (
+                "pool_enabled",
+                ClientIpcConfig {
+                    base: c2_config::BaseIpcConfig {
+                        pool_enabled: false,
+                        ..base.clone()
+                    },
+                    ..canonical.clone()
+                },
+            ),
+            (
+                "pool_prewarm_segments",
+                ClientIpcConfig {
+                    base: c2_config::BaseIpcConfig {
+                        pool_prewarm_segments: 1,
+                        ..base.clone()
+                    },
+                    ..canonical.clone()
+                },
+            ),
+            (
+                "chunk_threshold_ratio",
+                ClientIpcConfig {
+                    base: c2_config::BaseIpcConfig {
+                        chunk_threshold_ratio: 0.5,
+                        ..base.clone()
+                    },
+                    ..canonical.clone()
+                },
+            ),
+            (
+                "reassembly_segment_size",
+                ClientIpcConfig {
+                    base: c2_config::BaseIpcConfig {
+                        reassembly_segment_size: 32 * 1024 * 1024,
+                        ..base.clone()
+                    },
+                    ..canonical.clone()
+                },
+            ),
+            (
+                "pool_decay_seconds",
+                ClientIpcConfig {
+                    pool_decay_seconds: 5.0,
+                    ..canonical.clone()
+                },
+            ),
+        ];
+
+        for (field, variant) in variants {
+            assert_eq!(
+                variant.memory_budget_limits(),
+                canonical.memory_budget_limits(),
+                "fixture for {field} must keep budget identity equal"
+            );
+            let error = pool
+                .acquire(&address, Some(&variant))
+                .err()
+                .expect("a divergent resolved policy must be rejected on a cache hit");
+            let message = error.to_string();
+            assert!(
+                message.contains("different resolved client policy"),
+                "{field}: {message}"
+            );
+            assert!(message.contains(field), "{field}: {message}");
+            // The rejection must not evict or alter the live entry.
+            let still_cached = pool
+                .acquire(&address, Some(&canonical))
+                .expect("the canonical policy still serves the cache");
+            assert!(
+                Arc::ptr_eq(&first, &still_cached),
+                "{field}: a rejected policy must not disturb the cached entry"
+            );
+        }
+
+        // Rejected acquires leave exactly the original entry in place.
+        assert_eq!(pool.active_count(), 1);
+        let report = pool.close_all(Duration::from_secs(2));
+        assert!(report.error.is_none(), "{report:?}");
+
+        rt.block_on(async move {
+            server
+                .shutdown_and_wait(Duration::from_secs(2))
+                .await
+                .expect("server should shut down");
+            runner.await.unwrap().unwrap();
+        });
     }
 
     #[test]

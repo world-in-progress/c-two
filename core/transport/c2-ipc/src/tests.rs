@@ -367,7 +367,7 @@ mod client_tests {
             ..ClientIpcConfig::default()
         };
         let client = IpcClient::with_config("ipc://configured", cfg.clone());
-        assert!(client.pool.is_some());
+        assert!(client.has_request_pool());
         assert_eq!(client.config.shm_threshold, cfg.shm_threshold);
 
         // A disabled buddy pool is still a real pool: it keeps dedicated SHM
@@ -376,8 +376,7 @@ mod client_tests {
         disabled.base.pool_enabled = false;
         let client = IpcClient::with_config("ipc://configured-no-pool", disabled);
         let pool = client
-            .pool
-            .as_ref()
+            .request_pool()
             .expect("policy-disabled pool stays live");
         let mut pool = pool.lock();
         assert!(!pool.config().buddy_enabled);
@@ -698,7 +697,8 @@ mod lazy_policy_roundtrip_tests {
     use tokio::time::timeout;
 
     use crate::client::{ClientIpcConfig, IpcClient, IpcError};
-    use crate::response::ResponseData;
+    use crate::pool::ClientPool;
+    use crate::response::{ResponseData, ResponseLease};
 
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -882,8 +882,7 @@ mod lazy_policy_roundtrip_tests {
 
     fn own_pool_segment_count(client: &IpcClient) -> usize {
         client
-            .pool
-            .as_ref()
+            .request_pool()
             .expect("config-owned client pool")
             .lock()
             .segment_count()
@@ -931,7 +930,7 @@ mod lazy_policy_roundtrip_tests {
         // segments and neither side mapped any buddy memory.
         assert_eq!(own_pool_segment_count(&client), 0);
         assert_eq!(server.response_pool_arc().read().segment_count(), 0);
-        assert!(client.pool.as_ref().unwrap().lock().config().buddy_enabled);
+        assert!(client.request_pool().unwrap().lock().config().buddy_enabled);
 
         // A one-byte inline round trip must not change that.
         let response = echo_roundtrip(&client, "lazy_startup", b"x").await;
@@ -1001,7 +1000,7 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(response_bytes(&client, response), payload);
 
         // No buddy segments were ever mapped on either side.
-        assert!(!client.pool.as_ref().unwrap().lock().config().buddy_enabled);
+        assert!(!client.request_pool().unwrap().lock().config().buddy_enabled);
         assert_eq!(own_pool_segment_count(&client), 0);
         let server_pool = server.response_pool_arc();
         let pool_guard = server_pool.read();
@@ -1062,7 +1061,7 @@ mod lazy_policy_roundtrip_tests {
             ResponseData::Handle(backing) => backing,
             other => panic!("expected chunked Handle response, got {other:?}"),
         };
-        let reassembly = Arc::clone(client.chunk_registry.pool());
+        let reassembly = Arc::clone(client.require_chunk_registry().pool());
         assert!(!reassembly.read().config().buddy_enabled);
         assert!(backing.is_dedicated());
         assert_eq!(backing.copy_bytes().unwrap(), payload);
@@ -1420,10 +1419,10 @@ mod lazy_policy_roundtrip_tests {
         // Plant a stale assembly that will expire: the maintenance sweep must
         // abort it and release its reassembly-pool bytes.
         client
-            .chunk_registry
+            .require_chunk_registry()
             .insert(42_42, 7, 2, 4096)
             .expect("stale assembly insert");
-        assert_eq!(client.chunk_registry.active_count(), 1);
+        assert_eq!(client.require_chunk_registry().active_count(), 1);
 
         // One call: buddy request (client pool segment 0, generation 1) and a
         // chunked reply reassembled into the client's reassembly pool.
@@ -1435,9 +1434,9 @@ mod lazy_policy_roundtrip_tests {
             ResponseData::Handle(backing) => backing,
             other => panic!("expected chunked Handle reply, got {other:?}"),
         };
-        let reassembly = Arc::clone(client.chunk_registry.pool());
+        let reassembly = Arc::clone(client.require_chunk_registry().pool());
         assert_eq!(backing.copy_bytes().unwrap(), payload);
-        let request_gen = client.pool.as_ref().unwrap().lock().segment_generation(0);
+        let request_gen = client.request_pool().unwrap().lock().segment_generation(0);
         assert_eq!(request_gen, Some(1));
         assert_eq!(reassembly.read().segment_generation(0), Some(1));
         backing.release().unwrap();
@@ -1447,11 +1446,11 @@ mod lazy_policy_roundtrip_tests {
         wait_until(5, || {
             own_pool_segment_count(&client) == 0
                 && reassembly.read().segment_count() == 0
-                && client.chunk_registry.active_count() == 0
+                && client.require_chunk_registry().active_count() == 0
         })
         .await;
         assert_eq!(
-            client.pool.as_ref().unwrap().lock().segment_generation(0),
+            client.request_pool().unwrap().lock().segment_generation(0),
             None,
             "retired slot must not report a live generation"
         );
@@ -1466,7 +1465,7 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(backing.copy_bytes().unwrap(), payload);
         backing.release().unwrap();
         assert_eq!(
-            client.pool.as_ref().unwrap().lock().segment_generation(0),
+            client.request_pool().unwrap().lock().segment_generation(0),
             Some(2),
             "re-created slot must carry a fresh generation"
         );
@@ -1580,8 +1579,7 @@ mod lazy_policy_roundtrip_tests {
         wait_until(5, || {
             server_pool.read().stats().dedicated_segments == 0
                 && client
-                    .pool
-                    .as_ref()
+                    .request_pool()
                     .unwrap()
                     .lock()
                     .stats()
@@ -1769,11 +1767,620 @@ mod lazy_policy_roundtrip_tests {
 
         // Dropping the held requests frees the client's blocks cross-process.
         held_requests.lock().clear();
-        let pool_arc = Arc::clone(client.pool.as_ref().unwrap());
+        let pool_arc = client.request_pool().unwrap();
         wait_until(5, || pool_arc.lock().stats().alloc_count == 0).await;
 
         Arc::clone(&client).close_shared().await;
         drop(client);
+        stop_server(&server).await;
+    }
+
+    // ── Shared transport memory context and read-only snapshots ──────────
+
+    static SEGMENT_PROBE_GEN: AtomicU64 = AtomicU64::new(0);
+
+    /// Measure the exact mapped cost of one buddy segment for `cfg` so a test
+    /// can cap a shared domain at exactly one segment without hard-coding the
+    /// allocator's header/bitmap layout.
+    fn measured_one_segment_charge(cfg: &ClientIpcConfig) -> u64 {
+        let probed = c2_mem::MemoryBudget::new(u64::MAX, u64::MAX, u64::MAX);
+        let prefix = format!(
+            "/cc3p{:08x}{:08x}",
+            std::process::id(),
+            SEGMENT_PROBE_GEN.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut pool = MemPool::new_with_prefix_and_budget(
+            cfg.base.primary_pool_config(&cfg.pool_tuning()),
+            prefix,
+            probed.clone(),
+        );
+        pool.ensure_buddy_segments(1).expect("probe segment");
+        let charge = probed.snapshot().shm.used_bytes;
+        assert!(charge > 0, "a mapped buddy segment must be charged");
+        charge
+    }
+
+    /// Route-bound echo call through a pooled (synchronous) client, returning
+    /// owned bytes after the response lease releases its exact pool.
+    fn sync_echo_roundtrip(
+        client: &crate::SyncClient,
+        route_name: &str,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let binding = client
+            .acquire_route(&expected_contract(route_name))
+            .unwrap();
+        let response = client
+            .call_bound_phased(&binding, "echo", payload)
+            .expect("sync echo call");
+        client
+            .lease_response(response)
+            .into_owned_bytes()
+            .expect("materialize echoed response")
+    }
+
+    /// A standalone client shares one budget between its request pool and its
+    /// reassembly pool: a request charge and a chunk-reassembly charge land in
+    /// the same accounting context.
+    #[tokio::test]
+    async fn standalone_client_request_and_reassembly_share_one_budget() {
+        let (callback, _seen) = echo_callback();
+        let base = small_base(64 * 1024, 4);
+        // Deny every server-side backing tier so the echo reply must use the
+        // chunked path; the client's reassembly pool then really allocates.
+        let mut server_cfg = server_config(base.clone(), 1024);
+        server_cfg.base.shm_backing_budget_bytes = 0;
+        server_cfg.base.file_backing_budget_bytes = 0;
+        server_cfg.base.chunk_size = 8 * 1024;
+        let server = start_echo_server("budget_share_standalone", server_cfg, callback).await;
+
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let request_pool = client.request_pool().unwrap();
+        let reassembly_pool = Arc::clone(client.require_chunk_registry().pool());
+        assert_eq!(
+            request_pool.lock().budget().unwrap().snapshot(),
+            reassembly_pool.read().budget().unwrap().snapshot(),
+            "request and reassembly pools must charge one context"
+        );
+
+        let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let response = echo_roundtrip(&client, "budget_share_standalone", &payload).await;
+        assert_eq!(response_bytes(&client, response), payload);
+        let charged = request_pool.lock().budget().unwrap().snapshot();
+        assert!(
+            charged.shm.used_bytes > 0,
+            "buddy request backing must be charged to the shared context"
+        );
+        assert_eq!(
+            charged,
+            reassembly_pool.read().budget().unwrap().snapshot(),
+            "reassembly work must be visible in the same context"
+        );
+
+        client.close().await;
+        stop_server(&server).await;
+    }
+
+    /// Two distinct outgoing connections in one client cache charge one
+    /// finite budget and cannot double its cap: the first connection maps the
+    /// single admitted segment, the second is denied and falls back to the
+    /// checked chunked path while the shared accounting stays at one segment.
+    ///
+    /// This is a synchronous test: the pooled client embeds a blocking
+    /// runtime handle, so its calls must not run on a `#[tokio::test]` worker
+    /// thread. The servers run on a separate local runtime instead.
+    #[test]
+    fn cached_connections_share_one_finite_budget_and_cannot_double_the_cap() {
+        let server_rt = tokio::runtime::Runtime::new().expect("server runtime");
+        let (callback, _seen) = echo_callback();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let base = small_base(64 * 1024, 4);
+        let server_a = server_rt.block_on(start_echo_server(
+            "budget_two_a",
+            server_config(base.clone(), 1024),
+            Arc::clone(&callback),
+        ));
+        let server_b = server_rt.block_on(start_echo_server(
+            "budget_two_b",
+            server_config(base.clone(), 1024),
+            callback,
+        ));
+
+        let mut cfg = client_config(base, 1024);
+        cfg.base.shm_backing_budget_bytes = measured_one_segment_charge(&cfg);
+        cfg.base.file_backing_budget_bytes = 0;
+
+        let cache = Arc::new(ClientPool::new(Duration::from_secs(30)));
+        let client_a = cache.acquire(server_a.ipc_address(), Some(&cfg)).unwrap();
+        let client_b = cache.acquire(server_b.ipc_address(), Some(&cfg)).unwrap();
+        let pool_a = client_a.request_pool().unwrap();
+        let pool_b = client_b.request_pool().unwrap();
+        assert_eq!(
+            pool_a.lock().budget().unwrap().snapshot(),
+            pool_b.lock().budget().unwrap().snapshot(),
+            "both cached connections must charge the cache's one domain context"
+        );
+        assert_eq!(pool_a.lock().segment_count(), 0);
+        assert_eq!(pool_b.lock().segment_count(), 0);
+
+        // Connection A consumes the one-segment cap with a real allocation.
+        let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 241) as u8).collect();
+        assert_eq!(
+            sync_echo_roundtrip(&client_a, "budget_two_a", &payload),
+            payload
+        );
+        assert_eq!(pool_a.lock().segment_count(), 1);
+        let after_a = pool_a.lock().budget().unwrap().snapshot();
+        assert!(after_a.shm.used_bytes > 0);
+
+        // Connection B cannot map a second segment under the same cap. Its
+        // buddy attempt is rejected, the call succeeds through the checked
+        // chunked fallback, and no additional shm backing is admitted.
+        assert_eq!(
+            sync_echo_roundtrip(&client_b, "budget_two_b", &payload),
+            payload
+        );
+        assert_eq!(
+            pool_b.lock().segment_count(),
+            0,
+            "a second connection must not map backing beyond the shared cap"
+        );
+        let after_b = pool_b.lock().budget().unwrap().snapshot();
+        assert_eq!(
+            after_b.shm.used_bytes, after_a.shm.used_bytes,
+            "two connections must not double the shared cap"
+        );
+        assert!(
+            after_b.shm.rejected_allocations > after_a.shm.rejected_allocations,
+            "the denied second connection must be accounted as a rejected reservation"
+        );
+        assert!(
+            after_b.shm.used_bytes <= cfg.base.shm_backing_budget_bytes,
+            "shared usage must never exceed the configured cap"
+        );
+        assert_eq!(
+            cache.memory_budget_snapshot().unwrap().budget,
+            after_b,
+            "the cache snapshot must report the same accounting"
+        );
+
+        cache.close_all(Duration::from_secs(5));
+        server_rt.block_on(stop_server(&server_a));
+        server_rt.block_on(stop_server(&server_b));
+    }
+
+    /// An injected owner pool whose budget limits diverge from the config is
+    /// rejected before any connection I/O, and the pool is not mutated.
+    #[tokio::test]
+    async fn injected_pool_with_divergent_budget_is_rejected_before_io() {
+        let cfg = client_config(small_base(64 * 1024, 4), 1024);
+        let injected_budget = c2_mem::MemoryBudget::new(1, 2, 3);
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            cfg.base.primary_pool_config(&cfg.pool_tuning()),
+            "/cc3i00000000000001".to_string(),
+            injected_budget.clone(),
+        )));
+        let mut client = IpcClient::with_pool(
+            "ipc://budget_mismatch_never_connects",
+            Arc::clone(&pool),
+            cfg,
+        );
+        let error = client
+            .connect()
+            .await
+            .expect_err("divergent budget limits must reject before I/O");
+        assert!(matches!(error, IpcError::Pool(_)), "unexpected: {error:?}");
+        assert!(error.to_string().contains("do not match"), "{error}");
+        assert_eq!(
+            injected_budget.snapshot().shm.limit_bytes,
+            1,
+            "rejection must not mutate the injected budget"
+        );
+    }
+
+    /// An injected peer pool carries no owner-creation budget: it is rejected
+    /// instead of silently pairing the client with a freshly invented context.
+    #[tokio::test]
+    async fn injected_peer_pool_without_budget_is_rejected_before_io() {
+        let cfg = client_config(small_base(64 * 1024, 4), 1024);
+        let peer = MemPool::open_peer(
+            c2_mem::config::PoolConfig::default(),
+            "/cc3peer00000000001".to_string(),
+        );
+        let mut client = IpcClient::with_pool(
+            "ipc://peer_pool_without_budget_never_connects",
+            Arc::new(Mutex::new(peer)),
+            cfg,
+        );
+        let error = client
+            .connect()
+            .await
+            .expect_err("a peer pool without an owner budget must reject");
+        assert!(matches!(error, IpcError::Pool(_)), "unexpected: {error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("no owner-creation memory budget"),
+            "{error}"
+        );
+    }
+
+    /// Zero SHM budget still serves inline replies, and chunk/file reassembly
+    /// remains available when the file cell admits it.
+    #[tokio::test]
+    async fn zero_shm_budget_still_serves_inline_and_file_chunk_reassembly() {
+        let (callback, _seen) = echo_callback();
+        let base = small_base(64 * 1024, 4);
+        let mut server_cfg = server_config(base.clone(), 1024);
+        server_cfg.base.shm_backing_budget_bytes = 0;
+        server_cfg.base.file_backing_budget_bytes = 0;
+        server_cfg.base.chunk_size = 8 * 1024;
+        let server = start_echo_server("budget_zero_shm", server_cfg, callback).await;
+
+        let mut cfg = client_config(base, 1024);
+        cfg.base.shm_backing_budget_bytes = 0;
+        cfg.base.file_backing_budget_bytes = 2 * 1024 * 1024 * 1024;
+        let mut client = IpcClient::with_config(server.ipc_address(), cfg);
+        client.connect().await.unwrap();
+        let client = Arc::new(client);
+
+        // Inline path: no owner backing is needed at all.
+        let response = echo_roundtrip(&client, "budget_zero_shm", b"inline").await;
+        assert_eq!(response_bytes(&client, response), b"inline");
+
+        // Chunked path: buddy/dedicated are denied by the zero shm budget, so
+        // reassembly must spill to the admitted file tier. Keep the exact
+        // carrier across a confirmed close while the client Arc remains live.
+        let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 239) as u8).collect();
+        let response = echo_roundtrip(&client, "budget_zero_shm", &payload).await;
+        let ResponseData::Handle(backing) = &response else {
+            panic!("expected file-backed chunked response, got {response:?}");
+        };
+        assert!(backing.is_file_spill());
+        let budget = client
+            .require_chunk_registry()
+            .pool()
+            .read()
+            .budget()
+            .unwrap()
+            .clone();
+        let lease = ResponseLease::new(response, Arc::clone(client.server_pool_arc()));
+        assert_eq!(lease.copy_bytes().unwrap(), payload);
+        let held_budget = budget.snapshot();
+        assert_eq!(
+            held_budget.shm.used_bytes, 0,
+            "zero shm budget admits no mapping"
+        );
+        assert!(
+            held_budget.file.used_bytes > 0,
+            "file-backed reassembly must be charged to the file cell"
+        );
+        assert!(held_budget.reassembly.used_bytes > 0);
+
+        assert!(
+            client.close_shared_bounded(Duration::from_secs(5)).await,
+            "the client close must confirm before owner detachment"
+        );
+        assert_eq!(lease.copy_bytes().unwrap(), payload);
+        assert!(budget.snapshot().file.used_bytes > 0);
+        assert!(budget.snapshot().reassembly.used_bytes > 0);
+        drop(lease);
+        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+
+        drop(client);
+        stop_server(&server).await;
+    }
+
+    /// Exhausting the eligible client budgets produces a correlated failure
+    /// for the affected call while ping and a bounded close stay usable.
+    #[tokio::test]
+    async fn exhausted_client_budgets_fail_correlated_while_ping_and_close_stay_usable() {
+        let (callback, _seen) = echo_callback();
+        let base = small_base(64 * 1024, 4);
+        let mut server_cfg = server_config(base.clone(), 1024);
+        server_cfg.base.shm_backing_budget_bytes = 0;
+        server_cfg.base.file_backing_budget_bytes = 0;
+        server_cfg.base.chunk_size = 8 * 1024;
+        let server = start_echo_server("budget_exhausted", server_cfg, callback).await;
+
+        let mut cfg = client_config(base, 1024);
+        cfg.base.pool_enabled = false;
+        cfg.base.shm_backing_budget_bytes = 0;
+        cfg.base.file_backing_budget_bytes = 0;
+        let mut client = IpcClient::with_config(server.ipc_address(), cfg);
+        client.connect().await.unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("budget_exhausted"))
+            .await
+            .unwrap();
+
+        let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 233) as u8).collect();
+        let error = timeout(
+            Duration::from_secs(10),
+            client.call_bound(&binding, "echo", &payload),
+        )
+        .await
+        .expect("an exhausted budget must complete the call, not hang it")
+        .expect_err("chunked reception must fail when no budget cell admits it");
+        let message = error.to_string();
+        assert!(
+            message.contains("budget") && message.contains("rejected"),
+            "failure must carry the budget rejection: {message}"
+        );
+
+        // Control traffic is unaffected by data-budget exhaustion. The probe
+        // runs on a blocking worker: a `#[tokio::test]` runtime is
+        // single-threaded, so blocking its only worker would starve the
+        // server's accept loop this probe needs.
+        let address = server.ipc_address().to_string();
+        let ping_ok =
+            tokio::task::spawn_blocking(move || crate::ping(&address, Duration::from_secs(5)))
+                .await
+                .expect("ping worker must not panic")
+                .expect("ping probe must not fail");
+        assert!(
+            ping_ok,
+            "ping must stay usable after data-budget exhaustion"
+        );
+        assert!(client.close_shared_bounded(Duration::from_secs(5)).await);
+        stop_server(&server).await;
+    }
+
+    /// Independent client caches keep independent domains: they can carry
+    /// distinct limits, and draining one leaves the other's connection
+    /// callable on its own untouched budget.
+    #[test]
+    fn independent_client_caches_keep_distinct_domains_after_one_drains() {
+        let server_rt = tokio::runtime::Runtime::new().expect("server runtime");
+        let (callback_a, _seen_a) = echo_callback();
+        let (callback_b, _seen_b) = echo_callback();
+        let base = small_base(64 * 1024, 4);
+        let server_a = server_rt.block_on(start_echo_server(
+            "budget_independent_a",
+            server_config(base.clone(), 1024),
+            callback_a,
+        ));
+        let server_b = server_rt.block_on(start_echo_server(
+            "budget_independent_b",
+            server_config(base.clone(), 1024),
+            callback_b,
+        ));
+
+        let mut cfg_a = client_config(base.clone(), 1024);
+        cfg_a.base.shm_backing_budget_bytes = 1_234_567;
+        let cfg_b = client_config(base, 1024);
+        let default_shm = c2_config::BaseIpcConfig::default().shm_backing_budget_bytes;
+
+        let cache_a = Arc::new(ClientPool::new(Duration::from_secs(30)));
+        let cache_b = Arc::new(ClientPool::new(Duration::from_secs(30)));
+        let client_a = cache_a
+            .acquire(server_a.ipc_address(), Some(&cfg_a))
+            .unwrap();
+        let client_b = cache_b
+            .acquire(server_b.ipc_address(), Some(&cfg_b))
+            .unwrap();
+        assert_eq!(
+            cache_a
+                .memory_budget_snapshot()
+                .unwrap()
+                .limits
+                .shm_backing_budget_bytes,
+            1_234_567
+        );
+        assert_eq!(
+            cache_b
+                .memory_budget_snapshot()
+                .unwrap()
+                .limits
+                .shm_backing_budget_bytes,
+            default_shm
+        );
+
+        let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 223) as u8).collect();
+        assert_eq!(
+            sync_echo_roundtrip(&client_a, "budget_independent_a", &payload),
+            payload
+        );
+        assert_eq!(
+            sync_echo_roundtrip(&client_b, "budget_independent_b", &payload),
+            payload
+        );
+
+        // Draining cache A must not reset or close cache B's domain.
+        assert!(
+            cache_a
+                .close_all(Duration::from_secs(5))
+                .unconfirmed
+                .is_empty()
+        );
+        assert_eq!(
+            sync_echo_roundtrip(&client_b, "budget_independent_b", &payload),
+            payload
+        );
+        assert_eq!(
+            cache_b
+                .memory_budget_snapshot()
+                .unwrap()
+                .limits
+                .shm_backing_budget_bytes,
+            default_shm
+        );
+
+        drop(client_a);
+        drop(client_b);
+        server_rt.block_on(stop_server(&server_a));
+        server_rt.block_on(stop_server(&server_b));
+    }
+
+    /// A chunked reply retained by a response lease keeps its reassembly
+    /// charge visible across a cache drain — shutdown must never reset usage —
+    /// and the charge returns once every owner of the backing is gone.
+    /// This is a synchronous test for the same runtime-handle reason as
+    /// [`cached_connections_share_one_finite_budget_and_cannot_double_the_cap`].
+    #[test]
+    fn held_chunked_charge_survives_cache_drain_and_returns_after_release() {
+        let server_rt = tokio::runtime::Runtime::new().expect("server runtime");
+        let (callback, _seen) = echo_callback();
+        let base = small_base(64 * 1024, 4);
+        let mut server_cfg = server_config(base.clone(), 1024);
+        server_cfg.base.shm_backing_budget_bytes = 0;
+        server_cfg.base.file_backing_budget_bytes = 0;
+        server_cfg.base.chunk_size = 8 * 1024;
+        let server = server_rt.block_on(start_echo_server(
+            "budget_held_charge",
+            server_cfg,
+            callback,
+        ));
+
+        let cfg = client_config(base, 1024);
+        let cache = Arc::new(ClientPool::new(Duration::from_secs(30)));
+        let client = cache.acquire(server.ipc_address(), Some(&cfg)).unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("budget_held_charge"))
+            .unwrap();
+        let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 227) as u8).collect();
+        let response = client
+            .call_bound_phased(&binding, "echo", &payload)
+            .expect("chunked echo call");
+        let lease = client.lease_response(response);
+        let held = cache.memory_budget_snapshot().unwrap().budget;
+        assert!(
+            held.shm.used_bytes > 0,
+            "retained chunked backing must be charged"
+        );
+        assert!(
+            held.reassembly.used_bytes > 0,
+            "the carrier must retain the full reassembly reservation"
+        );
+
+        // Draining the cache closes the connection but must not reset the
+        // held charge or free the retained backing. The idle request pool is
+        // detached by the confirmed close, so the remaining charge is the
+        // reassembly backing retained by the lease.
+        let report = cache.close_all(Duration::from_secs(5));
+        assert!(report.unconfirmed.is_empty(), "{report:?}");
+        assert!(
+            client.request_pool().is_none(),
+            "the idle request pool must be detached by the drain"
+        );
+        assert!(
+            cache
+                .memory_budget_snapshot()
+                .unwrap()
+                .budget
+                .shm
+                .used_bytes
+                > 0,
+            "shutdown must not reset charges retained by held data"
+        );
+        assert!(
+            cache
+                .memory_budget_snapshot()
+                .unwrap()
+                .budget
+                .reassembly
+                .used_bytes
+                > 0,
+            "the held reassembly reservation must survive the drain"
+        );
+        assert_eq!(
+            lease.copy_bytes().unwrap(),
+            payload,
+            "held data must stay valid across the drain"
+        );
+
+        // Releasing the carrier returns both charges while the application
+        // still holds its closed client Arc. The new lazy registry must never
+        // be used to free coordinates from the old backing.
+        drop(lease);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && {
+            let budget = cache.memory_budget_snapshot().unwrap().budget;
+            budget.shm.used_bytes != 0 || budget.reassembly.used_bytes != 0
+        } {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let released = cache.memory_budget_snapshot().unwrap().budget;
+        assert_eq!(released.shm.used_bytes, 0, "old backing must be reclaimed");
+        assert_eq!(
+            released.reassembly.used_bytes, 0,
+            "released carrier must return its full reservation"
+        );
+        drop(binding);
+        drop(client);
+        server_rt.block_on(stop_server(&server));
+    }
+
+    /// A confirmed close detaches idle owner pools so a closed-but-retained
+    /// client stops pinning unused mappings and their charge; a reconnect
+    /// rebuilds fresh incarnations on the same frozen budget.
+    #[tokio::test]
+    async fn confirmed_close_detaches_idle_owner_pools_and_reconnect_rebuilds() {
+        let (callback, _seen) = echo_callback();
+        let base = small_base(64 * 1024, 4);
+        let server = start_echo_server(
+            "budget_detach_reconnect",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+
+        let cfg = client_config(base, 1024);
+        let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
+        let mut client = IpcClient::with_shared_budget(server.ipc_address(), cfg, budget.clone());
+        client.connect().await.unwrap();
+        let first_prefix = client
+            .request_pool()
+            .expect("connected request pool")
+            .lock()
+            .prefix()
+            .to_string();
+        let first_registry = client
+            .chunk_registry_arc()
+            .expect("connected reassembly registry");
+
+        let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 229) as u8).collect();
+        let response = echo_roundtrip(&client, "budget_detach_reconnect", &payload).await;
+        assert_eq!(response_bytes(&client, response), payload);
+        assert!(
+            budget.snapshot().shm.used_bytes > 0,
+            "real request backing must be charged before close"
+        );
+
+        client.close().await;
+        assert!(
+            client.request_pool().is_none(),
+            "a confirmed close must detach the idle request pool"
+        );
+        let fresh_registry = client
+            .chunk_registry_arc()
+            .expect("a fresh lazy registry incarnation remains");
+        assert!(
+            !Arc::ptr_eq(&fresh_registry, &first_registry),
+            "a confirmed close must detach the idle reassembly registry"
+        );
+        assert_eq!(
+            budget.snapshot().shm.used_bytes,
+            0,
+            "detaching an idle pool must return its backing charge"
+        );
+
+        // Reconnect rebuilds fresh pool incarnations on the same budget.
+        client.connect().await.unwrap();
+        let second_pool = client.request_pool().expect("reconnect recreates the pool");
+        assert_ne!(
+            second_pool.lock().prefix(),
+            first_prefix,
+            "reconnect must create a fresh pool incarnation"
+        );
+        assert!(client.chunk_registry_arc().is_some());
+        let response = echo_roundtrip(&client, "budget_detach_reconnect", &payload).await;
+        assert_eq!(response_bytes(&client, response), payload);
+        assert!(budget.snapshot().shm.used_bytes > 0);
+
+        client.close().await;
         stop_server(&server).await;
     }
 }

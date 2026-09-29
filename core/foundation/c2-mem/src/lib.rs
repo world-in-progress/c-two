@@ -22,14 +22,16 @@ pub mod spill;
 pub use alloc::{Allocation, BuddyAllocator, BuddyLayout, SegmentHeader, ShmSpinlock};
 pub use buddy_segment::BuddySegment;
 pub use budget::{
-    BudgetCellSnapshot, BudgetError, BudgetKind, BudgetReservation, BudgetSnapshot, MemoryBudget,
+    BudgetCellSnapshot, BudgetError, BudgetKind, BudgetObserver, BudgetObserverWeak,
+    BudgetReservation, BudgetSnapshot, MemoryBudget,
 };
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
 pub use handle::MemHandle;
 pub use lease::{
-    BufferLeaseGuard, BufferLeaseMeta, BufferLeaseSnapshot, BufferLeaseStats, BufferLeaseTracker,
-    BufferStorage, DirectionLeaseStats, LeaseDirection, LeaseRetention, StorageLeaseStats,
+    BufferLeaseGuard, BufferLeaseMeta, BufferLeaseObserver, BufferLeaseSnapshot, BufferLeaseStats,
+    BufferLeaseTracker, BufferStorage, DirectionLeaseStats, LeaseDirection, LeaseRetention,
+    StorageLeaseStats,
 };
 pub use pool::{FreeResult, MemPool};
 pub use segment::ShmRegion;

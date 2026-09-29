@@ -666,6 +666,15 @@ def test_server_id_rejects_empty_or_path_like_values():
         cc.set_server(server_id='bad\nid')
 
 
+class _FakeRetiredObservation:
+    """Retirement-bundle double for registry test doubles.
+
+    The real observation is an opaque handoff token: its lifetime is decided
+    by real owners inside Rust, so the session interface has no fence to
+    model.
+    """
+
+
 def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(monkeypatch):
     registry = _ProcessRegistry.get()
     settings.relay_anchor_address = 'http://registry-relay.test'
@@ -677,6 +686,17 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
         server_id_override = None
         server_ipc_overrides = None
         client_ipc_overrides = None
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def retire_memory_observation(self):
+            # Test double: the registry moves a retirement bundle between
+            # sessions on shutdown, so the double models the full interface.
+            return _FakeRetiredObservation()
+
+        def adopt_retired_memory_observation(self, observation):  # noqa: ARG002
+            pass
 
         def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             self.relay_anchor_address_override = relay_address
@@ -762,6 +782,15 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
 
     class FakeRuntimeSession:
         client_config_frozen = False
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def retire_memory_observation(self):
+            return _FakeRetiredObservation()
+
+        def adopt_retired_memory_observation(self, observation):  # noqa: ARG002
+            pass
 
         def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             pass

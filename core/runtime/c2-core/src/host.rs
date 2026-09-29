@@ -558,6 +558,31 @@ impl Drop for HostInner {
 }
 
 impl Host {
+    /// Read-only memory statistics for this host and its Runtime.
+    ///
+    /// Composes the Runtime's outgoing client domain with the Core host's
+    /// server direction (response pool, reassembly pool, and response
+    /// prewarm). Observation never connects, maps memory, freezes
+    /// configuration, or resets accounting; charges retained by outstanding
+    /// response or held data stay visible until their backing is released.
+    pub fn memory_stats(&self) -> crate::RuntimeMemoryStats {
+        crate::RuntimeMemoryStats {
+            runtime_outgoing: self.inner.runtime.outgoing_memory_stats(),
+            server: Some(crate::MemoryScopeStats::from_server(
+                self.inner.server.memory_budget_snapshot(),
+            )),
+        }
+    }
+
+    /// Read-only observer of this host's server-direction budget.
+    ///
+    /// The handle shares only the server accounting counters and resolved
+    /// limits, so a stopped host keeps retained response/reassembly charges
+    /// observable without retaining the Server, its pools, or its callbacks.
+    pub fn server_memory_observer(&self) -> c2_mem::BudgetObserver {
+        self.inner.server.memory_budget_observer()
+    }
+
     pub fn register(&self, definition: ServiceDefinition) -> Result<Registration, Error> {
         let route_name = definition.expected.route_name.clone();
         let (route_spec, runtime_spec) = route_specs(&definition)?;
