@@ -4,10 +4,10 @@
 //! a single local connection using request IDs.
 
 use parking_lot::{Mutex as StdMutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use c2_local::{
     AbortHandle, DEFAULT_CONNECT_TIMEOUT, LocalEndpoint, LocalReadHalf, LocalStream, LocalWriteHalf,
@@ -47,7 +47,7 @@ use c2_wire::route_catalog_control::{
 use c2_mem::config::PoolConfig;
 use c2_mem::{MemPool, PoolAllocation};
 
-use crate::response::ResponseData;
+use crate::response::{ResponseData, ResponseLease};
 
 pub use c2_config::ClientIpcConfig;
 
@@ -157,7 +157,565 @@ impl ServerPoolState {
     }
 }
 
+// ── Bounded shared dedicated-retire executor ──────────────────────────────
+
+/// Process-wide upper bound of concurrent retire workers.
+const DEDICATED_RETIRE_THREAD_LIMIT: usize = 2;
+/// Process-wide upper bound of simultaneously retained dedicated backings:
+/// granted permits cover queued plus in-flight jobs, so the queue itself is
+/// bounded by the same number. Saturation rejects new dedicated
+/// publications before any byte is written (a `PreDispatch`-class capacity
+/// error); already-settled backings are never dropped or refunded early.
+const DEDICATED_RETIRE_QUEUE_CAPACITY: usize = 256;
+/// Consecutive idle rounds before a retire worker exits. A worker only exits
+/// while no retention permit is outstanding, so a granted permit always
+/// implies a live worker owns the queue: a settled backing can never be
+/// stranded in a queue whose executor is gone, and a worker-creation failure
+/// can only ever reject an unpublished call.
+const DEDICATED_RETIRE_IDLE_ROUNDS: usize = 5;
+const DEDICATED_RETIRE_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct DedicatedRetireJob {
+    pool: Arc<StdMutex<MemPool>>,
+    alloc: PoolAllocation,
+    /// Retention permit for this backing, returned when it retires.
+    permit: DedicatedRetirePermit,
+}
+
+struct DedicatedRetireState {
+    jobs: VecDeque<DedicatedRetireJob>,
+    /// Granted permits: retained jobs (queued plus in-flight).
+    permits: usize,
+    live_workers: usize,
+    /// Test-only spawn-failure injection.
+    #[cfg(test)]
+    fail_spawn: bool,
+}
+
+struct DedicatedRetireExecutor {
+    state: StdMutex<DedicatedRetireState>,
+    signal: parking_lot::Condvar,
+}
+
+static DEDICATED_RETIRE: OnceLock<DedicatedRetireExecutor> = OnceLock::new();
+
+#[cfg(test)]
+static DEDICATED_RETIRE_CAPACITY_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn dedicated_retire() -> &'static DedicatedRetireExecutor {
+    DEDICATED_RETIRE.get_or_init(|| DedicatedRetireExecutor {
+        state: StdMutex::new(DedicatedRetireState {
+            jobs: VecDeque::new(),
+            permits: 0,
+            live_workers: 0,
+            #[cfg(test)]
+            fail_spawn: false,
+        }),
+        signal: parking_lot::Condvar::new(),
+    })
+}
+
+/// Test-only control over the shared retire executor: spawn-failure
+/// injection, a capacity override, and an ownership-free snapshot of
+/// (queued jobs, granted permits, live workers).
+#[cfg(test)]
+pub(crate) mod dedicated_retire_test_control {
+    use super::{DEDICATED_RETIRE_CAPACITY_OVERRIDE, DedicatedRetirePermit, dedicated_retire};
+
+    /// Exclusive guard for tests that inject executor faults: the shared
+    /// process-wide executor sees one controlled scenario at a time, and no
+    /// production-path test observes the injected faults.
+    pub(crate) fn exclusive_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+        static TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+        TEST_LOCK.write().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Shared guard for tests that exercise the production dedicated-retire
+    /// path: they run in parallel with each other but never inside an
+    /// injected-fault window.
+    pub(crate) fn production_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        static TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+        TEST_LOCK.read().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn set_fail_spawn(fail: bool) {
+        dedicated_retire().state.lock().fail_spawn = fail;
+    }
+
+    pub(crate) fn set_capacity_override(capacity: usize) {
+        DEDICATED_RETIRE_CAPACITY_OVERRIDE.store(capacity, super::Ordering::Release);
+    }
+
+    /// Injected worker-creation failure for the caller's scope.
+    ///
+    /// Dropping the guard restores production behavior, so a failed test can
+    /// never leave the shared executor fault-injected for later tests.
+    pub(crate) struct SpawnFailureGuard {
+        _private: (),
+    }
+
+    impl Drop for SpawnFailureGuard {
+        fn drop(&mut self) {
+            set_fail_spawn(false);
+        }
+    }
+
+    pub(crate) fn fail_worker_spawn() -> SpawnFailureGuard {
+        set_fail_spawn(true);
+        SpawnFailureGuard { _private: () }
+    }
+
+    /// Retention-capacity override for the caller's scope, restored on drop
+    /// for the same reason.
+    pub(crate) struct CapacityOverrideGuard {
+        _private: (),
+    }
+
+    impl Drop for CapacityOverrideGuard {
+        fn drop(&mut self) {
+            set_capacity_override(0);
+        }
+    }
+
+    pub(crate) fn capacity_override(capacity: usize) -> CapacityOverrideGuard {
+        set_capacity_override(capacity);
+        CapacityOverrideGuard { _private: () }
+    }
+
+    pub(crate) fn snapshot() -> (usize, usize, usize) {
+        let state = dedicated_retire().state.lock();
+        (state.jobs.len(), state.permits, state.live_workers)
+    }
+
+    pub(crate) fn reserve_permit() -> (DedicatedRetirePermit, std::sync::Arc<super::AtomicBool>) {
+        let returned = std::sync::Arc::new(super::AtomicBool::new(false));
+        let mut permit = dedicated_retire()
+            .reserve_for_publication()
+            .unwrap_or_else(|_| panic!("test retire permit must be available"));
+        permit.returned = Some(std::sync::Arc::clone(&returned));
+        (permit, returned)
+    }
+
+    pub(crate) fn can_reserve() -> bool {
+        match dedicated_retire().reserve_for_publication() {
+            Ok(permit) => {
+                permit.release();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Why a dedicated request could not reserve a bounded retention slot.
+enum RetireAdmissionError {
+    /// The bounded retention queue is full: every permit holds a backing whose
+    /// peer has not read it yet.
+    Capacity(usize),
+    /// No retire worker could be created to own the queue.
+    Worker,
+}
+
+/// A granted retention slot for one not-yet-published dedicated request.
+///
+/// Acquired before publication so saturation and worker-spawn failure fail the
+/// call while it is still unpublished. The holder either returns the permit
+/// (the backing retired immediately) or moves it into the shared queue with the
+/// retained backing, which becomes the backing's owner until `read_done` or the
+/// pool's crash timeout retires it.
+pub(crate) struct DedicatedRetirePermit {
+    executor: &'static DedicatedRetireExecutor,
+    #[cfg(test)]
+    returned: Option<Arc<AtomicBool>>,
+}
+
+impl DedicatedRetirePermit {
+    /// Return a permit whose backing retired without retention.
+    fn release(self) {
+        self.executor.return_permit();
+        #[cfg(test)]
+        if let Some(returned) = self.returned {
+            returned.store(true, Ordering::Release);
+        }
+    }
+
+    /// Hand the retained backing — and this permit — to the shared queue.
+    fn submit(self, pool: Arc<StdMutex<MemPool>>, alloc: PoolAllocation) {
+        self.executor.submit_job(DedicatedRetireJob {
+            pool,
+            alloc,
+            permit: self,
+        });
+    }
+}
+
+impl DedicatedRetireExecutor {
+    fn capacity(self: &'static Self) -> usize {
+        #[cfg(test)]
+        {
+            let cap = DEDICATED_RETIRE_CAPACITY_OVERRIDE.load(Ordering::Acquire);
+            if cap > 0 {
+                return cap;
+            }
+        }
+        DEDICATED_RETIRE_QUEUE_CAPACITY
+    }
+
+    /// Reserve one bounded retention slot for an unpublished dedicated request.
+    ///
+    /// Capacity check, permit grant, and the worker guarantee happen under one
+    /// executor lock, so a granted permit always implies a live worker: workers
+    /// only exit with zero outstanding permits. Saturation and worker-creation
+    /// failure therefore fail the caller before publication and can never
+    /// affect an already-settled backing.
+    fn reserve_for_publication(
+        self: &'static Self,
+    ) -> Result<DedicatedRetirePermit, RetireAdmissionError> {
+        let mut state = self.state.lock();
+        let capacity = self.capacity();
+        if state.permits >= capacity {
+            return Err(RetireAdmissionError::Capacity(capacity));
+        }
+        self.ensure_workers_locked(&mut state, 1)
+            .map_err(|()| RetireAdmissionError::Worker)?;
+        state.permits += 1;
+        Ok(DedicatedRetirePermit {
+            executor: self,
+            #[cfg(test)]
+            returned: None,
+        })
+    }
+
+    /// Ensure at least `wanted` workers exist (bounded by the thread limit),
+    /// with the executor state lock held.
+    ///
+    /// Fallible: a real thread-creation failure is reported to the caller,
+    /// which only ever rejects unpublished work.
+    fn ensure_workers_locked(
+        self: &'static Self,
+        state: &mut DedicatedRetireState,
+        wanted: usize,
+    ) -> Result<(), ()> {
+        // Test-only hard failure: model "thread creation is unavailable"
+        // regardless of already-live workers so injection is deterministic.
+        #[cfg(test)]
+        if state.fail_spawn {
+            return Err(());
+        }
+        while state.live_workers < wanted.min(DEDICATED_RETIRE_THREAD_LIMIT) {
+            match std::thread::Builder::new()
+                .name("c2-dedicated-retire".into())
+                .spawn(move || dedicated_retire_worker(self))
+            {
+                Ok(_) => state.live_workers += 1,
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue a retained backing and wake its worker.
+    ///
+    /// A job is submitted while its permit is outstanding, and a grant keeps a
+    /// worker alive, so the settle path never depends on creating a thread.
+    /// The best-effort spawn only replaces a worker lost to a panic; on failure
+    /// the job keeps its backing, charge, and permit in the queue.
+    fn submit_job(self: &'static Self, job: DedicatedRetireJob) {
+        {
+            let mut state = self.state.lock();
+            state.jobs.push_back(job);
+        }
+        self.signal.notify_all();
+        let _ = self.ensure_workers_locked(&mut self.state.lock(), 1);
+    }
+
+    /// Return one permit (a retained backing finished retiring).
+    fn return_permit(self: &'static Self) {
+        let mut state = self.state.lock();
+        state.permits = state.permits.saturating_sub(1);
+        drop(state);
+        self.signal.notify_all();
+    }
+}
+
+/// One live retire worker's accounting slot.
+///
+/// The slot returns the worker count on a normal exit and on a panic alike, so
+/// `live_workers` always reflects the set of workers that can still drain the
+/// queue.
+struct RetireWorkerSlot {
+    executor: &'static DedicatedRetireExecutor,
+    counted: bool,
+}
+
+impl RetireWorkerSlot {
+    /// Retire the slot while the caller holds the executor state lock.
+    fn retire_locked(&mut self, state: &mut DedicatedRetireState) {
+        if self.counted {
+            state.live_workers = state.live_workers.saturating_sub(1);
+            self.counted = false;
+        }
+    }
+}
+
+impl Drop for RetireWorkerSlot {
+    fn drop(&mut self) {
+        if self.counted {
+            let mut state = self.executor.state.lock();
+            self.retire_locked(&mut state);
+        }
+    }
+}
+
+fn dedicated_retire_worker(executor: &'static DedicatedRetireExecutor) {
+    let mut slot = RetireWorkerSlot {
+        executor,
+        counted: true,
+    };
+    let mut idle_rounds = 0usize;
+    loop {
+        let job = {
+            let mut state = executor.state.lock();
+            loop {
+                if let Some(job) = state.jobs.pop_front() {
+                    idle_rounds = 0;
+                    break job;
+                }
+                // Only exit while no permit is outstanding: every retained
+                // backing is then owned by a queue this worker still drains.
+                if idle_rounds >= DEDICATED_RETIRE_IDLE_ROUNDS && state.permits == 0 {
+                    slot.retire_locked(&mut state);
+                    return;
+                }
+                let timeout = executor
+                    .signal
+                    .wait_for(&mut state, DEDICATED_RETIRE_IDLE_POLL);
+                if timeout.timed_out() {
+                    idle_rounds += 1;
+                }
+            }
+        };
+        dedicated_retire_backing(job);
+    }
+}
+
+/// Retain one freed dedicated backing until it provably retires.
+///
+/// The job owns the pool reference and its retention permit, so the mapping,
+/// its budget charge, and the permit stay live while the job is queued or in
+/// flight. Retirement happens through the peer's cross-process `read_done` or
+/// the pool's configured crash timeout, whichever comes first. The wall-clock
+/// bound therefore exceeds the crash timeout by at most polling slack; a
+/// lock-starved tick can delay observation, but the crash-timeout decision that
+/// makes the backing reclaimable has already been taken.
+fn dedicated_retire_backing(job: DedicatedRetireJob) {
+    let (interval, bound) = {
+        let pool = job.pool.lock();
+        let secs = pool.config().dedicated_crash_timeout_secs;
+        let secs = if secs.is_finite() && secs >= 0.0 {
+            secs
+        } else {
+            60.0
+        };
+        let interval = (secs / 20.0).clamp(0.005, 0.2);
+        (
+            std::time::Duration::from_secs_f64(interval),
+            std::time::Duration::from_secs_f64(secs + interval * 3.0 + 1.0),
+        )
+    };
+    let start = std::time::Instant::now();
+    loop {
+        std::thread::sleep(interval);
+        let retired = {
+            let mut pool = job.pool.lock();
+            pool.gc_dedicated();
+            !pool.dedicated_awaiting_retirement(&job.alloc)
+        };
+        if retired || start.elapsed() >= bound {
+            // Retired, or the configured crash-timeout policy has already made
+            // the backing reclaimable. Dropping the job releases the pool
+            // reference and its permit; the pool's next GC unmaps the entry.
+            job.permit.release();
+            return;
+        }
+    }
+}
+
 // ── Request preallocation token ──────────────────────────────────────────
+
+/// Exact-once release authority for one client request allocation, shared
+/// between the owning [`RequestBlock`] and the pending-response entry once
+/// the frame carrying the allocation's pointer may have begun reaching the
+/// peer.
+///
+/// Sharing is what makes cancellation exact-once: after dispatch the caller
+/// may disappear at any await point, while the receive loop or a connection
+/// close drain observes the terminal outcome later. Every observer resolves
+/// through this one state object, so the allocation is released exactly once
+/// regardless of who acts first.
+///
+/// The phase is one atomic state — `Armed → Dispatched` at the writer seam
+/// (before the first frame byte may be written) or `Armed/Dispatched →
+/// Released` from any observer — so release and dispatch are linearizable:
+/// a released block can never be dispatched and a dispatched block can never
+/// be dispatched twice, no matter how the public surface interleaves.
+pub(crate) struct RequestReleaseState {
+    pool: Arc<StdMutex<MemPool>>,
+    alloc: PoolAllocation,
+    phase: AtomicU8,
+    /// Retention slot granted before the dedicated block was published (or
+    /// `None` for buddy blocks and unpublished states). Consumed by the
+    /// dispatched-dedicated settle; returned if publication is rejected.
+    permit: StdMutex<Option<DedicatedRetirePermit>>,
+    #[cfg(test)]
+    dispatch_seam: StdMutex<Option<DispatchPermitSeam>>,
+}
+
+/// Park after the dispatch CAS while the permit lock still excludes release.
+/// Tests use this to force the formerly unprotected handoff interleaving.
+#[cfg(test)]
+pub(crate) struct DispatchPermitSeam {
+    pub entered: std::sync::mpsc::Sender<()>,
+    pub resume: std::sync::mpsc::Receiver<()>,
+}
+
+impl RequestReleaseState {
+    const PHASE_ARMED: u8 = 0;
+    const PHASE_DISPATCHED: u8 = 1;
+    const PHASE_RELEASED: u8 = 2;
+
+    /// Transition `Armed → Dispatched`.
+    ///
+    /// Fails cleanly when the block was already released (its coordinates
+    /// were freed and must never be written to the peer) or is already
+    /// dispatched (one block carries at most one in-flight frame). The
+    /// caller must treat the error as pre-write: nothing was published.
+    fn try_dispatch(&self, permit: Option<DedicatedRetirePermit>) -> Result<(), IpcError> {
+        let mut slot = self.permit.lock();
+        if self.alloc.is_dedicated != permit.is_some() {
+            if let Some(permit) = permit {
+                drop(slot);
+                permit.release();
+            }
+            return Err(IpcError::Pool(
+                "dedicated dispatch requires exactly one retire permit".into(),
+            ));
+        }
+        let result = self
+            .phase
+            .compare_exchange(
+                Self::PHASE_ARMED,
+                Self::PHASE_DISPATCHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|current| {
+                IpcError::Pool(if current == Self::PHASE_RELEASED {
+                    "request block was already released; its coordinates must not be sent".into()
+                } else {
+                    "request block is already dispatched; one block carries at most one in-flight \
+                     frame"
+                        .into()
+                })
+            });
+        if result.is_ok() {
+            #[cfg(test)]
+            if let Some(seam) = self.dispatch_seam.lock().take() {
+                let _ = seam.entered.send(());
+                let _ = seam.resume.recv();
+            }
+            // Release also takes this lock before changing phase. No observer
+            // can see Dispatched and settle the backing without this permit.
+            *slot = permit;
+        } else if let Some(permit) = permit {
+            drop(slot);
+            permit.release();
+        }
+        result.map(|_| ())
+    }
+
+    /// Resolve ownership of the allocation exactly once.
+    ///
+    /// Exactly one observer wins the transition into `Released` and performs
+    /// the matching physical cleanup:
+    ///
+    /// - from `Armed` the allocation is purely local — no frame byte was
+    ///   written, so the peer can never have observed the pointer — and it
+    ///   is freed through its exact owning pool;
+    /// - from `Dispatched` a partial write is not proof of no dispatch: a
+    ///   buddy block is left to the server's cross-process free (a local
+    ///   free could double-free the shared allocator), while a dedicated
+    ///   block is settled by marking `freed_at` and then bounded-retired
+    ///   through the bounded retire executor: the mapping and its charge stay
+    ///   alive until the peer's cross-process `read_done` retires it (or the
+    ///   pool's configured crash timeout does), after which the backing
+    ///   charge returns.
+    fn release_once(&self) -> Result<(), IpcError> {
+        let mut permit_slot = self.permit.lock();
+        let observed = loop {
+            match self.phase.load(Ordering::Acquire) {
+                phase @ (Self::PHASE_ARMED | Self::PHASE_DISPATCHED) => {
+                    match self.phase.compare_exchange(
+                        phase,
+                        Self::PHASE_RELEASED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break phase,
+                        Err(_) => continue,
+                    }
+                }
+                _ => return Ok(()),
+            }
+        };
+        if observed == Self::PHASE_DISPATCHED && !self.alloc.is_dedicated {
+            return Ok(());
+        }
+        let mut pool = self.pool.lock();
+        pool.free(&self.alloc)
+            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
+        let mut permit = permit_slot.take();
+        drop(permit_slot);
+        if observed == Self::PHASE_DISPATCHED {
+            // Dispatched dedicated: retire now when the peer already
+            // signalled read_done (the response path); otherwise hand the
+            // backing — and its pre-granted permit — to the shared bounded
+            // retire queue, which owns the mapping and charge until
+            // read_done or the crash timeout retires it.
+            pool.gc_dedicated();
+            let awaiting = pool.dedicated_awaiting_retirement(&self.alloc);
+            drop(pool);
+            if awaiting {
+                permit
+                    .take()
+                    .expect("dispatched dedicated request has a retire permit")
+                    .submit(Arc::clone(&self.pool), self.alloc);
+            } else if let Some(permit) = permit.take() {
+                permit.release();
+            }
+        } else {
+            drop(pool);
+            if let Some(permit) = permit.take() {
+                // Unpublished release: the retention slot was never needed.
+                permit.release();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RequestReleaseState {
+    fn drop(&mut self) {
+        // Backstop: the last shared owner still resolves dedicated ownership
+        // (a no-op for dispatched buddy blocks and already-released blocks).
+        let _ = self.release_once();
+        // And any retention slot that no settle path consumed is returned.
+        if let Some(permit) = self.permit.lock().take() {
+            permit.release();
+        }
+    }
+}
 
 /// One request allocation bound to the exact pool that issued its coordinates.
 ///
@@ -170,47 +728,62 @@ impl ServerPoolState {
 /// can therefore never leak or free an unrelated allocation in a replacement
 /// pool that happens to have a matching segment index and generation.
 ///
-/// The token deliberately has no `Drop` release: buddy allocations are freed
-/// cross-process by the receiving server, and releasing the client's local
-/// view again would corrupt the allocator. Call [`RequestBlock::release`]
-/// exactly on the client-side release paths (size rejection, send failure,
-/// data-pointer failure, fill failure, and the dedicated-segment response
-/// path). It is deliberately not `Clone`: one charge has exactly one release
-/// authority.
+/// The token is an RAII release guard. While it is armed — before the frame
+/// write begins — dropping it frees the allocation through the owning pool,
+/// so cancelling the call while the body stream stalls or while the writer
+/// lock is unavailable, or panicking between allocation and dispatch (for
+/// example in a fill callback), cannot leak the charge or its shared-domain
+/// budget. Callers that observe a concrete error still call
+/// [`RequestBlock::release`], which is idempotent with `Drop`. Once
+/// [`RequestBlock::try_dispatch`] flips the phase at the writer seam, the
+/// transition is one linearizable state: a released block can never be
+/// dispatched and a dispatched block can never carry a second frame, and a
+/// dispatched buddy block is never freed locally, because the server owns
+/// its cross-process free. It is deliberately not `Clone`: one charge has
+/// exactly one release authority, shared only through
+/// [`RequestReleaseState`].
 pub struct RequestBlock {
-    pool: Arc<StdMutex<MemPool>>,
-    alloc: PoolAllocation,
+    release: Arc<RequestReleaseState>,
 }
 
 impl std::fmt::Debug for RequestBlock {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RequestBlock")
-            .field("allocation", &self.alloc)
+            .field("allocation", &self.release.alloc)
             .finish_non_exhaustive()
     }
 }
 
 impl RequestBlock {
     pub(crate) fn new(pool: Arc<StdMutex<MemPool>>, alloc: PoolAllocation) -> Self {
-        Self { pool, alloc }
+        Self {
+            release: Arc::new(RequestReleaseState {
+                pool,
+                alloc,
+                phase: AtomicU8::new(RequestReleaseState::PHASE_ARMED),
+                permit: StdMutex::new(None),
+                #[cfg(test)]
+                dispatch_seam: StdMutex::new(None),
+            }),
+        }
     }
 
     /// The allocation coordinates written to the wire.
     pub fn allocation(&self) -> &PoolAllocation {
-        &self.alloc
+        &self.release.alloc
     }
 
     /// Whether the allocation lives in a dedicated (non-buddy) segment.
     pub fn is_dedicated(&self) -> bool {
-        self.alloc.is_dedicated
+        self.release.alloc.is_dedicated
     }
 
     /// Copy `data` into the block at `offset` through the owning pool.
     pub(crate) fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), IpcError> {
-        let pool = self.pool.lock();
+        let pool = self.release.pool.lock();
         let ptr = pool
-            .data_ptr(&self.alloc)
+            .data_ptr(&self.release.alloc)
             .map_err(|error| IpcError::Shm(format!("buddy data_ptr failed: {error}")))?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
@@ -218,14 +791,45 @@ impl RequestBlock {
         Ok(())
     }
 
-    /// Release the allocation in the pool that owns it.
+    /// Release the allocation in the pool that owns it, exactly once.
     ///
-    /// Returns the pool's error for diagnostics; error-path callers may ignore
-    /// it because ownership is carried by this token, not by the client slot.
+    /// Idempotent with `Drop` and with terminal observers of the shared
+    /// release state. Before dispatch this frees the block through its exact
+    /// owner; after dispatch it settles dedicated owner release and never
+    /// frees a buddy block the peer may own. Returns the pool's error for
+    /// diagnostics; error-path callers may ignore it because ownership is
+    /// carried by this token, not by the client slot.
     pub fn release(&self) -> Result<(), IpcError> {
-        let mut pool = self.pool.lock();
-        pool.free(&self.alloc)
-            .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))
+        self.release.release_once()
+    }
+
+    /// Transition the token to the dispatched phase and share the release
+    /// authority with the pending-response entry.
+    ///
+    /// Must be called only while the writer lock is held, immediately before
+    /// the frame write begins, with no await in between: from this point the
+    /// peer may observe the allocation pointer (a partial or failed write is
+    /// not proof of no dispatch), so caller-side cancellation must never free
+    /// the buddy block locally. Fails cleanly when the block was already
+    /// released or is already dispatched, before any byte is written; the
+    /// caller must treat that as a not-sent failure.
+    pub(crate) fn try_dispatch(
+        &self,
+        permit: Option<DedicatedRetirePermit>,
+    ) -> Result<Arc<RequestReleaseState>, IpcError> {
+        self.release.try_dispatch(permit)?;
+        Ok(Arc::clone(&self.release))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dispatch_seam_for_test(&self, seam: DispatchPermitSeam) {
+        *self.release.dispatch_seam.lock() = Some(seam);
+    }
+}
+
+impl Drop for RequestBlock {
+    fn drop(&mut self) {
+        let _ = self.release.release_once();
     }
 }
 
@@ -665,11 +1269,128 @@ impl MethodTable {
 
 // ── Pending call ─────────────────────────────────────────────────────────
 
-pub(crate) enum PendingResponse {
-    Unary(oneshot::Sender<Result<ResponseData, IpcError>>),
+/// One in-flight unary call.
+pub(crate) struct PendingResponse {
+    tx: oneshot::Sender<Result<ResponseData, IpcError>>,
+    /// Exact-once release authority for a dispatched buddy/dedicated request
+    /// allocation this call carries, attached when the frame write begins.
+    /// Terminal observers (the receive loop and a connection-close drain)
+    /// resolve it through [`RequestReleaseState::release_once`] when the
+    /// caller is gone, so a cancelled-after-dispatch call cannot strand a
+    /// dedicated owner release.
+    request: Option<Arc<RequestReleaseState>>,
+}
+
+impl PendingResponse {
+    pub(crate) fn unary(tx: oneshot::Sender<Result<ResponseData, IpcError>>) -> Self {
+        Self { tx, request: None }
+    }
 }
 
 pub(crate) type PendingMap = HashMap<u32, PendingResponse>;
+
+/// Per-call send-cancellation guard.
+///
+/// A caller future can be dropped at any await point between pending-map
+/// insertion and a terminal branch. `Drop` closes every gap:
+///
+/// - nothing publishable (the write never began): remove this call's pending
+///   entry immediately so the connection carries no per-call residue;
+/// - the write began but did not complete: poison the stream by aborting it
+///   (idempotent with the local-stream write guard). The pending entry keeps
+///   its attached release authority, so the EOF/close drain still settles
+///   the request allocation exactly once;
+/// - the send completed but the reply is still pending: remove this call's
+///   waiter now and settle its request allocation (the same per-entry
+///   resolution a drain performs), so repeated cancellations against a
+///   slow server cannot accumulate pending entries or strand dedicated
+///   owner releases. The connection stays healthy, and a late reply for
+///   the removed entry is released by the receive loop instead of leaking
+///   its response backing.
+struct SendGuard {
+    pending: Arc<StdMutex<PendingMap>>,
+    abort: Arc<StdMutex<Option<AbortHandle>>>,
+    rid: u32,
+    /// Set once a terminal branch owns cleanup; `Drop` does nothing.
+    disarmed: bool,
+    /// Set once the frame write completed and the call waits for a reply.
+    sent: bool,
+    /// Set immediately before this call's first frame byte may be written;
+    /// shared with multi-write senders so interleaved chunk writes count.
+    write_started: Arc<AtomicBool>,
+}
+
+impl SendGuard {
+    fn new(
+        pending: Arc<StdMutex<PendingMap>>,
+        abort: Arc<StdMutex<Option<AbortHandle>>>,
+        rid: u32,
+    ) -> Self {
+        Self {
+            pending,
+            abort,
+            rid,
+            disarmed: false,
+            sent: false,
+            write_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A terminal branch owns cleanup from here on.
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+
+    /// The frame write completed; the call now waits for its reply.
+    fn mark_send_completed(&mut self) {
+        self.sent = true;
+    }
+
+    /// Mark that this call's first frame byte may now be written.
+    fn mark_write_started(&self) {
+        self.write_started.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if self.sent {
+            // Cancelled while waiting for a delayed reply on an otherwise
+            // healthy connection: resolve this entry exactly like a drain.
+            if let Some(entry) = self.pending.lock().remove(&self.rid) {
+                if let Some(request) = entry.request {
+                    let _ = request.release_once();
+                }
+            }
+            return;
+        }
+        if !self.write_started.load(Ordering::Acquire) {
+            self.pending.lock().remove(&self.rid);
+            return;
+        }
+        if let Some(abort) = self.abort.lock().as_ref() {
+            abort.abort();
+        }
+    }
+}
+
+/// Test-only seam that splits one prealloc frame write into a real partial
+/// prefix plus a parked continuation, so tests can prove that cancelling
+/// after bytes actually landed poisons the stream instead of leaving a frame
+/// prefix a later writer would append to. Production never installs it.
+#[cfg(test)]
+pub(crate) struct FrameWriteSeam {
+    /// Bytes of the frame to write for real before parking mid-frame.
+    pub prefix_bytes: usize,
+    /// Completed once the prefix bytes were written to the real stream.
+    pub prefix_written: tokio::sync::oneshot::Sender<()>,
+    /// The write parks until this resolves; dropping the caller future
+    /// cancels the park exactly like a stalled write would be.
+    pub release: tokio::sync::oneshot::Receiver<()>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestTransportKind {
@@ -860,6 +1581,11 @@ pub struct IpcClient {
     /// the selection/allocation window; production never installs a hook.
     #[cfg(test)]
     prealloc_selection_hook: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// One-shot seam that splits the next prealloc frame write into a real
+    /// partial prefix plus a parked continuation. Test-only: production
+    /// never installs it, so real builds always write whole frames.
+    #[cfg(test)]
+    frame_write_seam: StdMutex<Option<FrameWriteSeam>>,
 }
 
 /// Handle for the per-connection client maintenance task. Constructing,
@@ -949,6 +1675,8 @@ impl IpcClient {
             maintenance_ticks: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             prealloc_selection_hook: StdMutex::new(None),
+            #[cfg(test)]
+            frame_write_seam: StdMutex::new(None),
         }
     }
 
@@ -1596,7 +2324,7 @@ impl IpcClient {
         let rid = rid_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
-            pending.lock().insert(rid, PendingResponse::Unary(tx));
+            pending.lock().insert(rid, PendingResponse::unary(tx));
         }
 
         let frame = frame::encode_frame(rid as u64, flags::FLAG_CTRL, &payload);
@@ -1850,7 +2578,7 @@ impl IpcClient {
     }
 
     /// Inline call path — sends call control + data in a single frame.
-    async fn call_inline(
+    pub(crate) async fn call_inline(
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
@@ -1861,7 +2589,7 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
+            self.pending.lock().insert(rid, PendingResponse::unary(tx));
         }
 
         // Build and send the frame.
@@ -1870,10 +2598,15 @@ impl IpcClient {
         let total_len = (12 + payload_len) as u32;
         let frame_size = frame::HEADER_SIZE + payload_len;
 
+        let mut send_guard =
+            SendGuard::new(Arc::clone(&self.pending), Arc::clone(&self.abort), rid);
+        let write_started = Arc::clone(&send_guard.write_started);
+
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
 
+            write_started.store(true, Ordering::Release);
             if frame_size <= 1024 {
                 // Stack-allocate the entire frame (zero heap, single syscall).
                 let mut buf = [0u8; 1024];
@@ -1891,6 +2624,8 @@ impl IpcClient {
                 writer.write_all(&buf[..frame_size]).await?;
             } else {
                 // Large payload: header+ctrl on stack, data separate write.
+                // Cancellation between these writes would strand a partial
+                // frame; the send guard poisons the stream in that case.
                 let mut hdr_buf = [0u8; frame::HEADER_SIZE];
                 hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
                 hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
@@ -1905,9 +2640,11 @@ impl IpcClient {
         .await;
 
         if let Err(e) = send_result {
+            send_guard.disarm();
             self.pending.lock().remove(&rid);
             return Err(e);
         }
+        send_guard.mark_send_completed();
 
         // Await response.
         match rx.await {
@@ -1918,7 +2655,10 @@ impl IpcClient {
 
     /// Buddy SHM call path — allocates from MemPool and sends buddy frame.
     ///
-    /// The server reads data from SHM and frees the allocation.
+    /// The server reads data from SHM and frees the allocation. The
+    /// allocation is owned by a [`RequestBlock`] from construction, so every
+    /// release path — including cancellation between allocation and dispatch
+    /// — goes through the same exact-once authority as the prealloc paths.
     async fn call_buddy(
         &self,
         identity: &RouteCallIdentity,
@@ -1935,102 +2675,35 @@ impl IpcClient {
         // The selector observed a pool, but a confirmed close may have
         // detached it before this selection. That is a clean SHM-path
         // failure, not a panic: report it so the caller can fall back to the
-        // non-buddy policy. From here on the local pool Arc is the release
-        // authority for this allocation.
+        // non-buddy policy. From here on the block's release authority covers
+        // this allocation.
         let Some(pool_arc) = self.request_pool() else {
             return Err(IpcError::Shm(
                 "client request pool was detached by a concurrent close".into(),
             ));
         };
 
-        // Allocate and write data to SHM.
-        let alloc = {
+        // Allocate, then bind the allocation to its exact owner before any
+        // data write so cancellation or an error can never strand it.
+        let block = {
             let mut pool = pool_arc.lock();
-            pool.alloc(data.len())
-                .map_err(|e| IpcError::Shm(format!("buddy alloc failed: {e}")))?
+            let alloc = pool
+                .alloc(data.len())
+                .map_err(|e| IpcError::Shm(format!("buddy alloc failed: {e}")))?;
+            RequestBlock::new(Arc::clone(&pool_arc), alloc)
         };
+        // Write data into the SHM region; a failure drops the block, which
+        // releases through the owning pool while it is still armed.
+        block.write_at(0, data)?;
 
-        // Write data into the SHM region.
-        {
-            let pool = pool_arc.lock();
-            let ptr = match pool.data_ptr(&alloc) {
-                Ok(p) => p,
-                Err(e) => {
-                    drop(pool);
-                    let _ = pool_arc.lock().free(&alloc);
-                    return Err(IpcError::Shm(format!("buddy data_ptr failed: {e}")));
-                }
-            };
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-            }
-        }
-
-        // Build buddy payload.
-        let bp = BuddyPayload {
-            seg_idx: alloc.seg_idx as u16,
-            generation: alloc.generation,
-            offset: alloc.offset,
-            data_size: data.len() as u32,
-            is_dedicated: alloc.is_dedicated,
-        };
-        let buddy_bytes = encode_buddy_payload(&bp);
-
-        // Build call control.
-        let ctrl = encode_call_control(identity, method_idx)?;
-
-        // Assemble frame payload: [11B buddy][call_control]
-        let payload_len = buddy_bytes.len() + ctrl.len();
-        let mut payload = Vec::with_capacity(payload_len);
-        payload.extend_from_slice(&buddy_bytes);
-        payload.extend_from_slice(&ctrl);
-
-        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
-
-        // Register pending call.
-        let (tx, rx) = oneshot::channel();
-        {
-            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
-        }
-
-        // Send frame — free buddy allocation if send fails.
-        let frame_flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
-        let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
-        {
-            let mut writer_guard = self.writer.lock().await;
-            let writer = match writer_guard.as_mut() {
-                Some(w) => w,
-                None => {
-                    let _ = pool_arc.lock().free(&alloc);
-                    self.pending.lock().remove(&rid);
-                    return Err(IpcError::Closed);
-                }
-            };
-            if let Err(e) = writer.write_all(&frame_bytes).await {
-                let _ = pool_arc.lock().free(&alloc);
-                self.pending.lock().remove(&rid);
-                return Err(e.into());
-            }
-        }
-
-        // Await response (server frees the buddy allocation after reading).
-        match rx.await {
-            Ok(result) => {
-                // Free dedicated request allocation — server has read the data
-                // and only its local peer pool was freed.  Buddy allocs are
-                // freed by the server via cross-process SHM atomics; freeing
-                // them again here would corrupt the allocator.
-                if alloc.is_dedicated {
-                    let mut pool = pool_arc.lock();
-                    let _ = pool.free(&alloc);
-                }
-                result
-            }
-            Err(_) => Err(IpcError::Closed),
-        }
+        self.call_with_prealloc(identity, method_idx, &block, data.len())
+            .await
     }
 
-    fn try_alloc_request_block(&self, data_size: usize) -> Result<Option<RequestBlock>, IpcError> {
+    pub(crate) fn try_alloc_request_block(
+        &self,
+        data_size: usize,
+    ) -> Result<Option<RequestBlock>, IpcError> {
         if data_size > u32::MAX as usize {
             return Ok(None);
         }
@@ -2064,11 +2737,13 @@ impl IpcClient {
     {
         let mut written = 0usize;
         futures_util::pin_mut!(chunks);
+        // The block is still armed in this loop: no frame byte has been
+        // written, so cancelling the future at any of these await points
+        // drops the block and releases it through the owning pool.
         while let Some(next) = chunks.next().await {
             let chunk = match next {
                 Ok(chunk) => chunk,
                 Err(err) => {
-                    let _ = block.release();
                     return Err(stream_error(err));
                 }
             };
@@ -2077,26 +2752,20 @@ impl IpcClient {
                 continue;
             }
             let Some(next_written) = written.checked_add(data.len()) else {
-                let _ = block.release();
                 return Err(IpcError::Config(
                     "request body size overflow while streaming to SHM".into(),
                 ));
             };
             if next_written > data_size {
-                let _ = block.release();
                 return Err(IpcError::Config(format!(
                     "request body exceeded declared content length {data_size}"
                 )));
             }
-            if let Err(err) = block.write_at(written, data) {
-                let _ = block.release();
-                return Err(err);
-            }
+            block.write_at(written, data)?;
             written = next_written;
         }
 
         if written != data_size {
-            let _ = block.release();
             return Err(IpcError::Config(format!(
                 "request body ended at {written} bytes, expected {data_size}"
             )));
@@ -2113,6 +2782,18 @@ impl IpcClient {
     /// already did that through a [`RequestBlock`]. Every release path uses
     /// that token's owner, so a concurrent close/reconnect cannot redirect a
     /// free into a replacement pool.
+    ///
+    /// Dispatch ownership is explicit: the block is armed until the writer
+    /// lock is held, and [`RequestBlock::try_dispatch`] flips it
+    /// immediately before `write_all` begins (with no await in between).
+    /// Before that seam every failure and cancellation frees the allocation
+    /// through its owning pool. After it, a buddy block belongs to the
+    /// server's cross-process free and is never freed locally — a partial or
+    /// failed write is not proof of no dispatch — while a dedicated block is
+    /// settled locally behind the peer-visible `read_done` protocol. The
+    /// pending entry carries the shared release authority so the receive
+    /// loop and a confirmed-close drain resolve ownership when the caller is
+    /// gone.
     pub(crate) async fn call_with_prealloc(
         &self,
         identity: &RouteCallIdentity,
@@ -2158,39 +2839,111 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
+            self.pending.lock().insert(rid, PendingResponse::unary(tx));
         }
 
-        // Send buddy frame.
         let flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
         let frame = frame::encode_frame(rid as u64, flags, &payload);
+
+        // Per-call cancellation guard: a caller dropped before a terminal
+        // branch either removes this call's pending entry (nothing was
+        // publishable) or poisons the stream (the write began but did not
+        // complete), leaving the entry for the EOF/close drain to settle.
+        let mut send_guard =
+            SendGuard::new(Arc::clone(&self.pending), Arc::clone(&self.abort), rid);
+        let write_started = Arc::clone(&send_guard.write_started);
 
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+            // Before publication, a dedicated block must hold a bounded
+            // retention slot. Saturation (or an unavailable retire worker)
+            // fails the call while it is still unpublished, so the defined
+            // saturation behavior never drops or prematurely refunds an
+            // existing backing — it rejects new ones.
+            let retire_permit = if block.is_dedicated() {
+                match dedicated_retire().reserve_for_publication() {
+                    Ok(permit) => Some(permit),
+                    Err(RetireAdmissionError::Capacity(capacity)) => {
+                        return Err(IpcError::Pool(format!(
+                            "dedicated retire capacity exhausted ({capacity} retained backings); \
+                             retry when retirements complete"
+                        )));
+                    }
+                    Err(RetireAdmissionError::Worker) => {
+                        return Err(IpcError::Pool(
+                            "dedicated retire worker unavailable (thread spawn failed); retry \
+                             shortly"
+                                .into(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            // Dispatch seam: linearize Armed → Dispatched. A released or
+            // already-dispatched block is rejected before any byte is
+            // written, so freed or reused coordinates are never sent.
+            let request = block.try_dispatch(retire_permit)?;
+            // Attach the release authority before the write can publish any
+            // byte. Once bytes can flow, a fast reply — or a caller that
+            // vanishes mid-write — must find the settle authority already on
+            // the pending entry; the entry can never be removed "unarmed"
+            // by a response.
+            {
+                let mut pending = self.pending.lock();
+                if let Some(entry) = pending.get_mut(&rid) {
+                    entry.request = Some(request);
+                } else {
+                    // Unreachable before publication: no reply can exist for
+                    // a frame that was never written. Fail closed anyway.
+                    return Err(IpcError::Closed);
+                }
+            }
+            write_started.store(true, Ordering::Release);
+            #[cfg(test)]
+            let seam = self.frame_write_seam.lock().take();
+            #[cfg(test)]
+            if let Some(seam) = seam {
+                // Test-only partial-write seam: a real prefix lands on the
+                // real stream, then the write parks mid-frame.
+                let prefix = seam.prefix_bytes.min(frame.len());
+                writer.write_all(&frame[..prefix]).await?;
+                let _ = seam.prefix_written.send(());
+                let _ = seam.release.await;
+                writer.write_all(&frame[prefix..]).await?;
+            } else {
+                writer.write_all(&frame).await?;
+            }
+            #[cfg(not(test))]
             writer.write_all(&frame).await?;
             Ok(())
         }
         .await;
 
         if let Err(e) = send_result {
-            // Send failed — server never saw the allocation. Free it through
-            // the owning pool (never the client's current slot).
-            // This matches call_buddy() behavior.
+            send_guard.disarm();
+            // The write failed or the block was rejected. `release` resolves
+            // through the shared authority: if the seam was crossed, a buddy
+            // block stays charged for the peer's cross-process free (a
+            // partial write is not proof of no dispatch) and a dedicated
+            // block is settled and bounded-retired; if the seam was never
+            // crossed the block is still armed and freed here.
             let _ = block.release();
             self.pending.lock().remove(&rid);
             return Err(e);
         }
+        // The frame was handed over completely; from here the guard resolves
+        // a reply-wait cancellation instead of poisoning the stream.
+        send_guard.mark_send_completed();
 
-        // Await response — server already consumed the SHM allocation.
-        // For dedicated segments, the server only freed its local peer-pool
-        // copy; the client must also free its own allocation so the dedicated
-        // segment can be GC'd and the slot reused.
+        // Await response — the server owns the buddy allocation's
+        // cross-process free; for dedicated segments the server only freed
+        // its local peer-pool view, so the client settles its own owner
+        // allocation (idempotent with the terminal observers).
         match rx.await {
             Ok(result) => {
-                if block.is_dedicated() {
-                    let _ = block.release();
-                }
+                let _ = block.release();
                 result
             }
             Err(_) => Err(IpcError::Closed),
@@ -2212,16 +2965,24 @@ impl IpcClient {
         // Register pending call ONCE — reply comes after last chunk.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
+            self.pending.lock().insert(rid, PendingResponse::unary(tx));
         }
 
         // Build call control (included only in chunk 0).
         let ctrl = encode_call_control(identity, method_idx)?;
 
+        let mut send_guard =
+            SendGuard::new(Arc::clone(&self.pending), Arc::clone(&self.abort), rid);
+        let write_started = Arc::clone(&send_guard.write_started);
+
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
 
+            write_started.store(true, Ordering::Release);
+            // Cancellation between chunk writes would strand a partial
+            // chunked message; the send guard poisons the stream in that
+            // case so no later writer appends to it.
             for i in 0..total_chunks {
                 let chunk_start = i * chunk_size;
                 let chunk_end = std::cmp::min(chunk_start + chunk_size, data.len());
@@ -2253,9 +3014,11 @@ impl IpcClient {
         .await;
 
         if let Err(e) = send_result {
+            send_guard.disarm();
             self.pending.lock().remove(&rid);
             return Err(e);
         }
+        send_guard.mark_send_completed();
 
         // Await response.
         match rx.await {
@@ -2289,18 +3052,29 @@ impl IpcClient {
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
+            self.pending.lock().insert(rid, PendingResponse::unary(tx));
         }
 
         let ctrl = encode_call_control(identity, method_idx)
             .map_err(|error| pre_dispatch_call_error(error.into()))?;
+        let mut send_guard =
+            SendGuard::new(Arc::clone(&self.pending), Arc::clone(&self.abort), rid);
         let send_result = self
-            .send_chunked_stream_frames(rid, total_chunks, chunk_size, data_size, &ctrl, chunks)
+            .send_chunked_stream_frames(
+                &send_guard,
+                total_chunks,
+                chunk_size,
+                data_size,
+                &ctrl,
+                chunks,
+            )
             .await;
         if let Err(err) = send_result {
+            send_guard.disarm();
             self.pending.lock().remove(&rid);
             return Err(err);
         }
+        send_guard.mark_send_completed();
 
         match rx.await {
             Ok(result) => result.map_err(classified_call_error),
@@ -2310,7 +3084,7 @@ impl IpcClient {
 
     async fn send_chunked_stream_frames<S, B, E>(
         &self,
-        rid: u32,
+        send: &SendGuard,
         total_chunks: usize,
         chunk_size: usize,
         data_size: usize,
@@ -2372,9 +3146,12 @@ impl IpcClient {
                 if pending_chunk.len() == chunk_size {
                     let is_last = chunk_idx + 1 == total_chunks;
                     sent_or_attempted = true;
+                    // First publication point: the send guard must treat any
+                    // cancellation from here on as a started write.
+                    send.mark_write_started();
                     if let Err(err) = self
                         .write_chunk_frame(
-                            rid,
+                            send.rid,
                             chunk_idx,
                             total_chunks,
                             if chunk_idx == 0 { Some(ctrl) } else { None },
@@ -2409,9 +3186,11 @@ impl IpcClient {
         if !pending_chunk.is_empty() {
             let is_last = chunk_idx + 1 == total_chunks;
             sent_or_attempted = true;
+            // First publication point (single trailing chunk body).
+            send.mark_write_started();
             if let Err(err) = self
                 .write_chunk_frame(
-                    rid,
+                    send.rid,
                     chunk_idx,
                     total_chunks,
                     if chunk_idx == 0 { Some(ctrl) } else { None },
@@ -3128,11 +3907,15 @@ impl IpcClient {
         {
             confirmed = false;
         }
-        // Wake pending callers.
+        // Wake pending callers and resolve any dispatched request allocation
+        // they carried: this connection fence is the last terminal observer
+        // for callers that are already gone.
         let mut pending = self.pending.lock();
         for (_, pending) in pending.drain() {
-            let PendingResponse::Unary(tx) = pending;
-            let _ = tx.send(Err(IpcError::Closed));
+            let _ = pending.tx.send(Err(IpcError::Closed));
+            if let Some(request) = pending.request {
+                let _ = request.release_once();
+            }
         }
         drop(pending);
         // Only a confirmed close (writer cleared, receive and maintenance
@@ -3203,6 +3986,21 @@ impl IpcClient {
     pub(crate) fn writer_slot_for_test(&self) -> Arc<Mutex<Option<LocalWriteHalf>>> {
         Arc::clone(&self.writer)
     }
+
+    /// Install the one-shot partial-write seam for the next prealloc frame.
+    ///
+    /// Test-only: production never installs it.
+    #[cfg(test)]
+    pub(crate) fn set_frame_write_seam_for_test(&self, seam: Option<FrameWriteSeam>) {
+        *self.frame_write_seam.lock() = seam;
+    }
+
+    /// Number of live pending-response entries (test-only probe for
+    /// per-call pending cleanup).
+    #[cfg(test)]
+    pub(crate) fn pending_len_for_test(&self) -> usize {
+        self.pending.lock().len()
+    }
 }
 
 impl Drop for IpcClient {
@@ -3232,12 +4030,49 @@ const SIG_PONG: u8 = 0x02;
 const SIG_DISCONNECT: u8 = 0x08;
 const SIG_DISCONNECT_ACK: u8 = 0x09;
 
+/// Release a response nobody will read.
+///
+/// Used when a late reply arrives for an entry whose waiter is gone (the
+/// caller cancelled its reply wait) or for an unknown request id: an inline
+/// reply is simply dropped, while SHM and reassembly-handle backings are
+/// released through the exact response pools so the server-side allocation
+/// is returned instead of leaking.
+fn discard_unclaimed_response(
+    response: ResponseData,
+    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
+) {
+    let mut lease = ResponseLease::new(response, Arc::clone(server_pool));
+    let _ = lease.release();
+}
+
+#[allow(clippy::too_many_arguments)]
 fn complete_unary_pending(
     pending: Option<PendingResponse>,
     result: Result<ResponseData, IpcError>,
+    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
 ) {
-    if let Some(PendingResponse::Unary(tx)) = pending {
-        let _ = tx.send(result);
+    let Some(pending) = pending else {
+        // A late reply for an entry that no longer exists (for example its
+        // waiter cancelled the reply wait): nobody owns the response
+        // backing, so release it here instead of leaking it.
+        if let Ok(response) = result {
+            discard_unclaimed_response(response, server_pool);
+        }
+        return;
+    };
+    if let Err(undelivered) = pending.tx.send(result) {
+        // The waiter vanished while the reply was in flight: it will never
+        // read this response, so release its backing on its behalf.
+        if let Ok(response) = undelivered {
+            discard_unclaimed_response(response, server_pool);
+        }
+    }
+    // The response resolved this call: settle any dispatched request
+    // allocation exactly once. For a caller that cancelled after dispatch
+    // this is the only release authority left; for a live caller it is
+    // idempotent with the caller's own terminal path.
+    if let Some(request) = pending.request {
+        let _ = request.release_once();
     }
 }
 
@@ -3258,11 +4093,14 @@ impl Drop for ConnectionAssemblyCleanup {
 pub(crate) async fn recv_loop(
     mut reader: LocalReadHalf,
     pending: Arc<StdMutex<PendingMap>>,
-    _server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
+    server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     chunk_registry: Arc<ChunkRegistry>,
     conn_id: u64,
 ) {
+    // Response backings that no waiter claims (late replies after a
+    // cancelled reply wait, or replies for unknown ids) are released
+    // through the exact response pools.
     let cleanup = ConnectionAssemblyCleanup {
         registry: Arc::clone(&chunk_registry),
         conn_id,
@@ -3321,9 +4159,12 @@ pub(crate) async fn recv_loop(
         let rid = hdr.request_id as u32;
 
         if hdr.is_response() && hdr.is_ctrl() {
-            if let Some(PendingResponse::Unary(tx)) = pending.lock().remove(&rid) {
-                let _ = tx.send(Ok(ResponseData::Inline(recv_buf.clone())));
-            }
+            let entry = pending.lock().remove(&rid);
+            complete_unary_pending(
+                entry,
+                Ok(ResponseData::Inline(recv_buf.clone())),
+                &server_pool,
+            );
             continue;
         }
 
@@ -3343,7 +4184,7 @@ pub(crate) async fn recv_loop(
                         eprintln!("Warning: {message}");
                         chunk_registry.abort(conn_id, rid as u64);
                         let tx = pending.lock().remove(&rid);
-                        complete_unary_pending(tx, Err(IpcError::Chunk(message)));
+                        complete_unary_pending(tx, Err(IpcError::Chunk(message)), &server_pool);
                         continue;
                     }
                 };
@@ -3373,6 +4214,7 @@ pub(crate) async fn recv_loop(
                         Err(IpcError::Chunk(format!(
                             "chunked reply reassembly admission failed: {e}"
                         ))),
+                        &server_pool,
                     );
                     continue;
                 }
@@ -3388,6 +4230,7 @@ pub(crate) async fn recv_loop(
                                 complete_unary_pending(
                                     tx,
                                     Ok(ResponseData::Handle(finished.backing)),
+                                    &server_pool,
                                 );
                             }
                             Err(e) => {
@@ -3397,6 +4240,7 @@ pub(crate) async fn recv_loop(
                                     Err(IpcError::Chunk(format!(
                                         "chunked reply finish error: {e}"
                                     ))),
+                                    &server_pool,
                                 );
                             }
                         }
@@ -3413,6 +4257,7 @@ pub(crate) async fn recv_loop(
                     complete_unary_pending(
                         tx,
                         Err(IpcError::Chunk(format!("chunked reply feed error: {e}"))),
+                        &server_pool,
                     );
                 }
             }
@@ -3423,18 +4268,22 @@ pub(crate) async fn recv_loop(
         let result = decode_response(&hdr, &recv_buf);
 
         // Dispatch to pending caller.
-        let tx = { pending.lock().remove(&rid) };
-        complete_unary_pending(tx, result);
+        let entry = { pending.lock().remove(&rid) };
+        complete_unary_pending(entry, result, &server_pool);
     }
 
     // The guard also runs this cleanup when a close or Drop aborts the task.
     drop(cleanup);
 
-    // Connection lost — wake all pending callers.
+    // Connection lost — wake all pending callers and settle any dispatched
+    // request allocation whose caller is gone (idempotent with a caller that
+    // still observes the Closed result).
     let mut pending_guard = pending.lock();
     for (_, pending) in pending_guard.drain() {
-        let PendingResponse::Unary(tx) = pending;
-        let _ = tx.send(Err(IpcError::Closed));
+        let _ = pending.tx.send(Err(IpcError::Closed));
+        if let Some(request) = pending.request {
+            let _ = request.release_once();
+        }
     }
 }
 
@@ -4199,5 +5048,287 @@ mod tests {
                 "expected config error for {address:?}, got {error:?}"
             );
         }
+    }
+
+    // ── Cancellation-safe request allocation ownership ───────────────────
+
+    /// A pool-backed client with one bound route for the cancellation tests.
+    fn cancellation_client(label: &str) -> (IpcClient, RouteBinding, Arc<StdMutex<MemPool>>) {
+        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let cfg = ClientIpcConfig {
+            shm_threshold: 10,
+            base: c2_config::BaseIpcConfig {
+                pool_segment_size: 65_536,
+                max_pool_segments: 1,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        };
+        let client = IpcClient::with_config(&format!("ipc://{label}"), cfg);
+        let mut methods = HashMap::new();
+        methods.insert("ping".to_string(), 0);
+        client.route_directory.write().insert_table(
+            "grid".to_string(),
+            MethodTable {
+                route_name: "grid".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+                max_payload_size: 1024,
+                name_to_idx: methods,
+            },
+        );
+        let binding = client
+            .bind_cached_route(&c2_contract::ExpectedRouteContract {
+                route_name: "grid".to_string(),
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+            })
+            .expect("cached test route should bind");
+        let pool = client.request_pool().expect("transport-owned request pool");
+        (client, binding, pool)
+    }
+
+    /// Cancelling a sized-stream call while its body stream stalls must
+    /// release the preallocated block through the pool that owns it.
+    ///
+    /// The block is purely local in that window: no frame byte has been
+    /// written, so a Drop-time release is safe and required — otherwise the
+    /// allocation and its shared-domain charge leak until the client is
+    /// dropped, even across close/reconnect.
+    #[tokio::test]
+    async fn cancelled_stream_call_releases_its_preallocated_block() {
+        let (client, binding, pool) = cancellation_client("cancel_stream_stall");
+        let (resume_tx, resume_rx) = oneshot::channel::<Vec<u8>>();
+        let stream = futures_util::stream::once(async move {
+            resume_rx
+                .await
+                .expect("the body stream stays pending for the whole test")
+        })
+        .map(Ok::<Vec<u8>, std::io::Error>);
+
+        let client = Arc::new(client);
+        let task = {
+            let binding = binding.clone();
+            tokio::spawn(async move {
+                client
+                    .call_bound_sized_stream(&binding, "ping", 64, stream)
+                    .await
+            })
+        };
+        // Drive the spawned call to its first await point: the allocation has
+        // happened and the call is parked on the body stream.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "the preallocated block must be charged while the body stream stalls"
+        );
+
+        // Caller cancellation: the future is dropped while `chunks.next()`
+        // still pends. `resume_tx` stays alive so the stream itself never
+        // errors — the release must come from the cancelled call, not from a
+        // stream error path.
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            0,
+            "cancelling a stalled stream call must release its block through the owning pool"
+        );
+        let _ = resume_tx;
+    }
+
+    /// Cancelling a preallocated call while it waits for the writer lock must
+    /// release the block: the frame write has not begun, so the peer can
+    /// never have observed the allocation pointer.
+    #[tokio::test]
+    async fn cancelled_call_waiting_for_the_writer_lock_releases_its_block() {
+        let (client, _binding, pool) = cancellation_client("cancel_writer_wait");
+
+        // Deterministically occupy the writer slot exactly like a bulk write
+        // stuck on a non-reading peer would.
+        let writer_slot = client.writer_slot_for_test();
+        let (held_tx, held_rx) = oneshot::channel::<()>();
+        let (unhold_tx, unhold_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _guard = writer_slot.lock().await;
+            let _ = held_tx.send(());
+            let _ = unhold_rx.await;
+        });
+        held_rx.await.expect("writer slot must be held");
+
+        let body = futures_util::stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(vec![7u8; 64])]);
+        let block = client
+            .try_alloc_request_block(64)
+            .expect("allocation cannot fail before the pool lock")
+            .expect("a request pool is selected");
+        let client = Arc::new(client);
+        let identity = prealloc_race_identity();
+        let task = tokio::spawn(async move {
+            client
+                .call_buddy_stream(&identity, 0, block, 64, body)
+                .await
+        });
+        // The body is written into the block and the call parks on the writer
+        // lock inside `call_with_prealloc`.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "the block must stay charged while the call waits for the writer"
+        );
+
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            0,
+            "cancelling before the frame write begins must release the block"
+        );
+        let _ = unhold_tx.send(());
+    }
+
+    /// A frame-write failure at the dispatch seam must not free the buddy
+    /// block: a partial write is not proof that the peer never dispatched.
+    ///
+    /// The stream is aborted after connect, so `write_all` fails
+    /// deterministically once the call crosses the seam (the phase flips
+    /// immediately before the write begins). If the failure path freed the
+    /// block through the client's owner, a peer that did receive the
+    /// complete frame would free the same shared-allocator block again.
+    #[tokio::test]
+    async fn send_failure_after_the_dispatch_seam_holds_buddy_for_the_peer() {
+        static ADDRESS_GEN: AtomicU64 = AtomicU64::new(0);
+        let address = format!(
+            "ipc://dispatch_seam_{}_{}",
+            std::process::id(),
+            ADDRESS_GEN.fetch_add(1, Ordering::Relaxed)
+        );
+        let endpoint = LocalEndpoint::from_address(&address).expect("test endpoint");
+        let mut listener = c2_local::LocalListener::bind(&endpoint).expect("test listener");
+        let peer = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let mut len_buf = [0u8; 4];
+            stream
+                .read_exact(&mut len_buf)
+                .await
+                .expect("handshake len");
+            let mut body = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+            stream.read_exact(&mut body).await.expect("handshake body");
+            let identity = c2_wire::handshake::ServerIdentity {
+                server_id: "dispatch-seam-server".into(),
+                server_instance_id: "dispatch-seam-instance".into(),
+            };
+            let handshake = c2_wire::handshake::encode_server_handshake(
+                &[],
+                CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+                &[],
+                "",
+                &identity,
+            )
+            .expect("server handshake");
+            let frame =
+                frame::encode_frame(0, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, &handshake);
+            stream.write_all(&frame).await.expect("send handshake");
+            // Hold the stream open; the client aborts it after connecting.
+            let (_hold, held) = oneshot::channel::<()>();
+            let _ = held.await;
+        });
+
+        let cfg = ClientIpcConfig {
+            shm_threshold: 10,
+            base: c2_config::BaseIpcConfig {
+                pool_segment_size: 65_536,
+                max_pool_segments: 1,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        };
+        let mut client = IpcClient::with_config(&address, cfg);
+        client.connect().await.expect("connect must succeed");
+        let pool = client.request_pool().expect("transport-owned request pool");
+        let budget = pool
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+
+        let payload = vec![7u8; 8192];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation cannot fail before the pool lock")
+            .expect("a request pool is selected");
+        block
+            .write_at(0, &payload)
+            .expect("fill the preallocated block");
+
+        // Abort the local stream: the frame write inside the call now fails
+        // deterministically, after the dispatch seam was crossed.
+        let abort = client
+            .abort
+            .lock()
+            .as_ref()
+            .expect("connected client carries an abort handle")
+            .clone();
+        abort.abort();
+
+        let err = client
+            .call_with_prealloc(&prealloc_race_identity(), 0, &block, payload.len())
+            .await
+            .expect_err("the aborted stream must fail the frame write");
+        assert!(
+            matches!(err, IpcError::Io(_) | IpcError::Closed),
+            "unexpected send error: {err:?}"
+        );
+
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "a send failure at the seam must not free a buddy block the peer may own"
+        );
+        // Explicit release attempts must not free a dispatched buddy either;
+        // they stay exact-once no-ops for the shared allocator.
+        let _ = block.release();
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "explicit release must not free a dispatched buddy block"
+        );
+        drop(block);
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "the conservative hold must persist while any owner of the block existed"
+        );
+        assert!(
+            budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes > 0,
+            "memory must stay charged while the dispatched block is live"
+        );
+
+        // Confirmed cleanup retires the charge honestly: with every block and
+        // client owner gone, pool destruction returns the backing charge.
+        drop(client);
+        drop(pool);
+        assert_eq!(
+            budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes,
+            0,
+            "pool destruction must return the conservative hold to the budget"
+        );
+        peer.abort();
     }
 }

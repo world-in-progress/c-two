@@ -510,6 +510,28 @@ impl MemPool {
         }
     }
 
+    /// Whether a freed dedicated backing for these coordinates still awaits
+    /// retirement.
+    ///
+    /// `true` while the creator-side entry is present with `freed_at` set but
+    /// not yet reclaimed — that is, while the peer's cross-process
+    /// `read_done` signal or the configured crash-timeout policy has not yet
+    /// retired it through [`MemPool::gc_dedicated`]. `false` once the entry
+    /// is gone (retired, or the index was reused by a later live allocation).
+    ///
+    /// This is a generic pool status seam: it reports physical retirement
+    /// state only and carries no transport or routing policy. Owners use it
+    /// to keep the mapping (and its budget charge) alive until the peer is
+    /// provably done reading — `PoolStats::alloc_count` already excludes
+    /// pending-free entries, so it must never be used to infer retirement.
+    pub fn dedicated_awaiting_retirement(&self, alloc: &PoolAllocation) -> bool {
+        alloc.is_dedicated
+            && self
+                .dedicated
+                .get(&alloc.seg_idx)
+                .is_some_and(|entry| entry.freed_at.is_some())
+    }
+
     /// Ensure at least one buddy segment exists.
     ///
     /// No-op when the buddy tiers are policy-disabled; transports prewarm only
@@ -3177,6 +3199,47 @@ mod budget_tests {
         pool.gc_dedicated();
         assert!(pool.dedicated.get(&alloc.seg_idx).is_none());
         assert_eq!(budget.snapshot().shm.used_bytes, 0);
+    }
+
+    #[test]
+    fn dedicated_awaiting_retirement_reports_physical_pending_free_state() {
+        let config = budget_config();
+        let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+        let mut pool = budget_pool(config, budget);
+
+        let alloc = pool.alloc(20000).unwrap();
+        assert!(alloc.is_dedicated);
+        assert!(
+            !pool.dedicated_awaiting_retirement(&alloc),
+            "a live (unfreed) dedicated allocation is not awaiting retirement"
+        );
+
+        // Freed but unread: awaiting retirement until read_done or the
+        // crash-timeout policy reclaims the entry.
+        pool.free(&alloc).unwrap();
+        assert!(pool.dedicated_awaiting_retirement(&alloc));
+        pool.gc_dedicated();
+        assert!(
+            pool.dedicated_awaiting_retirement(&alloc),
+            "a peer that has not signalled read_done keeps the entry pending"
+        );
+
+        pool.dedicated
+            .get(&alloc.seg_idx)
+            .unwrap()
+            .segment
+            .mark_read_done();
+        pool.gc_dedicated();
+        assert!(
+            !pool.dedicated_awaiting_retirement(&alloc),
+            "a retired entry no longer awaits retirement"
+        );
+
+        // A buddy allocation never reports awaiting retirement.
+        let buddy = pool.alloc(4096).unwrap();
+        assert!(!buddy.is_dedicated);
+        pool.free(&buddy).unwrap();
+        assert!(!pool.dedicated_awaiting_retirement(&buddy));
     }
 
     #[test]

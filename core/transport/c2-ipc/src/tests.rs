@@ -688,7 +688,7 @@ mod lazy_policy_roundtrip_tests {
     use std::time::Duration;
 
     use c2_config::BaseIpcConfig;
-    use c2_mem::{MemPool, PoolAllocation};
+    use c2_mem::{MemPool, MemoryBudget, PoolAllocation, PoolConfig};
     use c2_server::{
         AccessLevel, ConcurrencyMode, CrmCallback, CrmError, RequestData, RequestLease,
         ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
@@ -696,7 +696,9 @@ mod lazy_policy_roundtrip_tests {
     use parking_lot::{Mutex, RwLock};
     use tokio::time::timeout;
 
-    use crate::client::{ClientIpcConfig, IpcClient, IpcError};
+    use crate::client::{
+        ClientIpcConfig, DispatchPermitSeam, FrameWriteSeam, IpcClient, IpcError, RequestBlock,
+    };
     use crate::pool::ClientPool;
     use crate::response::{ResponseData, ResponseLease};
 
@@ -948,6 +950,7 @@ mod lazy_policy_roundtrip_tests {
 
     #[tokio::test]
     async fn disabled_buddy_serves_dedicated_large_request_and_response() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
         let (callback, seen_kinds) = echo_callback();
         // chunk_size above the payload keeps the chunked fallback out of the
         // picture: dedicated SHM alone must carry both directions.
@@ -1201,6 +1204,132 @@ mod lazy_policy_roundtrip_tests {
         }
     }
 
+    /// Retention permits still outstanding when an exclusive retire test
+    /// starts.
+    ///
+    /// The retire executor is process-wide and a test that already finished can
+    /// leave a backing retained until its peer reads it or the crash timeout
+    /// fires; the exclusive test lock only excludes *concurrent* tests. Exact
+    /// assertions therefore size themselves against this observed baseline
+    /// instead of assuming a quiescent executor.
+    async fn retire_permit_baseline() -> usize {
+        for _ in 0..20 {
+            if crate::client::dedicated_retire_test_control::snapshot().1 == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        crate::client::dedicated_retire_test_control::snapshot().1
+    }
+
+    /// The public release may arrive after the dispatch CAS while its permit
+    /// is being installed. It must wait for that installation, then retain the
+    /// real backing under the same bounded permit until peer read_done.
+    #[test]
+    fn dedicated_release_at_dispatch_permit_handoff_keeps_capacity_and_charge() {
+        use crate::client::dedicated_retire_test_control as control;
+        let _retire_lock = control::exclusive_lock();
+        let baseline = control::snapshot().1;
+        let _capacity = control::capacity_override(baseline + 1);
+        let config = PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 2,
+            max_dedicated_segments: 2,
+            dedicated_crash_timeout_secs: 5.0,
+            spill_threshold: 1.0,
+            buddy_enabled: false,
+            ..PoolConfig::default()
+        };
+        let budget = MemoryBudget::new(1 << 20, 1 << 20, 1 << 20);
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            config.clone(),
+            format!(
+                "/cc3handoff{:08x}{:08x}",
+                std::process::id(),
+                ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
+            budget.clone(),
+        )));
+        let alloc = pool.lock().alloc(4096).expect("real dedicated allocation");
+        assert!(alloc.is_dedicated);
+        let prefix = pool.lock().prefix().to_string();
+        let name = pool
+            .lock()
+            .dedicated_name(alloc.seg_idx)
+            .expect("dedicated backing name")
+            .to_string();
+        let mut peer = MemPool::open_peer(config, prefix);
+        peer.open_dedicated_at(alloc.seg_idx, &name, 4096)
+            .expect("peer opens the request backing");
+        let charged = budget.snapshot().shm.used_bytes;
+        assert!(charged > 0);
+
+        let block = Arc::new(RequestBlock::new(Arc::clone(&pool), alloc));
+        let (permit, returned) = control::reserve_permit();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        block.set_dispatch_seam_for_test(DispatchPermitSeam {
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+        let dispatch_block = Arc::clone(&block);
+        let dispatch = std::thread::spawn(move || dispatch_block.try_dispatch(Some(permit)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dispatch crossed CAS before permit install");
+
+        let release_block = Arc::clone(&block);
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let result = release_block.release();
+            released_tx.send(()).unwrap();
+            result
+        });
+        attempt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("public release entered the race");
+        let premature_release = released_rx.recv_timeout(Duration::from_millis(100));
+        resume_tx.send(()).unwrap();
+        let request = dispatch.join().unwrap().expect("dispatch succeeds once");
+        release
+            .join()
+            .unwrap()
+            .expect("public release settles once");
+        assert!(
+            matches!(
+                premature_release,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "release must wait until dispatch has installed its permit"
+        );
+        drop(request);
+        drop(block);
+
+        assert!(!returned.load(Ordering::Acquire));
+        let outstanding = control::snapshot().1;
+        assert!(outstanding > 0, "retained backing has a counted permit");
+        control::set_capacity_override(outstanding);
+        assert!(
+            !control::can_reserve(),
+            "one retained backing fills capacity"
+        );
+        assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+
+        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true)
+            .expect("peer signals read_done");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !returned.load(Ordering::Acquire) || budget.snapshot().shm.used_bytes != 0 {
+            assert!(std::time::Instant::now() < deadline, "retirement timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        control::set_capacity_override(0);
+        assert!(control::can_reserve(), "retirement returns the permit");
+    }
+
     /// Client config with a fast idle-decay window so maintenance-driven
     /// retirement is observable in bounded test time.
     fn fast_client_config(base: BaseIpcConfig, shm_threshold: u64) -> ClientIpcConfig {
@@ -1329,6 +1458,7 @@ mod lazy_policy_roundtrip_tests {
 
     #[tokio::test]
     async fn disabled_injected_pool_still_sends_dedicated_data() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
         let (callback, seen_kinds) = echo_callback();
         let server = start_echo_server(
             "disabled_injected",
@@ -1374,12 +1504,14 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(response_bytes(&client, response), payload);
 
         // The externally owned pool was never mutated: same policy, no buddy
-        // mappings, and it is still usable after the client closes.
+        // mappings, and the settled dedicated request retired promptly — the
+        // response proves the peer set `read_done`, so the owner entry is
+        // already reclaimed here rather than lingering until a later GC.
         {
             let pool = injected.lock();
             assert!(!pool.config().buddy_enabled);
             assert_eq!(pool.segment_count(), 0);
-            assert!(pool.stats().dedicated_segments >= 1);
+            assert_eq!(pool.stats().dedicated_segments, 0);
         }
         client.close().await;
         assert_eq!(injected.lock().segment_count(), 0);
@@ -1533,6 +1665,7 @@ mod lazy_policy_roundtrip_tests {
 
     #[tokio::test]
     async fn maintenance_releases_dedicated_read_done_mappings_without_further_calls() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
         let (callback, seen_kinds) = echo_callback();
         // Dedicated-only connection (buddy disabled) with fast maintenance
         // cadence on both sides.
@@ -2383,6 +2516,1700 @@ mod lazy_policy_roundtrip_tests {
         client.close().await;
         stop_server(&server).await;
     }
+
+    // ── Cancellation-safe dispatched request ownership ────────────────────
+
+    /// Echo callback that deterministically parks the server after dispatch:
+    /// it signals `started` when invoked, blocks on `release`, then consumes
+    /// the request and echoes it. `finished` fires after the request lease
+    /// was released, so dedicated `read_done` is observable. The observed
+    /// request transports are recorded so tests can prove exactly how many
+    /// dispatches reached the server.
+    struct StallingEcho {
+        seen_kinds: Arc<Mutex<Vec<&'static str>>>,
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl CrmCallback for StallingEcho {
+        fn invoke(
+            &self,
+            _route_name: &str,
+            _method_idx: u16,
+            request: RequestData,
+            _response_pool: Arc<RwLock<MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            self.seen_kinds.lock().push(request_kind(&request));
+            if let Some(started) = self.started.lock().take() {
+                let _ = started.send(());
+            }
+            let _ = self.release.lock().recv_timeout(Duration::from_secs(10));
+            let request = RequestLease::new(request);
+            let bytes = request
+                .into_owned_bytes()
+                .map_err(CrmError::InternalError)?;
+            if let Some(finished) = self.finished.lock().take() {
+                let _ = finished.send(());
+            }
+            Ok(ResponseMeta::Inline(bytes))
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn stalling_echo() -> (
+        Arc<StallingEcho>,
+        Arc<Mutex<Vec<&'static str>>>,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let seen_kinds = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(StallingEcho {
+                seen_kinds: Arc::clone(&seen_kinds),
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+                finished: Mutex::new(Some(finished_tx)),
+            }),
+            seen_kinds,
+            started_rx,
+            release_tx,
+            finished_rx,
+        )
+    }
+
+    /// Buddy request whose caller is cancelled after dispatch: the server
+    /// owns the cross-process free, so the client must keep the allocation
+    /// charged (never free it locally), let the server's free land exactly
+    /// once, and never touch a replacement pool installed meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_buddy_call_after_dispatch_keeps_the_peer_owner_free() {
+        let (callback, _seen_kinds, started_rx, release_tx, finished_rx) = stalling_echo();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "cancel_buddy_dispatch",
+            server_config(small_base(64 * 1024, 2), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(
+            server.ipc_address(),
+            client_config(small_base(64 * 1024, 2), 1024),
+        );
+        client.connect().await.unwrap();
+        let old_pool = client.request_pool().expect("transport-owned request pool");
+        let binding = client
+            .acquire_route(&expected_contract("cancel_buddy_dispatch"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+
+        let payload = vec![7u8; 8192];
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+        };
+        timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("callback must start (frame dispatched)")
+            .unwrap();
+
+        // Caller cancellation after dispatch, before any response.
+        task.abort();
+        let join_error = task.await.expect_err("the aborted call must be cancelled");
+        assert!(join_error.is_cancelled());
+
+        assert_eq!(
+            old_pool.lock().stats().alloc_count,
+            1,
+            "a dispatched buddy allocation belongs to the server's free; the cancelled caller must keep it charged"
+        );
+
+        // Install a replacement pool incarnation exactly as a reconnect
+        // would, with a live canary: every later release must address only
+        // the old owner and never the replacement.
+        let (fresh_config, fresh_budget) = {
+            let pool = old_pool.lock();
+            (
+                pool.config().clone(),
+                pool.budget()
+                    .cloned()
+                    .expect("owner pool carries the domain budget"),
+            )
+        };
+        let fresh_pool = Arc::new(parking_lot::Mutex::new(
+            MemPool::new_with_prefix_and_budget(
+                fresh_config,
+                format!(
+                    "/cc3t5{:08x}{:08x}",
+                    std::process::id(),
+                    ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
+                ),
+                fresh_budget,
+            ),
+        ));
+        client.replace_request_pool_for_test(Some(Arc::clone(&fresh_pool)));
+        let _canary = fresh_pool.lock().alloc(64).expect("fresh-pool canary");
+        assert_eq!(fresh_pool.lock().stats().alloc_count, 1);
+
+        // Let the server finish: it frees the buddy block cross-process
+        // exactly once and replies into a pending entry whose caller is gone.
+        release_tx.send(()).expect("release callback");
+        timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("callback must finish")
+            .unwrap();
+        wait_until(5, || old_pool.lock().stats().alloc_count == 0).await;
+
+        // The shared allocator stayed consistent: a probe alloc/free on the
+        // old owner must still round-trip after the server's cross-process
+        // free (a second free of the same block would have corrupted the
+        // shared free list).
+        let probe = old_pool
+            .lock()
+            .alloc(8192)
+            .expect("the old owner's allocator must stay consistent");
+        old_pool
+            .lock()
+            .free(&probe)
+            .expect("probe free must round-trip on the old owner");
+        assert_eq!(
+            fresh_pool.lock().stats().alloc_count,
+            1,
+            "the replacement pool's live canary must never be freed by stale coordinates"
+        );
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Dedicated request whose caller is cancelled after dispatch: the owner
+    /// release must settle (the cross-process `read_done` protocol keeps the
+    /// mapping alive for the still-reading server), and after the server
+    /// finishes, GC retires the backing and returns the shared-domain charge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_dedicated_call_settles_its_owner_release() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let (callback, _seen_kinds, started_rx, release_tx, finished_rx) = stalling_echo();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "cancel_dedicated",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let pool = client
+            .request_pool()
+            .expect("dedicated-capable request pool");
+        let budget = pool
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let binding = client
+            .acquire_route(&expected_contract("cancel_dedicated"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+
+        let payload = vec![7u8; 48 * 1024];
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+        };
+        timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("callback must start (frame dispatched)")
+            .unwrap();
+        task.abort();
+        let join_error = task.await.expect_err("the aborted call must be cancelled");
+        assert!(join_error.is_cancelled());
+
+        assert_eq!(
+            pool.lock().stats().dedicated_active_count,
+            0,
+            "cancelling a dispatched dedicated call must settle the owner release exactly once"
+        );
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+
+        // The mapping stays for the stalled server (read_done not yet set):
+        // the charge must remain until the peer signals completion.
+        assert!(
+            budget.snapshot().shm.used_bytes > 0,
+            "the dedicated backing must stay charged while the peer may still read it"
+        );
+
+        release_tx.send(()).expect("release callback");
+        timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("callback must finish (read_done now set)")
+            .unwrap();
+        pool.lock().gc_dedicated();
+        assert_eq!(
+            pool.lock().stats().dedicated_segments,
+            0,
+            "read_done must let GC retire the settled dedicated backing"
+        );
+        assert_eq!(
+            budget.snapshot().shm.used_bytes,
+            0,
+            "retiring the backing must return the shared-domain charge"
+        );
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Dedicated request whose block is owned by an external caller (the
+    /// prealloc FFI shape): cancelling the call future leaves the block
+    /// alive, so the confirmed-close drain must settle the owner release
+    /// through the pending entry's release authority.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_settles_dispatched_dedicated_request_for_an_external_block() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let (callback, _seen_kinds, started_rx, release_tx, finished_rx) = stalling_echo();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "close_settle_dedicated",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let pool = client
+            .request_pool()
+            .expect("dedicated-capable request pool");
+        let budget = pool
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let binding = client
+            .acquire_route(&expected_contract("close_settle_dedicated"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
+
+        let payload = vec![9u8; 48 * 1024];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+
+        let mut started_rx = started_rx;
+        tokio::select! {
+            started = &mut started_rx => {
+                started.expect("callback must start (frame dispatched)");
+            }
+            result = client.call_with_prealloc(&identity, method_idx, &block, payload.len()) => {
+                panic!("the call must not complete while the callback stalls: {result:?}");
+            }
+        }
+        // The caller's future is gone: the send guard already handed the
+        // dispatched dedicated release to the bounded retire path (freed_at
+        // marked; the mapping stays for the still-reading peer). The still
+        // alive external block must not double-settle.
+        assert_eq!(
+            pool.lock().stats().dedicated_active_count,
+            0,
+            "the cancelled reply wait settles the dispatched dedicated owner release"
+        );
+        let _ = block.release();
+        assert_eq!(
+            pool.lock().stats().dedicated_active_count,
+            0,
+            "the still-alive external block must not double-settle"
+        );
+
+        assert!(
+            client.close_shared_bounded(Duration::from_secs(5)).await,
+            "the close barrier must confirm while the callback stalls"
+        );
+        assert_eq!(
+            pool.lock().stats().dedicated_active_count,
+            0,
+            "the confirmed-close drain must settle the owner release for a caller that is gone"
+        );
+        // The still-alive external block must not double-release.
+        let _ = block.release();
+        assert_eq!(
+            pool.lock().stats().dedicated_active_count,
+            0,
+            "an explicit release after the drain must be an exact-once no-op"
+        );
+
+        release_tx.send(()).expect("release callback");
+        timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("callback must finish (read_done now set)")
+            .unwrap();
+        pool.lock().gc_dedicated();
+        assert_eq!(
+            budget.snapshot().shm.used_bytes,
+            0,
+            "retiring the backing must return the shared-domain charge"
+        );
+        drop(client);
+        stop_server(&server).await;
+    }
+
+    // ── Linearizable dispatch state and physical dedicated retirement ─────
+
+    /// Raw handshake-only peer: completes the client handshake and hands the
+    /// accepted stream back to the test, so tests can observe exactly which
+    /// bytes the client wrote after connecting.
+    async fn raw_handshake_peer(
+        label: &str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<c2_local::LocalStream>,
+    ) {
+        let address = unique_address(label);
+        let endpoint = c2_local::LocalEndpoint::from_address(&address).expect("test endpoint");
+        let mut listener = c2_local::LocalListener::bind(&endpoint).expect("test listener");
+        let (stream_tx, stream_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let mut len_buf = [0u8; 4];
+            use tokio::io::AsyncReadExt as _;
+            stream
+                .read_exact(&mut len_buf)
+                .await
+                .expect("handshake len");
+            let mut body = vec![0u8; u32::from_le_bytes(len_buf) as usize];
+            stream.read_exact(&mut body).await.expect("handshake body");
+            let identity = c2_wire::handshake::ServerIdentity {
+                server_id: "raw-peer-server".into(),
+                server_instance_id: "raw-peer-instance".into(),
+            };
+            let handshake = c2_wire::handshake::encode_server_handshake(
+                &[],
+                c2_wire::handshake::CAP_CALL_V2
+                    | c2_wire::handshake::CAP_METHOD_IDX
+                    | c2_wire::handshake::CAP_CHUNKED,
+                &[],
+                "",
+                &identity,
+            )
+            .expect("server handshake");
+            let frame = c2_wire::frame::encode_frame(
+                0,
+                c2_wire::flags::FLAG_HANDSHAKE | c2_wire::flags::FLAG_RESPONSE,
+                &handshake,
+            );
+            stream.write_all(&frame).await.expect("send handshake");
+            let _ = stream_tx.send(stream);
+        });
+        (address, stream_rx)
+    }
+
+    fn raw_peer_identity() -> c2_wire::control::RouteCallIdentity {
+        c2_wire::control::RouteCallIdentity {
+            route_name: "grid".into(),
+            route_uid: "grid-route-uid-raw".into(),
+            observed_route_revision: 1,
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+        }
+    }
+
+    /// A released block must never be sent: `pool_free` followed by a call
+    /// through the public prealloc surface must fail before any byte is
+    /// written, leave exactly one free through the owning pool, and never
+    /// reach the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn released_request_block_is_never_sent() {
+        let (callback, seen_kinds) = echo_callback();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "released_block",
+            server_config(small_base(64 * 1024, 2), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(
+            server.ipc_address(),
+            client_config(small_base(64 * 1024, 2), 1024),
+        );
+        client.connect().await.unwrap();
+        let pool = client.request_pool().expect("transport-owned request pool");
+        let binding = client
+            .acquire_route(&expected_contract("released_block"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
+
+        let payload = vec![5u8; 8192];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+        // A live canary in the same pool: any misdirected or repeated free
+        // would have to corrupt it or the allocator state.
+        let _canary = pool.lock().alloc(64).expect("pool canary");
+        assert_eq!(pool.lock().stats().alloc_count, 2);
+
+        // The public release path (SyncClient::pool_free equivalent): the
+        // armed block is freed through its exact owner.
+        let _ = block.release();
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "releasing the armed block must free exactly its own allocation"
+        );
+
+        let err = timeout(
+            Duration::from_secs(5),
+            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+        )
+        .await
+        .expect("a released block must be rejected promptly")
+        .expect_err("a released block must never be sent");
+        assert!(
+            matches!(err, IpcError::Pool(ref message) if message.contains("released")),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            seen_kinds.lock().is_empty(),
+            "a released block must never reach server dispatch"
+        );
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "no second free and no canary corruption: only the canary remains"
+        );
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// One block carries at most one in-flight frame: a second call while
+    /// the first is dispatched must be rejected before any write, and the
+    /// server must observe exactly one dispatch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_block_never_carries_two_in_flight_frames() {
+        let (callback, seen_kinds, started_rx, release_tx, finished_rx) = stalling_echo();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "double_dispatch",
+            server_config(small_base(64 * 1024, 2), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(
+            server.ipc_address(),
+            client_config(small_base(64 * 1024, 2), 1024),
+        );
+        client.connect().await.unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("double_dispatch"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
+
+        let payload = vec![6u8; 8192];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+
+        // Drive the first call to the stalling server: its frame was
+        // dispatched and the call parks waiting for the response.
+        let first = client.call_with_prealloc(&identity, method_idx, &block, payload.len());
+        tokio::pin!(first);
+        let mut started_rx = started_rx;
+        tokio::select! {
+            _ = &mut started_rx => {}
+            result = &mut first => panic!("the first call must stall: {result:?}"),
+        }
+        assert_eq!(*seen_kinds.lock(), vec!["shm_buddy"]);
+
+        let err = timeout(
+            Duration::from_secs(5),
+            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+        )
+        .await
+        .expect("a re-dispatch must be rejected promptly")
+        .expect_err("an already-dispatched block must never carry a second frame");
+        assert!(
+            matches!(err, IpcError::Pool(ref message) if message.contains("dispatched")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            seen_kinds.lock().len(),
+            1,
+            "the server must observe exactly one dispatch for one block"
+        );
+
+        // The first call still completes normally after the stall.
+        release_tx.send(()).expect("release callback");
+        timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("callback must finish")
+            .unwrap();
+        let response = timeout(Duration::from_secs(5), &mut first)
+            .await
+            .expect("first call must complete")
+            .expect("first call must succeed");
+        assert_eq!(response_bytes(&client, response), payload);
+        assert_eq!(seen_kinds.lock().len(), 1);
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Release racing the dispatch seam: the writer lock is held so the call
+    /// parks before the seam, the block is released (armed free through its
+    /// owner), and after the writer unblocks the call must fail without the
+    /// peer receiving a single frame byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_racing_dispatch_never_sends_freed_coordinates() {
+        let (address, peer_rx) = raw_handshake_peer("release_race_dispatch").await;
+        let mut client =
+            IpcClient::with_config(&address, client_config(small_base(64 * 1024, 2), 1024));
+        client.connect().await.expect("connect");
+        let mut peer = peer_rx.await.expect("peer stream");
+        let pool = client.request_pool().expect("transport-owned request pool");
+
+        let payload = vec![3u8; 8192];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+
+        // Deterministically occupy the writer slot so the call parks at the
+        // writer-lock await, before the dispatch seam.
+        let writer_slot = client.writer_slot_for_test();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (unhold_tx, unhold_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _guard = writer_slot.lock().await;
+            let _ = held_tx.send(());
+            let _ = unhold_rx.await;
+        });
+        held_rx.await.expect("writer slot must be held");
+
+        let identity = raw_peer_identity();
+        let call = client.call_with_prealloc(&identity, 0, &block, payload.len());
+        tokio::pin!(call);
+        use futures_util::FutureExt;
+        assert!(
+            call.as_mut().now_or_never().is_none(),
+            "the call must park waiting for the writer lock"
+        );
+        assert_eq!(pool.lock().stats().alloc_count, 1);
+
+        // Release wins the race (armed free through the exact owner).
+        let _ = block.release();
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            0,
+            "the armed release must free through the owning pool"
+        );
+
+        let _ = unhold_tx.send(());
+        match timeout(Duration::from_secs(2), &mut call).await {
+            Ok(Err(err)) => assert!(
+                matches!(err, IpcError::Pool(ref message) if message.contains("released")),
+                "unexpected error: {err:?}"
+            ),
+            Ok(Ok(response)) => panic!("a released block must not be sent: {response:?}"),
+            Err(_) => panic!(
+                "a freed block was sent: the call is waiting for a response to a frame it must \
+                 never have written"
+            ),
+        }
+
+        // The peer must not have received a single frame byte.
+        use tokio::io::AsyncReadExt;
+        let mut probe = [0u8; 16];
+        let read = timeout(Duration::from_millis(300), peer.read(&mut probe)).await;
+        let silent = !matches!(read, Ok(Ok(count)) if count > 0);
+        assert!(
+            silent,
+            "the peer must receive no bytes for a released block"
+        );
+
+        client.close_shared().await;
+    }
+
+    /// Physical dedicated lifecycle: after the caller, block, and the whole
+    /// client are gone while the server callback still holds the unread
+    /// request, the backing must stay mapped and charged (no external pool
+    /// or block Arc may be needed), the server must still read the data, and
+    /// only then may the charge return.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dedicated_backing_survives_client_drop_until_peer_read_done() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let (callback, _seen_kinds, started_rx, release_tx, finished_rx) = stalling_echo();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "dedicated_survive_drop",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        // Keep only the domain budget (an accounting handle, not backing
+        // retention); the pool Arc is dropped immediately.
+        let budget = client
+            .request_pool()
+            .expect("dedicated-capable request pool")
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let binding = client
+            .acquire_route(&expected_contract("dedicated_survive_drop"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+
+        let payload = vec![11u8; 48 * 1024];
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+        };
+        timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("callback must start (frame dispatched)")
+            .unwrap();
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+
+        // Confirmed close and full client drop with no external pool or
+        // block reference left in the test.
+        assert!(
+            client.close_shared_bounded(Duration::from_secs(5)).await,
+            "the close barrier must confirm while the callback stalls"
+        );
+        match Arc::try_unwrap(client) {
+            Ok(dropped) => drop(dropped),
+            Err(_) => panic!("no other client owners may retain the client"),
+        }
+
+        assert!(
+            budget.snapshot().shm.used_bytes > 0,
+            "the settled dedicated backing must stay mapped and charged while the peer still reads"
+        );
+
+        // The server finishes: its read through the peer mapping must still
+        // see the data (read_done is set by that same release), and only
+        // then may the bounded retainer return the charge.
+        release_tx.send(()).expect("release callback");
+        timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("the server must still read the request data after client drop")
+            .unwrap();
+        wait_until(5, || budget.snapshot().shm.used_bytes == 0).await;
+
+        stop_server(&server).await;
+    }
+
+    /// Bounded crash retirement: when the peer never reads, the settled
+    /// dedicated backing stays charged until the pool's configured crash
+    /// timeout retires it — never leaked forever, never dropped early.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dedicated_backing_retires_within_bounded_crash_timeout() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let (callback, _seen_kinds, started_rx, release_tx, finished_rx) = stalling_echo();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "dedicated_crash_retire",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        // Build the client around a short-crash-timeout, buddy-disabled
+        // injected pool exactly as a deployment would configure it, and drop
+        // the test's pool reference right away: only production ownership
+        // may keep the backing alive from here on.
+        let cfg = client_config(base, 1024);
+        let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
+        let mut pool_config = cfg.base.primary_pool_config(&cfg.pool_tuning());
+        pool_config.dedicated_crash_timeout_secs = 0.25;
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            pool_config,
+            format!(
+                "/cc3crash{:08x}{:08x}",
+                std::process::id(),
+                ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
+            budget.clone(),
+        )));
+        let mut client = IpcClient::with_pool(server.ipc_address(), Arc::clone(&pool), cfg);
+        drop(pool);
+        client.connect().await.unwrap();
+
+        let binding = client
+            .acquire_route(&expected_contract("dedicated_crash_retire"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+
+        let payload = vec![11u8; 48 * 1024];
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+        };
+        timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("callback must start (frame dispatched)")
+            .unwrap();
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        assert!(
+            client.close_shared_bounded(Duration::from_secs(5)).await,
+            "the close barrier must confirm while the callback stalls"
+        );
+        drop(client);
+
+        assert!(
+            budget.snapshot().shm.used_bytes > 0,
+            "the settled dedicated backing must stay charged while the peer has not read"
+        );
+        // The peer never reads before this point, so only the crash-timeout
+        // policy can retire the backing — bounded, then refunded.
+        wait_until(5, || budget.snapshot().shm.used_bytes == 0).await;
+
+        release_tx.send(()).expect("release callback");
+        timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("callback must finish for shutdown")
+            .unwrap();
+        stop_server(&server).await;
+    }
+
+    // ── Fast replies, partial writes, and per-call pending cleanup ────────
+
+    /// A fast reply must settle an externally borrowed dedicated block even
+    /// when the caller vanishes inside the write: the pending entry carries
+    /// the release authority from the moment bytes could flow, so neither a
+    /// response that beats the caller nor a mid-write cancellation can
+    /// strand the owner release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fast_reply_settles_external_dedicated_block_despite_cancellation() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let (callback, seen_kinds) = echo_callback();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let server = start_echo_server(
+            "fast_reply_settle",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let pool = client
+            .request_pool()
+            .expect("dedicated-capable request pool");
+        let binding = client
+            .acquire_route(&expected_contract("fast_reply_settle"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
+
+        let payload = vec![13u8; 48 * 1024];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+
+        // Seam: write the complete frame, then park inside the write. The
+        // instant server dispatches and replies while the caller is parked.
+        let (prefix_tx, prefix_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_park_hold, park_release) = tokio::sync::oneshot::channel::<()>();
+        client.set_frame_write_seam_for_test(Some(FrameWriteSeam {
+            prefix_bytes: usize::MAX,
+            prefix_written: prefix_tx,
+            release: park_release,
+        }));
+
+        let mut call =
+            Box::pin(client.call_with_prealloc(&identity, method_idx, &block, payload.len()));
+        let mut prefix_rx = prefix_rx;
+        tokio::select! {
+            _ = &mut prefix_rx => {}
+            result = &mut call => panic!("the call must park inside the write seam: {result:?}"),
+        }
+        // The full frame landed; wait for the instant server to dispatch.
+        wait_until(5, || !seen_kinds.lock().is_empty()).await;
+
+        // Caller cancellation while parked inside the write; the external
+        // block stays alive, so only the armed pending entry can settle it.
+        drop(call);
+
+        wait_until(5, || pool.lock().stats().dedicated_active_count == 0).await;
+        assert_eq!(
+            seen_kinds.lock().len(),
+            1,
+            "exactly one dispatch happened for one block"
+        );
+        // The still-alive external block must not double-settle.
+        let _ = block.release();
+        assert_eq!(pool.lock().stats().dedicated_active_count, 0);
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Cancelling a partial frame write must poison the stream: the peer has
+    /// really received a prefix (twelve bytes of a frame header), no later
+    /// call may append to the corrupt stream, the pending entry drains with
+    /// a correct settle, and the buddy block stays conservatively charged
+    /// until pool destruction returns it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_frame_write_cancellation_poisons_the_stream() {
+        let (address, peer_rx) = raw_handshake_peer("partial_write_poison").await;
+        let mut client =
+            IpcClient::with_config(&address, client_config(small_base(64 * 1024, 2), 1024));
+        client.connect().await.expect("connect");
+        let mut peer = peer_rx.await.expect("peer stream");
+        let pool = client.request_pool().expect("transport-owned request pool");
+        let budget = pool
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+
+        let payload = vec![7u8; 8192];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+
+        // Seam: write only a twelve-byte header prefix, then park mid-frame.
+        let (prefix_tx, prefix_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_park_hold, park_release) = tokio::sync::oneshot::channel::<()>();
+        client.set_frame_write_seam_for_test(Some(FrameWriteSeam {
+            prefix_bytes: 12,
+            prefix_written: prefix_tx,
+            release: park_release,
+        }));
+
+        let identity = raw_peer_identity();
+        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block, payload.len()));
+        let mut prefix_rx = prefix_rx;
+        tokio::select! {
+            _ = &mut prefix_rx => {}
+            result = &mut call => panic!("the call must park mid-frame: {result:?}"),
+        }
+
+        // Proof that bytes really landed: the peer reads exactly the
+        // twelve-byte prefix of the frame header.
+        use tokio::io::AsyncReadExt as _;
+        let mut prefix_buf = [0u8; 12];
+        timeout(Duration::from_secs(3), peer.read_exact(&mut prefix_buf))
+            .await
+            .expect("the written prefix must be readable by the peer")
+            .expect("prefix read");
+
+        // Caller cancellation after the partial write.
+        drop(call);
+
+        // A follow-up call must fail instead of appending to the partial
+        // frame on the same stream.
+        let err = timeout(
+            Duration::from_secs(3),
+            client.call_inline(&identity, 0, b"follow-up"),
+        )
+        .await
+        .expect("the follow-up call must terminate")
+        .expect_err("no call may append to a corrupt stream");
+        assert!(
+            matches!(err, IpcError::Io(_) | IpcError::Closed),
+            "unexpected follow-up error: {err:?}"
+        );
+
+        // The peer receives nothing beyond the prefix.
+        let mut probe = [0u8; 8];
+        let read = timeout(Duration::from_millis(300), peer.read(&mut probe)).await;
+        let silent = !matches!(read, Ok(Ok(count)) if count > 0);
+        assert!(silent, "the poisoned stream must carry no further bytes");
+
+        // The pending entry drains with a correct settle.
+        wait_until(2, || client.pending_len_for_test() == 0).await;
+        // A dispatched buddy block is never freed locally: it stays charged
+        // until pool destruction returns it.
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "the buddy block stays conservatively charged for the peer"
+        );
+        assert!(budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes > 0);
+        drop(block);
+        drop(client);
+        drop(pool);
+        assert_eq!(
+            budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes,
+            0,
+            "pool destruction must return the conservative hold"
+        );
+    }
+
+    /// Cancelling a call while it waits for the writer lock must remove its
+    /// pending entry immediately: nothing was publishable, so a healthy
+    /// connection must not carry per-call residue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_call_waiting_for_the_writer_leaves_no_pending_entry() {
+        let cfg = client_config(small_base(64 * 1024, 2), 1024);
+        let client = IpcClient::with_config("ipc://pending_entry_cleanup", cfg);
+        let pool = client.request_pool().expect("transport-owned request pool");
+
+        let writer_slot = client.writer_slot_for_test();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (unhold_tx, unhold_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _guard = writer_slot.lock().await;
+            let _ = held_tx.send(());
+            let _ = unhold_rx.await;
+        });
+        held_rx.await.expect("writer slot must be held");
+
+        let payload = vec![7u8; 8192];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+
+        let identity = raw_peer_identity();
+        let mut call = Box::pin(client.call_with_prealloc(&identity, 0, &block, payload.len()));
+        use futures_util::FutureExt as _;
+        assert!(
+            call.as_mut().now_or_never().is_none(),
+            "the call must park waiting for the writer lock"
+        );
+        assert_eq!(
+            client.pending_len_for_test(),
+            1,
+            "the in-flight call owns exactly one pending entry"
+        );
+
+        // Caller cancellation: the send guard removes the entry at once.
+        drop(call);
+        assert_eq!(
+            client.pending_len_for_test(),
+            0,
+            "cancellation before the write must remove the pending entry immediately"
+        );
+        assert_eq!(pool.lock().stats().alloc_count, 1, "the block is armed");
+        let _ = block.release();
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+
+        let _ = unhold_tx.send(());
+        client.close_shared().await;
+    }
+
+    // ── Reply-wait cancellation, late replies, and bounded retire capacity ─
+
+    /// Echo callback that records dispatches (multi-shot) and stalls every
+    /// invoke until released, for batch-cancellation coverage.
+    struct CountingStall {
+        seen_kinds: Arc<Mutex<Vec<&'static str>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CrmCallback for CountingStall {
+        fn invoke(
+            &self,
+            _route_name: &str,
+            _method_idx: u16,
+            request: RequestData,
+            _response_pool: Arc<RwLock<MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            self.seen_kinds.lock().push(request_kind(&request));
+            let _ = self.release.lock().recv_timeout(Duration::from_secs(10));
+            let request = RequestLease::new(request);
+            let bytes = request
+                .into_owned_bytes()
+                .map_err(CrmError::InternalError)?;
+            self.finished
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(ResponseMeta::Inline(bytes))
+        }
+    }
+
+    /// Cancelling a call while it waits for a delayed reply on an otherwise
+    /// healthy connection must clean up its pending waiter, hand the
+    /// dedicated release authority to the retire path (charge stays until
+    /// read_done), and let the late reply release its response backing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reply_wait_cleans_pending_and_hands_off_dedicated() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let (callback, _seen_kinds, started_rx, release_tx, finished_rx) = stalling_echo();
+        let callback: Arc<dyn CrmCallback> = callback;
+        // Small server shm_threshold so the (late) reply uses SHM backing we
+        // can observe on the server's response pool.
+        let server = start_echo_server(
+            "reply_wait_cancel",
+            server_config(base.clone(), 64),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let budget = client
+            .request_pool()
+            .expect("dedicated-capable request pool")
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let binding = client
+            .acquire_route(&expected_contract("reply_wait_cancel"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+
+        let payload = vec![11u8; 48 * 1024];
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+        };
+        timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("callback must start (frame dispatched)")
+            .unwrap();
+        assert_eq!(client.pending_len_for_test(), 1);
+
+        // Cancel while the call waits for the delayed reply: the connection
+        // itself stays healthy.
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        assert!(
+            client.is_connected(),
+            "cancelling a reply wait must not tear down the healthy connection"
+        );
+        assert_eq!(
+            client.pending_len_for_test(),
+            0,
+            "cancelling a reply wait must remove the pending waiter immediately"
+        );
+        // The dedicated owner release was handed off: freed_at marked and
+        // the backing retained (not yet refunded) while the peer still reads.
+        assert!(
+            budget.snapshot().shm.used_bytes > 0,
+            "the handed-off dedicated backing must stay charged until read_done"
+        );
+
+        // Let the late reply land: its response backing must be released
+        // even though the waiter is gone.
+        release_tx.send(()).expect("release callback");
+        timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("callback must finish")
+            .unwrap();
+        wait_until(5, || budget.snapshot().shm.used_bytes == 0).await;
+        wait_until(5, || {
+            server.response_pool_arc().read().stats().alloc_count == 0
+        })
+        .await;
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Cancelling the reply wait must clean the pending waiter on every CRM
+    /// sender: inline, buddy/prealloc, and chunked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reply_wait_cleans_pending_across_senders() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let (callback, seen_kinds, release_tx) = {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let seen_kinds = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(CountingStall {
+                    seen_kinds: Arc::clone(&seen_kinds),
+                    release: Mutex::new(release_rx),
+                    finished: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                seen_kinds,
+                release_tx,
+            )
+        };
+        let callback: Arc<dyn CrmCallback> = callback;
+        // Three client policies, one connection each: a high threshold with a
+        // small chunk_size gives the inline (4 B) and chunked (48 KiB >
+        // chunk_size, under the threshold) senders; a buddy-disabled
+        // low-threshold client gives the prealloc/dedicated sender (4 KiB).
+        // One in-flight request per connection keeps every cancellation in the
+        // reply wait without depending on cross-request reassembly ordering.
+        let chunked_base = BaseIpcConfig {
+            chunk_size: 16 * 1024,
+            ..small_base(64 * 1024, 2)
+        };
+        let dedicated_base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 16 * 1024,
+            ..small_base(64 * 1024, 2)
+        };
+        let server = start_echo_server(
+            "sender_cancel",
+            server_config(chunked_base.clone(), 64),
+            callback,
+        )
+        .await;
+        let expected = expected_contract("sender_cancel");
+
+        let mut inline_client = IpcClient::with_config(
+            server.ipc_address(),
+            client_config(chunked_base.clone(), 1 << 20),
+        );
+        inline_client.connect().await.unwrap();
+        let inline_binding = inline_client.acquire_route(&expected).await.unwrap();
+        let inline_client = Arc::new(inline_client);
+        let mut chunked_client =
+            IpcClient::with_config(server.ipc_address(), client_config(chunked_base, 1 << 20));
+        chunked_client.connect().await.unwrap();
+        let chunked_binding = chunked_client.acquire_route(&expected).await.unwrap();
+        let chunked_client = Arc::new(chunked_client);
+        let mut dedicated_client =
+            IpcClient::with_config(server.ipc_address(), client_config(dedicated_base, 8));
+        dedicated_client.connect().await.unwrap();
+        let dedicated_binding = dedicated_client.acquire_route(&expected).await.unwrap();
+        let dedicated_client = Arc::new(dedicated_client);
+
+        let mut kinds = Vec::new();
+        for (label, client, binding, size) in [
+            ("inline", &inline_client, &inline_binding, 4usize),
+            (
+                "chunked_handle",
+                &chunked_client,
+                &chunked_binding,
+                48 * 1024,
+            ),
+            ("shm_dedicated", &dedicated_client, &dedicated_binding, 4096),
+        ] {
+            let dispatched = seen_kinds.lock().len();
+            let task = {
+                let client = Arc::clone(client);
+                let binding = binding.clone();
+                let payload = vec![7u8; size];
+                tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+            };
+            // The stalled callback has not read the request, so the frame was
+            // fully sent and the caller is parked in the reply wait.
+            wait_until(5, || seen_kinds.lock().len() > dispatched).await;
+            assert_eq!(
+                seen_kinds.lock().last().copied(),
+                Some(label),
+                "the {label} sender must be the transport under test"
+            );
+            task.abort();
+            assert!(
+                task.await.expect_err("aborted").is_cancelled(),
+                "the {label} caller must be cancelled in its reply wait"
+            );
+            assert_eq!(
+                client.pending_len_for_test(),
+                0,
+                "{label}: cancelling a reply wait must remove the pending waiter immediately"
+            );
+            assert!(
+                client.is_connected(),
+                "{label}: cancelling a reply wait must not tear down the healthy connection"
+            );
+            kinds.push(label);
+        }
+        assert_eq!(
+            kinds,
+            vec!["inline", "chunked_handle", "shm_dedicated"],
+            "all three CRM senders must be covered"
+        );
+
+        // Wake each stalled invoke so the server can shut down cleanly.
+        for _ in 0..3 {
+            let _ = release_tx.send(());
+        }
+        inline_client.close_shared().await;
+        chunked_client.close_shared().await;
+        dedicated_client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Retire-worker creation failure must fail the dedicated call closed
+    /// before publication: no bytes written, no dispatch, the block stays
+    /// armed — and the failure is recoverable once workers are available
+    /// again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_spawn_failure_fails_closed_before_publication() {
+        let _retire_lock = crate::client::dedicated_retire_test_control::exclusive_lock();
+        let (callback, seen_kinds) = echo_callback();
+        let callback: Arc<dyn CrmCallback> = callback;
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let server = start_echo_server(
+            "retire_spawn_fail",
+            server_config(base.clone(), 64),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        client.connect().await.unwrap();
+        let pool = client
+            .request_pool()
+            .expect("dedicated-capable request pool");
+        let binding = client
+            .acquire_route(&expected_contract("retire_spawn_fail"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
+
+        let payload = vec![9u8; 4096];
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+        assert!(block.is_dedicated());
+
+        let spawn_failure = crate::client::dedicated_retire_test_control::fail_worker_spawn();
+        let err = timeout(
+            Duration::from_secs(5),
+            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+        )
+        .await
+        .expect("the call must fail promptly")
+        .expect_err("a dedicated publication must fail without a retire worker");
+        assert!(
+            matches!(err, IpcError::Pool(ref message) if message.contains("retire worker unavailable")),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            seen_kinds.lock().is_empty(),
+            "the unpublished block must never reach dispatch"
+        );
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            0,
+            "the unpublished failure released the armed block cleanly (no leak)"
+        );
+
+        // Recoverable: a fresh publication succeeds once workers exist.
+        drop(spawn_failure);
+        let block = client
+            .try_alloc_request_block(payload.len())
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        block.write_at(0, &payload).expect("fill the block");
+        let response = timeout(
+            Duration::from_secs(5),
+            client.call_with_prealloc(&identity, method_idx, &block, payload.len()),
+        )
+        .await
+        .expect("retry must complete")
+        .expect("retry must succeed after worker recovery");
+        assert_eq!(response_bytes(&client, response), payload);
+        assert_eq!(seen_kinds.lock().len(), 1);
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Capacity saturation is a pre-publication rejection: the first
+    /// retained backing keeps its charge (never dropped or refunded), the
+    /// next dedicated publication fails with an explicit capacity error,
+    /// and once the retained backing retires through read_done the permit
+    /// returns and the same call succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_capacity_saturation_retains_and_recovers() {
+        let _retire_lock = crate::client::dedicated_retire_test_control::exclusive_lock();
+        let (callback, seen_kinds, release_tx) = {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let seen_kinds = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(CountingStall {
+                    seen_kinds: Arc::clone(&seen_kinds),
+                    release: Mutex::new(release_rx),
+                    finished: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                seen_kinds,
+                release_tx,
+            )
+        };
+        let callback: Arc<dyn CrmCallback> = callback;
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let server =
+            start_echo_server("retire_capacity", server_config(base.clone(), 64), callback).await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        client.connect().await.unwrap();
+        let budget = client
+            .request_pool()
+            .expect("dedicated-capable request pool")
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let binding = client
+            .acquire_route(&expected_contract("retire_capacity"))
+            .await
+            .unwrap();
+        let (method_idx, identity, _) = binding.call_target_for("echo").unwrap();
+        let client = Arc::new(client);
+
+        // A previously finished test may still own a permit for a backing its
+        // peer has not read; size the override one slot above that baseline.
+        let baseline = retire_permit_baseline().await;
+        let _capacity =
+            crate::client::dedicated_retire_test_control::capacity_override(baseline + 1);
+        let client_pool = client
+            .request_pool()
+            .expect("dedicated-capable request pool");
+
+        // First dedicated call: dispatched, then cancelled at the reply wait
+        // — its backing is retained through the bounded retire queue.
+        let first = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            let payload = vec![5u8; 4096];
+            tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+        };
+        wait_until(5, || !seen_kinds.lock().is_empty()).await;
+        first.abort();
+        assert!(first.await.expect_err("aborted").is_cancelled());
+        // Pool-local evidence: this call's freed-but-retained dedicated entry.
+        wait_until(5, || client_pool.lock().stats().dedicated_segments >= 1).await;
+        assert!(
+            budget.snapshot().shm.used_bytes > 0,
+            "the saturated-retained backing must stay charged"
+        );
+
+        // Second dedicated publication is rejected before any byte: the block
+        // stays armed and no dispatch happens. The override is re-measured per
+        // attempt because a permit owned by a test that already finished can
+        // retire at any moment; the admission check is exact whenever the
+        // grant count does not change between measurement and admission.
+        let second_block = client
+            .try_alloc_request_block(4096)
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        let mut rejection = None;
+        for attempt in 0..5 {
+            crate::client::dedicated_retire_test_control::set_capacity_override(
+                crate::client::dedicated_retire_test_control::snapshot().1,
+            );
+            match timeout(
+                Duration::from_secs(5),
+                client.call_with_prealloc(&identity, method_idx, &second_block, 4096),
+            )
+            .await
+            {
+                Ok(Err(err)) => {
+                    rejection = Some(err);
+                    break;
+                }
+                Ok(Ok(_)) => panic!(
+                    "attempt {attempt}: a dedicated publication must be rejected while the \
+                     retention queue is full"
+                ),
+                Err(_) => panic!("attempt {attempt}: the saturated call must fail promptly"),
+            }
+        }
+        let err = rejection.expect("saturation must reject the publication");
+        assert!(
+            matches!(err, IpcError::Pool(ref message) if message.contains("retire capacity exhausted")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(seen_kinds.lock().len(), 1, "no second dispatch happened");
+
+        // Retire the retained backing through read_done; the permit returns
+        // and a fresh publication then succeeds.
+        let _ = release_tx.send(());
+        wait_until(5, || {
+            crate::client::dedicated_retire_test_control::snapshot().1 <= baseline
+        })
+        .await;
+        let retry_block = client
+            .try_alloc_request_block(4096)
+            .expect("allocation attempt")
+            .expect("a request pool is selected");
+        retry_block
+            .write_at(0, &[5u8; 4096][..])
+            .expect("fill the block");
+        // The retry's stalled callback reads the next queued release signal.
+        let _ = release_tx.send(());
+        let response = timeout(
+            Duration::from_secs(5),
+            client.call_with_prealloc(&identity, method_idx, &retry_block, 4096),
+        )
+        .await
+        .expect("retry must complete")
+        .expect("retry must succeed after retirement");
+        assert_eq!(response_bytes(&client, response).len(), 4096);
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Batch cancellation must keep retire workers bounded and eventually
+    /// reclaim every retained backing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_workers_stay_bounded_under_batch_cancellation() {
+        let _retire_lock = crate::client::dedicated_retire_test_control::exclusive_lock();
+        let (callback, seen_kinds, release_tx) = {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let seen_kinds = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(CountingStall {
+                    seen_kinds: Arc::clone(&seen_kinds),
+                    release: Mutex::new(release_rx),
+                    finished: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                seen_kinds,
+                release_tx,
+            )
+        };
+        let callback: Arc<dyn CrmCallback> = callback;
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let server = start_echo_server(
+            "retire_batch_bound",
+            server_config(base.clone(), 64),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        client.connect().await.unwrap();
+        let budget = client
+            .request_pool()
+            .expect("dedicated-capable request pool")
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let binding = client
+            .acquire_route(&expected_contract("retire_batch_bound"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+
+        const BATCH: usize = 4;
+        // Permits a previously finished test still owns are not this batch's.
+        let baseline = retire_permit_baseline().await;
+        let client_pool = client
+            .request_pool()
+            .expect("dedicated-capable request pool");
+        let tasks: Vec<_> = (0..BATCH)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                let binding = binding.clone();
+                let payload = vec![5u8; 4096];
+                tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+            })
+            .collect();
+        wait_until(5, || seen_kinds.lock().len() >= BATCH).await;
+
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        // Every cancelled call retained its backing (pool-local evidence: the
+        // freed-but-unread dedicated entries are still mapped); the shared
+        // executor serves them with a bounded worker set.
+        wait_until(5, || client_pool.lock().stats().dedicated_segments >= BATCH).await;
+        let (_, permits, workers) = crate::client::dedicated_retire_test_control::snapshot();
+        assert!(permits >= BATCH, "retained permits: {permits}");
+        assert!(
+            workers <= 2,
+            "retire workers must stay within the thread limit, got {workers}"
+        );
+        assert!(budget.snapshot().shm.used_bytes > 0);
+
+        // read_done for all: every backing unmaps and every permit returns.
+        for _ in 0..BATCH {
+            let _ = release_tx.send(());
+        }
+        wait_until(5, || client_pool.lock().stats().dedicated_segments == 0).await;
+        wait_until(5, || {
+            crate::client::dedicated_retire_test_control::snapshot().1 <= baseline
+        })
+        .await;
+        wait_until(5, || budget.snapshot().shm.used_bytes == 0).await;
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    /// Repeated reply-wait cancellations on one healthy connection must not
+    /// accumulate pending waiters, and every handed-off dedicated backing must
+    /// still retire once the peer reads — nothing retained, nothing stranded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_reply_wait_cancellation_never_accumulates_pending() {
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let (callback, seen_kinds, release_tx) = {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let seen_kinds = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(CountingStall {
+                    seen_kinds: Arc::clone(&seen_kinds),
+                    release: Mutex::new(release_rx),
+                    finished: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                seen_kinds,
+                release_tx,
+            )
+        };
+        let callback: Arc<dyn CrmCallback> = callback;
+        let base = BaseIpcConfig {
+            pool_enabled: false,
+            chunk_size: 1 << 20,
+            ..small_base(64 * 1024, 2)
+        };
+        let server = start_echo_server(
+            "reply_wait_repeat",
+            server_config(base.clone(), 64),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        client.connect().await.unwrap();
+        let client_pool = client
+            .request_pool()
+            .expect("dedicated-capable request pool");
+        let budget = client_pool
+            .lock()
+            .budget()
+            .cloned()
+            .expect("owner pool carries the domain budget");
+        let binding = client
+            .acquire_route(&expected_contract("reply_wait_repeat"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+        let baseline = retire_permit_baseline().await;
+
+        const ROUNDS: usize = 6;
+        for round in 0..ROUNDS {
+            let task = {
+                let client = Arc::clone(&client);
+                let binding = binding.clone();
+                let payload = vec![13u8; 4096];
+                tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+            };
+            wait_until(5, || seen_kinds.lock().len() > round).await;
+            // The callback is stalled and has not read the request, so the
+            // cancellation below happens in the reply wait of a call whose
+            // frame the server already dispatched.
+            task.abort();
+            assert!(task.await.expect_err("aborted").is_cancelled());
+            assert_eq!(
+                client.pending_len_for_test(),
+                0,
+                "round {round} must leave no pending waiter on the healthy connection"
+            );
+            assert!(
+                client.is_connected(),
+                "round {round} must not tear down the healthy connection"
+            );
+        }
+
+        // Every cancelled call handed its dedicated backing to the bounded
+        // retire queue; all of them are still mapped and charged because the
+        // peer has not read yet. The evidence is pool-local: the process-wide
+        // permit count also carries permits owned by other, parallel tests.
+        wait_until(5, || {
+            client_pool.lock().stats().dedicated_segments >= ROUNDS
+        })
+        .await;
+        let workers = crate::client::dedicated_retire_test_control::snapshot().2;
+        assert!(workers <= 2, "retire workers stay bounded, got {workers}");
+        assert!(budget.snapshot().shm.used_bytes > 0);
+
+        // Unblock every stalled callback: each one reads its request and the
+        // handed-off backings retire through read_done.
+        for _ in 0..ROUNDS {
+            let _ = release_tx.send(());
+        }
+        wait_until(5, || client_pool.lock().stats().dedicated_segments == 0).await;
+        wait_until(5, || {
+            crate::client::dedicated_retire_test_control::snapshot().1 <= baseline
+        })
+        .await;
+        wait_until(5, || budget.snapshot().shm.used_bytes == 0).await;
+
+        // The connection is still fully usable after the cancellation storm.
+        let roundtrip = vec![21u8; 4096];
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            let payload = roundtrip.clone();
+            tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+        };
+        let _ = release_tx.send(());
+        let response = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the post-cancellation call must complete")
+            .expect("call task must not panic")
+            .expect("the healthy connection must still serve calls");
+        assert_eq!(response_bytes(&client, response), roundtrip);
+        assert_eq!(client.pending_len_for_test(), 0);
+
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
 }
 
 /// Chunked-response admission against the client's canonical reassembly
@@ -2512,7 +4339,7 @@ mod chunk_reply_admission_tests {
         driven
             .pending
             .lock()
-            .insert(rid, PendingResponse::Unary(tx));
+            .insert(rid, PendingResponse::unary(tx));
         rx
     }
 

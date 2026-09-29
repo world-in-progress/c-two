@@ -241,7 +241,9 @@ impl SyncClient {
     /// The fill callback receives exactly `data_size` bytes and runs without
     /// any pool lock held; the returned [`RequestBlock`] keeps the owning pool
     /// alive. On callback failure the allocation is released through that same
-    /// owner before the error is returned.
+    /// owner before the error is returned, and a panicking callback unwinds
+    /// through the block's armed `Drop` release, so neither path can strand
+    /// the allocation or its shared-domain charge.
     pub fn pool_alloc_and_fill<F>(
         &self,
         data_size: usize,
@@ -827,5 +829,46 @@ pub(crate) mod tests {
             "the replacement pool's live canary must never be freed by stale coordinates"
         );
         companion.join().expect("companion thread");
+    }
+
+    /// A panicking fill callback must not leak the allocation.
+    ///
+    /// The callback runs between the allocation and any frame write, so the
+    /// block is purely local when the panic unwinds through
+    /// `pool_alloc_and_fill`; unwinding must release it through the owning
+    /// pool instead of stranding the charge until the client is dropped.
+    #[test]
+    fn pool_alloc_and_fill_panic_releases_the_allocation() {
+        let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig {
+            segment_size: 65_536,
+            max_segments: 1,
+            ..c2_mem::PoolConfig::default()
+        })));
+        let inner = IpcClient::with_pool(
+            "ipc://fill_panic_release",
+            Arc::clone(&pool),
+            ClientIpcConfig {
+                shm_threshold: 1,
+                ..ClientIpcConfig::default()
+            },
+        );
+        let client = SyncClient {
+            inner,
+            rt: get_or_create_runtime().handle().clone(),
+        };
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.pool_alloc_and_fill(64, |_| panic!("injected fill callback panic"))
+        }));
+        std::panic::set_hook(previous_hook);
+
+        assert!(panic.is_err(), "the injected fill panic must unwind");
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            0,
+            "a panicking fill callback must release the allocation through the owning pool"
+        );
     }
 }
