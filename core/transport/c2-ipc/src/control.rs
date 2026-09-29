@@ -104,8 +104,70 @@ fn blocking<T: Send + 'static>(
         .map_err(|_| IpcError::Io(io::Error::other("local control worker panicked")))?
 }
 
+/// Test-only seams for the control probes.
+///
+/// Both seams are keyed by the exact logical address, so a watcher or a
+/// fault-injection entry only affects the probe that registered it. There is no
+/// unattributed global hook: other tests in this binary, and their endpoints,
+/// are never observed or changed.
+#[cfg(test)]
+mod test_seam {
+    use std::collections::HashSet;
+    use std::sync::mpsc;
+    use std::sync::{Mutex, OnceLock};
+
+    static ABSENT_WATCHERS: OnceLock<Mutex<Vec<(String, mpsc::Sender<()>)>>> = OnceLock::new();
+    static ABSENT_RETRY_DISABLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+    /// Reports the next `Exchange::Absent` for `address` exactly once.
+    pub(super) fn watch_first_absent(address: &str) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        ABSENT_WATCHERS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("absence watcher registry poisoned")
+            .push((address.to_owned(), sender));
+        receiver
+    }
+
+    /// Called by `ping` every time an exchange classifies the endpoint as absent.
+    pub(super) fn note_absent(address: &str) {
+        ABSENT_WATCHERS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("absence watcher registry poisoned")
+            .retain(|(watched, sender)| {
+                if watched == address {
+                    let _ = sender.send(());
+                    false
+                } else {
+                    true
+                }
+            });
+    }
+
+    /// Test-only fault injection: `ping` treats its first `Absent` as final.
+    pub(super) fn disable_absent_retry(address: &str) {
+        ABSENT_RETRY_DISABLED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("absent-retry registry poisoned")
+            .insert(address.to_owned());
+    }
+
+    pub(super) fn absent_retry_disabled(address: &str) -> bool {
+        ABSENT_RETRY_DISABLED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("absent-retry registry poisoned")
+            .contains(address)
+    }
+}
+
 pub fn ping(address: &str, timeout: Duration) -> Result<bool, IpcError> {
     let endpoint = local_endpoint_from_ipc_address(address)?;
+    #[cfg(test)]
+    let address = address.to_owned();
     blocking(async move {
         let started = Instant::now();
         while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
@@ -124,7 +186,17 @@ pub fn ping(address: &str, timeout: Duration) -> Result<bool, IpcError> {
                         && flags & FLAG_RESPONSE != 0
                         && payload == PONG_BYTES);
                 }
-                Exchange::Absent | Exchange::NoReply => {
+                Exchange::Absent => {
+                    #[cfg(test)]
+                    {
+                        test_seam::note_absent(&address);
+                        if test_seam::absent_retry_disabled(&address) {
+                            return Ok(false);
+                        }
+                    }
+                    tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
+                }
+                Exchange::NoReply => {
                     tokio::time::sleep(remaining.min(Duration::from_millis(10))).await
                 }
             }
@@ -188,42 +260,144 @@ mod tests {
     use c2_wire::shutdown_control::encode_shutdown_ack;
     use std::sync::mpsc;
 
+    /// Fixture-only bound: responder readiness, bind completion, and the
+    /// first-absence event. It never bounds a probe under test.
+    const FIXTURE_BUDGET: Duration = Duration::from_secs(10);
+
+    /// The probe budget under test, unchanged from the CI assertion.
+    const PROBE_BUDGET: Duration = Duration::from_secs(1);
+
     fn address(label: &str) -> String {
         format!("ipc://control-{label}-{}", std::process::id())
     }
 
+    /// True when the endpoint does not exist at this instant.
+    ///
+    /// A live endpoint can also be busy or unresponsive, so absence is proven
+    /// by the operating-system connect result, not by a missing reply.
+    fn endpoint_is_absent(endpoint: &LocalEndpoint) -> bool {
+        let endpoint = endpoint.clone();
+        blocking(async move {
+            match LocalStream::connect(&endpoint, Duration::from_millis(100)).await {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Ok(stream) => {
+                    drop(stream);
+                    Ok(false)
+                }
+                Err(_) => Ok(false),
+            }
+        })
+        .expect("local absence probe")
+    }
+
+    /// A responder that is already running behind a gate.
+    ///
+    /// Readiness and binding are separate events: `ready` fires only after the
+    /// responder's thread, runtime, and endpoint naming are initialized, so no
+    /// fixture setup cost can be mistaken for probe time. The endpoint cannot
+    /// exist before the gate opens, so the caller decides exactly when it
+    /// appears. One abandoned exchange cannot strand the fixture: every
+    /// connection gets its own attempt.
+    struct Responder {
+        gate: mpsc::Sender<()>,
+        ready: mpsc::Receiver<()>,
+        bound: mpsc::Receiver<()>,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Responder {
+        /// Waits until the responder thread, runtime, and endpoint naming are
+        /// initialized and it is parked on the gate.
+        fn wait_ready(&self) {
+            self.ready
+                .recv_timeout(FIXTURE_BUDGET)
+                .expect("the responder never became ready");
+        }
+
+        /// Opens the gate and waits until the endpoint exists.
+        fn bind(&self) {
+            self.gate.send(()).expect("responder gate receiver dropped");
+            self.bound
+                .recv_timeout(FIXTURE_BUDGET)
+                .expect("the responder never bound the endpoint");
+        }
+
+        /// Stops serving, then reports a fixture that failed on its own terms.
+        fn stop(mut self) {
+            let stop = self.stop.take().expect("responder is already stopped");
+            let _ = stop.send(());
+            self.thread.join().expect("responder thread panicked");
+        }
+    }
+
     fn responder(
         address: String,
-        delay: Duration,
         discard_first: bool,
         expected: Vec<u8>,
         reply: Vec<u8>,
-    ) -> (mpsc::Receiver<()>, std::thread::JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel();
+    ) -> Responder {
+        let (gate, gate_rx) = mpsc::channel();
+        let (ready_tx, ready) = mpsc::channel();
+        let (bound_tx, bound) = mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    tokio::time::sleep(delay).await;
+                    // Naming an endpoint costs token and hashing work on
+                    // Windows, so it happens before readiness: opening the gate
+                    // must only have to create the operating-system endpoint.
                     let endpoint = LocalEndpoint::from_address(&address).unwrap();
+                    ready_tx.send(()).unwrap();
+                    gate_rx.recv().expect("responder gate sender dropped");
                     let mut listener = LocalListener::bind(&endpoint).unwrap();
-                    tx.send(()).unwrap();
-                    if discard_first {
-                        let mut first = listener.accept().await.unwrap();
-                        let _ = read_reply(&mut first).await.unwrap();
+                    bound_tx.send(()).unwrap();
+                    let mut dropped = discard_first;
+                    loop {
+                        tokio::select! {
+                            _ = &mut stop_rx => break,
+                            accepted = listener.accept() => {
+                                let mut stream = accepted.unwrap();
+                                if dropped {
+                                    // Closing this connection is the dropped
+                                    // exchange. An attempt the probe abandoned
+                                    // before its frame landed is already a
+                                    // non-reply, so the read result is moot.
+                                    dropped = false;
+                                    let _ = read_reply(&mut stream).await;
+                                    continue;
+                                }
+                                let payload = match read_reply(&mut stream).await {
+                                    Ok((_, payload)) => payload,
+                                    // An exchange the probe abandoned is another
+                                    // attempt to answer, not a fixture failure.
+                                    Err(_) => continue,
+                                };
+                                assert_eq!(payload, expected);
+                                // A reply the probe never read costs one more
+                                // attempt, so writing it is best effort.
+                                let _ = stream
+                                    .write_all(&frame::encode_frame(
+                                        0,
+                                        FLAG_SIGNAL | FLAG_RESPONSE,
+                                        &reply,
+                                    ))
+                                    .await;
+                            }
+                        }
                     }
-                    let mut stream = listener.accept().await.unwrap();
-                    let (_, payload) = read_reply(&mut stream).await.unwrap();
-                    assert_eq!(payload, expected);
-                    stream
-                        .write_all(&frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE, &reply))
-                        .await
-                        .unwrap();
                 });
         });
-        (rx, thread)
+        Responder {
+            gate,
+            ready,
+            bound,
+            stop: Some(stop_tx),
+            thread,
+        }
     }
 
     #[test]
@@ -272,18 +446,69 @@ mod tests {
         assert!(!result.server_stopped);
     }
 
-    #[test]
-    fn ping_retries_until_endpoint_appears() {
-        let address = address("late");
-        let (_ready, thread) = responder(
-            address.clone(),
-            Duration::from_millis(50),
+    /// Drives one probe through the absent-to-ready sequence and returns its
+    /// outcome.
+    ///
+    /// The probe's own first `Exchange::Absent`, reported through the
+    /// address-keyed seam, is the event that opens the responder gate. The
+    /// endpoint therefore appears strictly after this probe observed it
+    /// missing, and a successful probe can only be explained by retrying after
+    /// that event. The probe keeps `PROBE_BUDGET`; the fixture waits use
+    /// `FIXTURE_BUDGET`.
+    fn probe_absent_to_ready(address: &str) -> Result<bool, IpcError> {
+        let endpoint = local_endpoint_from_ipc_address(address).expect("fixture address");
+        let first_absent = test_seam::watch_first_absent(address);
+        let responder = responder(
+            address.to_owned(),
             false,
             PING_BYTES.to_vec(),
             PONG_BYTES.to_vec(),
         );
-        assert!(ping(&address, Duration::from_secs(1)).unwrap());
-        thread.join().unwrap();
+        responder.wait_ready();
+        // Sanity check on the fixture, not the retry evidence: the seam event
+        // below is what proves this probe saw the endpoint missing.
+        assert!(
+            endpoint_is_absent(&endpoint),
+            "the fixture endpoint existed before the probe started"
+        );
+        let probe = std::thread::spawn({
+            let address = address.to_owned();
+            move || ping(&address, PROBE_BUDGET)
+        });
+        first_absent
+            .recv_timeout(FIXTURE_BUDGET)
+            .expect("the probe never observed the endpoint as absent");
+        // The endpoint appears only after this probe's first absence event.
+        responder.bind();
+        let outcome = probe.join().expect("probe thread panicked");
+        responder.stop();
+        outcome
+    }
+
+    /// The probe starts while the endpoint does not exist and must keep retrying
+    /// until the endpoint appears and answers.
+    #[test]
+    fn ping_retries_until_endpoint_appears() {
+        let address = address("late");
+        let outcome = probe_absent_to_ready(&address);
+        let probed = outcome.expect("ping must report absence, not a retry error");
+        assert!(probed, "ping must succeed once the endpoint appears");
+    }
+
+    /// Deterministic counterexample for the retry evidence above: with the same
+    /// fixture, the same events, and the same one-second budget, a probe that
+    /// treats its first `Absent` as final never reaches the endpoint that binds
+    /// right after that event. This is the negation of the positive test's
+    /// assertion, so disabling the absent retry makes that test fail.
+    #[test]
+    fn ping_without_absent_retry_never_reaches_a_late_endpoint() {
+        let address = address("no-retry");
+        test_seam::disable_absent_retry(&address);
+        let outcome = probe_absent_to_ready(&address);
+        assert!(
+            !matches!(outcome, Ok(true)),
+            "without an absent retry the probe cannot succeed"
+        );
     }
 
     #[test]
@@ -296,18 +521,18 @@ mod tests {
                 server_stopped: false,
                 route_outcomes: Vec::new(),
             };
-            let (ready, thread) = responder(
+            let responder = responder(
                 address.clone(),
-                Duration::ZERO,
                 discard_first,
                 encode_shutdown_initiate().to_vec(),
                 encode_shutdown_ack(&expected).unwrap(),
             );
-            ready.recv_timeout(Duration::from_secs(1)).unwrap();
-            let result = shutdown(&address, Duration::from_secs(1)).unwrap();
+            responder.wait_ready();
+            responder.bind();
+            let result = shutdown(&address, PROBE_BUDGET).unwrap();
+            responder.stop();
             assert!(result.acknowledged && result.shutdown_started && !result.server_stopped);
             assert!(result.route_outcomes.is_empty());
-            thread.join().unwrap();
         }
     }
 }
