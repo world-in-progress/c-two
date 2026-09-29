@@ -1194,14 +1194,86 @@ mod lazy_policy_roundtrip_tests {
     // ── Shared helpers for the corrective (Host-review) tests ────────────
 
     /// Poll every 25 ms until `cond` holds, panicking after `secs`.
-    async fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) {
+    async fn wait_until(secs: u64, cond: impl FnMut() -> bool) {
+        wait_until_observed(secs, "condition", cond, || String::new()).await;
+    }
+
+    /// Poll every 25 ms until `cond` holds, panicking after `secs` with the
+    /// caller's observation of the state that was still wrong.
+    ///
+    /// A bare "condition not reached within 5s" cannot distinguish "the
+    /// fixture never granted the concurrency this scenario asks for" from "the
+    /// production path lost a backing, a permit, or a signal". The waits that
+    /// carry the cancellation/retirement proof therefore report what they
+    /// actually saw instead of only how long they waited.
+    async fn wait_until_observed(
+        secs: u64,
+        what: &str,
+        mut cond: impl FnMut() -> bool,
+        mut observe: impl FnMut() -> String,
+    ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         while !cond() {
             if tokio::time::Instant::now() >= deadline {
-                panic!("condition not reached within {secs}s");
+                panic!(
+                    "condition not reached within {secs}s: {what} | observed {}",
+                    observe()
+                );
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// Declared server execution concurrency for the cancellation scenarios.
+    ///
+    /// Both scenarios hand a request to the server and only cancel the client's
+    /// reply wait, so every earlier callback is still holding an execution slot
+    /// when the next request arrives. The default
+    /// `max_execution_workers` follows `available_parallelism()` (clamped to
+    /// `4..=64`), which makes the number of slots a property of the machine:
+    /// a 4-vCPU CI runner starves the fifth simultaneous callback. The fixture
+    /// requirement is therefore declared here, where the scenario can be read,
+    /// instead of being inherited from the host CPU count.
+    fn cancellation_server_config(
+        base: BaseIpcConfig,
+        shm_threshold: u64,
+        concurrent_callbacks: usize,
+    ) -> ServerIpcConfig {
+        ServerIpcConfig {
+            max_execution_workers: u32::try_from(concurrent_callbacks)
+                .expect("fixture concurrency fits a worker count"),
+            ..server_config(base, shm_threshold)
+        }
+    }
+
+    /// One-line observation of the state the cancellation scenarios wait on.
+    ///
+    /// Deliberately mixes three different scopes so a timeout is diagnosable:
+    /// `callbacks_entered` is the server's proof that the request arrived,
+    /// `pending`/`connected` are caller-side cancellation evidence, the
+    /// `dedicated_*` fields are pool-local backing evidence, and the retire
+    /// counters are process-wide (a parallel test can own permits this scenario
+    /// never granted).
+    fn cancellation_state(
+        label: &str,
+        callbacks_entered: usize,
+        pending: usize,
+        connected: bool,
+        pool: &Arc<Mutex<MemPool>>,
+        budget: &MemoryBudget,
+    ) -> String {
+        let stats = pool.lock().stats();
+        let (jobs, permits, workers) = crate::client::dedicated_retire_test_control::snapshot();
+        format!(
+            "{label}: callbacks_entered={callbacks_entered} pending={pending} \
+             connected={connected} dedicated_segments={} dedicated_active={} \
+             dedicated_pending_free_bytes={} retire_jobs={jobs} retire_permits={permits} \
+             retire_workers={workers} shm_used_bytes={}",
+            stats.dedicated_segments,
+            stats.dedicated_active_count,
+            stats.dedicated_pending_free_bytes,
+            budget.snapshot().shm.used_bytes,
+        )
     }
 
     /// Retention permits still outstanding when an exclusive retire test
@@ -1328,6 +1400,120 @@ mod lazy_policy_roundtrip_tests {
         }
         control::set_capacity_override(0);
         assert!(control::can_reserve(), "retirement returns the permit");
+    }
+
+    /// A single retained job still counts against its exact pool after a worker
+    /// takes it off the shared queue and until the peer's `read_done` returns
+    /// its permit.
+    ///
+    /// Host-review regression: `pop_front` removes the job from `state.jobs`
+    /// before `dedicated_retire_backing` runs, so a queue-only scoped witness
+    /// observed zero during that window and a "slots returned" wait could pass
+    /// while the backing was still retained unread. The in-flight window is
+    /// pinned deterministically here: the job is proven taken through the
+    /// executor's own popped-job observation, and the backing cannot retire
+    /// because the peer has not read it and the crash timeout is 30 s away.
+    #[test]
+    fn pool_scoped_retention_slot_stays_visible_while_the_job_is_in_flight() {
+        use crate::client::dedicated_retire_test_control as control;
+        let _retire_lock = control::exclusive_lock();
+        let config = PoolConfig {
+            segment_size: 64 * 1024,
+            min_block_size: 4096,
+            max_segments: 2,
+            max_dedicated_segments: 2,
+            // Far beyond every wait bound in this test: without the peer's
+            // read_done the backing stays retained, which is what makes the
+            // in-flight assertion deterministic instead of a race with
+            // retirement.
+            dedicated_crash_timeout_secs: 30.0,
+            spill_threshold: 1.0,
+            buddy_enabled: false,
+            ..PoolConfig::default()
+        };
+        let budget = MemoryBudget::new(1 << 20, 1 << 20, 1 << 20);
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            config.clone(),
+            format!(
+                "/cc3inflight{:08x}{:08x}",
+                std::process::id(),
+                ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
+            budget.clone(),
+        )));
+        let alloc = pool.lock().alloc(4096).expect("real dedicated allocation");
+        assert!(alloc.is_dedicated);
+        let prefix = pool.lock().prefix().to_string();
+        let name = pool
+            .lock()
+            .dedicated_name(alloc.seg_idx)
+            .expect("dedicated backing name")
+            .to_string();
+        let mut peer = MemPool::open_peer(config, prefix);
+        peer.open_dedicated_at(alloc.seg_idx, &name, 4096)
+            .expect("peer opens the request backing");
+        let charged = budget.snapshot().shm.used_bytes;
+        assert!(charged > 0, "the retained backing must be charged");
+
+        // Hand one already-freed backing to the shared executor through the
+        // production queue path. `returned` flips inside `permit.release()`.
+        let returned = control::submit_retention_for_test(Arc::clone(&pool), alloc);
+
+        // Deterministic "taken by the worker": a non-zero popped-job count
+        // proves the job left the queue, and retirement is impossible before
+        // read_done.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while control::in_flight_jobs_for_pool(&pool) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shared retire worker must take the single queued job"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            control::retention_jobs_for_pool(&pool),
+            1,
+            "a popped, unread retained backing must still count against its pool"
+        );
+        assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        assert!(!returned.load(Ordering::Acquire));
+
+        peer.free_at(alloc.seg_idx, alloc.generation, alloc.offset, 4096, true)
+            .expect("peer signals read_done");
+        // Sample the returned flag and scoped count under the executor lock.
+        // Independent reads allow the worker to return the permit and clear
+        // the count between them, producing a false failure. If this snapshot
+        // sees false + zero, the count really vanished before permit return.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (retained, permit_returned) =
+                control::retention_and_returned_for_pool(&pool, &returned);
+            if permit_returned {
+                break;
+            }
+            assert!(
+                retained >= 1,
+                "the scoped count must stay non-zero until the permit returns"
+            );
+            assert!(std::time::Instant::now() < deadline, "retirement timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while control::retention_jobs_for_pool(&pool) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scoped count must return to zero once the permit is back"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(control::in_flight_jobs_for_pool(&pool), 0);
+        assert!(!pool.lock().dedicated_awaiting_retirement(&alloc));
+        assert_eq!(
+            budget.snapshot().shm.used_bytes,
+            0,
+            "the retired backing's charge must return"
+        );
     }
 
     /// Client config with a fast idle-decay window so maintenance-driven
@@ -4025,9 +4211,12 @@ mod lazy_policy_roundtrip_tests {
             chunk_size: 1 << 20,
             ..small_base(64 * 1024, 2)
         };
+        // The scenario needs `BATCH` callbacks stalled at the same time: the
+        // `64` below is the server's shm_threshold, not a worker count.
+        const BATCH: usize = 4;
         let server = start_echo_server(
             "retire_batch_bound",
-            server_config(base.clone(), 64),
+            cancellation_server_config(base.clone(), 64, BATCH),
             callback,
         )
         .await;
@@ -4045,22 +4234,45 @@ mod lazy_policy_roundtrip_tests {
             .await
             .unwrap();
         let client = Arc::new(client);
-
-        const BATCH: usize = 4;
-        // Permits a previously finished test still owns are not this batch's.
-        let baseline = retire_permit_baseline().await;
         let client_pool = client
             .request_pool()
             .expect("dedicated-capable request pool");
+        let call_errors = Arc::new(Mutex::new(Vec::<String>::new()));
         let tasks: Vec<_> = (0..BATCH)
             .map(|_| {
                 let client = Arc::clone(&client);
                 let binding = binding.clone();
                 let payload = vec![5u8; 4096];
-                tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+                let call_errors = Arc::clone(&call_errors);
+                tokio::spawn(async move {
+                    let result = client.call_bound(&binding, "echo", &payload).await;
+                    if let Err(error) = &result {
+                        call_errors.lock().push(format!("{error:?}"));
+                    }
+                    result
+                })
             })
             .collect();
-        wait_until(5, || seen_kinds.lock().len() >= BATCH).await;
+        wait_until_observed(
+            5,
+            "every batch callback must be dispatched to the server",
+            || seen_kinds.lock().len() >= BATCH,
+            || {
+                format!(
+                    "{} call_errors={:?}",
+                    cancellation_state(
+                        "batch dispatch",
+                        seen_kinds.lock().len(),
+                        client.pending_len_for_test(),
+                        client.is_connected(),
+                        &client_pool,
+                        &budget,
+                    ),
+                    call_errors.lock().clone(),
+                )
+            },
+        )
+        .await;
 
         for task in tasks {
             task.abort();
@@ -4069,7 +4281,22 @@ mod lazy_policy_roundtrip_tests {
         // Every cancelled call retained its backing (pool-local evidence: the
         // freed-but-unread dedicated entries are still mapped); the shared
         // executor serves them with a bounded worker set.
-        wait_until(5, || client_pool.lock().stats().dedicated_segments >= BATCH).await;
+        wait_until_observed(
+            5,
+            "every cancelled batch call must still retain its dedicated backing",
+            || client_pool.lock().stats().dedicated_segments >= BATCH,
+            || {
+                cancellation_state(
+                    "batch retention",
+                    seen_kinds.lock().len(),
+                    client.pending_len_for_test(),
+                    client.is_connected(),
+                    &client_pool,
+                    &budget,
+                )
+            },
+        )
+        .await;
         let (_, permits, workers) = crate::client::dedicated_retire_test_control::snapshot();
         assert!(permits >= BATCH, "retained permits: {permits}");
         assert!(
@@ -4082,12 +4309,61 @@ mod lazy_policy_roundtrip_tests {
         for _ in 0..BATCH {
             let _ = release_tx.send(());
         }
-        wait_until(5, || client_pool.lock().stats().dedicated_segments == 0).await;
-        wait_until(5, || {
-            crate::client::dedicated_retire_test_control::snapshot().1 <= baseline
-        })
+        wait_until_observed(
+            5,
+            "every released batch backing must unmap after read_done",
+            || client_pool.lock().stats().dedicated_segments == 0,
+            || {
+                cancellation_state(
+                    "batch read_done",
+                    seen_kinds.lock().len(),
+                    client.pending_len_for_test(),
+                    client.is_connected(),
+                    &client_pool,
+                    &budget,
+                )
+            },
+        )
         .await;
-        wait_until(5, || budget.snapshot().shm.used_bytes == 0).await;
+        wait_until_observed(
+            5,
+            "every batch retention slot must return to its pool",
+            || {
+                crate::client::dedicated_retire_test_control::retention_jobs_for_pool(&client_pool)
+                    == 0
+            },
+            || {
+                let (jobs, permits, workers) =
+                    crate::client::dedicated_retire_test_control::snapshot();
+                format!(
+                    "batch slots: pool_jobs={} pool_in_flight={} executor_jobs={jobs} \
+                     executor_permits={permits} workers={workers}",
+                    crate::client::dedicated_retire_test_control::retention_jobs_for_pool(
+                        &client_pool
+                    ),
+                    crate::client::dedicated_retire_test_control::in_flight_jobs_for_pool(
+                        &client_pool
+                    ),
+                )
+            },
+        )
+        .await;
+        wait_until_observed(
+            5,
+            "the batch memory budget must be fully returned",
+            || budget.snapshot().shm.used_bytes == 0,
+            || {
+                cancellation_state(
+                    "batch budget",
+                    seen_kinds.lock().len(),
+                    client.pending_len_for_test(),
+                    client.is_connected(),
+                    &client_pool,
+                    &budget,
+                )
+            },
+        )
+        .await;
 
         client.close_shared().await;
         stop_server(&server).await;
@@ -4118,9 +4394,13 @@ mod lazy_policy_roundtrip_tests {
             chunk_size: 1 << 20,
             ..small_base(64 * 1024, 2)
         };
+        // One execution slot per round: the earlier rounds' callbacks are still
+        // stalled when the next request arrives (the `64` below is the server's
+        // shm_threshold, not a worker count).
+        const ROUNDS: usize = 6;
         let server = start_echo_server(
             "reply_wait_repeat",
-            server_config(base.clone(), 64),
+            cancellation_server_config(base.clone(), 64, ROUNDS),
             callback,
         )
         .await;
@@ -4139,17 +4419,47 @@ mod lazy_policy_roundtrip_tests {
             .await
             .unwrap();
         let client = Arc::new(client);
-        let baseline = retire_permit_baseline().await;
 
-        const ROUNDS: usize = 6;
         for round in 0..ROUNDS {
+            // A call that returns before its callback enters failed instead of
+            // waiting; the diagnostic below reports that error verbatim.
+            let call_error = Arc::new(Mutex::new(None::<String>));
             let task = {
                 let client = Arc::clone(&client);
                 let binding = binding.clone();
                 let payload = vec![13u8; 4096];
-                tokio::spawn(async move { client.call_bound(&binding, "echo", &payload).await })
+                let call_error = Arc::clone(&call_error);
+                tokio::spawn(async move {
+                    let result = client.call_bound(&binding, "echo", &payload).await;
+                    if let Err(error) = &result {
+                        *call_error.lock() = Some(format!("{error:?}"));
+                    }
+                    result
+                })
             };
-            wait_until(5, || seen_kinds.lock().len() > round).await;
+            wait_until_observed(
+                5,
+                &format!("round {round} must reach the stalled callback"),
+                || seen_kinds.lock().len() > round,
+                || {
+                    format!(
+                        "{} call_outcome={}",
+                        cancellation_state(
+                            &format!("round {round} call_finished={}", task.is_finished()),
+                            seen_kinds.lock().len(),
+                            client.pending_len_for_test(),
+                            client.is_connected(),
+                            &client_pool,
+                            &budget,
+                        ),
+                        match call_error.lock().as_deref() {
+                            Some(error) => format!("failed with {error}"),
+                            None => "still waiting".to_string(),
+                        },
+                    )
+                },
+            )
+            .await;
             // The callback is stalled and has not read the request, so the
             // cancellation below happens in the reply wait of a call whose
             // frame the server already dispatched.
@@ -4170,9 +4480,21 @@ mod lazy_policy_roundtrip_tests {
         // retire queue; all of them are still mapped and charged because the
         // peer has not read yet. The evidence is pool-local: the process-wide
         // permit count also carries permits owned by other, parallel tests.
-        wait_until(5, || {
-            client_pool.lock().stats().dedicated_segments >= ROUNDS
-        })
+        wait_until_observed(
+            5,
+            "every cancelled round must retain its dedicated backing",
+            || client_pool.lock().stats().dedicated_segments >= ROUNDS,
+            || {
+                cancellation_state(
+                    "round retention",
+                    seen_kinds.lock().len(),
+                    client.pending_len_for_test(),
+                    client.is_connected(),
+                    &client_pool,
+                    &budget,
+                )
+            },
+        )
         .await;
         let workers = crate::client::dedicated_retire_test_control::snapshot().2;
         assert!(workers <= 2, "retire workers stay bounded, got {workers}");
@@ -4183,12 +4505,61 @@ mod lazy_policy_roundtrip_tests {
         for _ in 0..ROUNDS {
             let _ = release_tx.send(());
         }
-        wait_until(5, || client_pool.lock().stats().dedicated_segments == 0).await;
-        wait_until(5, || {
-            crate::client::dedicated_retire_test_control::snapshot().1 <= baseline
-        })
+        wait_until_observed(
+            5,
+            "every released round backing must unmap after read_done",
+            || client_pool.lock().stats().dedicated_segments == 0,
+            || {
+                cancellation_state(
+                    "round read_done",
+                    seen_kinds.lock().len(),
+                    client.pending_len_for_test(),
+                    client.is_connected(),
+                    &client_pool,
+                    &budget,
+                )
+            },
+        )
         .await;
-        wait_until(5, || budget.snapshot().shm.used_bytes == 0).await;
+        wait_until_observed(
+            5,
+            "every round retention slot must return to its pool",
+            || {
+                crate::client::dedicated_retire_test_control::retention_jobs_for_pool(&client_pool)
+                    == 0
+            },
+            || {
+                let (jobs, permits, workers) =
+                    crate::client::dedicated_retire_test_control::snapshot();
+                format!(
+                    "round slots: pool_jobs={} pool_in_flight={} executor_jobs={jobs} \
+                     executor_permits={permits} workers={workers}",
+                    crate::client::dedicated_retire_test_control::retention_jobs_for_pool(
+                        &client_pool
+                    ),
+                    crate::client::dedicated_retire_test_control::in_flight_jobs_for_pool(
+                        &client_pool
+                    ),
+                )
+            },
+        )
+        .await;
+        wait_until_observed(
+            5,
+            "the round memory budget must be fully returned",
+            || budget.snapshot().shm.used_bytes == 0,
+            || {
+                cancellation_state(
+                    "round budget",
+                    seen_kinds.lock().len(),
+                    client.pending_len_for_test(),
+                    client.is_connected(),
+                    &client_pool,
+                    &budget,
+                )
+            },
+        )
+        .await;
 
         // The connection is still fully usable after the cancellation storm.
         let roundtrip = vec![21u8; 4096];

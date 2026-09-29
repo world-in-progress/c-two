@@ -190,6 +190,15 @@ struct DedicatedRetireState {
     /// Test-only spawn-failure injection.
     #[cfg(test)]
     fail_spawn: bool,
+    /// Test-only: pools whose job a worker has already popped and whose permit
+    /// has not returned yet.
+    ///
+    /// Pushed under the same lock as `pop_front`, so a job is never invisible
+    /// to the scoped count between "queued" and "in flight". The entry is a
+    /// `Weak` reference: observation alone must never keep a pool alive that
+    /// the job itself would have released.
+    #[cfg(test)]
+    in_flight: Vec<Weak<StdMutex<MemPool>>>,
 }
 
 struct DedicatedRetireExecutor {
@@ -211,6 +220,8 @@ fn dedicated_retire() -> &'static DedicatedRetireExecutor {
             live_workers: 0,
             #[cfg(test)]
             fail_spawn: false,
+            #[cfg(test)]
+            in_flight: Vec::new(),
         }),
         signal: parking_lot::Condvar::new(),
     })
@@ -221,22 +232,39 @@ fn dedicated_retire() -> &'static DedicatedRetireExecutor {
 /// (queued jobs, granted permits, live workers).
 #[cfg(test)]
 pub(crate) mod dedicated_retire_test_control {
-    use super::{DEDICATED_RETIRE_CAPACITY_OVERRIDE, DedicatedRetirePermit, dedicated_retire};
+    use super::{
+        Arc, DEDICATED_RETIRE_CAPACITY_OVERRIDE, DedicatedRetirePermit, MemPool, StdMutex,
+        dedicated_retire,
+    };
 
     /// Exclusive guard for tests that inject executor faults: the shared
     /// process-wide executor sees one controlled scenario at a time, and no
     /// production-path test observes the injected faults.
     pub(crate) fn exclusive_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
-        static TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
-        TEST_LOCK.write().unwrap_or_else(|error| error.into_inner())
+        retire_test_lock()
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// Shared guard for tests that exercise the production dedicated-retire
     /// path: they run in parallel with each other but never inside an
     /// injected-fault window.
     pub(crate) fn production_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+        retire_test_lock()
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The one lock both guards above share.
+    ///
+    /// A function-local `static` in each guard would be a *different* lock, so
+    /// the "exclusive" fault-injection windows (capacity override, spawn
+    /// failure) would still overlap the production-path scenarios and reject
+    /// their publications with another test's injected capacity. Both guards
+    /// must therefore name the same static.
+    fn retire_test_lock() -> &'static std::sync::RwLock<()> {
         static TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
-        TEST_LOCK.read().unwrap_or_else(|error| error.into_inner())
+        &TEST_LOCK
     }
 
     pub(crate) fn set_fail_spawn(fail: bool) {
@@ -286,6 +314,104 @@ pub(crate) mod dedicated_retire_test_control {
     pub(crate) fn snapshot() -> (usize, usize, usize) {
         let state = dedicated_retire().state.lock();
         (state.jobs.len(), state.permits, state.live_workers)
+    }
+
+    /// Retained jobs (queued plus in-flight) whose backing came from this exact
+    /// pool.
+    ///
+    /// [`snapshot`] is process-wide: a parallel test's retained backing and a
+    /// leftover job from a previous scenario appear in the same counters, so a
+    /// count compared against an earlier baseline can be poisoned by work this
+    /// scenario never started. This scoped count attributes retention to the
+    /// pool that owns the backings, letting a scenario prove its own slots were
+    /// retained and returned without depending on the rest of the test binary.
+    ///
+    /// Both retention states are covered: a job is either in `state.jobs`
+    /// (queued) or in `state.in_flight` (a worker popped it and still owns its
+    /// permit), never both and never neither. A queue-only count would observe
+    /// zero as soon as a worker took the job, which is exactly the window in
+    /// which the backing is still retained unread.
+    pub(crate) fn retention_jobs_for_pool(pool: &Arc<StdMutex<MemPool>>) -> usize {
+        let state = dedicated_retire().state.lock();
+        retention_jobs_for_pool_locked(&state, pool)
+    }
+
+    fn retention_jobs_for_pool_locked(
+        state: &super::DedicatedRetireState,
+        pool: &Arc<StdMutex<MemPool>>,
+    ) -> usize {
+        let queued = state
+            .jobs
+            .iter()
+            .filter(|job| Arc::ptr_eq(&job.pool, pool))
+            .count();
+        let in_flight = state
+            .in_flight
+            .iter()
+            .filter(|entry| entry.as_ptr() == Arc::as_ptr(pool))
+            .count();
+        queued + in_flight
+    }
+
+    /// Sample the permit-return witness and scoped retention under the same
+    /// executor lock used to remove an in-flight entry. Read the flag first:
+    /// if it is false and the count is zero, the slot really vanished before
+    /// the permit returned. The worker cannot remove an entry between reads.
+    pub(crate) fn retention_and_returned_for_pool(
+        pool: &Arc<StdMutex<MemPool>>,
+        returned: &super::AtomicBool,
+    ) -> (usize, bool) {
+        let state = dedicated_retire().state.lock();
+        let permit_returned = returned.load(super::Ordering::Acquire);
+        (
+            retention_jobs_for_pool_locked(&state, pool),
+            permit_returned,
+        )
+    }
+
+    /// Retained jobs a worker has already popped but whose permit has not
+    /// returned yet, scoped to this exact pool.
+    ///
+    /// This is the deterministic "the worker took it" witness: the entry is
+    /// pushed under the same lock as `pop_front` and removed only after
+    /// `permit.release()`, so a non-zero value proves the job left the queue
+    /// while its retention slot is still outstanding.
+    pub(crate) fn in_flight_jobs_for_pool(pool: &Arc<StdMutex<MemPool>>) -> usize {
+        dedicated_retire()
+            .state
+            .lock()
+            .in_flight
+            .iter()
+            .filter(|entry| entry.as_ptr() == Arc::as_ptr(pool))
+            .count()
+    }
+
+    /// Queue one already-freed retained backing on the production retire path,
+    /// returning the flag that flips inside `permit.release()`.
+    ///
+    /// Mirrors the dispatched-dedicated hand-off exactly: the caller's local
+    /// free leaves the backing mapped and charged awaiting the peer's
+    /// cross-process `read_done`, and the pre-granted permit moves into the
+    /// shared queue. Used by the in-flight lifecycle regression, which needs
+    /// the real queue without a live connection.
+    pub(crate) fn submit_retention_for_test(
+        pool: Arc<StdMutex<MemPool>>,
+        alloc: super::PoolAllocation,
+    ) -> Arc<super::AtomicBool> {
+        let (permit, returned) = reserve_permit();
+        {
+            let mut guard = pool.lock();
+            guard
+                .free(&alloc)
+                .expect("test retained backing must free through its owning pool");
+            guard.gc_dedicated();
+            assert!(
+                guard.dedicated_awaiting_retirement(&alloc),
+                "a locally freed dedicated backing must still await peer read_done"
+            );
+        }
+        permit.submit(pool, alloc);
+        returned
     }
 
     pub(crate) fn reserve_permit() -> (DedicatedRetirePermit, std::sync::Arc<super::AtomicBool>) {
@@ -480,6 +606,11 @@ fn dedicated_retire_worker(executor: &'static DedicatedRetireExecutor) {
             loop {
                 if let Some(job) = state.jobs.pop_front() {
                     idle_rounds = 0;
+                    // Test-only observation, registered under the same lock as
+                    // the pop: the job is never invisible to the scoped count
+                    // between "queued" and "in flight".
+                    #[cfg(test)]
+                    state.in_flight.push(Arc::downgrade(&job.pool));
                     break job;
                 }
                 // Only exit while no permit is outstanding: every retained
@@ -496,7 +627,54 @@ fn dedicated_retire_worker(executor: &'static DedicatedRetireExecutor) {
                 }
             }
         };
+        // The guard deregisters the in-flight entry only after
+        // `dedicated_retire_backing` has returned — that is, after its permit
+        // was released. Test-only; it holds a `Weak` reference so observation
+        // never extends the observed pool's lifetime.
+        #[cfg(test)]
+        let _in_flight = InFlightRetireGuard {
+            executor,
+            pool: Arc::downgrade(&job.pool),
+            returned: job.permit.returned.clone(),
+        };
         dedicated_retire_backing(job);
+    }
+}
+
+/// Test-only deregistration token for one popped job's in-flight window.
+///
+/// The matching entry is pushed under the executor lock at `pop_front`; this
+/// guard removes exactly one entry for its pool when it drops, which happens
+/// after the backing function returned and therefore after `permit.release()`.
+/// A scoped count that includes the entry can thus never observe zero while a
+/// popped job still owns its retention slot.
+#[cfg(test)]
+struct InFlightRetireGuard {
+    executor: &'static DedicatedRetireExecutor,
+    pool: Weak<StdMutex<MemPool>>,
+    returned: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(test)]
+impl Drop for InFlightRetireGuard {
+    fn drop(&mut self) {
+        let mut state = self.executor.state.lock();
+        if !std::thread::panicking() {
+            if let Some(returned) = &self.returned {
+                assert!(
+                    returned.load(Ordering::Acquire),
+                    "a test retention slot must not disappear before its permit returns"
+                );
+            }
+        }
+        let target = self.pool.as_ptr();
+        if let Some(index) = state
+            .in_flight
+            .iter()
+            .position(|entry| entry.as_ptr() == target)
+        {
+            state.in_flight.swap_remove(index);
+        }
     }
 }
 
