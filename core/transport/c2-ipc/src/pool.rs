@@ -1766,13 +1766,15 @@ mod tests {
     #[test]
     fn close_shared_aborts_blocked_receiver_within_deadline() {
         // Fake peer serves the real handshake, then delivers two bytes of a
-        // frame length prefix and goes silent: the client receive task is
-        // deterministically blocked mid-frame. The close barrier must abort
+        // frame length prefix and goes silent. A receive-side probe confirms
+        // that this task consumed those bytes and polled the rest to Pending
+        // before close starts. The close barrier must abort
         // the stalled stream, let the receive task finish within its bounded
         // join slice, and confirm — without waiting for the peer.
         let address = unique_ipc_address("pool_close_receiver_blocked");
         let endpoint = LocalEndpoint::from_address(&address).unwrap();
         let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
+        let (receiver_blocked_tx, receiver_blocked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
 
         let server_thread = thread::spawn(move || {
@@ -1806,8 +1808,16 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("blocked-receiver listener readiness");
 
-        let client = SyncClient::connect(&address, None, ClientIpcConfig::default())
-            .expect("connect against the real handshake");
+        let client = SyncClient::connect_with_partial_header_probe_for_test(
+            &address,
+            ClientIpcConfig::default(),
+            receiver_blocked_tx,
+            None,
+        )
+        .expect("connect against the real handshake");
+        receiver_blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the receive task must consume two header bytes and poll the rest to Pending");
         let started = Instant::now();
         let confirmed = client.close_shared(Duration::from_secs(2));
         let elapsed = started.elapsed();
@@ -2087,16 +2097,16 @@ mod tests {
 
     #[test]
     fn two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable() {
-        // One client whose receive task is blocked mid-frame; two threads
-        // close it concurrently. The close gate serializes the barriers: the
-        // loser cannot observe a taken receive handle and mistake it for a
-        // terminal task state, both callers stay bounded, at least one
-        // reports an honest unconfirmed close, and the aborted task stays
-        // observable — a subsequent close retries the restored handle and
-        // confirms.
+        // The receive task is proven blocked mid-frame. Its cancellation Drop
+        // then parks until this test releases it. Both concurrent close
+        // barriers must stay bounded and unconfirmed while that exact task
+        // remains nonterminal; a later close joins its restored handle.
         let address = unique_ipc_address("pool_double_close_receiver");
         let endpoint = LocalEndpoint::from_address(&address).unwrap();
         let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
+        let (receiver_blocked_tx, receiver_blocked_rx) = std::sync::mpsc::channel();
+        let (receiver_drop_entered_tx, receiver_drop_entered_rx) = std::sync::mpsc::channel();
+        let (release_receiver_drop_tx, release_receiver_drop_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
 
         let server_thread = thread::spawn(move || {
@@ -2127,9 +2137,20 @@ mod tests {
             .expect("double-close listener readiness");
 
         let client = Arc::new(
-            SyncClient::connect(&address, None, ClientIpcConfig::default())
-                .expect("connect against the real handshake"),
+            SyncClient::connect_with_partial_header_probe_for_test(
+                &address,
+                ClientIpcConfig::default(),
+                receiver_blocked_tx,
+                Some(crate::client::ReceiverDropGateForTest {
+                    entered: receiver_drop_entered_tx,
+                    release: release_receiver_drop_rx,
+                }),
+            )
+            .expect("connect against the real handshake"),
         );
+        receiver_blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("this receive task must poll the rest of the partial header to Pending");
 
         let barrier = Arc::new(Barrier::new(2));
         let (result_tx, result_rx) = std::sync::mpsc::channel::<(bool, Duration)>();
@@ -2146,6 +2167,9 @@ mod tests {
             }));
         }
         drop(result_tx);
+        receiver_drop_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blocked receiver must enter its cancellation Drop gate");
         let mut results = Vec::new();
         for _ in 0..2 {
             results.push(
@@ -2154,16 +2178,15 @@ mod tests {
                     .expect("both concurrent closes must return"),
             );
         }
-        for (confirmed, elapsed) in &results {
+        for (_, elapsed) in &results {
             assert!(
                 elapsed < &Duration::from_secs(8),
                 "each concurrent close must stay bounded, took {elapsed:?}"
             );
-            let _ = confirmed;
         }
         assert!(
-            results.iter().any(|(confirmed, _)| !confirmed),
-            "the barrier that consumed its receive budget must report an honest unconfirmed close: {results:?}"
+            results.iter().all(|(confirmed, _)| !confirmed),
+            "neither close may confirm while the receiver's cancellation Drop is gated: {results:?}"
         );
         for thread in close_threads {
             thread.join().expect("close thread");
@@ -2171,6 +2194,9 @@ mod tests {
 
         // Retryability: the aborted receive task is still observable through
         // its restored handle; a subsequent close joins it and confirms.
+        release_receiver_drop_tx
+            .send(())
+            .expect("release the receiver cancellation gate");
         let retry = client.close_shared(Duration::from_secs(2));
         assert!(retry, "a later close must confirm after the serialized barriers");
         assert!(!client.is_connected());

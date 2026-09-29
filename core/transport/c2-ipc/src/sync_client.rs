@@ -153,6 +153,27 @@ impl SyncClient {
         })
     }
 
+    /// Test-only connect that arms a probe before the receive task is spawned.
+    #[cfg(test)]
+    pub(crate) fn connect_with_partial_header_probe_for_test(
+        address: &str,
+        config: ClientIpcConfig,
+        ready: std::sync::mpsc::Sender<()>,
+        receiver_drop_gate: Option<crate::client::ReceiverDropGateForTest>,
+    ) -> Result<Self, IpcError> {
+        let rt = get_or_create_runtime();
+        let mut client = IpcClient::with_config(address, config);
+        client.set_partial_header_pending_for_test(ready);
+        if let Some(gate) = receiver_drop_gate {
+            client.set_receiver_drop_gate_for_test(gate);
+        }
+        rt.block_on(client.connect())?;
+        Ok(Self {
+            inner: client,
+            rt: rt.handle().clone(),
+        })
+    }
+
     /// Connect with a transport-internal pool (pooled-client acquire path).
     ///
     /// The pool was built from `config` by the caller inside this crate and is

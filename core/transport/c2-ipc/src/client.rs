@@ -1700,6 +1700,12 @@ pub struct IpcClient {
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// One-shot proof that the test receive loop consumed a partial frame
+    /// header and then polled the rest of that header to Pending.
+    #[cfg(test)]
+    partial_header_pending_for_test: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    receiver_drop_gate_for_test: StdMutex<Option<ReceiverDropGateForTest>>,
     /// Serializes close barriers. Only one closer at a time may manipulate
     /// the writer slot and the receive-task handle, so a concurrent close
     /// can never observe a taken handle and mistake it for a terminal task
@@ -1839,6 +1845,10 @@ impl IpcClient {
             server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            partial_header_pending_for_test: StdMutex::new(None),
+            #[cfg(test)]
+            receiver_drop_gate_for_test: StdMutex::new(None),
             close_gate: tokio::sync::Mutex::new(()),
             connected: Arc::new(AtomicBool::new(false)),
             pool: StdMutex::new(pool),
@@ -2318,7 +2328,36 @@ impl IpcClient {
         let connected = self.connected.clone();
         let chunk_registry = self.require_chunk_registry();
         let conn_id = self.conn_id;
+        #[cfg(test)]
+        let partial_header_pending = self.partial_header_pending_for_test.lock().take();
+        #[cfg(test)]
+        let receiver_drop_gate =
+            self.receiver_drop_gate_for_test
+                .lock()
+                .take()
+                .map(|gate| ReceiverDropGuardForTest {
+                    gate,
+                    abort: self
+                        .abort
+                        .lock()
+                        .as_ref()
+                        .expect("connected stream has an abort handle")
+                        .clone(),
+                });
         let recv_handle = tokio::spawn(async move {
+            #[cfg(test)]
+            recv_loop_inner(
+                reader,
+                pending,
+                server_pool,
+                writer_clone,
+                chunk_registry,
+                conn_id,
+                partial_header_pending,
+                receiver_drop_gate,
+            )
+            .await;
+            #[cfg(not(test))]
             recv_loop(
                 reader,
                 pending,
@@ -4052,7 +4091,13 @@ impl IpcClient {
         let receiver = self.recv_handle.lock().take();
         if let Some(mut receiver) = receiver {
             // The receive loop ends on DISCONNECT_ACK or peer EOF.
-            if timeout_at(deadline, &mut receiver).await.is_err() {
+            // Reserve part of the remaining deadline for abort and join. A
+            // silent peer otherwise consumes the entire deadline in this
+            // wait, making confirmation depend on whether Tokio happens to
+            // poll an already-aborted task before a zero-budget timeout.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let graceful_deadline = deadline - remaining.min(std::time::Duration::from_secs(1));
+            if timeout_at(graceful_deadline, &mut receiver).await.is_err() {
                 // Abort the stream and the task, then wait once more within
                 // the time still remaining to the absolute deadline (capped
                 // at one second). Aborted tasks finish at their next await
@@ -4165,6 +4210,16 @@ impl IpcClient {
         Arc::clone(&self.writer)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_partial_header_pending_for_test(&self, ready: std::sync::mpsc::Sender<()>) {
+        *self.partial_header_pending_for_test.lock() = Some(ready);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_receiver_drop_gate_for_test(&self, gate: ReceiverDropGateForTest) {
+        *self.receiver_drop_gate_for_test.lock() = Some(gate);
+    }
+
     /// Install the one-shot partial-write seam for the next prealloc frame.
     ///
     /// Test-only: production never installs it.
@@ -4268,14 +4323,87 @@ impl Drop for ConnectionAssemblyCleanup {
     }
 }
 
+#[cfg(test)]
+struct PartialHeaderAbortDelayForTest;
+
+#[cfg(test)]
+impl Drop for PartialHeaderAbortDelayForTest {
+    fn drop(&mut self) {
+        // Make an immediate post-abort, zero-budget join observably wrong.
+        // The fixture's readiness comes from the pending read probe below;
+        // this delay only models finite cancellation scheduling latency.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Parks one test connection's receive task while cancellation drops its
+/// future. Dropping the release sender always unblocks it, including on a
+/// test panic; no production connection installs this gate.
+#[cfg(test)]
+pub(crate) struct ReceiverDropGateForTest {
+    pub(crate) entered: std::sync::mpsc::Sender<()>,
+    pub(crate) release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct ReceiverDropGuardForTest {
+    gate: ReceiverDropGateForTest,
+    abort: AbortHandle,
+}
+
+#[cfg(test)]
+impl Drop for ReceiverDropGuardForTest {
+    fn drop(&mut self) {
+        if self.abort.is_aborted() {
+            let _ = self.gate.entered.send(());
+            let _ = self.gate.release.recv();
+        }
+    }
+}
+
 pub(crate) async fn recv_loop(
-    mut reader: LocalReadHalf,
+    reader: LocalReadHalf,
     pending: Arc<StdMutex<PendingMap>>,
     server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     chunk_registry: Arc<ChunkRegistry>,
     conn_id: u64,
 ) {
+    recv_loop_inner(
+        reader,
+        pending,
+        server_pool,
+        writer,
+        chunk_registry,
+        conn_id,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await;
+}
+
+async fn recv_loop_inner(
+    mut reader: LocalReadHalf,
+    pending: Arc<StdMutex<PendingMap>>,
+    server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
+    writer: Arc<Mutex<Option<LocalWriteHalf>>>,
+    chunk_registry: Arc<ChunkRegistry>,
+    conn_id: u64,
+    #[cfg(test)] mut partial_header_pending: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)] receiver_drop_gate: Option<ReceiverDropGuardForTest>,
+) {
+    #[cfg(test)]
+    let _abort_join_delay = if receiver_drop_gate.is_none() {
+        partial_header_pending
+            .as_ref()
+            .map(|_| PartialHeaderAbortDelayForTest)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let _receiver_drop_gate = receiver_drop_gate;
     // Response backings that no waiter claims (late replies after a
     // cancelled reply wait, or replies for unknown ids) are released
     // through the exact response pools.
@@ -4287,7 +4415,35 @@ pub(crate) async fn recv_loop(
     let mut recv_buf = Vec::with_capacity(4096); // reusable buffer
     loop {
         // Read frame header.
-        if reader.read_exact(&mut header_buf).await.is_err() {
+        #[cfg(test)]
+        let read_header = if let Some(ready) = partial_header_pending.take() {
+            // Only this test connection splits the read. The signal is sent
+            // after its first two bytes were consumed and the rest of the
+            // same header actually returned Pending on its first poll.
+            use std::future::Future;
+            match reader.read_exact(&mut header_buf[..2]).await {
+                Ok(_) => {
+                    let mut rest = Box::pin(reader.read_exact(&mut header_buf[2..]));
+                    let mut ready = Some(ready);
+                    std::future::poll_fn(|cx| match rest.as_mut().poll(cx) {
+                        std::task::Poll::Pending => {
+                            if let Some(ready) = ready.take() {
+                                let _ = ready.send(());
+                            }
+                            std::task::Poll::Pending
+                        }
+                        std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+                    })
+                    .await
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            reader.read_exact(&mut header_buf).await
+        };
+        #[cfg(not(test))]
+        let read_header = reader.read_exact(&mut header_buf).await;
+        if read_header.is_err() {
             break; // Connection closed.
         }
         let (total_len, body_rest) = match frame::decode_total_len(&header_buf) {
@@ -4508,6 +4664,42 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_reserves_time_to_join_an_aborted_receiver() {
+        // A pending receive task can take finite time to finish its abort.
+        // This isolates the deadline policy without requiring SHM or an OS
+        // endpoint; the pool test covers the real half-frame receive path.
+        struct SlowCancel;
+        impl Drop for SlowCancel {
+            fn drop(&mut self) {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+
+        let client = IpcClient::new("ipc://close_join_budget_test");
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let receiver = tokio::spawn(async move {
+            let _cancel = SlowCancel;
+            let mut ready = Some(ready_tx);
+            std::future::poll_fn(|_| {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(());
+                }
+                std::task::Poll::<()>::Pending
+            })
+            .await;
+        });
+        *client.recv_handle.lock() = Some(receiver);
+        ready_rx.await.expect("receiver was first polled");
+
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_millis(250))
+                .await,
+            "close must join an aborted receiver within the original deadline"
+        );
+    }
 
     #[tokio::test]
     async fn aborted_receive_cleans_partial_reply_before_reconnect_and_after_drop() {
