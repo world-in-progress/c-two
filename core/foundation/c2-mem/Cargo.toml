@@ -13,7 +13,7 @@ name = "c2_mem"
 c2-config = { version = "0.1.0", path = "../c2-config" }
 libc = "0.2"
 memmap2 = "0.9"
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 
