@@ -280,6 +280,7 @@ dependencies = [
  "c2-contract",
  "c2-error",
  "c2-ipc",
+ "c2-mem",
  "c2-wire",
  "futures",
  "hex",
