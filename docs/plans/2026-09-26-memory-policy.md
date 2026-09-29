@@ -11,7 +11,7 @@ PyPI：https://pypi.org/project/c-two/0.6.0/
 
 需要分清两个连续决策：发送端先选 inline / 共享内存引用 / 分块传输；接收端对分块消息选择 buddy / dedicated / 文件 mmap 作为重组存储。现有分块 API 在完整消息收齐后调用资源，因此仍需要完整消息的存储空间。文件回退可以降低匿名内存压力，但仍消耗地址空间、页缓存、磁盘和 I/O；并非无限、零内存的兜底。真正的增量消费 API 可以以后单独设计。
 
-## 当前证据
+## 0.6.0 分析基线证据
 
 1. **buddy 禁用策略没有覆盖所有入口。** `core/transport/c2-ipc/src/pool.rs:47` 无条件创建并传入 `Some(pool)`；`client.rs:758` 的普通构造检查了开关，但 `client.rs:841` 的外部池路径直接接收池。`client.rs:855` 连接前 `ensure_ready()`，`core/transport/c2-server/src/server.rs:318` 创建响应池并 `ensure_ready()`，均会预热 buddy。客户端和服务端重组池的构造也没有该策略。默认主池段大小 256 MiB，见 `core/foundation/c2-config/src/ipc.rs:114`；这是容量配置，不是 RSS 测量。
 
@@ -70,12 +70,11 @@ PyPI：https://pypi.org/project/c-two/0.6.0/
 
 ## 实施跟踪
 
-用户已批准按上述方案实现。集成分支为 `socu/memory-policy`；实现提交与分析基线分别记录。
+实现及本轮验收已落在 `socu/memory-policy` / [PR #162](https://github.com/world-in-progress/c-two/pull/162)。验证源码为 `abfeaf71deaa9ff4428d0c043ab80e3210746f47`，FastDB 固定 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`；后续文档提交不充当产物源码。
 
-- 待验收：统一 buddy 策略、惰性创建、明确预热和空闲温存配置。
-- 已验收并提交 `ab9224d`：文件重组保留 backing，移除自动提升和整包临时复制；相关 319 项测试及新增 2 项 FileSpill 消费测试通过。Windows 条件断言仍待 CI。
-- 设计已复核，实施待验收：预算由 Runtime 客户端域、Server 域或显式低层上下文持有，明确有限默认值及生命周期；见 [预算契约](../reports/memory-budget-contract.md)。首轮设计已拒收，当前版本包含 Host 修正和独立审查补充。
-- 待验收：预算、各层回退和清理的负向测试，以及低负载/大消息基准。
-- 待验收：集成的 Unix、本机 Python 与 Windows CI 验证。
+- 统一策略、惰性创建、显式预热、空闲归零与文件 backing 保留已实现，buddy 禁用仍保留其他回退能力。
+- SHM / 文件 / 重组预算贯穿实际所有权；请求取消、held、客户端缓存、关闭及弱 retired 观察经过集成审查。Host 修正了 permit 交接竞争，并由 GPT-6 Sol 收口计数检查与关闭时限问题。
+- 观测及九行基准覆盖小调用、四进程突发、科学计算大消息、强制预算失败；记录延迟、吞吐、backing 高水位与独立 RSS。逐处复制字节归因和改善百分比保留为后续性能测量，不冒充当前证据。
+- Windows 2022 / 2025 各 707 项基础测试、23 项完整门禁、严格 18 / 12 行跨语言收据及九行内存矩阵全部通过。普通与非管理员 wheel 消费、生命周期清理、ZIP / 内部哈希及 c3 字节身份已核验。Linux CI 与候选包构建亦通过。
 
-不以单个 worker 完成或局部测试通过代表整体交付；各项状态由集成后的证据更新。
+完整运行链接、源码对、产物摘要与边界见 [最终验收](../reports/memory-native-final-validation.md)。正式包尚未发布；Windows 11 桌面及未执行平台不在通过范围。

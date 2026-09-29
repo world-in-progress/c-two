@@ -33,22 +33,12 @@ The Host's `/tmp/c2-close-host-validation-0929/affected-rust.log` shows the repa
 
 The concurrent fixture now uses the same connection-scoped half-header Pending probe, plus a connection-scoped test-only cancellation Drop gate. The guard checks that this connection's stream abort handle was actually aborted before it signals entry or blocks; a natural receive exit cannot satisfy the gate. Until the test releases it, that task cannot finish its JoinHandle, so **both** bounded closes must report `false` even if one caller temporarily owns the handle under the close gate. Releasing the gate permits a subsequent close to join the restored handle and confirm. Dropping the release sender also opens the gate on test failure; a failed connection attempt never installs a blocking Drop guard. The normal half-frame test installs no gate and still expects `confirmed=true`. No production close, lease, owner, budget, or `c2-local` code changed in this continuation.
 
-This continuation used `CARGO_TARGET_DIR=/private/tmp/c2-close-barrier-33ae` with two build jobs and empty `C2_ENV_FILE` / `C2_RELAY_ANCHOR_ADDRESS`. `cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib --no-run` compiled, the pure `client::tests::close_reserves_time_to_join_an_aborted_receiver` passed (1/1), and `rustfmt --check` on `client.rs` and `sync_client.rs` plus `git diff --check` passed. The actual concurrent IPC test remains for Host validation with SHM/native pipe access.
+This continuation used `CARGO_TARGET_DIR=/private/tmp/c2-close-barrier-33ae` with two build jobs and empty `C2_ENV_FILE` / `C2_RELAY_ANCHOR_ADDRESS`. `cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib --no-run` compiled, the pure `client::tests::close_reserves_time_to_join_an_aborted_receiver` passed (1/1), and `rustfmt --check` on `client.rs` and `sync_client.rs` plus `git diff --check` passed. The concurrent IPC test was then handed to the Host; its completed results are below.
 
-## Host validation needed
+## 最终验证与边界
 
-Run against this exact checkout contents on the Windows 2025 runner with SHM and native pipe access. Use an independent temporary Cargo target, two build jobs, and empty `C2_ENV_FILE` / `C2_RELAY_ANCHOR_ADDRESS`:
+Host 集成环境的 `/tmp/c2-close-concurrent-host-0929/result.json` 记录 `ipc-full` 退出码 0；相应日志显示 c2-ipc 130/130 通过，三个具名关闭测试均为 `ok`。这份本机结果的来源记录是基线加运行时补丁，须与下列 Windows 源码提交分开表述。
 
-```powershell
-$env:CARGO_BUILD_JOBS = '2'
-$env:CARGO_TARGET_DIR = Join-Path $env:TEMP 'c2-close-barrier-33ae'
-$env:C2_ENV_FILE = ''
-$env:C2_RELAY_ANCHOR_ADDRESS = ''
-cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib pool::tests::two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable -- --exact --nocapture
-cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib pool::tests::close_shared_aborts_blocked_receiver_within_deadline -- --exact --nocapture
-cargo test --manifest-path core/Cargo.toml -p c2-ipc --lib pool::tests::close_shared_is_bounded_and_honest_when_writer_slot_is_held -- --exact --nocapture
-```
+GitHub Windows Native `36552609987` 的四份 `run-evidence.json` 均标记 C-Two 实际源码为 `abfeaf71deaa9ff4428d0c043ab80e3210746f47` 且状态为 `passed`。Windows 2022 与 2025 的 `local-platform-tests.log` 分别显示 707 项通过，其中 c2-ipc 为 129/129；两份日志均明确记录半帧关闭、writer-slot 关闭、并发关闭三个具名测试为 `ok`。两个 `full` scope 各有 23/23 个成功步骤。
 
-Acceptance: the three focused tests pass from the patched source, with exit codes and full logs retained. The concurrent test must see the same receive task's Pending and cancellation-Drop events, both closes must return bounded `false` before gate release, and retry must confirm after release. The normal half-frame test must still confirm; the writer-slot test must remain unconfirmed while held and confirm after release. If any fails, return its full log and the exact source fingerprint; unrelated green jobs cannot substitute for this gate.
-
-Host 本机集成验证：生产关闭修复经过 Rust runtime/transport、Rust SDK、CLI、native 重建、Python suite、18/12 行严格跨语言矩阵与9行内存矩阵。首次仅旧并发夹具的至少一个 false 断言失败；按事件化改写后，完整 c2-ipc 130项全部通过，其中真实半帧、writer-slot、并发 gate 测试均通过。原始记录为 `/tmp/c2-close-host-validation-0929/` 和 `/tmp/c2-close-concurrent-host-0929/`。新的 Windows 源码验证待本提交后的 CI，不把本机结果当作 Windows 通过。
+`/tmp/c2-memory-windows-abfe/verification.txt` 以 `PASS: 0 failure(s)` 收尾，并记录严格 18 行 Rust/Python、12 行 TypeScript、9 行 IPC memory 矩阵，以及普通 wheel 消费者、测试 XML 和 c3 字节一致性核验。该文件还核对了解包内容的内部哈希及所给 ZIP 摘要；Host 另行报告 ZIP 摘要与 GitHub API 一致、非管理员 wheel 消费及进程账号目录清理通过。以上是 Windows Server 2022/2025 的该提交证据；Windows 11 未执行，RC 未发布。

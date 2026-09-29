@@ -1,5 +1,7 @@
 # IPC memory benchmark harness
 
+Final integration: the complete nine-row matrix passed with required native memory statistics on Windows 2022 and 2025. See [final validation](memory-native-final-validation.md). The development and recovery records below retain their original source boundaries. Runtime copy-byte attribution is not implemented; this harness records latency, throughput, backing/lease observations and RSS.
+
 This report covers `tools/benchmarks/ipc_memory.py`, the end-to-end measurement driver for step 3 of the approved [memory plan](../plans/2026-09-26-memory-policy.md) ("比较四类负载 … 记录首次/稳态延迟、吞吐、复制量和峰值 backing/RSS") and for the still-pending "预算、各层回退和清理的负向测试，以及低负载/大消息基准" item. The work recovers the preserved draft on base `947415ba62eaf488f728bb554b74188295091a1e` and keeps the reviewed harness issues corrected; it changes the harness and this report only. No runtime, native, or production file was edited.
 
 ## What the harness guarantees
@@ -59,7 +61,7 @@ PYTHONDONTWRITEBYTECODE=1 /tmp/c2-memory-venv/bin/python -B "$REPO/tools/benchma
   --memory-stats --output-dir "$OUT"
 ```
 
-Add `--require-memory-stats` when the integrated candidate exposes `cc.memory_stats` and the run must fail closed instead of recording unavailable snapshots; it fails today because that API is not exposed yet. Add `--allow-unavailable-stats-after-shutdown` only to adopt the explicit contract that post-shutdown snapshots may be unavailable; the exemption is recorded per snapshot. `--only <substring,...>` runs a subset (`matrix.json` then reports `complete: false`), `--list-rows` prints the row table, and a single measurement uses `--mode single` with `--output`. `--workers` is capped at 16; `--child-timeout` and `--row-timeout` must be finite positive and at most 600 s / 3600 s. Artifacts: `matrix.json` plus one `rows/<name>.json` per row.
+Add `--require-memory-stats` when the integrated candidate exposes `cc.memory_stats` and the run must fail closed instead of recording unavailable snapshots; the final integrated candidate exposes that API and both Windows full gates require it. Add `--allow-unavailable-stats-after-shutdown` only to adopt the explicit contract that post-shutdown snapshots may be unavailable; the exemption is recorded per snapshot. `--only <substring,...>` runs a subset (`matrix.json` then reports `complete: false`), `--list-rows` prints the row table, and a single measurement uses `--mode single` with `--output`. `--workers` is capped at 16; `--child-timeout` and `--row-timeout` must be finite positive and at most 600 s / 3600 s. Artifacts: `matrix.json` plus one `rows/<name>.json` per row.
 
 Python 3.10 syntax gate (execute-only, no bytecode written):
 

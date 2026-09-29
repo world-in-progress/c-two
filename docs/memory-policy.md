@@ -94,7 +94,7 @@ cc.set_client(ipc_overrides=dict(BUDGET))
 
 ## 9. 本文不承诺的事项
 
-本文不声称分块路径提供流式或增量资源输入；不给出任何性能百分比；不声明 Windows 平台行为完整；不是发布或发布公告；不引入也不承诺兼容 shim。配置与行为应结合本分支的代码、测试及最终验收报告核对。
+本文不声称分块路径提供流式或增量资源输入；不给出任何性能百分比；Windows 验证限于最终报告列出的 Server 2022/2025 门禁；不是发布或发布公告；不引入也不承诺兼容 shim。配置与行为应结合本分支的代码、测试及最终验收报告核对。
 
 ## 10. 证据指针
 
@@ -106,3 +106,4 @@ cc.set_client(ipc_overrides=dict(BUDGET))
 - `sdk/python/src/c_two/config/ipc.py`、`settings.py` — 类型化覆盖模式与进程策略；`sdk/python/src/c_two/mem/__init__.py`、`transport/registry.py` — `memory_stats`/`hold_stats` 门面。
 - `sdk/python/src/c_two/crm/transferable.py` — `HeldResult` 释放顺序；`.env.example` — `C2_IPC_POOL_ENABLED`/`PREWARM`/`MIN_RETAINED` 键。
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
+- [最终验收](reports/memory-native-final-validation.md) — 固定源码、Windows/Linux 门禁、候选包与产物哈希证据。
