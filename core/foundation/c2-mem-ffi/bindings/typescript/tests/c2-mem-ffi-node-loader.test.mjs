@@ -94,6 +94,51 @@ test('c2-mem-ffi Node native loader composes real request and response pools', a
   await fakeServerPool.close?.();
 });
 
+test('c2-mem-ffi response pool bootstraps a differently sized owner backing', async () => {
+  const { requestSymbols, responseSymbols } = loadC2MemFfiNodeNativeSymbols(libraryPath());
+  const owner = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
+    prefix: '/cc2snode2',
+    segmentSize: 1024 * 1024,
+    maxSegments: 1,
+    minBlockSize: 4096,
+  });
+  // The reader only declares the minimum legal peer geometry: the real backing
+  // geometry must come from the mapped segment, never from this bootstrap floor.
+  const bootstrapFloor = 2 * 4096;
+  const responsePool = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
+    prefix: owner.prefix,
+    segmentSize: bootstrapFloor,
+    maxSegments: 1,
+    minBlockSize: 4096,
+  });
+  assert.ok(owner.segments[0].size >= 1024 * 1024);
+
+  const payload = new Uint8Array(4096).fill(0x5a);
+  const block = await owner.write(payload);
+  await owner.forgetConsumed(block);
+
+  const destination = new Uint8Array(payload.byteLength);
+  await responsePool.read(block, destination);
+  assert.deepEqual(Array.from(destination), Array.from(payload));
+  await responsePool.release(block);
+  await assert.rejects(
+    () => responsePool.release(block),
+    /INVALID_ARGUMENT|POOL_ERROR/,
+  );
+
+  await assert.rejects(
+    () => responsePool.read(
+      { ...block, generation: block.generation + 1 },
+      new Uint8Array(payload.byteLength),
+    ),
+    /POOL_ERROR/,
+    'an unbacked generation must never be fabricated',
+  );
+
+  await responsePool.close?.();
+  await owner.close?.();
+});
+
 test('bundled Node runtime exposes generated-transport compatible IPC support', async () => {
   const { requestSymbols } = loadBundledC2MemFfiNodeNativeSymbols();
   const fakeServerPool = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {

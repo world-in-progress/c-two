@@ -27,6 +27,14 @@ export interface C2MemFfiCallResult<T = void> {
 
 export interface C2MemFfiPoolConfig {
   readonly prefix: string;
+  /**
+   * Request pools create backings with this exact data capacity. Response
+   * pools only open peer backings, so for them this is a bootstrap capacity
+   * floor: c2-mem derives the real geometry from the mapped segment at
+   * prefix/index/generation and validates capacity, byte range, and
+   * generation. Response readers must not treat this value as a claim about
+   * the server's segment size.
+   */
   readonly segmentSize: number;
   readonly maxSegments: number;
   readonly minBlockSize: number;
@@ -443,6 +451,13 @@ export async function createC2MemFfiRequestPoolFromSymbols<Handle>(
   }
 }
 
+/**
+ * Open a peer response pool over an owner's advertised SHM prefix.
+ *
+ * The pool maps nothing until a block references a backing. `config.segmentSize`
+ * is only the minimum capacity accepted for buddy backings opened lazily by
+ * prefix/index/generation; actual geometry and validation stay in c2-mem.
+ */
 export async function createC2MemFfiResponsePoolFromSymbols<Handle>(
   symbols: C2MemFfiResponsePoolSymbols<Handle>,
   config: C2MemFfiPoolConfig,

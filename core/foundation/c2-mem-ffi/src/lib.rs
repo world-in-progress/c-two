@@ -1418,13 +1418,77 @@ static void use_response_api(void) {
         )
     }
 
+    /// Owner pool that creates its buddy backing only on the first allocation,
+    /// like a lazy IPC server pool whose handshake advertised no segments.
+    fn lazy_server_pool(prefix: &str, segment_size: usize) -> MemPool {
+        MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 0,
+                min_retained_segments: 0,
+                buddy_idle_decay_secs: -1.0,
+                ..PoolConfig::default()
+            },
+            prefix.to_string(),
+        )
+    }
+
+    /// Allocate and fill one buddy block, returning its response coordinates.
+    fn lazy_server_block(server: &mut MemPool, payload: &[u8]) -> C2MemFfiResponseBlock {
+        let alloc = server.alloc(payload.len()).unwrap();
+        assert!(!alloc.is_dedicated);
+        let ptr = server.data_ptr(&alloc).unwrap();
+        unsafe {
+            ptr::copy_nonoverlapping(payload.as_ptr(), ptr, payload.len());
+        }
+        C2MemFfiResponseBlock {
+            segment_index: alloc.seg_idx as u16,
+            is_dedicated: 0,
+            reserved: 0,
+            generation: alloc.generation,
+            offset: alloc.offset,
+            byte_length: payload.len() as u32,
+        }
+    }
+
+    fn read_response_block(
+        pool: *mut C2MemFfiResponsePool,
+        block: C2MemFfiResponseBlock,
+        out: &mut [u8],
+    ) -> (C2MemFfiStatus, usize) {
+        let mut read = usize::MAX;
+        let status = unsafe {
+            c2_mem_ffi_response_pool_read(pool, block, out.as_mut_ptr(), out.len(), &mut read)
+        };
+        (status, read)
+    }
+
     struct ResponsePoolHandle(*mut C2MemFfiResponsePool);
 
     impl ResponsePoolHandle {
         fn new(prefix: &CString) -> Self {
+            Self::with_bootstrap_config(prefix, 65_536, 2, 4096)
+        }
+
+        /// Create a peer pool whose configured capacity is only a bootstrap
+        /// floor for lazily opened backings.
+        fn with_bootstrap_config(
+            prefix: &CString,
+            segment_size: u32,
+            max_segments: u16,
+            min_block_size: u32,
+        ) -> Self {
             let mut pool = ptr::null_mut();
             let status = unsafe {
-                c2_mem_ffi_response_pool_new(prefix.as_ptr(), 65_536, 2, 4096, &mut pool)
+                c2_mem_ffi_response_pool_new(
+                    prefix.as_ptr(),
+                    segment_size,
+                    max_segments,
+                    min_block_size,
+                    &mut pool,
+                )
             };
             assert_eq!(status, C2MemFfiStatus::Ok);
             assert!(!pool.is_null());
@@ -1724,5 +1788,170 @@ static void use_response_api(void) {
             C2MemFfiStatus::Ok
         );
         server.free(&first).unwrap();
+    }
+
+    #[test]
+    fn response_pool_bootstrap_floor_reads_and_releases_late_server_segment() {
+        let prefix = test_prefix();
+        let payload = b"late lazy server response";
+        // The reader's configured capacity is the minimum legal peer geometry,
+        // while the server lazily creates a much larger backing after the
+        // handshake advertised none. Only the mapped backing is authoritative.
+        let bootstrap_floor = 2 * 4096;
+        let mut server = lazy_server_pool(prefix.to_str().unwrap(), 1 << 20);
+        assert_eq!(
+            server.stats().total_segments,
+            0,
+            "lazy owner must not pre-create a backing"
+        );
+        let block = lazy_server_block(&mut server, payload);
+        assert_eq!(block.segment_index, 0);
+        assert_eq!(block.generation, 1);
+        assert!(
+            server.stats().buddy_data_bytes > bootstrap_floor as u64,
+            "server backing must differ from the reader's bootstrap floor"
+        );
+        let server_prefix = CString::new(server.prefix()).unwrap();
+
+        let handle =
+            ResponsePoolHandle::with_bootstrap_config(&server_prefix, bootstrap_floor, 1, 4096);
+        {
+            let state = response_pool_ref(handle.0).unwrap().inner.lock().unwrap();
+            assert_eq!(state.buddy_segment_size, bootstrap_floor as usize);
+        }
+        let mut out = vec![0_u8; payload.len()];
+        let (status, read) = read_response_block(handle.0, block, &mut out);
+        assert_eq!(status, C2MemFfiStatus::Ok);
+        assert_eq!(read, payload.len());
+        assert_eq!(out, payload);
+
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, block) },
+            C2MemFfiStatus::Ok
+        );
+        assert!(
+            server
+                .free_at(
+                    block.segment_index as u32,
+                    block.generation,
+                    block.offset,
+                    block.byte_length,
+                    false,
+                )
+                .is_err(),
+            "peer release must reach the owner allocator"
+        );
+    }
+
+    #[test]
+    fn response_pool_rejects_unbacked_generation_before_late_open() {
+        let prefix = test_prefix();
+        let payload = b"generation gated late open";
+        let mut server = lazy_server_pool(prefix.to_str().unwrap(), 1 << 20);
+        let current = lazy_server_block(&mut server, payload);
+        let server_prefix = CString::new(server.prefix()).unwrap();
+        let handle = ResponsePoolHandle::with_bootstrap_config(&server_prefix, 2 * 4096, 1, 4096);
+
+        let mut future = current;
+        future.generation = current.generation + 1;
+        let mut out = vec![0_u8; payload.len()];
+        let (status, read) = read_response_block(handle.0, future, &mut out);
+        assert_eq!(
+            status,
+            C2MemFfiStatus::PoolError,
+            "an unbacked generation must never be fabricated"
+        );
+        assert_eq!(read, 0);
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, future) },
+            C2MemFfiStatus::PoolError
+        );
+
+        // The rejected generation must not poison the real coordinates.
+        let (status, read) = read_response_block(handle.0, current, &mut out);
+        assert_eq!(status, C2MemFfiStatus::Ok);
+        assert_eq!(read, payload.len());
+        assert_eq!(out, payload);
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, current) },
+            C2MemFfiStatus::Ok
+        );
+    }
+
+    #[test]
+    fn response_pool_reopens_late_generation_after_owner_retires_backing() {
+        let prefix = test_prefix();
+        let payload = b"retired and recreated backing";
+        let mut server = lazy_server_pool(prefix.to_str().unwrap(), 1 << 20);
+        let first = lazy_server_block(&mut server, payload);
+        let server_prefix = CString::new(server.prefix()).unwrap();
+        let handle = ResponsePoolHandle::with_bootstrap_config(&server_prefix, 2 * 4096, 1, 4096);
+
+        let mut out = vec![0_u8; payload.len()];
+        let (status, read) = read_response_block(handle.0, first, &mut out);
+        assert_eq!(status, C2MemFfiStatus::Ok);
+        assert_eq!(read, payload.len());
+        assert_eq!(out, payload);
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, first) },
+            C2MemFfiStatus::Ok
+        );
+
+        assert_eq!(server.gc_buddy(), 1, "idle owner backing must retire");
+        assert_eq!(server.stats().total_segments, 0);
+        let second = lazy_server_block(&mut server, payload);
+        assert_eq!(second.segment_index, 0);
+        assert_eq!(
+            second.generation,
+            first.generation + 1,
+            "a recreated slot must carry a fresh generation"
+        );
+
+        out.fill(0);
+        let (status, read) = read_response_block(handle.0, second, &mut out);
+        assert_eq!(
+            status,
+            C2MemFfiStatus::Ok,
+            "the peer must lazy-open the recreated backing by generation"
+        );
+        assert_eq!(read, payload.len());
+        assert_eq!(out, payload);
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, second) },
+            C2MemFfiStatus::Ok
+        );
+    }
+
+    #[test]
+    fn response_pool_rejects_out_of_range_bootstrap_geometry() {
+        let prefix = test_prefix();
+        let payload = b"range guarded lazy response";
+        let mut server = lazy_server_pool(prefix.to_str().unwrap(), 1 << 20);
+        let block = lazy_server_block(&mut server, payload);
+        let data_size = server.stats().buddy_data_bytes as u32;
+        let server_prefix = CString::new(server.prefix()).unwrap();
+        let handle = ResponsePoolHandle::with_bootstrap_config(&server_prefix, 2 * 4096, 1, 4096);
+
+        let mut oversized = block;
+        oversized.offset = data_size;
+        oversized.byte_length = 4096;
+        let mut out = vec![0_u8; oversized.byte_length as usize];
+        let (status, read) = read_response_block(handle.0, oversized, &mut out);
+        assert_eq!(status, C2MemFfiStatus::InvalidArgument);
+        assert_eq!(read, 0);
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, oversized) },
+            C2MemFfiStatus::InvalidArgument
+        );
+
+        let mut actual = vec![0_u8; payload.len()];
+        let (status, read) = read_response_block(handle.0, block, &mut actual);
+        assert_eq!(status, C2MemFfiStatus::Ok);
+        assert_eq!(read, payload.len());
+        assert_eq!(actual, payload);
+        assert_eq!(
+            unsafe { c2_mem_ffi_response_pool_release(handle.0, block) },
+            C2MemFfiStatus::Ok
+        );
     }
 }

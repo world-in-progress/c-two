@@ -187,6 +187,12 @@ export interface C2NativeRequestShmWriterOptions {
 
 export interface C2MemFfiNativeResponseShmReaderOptions {
   readonly binding: C2MemFfiResponsePoolFactory;
+  /**
+   * Explicit peer response pool capacity. This is a bootstrap geometry for
+   * opening the server's backings, never a replacement for the geometry the
+   * mapped backing actually carries: c2-mem validates capacity, byte range,
+   * and generation when the pooled reader opens prefix/index/generation.
+   */
   readonly segmentSize?: number;
   readonly maxSegments?: number;
   readonly minBlockSize?: number;
@@ -1425,7 +1431,7 @@ export function createC2MemFfiNativeResponseShmReader(options: C2MemFfiNativeRes
     const prefix = block.prefix;
     let pool = pools.get(prefix);
     if (pool === undefined) {
-      const segmentSize = resolveC2MemFfiResponseSegmentSize(block, normalized.segmentSize, normalized.minBlockSize);
+      const segmentSize = resolveC2MemFfiResponseBootstrapSegmentSize(block, normalized.segmentSize, normalized.minBlockSize);
       pool = Promise.resolve(normalized.binding.createResponsePool({
         prefix,
         segmentSize,
@@ -1653,7 +1659,28 @@ function normalizeC2MemFfiRequestPool(
   return pool;
 }
 
-function resolveC2MemFfiResponseSegmentSize(block: C2IpcResponseShmBlock, configuredSegmentSize: number | undefined, minBlockSize: number): number {
+/**
+ * Smallest `PoolConfig.segment_size` that buddy-pool validation accepts for a
+ * `min_block_size` (`segment_size >= 2 * min_block_size`).
+ */
+function minimumC2MemFfiPeerSegmentSize(minBlockSize: number): number {
+  return normalizeC2MemFfiPositiveU32(minBlockSize * 2, "C-Two c2-mem-ffi response SHM minimum peer segment size");
+}
+
+/**
+ * Resolve the bootstrap capacity used to open a peer response pool.
+ *
+ * The pool factory only needs a legal bootstrap geometry: c2-mem resolves the
+ * actual backing by prefix/index/generation and stays authoritative for
+ * capacity, byte range, and generation checks. A handshake segment list is a
+ * descriptive snapshot of the segments that happened to exist when the
+ * connection was opened, so a lazy server pool legitimately advertises none
+ * and publishes later backings only through response frames. Prefer the
+ * explicit configuration, then the advertised snapshot, and otherwise use the
+ * minimum legal peer-pool geometry as an open-side floor — never a fabricated
+ * claim about the server's real segment size.
+ */
+function resolveC2MemFfiResponseBootstrapSegmentSize(block: C2IpcResponseShmBlock, configuredSegmentSize: number | undefined, minBlockSize: number): number {
   if (configuredSegmentSize !== undefined) {
     return configuredSegmentSize;
   }
@@ -1661,8 +1688,7 @@ function resolveC2MemFfiResponseSegmentSize(block: C2IpcResponseShmBlock, config
   if (advertisedSegment !== undefined) {
     return normalizeC2MemFfiPositiveU32(advertisedSegment.size, `C-Two c2-mem-ffi response SHM segment ${block.segmentIndex} advertised size`);
   }
-  if (block.dedicated) return minBlockSize;
-  throw new C2IpcTransportError("C-Two c2-mem-ffi response SHM reader requires segmentSize when the server handshake does not advertise the response buddy segment.");
+  return minimumC2MemFfiPeerSegmentSize(minBlockSize);
 }
 
 function requireC2MemFfiResponsePrefix(prefix: string): void {
