@@ -75,7 +75,7 @@ jobs:
     steps:
       # The default checkout is the current main code: the promotion trusts
       # the reviewed validators on main, never the candidate's input SHA.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - uses: actions/setup-python@v7
         with:
