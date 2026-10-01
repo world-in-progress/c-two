@@ -77,7 +77,7 @@ jobs:
       # the reviewed validators on main, never the candidate's input SHA.
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
