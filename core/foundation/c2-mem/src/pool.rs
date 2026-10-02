@@ -610,6 +610,21 @@ impl MemPool {
         &self.name_prefix
     }
 
+    /// Check that this pool is the allocation owner with the captured
+    /// incarnation, without opening, reading, or releasing any backing.
+    ///
+    /// Coordinates alone can collide across owner pools. Peer caches may
+    /// carry an owner's advertised prefix but are not that owner authority.
+    pub fn validate_owner_incarnation(&self, expected: &str) -> Result<(), String> {
+        if self.is_peer {
+            return Err("peer pool is not an owner authority".into());
+        }
+        if self.name_prefix != expected {
+            return Err("pool owner incarnation mismatch".into());
+        }
+        Ok(())
+    }
+
     pub fn segment_generation(&self, idx: usize) -> Option<u32> {
         self.segment(idx)?;
         self.generations.get(idx).copied()
@@ -1627,6 +1642,39 @@ mod tests {
 
     fn test_config() -> PoolConfig {
         small_config()
+    }
+
+    #[test]
+    fn owner_incarnation_validation_is_non_destructive() {
+        // Lazy pools: this check requires no SHM mapping or payload access.
+        let owner = MemPool::new_with_prefix(small_config(), "same-label".into());
+        let expected = owner.prefix().to_owned();
+        let replacement = MemPool::new_with_prefix(small_config(), "same-label".into());
+        let peer = MemPool::open_peer(small_config(), expected.clone());
+        assert!(owner.validate_owner_incarnation(&expected).is_ok());
+        assert!(
+            replacement
+                .validate_owner_incarnation(&expected)
+                .unwrap_err()
+                .contains("incarnation")
+        );
+        assert_eq!(peer.prefix(), expected);
+        assert!(
+            peer.validate_owner_incarnation(&expected)
+                .unwrap_err()
+                .contains("authority")
+        );
+        // Moving/restoring the actual owner preserves its identity.
+        let restored = owner;
+        assert!(restored.validate_owner_incarnation(&expected).is_ok());
+        for pool in [&restored, &replacement, &peer] {
+            assert_eq!(pool.stats().alloc_count, 0);
+            assert_eq!(pool.stats().total_segments, 0);
+        }
+        let snapshot = restored.budget().unwrap().snapshot();
+        assert_eq!(snapshot.shm.used_bytes, 0);
+        assert_eq!(snapshot.file.used_bytes, 0);
+        assert_eq!(snapshot.reassembly.used_bytes, 0);
     }
 
     #[test]

@@ -270,17 +270,46 @@ mod tests {
 
     #[test]
     fn test_abort_releases_handle_and_charge() {
-        let (pool, budget) = budgeted_pool_arc(64 * 1024);
-        let asm = ChunkAssembler::new(pool, 4, 4096, 512, 8 * (1 << 30)).unwrap();
+        let budget = MemoryBudget::new(1 << 20, 0, 64 * 1024);
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                min_retained_segments: 1,
+                max_dedicated_segments: 0,
+                spill_threshold: 1.0,
+                ..PoolConfig::default()
+            },
+            format!("/cc3abort{:08x}", std::process::id()),
+            budget.clone(),
+        )));
+        let asm = ChunkAssembler::new(pool.clone(), 4, 4096, 512, 8 * (1 << 30)).unwrap();
+        assert!(asm.backing.is_buddy());
+        assert_eq!(pool.read().stats().alloc_count, 1);
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
             4 * 4096
         );
         asm.abort();
-        assert_eq!(
-            budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            0
-        );
+        assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
+        assert_eq!(pool.read().stats().alloc_count, 0);
+        // The only 64 KiB buddy remains mapped. No extra segment, dedicated
+        // allocation, or file fallback may hide an unreleased assembly block.
+        let before = pool.read().stats();
+        assert_eq!(before.total_segments, 1);
+        assert_eq!(before.buddy_data_bytes, 64 * 1024);
+        let mut guard = pool.write();
+        let handle = guard.alloc_handle(64 * 1024).unwrap();
+        assert!(handle.is_buddy());
+        let after = guard.stats();
+        assert_eq!(after.total_segments, 1);
+        assert_eq!(after.buddy_expanded_allocs, before.buddy_expanded_allocs);
+        assert_eq!(after.dedicated_allocs, 0);
+        assert_eq!(after.file_spill_allocs, 0);
+        guard.release_handle(handle);
+        assert_eq!(guard.stats().alloc_count, 0);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
 
     #[test]
@@ -295,10 +324,7 @@ mod tests {
         let err = asm.finish().unwrap_err();
         assert!(err.contains("incomplete"));
         // The dropped incomplete assembler released storage and refunded.
-        assert_eq!(
-            budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            0
-        );
+        assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         // The pool remains usable for a fresh assembly.
         let fresh = ChunkAssembler::new(pool, 1, 4096, 512, 8 * (1 << 30)).unwrap();
         fresh.abort();
@@ -337,7 +363,10 @@ mod tests {
     fn budget_rejection_leaves_no_mapping_and_reports_cell_and_size() {
         let (pool, budget) = budgeted_pool_arc(100);
         let err = ChunkAssembler::new(pool.clone(), 2, 64, 512, 8 * (1 << 30)).unwrap_err();
-        assert!(err.contains("'reassembly'"), "error must name the cell: {err}");
+        assert!(
+            err.contains("'reassembly'"),
+            "error must name the cell: {err}"
+        );
         assert!(err.contains("128"), "error must name the size: {err}");
         assert!(err.contains("100"), "error must name the limit: {err}");
 
@@ -374,10 +403,7 @@ mod tests {
         // Idempotent release refunds exactly once.
         backing.release().unwrap();
         backing.release().unwrap();
-        assert_eq!(
-            budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            0
-        );
+        assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         assert!(backing.is_released());
     }
 }
