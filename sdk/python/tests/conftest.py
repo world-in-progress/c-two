@@ -3,9 +3,12 @@ import signal
 import socket
 import subprocess
 import tempfile
+import hashlib
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from collections.abc import Callable, Iterator
-from typing import TextIO
+from typing import Any, TextIO
 import urllib.request
 
 # Disable .env loading before any c_two import — must be first.
@@ -30,6 +33,11 @@ os.environ.setdefault('no_proxy', '127.0.0.1,localhost')
 # Unique address factory to avoid conflicts between tests
 _address_counter = 0
 _address_lock = threading.Lock()
+_run_namespace = hashlib.sha256(
+    (os.environ.get('CTWO_TEST_RUN_NAMESPACE')
+     or os.environ.get('PYTEST_XDIST_TESTRUNUID')
+     or uuid.uuid4().hex).encode()
+).hexdigest()[:12]
 
 def _next_id():
     global _address_counter
@@ -39,8 +47,77 @@ def _next_id():
 
 
 @pytest.fixture
-def unique_ipc_address():
-    return f'ipc://test_hello_{_next_id()}'
+def unique_ipc_address() -> str:
+    worker = os.environ.get('PYTEST_XDIST_WORKER', 'master')
+    return f'ipc://test_hello_{_run_namespace}_{worker}_{os.getpid()}_{_next_id()}'
+
+
+_SERIAL_MATRIX_FILES = (
+    'test_portable_payload_cross_language.py',
+    'test_portable_payload_matrix.py',
+    'test_typescript_real_calls.py',
+)
+
+
+def pytest_configure(config: Any) -> None:
+    """在controller创建workers前拒绝误用，让UsageError引导实际可见。"""
+    if not (getattr(config.option, 'numprocesses', 0) or hasattr(config, 'workerinput')):
+        return
+    ignores = [Path(value).resolve() for value in (getattr(config.option, 'ignore', None) or [])]
+    integration = Path(__file__).resolve().parent / 'integration'
+    for name in _SERIAL_MATRIX_FILES:
+        matrix = integration / name
+        if any(matrix == ignored or ignored in matrix.parents for ignored in ignores):
+            continue
+        for argument in config.args:
+            selected = Path(argument.split('::', 1)[0]).resolve()
+            if selected == matrix or selected in matrix.parents:
+                raise pytest.UsageError(
+                    '完整portable/TypeScript矩阵必须单进程运行；使用 '
+                    '`python tools/dev/test_python.py --help`编排，或对完整矩阵使用`-n0`。'
+                )
+
+
+def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
+    """矩阵依赖模块内完整累积收据，任何xdist分发都会破坏该契约。"""
+    if not (getattr(config.option, 'numprocesses', 0) or hasattr(config, 'workerinput')):
+        return
+    if any(Path(str(item.path)).name in _SERIAL_MATRIX_FILES for item in items):
+        raise pytest.UsageError(
+            '完整portable/TypeScript矩阵必须单进程运行；使用 '
+            '`python tools/dev/test_python.py --help`编排，或对完整矩阵使用`-n0`。'
+        )
+
+
+_relay_start_thread_lock = threading.Lock()
+
+
+@contextmanager
+def _relay_start_lock() -> Iterator[None]:
+    """仅锁选端口至readiness，运行中已bind的relay可并存。
+
+    xdist命名空间见官方how-to；锁必须跨worker，不能只是Python线程锁。
+    不防御不遵守此fixture的外部进程抢占端口，既有启动失败断言仍有效。
+    """
+    uid = os.environ.get('PYTEST_XDIST_TESTRUNUID', _run_namespace)
+    path = Path(os.environ.get(
+        'CTWO_RELAY_START_LOCK',
+        str(Path(tempfile.gettempdir()) / f'c2-relay-start-{hashlib.sha256(uid.encode()).hexdigest()[:24]}.lock'),
+    ))
+    with _relay_start_thread_lock:
+        if os.name != 'posix':
+            if os.environ.get('PYTEST_XDIST_WORKER'):
+                raise RuntimeError('跨worker relay启动锁目前仅实现于Unix；Windows使用原有串行门禁')
+            yield
+            return
+        import fcntl
+        # 不unlink：避免等待者与新来者锁到不同inode。
+        with path.open('a+b') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 @pytest.fixture(params=['ipc'])
@@ -82,6 +159,12 @@ def free_tcp_port() -> int:
 
 
 def c3_binary() -> Path:
+    selected = os.environ.get('CTWO_TEST_C3_BIN')
+    if selected:
+        candidate = Path(selected)
+        if not candidate.is_file():
+            raise AssertionError(f'选定预建c3不存在：{candidate}')
+        return candidate
     root = repo_root()
     name = 'c3.exe' if os.name == 'nt' else 'c3'
     candidates = [
@@ -160,7 +243,17 @@ def _read_log(log: TextIO) -> str:
     return log.read()
 
 
-def _open_process_log() -> TextIO:
+def _open_process_log(channel: str = 'process') -> TextIO:
+    stage = os.environ.get('CTWO_PYTHON_STAGE_DIR')
+    if stage:
+        directory = Path(stage) / 'relay-logs'
+        directory.mkdir(parents=True, exist_ok=True)
+        worker = os.environ.get('PYTEST_XDIST_WORKER', 'master')
+        path = directory / f'{worker}-{os.getpid()}-{uuid.uuid4().hex}-{channel}.log'
+        log = path.open('w+', encoding='utf-8')
+        log.write(f"pytest: {os.environ.get('PYTEST_CURRENT_TEST', 'unknown')}\n")
+        log.flush()
+        return log
     return tempfile.TemporaryFile(mode='w+', encoding='utf-8')
 
 
@@ -189,8 +282,8 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
         env['C2_ENV_FILE'] = ''
         env['NO_PROXY'] = '127.0.0.1,localhost'
         env['no_proxy'] = '127.0.0.1,localhost'
-        stdout_log = _open_process_log()
-        stderr_log = _open_process_log()
+        stdout_log = _open_process_log('stdout')
+        stderr_log = _open_process_log('stderr')
         try:
             proc = subprocess.Popen(
                 args,
@@ -225,7 +318,7 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
         processes.append(relay)
         return relay
 
-    def _start(
+    def _start_locked(
         *,
         port: int | None = None,
         relay_id: str | None = None,
@@ -249,6 +342,16 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
                     raise
         assert last_error is not None
         raise last_error
+
+    def _start(
+        *,
+        port: int | None = None,
+        relay_id: str | None = None,
+        seeds: list[str] | None = None,
+        idle_timeout: int | None = None,
+    ) -> RelayProcess:
+        with _relay_start_lock():
+            return _start_locked(port=port, relay_id=relay_id, seeds=seeds, idle_timeout=idle_timeout)
 
     yield _start
 
