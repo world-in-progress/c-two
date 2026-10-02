@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.dev import test_python as runner
 
+pytestmark = pytest.mark.skipif(os.name != 'posix', reason='local Python runner uses POSIX process groups and flock; Windows has native gates')
+
 
 @pytest.mark.parametrize('groups', [
     {'ordinary': ['a'], 'matrix': ['c']},  # 缺b
@@ -160,6 +162,22 @@ def test_resource_lease_rejects_another_user_and_releases(tmp_path: Path) -> Non
                 pytest.fail('租约未生效')
     with runner.resource_lease(tmp_path):
         pass
+
+
+def test_resource_lease_contends_across_different_temp_directories(tmp_path: Path) -> None:
+    other_tmp = tmp_path / 'other-tmp'
+    other_tmp.mkdir()
+    script = (
+        'from pathlib import Path\n'
+        'from tools.dev.test_python import resource_lease, RunnerError\n'
+        f'try:\n    with resource_lease(Path({str(tmp_path)!r})):\n        raise SystemExit(7)\n'
+        'except RunnerError:\n    print("lease rejected")\n'
+    )
+    env = {**os.environ, 'TMPDIR': str(other_tmp), 'TEMP': str(other_tmp), 'TMP': str(other_tmp), 'PYTHONPATH': str(ROOT)}
+    with runner.resource_lease(tmp_path):
+        child = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True, timeout=5)
+    assert child.returncode == 0, child.stdout + child.stderr
+    assert 'lease rejected' in child.stdout
 
 
 def fixture_source(names: set[str]) -> str:

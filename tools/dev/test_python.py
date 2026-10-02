@@ -20,7 +20,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from typing import Any, Iterator
@@ -97,8 +96,10 @@ def resource_lease(resource: Path) -> Iterator[None]:
     """只协调这个入口；不宣称能阻止不遵守租约的外部构建。"""
     import fcntl
 
-    leases = Path(tempfile.gettempdir()) / f"c-two-python-test-leases-{os.getuid()}"
-    leases.mkdir(exist_ok=True)
+    # TMPDIR is deliberately different between test runs. A resource shared
+    # by those runs still needs the same lease directory.
+    leases = Path.home() / ".cache" / "c-two" / "python-test-leases"
+    leases.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha256(str(resource.resolve()).encode()).hexdigest()
     # 不 unlink：等待者可能已打开同一 inode。
     with (leases / key).open("a+b") as stream:
