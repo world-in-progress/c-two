@@ -60,3 +60,7 @@ Host 负责整合和最终审查。请将上述真实验收记录写入本报告
 ## Host 整合定向验证（2026-10-03）
 
 Host 已审阅合成后的释放、pending、receiver 与 maintenance 路径，保留同一 guard 内的 incarnation 校验和类型化 admission。完整 c2-wire 149 项、c2-ipc 151 项（含真实 LocalStream/SHM/dedicated completion/footer 对照）及 Core 错误边界 2 项已在真实环境通过，0 ignored。机器收据 /tmp/c2-full-review-1002/close-integrated-result.json。新 try-release 也补入 owner/peer 替换回归，要求错误而非提前退款。最终 native/SDK/完整 Python 与 Windows 门禁仍待后续固定提交验证。
+
+## Host 最终验收（2026-10-03）
+
+固定实现 `15578b5`：Core all-features 1211、Rust SDK 10、native 2、Python 定向 53 / 完整 918 项及三个原始故障探针通过，严格 18/12 收据有效。Windows 验证源码 `2d360875` 的 2022/2025 各 23 项完整门禁、两套基础门禁及不可变 ZIP/内部 hash/两种 wheel 消费清理/c3 字节核验全部通过；与本机仅有验证 workflow 触发条件差异。最新 sealed artifact 已在 Host 真实合成树验收，细节与边界见 [总报告](2026-10-03-memory-audit-validation.md) 和精简证据 JSON。正式发布与 PR 不由这些测试自动授权。

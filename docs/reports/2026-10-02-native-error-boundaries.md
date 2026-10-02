@@ -173,3 +173,7 @@ PYO3_PYTHON="$PWD/.venv/bin/python" cargo test \
 ## Host 整合定向验证（2026-10-03）
 
 Host 将本稿与 carrier 身份修复和关闭修复合成：admit_with_guard 中 allocation 与 owner incarnation 捕获共用同一 guard，release_storage_with_pool 中先核对 incarnation/authority，再释放与退款。合并前定向 gate 为 wire145、真实 IPC reply6、Core2；合并关闭修复后完整 wire149、IPC151、Core边界2 均通过。收据 /tmp/c2-full-review-1002/admission-integrated-result.json 与 close-integrated-result.json。最终 native/完整 facade 回归和 Windows 验证将绑定后续源码提交，当前不声明全部交付。
+
+## Host 最终验收（2026-10-03）
+
+固定实现 `15578b5`：Core all-features 1211、Rust SDK 10、native 2、Python 定向 53 / 完整 918 项及三个原始故障探针通过，严格 18/12 收据有效。Windows 验证源码 `2d360875` 的 2022/2025 各 23 项完整门禁、两套基础门禁及不可变 ZIP/内部 hash/两种 wheel 消费清理/c3 字节核验全部通过；与本机仅有验证 workflow 触发条件差异。最新 sealed artifact 已在 Host 真实合成树验收，细节与边界见 [总报告](2026-10-03-memory-audit-validation.md) 和精简证据 JSON。正式发布与 PR 不由这些测试自动授权。
