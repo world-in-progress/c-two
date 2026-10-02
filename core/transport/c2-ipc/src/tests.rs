@@ -3592,8 +3592,14 @@ mod lazy_policy_roundtrip_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_frame_write_cancellation_poisons_the_stream() {
         let (address, peer_rx) = raw_handshake_peer("partial_write_poison").await;
-        let mut client =
-            IpcClient::with_config(&address, client_config(small_base(64 * 1024, 2), 1024));
+        let base = BaseIpcConfig {
+            // One backing fits; two simultaneous 64 KiB buddy backings do
+            // not. Reacquire must use this same finite budget, not a reset.
+            shm_backing_budget_bytes: 128 * 1024,
+            ..small_base(64 * 1024, 2)
+        };
+        let cfg = client_config(base.clone(), 1024);
+        let mut client = IpcClient::with_config(&address, cfg.clone());
         client.connect().await.expect("connect");
         let mut peer = peer_rx.await.expect("peer stream");
         let pool = client.request_pool().expect("transport-owned request pool");
@@ -3602,6 +3608,7 @@ mod lazy_policy_roundtrip_tests {
             .budget()
             .cloned()
             .expect("owner pool carries the domain budget");
+        let first_prefix = pool.lock().prefix().to_string();
 
         let payload = vec![7u8; 8192];
         let block = client
@@ -3669,14 +3676,51 @@ mod lazy_policy_roundtrip_tests {
             "the buddy block stays conservatively charged for the peer"
         );
         assert!(budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes > 0);
-        drop(block);
-        drop(client);
+        let retained_bytes = budget.snapshot().shm.used_bytes;
+        assert!(client.close_shared_bounded(Duration::from_secs(2)).await);
+        assert!(client.request_pool().is_none());
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "close must not locally free a possibly published buddy block"
+        );
         drop(pool);
+        assert_eq!(
+            budget.snapshot().shm.used_bytes,
+            retained_bytes,
+            "the real external RequestBlock keeps its pool and budget alive"
+        );
+        drop(block);
         assert_eq!(
             budget.snapshot().cell(c2_mem::BudgetKind::Shm).used_bytes,
             0,
-            "pool destruction must return the conservative hold"
+            "the closed client must not pin an orphaned buddy backing"
         );
+
+        // Keep the closed client alive while a fresh connection uses exactly
+        // the same frozen budget to perform a real buddy request.
+        let (callback, seen_kinds) = echo_callback();
+        let server = start_echo_server(
+            "partial_write_reacquire",
+            server_config(base, 1024),
+            callback,
+        )
+        .await;
+        let mut reacquired =
+            IpcClient::with_shared_budget(server.ipc_address(), cfg, budget.clone());
+        reacquired.connect().await.expect("same-budget reconnect");
+        assert_ne!(
+            reacquired.request_pool().unwrap().lock().prefix(),
+            first_prefix,
+            "the old buddy coordinates must not be reused in a new incarnation"
+        );
+        let response = echo_roundtrip(&reacquired, "partial_write_reacquire", &payload).await;
+        assert_eq!(response_bytes(&reacquired, response), payload);
+        assert_eq!(*seen_kinds.lock(), vec!["shm_buddy"]);
+        assert!(reacquired.close_shared_bounded(Duration::from_secs(2)).await);
+        drop(client);
+        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        stop_server(&server).await;
     }
 
     /// Cancelling a call while it waits for the writer lock must remove its
@@ -4603,7 +4647,7 @@ mod chunk_reply_admission_tests {
     use tokio::sync::oneshot;
 
     use crate::IpcError;
-    use crate::client::{PendingResponse, recv_loop};
+    use crate::client::{ChunkError, PendingResponse, recv_loop};
     use crate::response::ResponseData;
 
     const SIG_PING: u8 = 0x01;
@@ -4745,6 +4789,91 @@ mod chunk_reply_admission_tests {
         );
     }
 
+    /// Well-encoded metadata can still describe invalid geometry. It must
+    /// remain a protocol failure even when the reassembly budget is zero.
+    #[tokio::test]
+    async fn encoded_invalid_reply_geometry_is_protocol_and_ping_stays_usable() {
+        let (registry, budget) = budgeted_registry(0, "g");
+        let mut driven = drive_recv_loop(Arc::clone(&registry)).await;
+        for (offset, (size, chunks, data_len)) in [
+            (128, 0, 64),
+            (0, 1, 1),
+            (0, 2, 64),
+            (128, 2, 0),
+            (128, 1, 0),
+            (128, 1, 129),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rid = 100 + offset as u32;
+            let receiver = register_pending(&driven, rid);
+            driven
+                .probe_write
+                .write_all(&chunked_reply_frame(
+                    u64::from(rid),
+                    size,
+                    chunks,
+                    0,
+                    &vec![0x42; data_len],
+                ))
+                .await
+                .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("invalid geometry completes its RID")
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, IpcError::Chunk(ChunkError::Protocol(_))),
+                "{error:?}"
+            );
+            assert!(!driven.pending.lock().contains_key(&rid));
+            assert!(!registry.contains(7, rid as u64));
+            assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
+            assert_eq!(reassembly_used(&budget), 0);
+        }
+        let ping = signal_frame(199, SIG_PING);
+        driven.probe_write.write_all(&ping).await.unwrap();
+        let pong = frame::encode_frame(199, flags::FLAG_RESPONSE | flags::FLAG_SIGNAL, &[SIG_PONG]);
+        assert_eq!(
+            read_exact_frame(&mut driven.probe_read, pong.len()).await,
+            pong
+        );
+        // A different RID gets the actual capacity result, rather than a
+        // sticky protocol rejection or a failed connection.
+        for (offset, (chunks, len)) in [(2, 64), (1, 128)].into_iter().enumerate() {
+            let rid = 200 + offset as u32;
+            let receiver = register_pending(&driven, rid);
+            driven
+                .probe_write
+                .write_all(&chunked_reply_frame(
+                    u64::from(rid),
+                    128,
+                    chunks,
+                    0,
+                    &vec![0x33; len],
+                ))
+                .await
+                .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("capacity failure completes unrelated RID")
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(error, IpcError::Chunk(ChunkError::Capacity(_))));
+            assert!(!driven.pending.lock().contains_key(&rid));
+            assert!(!registry.contains(7, u64::from(rid)));
+            assert_eq!(
+                budget.snapshot().reassembly.rejected_allocations,
+                offset as u64 + 1
+            );
+        }
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(registry.active_count(), 0);
+        driven._handle.abort();
+    }
+
     /// Malformed reply chunk metadata for a request with an in-flight assembly
     /// must complete exactly that pending caller with a useful error, release
     /// the charged assembly immediately (no GC or disconnect wait), and leave
@@ -4780,7 +4909,7 @@ mod chunk_reply_admission_tests {
             .unwrap()
             .expect_err("malformed metadata must fail the call");
         match &error {
-            IpcError::Chunk(message) => {
+            IpcError::Chunk(ChunkError::Protocol(message)) => {
                 assert!(message.contains("metadata"), "useful error: {message}");
             }
             other => panic!("expected chunk error, got {other:?}"),
@@ -4857,7 +4986,7 @@ mod chunk_reply_admission_tests {
             .unwrap()
             .expect_err("duplicate chunk must fail the call");
         match &error {
-            IpcError::Chunk(message) => {
+            IpcError::Chunk(ChunkError::Protocol(message)) => {
                 assert!(message.contains("duplicate"), "useful error: {message}");
             }
             other => panic!("expected chunk error, got {other:?}"),
@@ -4898,7 +5027,7 @@ mod chunk_reply_admission_tests {
     /// (the caller is already failed) instead of staying charged until GC.
     #[tokio::test]
     async fn duplicate_first_chunk_aborts_existing_assembly_and_releases_budget_once() {
-        let (registry, budget) = budgeted_registry(1 << 20, "D");
+        let (registry, budget) = budgeted_registry(1024, "D");
         let mut driven = drive_recv_loop(Arc::clone(&registry)).await;
 
         let rx_duplicate = register_pending(&driven, 61);
@@ -4922,7 +5051,7 @@ mod chunk_reply_admission_tests {
             .unwrap()
             .expect_err("duplicate first chunk must fail the call");
         match &error {
-            IpcError::Chunk(message) => {
+            IpcError::Chunk(ChunkError::Protocol(message)) => {
                 assert!(message.contains("duplicate"), "useful error: {message}");
             }
             other => panic!("expected chunk error, got {other:?}"),
@@ -4932,6 +5061,10 @@ mod chunk_reply_admission_tests {
             "the abandoned assembly must be released, not stranded"
         );
         assert_eq!(reassembly_used(&budget), 0);
+
+        // Duplicate rejection is decided before trying another reservation,
+        // even when the existing assembly has filled the whole budget.
+        assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
 
         driven._handle.abort();
     }
@@ -4964,7 +5097,7 @@ mod chunk_reply_admission_tests {
             .unwrap()
             .expect_err("oversized chunk must fail the call");
         match &error {
-            IpcError::Chunk(message) => {
+            IpcError::Chunk(ChunkError::Protocol(message)) => {
                 assert!(
                     message.contains("exceeds chunk_size"),
                     "useful error: {message}"
@@ -4996,7 +5129,7 @@ mod chunk_reply_admission_tests {
     async fn admission_failure_is_correlated_and_ping_survives_exhausted_budget() {
         // Exactly one 1024-byte assembly fits.
         let (registry, budget) = budgeted_registry(1024, "a");
-        let mut driven = drive_recv_loop(registry).await;
+        let mut driven = drive_recv_loop(Arc::clone(&registry)).await;
 
         // (1) Fill the budget with one in-flight two-chunk assembly.
         let rx_fill = register_pending(&driven, 5);
@@ -5032,12 +5165,17 @@ mod chunk_reply_admission_tests {
             .unwrap()
             .expect_err("over-capacity reply must be rejected");
         match &rejection {
-            IpcError::Chunk(message) => {
+            IpcError::Chunk(ChunkError::Capacity(message)) => {
                 assert!(message.contains("'reassembly'"), "cell named: {message}");
                 assert!(message.contains("2048"), "size named: {message}");
             }
             other => panic!("expected chunk admission error, got {other:?}"),
         }
+        assert!(!driven.pending.lock().contains_key(&6));
+        assert!(!registry.contains(7, 6));
+        assert!(registry.contains(7, 5));
+        // The other in-flight assembly keeps its own charge and identity.
+        assert_eq!(reassembly_used(&budget), 1024);
         // The rejected reply left the budget untouched and no entry behind.
         assert_eq!(
             budget
@@ -5106,6 +5244,8 @@ mod chunk_reply_admission_tests {
             .unwrap()
             .unwrap();
         drop(response); // carrier drop releases storage and refunds.
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(registry.active_count(), 0);
 
         driven._handle.abort();
     }

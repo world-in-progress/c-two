@@ -21,7 +21,7 @@ use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
 use c2_wire::chunk::encode_chunk_header;
-use c2_wire::chunk::{ChunkConfig, ChunkRegistry};
+use c2_wire::chunk::{ChunkAdmissionError, ChunkConfig, ChunkRegistry};
 use c2_wire::control::{
     ReplyControl, RouteCallIdentity, decode_reply_control, encode_call_control,
     encoded_call_control_len,
@@ -47,7 +47,7 @@ use c2_wire::route_catalog_control::{
 use c2_mem::config::PoolConfig;
 use c2_mem::{MemPool, PoolAllocation};
 
-use crate::response::{ResponseData, ResponseLease};
+use crate::response::ResponseData;
 
 pub use c2_config::ClientIpcConfig;
 
@@ -459,7 +459,16 @@ pub(crate) struct DedicatedRetirePermit {
 impl DedicatedRetirePermit {
     /// Return a permit whose backing retired without retention.
     fn release(self) {
-        self.executor.return_permit();
+        let executor = self.executor;
+        self.release_locked(&mut executor.state.lock());
+        executor.signal.notify_all();
+    }
+
+    /// Return the slot while its executor lock is already held. Close acquires
+    /// this lock before touching the allocation, so settlement cannot block
+    /// halfway through transferring release authority.
+    fn release_locked(self, state: &mut DedicatedRetireState) {
+        state.permits = state.permits.saturating_sub(1);
         #[cfg(test)]
         if let Some(returned) = self.returned {
             returned.store(true, Ordering::Release);
@@ -467,6 +476,7 @@ impl DedicatedRetirePermit {
     }
 
     /// Hand the retained backing — and this permit — to the shared queue.
+    #[cfg(test)]
     fn submit(self, pool: Arc<StdMutex<MemPool>>, alloc: PoolAllocation) {
         self.executor.submit_job(DedicatedRetireJob {
             pool,
@@ -547,21 +557,22 @@ impl DedicatedRetireExecutor {
     /// worker alive, so the settle path never depends on creating a thread.
     /// The best-effort spawn only replaces a worker lost to a panic; on failure
     /// the job keeps its backing, charge, and permit in the queue.
+    #[cfg(test)]
     fn submit_job(self: &'static Self, job: DedicatedRetireJob) {
         {
             let mut state = self.state.lock();
-            state.jobs.push_back(job);
+            self.submit_job_locked(&mut state, job);
         }
         self.signal.notify_all();
-        let _ = self.ensure_workers_locked(&mut self.state.lock(), 1);
     }
 
-    /// Return one permit (a retained backing finished retiring).
-    fn return_permit(self: &'static Self) {
-        let mut state = self.state.lock();
-        state.permits = state.permits.saturating_sub(1);
-        drop(state);
-        self.signal.notify_all();
+    fn submit_job_locked(
+        self: &'static Self,
+        state: &mut DedicatedRetireState,
+        job: DedicatedRetireJob,
+    ) {
+        state.jobs.push_back(job);
+        let _ = self.ensure_workers_locked(state, 1);
     }
 }
 
@@ -830,31 +841,69 @@ impl RequestReleaseState {
     ///   pool's configured crash timeout does), after which the backing
     ///   charge returns.
     fn release_once(&self) -> Result<(), IpcError> {
-        let mut permit_slot = self.permit.lock();
-        let observed = loop {
-            match self.phase.load(Ordering::Acquire) {
-                phase @ (Self::PHASE_ARMED | Self::PHASE_DISPATCHED) => {
-                    match self.phase.compare_exchange(
-                        phase,
-                        Self::PHASE_RELEASED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break phase,
-                        Err(_) => continue,
-                    }
-                }
-                _ => return Ok(()),
-            }
-        };
-        if observed == Self::PHASE_DISPATCHED && !self.alloc.is_dedicated {
-            return Ok(());
+        self.release_inner(false).map(|_| ())
+    }
+
+    /// Nonblocking settlement for connection-owned cleanup. A pending entry
+    /// carries only dispatched allocations. If any required local lock is
+    /// busy, leave the entry, phase, pool and permit untouched for a retry.
+    fn try_release_dispatched(&self) -> Result<bool, IpcError> {
+        self.release_inner(true)
+    }
+
+    fn release_inner(&self, nonblocking: bool) -> Result<bool, IpcError> {
+        if self.phase.load(Ordering::Acquire) == Self::PHASE_RELEASED {
+            return Ok(true);
         }
-        let mut pool = self.pool.lock();
+        let mut permit_slot = if nonblocking {
+            let Some(slot) = self.permit.try_lock() else {
+                return Ok(false);
+            };
+            slot
+        } else {
+            self.permit.lock()
+        };
+        let observed = self.phase.load(Ordering::Acquire);
+        if observed == Self::PHASE_RELEASED {
+            return Ok(true);
+        }
+        if observed == Self::PHASE_DISPATCHED && !self.alloc.is_dedicated {
+            self.phase.store(Self::PHASE_RELEASED, Ordering::Release);
+            return Ok(true);
+        }
+        if nonblocking && observed == Self::PHASE_ARMED {
+            // Armed blocks belong to their allocating caller, never to the
+            // pending-map close drain. In particular, close must not enter a
+            // buddy allocator's cross-process lock to free an unpublished
+            // block on that caller's behalf.
+            return Ok(false);
+        }
+        let mut pool = if nonblocking {
+            let Some(pool) = self.pool.try_lock() else {
+                return Ok(false);
+            };
+            pool
+        } else {
+            self.pool.lock()
+        };
+        let executor = permit_slot.as_ref().map(|permit| permit.executor);
+        let mut executor_state = match executor {
+            Some(executor) if nonblocking => {
+                let Some(state) = executor.state.try_lock() else {
+                    return Ok(false);
+                };
+                Some(state)
+            }
+            Some(executor) => Some(executor.state.lock()),
+            None => None,
+        };
+        // The permit lock serializes dispatch and every release observer.
+        // Acquire all cleanup locks before changing phase or consuming the
+        // permit. Released means settlement has finished, including its
+        // retention handoff, rather than merely that one observer started it.
         pool.free(&self.alloc)
             .map_err(|error| IpcError::Pool(format!("prealloc free failed: {error}")))?;
         let mut permit = permit_slot.take();
-        drop(permit_slot);
         if observed == Self::PHASE_DISPATCHED {
             // Dispatched dedicated: retire now when the peer already
             // signalled read_done (the response path); otherwise hand the
@@ -865,21 +914,34 @@ impl RequestReleaseState {
             let awaiting = pool.dedicated_awaiting_retirement(&self.alloc);
             drop(pool);
             if awaiting {
-                permit
+                let permit = permit
                     .take()
-                    .expect("dispatched dedicated request has a retire permit")
-                    .submit(Arc::clone(&self.pool), self.alloc);
+                    .expect("dispatched dedicated request has a retire permit");
+                let state = executor_state.as_mut().expect("retire executor locked");
+                executor.unwrap().submit_job_locked(
+                    state,
+                    DedicatedRetireJob {
+                        pool: Arc::clone(&self.pool),
+                        alloc: self.alloc,
+                        permit,
+                    },
+                );
             } else if let Some(permit) = permit.take() {
-                permit.release();
+                permit.release_locked(executor_state.as_mut().unwrap());
             }
         } else {
             drop(pool);
             if let Some(permit) = permit.take() {
                 // Unpublished release: the retention slot was never needed.
-                permit.release();
+                permit.release_locked(executor_state.as_mut().unwrap());
             }
         }
-        Ok(())
+        self.phase.store(Self::PHASE_RELEASED, Ordering::Release);
+        drop(executor_state);
+        if let Some(executor) = executor {
+            executor.signal.notify_all();
+        }
+        Ok(true)
     }
 }
 
@@ -889,7 +951,7 @@ impl Drop for RequestReleaseState {
         // (a no-op for dispatched buddy blocks and already-released blocks).
         let _ = self.release_once();
         // And any retention slot that no settle path consumed is returned.
-        if let Some(permit) = self.permit.lock().take() {
+        if let Some(permit) = self.permit.get_mut().take() {
             permit.release();
         }
     }
@@ -1007,7 +1069,14 @@ impl RequestBlock {
 
 impl Drop for RequestBlock {
     fn drop(&mut self) {
-        let _ = self.release.release_once();
+        if self.release.phase.load(Ordering::Acquire) == RequestReleaseState::PHASE_ARMED {
+            let _ = self.release.release_once();
+        } else {
+            // Published requests retain their release authority in pending
+            // until settlement succeeds. Dropping the caller's token must not
+            // stall its runtime while an external owner holds the pool lock.
+            let _ = self.release.try_release_dispatched();
+        }
     }
 }
 
@@ -1016,6 +1085,34 @@ impl Drop for RequestBlock {
 /// Default deadline for one client close barrier (writer lock, receive join,
 /// final writer clear).
 const DEFAULT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A chunk failure's stage, independent of allocator diagnostic text.
+#[derive(Debug)]
+pub enum ChunkError {
+    Protocol(String),
+    /// The peer already replied, but local reassembly admission failed.
+    Capacity(String),
+}
+
+impl Display for ChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(message) | Self::Capacity(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<ChunkAdmissionError> for ChunkError {
+    fn from(error: ChunkAdmissionError) -> Self {
+        let message = format!("chunked reply reassembly admission failed: {error}");
+        match error {
+            ChunkAdmissionError::Capacity(_) => Self::Capacity(message),
+            ChunkAdmissionError::Protocol(_) | ChunkAdmissionError::Duplicate { .. } => {
+                Self::Protocol(message)
+            }
+        }
+    }
+}
 
 /// IPC client error.
 #[derive(Debug)]
@@ -1073,7 +1170,7 @@ pub enum IpcError {
     /// Shared-memory request/response setup failed.
     Shm(String),
     /// Chunked response assembly failed.
-    Chunk(String),
+    Chunk(ChunkError),
     /// CRM method returned an error (serialized error bytes).
     CrmError(Vec<u8>),
     /// Client is closed or connection lost.
@@ -1449,23 +1546,81 @@ impl MethodTable {
 
 /// One in-flight unary call.
 pub(crate) struct PendingResponse {
-    tx: oneshot::Sender<Result<ResponseData, IpcError>>,
+    // A close may wake the waiter before its allocation can be settled. The
+    // entry then remains a cleanup owner without retaining a dead channel.
+    tx: Option<oneshot::Sender<Result<ResponseData, IpcError>>>,
     /// Exact-once release authority for a dispatched buddy/dedicated request
     /// allocation this call carries, attached when the frame write begins.
     /// Terminal observers (the receive loop and a connection-close drain)
-    /// resolve it through [`RequestReleaseState::release_once`] when the
+    /// resolve it through [`RequestReleaseState::try_release_dispatched`] when the
     /// caller is gone, so a cancelled-after-dispatch call cannot strand a
     /// dedicated owner release.
     request: Option<Arc<RequestReleaseState>>,
+    /// An undelivered response retains its entire carrier until nonblocking
+    /// release succeeds. The receiver pauses before accepting another one.
+    response: Option<ResponseData>,
 }
 
 impl PendingResponse {
     pub(crate) fn unary(tx: oneshot::Sender<Result<ResponseData, IpcError>>) -> Self {
-        Self { tx, request: None }
+        Self {
+            tx: Some(tx),
+            request: None,
+            response: None,
+        }
+    }
+
+    fn close_waiter(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Err(IpcError::Closed));
+        }
+    }
+
+    fn try_release_request(&mut self) -> bool {
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|request| !matches!(request.try_release_dispatched(), Ok(true)))
+        {
+            return false;
+        }
+        self.request.take();
+        true
+    }
+
+    fn try_settle(&mut self, server_pool: &Arc<StdMutex<Option<ServerPoolState>>>) -> bool {
+        let request_released = self.try_release_request();
+        if let Some(response) = self.response.as_mut() {
+            if !matches!(
+                try_release_unclaimed_response(response, server_pool),
+                Ok(true)
+            ) {
+                return false;
+            }
+        }
+        self.response.take();
+        request_released
     }
 }
 
 pub(crate) type PendingMap = HashMap<u32, PendingResponse>;
+
+fn register_unary_pending(
+    pending: &StdMutex<PendingMap>,
+    rid_counter: &AtomicU32,
+    tx: oneshot::Sender<Result<ResponseData, IpcError>>,
+) -> u32 {
+    let mut pending = pending.lock();
+    loop {
+        let rid = rid_counter.fetch_add(1, Ordering::Relaxed);
+        if let std::collections::hash_map::Entry::Vacant(slot) = pending.entry(rid) {
+            slot.insert(PendingResponse::unary(tx));
+            return rid;
+        }
+        // A deferred cleanup owner reserves its id too. Never overwrite its
+        // carrier/request when the counter reaches it (including wraparound).
+    }
+}
 
 /// Per-call send-cancellation guard.
 ///
@@ -1478,13 +1633,10 @@ pub(crate) type PendingMap = HashMap<u32, PendingResponse>;
 ///   (idempotent with the local-stream write guard). The pending entry keeps
 ///   its attached release authority, so the EOF/close drain still settles
 ///   the request allocation exactly once;
-/// - the send completed but the reply is still pending: remove this call's
-///   waiter now and settle its request allocation (the same per-entry
-///   resolution a drain performs), so repeated cancellations against a
-///   slow server cannot accumulate pending entries or strand dedicated
-///   owner releases. The connection stays healthy, and a late reply for
-///   the removed entry is released by the receive loop instead of leaking
-///   its response backing.
+/// - the send completed but the reply is still pending: close this call's
+///   waiter and try settlement without waiting for its pool. If busy, the
+///   entry remains the cleanup owner for maintenance/close; otherwise it is
+///   removed immediately. Late replies are released by the receive loop.
 struct SendGuard {
     pending: Arc<StdMutex<PendingMap>>,
     abort: Arc<StdMutex<Option<AbortHandle>>>,
@@ -1538,9 +1690,11 @@ impl Drop for SendGuard {
         if self.sent {
             // Cancelled while waiting for a delayed reply on an otherwise
             // healthy connection: resolve this entry exactly like a drain.
-            if let Some(entry) = self.pending.lock().remove(&self.rid) {
-                if let Some(request) = entry.request {
-                    let _ = request.release_once();
+            let mut pending = self.pending.lock();
+            if let Some(entry) = pending.get_mut(&self.rid) {
+                entry.close_waiter();
+                if entry.try_release_request() && entry.response.is_none() {
+                    pending.remove(&self.rid);
                 }
             }
             return;
@@ -1711,11 +1865,14 @@ pub struct IpcClient {
     /// can never observe a taken handle and mistake it for a terminal task
     /// state.
     close_gate: tokio::sync::Mutex<()>,
+    /// A partial close may leave cleanup-only pending entries even after both
+    /// tasks finish. Reconnect must wait for that same transaction to finish.
+    close_incomplete: AtomicBool,
     connected: Arc<AtomicBool>,
     /// Transport-owned request pool.
     ///
-    /// `Some` while this client owns the pool. A confirmed close detaches an
-    /// idle pool so a closed-but-application-retained client stops pinning
+    /// `Some` while this client owns the pool. A confirmed close detaches the
+    /// pool so a closed-but-application-retained client stops pinning
     /// unused mappings and their shared budget charge; a reconnect creates a
     /// fresh incarnation on the same domain budget. Injected pools are owned
     /// by the caller and are never detached here.
@@ -1778,6 +1935,39 @@ pub struct IpcClient {
 pub(crate) struct MaintenanceTask {
     stop: tokio::sync::watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
+}
+
+/// Poll a task without taking its handle out of the owner's slot. Each poll
+/// uses only try_lock, and an incomplete/cancelled wait leaves the handle
+/// reachable for the next close. No synchronous guard survives an await.
+async fn join_close_task<T>(
+    slot: &StdMutex<Option<T>>,
+    deadline: tokio::time::Instant,
+    handle: fn(&mut T) -> &mut tokio::task::JoinHandle<()>,
+) -> bool {
+    use std::future::Future;
+    use std::task::Poll;
+
+    tokio::time::timeout_at(
+        deadline,
+        std::future::poll_fn(|cx| {
+            let Some(mut slot) = slot.try_lock() else {
+                return Poll::Ready(false);
+            };
+            let Some(task) = slot.as_mut() else {
+                return Poll::Ready(true);
+            };
+            match std::pin::Pin::new(handle(task)).poll(cx) {
+                Poll::Ready(_) => {
+                    slot.take();
+                    Poll::Ready(true)
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }),
+    )
+    .await
+    .unwrap_or(false)
 }
 
 // Compile-time assertion: IpcClient is Send+Sync because all fields are
@@ -1850,6 +2040,7 @@ impl IpcClient {
             #[cfg(test)]
             receiver_drop_gate_for_test: StdMutex::new(None),
             close_gate: tokio::sync::Mutex::new(()),
+            close_incomplete: AtomicBool::new(false),
             connected: Arc::new(AtomicBool::new(false)),
             pool: StdMutex::new(pool),
             pool_transport_owned,
@@ -1882,8 +2073,8 @@ impl IpcClient {
     /// authority for the coordinates regardless of what a concurrent
     /// confirmed close does to the client's pool slot afterwards. The
     /// test-only hook runs after selection and before the allocation, which
-    /// is the window in which a close can observe `alloc_count == 0` and
-    /// detach the pool (or a reconnect can install a fresh incarnation).
+    /// is the window in which a close can detach the pool (or a reconnect can
+    /// install a fresh incarnation) without invalidating that selection.
     pub(crate) fn select_request_pool(&self) -> Option<Arc<StdMutex<MemPool>>> {
         let pool = self.request_pool();
         #[cfg(test)]
@@ -2085,6 +2276,7 @@ impl IpcClient {
         // both background tasks. Replacing either handle here would detach
         // its task from the client's close and Drop ownership.
         if self.is_connected()
+            || self.close_incomplete.load(Ordering::Acquire)
             || self.recv_handle.lock().is_some()
             || self.maintenance.lock().is_some()
         {
@@ -2395,6 +2587,8 @@ impl IpcClient {
     /// (`MemPool::gc_dedicated`), so a dedicated-only lightweight connection
     /// releases its mappings without waiting for another allocation. The pool
     /// stays the release authority and live allocations are never touched.
+    /// Busy shards and pools are skipped for this tick; resolved/cancelled
+    /// pending entries retain their exact cleanup authority until retry.
     /// The task holds only weak references plus a shutdown watch channel:
     ///
     /// - `close_shared` stops it immediately through the watch channel.
@@ -2413,6 +2607,8 @@ impl IpcClient {
         let registry = self
             .chunk_registry_arc()
             .map(|registry| Arc::downgrade(&registry));
+        let pending = Arc::downgrade(&self.pending);
+        let server_pool = Arc::downgrade(&self.server_pool);
         #[cfg(test)]
         let tick_counter = Arc::clone(&self.maintenance_ticks);
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -2431,7 +2627,7 @@ impl IpcClient {
                         // (or has closed and taken the task out of the state).
                         let client_alive = match state_probe.upgrade() {
                             Some(state) => {
-                                let alive = state.lock().is_some();
+                                let alive = state.try_lock().is_none_or(|slot| slot.is_some());
                                 alive
                             }
                             None => false,
@@ -2440,15 +2636,20 @@ impl IpcClient {
                             break;
                         }
                         if let Some(registry) = registry.as_ref().and_then(Weak::upgrade) {
-                            registry.gc_sweep();
-                            let mut pool = registry.pool().write();
-                            pool.gc_buddy();
-                            pool.gc_dedicated();
+                            registry.try_gc_sweep();
+                            if let Some(mut pool) = registry.pool().try_write() {
+                                pool.gc_buddy();
+                                pool.gc_dedicated();
+                            }
                         }
                         if let Some(pool) = request_pool.as_ref().and_then(Weak::upgrade) {
-                            let mut pool = pool.lock();
-                            pool.gc_buddy();
-                            pool.gc_dedicated();
+                            if let Some(mut pool) = pool.try_lock() {
+                                pool.gc_buddy();
+                                pool.gc_dedicated();
+                            }
+                        }
+                        if let (Some(pending), Some(server_pool)) = (pending.upgrade(), server_pool.upgrade()) {
+                            try_drain_pending(&pending, &server_pool, false, None);
                         }
                     }
                 }
@@ -2538,11 +2739,8 @@ impl IpcClient {
         payload: Vec<u8>,
         description: &str,
     ) -> Result<Vec<u8>, IpcError> {
-        let rid = rid_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        {
-            pending.lock().insert(rid, PendingResponse::unary(tx));
-        }
+        let rid = register_unary_pending(&pending, &rid_counter, tx);
 
         let frame = frame::encode_frame(rid as u64, flags::FLAG_CTRL, &payload);
         let send_result: Result<(), IpcError> = async {
@@ -2801,13 +2999,9 @@ impl IpcClient {
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
-        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
-
         // Register pending call.
         let (tx, rx) = oneshot::channel();
-        {
-            self.pending.lock().insert(rid, PendingResponse::unary(tx));
-        }
+        let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
 
         // Build and send the frame.
         let ctrl_len = encoded_call_control_len(identity)?;
@@ -3051,13 +3245,9 @@ impl IpcClient {
         payload.extend_from_slice(&buddy_bytes);
         payload.extend_from_slice(&ctrl);
 
-        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
-
         // Register pending call.
         let (tx, rx) = oneshot::channel();
-        {
-            self.pending.lock().insert(rid, PendingResponse::unary(tx));
-        }
+        let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
 
         let flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
         let frame = frame::encode_frame(rid as u64, flags, &payload);
@@ -3140,14 +3330,22 @@ impl IpcClient {
 
         if let Err(e) = send_result {
             send_guard.disarm();
-            // The write failed or the block was rejected. `release` resolves
-            // through the shared authority: if the seam was crossed, a buddy
-            // block stays charged for the peer's cross-process free (a
-            // partial write is not proof of no dispatch) and a dedicated
-            // block is settled and bounded-retired; if the seam was never
-            // crossed the block is still armed and freed here.
-            let _ = block.release();
-            self.pending.lock().remove(&rid);
+            // Unpublished blocks still belong to their allocating caller.
+            // Published authority stays in pending until nonblocking
+            // settlement succeeds; a partial write never permits local buddy
+            // free, and dedicated backing retains its retire permit.
+            if block.release.phase.load(Ordering::Acquire) == RequestReleaseState::PHASE_ARMED {
+                let _ = block.release();
+                self.pending.lock().remove(&rid);
+            } else {
+                let mut pending = self.pending.lock();
+                if let Some(entry) = pending.get_mut(&rid) {
+                    entry.close_waiter();
+                    if entry.try_release_request() && entry.response.is_none() {
+                        pending.remove(&rid);
+                    }
+                }
+            }
             return Err(e);
         }
         // The frame was handed over completely; from here the guard resolves
@@ -3159,10 +3357,10 @@ impl IpcClient {
         // its local peer-pool view, so the client settles its own owner
         // allocation (idempotent with the terminal observers).
         match rx.await {
-            Ok(result) => {
-                let _ = block.release();
-                result
-            }
+            // The receiver/pending entry settles published ownership. A busy
+            // pool stays there for maintenance/close rather than blocking the
+            // caller again after its response has already been delivered.
+            Ok(result) => result,
             Err(_) => Err(IpcError::Closed),
         }
     }
@@ -3177,13 +3375,9 @@ impl IpcClient {
         let chunk_size = self.config.chunk_size as usize;
         let total_chunks = request_chunk_count(data.len(), chunk_size)?;
 
-        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
-
         // Register pending call ONCE — reply comes after last chunk.
         let (tx, rx) = oneshot::channel();
-        {
-            self.pending.lock().insert(rid, PendingResponse::unary(tx));
-        }
+        let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
 
         // Build call control (included only in chunk 0).
         let ctrl = encode_call_control(identity, method_idx)?;
@@ -3266,11 +3460,8 @@ impl IpcClient {
                 .map_err(classified_call_error);
         }
 
-        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        {
-            self.pending.lock().insert(rid, PendingResponse::unary(tx));
-        }
+        let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
 
         let ctrl = encode_call_control(identity, method_idx)
             .map_err(|error| pre_dispatch_call_error(error.into()))?;
@@ -4013,11 +4204,12 @@ impl IpcClient {
         let _ = self.close_shared_bounded(DEFAULT_CLOSE_TIMEOUT).await;
     }
 
-    /// Close through shared ownership with every barrier phase bounded by one
-    /// deadline, reporting honestly whether the close was confirmed.
+    /// Close through shared ownership using one deadline for the asynchronous
+    /// barriers and nonblocking attempts at IPC-owned cleanup locks.
     ///
     /// `true` means the maintenance and receive tasks finished (or none
-    /// existed) and the writer slot was cleared, all within `timeout`. A
+    /// existed), the writer slot was cleared, pending allocations were
+    /// settled, and transport-owned pool slots were detached within `timeout`. A
     /// `false` result reports an unconfirmed close: tasks may still be draining, and no backing memory
     /// is force-released. Concurrent callers serialize through a close gate:
     /// a caller that cannot enter the gate before its deadline expires, or
@@ -4026,9 +4218,14 @@ impl IpcClient {
     ///
     /// Every phase, including the final writer-lock clear and the
     /// maintenance and receive-task joins, derives its budget from the single
-    /// absolute deadline. An unconfirmed task is aborted and its handle is
-    /// restored, so a later close can retry the join; a missing handle means
+    /// absolute deadline. IPC-owned cleanup locks are tried without waiting;
+    /// contention leaves ownership intact and reports an unconfirmed close.
+    /// An unconfirmed task is aborted and its handle stays in its slot, so a
+    /// later close can retry the join; a missing handle means
     /// the task has finished or never existed.
+    /// Receiver teardown and pending settlement retain busy carriers in their
+    /// connection owners for retry. This bounds contended cleanup waits, not
+    /// OS scheduling or mapping destruction as a hard real-time guarantee.
     pub async fn close_shared_bounded(&self, timeout: std::time::Duration) -> bool {
         use tokio::time::timeout_at;
 
@@ -4051,18 +4248,24 @@ impl IpcClient {
             }
         };
         let mut confirmed = true;
+        self.close_incomplete.store(true, Ordering::Release);
 
-        // Stop maintenance inside the same close transaction. The watch
-        // signal permits a clean exit; a task still running at the deadline
-        // is aborted and kept reachable for a later join. Never hold the
-        // synchronous maintenance mutex across an await.
-        let maintenance = { self.maintenance.lock().take() };
-        if let Some(mut task) = maintenance {
-            let _ = task.stop.send(true);
-            if timeout_at(deadline, &mut task.handle).await.is_err() {
-                task.handle.abort();
-                confirmed = false;
-                *self.maintenance.lock() = Some(task);
+        // Keep task handles in their slots while joining. Taking a handle and
+        // restoring it on timeout would introduce a second unbounded lock
+        // acquisition, and cancellation of this close could lose its owner.
+        if let Some(slot) = self.maintenance.try_lock() {
+            if let Some(task) = slot.as_ref() {
+                let _ = task.stop.send(true);
+            }
+        } else {
+            confirmed = false;
+        }
+        if !join_close_task(&self.maintenance, deadline, |task| &mut task.handle).await {
+            confirmed = false;
+            if let Some(slot) = self.maintenance.try_lock() {
+                if let Some(task) = slot.as_ref() {
+                    task.handle.abort();
+                }
             }
         }
 
@@ -4083,44 +4286,30 @@ impl IpcClient {
             // The writer slot is stuck (for example a blocked bulk write
             // holding the lock). Abort the stream now so that writer fails
             // and releases the lock instead of pinning the whole deadline.
-            if let Some(abort) = self.abort.lock().as_ref() {
-                abort.abort();
-            }
+            self.abort_stream_for_close(false);
         }
 
-        let receiver = self.recv_handle.lock().take();
-        if let Some(mut receiver) = receiver {
-            // The receive loop ends on DISCONNECT_ACK or peer EOF.
-            // Reserve part of the remaining deadline for abort and join. A
-            // silent peer otherwise consumes the entire deadline in this
-            // wait, making confirmation depend on whether Tokio happens to
-            // poll an already-aborted task before a zero-budget timeout.
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let graceful_deadline = deadline - remaining.min(std::time::Duration::from_secs(1));
-            if timeout_at(graceful_deadline, &mut receiver).await.is_err() {
-                // Abort the stream and the task, then wait once more within
-                // the time still remaining to the absolute deadline (capped
-                // at one second). Aborted tasks finish at their next await
-                // point; if even that budget expires the handle is restored
-                // (kept observable, retryable by a later close) and the
-                // close stays unconfirmed.
-                if let Some(abort) = self.abort.lock().as_ref() {
-                    abort.abort();
+        // The receive loop ends on DISCONNECT_ACK or peer EOF. Reserve up to
+        // one second of the original deadline for its abort/join, as before.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let graceful_deadline = deadline - remaining.min(std::time::Duration::from_secs(1));
+        if !join_close_task(&self.recv_handle, graceful_deadline, |task| task).await {
+            if !self.abort_stream_for_close(false) {
+                confirmed = false;
+            }
+            if let Some(slot) = self.recv_handle.try_lock() {
+                if let Some(receiver) = slot.as_ref() {
+                    receiver.abort();
                 }
-                receiver.abort();
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let join_budget = remaining.min(std::time::Duration::from_secs(1));
-                if tokio::time::timeout(join_budget, &mut receiver)
-                    .await
-                    .is_err()
-                {
-                    confirmed = false;
-                    *self.recv_handle.lock() = Some(receiver);
-                }
+            } else {
+                confirmed = false;
+            }
+            if !join_close_task(&self.recv_handle, deadline, |task| task).await {
+                confirmed = false;
             }
         }
-        if let Some(abort) = self.abort.lock().take() {
-            abort.abort();
+        if !self.abort_stream_for_close(true) {
+            confirmed = false;
         }
         if timeout_at(deadline, async {
             *self.writer.lock().await = None;
@@ -4133,22 +4322,49 @@ impl IpcClient {
         // Wake pending callers and resolve any dispatched request allocation
         // they carried: this connection fence is the last terminal observer
         // for callers that are already gone.
-        let mut pending = self.pending.lock();
-        for (_, pending) in pending.drain() {
-            let _ = pending.tx.send(Err(IpcError::Closed));
-            if let Some(request) = pending.request {
-                let _ = request.release_once();
-            }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
         }
-        drop(pending);
+        confirmed &= try_drain_pending(
+            &self.pending,
+            &self.server_pool,
+            true,
+            Some(deadline.into_std()),
+        );
+        if confirmed {
+            confirmed = match self.chunk_registry.try_lock() {
+                Some(slot) => slot.as_ref().is_none_or(|registry| {
+                    registry.try_cleanup_connection_until(self.conn_id, deadline.into_std())
+                }),
+                None => false,
+            };
+        }
         // Only a confirmed close (writer cleared, receive and maintenance
         // tasks joined) proves that no assembly or request backing is still
         // owned by background work, so only then may owner pools be detached.
+        if confirmed && tokio::time::Instant::now() < deadline {
+            confirmed = self.detach_owner_pools();
+        }
+        confirmed &= tokio::time::Instant::now() < deadline;
         if confirmed {
-            self.detach_idle_owner_pools();
+            self.close_incomplete.store(false, Ordering::Release);
         }
         drop(close_guard);
         confirmed
+    }
+
+    /// The slot lock must not add an unbounded wait to a close. Keep an abort
+    /// handle reachable on contention so the next close can retry it.
+    fn abort_stream_for_close(&self, take: bool) -> bool {
+        let Some(mut slot) = self.abort.try_lock() else {
+            return false;
+        };
+        let abort = if take { slot.take() } else { slot.clone() };
+        drop(slot);
+        if let Some(abort) = abort {
+            abort.abort();
+        }
+        true
     }
 
     /// Release transport-owned pool ownership once the connection is
@@ -4158,10 +4374,13 @@ impl IpcClient {
     /// Python proxy that outlives `RuntimeSession.shutdown`). Its pools would
     /// otherwise pin idle mappings and their shared-budget charges until the
     /// last external reference disappears, starving a shared domain budget on
-    /// a later acquire. Detaching is deliberately conservative:
+    /// a later acquire. Detach references, never allocation coordinates:
     ///
-    /// - the request pool is dropped only when it has no live allocation, so
-    ///   an outstanding request backing is never freed under its user;
+    /// - the request-pool slot is detached regardless of allocator counts.
+    ///   Every selected pool, RequestBlock, and dedicated-retire job carries
+    ///   its own Arc. Those real owners keep their exact pool and its charge
+    ///   alive; an orphaned dispatched buddy count alone is not an owner.
+    ///   No possibly-published buddy allocation is locally freed or reused;
     /// - the reassembly registry is replaced once it owns no in-flight
     ///   assembly. Every finished handle carries the exact old pool and its
     ///   charge in `ReassemblyBacking`, even before a response lease is
@@ -4172,17 +4391,16 @@ impl IpcClient {
     ///
     /// A reconnect creates fresh pool incarnations on the same frozen domain
     /// budget. Nothing here resets budget accounting.
-    fn detach_idle_owner_pools(&self) {
+    fn detach_owner_pools(&self) -> bool {
         if self.pool_transport_owned {
-            let mut slot = self.pool.lock();
-            let idle = slot
-                .as_ref()
-                .is_some_and(|pool| pool.lock().stats().alloc_count == 0);
-            if idle {
-                slot.take();
-            }
+            let Some(mut slot) = self.pool.try_lock() else {
+                return false;
+            };
+            slot.take();
         }
-        let mut slot = self.chunk_registry.lock();
+        let Some(mut slot) = self.chunk_registry.try_lock() else {
+            return false;
+        };
         let idle = slot
             .as_ref()
             .is_some_and(|registry| registry.active_count() == 0);
@@ -4200,6 +4418,7 @@ impl IpcClient {
                 }
             }
         }
+        slot.is_none() || idle
     }
 
     /// Test-only handle to the writer slot so tests can deterministically
@@ -4270,42 +4489,106 @@ const SIG_DISCONNECT_ACK: u8 = 0x09;
 /// reply is simply dropped, while SHM and reassembly-handle backings are
 /// released through the exact response pools so the server-side allocation
 /// is returned instead of leaking.
-fn discard_unclaimed_response(
-    response: ResponseData,
+fn try_release_unclaimed_response(
+    response: &mut ResponseData,
     server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
-) {
-    let mut lease = ResponseLease::new(response, Arc::clone(server_pool));
-    let _ = lease.release();
+) -> Result<bool, String> {
+    match response {
+        ResponseData::Inline(_) => Ok(true),
+        ResponseData::Handle(backing) => backing.try_release(),
+        ResponseData::Shm {
+            seg_idx,
+            generation,
+            offset,
+            data_size,
+            is_dedicated,
+        } => {
+            let Some(mut pool) = server_pool.try_lock() else {
+                return Ok(false);
+            };
+            let state = pool
+                .as_mut()
+                .ok_or_else(|| "server pool not initialised".to_string())?;
+            state.release_response(*seg_idx, *generation, *offset, *data_size, *is_dedicated)?;
+            Ok(true)
+        }
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn complete_unary_pending(
-    pending: Option<PendingResponse>,
+/// Only cleanup entries are settled by maintenance. A close/footer first
+/// closes live waiters too. No busy entry is removed and then dropped.
+fn try_drain_pending(
+    pending: &StdMutex<PendingMap>,
+    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
+    close_waiters: bool,
+    deadline: Option<std::time::Instant>,
+) -> bool {
+    let Some(mut pending) = pending.try_lock() else {
+        return false;
+    };
+    pending.retain(|_, entry| {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return true;
+        }
+        if close_waiters || entry.tx.as_ref().is_some_and(|tx| tx.is_closed()) {
+            entry.close_waiter();
+        }
+        entry.tx.is_some() || !entry.try_settle(server_pool)
+    });
+    if close_waiters {
+        pending.is_empty()
+    } else {
+        pending.values().all(|entry| entry.tx.is_some())
+    }
+}
+
+async fn complete_unary_pending(
+    pending: &Arc<StdMutex<PendingMap>>,
+    rid: u32,
     result: Result<ResponseData, IpcError>,
     server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
 ) {
-    let Some(pending) = pending else {
-        // A late reply for an entry that no longer exists (for example its
-        // waiter cancelled the reply wait): nobody owns the response
-        // backing, so release it here instead of leaking it.
-        if let Ok(response) = result {
-            discard_unclaimed_response(response, server_pool);
+    {
+        let mut pending = pending.lock();
+        let entry = pending.entry(rid).or_insert_with(|| PendingResponse {
+            tx: None,
+            request: None,
+            response: None,
+        });
+        let undelivered = match entry.tx.take() {
+            Some(tx) => tx.send(result).err(),
+            None => Some(result),
+        };
+        if let Some(Ok(response)) = undelivered {
+            entry.response = Some(response);
         }
-        return;
-    };
-    if let Err(undelivered) = pending.tx.send(result) {
-        // The waiter vanished while the reply was in flight: it will never
-        // read this response, so release its backing on its behalf.
-        if let Ok(response) = undelivered {
-            discard_unclaimed_response(response, server_pool);
+        if entry.try_settle(server_pool) {
+            pending.remove(&rid);
         }
     }
-    // The response resolved this call: settle any dispatched request
-    // allocation exactly once. For a caller that cancelled after dispatch
-    // this is the only release authority left; for a live caller it is
-    // idempotent with the caller's own terminal path.
-    if let Some(request) = pending.request {
-        let _ = request.release_once();
+
+    // At most this one received frame is retained. Pause the receive loop
+    // before accepting another unclaimed response; cancellation can now drop
+    // this future because the complete carrier already lives in pending.
+    loop {
+        let waiting = {
+            let mut pending = pending.lock();
+            match pending.get_mut(&rid) {
+                Some(entry) if entry.response.is_some() => {
+                    if entry.try_settle(server_pool) {
+                        pending.remove(&rid);
+                        false
+                    } else {
+                        entry.response.is_some()
+                    }
+                }
+                _ => false,
+            }
+        };
+        if !waiting {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
@@ -4319,7 +4602,7 @@ struct ConnectionAssemblyCleanup {
 
 impl Drop for ConnectionAssemblyCleanup {
     fn drop(&mut self) {
-        self.registry.cleanup_connection(self.conn_id);
+        self.registry.try_cleanup_connection(self.conn_id);
     }
 }
 
@@ -4493,12 +4776,13 @@ async fn recv_loop_inner(
         let rid = hdr.request_id as u32;
 
         if hdr.is_response() && hdr.is_ctrl() {
-            let entry = pending.lock().remove(&rid);
             complete_unary_pending(
-                entry,
+                &pending,
+                rid,
                 Ok(ResponseData::Inline(recv_buf.clone())),
                 &server_pool,
-            );
+            )
+            .await;
             continue;
         }
 
@@ -4516,9 +4800,14 @@ async fn recv_loop_inner(
                         // leaving both stranded.
                         let message = format!("chunked reply metadata decode error: {e:?}");
                         eprintln!("Warning: {message}");
-                        chunk_registry.abort(conn_id, rid as u64);
-                        let tx = pending.lock().remove(&rid);
-                        complete_unary_pending(tx, Err(IpcError::Chunk(message)), &server_pool);
+                        abort_reply_assembly(&chunk_registry, conn_id, rid).await;
+                        complete_unary_pending(
+                            &pending,
+                            rid,
+                            Err(IpcError::Chunk(ChunkError::Protocol(message))),
+                            &server_pool,
+                        )
+                        .await;
                         continue;
                     }
                 };
@@ -4528,28 +4817,26 @@ async fn recv_loop_inner(
             // reservation before allocation) happens inside insert; a
             // rejection is correlated back to the pending caller below.
             if chunk_idx == 0 {
-                let chunk_size = if total_chunks > 1 {
-                    chunk_data.len()
-                } else {
-                    total_size as usize
-                };
-                if let Err(e) =
-                    chunk_registry.insert(conn_id, rid as u64, total_chunks as usize, chunk_size)
-                {
+                if let Err(e) = chunk_registry.insert_reply(
+                    conn_id,
+                    rid as u64,
+                    total_size,
+                    total_chunks as usize,
+                    chunk_data.len(),
+                ) {
                     // A rejected first chunk (budget/geometry, or a duplicate
                     // first chunk for an assembly already in flight) poisons
                     // this request: release whatever it may still hold for this
                     // request id, then complete the correlated caller.
                     eprintln!("Warning: reply chunk assembler creation failed: {e}");
-                    chunk_registry.abort(conn_id, rid as u64);
-                    let tx = pending.lock().remove(&rid);
+                    abort_reply_assembly(&chunk_registry, conn_id, rid).await;
                     complete_unary_pending(
-                        tx,
-                        Err(IpcError::Chunk(format!(
-                            "chunked reply reassembly admission failed: {e}"
-                        ))),
+                        &pending,
+                        rid,
+                        Err(IpcError::Chunk(e.into())),
                         &server_pool,
-                    );
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -4560,22 +4847,24 @@ async fn recv_loop_inner(
                     if complete {
                         match chunk_registry.finish(conn_id, rid as u64) {
                             Ok(finished) => {
-                                let tx = pending.lock().remove(&rid);
                                 complete_unary_pending(
-                                    tx,
+                                    &pending,
+                                    rid,
                                     Ok(ResponseData::Handle(finished.backing)),
                                     &server_pool,
-                                );
+                                )
+                                .await;
                             }
                             Err(e) => {
-                                let tx = pending.lock().remove(&rid);
                                 complete_unary_pending(
-                                    tx,
-                                    Err(IpcError::Chunk(format!(
+                                    &pending,
+                                    rid,
+                                    Err(IpcError::Chunk(ChunkError::Protocol(format!(
                                         "chunked reply finish error: {e}"
-                                    ))),
+                                    )))),
                                     &server_pool,
-                                );
+                                )
+                                .await;
                             }
                         }
                     }
@@ -4586,13 +4875,16 @@ async fn recv_loop_inner(
                     // before completing the caller so the budget returns
                     // immediately instead of waiting for GC or disconnect.
                     eprintln!("Warning: reply chunk feed error: {e}");
-                    chunk_registry.abort(conn_id, rid as u64);
-                    let tx = pending.lock().remove(&rid);
+                    abort_reply_assembly(&chunk_registry, conn_id, rid).await;
                     complete_unary_pending(
-                        tx,
-                        Err(IpcError::Chunk(format!("chunked reply feed error: {e}"))),
+                        &pending,
+                        rid,
+                        Err(IpcError::Chunk(ChunkError::Protocol(format!(
+                            "chunked reply feed error: {e}"
+                        )))),
                         &server_pool,
-                    );
+                    )
+                    .await;
                 }
             }
             continue; // Don't fall through to decode_response.
@@ -4602,8 +4894,7 @@ async fn recv_loop_inner(
         let result = decode_response(&hdr, &recv_buf);
 
         // Dispatch to pending caller.
-        let entry = { pending.lock().remove(&rid) };
-        complete_unary_pending(entry, result, &server_pool);
+        complete_unary_pending(&pending, rid, result, &server_pool).await;
     }
 
     // The guard also runs this cleanup when a close or Drop aborts the task.
@@ -4612,12 +4903,14 @@ async fn recv_loop_inner(
     // Connection lost — wake all pending callers and settle any dispatched
     // request allocation whose caller is gone (idempotent with a caller that
     // still observes the Closed result).
-    let mut pending_guard = pending.lock();
-    for (_, pending) in pending_guard.drain() {
-        let _ = pending.tx.send(Err(IpcError::Closed));
-        if let Some(request) = pending.request {
-            let _ = request.release_once();
-        }
+    try_drain_pending(&pending, &server_pool, true, None);
+}
+
+async fn abort_reply_assembly(registry: &ChunkRegistry, conn_id: u64, rid: u32) {
+    while !registry.try_abort(conn_id, u64::from(rid)) {
+        // The original registry entry remains the release owner at this await.
+        // Close may abort this wait and retry that same connection's cleanup.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
@@ -4664,6 +4957,995 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response::ResponseLease;
+
+    #[tokio::test]
+    async fn close_owner_pool_mutex_respects_deadline() {
+        use std::time::{Duration, Instant};
+
+        let client =
+            IpcClient::with_config("ipc://close-owner-pool-mutex", ClientIpcConfig::default());
+        let pool = client.request_pool().expect("lazy request pool");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = pool.lock();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        holder.join().unwrap();
+        eprintln!("elapsed={elapsed:?}, confirmed={confirmed}");
+        assert!(elapsed < Duration::from_millis(200));
+        // The client drops its slot reference without inspecting the pool.
+        // The lock holder itself keeps the old pool alive, so this contention
+        // no longer prevents confirmed close.
+        assert!(confirmed);
+        assert!(client.request_pool().is_none());
+        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CloseSlotForTest {
+        Pending,
+        Maintenance,
+        Receiver,
+        Abort,
+        Pool,
+        Registry,
+    }
+
+    async fn check_contended_close_slot(which: CloseSlotForTest) {
+        use std::time::{Duration, Instant};
+
+        fn park<T>(
+            slot: &StdMutex<T>,
+            ready: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) {
+            let _guard = slot.lock();
+            ready.send(()).unwrap();
+            // The old blocking close still terminates and fails the elapsed
+            // assertion; a failed test never leaves a holder thread parked.
+            let _ = release.recv_timeout(Duration::from_secs(1));
+        }
+
+        let mut client = Arc::new(IpcClient::with_config(
+            "ipc://close-slot-contention",
+            ClientIpcConfig::default(),
+        ));
+        let (tx, mut rx) = oneshot::channel();
+        client.pending.lock().insert(41, PendingResponse::unary(tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_client = Arc::clone(&client);
+        let holder = std::thread::spawn(move || match which {
+            CloseSlotForTest::Pending => park(&holder_client.pending, ready_tx, release_rx),
+            CloseSlotForTest::Maintenance => park(&holder_client.maintenance, ready_tx, release_rx),
+            CloseSlotForTest::Receiver => park(&holder_client.recv_handle, ready_tx, release_rx),
+            CloseSlotForTest::Abort => park(&holder_client.abort, ready_tx, release_rx),
+            CloseSlotForTest::Pool => park(&holder_client.pool, ready_tx, release_rx),
+            CloseSlotForTest::Registry => park(&holder_client.chunk_registry, ready_tx, release_rx),
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "{which:?}: {elapsed:?}"
+        );
+        assert!(!confirmed, "{which:?} cleanup must remain unconfirmed");
+        if matches!(which, CloseSlotForTest::Pending) {
+            assert_eq!(client.pending.lock().len(), 1);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        let reconnect = Arc::get_mut(&mut client)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(reconnect, IpcError::Pool(ref message) if message == "client must finish closing before reconnect"),
+            "an incomplete close must reject before endpoint I/O: {reconnect:?}"
+        );
+        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        assert!(client.pending.lock().is_empty());
+        assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
+        assert!(client.request_pool().is_none());
+        assert!(!client.close_incomplete.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn close_pending_mutex_is_retryable() {
+        check_contended_close_slot(CloseSlotForTest::Pending).await;
+    }
+
+    #[tokio::test]
+    async fn close_maintenance_mutex_is_retryable() {
+        check_contended_close_slot(CloseSlotForTest::Maintenance).await;
+    }
+
+    #[tokio::test]
+    async fn close_receiver_slot_mutex_is_retryable() {
+        check_contended_close_slot(CloseSlotForTest::Receiver).await;
+    }
+
+    #[tokio::test]
+    async fn close_abort_slot_mutex_is_retryable() {
+        check_contended_close_slot(CloseSlotForTest::Abort).await;
+    }
+
+    #[tokio::test]
+    async fn close_pool_slot_mutex_is_retryable() {
+        check_contended_close_slot(CloseSlotForTest::Pool).await;
+    }
+
+    #[tokio::test]
+    async fn close_registry_slot_mutex_is_retryable() {
+        check_contended_close_slot(CloseSlotForTest::Registry).await;
+    }
+
+    #[tokio::test]
+    async fn close_cancelled_join_keeps_receiver_handle_reachable() {
+        let client = IpcClient::new("ipc://close-cancelled-join");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        *client.recv_handle.lock() = Some(tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        entered_rx.await.unwrap();
+        let mut close = Box::pin(client.close_shared_bounded(std::time::Duration::from_secs(3)));
+        tokio::select! {
+            biased;
+            _ = &mut close => panic!("receive task is still pending"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(close);
+        assert!(
+            client.recv_handle.lock().is_some(),
+            "cancelling the closer must not detach an unfinished task"
+        );
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_millis(100))
+                .await
+        );
+        assert!(client.recv_handle.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_request_permit_mutex_keeps_pending_authority() {
+        use std::time::{Duration, Instant};
+
+        let client = IpcClient::with_config("ipc://close-permit-mutex", ClientIpcConfig::default());
+        // Only the dispatched-buddy phase/permit handoff is exercised here:
+        // its release deliberately never reads or frees these coordinates.
+        // Real backing and budget retention are covered by owner_* tests.
+        let block = RequestBlock::new(
+            client.request_pool().unwrap(),
+            PoolAllocation {
+                seg_idx: 0,
+                generation: 1,
+                offset: 0,
+                actual_size: 4096,
+                level: 0,
+                is_dedicated: false,
+            },
+        );
+        let request = block.try_dispatch(None).unwrap();
+        let (tx, rx) = oneshot::channel();
+        let mut entry = PendingResponse::unary(tx);
+        entry.request = Some(Arc::clone(&request));
+        client.pending.lock().insert(42, entry);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_request = Arc::clone(&request);
+        let holder = std::thread::spawn(move || {
+            let _guard = holder_request.permit.lock();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        assert!(!confirmed);
+        assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
+        assert_eq!(
+            request.phase.load(Ordering::Acquire),
+            RequestReleaseState::PHASE_DISPATCHED
+        );
+        assert_eq!(client.pending.lock().len(), 1);
+        assert!(Arc::ptr_eq(
+            client.pending.lock()[&42].request.as_ref().unwrap(),
+            &request
+        ));
+        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        assert!(client.pending.lock().is_empty());
+        assert_eq!(
+            request.phase.load(Ordering::Acquire),
+            RequestReleaseState::PHASE_RELEASED
+        );
+    }
+
+    #[tokio::test]
+    async fn close_injected_pool_preserves_external_authority() {
+        let config = ClientIpcConfig::default();
+        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        let external = IpcClient::own_pool_from_config(&config, &budget);
+        let prefix = external.lock().prefix().to_string();
+        let client = IpcClient::with_pool("ipc://close-injected", Arc::clone(&external), config);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_pool = Arc::clone(&external);
+        let holder = std::thread::spawn(move || {
+            let _guard = holder_pool.lock();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(1));
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let confirmed = client
+            .close_shared_bounded(std::time::Duration::from_millis(50))
+            .await;
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(confirmed);
+        assert!(elapsed < std::time::Duration::from_millis(200));
+        assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &external));
+        assert_eq!(external.lock().prefix(), prefix);
+        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn close_finished_file_carrier_survives_registry_detach() {
+        use std::time::{Duration, Instant};
+
+        let mut config = ClientIpcConfig::default();
+        config.base.shm_backing_budget_bytes = 0;
+        config.base.file_backing_budget_bytes = 32 * 1024;
+        config.base.live_reassembly_budget_bytes = 32 * 1024;
+        let client = IpcClient::with_config("ipc://close-file-carrier", config);
+        let budget = client.memory_budget.as_ref().unwrap().clone();
+        let registry = client.chunk_registry_arc().unwrap();
+        registry.insert(client.conn_id, 44, 2, 8192).unwrap();
+        assert!(
+            !registry
+                .feed(client.conn_id, 44, 0, &vec![22; 8192])
+                .unwrap()
+        );
+        assert!(registry.feed(client.conn_id, 44, 1, &[44; 100]).unwrap());
+        let finished = registry.finish(client.conn_id, 44).unwrap();
+        assert!(finished.backing.is_file_spill());
+        assert_eq!(finished.backing.capacity_bytes(), 16 * 1024);
+        assert_eq!(finished.backing.len(), 8192 + 100);
+        let mut lease = ResponseLease::new(
+            ResponseData::Handle(finished.backing),
+            Arc::clone(&client.server_pool),
+        );
+        let old_pool = Arc::downgrade(registry.pool());
+        let charged = budget.snapshot();
+        assert_eq!(charged.shm.used_bytes, 0);
+        assert_eq!(charged.file.used_bytes, 16 * 1024);
+        assert_eq!(charged.reassembly.used_bytes, 16 * 1024);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_pool = Arc::clone(registry.pool());
+        let holder = std::thread::spawn(move || {
+            let _guard = holder_pool.write();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(confirmed, "a finished carrier owns its pool independently");
+        assert!(elapsed < Duration::from_millis(200));
+        assert!(!Arc::ptr_eq(
+            &registry,
+            &client.chunk_registry_arc().unwrap()
+        ));
+        drop(registry);
+        assert_eq!(budget.snapshot().file.used_bytes, charged.file.used_bytes);
+        assert_eq!(
+            budget.snapshot().reassembly.used_bytes,
+            charged.reassembly.used_bytes
+        );
+        let mut expected = vec![22; 8192];
+        expected.extend_from_slice(&[44; 100]);
+        assert_eq!(lease.copy_bytes().unwrap(), expected);
+        lease.release().unwrap();
+        assert!(lease.copy_bytes().is_err());
+        let released = budget.snapshot();
+        assert_eq!(released.shm.used_bytes, 0);
+        assert_eq!(released.file.used_bytes, 0);
+        assert_eq!(released.reassembly.used_bytes, 0);
+        assert!(old_pool.upgrade().is_none());
+        assert!(client.request_pool().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_aborted_receiver_file_cleanup_is_retryable() {
+        check_aborted_receiver_file_cleanup(false).await;
+    }
+
+    fn file_close_test_config() -> ClientIpcConfig {
+        let mut config = ClientIpcConfig::default();
+        config.base.shm_backing_budget_bytes = 0;
+        config.base.file_backing_budget_bytes = 32 * 1024;
+        config.base.live_reassembly_budget_bytes = 32 * 1024;
+        config
+    }
+
+    fn park_carrier_callback(
+        backing: c2_wire::chunk::ReassemblyBacking,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<c2_wire::chunk::ReassemblyBacking>,
+    ) {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let expected = backing.copy_bytes().unwrap();
+            backing
+                .with_slice(|bytes| {
+                    assert_eq!(bytes, expected);
+                    ready_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(1));
+                    assert_eq!(bytes, expected);
+                })
+                .unwrap();
+            backing
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        (release_tx, holder)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_unclaimed_file_completion_keeps_carrier_for_retry() {
+        use std::time::{Duration, Instant};
+
+        for known_waiter in [true, false] {
+            let client =
+                IpcClient::with_config("ipc://close-unclaimed-file", file_close_test_config());
+            let registry = client.chunk_registry_arc().unwrap();
+            let budget = client.memory_budget.as_ref().unwrap().clone();
+            registry.insert(client.conn_id, 11, 1, 8192).unwrap();
+            registry.feed(client.conn_id, 11, 0, &[11; 8192]).unwrap();
+            let held = registry.finish(client.conn_id, 11).unwrap().backing;
+            registry.insert(client.conn_id, 22, 1, 8192).unwrap();
+            registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap();
+            let response = registry.finish(client.conn_id, 22).unwrap().backing;
+            assert!(held.is_file_spill() && response.is_file_spill());
+            if known_waiter {
+                let (tx, rx) = oneshot::channel();
+                client.pending.lock().insert(22, PendingResponse::unary(tx));
+                drop(rx);
+            }
+            let (release_tx, holder) = park_carrier_callback(held);
+            let pending = Arc::clone(&client.pending);
+            let server_pool = Arc::clone(&client.server_pool);
+            let cleanup = ConnectionAssemblyCleanup {
+                registry: Arc::clone(&registry),
+                conn_id: client.conn_id,
+            };
+            let (entered_tx, entered_rx) = oneshot::channel();
+            *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                let _cleanup = cleanup;
+                let _ = entered_tx.send(());
+                complete_unary_pending(
+                    &pending,
+                    22,
+                    Ok(ResponseData::Handle(response)),
+                    &server_pool,
+                )
+                .await;
+            }));
+            entered_rx.await.unwrap(); // task reached its cooperative cleanup wait
+            assert_eq!(client.pending.lock().len(), 1);
+            assert!(matches!(
+                client.pending.lock()[&22].response,
+                Some(ResponseData::Handle(_))
+            ));
+            // A retained cleanup entry must not be overwritten by a new call
+            // reaching the same id, even for an unknown late response.
+            client.rid_counter.store(22, Ordering::Relaxed);
+            let (new_tx, new_rx) = oneshot::channel();
+            let new_rid = register_unary_pending(&client.pending, &client.rid_counter, new_tx);
+            assert_eq!(new_rid, 23);
+            assert!(matches!(
+                client.pending.lock()[&22].response,
+                Some(ResponseData::Handle(_))
+            ));
+            client.pending.lock().remove(&new_rid);
+            assert!(new_rx.await.is_err());
+            let started = Instant::now();
+            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+            let elapsed = started.elapsed();
+            let charged = budget.snapshot();
+            let terminal = client.recv_handle.lock().is_none();
+            let retained = client.pending.lock().len();
+            let _ = release_tx.send(());
+            let mut held = holder.join().unwrap();
+            assert!(!confirmed);
+            assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+            assert!(terminal);
+            assert_eq!(retained, 1);
+            assert_eq!(charged.file.used_bytes, 16384);
+            assert_eq!(charged.reassembly.used_bytes, 16384);
+            assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+            assert!(client.pending.lock().is_empty());
+            assert_eq!(budget.snapshot().file.used_bytes, 8192);
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
+            assert_eq!(held.copy_bytes().unwrap(), &[11; 8192]);
+            held.release().unwrap();
+            assert!(held.copy_bytes().is_err());
+            assert_eq!(budget.snapshot().file.used_bytes, 0);
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+        }
+    }
+
+    async fn wait_for_maintenance_tick(client: &IpcClient) {
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while client.maintenance_ticks.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("maintenance tick must not stall the runtime");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_maintenance_file_callback_is_retryable() {
+        use std::time::{Duration, Instant};
+
+        let mut config = file_close_test_config();
+        config.base.chunk_assembler_timeout_secs = 0.001;
+        config.base.chunk_gc_interval_secs = 0.005;
+        config.pool_decay_seconds = 0.0;
+        let client = IpcClient::with_config("ipc://close-maintenance-file", config);
+        let registry = client.chunk_registry_arc().unwrap();
+        let budget = client.memory_budget.as_ref().unwrap().clone();
+        registry.insert(client.conn_id, 11, 1, 8192).unwrap();
+        registry.feed(client.conn_id, 11, 0, &[11; 8192]).unwrap();
+        let held = registry.finish(client.conn_id, 11).unwrap().backing;
+        registry.insert(client.conn_id, 22, 2, 8192).unwrap();
+        registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap();
+        let (release_tx, holder) = park_carrier_callback(held);
+        let started = Instant::now();
+        client.spawn_maintenance();
+        wait_for_maintenance_tick(&client).await;
+        let tick_elapsed = started.elapsed();
+        let started = Instant::now();
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        let charged = budget.snapshot();
+        let remaining = registry.active_count();
+        let terminal = client.maintenance.lock().is_none();
+        let _ = release_tx.send(());
+        let mut held = holder.join().unwrap();
+        assert!(
+            tick_elapsed < Duration::from_millis(200),
+            "{tick_elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        assert!(!confirmed);
+        assert!(terminal);
+        assert_eq!(remaining, 1);
+        assert_eq!(charged.file.used_bytes, 24576);
+        assert_eq!(charged.reassembly.used_bytes, 24576);
+        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(budget.snapshot().file.used_bytes, 8192);
+        assert_eq!(held.copy_bytes().unwrap(), &[11; 8192]);
+        held.release().unwrap();
+        assert!(held.copy_bytes().is_err());
+        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_maintenance_request_pool_contention_does_not_stall_runtime() {
+        use std::time::{Duration, Instant};
+
+        let mut config = ClientIpcConfig::default();
+        config.base.chunk_gc_interval_secs = 0.005;
+        config.pool_decay_seconds = 0.0;
+        let client = IpcClient::with_config("ipc://close-maintenance-request", config);
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        client
+            .pending
+            .lock()
+            .insert(41, PendingResponse::unary(cancelled_tx));
+        drop(cancelled_rx);
+        let (live_tx, live_rx) = oneshot::channel();
+        client
+            .pending
+            .lock()
+            .insert(42, PendingResponse::unary(live_tx));
+        let pool = client.request_pool().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = pool.lock();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(1));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        client.spawn_maintenance();
+        wait_for_maintenance_tick(&client).await;
+        let tick_elapsed = started.elapsed();
+        let cancelled_removed = !client.pending.lock().contains_key(&41);
+        let live_preserved = client.pending.lock().contains_key(&42);
+        let started = Instant::now();
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        assert!(
+            tick_elapsed < Duration::from_millis(200),
+            "{tick_elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        assert!(confirmed); // an idle pool can detach without waiting for its lock
+        assert!(cancelled_removed && live_preserved);
+        assert!(matches!(live_rx.await.unwrap(), Err(IpcError::Closed)));
+        assert!(client.maintenance.lock().is_none());
+        assert!(client.request_pool().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_aborted_real_receiver_file_cleanup_is_retryable() {
+        check_aborted_receiver_file_cleanup(true).await;
+    }
+
+    async fn check_aborted_receiver_file_cleanup(real_reader: bool) {
+        use std::time::{Duration, Instant};
+
+        let mut config = ClientIpcConfig::default();
+        config.base.shm_backing_budget_bytes = 0;
+        config.base.file_backing_budget_bytes = 32 * 1024;
+        config.base.live_reassembly_budget_bytes = 32 * 1024;
+        let client = IpcClient::with_config("ipc://close-receiver-file-cleanup", config);
+        let budget = client.memory_budget.as_ref().unwrap().clone();
+        let registry = client.chunk_registry_arc().unwrap();
+        registry.insert(client.conn_id, 11, 1, 8192).unwrap();
+        assert!(registry.feed(client.conn_id, 11, 0, &[11; 8192]).unwrap());
+        let finished = registry.finish(client.conn_id, 11).unwrap();
+        assert!(finished.backing.is_file_spill());
+        registry.insert(client.conn_id, 22, 2, 8192).unwrap();
+        assert!(!registry.feed(client.conn_id, 22, 0, &[22; 8192]).unwrap());
+
+        let (receiver_ready_tx, receiver_ready_rx) = oneshot::channel();
+        let _peer = if real_reader {
+            // Real OS local streams and the production receive loop, without
+            // the artificial drop delay used by partial-header tests. Polling
+            // the real future to Pending proves the cleanup guard exists and
+            // its empty reader is parked before close can abort it.
+            use std::future::Future;
+            use std::task::Poll;
+
+            let (stream, peer) = LocalStream::pair().await.unwrap();
+            *client.abort.lock() = Some(stream.abort_handle());
+            let (reader, writer) = stream.into_split();
+            *client.writer.lock().await = Some(writer);
+            let receive = recv_loop(
+                reader,
+                Arc::clone(&client.pending),
+                Arc::clone(&client.server_pool),
+                Arc::clone(&client.writer),
+                Arc::clone(&registry),
+                client.conn_id,
+            );
+            *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                let mut receive = Box::pin(receive);
+                let mut ready = Some(receiver_ready_tx);
+                std::future::poll_fn(|cx| match receive.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(());
+                        }
+                        Poll::Pending
+                    }
+                    Poll::Ready(()) => Poll::Ready(()),
+                })
+                .await;
+            }));
+            Some(peer)
+        } else {
+            // Pure file seam: production cancellation guard and actual close
+            // barrier, with a parked await instead of an OS IPC stream.
+            let cleanup = ConnectionAssemblyCleanup {
+                registry: Arc::clone(&registry),
+                conn_id: client.conn_id,
+            };
+            *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                let _cleanup = cleanup;
+                let _ = receiver_ready_tx.send(());
+                std::future::pending::<()>().await;
+            }));
+            None
+        };
+        receiver_ready_rx.await.unwrap();
+
+        // The long-lived guard belongs to a real, completed carrier's public
+        // callback. No private lock or forged allocation coordinates are used.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            finished
+                .backing
+                .with_slice(|bytes| {
+                    assert_eq!(bytes, &[11; 8192]);
+                    ready_tx.send(()).unwrap();
+                    // A red test terminates by itself instead of hanging its join.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                    assert_eq!(bytes, &[11; 8192]);
+                })
+                .unwrap();
+            finished.backing
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let charged = budget.snapshot();
+        assert_eq!(charged.file.used_bytes, 24 * 1024);
+        assert_eq!(charged.reassembly.used_bytes, 24 * 1024);
+        let started = Instant::now();
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        let elapsed = started.elapsed();
+        let still_charged = budget.snapshot();
+        let remaining = registry.active_count();
+        let receiver_terminal = client.recv_handle.lock().is_none();
+        let _ = release_tx.send(());
+        let mut held = holder.join().unwrap();
+        eprintln!(
+            "file cleanup: elapsed={elapsed:?}, confirmed={confirmed}, active={remaining}, file={}, reassembly={}, receiver_terminal={receiver_terminal}",
+            still_charged.file.used_bytes, still_charged.reassembly.used_bytes
+        );
+        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        assert!(
+            !confirmed,
+            "an unfinished assembly must keep its release authority"
+        );
+        assert!(
+            receiver_terminal,
+            "cancellation must finish without waiting for the callback"
+        );
+        assert_eq!(still_charged.file.used_bytes, charged.file.used_bytes);
+        assert_eq!(
+            still_charged.reassembly.used_bytes,
+            charged.reassembly.used_bytes
+        );
+        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(budget.snapshot().file.used_bytes, 8192);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
+        assert_eq!(held.copy_bytes().unwrap(), &[11; 8192]);
+        held.release().unwrap();
+        assert!(held.copy_bytes().is_err());
+        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    }
+
+    fn owner_test_config() -> ClientIpcConfig {
+        ClientIpcConfig {
+            base: c2_config::BaseIpcConfig {
+                pool_segment_size: 64 * 1024,
+                max_pool_segments: 1,
+                // The exact backing cost of one 64 KiB buddy mapping.
+                shm_backing_budget_bytes: 64 * 1024 + 4096,
+                file_backing_budget_bytes: 0,
+                pool_prewarm_segments: 0,
+                pool_min_retained_segments: 0,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ClientIpcConfig::default()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_receiver_request_completion_and_footer_are_retryable() {
+        use std::time::{Duration, Instant};
+
+        let _retire_guard = dedicated_retire_test_control::production_guard();
+        for footer in [false, true] {
+            let mut config = owner_test_config();
+            config.base.pool_enabled = false;
+            let client = IpcClient::with_config("ipc://owner-receiver-request-cleanup", config);
+            let block = client.try_alloc_request_block(8192).unwrap().unwrap();
+            assert!(block.is_dedicated());
+            let alloc = *block.allocation();
+            block.write_at(0, &[27; 8192]).unwrap();
+            let pool = client.request_pool().unwrap();
+            let (budget, prefix, peer_config) = {
+                let pool = pool.lock();
+                (
+                    pool.budget().unwrap().clone(),
+                    pool.prefix().to_string(),
+                    pool.config().clone(),
+                )
+            };
+            let charged = budget.snapshot().shm.used_bytes;
+            let mut peer = MemPool::open_peer(peer_config, prefix);
+            peer.ensure_peer_dedicated(alloc.seg_idx, 8192).unwrap();
+            let permit = dedicated_retire().reserve_for_publication().ok().unwrap();
+            let request = block.try_dispatch(Some(permit)).unwrap();
+            let weak_request = Arc::downgrade(&request);
+            let (tx, rx) = oneshot::channel();
+            let mut entry = PendingResponse::unary(tx);
+            entry.request = Some(request);
+            client.pending.lock().insert(43, entry);
+
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder_pool = Arc::clone(&pool);
+            let holder = std::thread::spawn(move || {
+                let _guard = holder_pool.lock();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // After the caller's token disappears, pending is the sole
+            // request-state owner. Its Drop cannot force a pool-lock wait.
+            let started = Instant::now();
+            drop(block);
+            let token_elapsed = started.elapsed();
+            let pending = Arc::clone(&client.pending);
+            let server_pool = Arc::clone(&client.server_pool);
+            let cleanup = ConnectionAssemblyCleanup {
+                registry: client.chunk_registry_arc().unwrap(),
+                conn_id: client.conn_id,
+            };
+            let (done_tx, done_rx) = oneshot::channel();
+            *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                let _cleanup = cleanup;
+                if footer {
+                    try_drain_pending(&pending, &server_pool, true, None);
+                } else {
+                    complete_unary_pending(
+                        &pending,
+                        43,
+                        Ok(ResponseData::Inline(vec![9])),
+                        &server_pool,
+                    )
+                    .await;
+                }
+                let _ = done_tx.send(());
+            }));
+            let started = Instant::now();
+            done_rx.await.unwrap();
+            let terminal_elapsed = started.elapsed();
+            let result = rx.await.unwrap();
+            let started = Instant::now();
+            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+            let elapsed = started.elapsed();
+            let live = budget.snapshot().shm.used_bytes;
+            let terminal = client.recv_handle.lock().is_none();
+            let request = weak_request
+                .upgrade()
+                .expect("pending must retain release authority");
+            let phase = request.phase.load(Ordering::Acquire);
+            let retained = client.pending.lock().len();
+            drop(request);
+            let _ = release_tx.send(());
+            holder.join().unwrap();
+            assert!(
+                token_elapsed < Duration::from_millis(200),
+                "{token_elapsed:?}"
+            );
+            assert!(
+                terminal_elapsed < Duration::from_millis(200),
+                "{terminal_elapsed:?}"
+            );
+            assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+            assert!(!confirmed && terminal);
+            assert_eq!(phase, RequestReleaseState::PHASE_DISPATCHED);
+            assert_eq!(retained, 1);
+            assert_eq!(live, charged);
+            if footer {
+                assert!(matches!(result, Err(IpcError::Closed)));
+            } else {
+                assert!(matches!(result, Ok(ResponseData::Inline(bytes)) if bytes == [9]));
+            }
+            assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+            assert!(client.pending.lock().is_empty());
+            assert!(weak_request.upgrade().is_none());
+            assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+            drop(pool);
+            assert_eq!(budget.snapshot().shm.used_bytes, charged);
+            assert_eq!(
+                peer.copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
+                    .unwrap(),
+                &[27; 8192]
+            );
+            peer.free(&alloc).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while budget.snapshot().shm.used_bytes != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the real reader must retire the exact backing");
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_preallocated_block_survives_close_and_limits_same_budget_reacquire() {
+        let config = owner_test_config();
+        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        let client =
+            IpcClient::with_shared_budget("ipc://owner-old", config.clone(), budget.clone());
+        let block = client.try_alloc_request_block(8192).unwrap().unwrap();
+        assert!(!block.is_dedicated());
+        let old_pool = Arc::downgrade(&block.release.pool);
+        let prefix = block.release.pool.lock().prefix().to_string();
+        block.write_at(0, &vec![7; 8192]).unwrap();
+        let charged = budget.snapshot().shm.used_bytes;
+        assert!(charged > 0);
+        assert!(
+            client
+                .close_shared_bounded(std::time::Duration::from_millis(50))
+                .await
+        );
+        assert!(client.request_pool().is_none());
+        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        // The caller still owns an armed block, including the right to fill it.
+        block.write_at(0, &vec![9; 8192]).unwrap();
+        let alloc = *block.allocation();
+        assert_eq!(
+            block
+                .release
+                .pool
+                .lock()
+                .copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, false,)
+                .unwrap(),
+            vec![9; 8192]
+        );
+
+        let next = IpcClient::with_shared_budget("ipc://owner-new", config, budget.clone());
+        assert!(
+            next.try_alloc_request_block(8192).unwrap().is_none(),
+            "a real owner must keep the finite budget charged"
+        );
+        drop(block);
+        assert!(old_pool.upgrade().is_none());
+        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        let next_block = next.try_alloc_request_block(8192).unwrap().unwrap();
+        assert!(!next_block.is_dedicated());
+        assert_ne!(next_block.release.pool.lock().prefix(), prefix);
+        drop(next_block);
+        assert!(
+            next.close_shared_bounded(std::time::Duration::from_millis(50))
+                .await
+        );
+        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        // Both old and new clients remain alive through the zero assertion.
+        assert!(client.request_pool().is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_dispatched_dedicated_locks_keep_settlement_retryable() {
+        use std::time::{Duration, Instant};
+
+        let _retire_guard = dedicated_retire_test_control::production_guard();
+        for lock in ["permit", "pool", "executor"] {
+            let mut config = owner_test_config();
+            config.base.pool_enabled = false;
+            let client = IpcClient::with_config("ipc://owner-dedicated-lock", config);
+            let block = client.try_alloc_request_block(8192).unwrap().unwrap();
+            assert!(block.is_dedicated());
+            let alloc = *block.allocation();
+            block.write_at(0, &vec![17; 8192]).unwrap();
+            let pool = Arc::clone(&block.release.pool);
+            let (budget, prefix, peer_config) = {
+                let pool = pool.lock();
+                (
+                    pool.budget().unwrap().clone(),
+                    pool.prefix().to_string(),
+                    pool.config().clone(),
+                )
+            };
+            let charged = budget.snapshot().shm.used_bytes;
+            // A real reader owns an already opened peer mapping. Its read_done
+            // must remain the retirement signal after client/block detachment.
+            let mut peer = MemPool::open_peer(peer_config, prefix);
+            peer.ensure_peer_dedicated(alloc.seg_idx, 8192).unwrap();
+            let permit = dedicated_retire().reserve_for_publication().ok().unwrap();
+            let request = block.try_dispatch(Some(permit)).unwrap();
+            let (tx, rx) = oneshot::channel();
+            let mut entry = PendingResponse::unary(tx);
+            entry.request = Some(Arc::clone(&request));
+            client.pending.lock().insert(43, entry);
+
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder_request = Arc::clone(&request);
+            let holder = std::thread::spawn(move || {
+                let wait = |ready: std::sync::mpsc::Sender<()>,
+                            release: std::sync::mpsc::Receiver<()>| {
+                    ready.send(()).unwrap();
+                    let _ = release.recv_timeout(Duration::from_secs(1));
+                };
+                match lock {
+                    "permit" => {
+                        let _guard = holder_request.permit.lock();
+                        wait(ready_tx, release_rx);
+                    }
+                    "pool" => {
+                        let _guard = holder_request.pool.lock();
+                        wait(ready_tx, release_rx);
+                    }
+                    "executor" => {
+                        let _guard = dedicated_retire().state.lock();
+                        wait(ready_tx, release_rx);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let started = Instant::now();
+            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+            let elapsed = started.elapsed();
+            let _ = release_tx.send(());
+            holder.join().unwrap();
+            assert!(!confirmed, "{lock}");
+            assert!(elapsed < Duration::from_millis(200), "{lock}: {elapsed:?}");
+            assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
+            assert_eq!(
+                request.phase.load(Ordering::Acquire),
+                RequestReleaseState::PHASE_DISPATCHED
+            );
+            assert_eq!(client.pending.lock().len(), 1);
+            assert_eq!(pool.lock().stats().dedicated_active_count, 1);
+            assert_eq!(budget.snapshot().shm.used_bytes, charged);
+            assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+            assert!(client.pending.lock().is_empty());
+            assert!(client.request_pool().is_none());
+            assert_eq!(pool.lock().stats().dedicated_active_count, 0);
+            assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+            drop(block);
+            drop(request);
+            drop(pool);
+            assert_eq!(
+                budget.snapshot().shm.used_bytes,
+                charged,
+                "retire authority must keep the charge"
+            );
+            assert_eq!(
+                peer.copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
+                    .unwrap(),
+                vec![17; 8192]
+            );
+            peer.free(&alloc).unwrap(); // the reader's real read_done signal
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while budget.snapshot().shm.used_bytes != 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("retire after read_done with closed client retained");
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_reserves_time_to_join_an_aborted_receiver() {

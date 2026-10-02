@@ -19,7 +19,7 @@
 
 use c2_mem::budget::{BudgetKind, BudgetReservation};
 use c2_mem::{MemHandle, MemPool};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::fmt;
 use std::sync::Arc;
 
@@ -95,6 +95,24 @@ impl ReassemblyBacking {
         total_chunks: usize,
         chunk_size: usize,
     ) -> Result<Self, String> {
+        // Keep standalone invalid geometry rejection ahead of lock waiting.
+        checked_capacity(total_chunks, chunk_size)?;
+        let guard = pool.write();
+        Self::admit_with_guard(Arc::clone(&pool), guard, total_chunks, chunk_size)
+    }
+
+    /// Admission with an already acquired write guard from this exact pool.
+    /// Registry callers acquire it nonblockingly while holding their shard;
+    /// this constructor never waits for the pool lock or enters the registry.
+    pub(crate) fn admit_with_guard(
+        pool: Arc<RwLock<MemPool>>,
+        mut guard: RwLockWriteGuard<'_, MemPool>,
+        total_chunks: usize,
+        chunk_size: usize,
+    ) -> Result<Self, String> {
+        if !std::ptr::eq(Arc::as_ptr(&pool), RwLockWriteGuard::rwlock(&guard)) {
+            return Err("reassembly admission guard belongs to a different pool".to_string());
+        }
         let capacity = checked_capacity(total_chunks, chunk_size)?;
         let capacity_bytes = u64::try_from(capacity).map_err(|_| {
             format!("reassembly capacity {capacity} bytes exceeds the budget accounting range")
@@ -102,7 +120,6 @@ impl ReassemblyBacking {
         // One pool write critical section covers charge and allocation so no
         // other allocator can consume the admitted bytes in between.
         let (handle, reservation, owner_incarnation) = {
-            let mut guard = pool.write();
             let budget = guard
                 .budget()
                 .ok_or_else(|| "reassembly pool carries no owner budget context".to_string())?;
@@ -116,6 +133,7 @@ impl ReassemblyBacking {
                 Err(e) => return Err(e),
             }
         };
+        drop(guard);
         Ok(Self {
             pool,
             state: Some(BackingState {
@@ -271,43 +289,70 @@ impl ReassemblyBacking {
         self.release_storage()
     }
 
+    /// Try to release without waiting for the pool lock.
+    ///
+    /// `Ok(false)` leaves the entire carrier (storage, exact owner pool and
+    /// reservation) unchanged. The caller must retain it for retry; dropping
+    /// it would use the ordinary blocking RAII fallback. Validation and the
+    /// physical release share the acquired write guard, just as in `release`.
+    /// An error also preserves the live state instead of refunding its charge.
+    pub fn try_release(&mut self) -> Result<bool, String> {
+        if self.state.is_none() {
+            return Ok(true);
+        }
+        let pool = Arc::clone(&self.pool);
+        let Some(mut guard) = pool.try_write() else {
+            return Ok(false);
+        };
+        self.release_storage_with_pool(&mut guard)?;
+        Ok(true)
+    }
+
     fn release_storage(&mut self) -> Result<(), String> {
+        if self.state.is_none() {
+            return Ok(());
+        }
+        let pool = Arc::clone(&self.pool);
+        let mut guard = pool.write();
+        self.release_storage_with_pool(&mut guard)
+    }
+
+    /// Both release entry points keep authority validation and mutation in
+    /// this same pool critical section. Incarnation checks belong here too.
+    fn release_storage_with_pool(&mut self, pool: &mut MemPool) -> Result<(), String> {
         let Some(state) = self.state.as_ref() else {
             return Ok(());
         };
-        {
-            let mut pool = self.pool.write();
-            state
-                .validate_access(&pool)
-                .map_err(|e| format!("reassembly release validation failed: {e}"))?;
-            match &state.handle {
-                MemHandle::Buddy {
-                    seg_idx,
-                    generation,
-                    offset,
-                    allocation_size,
-                    ..
-                } => {
-                    pool.free_at(
-                        u32::from(*seg_idx),
-                        *generation,
-                        *offset,
-                        *allocation_size,
-                        false,
-                    )
+        state
+            .validate_access(pool)
+            .map_err(|e| format!("reassembly release validation failed: {e}"))?;
+        match &state.handle {
+            MemHandle::Buddy {
+                seg_idx,
+                generation,
+                offset,
+                allocation_size,
+                ..
+            } => {
+                pool.free_at(
+                    u32::from(*seg_idx),
+                    *generation,
+                    *offset,
+                    *allocation_size,
+                    false,
+                )
+                .map_err(|e| format!("reassembly backing release failed: {e}"))?;
+            }
+            MemHandle::Dedicated { seg_idx, len } => {
+                let data_size = u32::try_from(*len).map_err(|_| {
+                    "dedicated reassembly length exceeds the wire address space".to_string()
+                })?;
+                pool.free_at(u32::from(*seg_idx), 0, 0, data_size, true)
                     .map_err(|e| format!("reassembly backing release failed: {e}"))?;
-                }
-                MemHandle::Dedicated { seg_idx, len } => {
-                    let data_size = u32::try_from(*len).map_err(|_| {
-                        "dedicated reassembly length exceeds the wire address space".to_string()
-                    })?;
-                    pool.free_at(u32::from(*seg_idx), 0, 0, data_size, true)
-                        .map_err(|e| format!("reassembly backing release failed: {e}"))?;
-                }
-                MemHandle::FileSpill { .. } => {
-                    // Self-owned mapping: it closes when the handle value
-                    // drops below, before the reservation refunds.
-                }
+            }
+            MemHandle::FileSpill { .. } => {
+                // Self-owned mapping: it closes when the handle value
+                // drops below, before the reservation refunds.
             }
         }
         // Storage release accepted. Drop the handle value (closing any file
@@ -383,6 +428,100 @@ mod tests {
 
     fn make_pool(label: &str) -> Arc<RwLock<MemPool>> {
         Arc::new(RwLock::new(make_mempool(label)))
+    }
+
+    #[test]
+    fn try_release_file_preserves_owner_under_live_carrier_callback() {
+        use std::time::{Duration, Instant};
+
+        let budget = c2_mem::MemoryBudget::new(0, 8192, 8192);
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
+            make_mempool("try-release-file").config().clone(),
+            format!("/cc3try{:08x}", std::process::id()),
+            budget.clone(),
+        )));
+        let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 4096).unwrap();
+        backing.write_at(0, &[21; 4096]).unwrap();
+        let mut held = ReassemblyBacking::admit(Arc::clone(&pool), 1, 4096).unwrap();
+        held.write_at(0, &[34; 4096]).unwrap();
+        assert!(backing.is_file_spill() && held.is_file_spill());
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            held.with_slice(|bytes| {
+                assert_eq!(bytes, &[34; 4096]);
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                assert_eq!(bytes, &[34; 4096]);
+            })
+            .unwrap();
+            held
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        let released = backing.try_release().unwrap();
+        let elapsed = started.elapsed();
+        let live = budget.snapshot();
+        let _ = release_tx.send(());
+        let mut held = holder.join().unwrap();
+        assert!(!released);
+        assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+        assert!(!backing.is_released());
+        assert_eq!(backing.capacity_bytes(), 4096);
+        assert_eq!(live.file.used_bytes, 8192);
+        assert_eq!(live.reassembly.used_bytes, 8192);
+        assert!(Arc::ptr_eq(&backing.pool, &pool));
+        assert_eq!(backing.copy_bytes().unwrap(), &[21; 4096]);
+        assert_eq!(held.copy_bytes().unwrap(), &[34; 4096]);
+
+        assert!(backing.try_release().unwrap());
+        assert!(backing.is_released());
+        assert!(backing.copy_bytes().is_err());
+        assert_eq!(budget.snapshot().file.used_bytes, 4096);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 4096);
+        // Idempotent release needs no lock once the storage is gone.
+        {
+            let _guard = pool.write();
+            assert!(backing.try_release().unwrap());
+        }
+        assert_eq!(held.copy_bytes().unwrap(), &[34; 4096]);
+        held.release().unwrap();
+        assert!(held.with_slice(|_| ()).is_err());
+        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    }
+
+    #[test]
+    fn admission_guard_must_belong_to_carrier_pool_before_charging() {
+        let make = || {
+            let budget = c2_mem::MemoryBudget::new(0, 0, 0);
+            let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: false,
+                    spill_threshold: 0.0,
+                    ..PoolConfig::default()
+                },
+                "admission-guard-pure".to_string(),
+                budget.clone(),
+            )));
+            (pool, budget)
+        };
+        let (owner, owner_budget) = make();
+        let (other, other_budget) = make();
+        let error =
+            ReassemblyBacking::admit_with_guard(owner.clone(), other.write(), 1, 128).unwrap_err();
+        assert!(error.contains("different pool"));
+        for (pool, budget) in [(owner, owner_budget), (other, other_budget)] {
+            let snapshot = budget.snapshot();
+            assert_eq!(snapshot.reassembly.used_bytes, 0);
+            assert_eq!(snapshot.reassembly.peak_bytes, 0);
+            assert_eq!(snapshot.reassembly.rejected_allocations, 0);
+            assert_eq!(snapshot.file.used_bytes, 0);
+            assert_eq!(snapshot.shm.used_bytes, 0);
+            assert_eq!(pool.read().stats().total_segments, 0);
+            assert_eq!(pool.read().stats().dedicated_segments, 0);
+        }
     }
 
     #[test]
@@ -507,6 +646,9 @@ mod tests {
         assert!(backing.with_slice(|_| panic!("unexpected access")).is_err());
         assert!(backing.write_at(0, &vec![0x33; size]).is_err());
         for _ in 0..2 {
+            assert!(backing.try_release().unwrap_err().contains("validation"));
+            assert!(!backing.is_released());
+            assert_eq!(budget.snapshot().reassembly.used_bytes, size as u64);
             assert!(backing.release().unwrap_err().contains("validation"));
             assert!(!backing.is_released());
             assert_eq!(backing.len(), size);
@@ -571,6 +713,9 @@ mod tests {
         assert!(backing.copy_bytes().is_err());
         assert!(backing.with_slice(|_| panic!("unexpected access")).is_err());
         assert!(backing.write_at(0, &[0x33]).is_err());
+        assert!(backing.try_release().is_err());
+        assert!(!backing.is_released());
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
         assert!(backing.release().is_err());
         assert_eq!(owner.stats().alloc_count, 1);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 512);

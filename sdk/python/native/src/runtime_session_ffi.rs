@@ -29,6 +29,47 @@ use crate::core_ffi::{PyCoreClient, PyCoreService};
 use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 
+fn checked_shutdown_timeout(seconds: f64) -> Result<Duration, &'static str> {
+    const INVALID: &str =
+        "timeout_seconds must be finite, non-negative, and representable as a Duration";
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(INVALID);
+    }
+    Duration::try_from_secs_f64(seconds).map_err(|_| INVALID)
+}
+
+#[cfg(test)]
+mod shutdown_timeout_tests {
+    use super::checked_shutdown_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn invalid_timeouts_are_rejected_without_panicking() {
+        for seconds in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -1.0,
+            -0.001,
+            1e300,
+            u64::MAX as f64,
+        ] {
+            assert!(checked_shutdown_timeout(seconds).is_err(), "{seconds:?}");
+        }
+    }
+
+    #[test]
+    fn zero_and_normal_timeouts_remain_valid() {
+        assert_eq!(checked_shutdown_timeout(0.0), Ok(Duration::ZERO));
+        assert_eq!(checked_shutdown_timeout(-0.0), Ok(Duration::ZERO));
+        assert_eq!(
+            checked_shutdown_timeout(0.125),
+            Ok(Duration::from_millis(125))
+        );
+        assert_eq!(checked_shutdown_timeout(5.0), Ok(Duration::from_secs(5)));
+    }
+}
+
 #[pyclass(name = "RuntimeSession", frozen)]
 pub struct PyRuntimeSession {
     inner: Arc<Runtime>,
@@ -278,8 +319,7 @@ impl PyRuntimeSession {
         let retired = self.live_retired_observations();
         let mut snapshots = self.lease_tracker.sweep_retained(threshold);
         snapshots.extend(RetiredMemoryObservation::compose_sweep_snapshots(
-            &retired,
-            threshold,
+            &retired, threshold,
         ));
         snapshots.sort_by_key(|snapshot| snapshot.id);
         let list = PyList::new(
@@ -549,7 +589,9 @@ impl PyRuntimeSession {
         relay_anchor_address: Option<String>,
         timeout_seconds: f64,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let _ = (relay_anchor_address, timeout_seconds);
+        // Validate before taking the Host or changing any session state.
+        let timeout = checked_shutdown_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
+        let _ = relay_anchor_address;
         if let Some(route_names) = route_names {
             let registered = self.registrations.lock();
             for route_name in route_names {
@@ -561,15 +603,12 @@ impl PyRuntimeSession {
             }
         }
         let host = self.host.lock().take();
-        let timeout = Duration::from_secs_f64(timeout_seconds.max(0.0));
         let outcome = py.detach(move || {
             // Hostless sessions still own outgoing IPC clients; the Core
             // client-only shutdown detaches and closes them through the same
             // bounded barrier as the hosted path.
-            host.as_ref().map_or_else(
-                || self.inner.shutdown_without_host(timeout),
-                Host::shutdown,
-            )
+            host.as_ref()
+                .map_or_else(|| self.inner.shutdown_without_host(timeout), Host::shutdown)
         });
         self.registrations.lock().clear();
         self.server_bridge.lock().take();

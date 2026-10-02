@@ -6,6 +6,80 @@ from pathlib import Path
 import pytest
 
 
+BAD_SHUTDOWN_TIMEOUTS = [float('inf'), float('-inf'), float('nan'), -1.0, -0.001, 1e300, float(2**64)]
+
+
+@pytest.mark.parametrize('timeout', BAD_SHUTDOWN_TIMEOUTS)
+def test_native_shutdown_rejects_invalid_timeout_without_changing_identity(timeout: float) -> None:
+    from c_two._native import RuntimeSession
+
+    session = RuntimeSession(server_id='timeout-validation')
+    with pytest.raises(ValueError, match='timeout_seconds'):
+        session.shutdown(route_names=[], timeout_seconds=timeout)
+    assert session.server_id is None
+    assert session.server_address is None
+    # A rejected call leaves the session usable for an ordinary shutdown.
+    outcome = dict(session.shutdown(route_names=[], timeout_seconds=0.0))
+    assert outcome['ipc_clients_drained'] is True
+    assert outcome['runtime_barrier_error'] is None
+
+
+@pytest.mark.parametrize('timeout', [0.0, -0.0, 0.125, 5.0])
+def test_native_shutdown_accepts_zero_and_normal_timeout(timeout: float) -> None:
+    from c_two._native import RuntimeSession
+
+    outcome = dict(RuntimeSession().shutdown(route_names=[], timeout_seconds=timeout))
+    assert outcome['ipc_clients_drained'] is True
+    assert outcome['runtime_barrier_error'] is None
+
+
+def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -> None:
+    import c_two as cc
+    from c_two.transport.registry import _ProcessRegistry
+
+    @cc.crm(namespace='test.shutdown-timeout-boundary', version='0.1.0')
+    class Alive:
+        def ping(self) -> str:
+            ...
+
+        @cc.on_shutdown
+        def stop(self) -> None:
+            ...
+
+    class AliveResource:
+        shutdown_calls = 0
+
+        def ping(self) -> str:
+            return 'pong'
+
+        def stop(self) -> None:
+            self.shutdown_calls += 1
+
+    cc.shutdown()
+    resource = AliveResource()
+    proxy = None
+    try:
+        cc.register(Alive, resource, name='timeout-alive')
+        session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+        identity = (session.server_id, session.server_address)
+        proxy = cc.connect(Alive, name='timeout-alive', address=cc.server_address())
+        assert proxy.ping() == 'pong'
+        for timeout in BAD_SHUTDOWN_TIMEOUTS:
+            with pytest.raises(ValueError, match='timeout_seconds'):
+                session.shutdown(route_names=['timeout-alive'], timeout_seconds=timeout)
+            assert (session.server_id, session.server_address) == identity
+            assert proxy.ping() == 'pong'
+            assert resource.shutdown_calls == 0
+        cc.shutdown()
+        assert resource.shutdown_calls == 1
+        cc.shutdown()
+        assert resource.shutdown_calls == 1
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        cc.shutdown()
+
+
 def test_native_runtime_session_explicit_identity_is_lazy() -> None:
     from c_two._native import RuntimeSession
 

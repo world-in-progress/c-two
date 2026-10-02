@@ -727,7 +727,7 @@ impl PyChunkAssembler {
             512,           // TODO: pass from config
             8 * (1 << 30), // TODO: pass from config
         )
-        .map_err(PyRuntimeError::new_err)?;
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         Ok(Self {
             state: Mutex::new(AssemblerInner { inner: Some(asm) }),
         })

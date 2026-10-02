@@ -375,10 +375,14 @@ impl SyncClient {
     /// Synchronous shared-ownership close with a bounded close barrier.
     ///
     /// Usable through `Arc<SyncClient>` when unique ownership cannot be
-    /// proven. Returns `true` only when the receive task finished and the
-    /// writer slot cleared within `timeout`; `false` reports an unconfirmed
-    /// close honestly — nothing is force-stopped or force-released beyond the
-    /// bounded abort attempts made inside the barrier.
+    /// proven. Returns `true` when maintenance and receive tasks finished,
+    /// the writer cleared, pending requests settled, and transport-owned pool
+    /// slots detached within `timeout`. Live RequestBlocks, held carriers and
+    /// dedicated-retire jobs retain their exact pools and budget charges.
+    /// IPC-owned cleanup-lock contention returns `false` with the cleanup
+    /// owners reachable for a later close; injected pools remain external.
+    /// Busy connection cleanup stays owned for retry. This is not a hard
+    /// real-time bound on OS scheduling or mapping destruction.
     pub fn close_shared(&self, timeout: std::time::Duration) -> bool {
         self.rt.block_on(self.inner.close_shared_bounded(timeout))
     }
@@ -534,6 +538,25 @@ pub(crate) mod tests {
 
         assert!(before_dispatch.is_retry_safe());
         assert!(!uncertain.is_retry_safe());
+    }
+
+    #[test]
+    fn response_admission_is_dispatch_uncertain_and_not_retry_safe() {
+        let budget = c2_mem::MemoryBudget::new(0, 0, 0);
+        let pool = Arc::new(parking_lot::RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                c2_mem::PoolConfig::default(),
+                "phase-pure".to_string(),
+                budget,
+            ),
+        ));
+        let registry =
+            c2_wire::chunk::ChunkRegistry::new(pool, c2_wire::chunk::ChunkConfig::default());
+        let failure = registry.insert_reply(1, 1, 128, 2, 64).unwrap_err();
+        let error = IpcError::Chunk(failure.into());
+        let phase = call_error_phase(&error);
+        assert_eq!(phase, TransportPhase::DispatchUncertain);
+        assert!(!IpcCallError::new(phase, error).is_retry_safe());
     }
 
     #[test]

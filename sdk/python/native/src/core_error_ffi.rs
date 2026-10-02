@@ -49,6 +49,20 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 set_attr(value, "transport_kind", kind);
                 set_attr(value, "transport_phase", phase);
                 set_attr(value, "fallback_eligible", fallback_eligible);
+                if let Some(semantic) = error.semantic_error() {
+                    set_attr(value, "code", u16::from(semantic.code));
+                    set_attr(value, "name", semantic.code.name());
+                    let details = PyDict::new(value.py());
+                    for (key, item) in &semantic.details {
+                        let _ = details.set_item(key, item);
+                    }
+                    set_attr(value, "details", details);
+                    set_attr(
+                        value,
+                        "error_bytes",
+                        PyBytes::new(value.py(), &semantic.to_wire_bytes()),
+                    );
+                }
             })
         }
         Error::Lifecycle(error) => lifecycle_error_to_py(error),

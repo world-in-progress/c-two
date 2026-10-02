@@ -33,7 +33,9 @@ use c2_mem::{MemPool, MemoryBudget};
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
-use c2_wire::chunk::{REPLY_CHUNK_META_SIZE, decode_chunk_header, encode_reply_chunk_meta};
+use c2_wire::chunk::{
+    ChunkAdmissionError, REPLY_CHUNK_META_SIZE, decode_chunk_header, encode_reply_chunk_meta,
+};
 use c2_wire::control::{
     ReplyControl, RouteCallIdentity, decode_call_control, try_encode_reply_control,
 };
@@ -3298,7 +3300,7 @@ async fn dispatch_chunked_call(
                 writer,
                 request_id,
                 admission_owner.take(),
-                ErrorCode::ResourceUnavailable,
+                ErrorCode::ProtocolViolation,
                 "chunked call rejected: first chunk carries no data".to_string(),
             )
             .await;
@@ -3325,13 +3327,19 @@ async fn dispatch_chunked_call(
                 // carries the budget cell and size detail from the admission
                 // error.
                 drop(publication);
+                let code = match &e {
+                    ChunkAdmissionError::Capacity(_) => ErrorCode::ResourceUnavailable,
+                    ChunkAdmissionError::Protocol(_) | ChunkAdmissionError::Duplicate { .. } => {
+                        ErrorCode::ProtocolViolation
+                    }
+                };
                 fail_chunked_request(
                     server,
                     conn,
                     writer,
                     request_id,
                     admission_owner.take(),
-                    ErrorCode::ResourceUnavailable,
+                    code,
                     format!("chunked call reassembly admission failed: {e}"),
                 )
                 .await;

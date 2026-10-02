@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use c2_mem::MemPool;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 
+use crate::chunk::ChunkAdmissionError;
 use crate::chunk::backing::{ReassemblyBacking, checked_capacity};
 
 /// Reassembles chunked payloads into a contiguous [`MemHandle`].
@@ -36,6 +37,12 @@ pub struct ChunkAssembler {
     pub method_idx: Option<u16>,
 }
 
+/// Checked immutable geometry. Only the canonical checks can create this token.
+pub(crate) struct ChunkGeometry {
+    total_chunks: usize,
+    chunk_size: usize,
+}
+
 impl std::fmt::Debug for ChunkAssembler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChunkAssembler")
@@ -60,21 +67,53 @@ impl ChunkAssembler {
         chunk_size: usize,
         max_total_chunks: usize,
         max_reassembly_bytes: usize,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkAdmissionError> {
+        let geometry = Self::check_geometry(
+            total_chunks,
+            chunk_size,
+            max_total_chunks,
+            max_reassembly_bytes,
+        )?;
+        let guard = pool.write();
+        Self::new_with_guard(Arc::clone(&pool), guard, geometry)
+    }
+
+    pub(crate) fn check_geometry(
+        total_chunks: usize,
+        chunk_size: usize,
+        max_total_chunks: usize,
+        max_reassembly_bytes: usize,
+    ) -> Result<ChunkGeometry, ChunkAdmissionError> {
         if total_chunks > max_total_chunks {
-            return Err(format!(
+            return Err(ChunkAdmissionError::Protocol(format!(
                 "total_chunks {total_chunks} exceeds limit {max_total_chunks}"
-            ));
+            )));
         }
-        let capacity = checked_capacity(total_chunks, chunk_size)?;
+        let capacity =
+            checked_capacity(total_chunks, chunk_size).map_err(ChunkAdmissionError::Protocol)?;
         if capacity > max_reassembly_bytes {
-            return Err(format!(
+            return Err(ChunkAdmissionError::Protocol(format!(
                 "reassembly size {capacity} exceeds limit {max_reassembly_bytes}"
-            ));
+            )));
         }
-        // Admission: reserve the checked total capacity from the pool's
-        // reassembly budget before allocating.
-        let backing = ReassemblyBacking::admit(pool, total_chunks, chunk_size)?;
+        Ok(ChunkGeometry {
+            total_chunks,
+            chunk_size,
+        })
+    }
+
+    /// Allocate from an already acquired pool guard; no pool lock wait occurs.
+    pub(crate) fn new_with_guard(
+        pool: Arc<RwLock<MemPool>>,
+        guard: RwLockWriteGuard<'_, MemPool>,
+        geometry: ChunkGeometry,
+    ) -> Result<Self, ChunkAdmissionError> {
+        let ChunkGeometry {
+            total_chunks,
+            chunk_size,
+        } = geometry;
+        let backing = ReassemblyBacking::admit_with_guard(pool, guard, total_chunks, chunk_size)
+            .map_err(ChunkAdmissionError::Capacity)?;
         Ok(Self {
             total_chunks,
             chunk_size,
@@ -164,6 +203,15 @@ impl ChunkAssembler {
         drop(self)
     }
 
+    /// Try to release without consuming the assembler on pool contention.
+    ///
+    /// Cleanup owners retain this assembler on `Ok(false)` or an error and
+    /// retry it later. Only a successful release permits removing the entry;
+    /// its subsequent Drop then has no storage or reservation left to release.
+    pub fn try_release(&mut self) -> Result<bool, String> {
+        self.backing.try_release()
+    }
+
     /// One past the last byte written (actual data length).
     pub fn written_end(&self) -> usize {
         self.written_end
@@ -211,6 +259,43 @@ mod tests {
             ))),
             budget,
         )
+    }
+
+    #[test]
+    fn try_release_file_keeps_partial_assembly_for_retry() {
+        let budget = MemoryBudget::new(0, 8192, 8192);
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
+            PoolConfig {
+                spill_threshold: 0.0,
+                ..PoolConfig::default()
+            },
+            "assembler-try-release-file".into(),
+            budget.clone(),
+        )));
+        let mut asm = ChunkAssembler::new(Arc::clone(&pool), 2, 4096, 2, 8192).unwrap();
+        assert!(asm.backing.is_file_spill());
+        assert!(!asm.feed_chunk(0, &[27; 4096]).unwrap());
+        {
+            let _reader = pool.read();
+            assert!(!asm.try_release().unwrap());
+            assert_eq!(asm.received(), 1);
+            assert_eq!(asm.written_end(), 4096);
+            assert_eq!(asm.capacity_bytes(), 8192);
+            assert_eq!(budget.snapshot().file.used_bytes, 8192);
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
+        }
+        // Failed cleanup left data and chunk geometry intact, rather than
+        // consuming the assembler or silently refunding an unfinished owner.
+        assert!(asm.feed_chunk(1, &[38; 1024]).unwrap());
+        assert_eq!(&asm.backing.copy_bytes().unwrap()[..4096], &[27; 4096]);
+        assert_eq!(&asm.backing.copy_bytes().unwrap()[4096..5120], &[38; 1024]);
+        assert!(asm.try_release().unwrap());
+        assert_eq!(asm.capacity_bytes(), 0);
+        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+        let _writer = pool.write();
+        assert!(asm.try_release().unwrap());
+        drop(asm); // successful cleanup's Drop must not reacquire the pool
     }
 
     #[test]
@@ -333,14 +418,18 @@ mod tests {
     #[test]
     fn test_zero_chunks_rejected() {
         let pool = test_pool_arc();
-        let err = ChunkAssembler::new(pool, 0, 4096, 512, 8 * (1 << 30)).unwrap_err();
+        let err = ChunkAssembler::new(pool, 0, 4096, 512, 8 * (1 << 30))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("total_chunks must be > 0"));
     }
 
     #[test]
     fn test_zero_chunk_size_rejected_before_charge_or_allocation() {
         let (pool, budget) = budgeted_pool_arc(64 * 1024);
-        let err = ChunkAssembler::new(pool.clone(), 1, 0, 512, 8 * (1 << 30)).unwrap_err();
+        let err = ChunkAssembler::new(pool.clone(), 1, 0, 512, 8 * (1 << 30))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("chunk_size must be > 0"));
         // No charge taken and no mapping created.
         let snap = budget.snapshot();
@@ -362,7 +451,9 @@ mod tests {
     #[test]
     fn budget_rejection_leaves_no_mapping_and_reports_cell_and_size() {
         let (pool, budget) = budgeted_pool_arc(100);
-        let err = ChunkAssembler::new(pool.clone(), 2, 64, 512, 8 * (1 << 30)).unwrap_err();
+        let err = ChunkAssembler::new(pool.clone(), 2, 64, 512, 8 * (1 << 30))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("'reassembly'"),
             "error must name the cell: {err}"
