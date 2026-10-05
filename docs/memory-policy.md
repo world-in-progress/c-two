@@ -78,6 +78,22 @@ cc.set_client(ipc_overrides=dict(BUDGET))
 
 同样的三个键也可通过环境变量 `C2_IPC_SHM_BACKING_BUDGET_BYTES`、`C2_IPC_FILE_BACKING_BUDGET_BYTES`、`C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` 设置，解析优先级为显式代码覆盖 > 进程环境/`.env` > Rust 默认。客户端 Runtime 的配置在首次连接尝试前冻结，包括失败的首次尝试；缓存命中要求完整的已解析策略相等。需要更改配置时，先关闭旧 Runtime，再为新 Runtime 设置配置。旧 held 数据仍由其原预算域计账。
 
+### 独立 relay 进程
+
+`c3 relay` 在启动时通过同一个 Rust 配置解析器解析上游 IPC 策略，固定在 `RelayConfig.upstream_ipc` 中。所有数据面上游连接的请求池和组装池共享该 relay 实例的预算，重连继续使用同一策略与预算。应用进程中的 `cc.set_client()` 不会配置另一个 relay 进程；需要在启动 relay 的进程环境或命令行设置策略。
+
+```bash
+c3 relay --bind 127.0.0.1:8080 \
+  --ipc-pool-enabled false \
+  --ipc-shm-backing-budget-bytes 134217728 \
+  --ipc-file-backing-budget-bytes 268435456 \
+  --ipc-live-reassembly-budget-bytes 134217728
+```
+
+四个命令行覆盖分别对应 `C2_IPC_POOL_ENABLED` 和上述三个预算环境变量，命令行优先于进程环境/`.env`。其他 client IPC 设置（例如 `C2_IPC_POOL_PREWARM_SEGMENTS`、`C2_IPC_POOL_DECAY_SECONDS`、`C2_SHM_THRESHOLD`）也经既有解析器生效；`c3 relay --dry-run` 可查看 buddy、预热和预算的已解析值。禁用 buddy 时预热必须为零；零预算保留“拒绝正数预留”的含义。
+
+此范围只包含 relay 自有的数据面 IPC 后备与组装。注册证明和控制 watch 使用独立的惰性默认上下文，对端映射和 HTTP 缓冲不计入该预算。HTTP 响应目前仍会全量物化后分片发送；小的发送分片不等于小的响应内存占用。后续治理边界见 [HTTP 预算设计提案](plans/2026-10-06-http-memory-budget.md)，该提案尚未实施。
+
 ## 7. 只读统计：`cc.memory_stats()` 与 `cc.hold_stats()`
 
 `cc.memory_stats()` 返回只读、按方向标注的快照：`runtime_outgoing`（本 Runtime 出站客户端域，首次连接尝试时冻结；观察它不会触发冻结或连接）、`server`（本进程服务端方向，无主机时为 `None`）、`retired`（先前会话关闭时仍有持有者的域，`state="retired"`）、`holds`（与 `cc.hold_stats()` 同源的保留租约计数）与 `budget_cells_note`。每个域含 `role`、`state`、`limits`（三个已解析上限）与 `cells`（`shm`/`file`/`reassembly`），每格为 `limit_bytes`、`used_bytes`、`peak_bytes`、`rejected_allocations`、`rejected_bytes`，峰值跨释放保留高水位。
