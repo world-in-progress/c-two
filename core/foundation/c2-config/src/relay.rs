@@ -5,6 +5,9 @@ use std::time::Duration;
 /// Configuration for the relay server.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
+    /// Fully resolved data-plane upstream IPC policy, frozen at relay startup.
+    /// Attestation/watch clients keep private, lazy default contexts outside this budget.
+    pub upstream_ipc: crate::ClientIpcConfig,
     /// HTTP bind address (e.g. "0.0.0.0:8080").
     pub bind: String,
     /// Stable relay identifier. Default: "{hostname}_{pid}_{uuid8}".
@@ -39,6 +42,7 @@ pub struct RelayConfig {
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
+            upstream_ipc: crate::ClientIpcConfig::default(),
             bind: "0.0.0.0:8080".into(),
             relay_id: Self::generate_relay_id(),
             advertise_url: String::new(),
@@ -57,6 +61,9 @@ impl Default for RelayConfig {
 
 impl RelayConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.upstream_ipc
+            .validate()
+            .map_err(|reason| format!("upstream_ipc {reason}"))?;
         crate::validate_relay_id(&self.relay_id)?;
         if self.idle_timeout_secs != 0 && self.idle_timeout_secs.checked_mul(1000).is_none() {
             return Err("idle_timeout_secs must fit in milliseconds".into());
@@ -207,5 +214,23 @@ mod tests {
         assert!(!relay_id.contains('/'));
         assert!(!relay_id.contains('\n'));
         crate::validate_relay_id(&relay_id).unwrap();
+    }
+
+    #[test]
+    fn relay_config_validates_upstream_ipc_and_accepts_zero_budgets() {
+        let mut config = RelayConfig::default();
+        config.upstream_ipc.base.pool_enabled = false;
+        config.upstream_ipc.base.shm_backing_budget_bytes = 0;
+        config.upstream_ipc.base.file_backing_budget_bytes = 0;
+        config.upstream_ipc.base.live_reassembly_budget_bytes = 0;
+        config
+            .validate()
+            .expect("zero budgets are finite valid limits");
+        config.upstream_ipc.base.pool_prewarm_segments = 1;
+        let err = config
+            .validate()
+            .expect_err("disabled buddy cannot prewarm");
+        assert!(err.contains("upstream_ipc"), "{err}");
+        assert!(err.contains("pool_prewarm_segments"), "{err}");
     }
 }
