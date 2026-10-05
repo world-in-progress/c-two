@@ -1724,6 +1724,16 @@ pub(crate) struct FrameWriteSeam {
     pub release: tokio::sync::oneshot::Receiver<()>,
 }
 
+/// Park this connection immediately before its terminal pending drain and
+/// report the first real attempt. Tests can hold the pending map across that
+/// attempt without relying on timing or affecting any other connection.
+#[cfg(test)]
+pub(crate) struct PendingDrainSeam {
+    pub entered: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
+    pub attempted: tokio::sync::oneshot::Sender<bool>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestTransportKind {
     Inline,
@@ -1860,6 +1870,8 @@ pub struct IpcClient {
     partial_header_pending_for_test: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     receiver_drop_gate_for_test: StdMutex<Option<ReceiverDropGateForTest>>,
+    #[cfg(test)]
+    pending_drain_seam: StdMutex<Option<PendingDrainSeam>>,
     /// Serializes close barriers. Only one closer at a time may manipulate
     /// the writer slot and the receive-task handle, so a concurrent close
     /// can never observe a taken handle and mistake it for a terminal task
@@ -2039,6 +2051,8 @@ impl IpcClient {
             partial_header_pending_for_test: StdMutex::new(None),
             #[cfg(test)]
             receiver_drop_gate_for_test: StdMutex::new(None),
+            #[cfg(test)]
+            pending_drain_seam: StdMutex::new(None),
             close_gate: tokio::sync::Mutex::new(()),
             close_incomplete: AtomicBool::new(false),
             connected: Arc::new(AtomicBool::new(false)),
@@ -2536,6 +2550,8 @@ impl IpcClient {
                         .expect("connected stream has an abort handle")
                         .clone(),
                 });
+        #[cfg(test)]
+        let pending_drain_seam = self.pending_drain_seam.lock().take();
         let recv_handle = tokio::spawn(async move {
             #[cfg(test)]
             recv_loop_inner(
@@ -2547,6 +2563,7 @@ impl IpcClient {
                 conn_id,
                 partial_header_pending,
                 receiver_drop_gate,
+                pending_drain_seam,
             )
             .await;
             #[cfg(not(test))]
@@ -4452,6 +4469,16 @@ impl IpcClient {
         *self.frame_write_seam.lock() = seam;
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_pending_drain_seam_for_test(&self, seam: PendingDrainSeam) {
+        *self.pending_drain_seam.lock() = Some(seam);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_slot_for_test(&self) -> Arc<StdMutex<PendingMap>> {
+        Arc::clone(&self.pending)
+    }
+
     /// Number of live pending-response entries (test-only probe for
     /// per-call pending cleanup).
     #[cfg(test)]
@@ -4668,6 +4695,8 @@ pub(crate) async fn recv_loop(
         None,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
     .await;
 }
@@ -4681,6 +4710,7 @@ async fn recv_loop_inner(
     conn_id: u64,
     #[cfg(test)] mut partial_header_pending: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)] receiver_drop_gate: Option<ReceiverDropGuardForTest>,
+    #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
 ) {
     #[cfg(test)]
     let _abort_join_delay = if receiver_drop_gate.is_none() {
@@ -4908,7 +4938,44 @@ async fn recv_loop_inner(
     // Connection lost — wake all pending callers and settle any dispatched
     // request allocation whose caller is gone (idempotent with a caller that
     // still observes the Closed result).
-    try_drain_pending(&pending, &server_pool, true, None);
+    drain_pending_on_disconnect(
+        &pending,
+        &server_pool,
+        #[cfg(test)]
+        pending_drain_seam,
+    )
+    .await;
+}
+
+/// The receive task owns terminal settlement until it succeeds or an explicit
+/// close aborts/joins the task and takes over the same pending-map owners.
+async fn drain_pending_on_disconnect(
+    pending: &StdMutex<PendingMap>,
+    server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
+    #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
+) {
+    #[cfg(test)]
+    let attempted = if let Some(seam) = pending_drain_seam {
+        let _ = seam.entered.send(());
+        let _ = seam.resume.await;
+        Some(seam.attempted)
+    } else {
+        None
+    };
+    let drained = try_drain_pending(pending, server_pool, true, None);
+    #[cfg(test)]
+    if let Some(attempted) = attempted {
+        let _ = attempted.send(drained);
+    }
+    // A busy map/pool is a deferred settlement, not a completed drain. Keep
+    // this terminal observer alive instead of handing cancelled callers to
+    // the much slower maintenance cadence. No lock survives the await; close
+    // can still abort/join us and settle the same exact-once owners.
+    let mut drained = drained;
+    while !drained {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        drained = try_drain_pending(pending, server_pool, true, None);
+    }
 }
 
 async fn abort_reply_assembly(registry: &ChunkRegistry, conn_id: u64, rid: u32) {
@@ -7051,5 +7118,56 @@ mod tests {
             "pool destruction must return the conservative hold to the budget"
         );
         peer.abort();
+    }
+}
+
+#[cfg(test)]
+mod pending_disconnect_tests {
+    use super::*;
+
+    /// Exercise the exact terminal drain without requiring an OS listener.
+    /// A cancelled call and a live waiter both survive the first busy-map
+    /// attempt; neither may depend on a maintenance tick or explicit close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_pending_drain_keeps_ownership_after_contention() {
+        let pending = Arc::new(StdMutex::new(PendingMap::new()));
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        pending
+            .lock()
+            .insert(1, PendingResponse::unary(cancelled_tx));
+        drop(cancelled_rx);
+        let (live_tx, live_rx) = oneshot::channel();
+        pending.lock().insert(2, PendingResponse::unary(live_tx));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+        let loop_pending = Arc::clone(&pending);
+        let drain = tokio::spawn(async move {
+            drain_pending_on_disconnect(
+                &loop_pending,
+                &Arc::new(StdMutex::new(None)),
+                Some(PendingDrainSeam {
+                    entered: entered_tx,
+                    resume: resume_rx,
+                    attempted: attempted_tx,
+                }),
+            )
+            .await;
+        });
+        entered_rx.await.expect("terminal drain entered");
+        let guard = pending.lock();
+        resume_tx.send(()).expect("resume terminal drain");
+        assert!(!attempted_rx.await.expect("first real drain result"));
+        assert_eq!(guard.len(), 2, "contention preserves cleanup owners");
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("automatic drain must finish after contention clears")
+            .expect("drain task");
+        assert!(
+            pending.lock().is_empty(),
+            "terminal pending owners were stranded"
+        );
+        assert!(matches!(live_rx.await, Ok(Err(IpcError::Closed))));
     }
 }

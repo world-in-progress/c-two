@@ -697,7 +697,8 @@ mod lazy_policy_roundtrip_tests {
     use tokio::time::timeout;
 
     use crate::client::{
-        ClientIpcConfig, DispatchPermitSeam, FrameWriteSeam, IpcClient, IpcError, RequestBlock,
+        ClientIpcConfig, DispatchPermitSeam, FrameWriteSeam, IpcClient, IpcError, PendingDrainSeam,
+        RequestBlock,
     };
     use crate::pool::ClientPool;
     use crate::response::{ResponseData, ResponseLease};
@@ -3824,6 +3825,17 @@ mod lazy_policy_roundtrip_tests {
     /// until pool destruction returns it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_frame_write_cancellation_poisons_the_stream() {
+        check_partial_frame_write_cancellation(false).await;
+    }
+
+    /// A short pending-map lock holder must not strand terminal cleanup until
+    /// periodic pool maintenance. All partial-write/lifetime proofs still run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_frame_write_cancellation_retries_contended_drain() {
+        check_partial_frame_write_cancellation(true).await;
+    }
+
+    async fn check_partial_frame_write_cancellation(contended_drain: bool) {
         let (address, peer_rx) = raw_handshake_peer("partial_write_poison").await;
         let base = BaseIpcConfig {
             // One backing fits; two simultaneous 64 KiB buddy backings do
@@ -3831,8 +3843,26 @@ mod lazy_policy_roundtrip_tests {
             shm_backing_budget_bytes: 128 * 1024,
             ..small_base(64 * 1024, 2)
         };
-        let cfg = client_config(base.clone(), 1024);
+        let mut cfg = client_config(base.clone(), 1024);
+        if contended_drain {
+            // Isolate terminal cleanup from the periodic maintenance fallback.
+            cfg.base.chunk_gc_interval_secs = 60.0;
+            cfg.pool_decay_seconds = 60.0;
+        }
         let mut client = IpcClient::with_config(&address, cfg.clone());
+        let drain_probe = if contended_drain {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+            client.set_pending_drain_seam_for_test(PendingDrainSeam {
+                entered: entered_tx,
+                resume: resume_rx,
+                attempted: attempted_tx,
+            });
+            Some((entered_rx, resume_tx, attempted_rx))
+        } else {
+            None
+        };
         client.connect().await.expect("connect");
         let mut peer = peer_rx.await.expect("peer stream");
         let pool = client.request_pool().expect("transport-owned request pool");
@@ -3899,7 +3929,25 @@ mod lazy_policy_roundtrip_tests {
         let silent = !matches!(read, Ok(Ok(count)) if count > 0);
         assert!(silent, "the poisoned stream must carry no further bytes");
 
-        // The pending entry drains with a correct settle.
+        if let Some((entered, resume, attempted)) = drain_probe {
+            timeout(Duration::from_secs(2), entered)
+                .await
+                .expect("abort must wake the receive loop without dropping the peer")
+                .expect("terminal drain seam");
+            let pending = client.pending_slot_for_test();
+            let guard = pending.lock();
+            assert_eq!(guard.len(), 1, "the cancelled request still owns cleanup");
+            resume.send(()).expect("resume the terminal drain");
+            let drained = timeout(Duration::from_secs(2), attempted)
+                .await
+                .expect("nonblocking drain must report while the map is locked")
+                .expect("first drain attempt");
+            assert!(!drained, "the first real drain must encounter contention");
+            drop(guard);
+        }
+
+        // The pending entry drains with a correct settle, without explicit
+        // close, peer drop, or a periodic maintenance tick rescuing it.
         wait_until(2, || client.pending_len_for_test() == 0).await;
         // A dispatched buddy block is never freed locally: it stays charged
         // until pool destruction returns it.
