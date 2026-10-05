@@ -369,6 +369,17 @@ pub(crate) mod dedicated_retire_test_control {
         )
     }
 
+    /// Nonblocking version for deadline-bounded fixture cleanup, using the
+    /// same exact-pool queued/in-flight witness as the other retirement tests.
+    pub(crate) fn try_retention_and_returned_for_pool(
+        pool: &Arc<StdMutex<MemPool>>,
+        returned: &super::AtomicBool,
+    ) -> Option<(usize, bool)> {
+        let state = dedicated_retire().state.try_lock()?;
+        let returned = returned.load(super::Ordering::Acquire);
+        Some((retention_jobs_for_pool_locked(&state, pool), returned))
+    }
+
     /// Retained jobs a worker has already popped but whose permit has not
     /// returned yet, scoped to this exact pool.
     ///
@@ -5762,8 +5773,269 @@ mod tests {
         }
     }
 
+    // These fixtures are their allocation's ONLY simulated reader. Ending
+    // that reader, including on panic, may send real read_done via peer.free.
+    // This is not a cleanup policy for RPCs with an independent live reader.
+    struct OwnerReaderFixture<'a> {
+        client: &'a IpcClient,
+        pool: Arc<StdMutex<MemPool>>,
+        alloc: PoolAllocation,
+        peer: MemPool,
+        budget: c2_mem::MemoryBudget,
+        branch: &'static str,
+        request: Weak<RequestReleaseState>,
+        returned: Arc<AtomicBool>,
+        holder: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
+        read_done: bool,
+        dispatched: bool,
+        finished: bool,
+    }
+
+    impl<'a> OwnerReaderFixture<'a> {
+        fn new(client: &'a IpcClient, block: &RequestBlock, branch: &'static str) -> Self {
+            let pool = Arc::clone(&block.release.pool);
+            let guard = pool.lock();
+            let peer = MemPool::open_peer(guard.config().clone(), guard.prefix().to_string());
+            let budget = guard.budget().unwrap().clone();
+            drop(guard);
+            let mut fixture = Self {
+                client,
+                pool,
+                alloc: *block.allocation(),
+                peer,
+                budget,
+                branch,
+                request: Arc::downgrade(&block.release),
+                returned: Arc::new(AtomicBool::new(true)),
+                holder: None,
+                read_done: false,
+                dispatched: false,
+                finished: false,
+            };
+            fixture
+                .peer
+                .ensure_peer_dedicated(fixture.alloc.seg_idx, 8192)
+                .unwrap();
+            fixture
+        }
+
+        fn dispatch(&mut self, block: &RequestBlock) -> Arc<RequestReleaseState> {
+            let (permit, returned) = dedicated_retire_test_control::reserve_permit();
+            self.returned = returned;
+            let request = block.try_dispatch(Some(permit)).unwrap();
+            self.dispatched = true;
+            request
+        }
+
+        fn hold(&mut self, request: Arc<RequestReleaseState>, lock: &'static str) {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let wait = || {
+                    let _ = ready_tx.send(());
+                    let _ = release_rx.recv_timeout(std::time::Duration::from_secs(1));
+                };
+                match lock {
+                    "permit" => {
+                        let _guard = request.permit.lock();
+                        wait();
+                    }
+                    "pool" => {
+                        let _guard = request.pool.lock();
+                        wait();
+                    }
+                    "executor" => {
+                        let _guard = dedicated_retire().state.lock();
+                        wait();
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            // Install before the readiness assertion so unexpected unwind also
+            // releases and joins the holder before touching settlement locks.
+            self.holder = Some((release_tx, holder));
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+
+        fn stop_holder(&mut self) -> Result<(), String> {
+            if let Some((release, holder)) = self.holder.take() {
+                let _ = release.send(());
+                holder
+                    .join()
+                    .map_err(|_| "lock holder panicked".to_string())?;
+            }
+            Ok(())
+        }
+
+        fn end_reader(&mut self) -> Result<(), String> {
+            if !self.read_done {
+                self.peer.free(&self.alloc)?;
+                self.read_done = true;
+            }
+            if !self.dispatched {
+                // Before dispatch this fixture still owns the unpublished
+                // allocation. Use its ordinary release authority, then GC
+                // only after this sole simulated reader has sent read_done.
+                if let Some(request) = self.request.upgrade() {
+                    request.release_once().map_err(|error| error.to_string())?;
+                }
+                self.pool.lock().gc_dedicated();
+            }
+            Ok(())
+        }
+
+        fn diagnostic(&self) -> String {
+            let request = self.request.upgrade();
+            let phase = request.as_ref().map(|r| r.phase.load(Ordering::Acquire));
+            let permit_lock = request.as_ref().map(|r| r.permit.try_lock().is_some());
+            let pending = self.client.pending.try_lock().map(|p| p.len());
+            let pool = self.pool.try_lock().map(|p| {
+                (
+                    p.prefix().to_string(),
+                    p.stats(),
+                    p.dedicated_name(self.alloc.seg_idx).map(str::to_string),
+                    p.dedicated_awaiting_retirement(&self.alloc),
+                )
+            });
+            let retention = dedicated_retire().state.try_lock().map(|state| {
+                let queued = state
+                    .jobs
+                    .iter()
+                    .filter(|j| Arc::ptr_eq(&j.pool, &self.pool))
+                    .count();
+                let in_flight = state
+                    .in_flight
+                    .iter()
+                    .filter(|p| p.as_ptr() == Arc::as_ptr(&self.pool))
+                    .count();
+                (
+                    queued,
+                    in_flight,
+                    state.jobs.len(),
+                    state.permits,
+                    state.live_workers,
+                )
+            });
+            format!(
+                "branch={} alloc={:?} phase={phase:?} pending={pending:?} permit_lock_available={permit_lock:?} pool={pool:?} retention(pool_queued,pool_in_flight,global_queued,permits,workers)={retention:?} returned={} read_done={} budget={:?}",
+                self.branch,
+                self.alloc,
+                self.returned.load(Ordering::Acquire),
+                self.read_done,
+                self.budget.snapshot()
+            )
+        }
+
+        async fn close_until(&self, deadline: std::time::Instant) -> Result<(), String> {
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!("close deadline: {}", self.diagnostic()));
+                }
+                if self
+                    .client
+                    .close_shared_bounded(remaining.min(std::time::Duration::from_millis(50)))
+                    .await
+                {
+                    return Ok(());
+                }
+                // A failed try_lock is legal even after the fixture's holder
+                // exits. Yield asynchronously; never enlarge one close call.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(5))).await;
+            }
+        }
+
+        fn retired(&self) -> bool {
+            let Some(pool) = self.pool.try_lock() else {
+                return false;
+            };
+            if pool.dedicated_name(self.alloc.seg_idx).is_some()
+                || pool.stats().dedicated_active_count != 0
+                || self.budget.snapshot().shm.used_bytes != 0
+            {
+                return false;
+            }
+            drop(pool);
+            dedicated_retire_test_control::try_retention_and_returned_for_pool(
+                &self.pool,
+                &self.returned,
+            ) == Some((0, true))
+        }
+
+        async fn wait_retired(&self, deadline: std::time::Instant) -> Result<(), String> {
+            while !self.retired() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!("retirement deadline: {}", self.diagnostic()));
+                }
+                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(5))).await;
+            }
+            Ok(())
+        }
+
+        async fn finish(&mut self, outcome: Result<(), Box<dyn std::any::Any + Send>>) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let cleanup = async {
+                let holder = self.stop_holder();
+                let reader = self.end_reader();
+                holder?;
+                reader?;
+                self.close_until(deadline).await?;
+                self.wait_retired(deadline).await
+            }
+            .await;
+            self.finished = true;
+            if let Err(panic) = outcome {
+                if let Err(error) = cleanup {
+                    eprintln!("panic cleanup failed: {error}");
+                }
+                std::panic::resume_unwind(panic);
+            }
+            cleanup.unwrap_or_else(|error| panic!("{error}"));
+        }
+    }
+
+    impl Drop for OwnerReaderFixture<'_> {
+        fn drop(&mut self) {
+            if self.finished {
+                return;
+            }
+            // Backstop for unexpected unwind/cancellation outside catch_unwind.
+            // No assertions here: preserve the original panic, never double-panic.
+            let cleanup = (|| -> Result<(), String> {
+                let holder = self.stop_holder();
+                let reader = self.end_reader();
+                holder?;
+                reader?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    try_drain_pending(
+                        &self.client.pending,
+                        &self.client.server_pool,
+                        true,
+                        Some(deadline),
+                    );
+                    if self.retired() {
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!("Drop cleanup deadline: {}", self.diagnostic()));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })();
+            if let Err(error) = cleanup {
+                eprintln!("owner fixture cleanup failed: {error}");
+            }
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn owner_receiver_request_completion_and_footer_are_retryable() {
+        use futures_util::FutureExt;
         use std::time::{Duration, Instant};
 
         let _retire_guard = dedicated_retire_test_control::production_guard();
@@ -5776,115 +6048,122 @@ mod tests {
             let alloc = *block.allocation();
             block.write_at(0, &[27; 8192]).unwrap();
             let pool = client.request_pool().unwrap();
-            let (budget, prefix, peer_config) = {
-                let pool = pool.lock();
-                (
-                    pool.budget().unwrap().clone(),
-                    pool.prefix().to_string(),
-                    pool.config().clone(),
-                )
-            };
-            let charged = budget.snapshot().shm.used_bytes;
-            let mut peer = MemPool::open_peer(peer_config, prefix);
-            peer.ensure_peer_dedicated(alloc.seg_idx, 8192).unwrap();
-            let permit = dedicated_retire().reserve_for_publication().ok().unwrap();
-            let request = block.try_dispatch(Some(permit)).unwrap();
-            let weak_request = Arc::downgrade(&request);
-            let (tx, rx) = oneshot::channel();
-            let mut entry = PendingResponse::unary(tx);
-            entry.request = Some(request);
-            client.pending.lock().insert(43, entry);
-
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let holder_pool = Arc::clone(&pool);
-            let holder = std::thread::spawn(move || {
-                let _guard = holder_pool.lock();
-                ready_tx.send(()).unwrap();
-                let _ = release_rx.recv_timeout(Duration::from_secs(1));
-            });
-            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            // After the caller's token disappears, pending is the sole
-            // request-state owner. Its Drop cannot force a pool-lock wait.
-            let started = Instant::now();
-            drop(block);
-            let token_elapsed = started.elapsed();
-            let pending = Arc::clone(&client.pending);
-            let server_pool = Arc::clone(&client.server_pool);
-            let cleanup = ConnectionAssemblyCleanup {
-                registry: client.chunk_registry_arc().unwrap(),
-                conn_id: client.conn_id,
-            };
-            let (done_tx, done_rx) = oneshot::channel();
-            *client.recv_handle.lock() = Some(tokio::spawn(async move {
-                let _cleanup = cleanup;
+            let mut fixture = OwnerReaderFixture::new(
+                &client,
+                &block,
                 if footer {
-                    try_drain_pending(&pending, &server_pool, true, None);
+                    "receiver-footer/pool"
                 } else {
-                    complete_unary_pending(
-                        &pending,
-                        43,
-                        Ok(ResponseData::Inline(vec![9])),
-                        &server_pool,
-                    )
-                    .await;
+                    "receiver-completion/pool"
+                },
+            );
+            let budget = fixture.budget.clone();
+            let charged = budget.snapshot().shm.used_bytes;
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let request = fixture.dispatch(&block);
+                let weak_request = Arc::downgrade(&request);
+                let (tx, rx) = oneshot::channel();
+                let mut entry = PendingResponse::unary(tx);
+                entry.request = Some(request);
+                client.pending.lock().insert(43, entry);
+
+                fixture.hold(weak_request.upgrade().unwrap(), "pool");
+                // After the caller's token disappears, pending is the sole
+                // request-state owner. Its Drop cannot force a pool-lock wait.
+                let started = Instant::now();
+                drop(block);
+                let token_elapsed = started.elapsed();
+                let pending = Arc::clone(&client.pending);
+                let server_pool = Arc::clone(&client.server_pool);
+                let cleanup = ConnectionAssemblyCleanup {
+                    registry: client.chunk_registry_arc().unwrap(),
+                    conn_id: client.conn_id,
+                };
+                let (done_tx, done_rx) = oneshot::channel();
+                *client.recv_handle.lock() = Some(tokio::spawn(async move {
+                    let _cleanup = cleanup;
+                    if footer {
+                        try_drain_pending(&pending, &server_pool, true, None);
+                    } else {
+                        complete_unary_pending(
+                            &pending,
+                            43,
+                            Ok(ResponseData::Inline(vec![9])),
+                            &server_pool,
+                        )
+                        .await;
+                    }
+                    let _ = done_tx.send(());
+                }));
+                let started = Instant::now();
+                done_rx.await.unwrap();
+                let terminal_elapsed = started.elapsed();
+                let result = rx.await.unwrap();
+                let started = Instant::now();
+                let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+                let elapsed = started.elapsed();
+                let live = budget.snapshot().shm.used_bytes;
+                let terminal = client.recv_handle.lock().is_none();
+                let request = weak_request
+                    .upgrade()
+                    .expect("pending must retain release authority");
+                let phase = request.phase.load(Ordering::Acquire);
+                let retained = client.pending.lock().len();
+                drop(request);
+                fixture.stop_holder().unwrap();
+                assert!(
+                    token_elapsed < Duration::from_millis(200),
+                    "{token_elapsed:?}"
+                );
+                assert!(
+                    terminal_elapsed < Duration::from_millis(200),
+                    "{terminal_elapsed:?}"
+                );
+                assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+                assert!(!confirmed && terminal);
+                assert_eq!(phase, RequestReleaseState::PHASE_DISPATCHED);
+                assert_eq!(retained, 1);
+                assert_eq!(live, charged);
+                assert_eq!(pool.lock().stats().dedicated_active_count, 1);
+                if footer {
+                    assert!(matches!(result, Err(IpcError::Closed)));
+                } else {
+                    assert!(matches!(result, Ok(ResponseData::Inline(bytes)) if bytes == [9]));
                 }
-                let _ = done_tx.send(());
-            }));
-            let started = Instant::now();
-            done_rx.await.unwrap();
-            let terminal_elapsed = started.elapsed();
-            let result = rx.await.unwrap();
-            let started = Instant::now();
-            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-            let elapsed = started.elapsed();
-            let live = budget.snapshot().shm.used_bytes;
-            let terminal = client.recv_handle.lock().is_none();
-            let request = weak_request
-                .upgrade()
-                .expect("pending must retain release authority");
-            let phase = request.phase.load(Ordering::Acquire);
-            let retained = client.pending.lock().len();
-            drop(request);
-            let _ = release_tx.send(());
-            holder.join().unwrap();
-            assert!(
-                token_elapsed < Duration::from_millis(200),
-                "{token_elapsed:?}"
-            );
-            assert!(
-                terminal_elapsed < Duration::from_millis(200),
-                "{terminal_elapsed:?}"
-            );
-            assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
-            assert!(!confirmed && terminal);
-            assert_eq!(phase, RequestReleaseState::PHASE_DISPATCHED);
-            assert_eq!(retained, 1);
-            assert_eq!(live, charged);
-            if footer {
-                assert!(matches!(result, Err(IpcError::Closed)));
-            } else {
-                assert!(matches!(result, Ok(ResponseData::Inline(bytes)) if bytes == [9]));
-            }
-            assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
-            assert!(client.pending.lock().is_empty());
-            assert!(weak_request.upgrade().is_none());
-            assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
-            drop(pool);
-            assert_eq!(budget.snapshot().shm.used_bytes, charged);
-            assert_eq!(
-                peer.copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
-                    .unwrap(),
-                &[27; 8192]
-            );
-            peer.free(&alloc).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while budget.snapshot().shm.used_bytes != 0 {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+                fixture
+                    .close_until(Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                assert!(client.pending.lock().is_empty());
+                assert!(client.request_pool().is_none());
+                assert!(weak_request.upgrade().is_none());
+                assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+                assert!(pool.lock().dedicated_name(alloc.seg_idx).is_some());
+                assert_eq!(pool.lock().stats().dedicated_active_count, 0);
+                assert_eq!(
+                    dedicated_retire_test_control::retention_jobs_for_pool(&pool),
+                    1
+                );
+                assert!(!fixture.returned.load(Ordering::Acquire));
+                drop(pool);
+
+                assert_eq!(budget.snapshot().shm.used_bytes, charged);
+                assert_eq!(
+                    fixture
+                        .peer
+                        .copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
+                        .unwrap(),
+                    &[27; 8192]
+                );
+                fixture.end_reader().unwrap(); // the sole reader's real read_done
+                fixture
+                    .wait_retired(Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
             })
-            .await
-            .expect("the real reader must retire the exact backing");
+            .catch_unwind()
+            .await;
+            fixture.finish(outcome).await;
         }
     }
 
@@ -5944,6 +6223,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_dispatched_dedicated_locks_keep_settlement_retryable() {
+        use futures_util::FutureExt;
         use std::time::{Duration, Instant};
 
         let _retire_guard = dedicated_retire_test_control::production_guard();
@@ -5956,93 +6236,204 @@ mod tests {
             let alloc = *block.allocation();
             block.write_at(0, &vec![17; 8192]).unwrap();
             let pool = Arc::clone(&block.release.pool);
-            let (budget, prefix, peer_config) = {
-                let pool = pool.lock();
-                (
-                    pool.budget().unwrap().clone(),
-                    pool.prefix().to_string(),
-                    pool.config().clone(),
-                )
-            };
+            let mut fixture = OwnerReaderFixture::new(&client, &block, lock);
+            let budget = fixture.budget.clone();
             let charged = budget.snapshot().shm.used_bytes;
-            // A real reader owns an already opened peer mapping. Its read_done
-            // must remain the retirement signal after client/block detachment.
-            let mut peer = MemPool::open_peer(peer_config, prefix);
-            peer.ensure_peer_dedicated(alloc.seg_idx, 8192).unwrap();
-            let permit = dedicated_retire().reserve_for_publication().ok().unwrap();
-            let request = block.try_dispatch(Some(permit)).unwrap();
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let request = fixture.dispatch(&block);
+                let (tx, rx) = oneshot::channel();
+                let mut entry = PendingResponse::unary(tx);
+                entry.request = Some(Arc::clone(&request));
+                client.pending.lock().insert(43, entry);
+
+                fixture.hold(Arc::clone(&request), lock);
+                let started = Instant::now();
+                let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+                let elapsed = started.elapsed();
+                fixture.stop_holder().unwrap();
+                assert!(!confirmed, "{lock}");
+                assert!(elapsed < Duration::from_millis(200), "{lock}: {elapsed:?}");
+                assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
+                assert_eq!(
+                    request.phase.load(Ordering::Acquire),
+                    RequestReleaseState::PHASE_DISPATCHED
+                );
+                assert_eq!(client.pending.lock().len(), 1);
+                assert_eq!(pool.lock().stats().dedicated_active_count, 1);
+                assert_eq!(budget.snapshot().shm.used_bytes, charged);
+                fixture
+                    .close_until(Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                assert!(client.pending.lock().is_empty());
+                assert!(client.request_pool().is_none());
+                assert_eq!(
+                    request.phase.load(Ordering::Acquire),
+                    RequestReleaseState::PHASE_RELEASED
+                );
+                assert_eq!(pool.lock().stats().dedicated_active_count, 0);
+                assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
+                assert!(pool.lock().dedicated_name(alloc.seg_idx).is_some());
+                assert_eq!(
+                    dedicated_retire_test_control::retention_jobs_for_pool(&pool),
+                    1
+                );
+                assert!(!fixture.returned.load(Ordering::Acquire));
+                drop(pool);
+                drop(block);
+                drop(request);
+
+                assert_eq!(
+                    budget.snapshot().shm.used_bytes,
+                    charged,
+                    "retire authority must keep the charge"
+                );
+                assert_eq!(
+                    fixture
+                        .peer
+                        .copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
+                        .unwrap(),
+                    vec![17; 8192]
+                );
+                fixture.end_reader().unwrap(); // the sole reader's real read_done
+                fixture
+                    .wait_retired(Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+            })
+            .catch_unwind()
+            .await;
+            fixture.finish(outcome).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_reader_panic_preserves_payload_and_does_not_block_retirement() {
+        use futures_util::FutureExt;
+        use std::time::{Duration, Instant};
+
+        let _retire_guard = dedicated_retire_test_control::production_guard();
+        for unexpected_unwind in [false, true] {
+            let mut config = owner_test_config();
+            config.base.pool_enabled = false;
+            let client = IpcClient::with_config("ipc://owner-reader-panic", config.clone());
+            let block = client.try_alloc_request_block(8192).unwrap().unwrap();
+            block.write_at(0, &[31; 8192]).unwrap();
+            let mut fixture = OwnerReaderFixture::new(&client, &block, "panic/pool");
+            let pool = Arc::clone(&fixture.pool);
+            let budget = fixture.budget.clone();
+            let alloc = fixture.alloc;
+            let request = fixture.dispatch(&block);
+            let returned = Arc::clone(&fixture.returned);
             let (tx, rx) = oneshot::channel();
             let mut entry = PendingResponse::unary(tx);
             entry.request = Some(Arc::clone(&request));
             client.pending.lock().insert(43, entry);
-
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel();
-            let holder_request = Arc::clone(&request);
-            let holder = std::thread::spawn(move || {
-                let wait = |ready: std::sync::mpsc::Sender<()>,
-                            release: std::sync::mpsc::Receiver<()>| {
-                    ready.send(()).unwrap();
-                    let _ = release.recv_timeout(Duration::from_secs(1));
-                };
-                match lock {
-                    "permit" => {
-                        let _guard = holder_request.permit.lock();
-                        wait(ready_tx, release_rx);
-                    }
-                    "pool" => {
-                        let _guard = holder_request.pool.lock();
-                        wait(ready_tx, release_rx);
-                    }
-                    "executor" => {
-                        let _guard = dedicated_retire().state.lock();
-                        wait(ready_tx, release_rx);
-                    }
-                    _ => unreachable!(),
+            fixture.hold(Arc::clone(&request), "pool");
+            let original = Arc::new(());
+            let payload = Arc::clone(&original);
+            let panic = std::panic::AssertUnwindSafe(async move {
+                // Reproduce a failure before manual peer.free while pending
+                // owns a dispatched backing and the holder is still alive.
+                drop(block);
+                drop(request);
+                if unexpected_unwind {
+                    std::panic::panic_any(payload);
                 }
-            });
-            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            let started = Instant::now();
-            let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
-            let elapsed = started.elapsed();
-            let _ = release_tx.send(());
-            holder.join().unwrap();
-            assert!(!confirmed, "{lock}");
-            assert!(elapsed < Duration::from_millis(200), "{lock}: {elapsed:?}");
-            assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
-            assert_eq!(
-                request.phase.load(Ordering::Acquire),
-                RequestReleaseState::PHASE_DISPATCHED
+                let outcome = std::panic::AssertUnwindSafe(async {
+                    std::panic::panic_any(payload);
+                })
+                .catch_unwind()
+                .await;
+                fixture.finish(outcome).await;
+            })
+            .catch_unwind()
+            .await
+            .unwrap_err();
+            let preserved = panic.downcast::<Arc<()>>().expect("original panic type");
+            assert!(
+                Arc::ptr_eq(&preserved, &original),
+                "original panic identity"
             );
-            assert_eq!(client.pending.lock().len(), 1);
-            assert_eq!(pool.lock().stats().dedicated_active_count, 1);
-            assert_eq!(budget.snapshot().shm.used_bytes, charged);
-            assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+            assert!(matches!(rx.await.unwrap(), Err(IpcError::Closed)));
             assert!(client.pending.lock().is_empty());
-            assert!(client.request_pool().is_none());
             assert_eq!(pool.lock().stats().dedicated_active_count, 0);
-            assert!(pool.lock().dedicated_awaiting_retirement(&alloc));
-            drop(block);
-            drop(request);
-            drop(pool);
+            assert!(pool.lock().dedicated_name(alloc.seg_idx).is_none());
             assert_eq!(
                 budget.snapshot().shm.used_bytes,
-                charged,
-                "retire authority must keep the charge"
+                0,
+                "exact panic backing refund"
             );
             assert_eq!(
-                peer.copy_data_at(alloc.seg_idx, alloc.generation, alloc.offset, 8192, true)
-                    .unwrap(),
-                vec![17; 8192]
+                dedicated_retire_test_control::retention_and_returned_for_pool(&pool, &returned),
+                (0, true)
             );
-            peer.free(&alloc).unwrap(); // the reader's real read_done signal
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while budget.snapshot().shm.used_bytes != 0 {
+
+            // A new real dispatched backing must leave the shared queue while
+            // still unread. A mere reservation or empty-queue check would not
+            // detect a previous panic monopolizing the worker for 60 seconds.
+            let next = IpcClient::with_config("ipc://owner-reader-after-panic", config);
+            let block = next.try_alloc_request_block(8192).unwrap().unwrap();
+            block.write_at(0, &[37; 8192]).unwrap();
+            let mut next_fixture = OwnerReaderFixture::new(&next, &block, "after-panic/worker");
+            let outcome = std::panic::AssertUnwindSafe(async {
+                let request = next_fixture.dispatch(&block);
+                let (tx, _rx) = oneshot::channel();
+                let mut entry = PendingResponse::unary(tx);
+                entry.request = Some(request);
+                next.pending.lock().insert(43, entry);
+                next_fixture
+                    .close_until(Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                drop(block);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while dedicated_retire_test_control::in_flight_jobs_for_pool(&next_fixture.pool)
+                    != 1
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "worker did not take follow-up: {}",
+                        next_fixture.diagnostic()
+                    );
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
+                assert_eq!(
+                    dedicated_retire_test_control::retention_and_returned_for_pool(
+                        &next_fixture.pool,
+                        &next_fixture.returned
+                    ),
+                    (1, false)
+                );
+                assert!(
+                    next_fixture
+                        .pool
+                        .lock()
+                        .dedicated_awaiting_retirement(&next_fixture.alloc)
+                );
+                assert!(next_fixture.budget.snapshot().shm.used_bytes > 0);
+                assert_eq!(
+                    next_fixture
+                        .peer
+                        .copy_data_at(
+                            next_fixture.alloc.seg_idx,
+                            next_fixture.alloc.generation,
+                            next_fixture.alloc.offset,
+                            8192,
+                            true
+                        )
+                        .unwrap(),
+                    &[37; 8192]
+                );
+                next_fixture.end_reader().unwrap();
+                next_fixture
+                    .wait_retired(Instant::now() + Duration::from_secs(5))
+                    .await
+                    .unwrap();
             })
-            .await
-            .expect("retire after read_done with closed client retained");
+            .catch_unwind()
+            .await;
+            next_fixture.finish(outcome).await;
         }
     }
 
