@@ -4008,6 +4008,339 @@ mod lazy_policy_roundtrip_tests {
         stop_server(&server).await;
     }
 
+    /// Real pooled IPC dispatch: a peer consumes a dedicated request, then
+    /// terminates the connection while its owner pool is busy. Neither the
+    /// live caller nor the cache may mistake deferred settlement for liveness.
+    #[test]
+    fn terminal_dedicated_settlement_disconnects_before_waiter_and_cache_acquire() {
+        use c2_wire::buddy::decode_buddy_payload;
+        use c2_wire::control::{ReplyControl, decode_call_control, try_encode_reply_control};
+        use c2_wire::flags;
+        use c2_wire::frame;
+        use c2_wire::handshake::{
+            CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, ServerIdentity, decode_handshake,
+            encode_server_handshake,
+        };
+        use c2_wire::route_catalog_control::{
+            RouteContractWire, RouteLookupResponse, RouteMethodWire, RouteRecordWire,
+            RouteStateWire, decode_route_lookup_request, encode_route_lookup_response,
+        };
+        use tokio::io::AsyncReadExt as _;
+
+        async fn read_frame(peer: &mut c2_local::LocalStream) -> Vec<u8> {
+            let mut length = [0; 4];
+            peer.read_exact(&mut length).await.unwrap();
+            let mut bytes = vec![0; 4 + u32::from_le_bytes(length) as usize];
+            bytes[..4].copy_from_slice(&length);
+            peer.read_exact(&mut bytes[4..]).await.unwrap();
+            bytes
+        }
+
+        async fn accept_bound_peer(
+            listener: &mut c2_local::LocalListener,
+            epoch: u64,
+        ) -> (c2_local::LocalStream, String) {
+            let mut peer = listener.accept().await.unwrap();
+            let bytes = read_frame(&mut peer).await;
+            let (header, payload) = frame::decode_frame(&bytes).unwrap();
+            assert!(header.is_handshake());
+            let client_handshake = decode_handshake(payload).unwrap();
+            let identity = ServerIdentity {
+                server_id: "terminal-peer".into(),
+                server_instance_id: format!("terminal-peer-{epoch}"),
+            };
+            let handshake = encode_server_handshake(
+                &[],
+                CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED,
+                &[],
+                "",
+                &identity,
+            )
+            .unwrap();
+            peer.write_all(&frame::encode_frame(
+                0,
+                flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE,
+                &handshake,
+            ))
+            .await
+            .unwrap();
+
+            // Use the actual contract-scoped route acquisition, not a forged
+            // binding or an injected cache entry.
+            let bytes = read_frame(&mut peer).await;
+            let (header, payload) = frame::decode_frame(&bytes).unwrap();
+            assert!(header.is_ctrl());
+            let lookup = decode_route_lookup_request(payload).unwrap();
+            assert_eq!(lookup.expected.route_name, "grid");
+            let record = RouteRecordWire {
+                route_name: "grid".into(),
+                route_uid: format!("terminal-grid-{epoch}"),
+                route_revision: epoch,
+                catalog_revision: epoch,
+                owner_server_id: identity.server_id,
+                owner_server_instance_id: identity.server_instance_id,
+                owner_epoch: epoch,
+                contract: RouteContractWire {
+                    route_name: "grid".into(),
+                    crm_ns: "test.grid".into(),
+                    crm_name: "Grid".into(),
+                    crm_ver: "0.1.0".into(),
+                    abi_hash: ABI_HASH.into(),
+                    signature_hash: SIG_HASH.into(),
+                },
+                methods: vec![RouteMethodWire {
+                    name: "echo".into(),
+                    index: 0,
+                }],
+                max_payload_size: 1 << 20,
+                state: RouteStateWire::Ready,
+                state_reason: None,
+                lease_deadline_ms: None,
+            };
+            assert_eq!(lookup.expected, record.contract);
+            let reply =
+                encode_route_lookup_response(&RouteLookupResponse::Ready { current: record })
+                    .unwrap();
+            peer.write_all(&frame::encode_frame(
+                header.request_id,
+                flags::FLAG_RESPONSE | flags::FLAG_CTRL,
+                &reply,
+            ))
+            .await
+            .unwrap();
+            (peer, client_handshake.prefix)
+        }
+
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let peer_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let address = unique_address("terminal_dedicated_cache");
+        let endpoint = c2_local::LocalEndpoint::from_address(&address).unwrap();
+        let mut listener =
+            peer_rt.block_on(async { c2_local::LocalListener::bind(&endpoint).unwrap() });
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
+        let peer = peer_rt.spawn(async move {
+            let (mut old_peer, prefix) = accept_bound_peer(&mut listener, 1).await;
+            let bytes = read_frame(&mut old_peer).await;
+            let (header, payload) = frame::decode_frame(&bytes).unwrap();
+            assert!(header.is_call_v2() && header.is_buddy());
+            let (pointer, consumed) = decode_buddy_payload(payload).unwrap();
+            assert!(pointer.is_dedicated, "must publish real dedicated SHM");
+            let (control, _) = decode_call_control(payload, consumed).unwrap();
+            assert_eq!(control.identity.route_uid, "terminal-grid-1");
+            let mut memory = MemPool::open_peer(c2_mem::PoolConfig::default(), prefix.clone());
+            memory
+                .open_dedicated_at(
+                    u32::from(pointer.seg_idx),
+                    &MemPool::dedicated_segment_name(&prefix, u32::from(pointer.seg_idx)),
+                    pointer.data_size as usize,
+                )
+                .unwrap();
+            assert_eq!(
+                memory
+                    .copy_data_at(
+                        u32::from(pointer.seg_idx),
+                        pointer.generation,
+                        pointer.offset,
+                        pointer.data_size,
+                        true,
+                    )
+                    .unwrap(),
+                vec![7; 160 * 1024]
+            );
+            memory
+                .free_at(
+                    u32::from(pointer.seg_idx),
+                    pointer.generation,
+                    pointer.offset,
+                    pointer.data_size,
+                    true,
+                )
+                .unwrap();
+            published_tx.send(()).unwrap();
+            terminate_rx.await.unwrap();
+            // Keep this real peer alive: termination comes from the protocol,
+            // not dropping a peer or explicitly closing the client.
+            old_peer
+                .write_all(&frame::encode_frame(
+                    0,
+                    flags::FLAG_SIGNAL | flags::FLAG_RESPONSE,
+                    &[c2_wire::msg_type::MsgType::DisconnectAck as u8],
+                ))
+                .await
+                .unwrap();
+
+            let (mut fresh_peer, _) = accept_bound_peer(&mut listener, 2).await;
+            let bytes = read_frame(&mut fresh_peer).await;
+            let (header, payload) = frame::decode_frame(&bytes).unwrap();
+            assert!(header.is_call_v2() && !header.is_buddy());
+            let (control, consumed) = decode_call_control(payload, 0).unwrap();
+            assert_eq!(control.identity.route_uid, "terminal-grid-2");
+            let mut reply = try_encode_reply_control(&ReplyControl::Success).unwrap();
+            reply.extend_from_slice(&payload[consumed..]);
+            fresh_peer
+                .write_all(&frame::encode_frame(
+                    header.request_id,
+                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
+                    &reply,
+                ))
+                .await
+                .unwrap();
+            let bytes = read_frame(&mut fresh_peer).await;
+            let (header, payload) = frame::decode_frame(&bytes).unwrap();
+            assert!(header.is_signal());
+            assert_eq!(payload, &[c2_wire::msg_type::MsgType::Disconnect as u8]);
+            fresh_peer
+                .write_all(&frame::encode_frame(
+                    header.request_id,
+                    flags::FLAG_SIGNAL | flags::FLAG_RESPONSE,
+                    &[c2_wire::msg_type::MsgType::DisconnectAck as u8],
+                ))
+                .await
+                .unwrap();
+            drop(old_peer);
+        });
+
+        let mut cfg = client_config(small_base(64 * 1024, 1), 1024);
+        cfg.base.shm_backing_budget_bytes = 256 * 1024;
+        cfg.base.chunk_gc_interval_secs = 60.0;
+        cfg.pool_decay_seconds = 60.0;
+        cfg.base.pool_prewarm_segments = 1;
+        let cache = ClientPool::new(Duration::from_secs(30));
+        let old = cache.acquire(&address, Some(&cfg)).unwrap();
+        let binding = old.acquire_route(&expected_contract("grid")).unwrap();
+        let owner = old.request_pool().unwrap();
+        let prewarm_bytes = cache
+            .memory_budget_snapshot()
+            .unwrap()
+            .budget
+            .shm
+            .used_bytes;
+        let block = Arc::new(old.pool_alloc_and_write(&vec![7; 160 * 1024]).unwrap());
+        assert!(block.is_dedicated());
+        let retained = cache
+            .memory_budget_snapshot()
+            .unwrap()
+            .budget
+            .shm
+            .used_bytes;
+        assert!(
+            cfg.base.shm_backing_budget_bytes - retained < prewarm_bytes,
+            "a fresh prewarm cannot fit while the old real backing is retained"
+        );
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let caller = {
+            let old = Arc::clone(&old);
+            let block = Arc::clone(&block);
+            std::thread::spawn(move || {
+                let err = old
+                    .call_bound_prealloc(&binding, "echo", &block, 160 * 1024)
+                    .expect_err("the live request must receive Closed");
+                closed_tx.send((err, old.is_connected())).unwrap();
+            })
+        };
+        peer_rt.block_on(published_rx).unwrap();
+        let busy = owner.lock();
+        assert_eq!(busy.stats().dedicated_active_count, 1);
+        terminate_tx.send(()).unwrap();
+        let (err, connected_when_closed) = closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(err, IpcError::Closed), "{err:?}");
+        assert!(
+            !connected_when_closed,
+            "Closed must never be delivered while the dead connection is advertised live"
+        );
+        caller.join().unwrap();
+        assert!(Arc::ptr_eq(&owner, &old.request_pool().unwrap()));
+
+        // Keep the lock held across the original acquire and its bounded
+        // retired close. A cache hit would return the same dead Arc; the real
+        // replacement attempt must instead report frozen-budget admission.
+        let started = std::time::Instant::now();
+        let error = match cache.acquire(&address, Some(&cfg)) {
+            Ok(client) => {
+                assert!(!Arc::ptr_eq(&old, &client), "cache returned the dead Arc");
+                panic!("a replacement prewarm must fail while the old charge is retained");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "retired close exceeded its 5s budget"
+        );
+        assert!(
+            matches!(error, IpcError::Io(_)) && error.to_string().contains("budget"),
+            "{error:?}"
+        );
+        let started = std::time::Instant::now();
+        assert!(
+            !old.close_shared(Duration::from_millis(50)),
+            "busy settlement stays unconfirmed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "bounded close exceeded its deadline"
+        );
+        assert_eq!(
+            busy.stats().dedicated_active_count,
+            1,
+            "failed close keeps the exact owner"
+        );
+        assert_eq!(
+            cache
+                .memory_budget_snapshot()
+                .unwrap()
+                .budget
+                .shm
+                .used_bytes,
+            retained
+        );
+        drop(busy);
+        assert!(
+            old.close_shared(Duration::from_secs(2)),
+            "close retry must finish settlement"
+        );
+        assert!(old.request_pool().is_none());
+        drop(block);
+        drop(owner);
+        assert_eq!(
+            cache
+                .memory_budget_snapshot()
+                .unwrap()
+                .budget
+                .shm
+                .used_bytes,
+            0
+        );
+
+        let fresh = cache.acquire(&address, Some(&cfg)).unwrap();
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert_ne!(old.server_instance_id(), fresh.server_instance_id());
+        let binding = fresh.acquire_route(&expected_contract("grid")).unwrap();
+        let response = fresh.call_bound(&binding, "echo", b"new epoch").unwrap();
+        assert_eq!(
+            fresh.lease_response(response).into_owned_bytes().unwrap(),
+            b"new epoch"
+        );
+        assert!(
+            fresh.is_connected(),
+            "old cleanup cannot clear the fresh connection state"
+        );
+        let hit = cache.acquire(&address, Some(&cfg)).unwrap();
+        assert!(Arc::ptr_eq(&fresh, &hit));
+        assert!(fresh.close_shared(Duration::from_secs(2)));
+        assert!(
+            cache
+                .close_all(Duration::from_secs(2))
+                .unconfirmed
+                .is_empty()
+        );
+        peer_rt.block_on(peer).unwrap();
+    }
+
     /// Cancelling a call while it waits for the writer lock must remove its
     /// pending entry immediately: nothing was publishable, so a healthy
     /// connection must not carry per-call residue.

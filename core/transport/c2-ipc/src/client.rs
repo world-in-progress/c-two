@@ -1848,6 +1848,26 @@ where
 
 // ── IpcClient ────────────────────────────────────────────────────────────
 
+/// One connection incarnation's receive-task state. Constructed before spawn,
+/// so aborting even an unpolled task publishes termination. Reconnect installs
+/// a fresh flag after joining the old tasks; an old guard can only clear its
+/// own incarnation, never a new connection's state.
+struct ReceiveConnectionState {
+    connected: Arc<AtomicBool>,
+}
+
+impl ReceiveConnectionState {
+    fn disconnect(&self) {
+        self.connected.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for ReceiveConnectionState {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
+}
+
 /// Async IPC client for the C-Two relay.
 ///
 /// Connects to a C-Two IPC server through its local OS endpoint, performs
@@ -2298,6 +2318,9 @@ impl IpcClient {
                 "client must finish closing before reconnect".to_string(),
             ));
         }
+        // The old receive guard must never publish into a later incarnation.
+        // The gate above still requires its task to be joined before reconnect.
+        self.connected = Arc::new(AtomicBool::new(false));
         let endpoint = self
             .endpoint
             .as_ref()
@@ -2456,7 +2479,8 @@ impl IpcClient {
 
         *self.writer.lock().await = Some(writer);
 
-        self.connected.store(true, Ordering::Release);
+        // Handshake published readiness before spawning the receive task.
+        // Do not restore it here: that task may already have observed EOF.
 
         // One cancellable maintenance task per connection: periodic idle
         // retirement for the client's owner pools plus stale chunk sweeps.
@@ -2531,7 +2555,10 @@ impl IpcClient {
         let pending = self.pending.clone();
         let server_pool = self.server_pool.clone();
         let writer_clone = self.writer.clone();
-        let connected = self.connected.clone();
+        self.connected.store(true, Ordering::Release);
+        let connection = ReceiveConnectionState {
+            connected: Arc::clone(&self.connected),
+        };
         let chunk_registry = self.require_chunk_registry();
         let conn_id = self.conn_id;
         #[cfg(test)]
@@ -2552,32 +2579,21 @@ impl IpcClient {
                 });
         #[cfg(test)]
         let pending_drain_seam = self.pending_drain_seam.lock().take();
-        let recv_handle = tokio::spawn(async move {
+        let recv_handle = tokio::spawn(recv_loop_inner(
+            reader,
+            pending,
+            server_pool,
+            writer_clone,
+            chunk_registry,
+            conn_id,
+            Some(connection),
             #[cfg(test)]
-            recv_loop_inner(
-                reader,
-                pending,
-                server_pool,
-                writer_clone,
-                chunk_registry,
-                conn_id,
-                partial_header_pending,
-                receiver_drop_gate,
-                pending_drain_seam,
-            )
-            .await;
-            #[cfg(not(test))]
-            recv_loop(
-                reader,
-                pending,
-                server_pool,
-                writer_clone,
-                chunk_registry,
-                conn_id,
-            )
-            .await;
-            connected.store(false, Ordering::Release);
-        });
+            partial_header_pending,
+            #[cfg(test)]
+            receiver_drop_gate,
+            #[cfg(test)]
+            pending_drain_seam,
+        ));
         *self.recv_handle.lock() = Some(recv_handle);
 
         Ok(hs)
@@ -4676,6 +4692,7 @@ impl Drop for ReceiverDropGuardForTest {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn recv_loop(
     reader: LocalReadHalf,
     pending: Arc<StdMutex<PendingMap>>,
@@ -4691,6 +4708,7 @@ pub(crate) async fn recv_loop(
         writer,
         chunk_registry,
         conn_id,
+        None,
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -4708,6 +4726,7 @@ async fn recv_loop_inner(
     writer: Arc<Mutex<Option<LocalWriteHalf>>>,
     chunk_registry: Arc<ChunkRegistry>,
     conn_id: u64,
+    connection: Option<ReceiveConnectionState>,
     #[cfg(test)] mut partial_header_pending: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)] receiver_drop_gate: Option<ReceiverDropGuardForTest>,
     #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
@@ -4932,7 +4951,8 @@ async fn recv_loop_inner(
         complete_unary_pending(&pending, rid, result, &server_pool).await;
     }
 
-    // The guard also runs this cleanup when a close or Drop aborts the task.
+    // The guard also runs this nonblocking assembly cleanup when a close or
+    // Drop aborts the task. Pending settlement remains owned by this receiver.
     drop(cleanup);
 
     // Connection lost — wake all pending callers and settle any dispatched
@@ -4941,6 +4961,7 @@ async fn recv_loop_inner(
     drain_pending_on_disconnect(
         &pending,
         &server_pool,
+        connection.as_ref(),
         #[cfg(test)]
         pending_drain_seam,
     )
@@ -4952,8 +4973,14 @@ async fn recv_loop_inner(
 async fn drain_pending_on_disconnect(
     pending: &StdMutex<PendingMap>,
     server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
+    connection: Option<&ReceiveConnectionState>,
     #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
 ) {
+    // Publish transport termination before waking a waiter or waiting for
+    // pending settlement. Keeping the receiver alive is cleanup, not liveness.
+    if let Some(connection) = connection {
+        connection.disconnect();
+    }
     #[cfg(test)]
     let attempted = if let Some(seam) = pending_drain_seam {
         let _ = seam.entered.send(());
@@ -7125,6 +7152,31 @@ mod tests {
 mod pending_disconnect_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn aborted_receiver_state_cannot_clear_a_new_connection_incarnation() {
+        // An invalid endpoint exercises connect's real incarnation reset
+        // without an OS listener. The delayed task owns only the old flag.
+        let mut client = IpcClient::new("not-an-ipc-address");
+        let old = Arc::clone(&client.connected);
+        let connection = ReceiveConnectionState {
+            connected: Arc::clone(&old),
+        };
+        let receiver = tokio::spawn(async move {
+            let _connection = connection;
+            std::future::pending::<()>().await;
+        });
+        assert!(matches!(client.connect().await, Err(IpcError::Config(_))));
+        assert!(!Arc::ptr_eq(&old, &client.connected));
+        client.force_connected(true);
+        old.store(true, Ordering::Release);
+        // Covers cancellation before the receiver's first poll as well as a
+        // parked receiver. Its destructor cannot clear the client's new flag.
+        receiver.abort();
+        assert!(receiver.await.unwrap_err().is_cancelled());
+        assert!(!old.load(Ordering::Acquire));
+        assert!(client.is_connected());
+    }
+
     /// Exercise the exact terminal drain without requiring an OS listener.
     /// A cancelled call and a live waiter both survive the first busy-map
     /// attempt; neither may depend on a maintenance tick or explicit close.
@@ -7142,10 +7194,15 @@ mod pending_disconnect_tests {
         let (resume_tx, resume_rx) = oneshot::channel();
         let (attempted_tx, attempted_rx) = oneshot::channel();
         let loop_pending = Arc::clone(&pending);
+        let connected = Arc::new(AtomicBool::new(true));
+        let connection = ReceiveConnectionState {
+            connected: Arc::clone(&connected),
+        };
         let drain = tokio::spawn(async move {
             drain_pending_on_disconnect(
                 &loop_pending,
                 &Arc::new(StdMutex::new(None)),
+                Some(&connection),
                 Some(PendingDrainSeam {
                     entered: entered_tx,
                     resume: resume_rx,
@@ -7155,6 +7212,10 @@ mod pending_disconnect_tests {
             .await;
         });
         entered_rx.await.expect("terminal drain entered");
+        assert!(
+            !connected.load(Ordering::Acquire),
+            "termination must be visible before waking callers or waiting for settlement"
+        );
         let guard = pending.lock();
         resume_tx.send(()).expect("resume terminal drain");
         assert!(!attempted_rx.await.expect("first real drain result"));
