@@ -1592,6 +1592,18 @@ async fn call_handler(
                     }
                     ipc_route_error_response(&route_name, &error)
                 }
+                error @ c2_ipc::IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_))
+                    if matches!(phase, c2_ipc::TransportPhase::DispatchUncertain) =>
+                {
+                    // Reply admission rejects only this RID; the receiver
+                    // keeps serving other calls on the healthy connection.
+                    // Dispatch already happened, so replay is still unsafe.
+                    resource_unavailable_response_with_phase(
+                        &route_name,
+                        format!("relay error after possible dispatch: {error}"),
+                        "dispatch_uncertain",
+                    )
+                }
                 error => {
                     // The request may already have reached the service. Evict
                     // the failed transport, but never tell the client that
@@ -2305,7 +2317,8 @@ mod tests {
                     is_dedicated,
                 } => {
                     let mut pool = pool.write();
-                    let _ = pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
+                    let _ =
+                        pool.free_at(seg_idx as u32, generation, offset, data_size, is_dedicated);
                     "shm"
                 }
                 RequestData::Handle(backing) => {
@@ -4194,6 +4207,280 @@ mod tests {
         assert_eq!(&body[..], b"shm");
 
         shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn relay_reply_capacity_preserves_shared_connection_and_inflight_call() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CapacityCallback {
+            calls: [AtomicUsize; 3],
+            blocked_started: tokio::sync::Notify,
+            release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+
+        impl CrmCallback for CapacityCallback {
+            fn invoke(
+                &self,
+                _route_name: &str,
+                method_idx: u16,
+                request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                // Consume through the real owner even when the HTTP request
+                // reached us as SHM. No transport coordinates are discarded.
+                let bytes = c2_server::RequestLease::new(request)
+                    .into_owned_bytes()
+                    .map_err(CrmError::InternalError)?;
+                if bytes != [7; 32] {
+                    return Err(CrmError::InternalError("unexpected request".into()));
+                }
+                self.calls[method_idx as usize].fetch_add(1, Ordering::SeqCst);
+                if method_idx == 1 {
+                    // Take the receiver before blocking; no synchronous guard
+                    // survives the wait, and cleanup can always release us.
+                    let release = self.release.lock().take().ok_or_else(|| {
+                        CrmError::InternalError("blocked call was replayed".into())
+                    })?;
+                    self.blocked_started.notify_one();
+                    release
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|err| {
+                            CrmError::InternalError(format!("barrier release failed: {err}"))
+                        })?;
+                }
+                Ok(ResponseMeta::Inline(vec![
+                    method_idx as u8;
+                    if method_idx == 0 {
+                        2048
+                    } else {
+                        512
+                    }
+                ]))
+            }
+        }
+
+        // Bind HTTP before starting any tasks, so a failed bind needs no
+        // asynchronous cleanup. Exercise the router through a real listener.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_url = format!("http://{}", listener.local_addr().unwrap());
+        let mut upstream_ipc = ClientIpcConfig::default();
+        upstream_ipc.base.pool_segment_size = 64 * 1024;
+        upstream_ipc.base.max_pool_segments = 2;
+        upstream_ipc.base.max_pool_memory = 128 * 1024;
+        upstream_ipc.base.reassembly_segment_size = 64 * 1024;
+        upstream_ipc.base.reassembly_max_segments = 2;
+        upstream_ipc.base.live_reassembly_budget_bytes = 1024;
+        upstream_ipc.base.chunk_size = 256;
+        upstream_ipc.shm_threshold = 1;
+        upstream_ipc.validate().unwrap();
+        let state = Arc::new(RelayState::new(
+            Arc::new(c2_config::RelayConfig {
+                upstream_ipc,
+                idle_timeout_secs: 0,
+                advertise_url: relay_url.clone(),
+                ..c2_config::RelayConfig::default()
+            }),
+            Arc::new(crate::relay::test_support::NoopDisseminator),
+        ));
+        let mut server_config = ServerIpcConfig::default();
+        // Both backing budgets are zero, forcing owned replies through the
+        // real chunk fallback (eight 256-byte chunks for the rejected RID).
+        server_config.base.shm_backing_budget_bytes = 0;
+        server_config.base.file_backing_budget_bytes = 0;
+        server_config.base.chunk_size = 256;
+        server_config.shm_threshold = 1;
+        server_config.max_execution_workers = 2;
+        let address = format!(
+            "ipc://relay_reply_capacity_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = Arc::new(
+            Server::new_with_identity(
+                &address,
+                server_config,
+                ServerIdentity {
+                    server_id: "capacity-server".into(),
+                    server_instance_id: "capacity-instance".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let callback = Arc::new(CapacityCallback {
+            calls: std::array::from_fn(|_| AtomicUsize::new(0)),
+            blocked_started: tokio::sync::Notify::new(),
+            release: parking_lot::Mutex::new(Some(release_rx)),
+        });
+        let route = server
+            .build_route(
+                RouteBuildSpec {
+                    name: "grid".into(),
+                    crm_ns: "test.echo".into(),
+                    crm_name: "Echo".into(),
+                    crm_ver: "0.1.0".into(),
+                    abi_hash: TEST_ABI_HASH.into(),
+                    signature_hash: TEST_SIGNATURE_HASH.into(),
+                    method_names: vec!["oversized".into(), "blocked".into(), "ping".into()],
+                    access_map: std::collections::HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::Parallel,
+                    limits: SchedulerLimits::default(),
+                },
+                callback.clone(),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(route).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+        let run_server = server.clone();
+        let mut ipc_task = tokio::spawn(async move { run_server.run().await });
+        let (http_stop_tx, http_stop_rx) = tokio::sync::oneshot::channel();
+        let app = build_router(state.clone());
+        let mut http_task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = http_stop_rx.await;
+                })
+                .await
+        });
+
+        // Run assertions inside a caught future so failures also release the
+        // barrier, retire the upstream, and join both listener tasks.
+        let mut original_client = None;
+        let result = std::panic::AssertUnwindSafe(async {
+            server.wait_until_responsive(Duration::from_secs(2)).await.unwrap();
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let registered = http.post(format!("{relay_url}/_register"))
+                .json(&serde_json::json!({
+                    "name": "grid",
+                    "server_id": "capacity-server",
+                    "server_instance_id": "capacity-instance",
+                    "address": address,
+                    "max_payload_size": server.config().max_payload_size,
+                }))
+                .send().await.unwrap();
+            assert_eq!(registered.status(), StatusCode::CREATED);
+            let _ = registered.bytes().await.unwrap();
+            let route = state.local_route("grid").unwrap();
+            let (lease, _) = state.acquire_upstream("grid").await
+                .unwrap_or_else(|_| panic!("initial upstream acquisition failed"));
+            let client = lease.client();
+            original_client = Some(client.clone());
+            drop(lease);
+            let request = |method: &str| {
+                http.post(format!("{relay_url}/grid/{method}"))
+                    .header(EXPECTED_CRM_NS_HEADER, "test.echo")
+                    .header(EXPECTED_CRM_NAME_HEADER, "Echo")
+                    .header(EXPECTED_CRM_VER_HEADER, "0.1.0")
+                    .header(EXPECTED_ABI_HASH_HEADER, TEST_ABI_HASH)
+                    .header(EXPECTED_SIGNATURE_HASH_HEADER, TEST_SIGNATURE_HASH)
+                    .header(ROUTE_UID_HEADER, &route.route_uid)
+                    .header(ROUTE_REVISION_HEADER, route.route_revision)
+                    .body(vec![7; 32])
+            };
+            let blocked = request("blocked").send();
+            tokio::pin!(blocked);
+            tokio::select! {
+                _ = callback.blocked_started.notified() => {}
+                response = &mut blocked => panic!("blocked call completed before barrier: {response:?}"),
+                _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("blocked call did not reach IPC"),
+            }
+            let (lease, _) = state.acquire_upstream("grid").await
+                .unwrap_or_else(|_| panic!("upstream acquisition failed while blocked"));
+            assert!(Arc::ptr_eq(&client, &lease.client()));
+            drop(lease);
+            let rejected = request("oversized").send().await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
+            let envelope = rejected.json::<c2_error::C2ErrorEnvelope>().await.unwrap();
+            assert_eq!(envelope.code, 702);
+            assert_eq!(envelope.name, "ResourceUnavailable");
+            assert_eq!(envelope.details["dispatch_phase"], "dispatch_uncertain");
+            assert_eq!(envelope.details["route"], "grid");
+            assert_eq!(c2_error::C2Error::from_envelope(envelope).unwrap().code,
+                c2_error::ErrorCode::ResourceUnavailable);
+            let budget = state.upstream_memory_snapshot();
+            assert_eq!(budget.reassembly.limit_bytes, 1024);
+            assert_eq!(budget.reassembly.rejected_allocations, 1,
+                "must hit real reply admission, not a synthetic transport error");
+            assert_eq!(budget.reassembly.used_bytes, 0);
+            assert!(budget.shm.peak_bytes > 0, "requests must use real owned SHM");
+            assert_eq!(callback.calls.each_ref().map(|n| n.load(Ordering::SeqCst)), [1, 1, 0]);
+
+            // The original pooled connection must survive, while the other
+            // RID is still in flight. The old generic eviction fails here.
+            let (lease, current_route) = state.acquire_upstream("grid").await
+                .unwrap_or_else(|_| panic!("upstream acquisition failed after capacity rejection"));
+            assert!(Arc::ptr_eq(&client, &lease.client()), "capacity must not evict the shared client");
+            assert!(client.is_connected());
+            assert_eq!(current_route.route_uid, route.route_uid);
+            assert_eq!(current_route.route_revision, route.route_revision);
+            assert_eq!(UpstreamEndpointKey::from_route(&current_route), UpstreamEndpointKey::from_route(&route));
+            assert!(route_matches_expected_crm(&current_route, &c2_contract::ExpectedRouteContract {
+                route_name: route.name.clone(),
+                crm_ns: route.crm_ns.clone(),
+                crm_name: route.crm_name.clone(),
+                crm_ver: route.crm_ver.clone(),
+                abi_hash: route.abi_hash.clone(),
+                signature_hash: route.signature_hash.clone(),
+            }));
+            drop(lease);
+            release_tx.send(()).unwrap();
+            let completed = blocked.await.unwrap();
+            assert_eq!(completed.status(), StatusCode::OK);
+            assert_eq!(completed.bytes().await.unwrap().as_ref(), &[1; 512]);
+            let ping_address = address.clone();
+            assert!(tokio::task::spawn_blocking(move || {
+                c2_ipc::ping(&ping_address, Duration::from_secs(1))
+            }).await.unwrap().unwrap());
+            let pong = request("ping").send().await.unwrap();
+            assert_eq!(pong.status(), StatusCode::OK);
+            assert_eq!(pong.bytes().await.unwrap().as_ref(), &[2; 512]);
+            let (lease, final_route) = state.acquire_upstream("grid").await
+                .unwrap_or_else(|_| panic!("upstream acquisition failed after subsequent call"));
+            assert!(Arc::ptr_eq(&client, &lease.client()));
+            assert!(client.is_connected());
+            assert_eq!(final_route.route_uid, route.route_uid);
+            assert_eq!(final_route.route_revision, route.route_revision);
+            drop(lease);
+            assert_eq!(callback.calls.each_ref().map(|n| n.load(Ordering::SeqCst)), [1, 1, 1],
+                "capacity rejection must not replay either dispatched call");
+            assert_eq!(state.upstream_memory_snapshot().reassembly.used_bytes, 0);
+        }).catch_unwind().await;
+
+        let _ = release_tx.send(());
+        if let crate::relay::state::UnregisterResult::Removed {
+            client: Some(client),
+            ..
+        } = state.unregister_upstream("grid", "capacity-server")
+        {
+            client.close_shared().await;
+        }
+        if let Some(client) = original_client {
+            client.close_shared().await;
+        }
+        let _ = http_stop_tx.send(());
+        let ipc_stopped = server.shutdown_and_wait(Duration::from_secs(2)).await;
+        let http_stopped = tokio::time::timeout(Duration::from_secs(2), &mut http_task).await;
+        if http_stopped.is_err() {
+            http_task.abort();
+            let _ = http_task.await;
+        }
+        let ipc_joined = tokio::time::timeout(Duration::from_secs(2), &mut ipc_task).await;
+        if ipc_joined.is_err() {
+            ipc_task.abort();
+            let _ = ipc_task.await;
+        }
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        http_stopped.unwrap().unwrap().unwrap();
+        ipc_stopped.unwrap();
+        ipc_joined.unwrap().unwrap().unwrap();
     }
 
     #[tokio::test]
