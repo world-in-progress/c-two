@@ -5830,6 +5830,10 @@ mod tests {
         fn hold(&mut self, request: Arc<RequestReleaseState>, lock: &'static str) {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
+            // A pool-only holder must not keep RequestReleaseState alive:
+            // the receiver regression requires pending to be its sole owner.
+            let pool = Arc::clone(&request.pool);
+            let request = (lock != "pool").then_some(request);
             let holder = std::thread::spawn(move || {
                 let wait = || {
                     let _ = ready_tx.send(());
@@ -5837,11 +5841,11 @@ mod tests {
                 };
                 match lock {
                     "permit" => {
-                        let _guard = request.permit.lock();
+                        let _guard = request.as_ref().unwrap().permit.lock();
                         wait();
                     }
                     "pool" => {
-                        let _guard = request.pool.lock();
+                        let _guard = pool.lock();
                         wait();
                     }
                     "executor" => {
@@ -6073,6 +6077,11 @@ mod tests {
                 let started = Instant::now();
                 drop(block);
                 let token_elapsed = started.elapsed();
+                assert_eq!(
+                    weak_request.strong_count(),
+                    1,
+                    "pending must be the sole request-state owner while the pool is locked"
+                );
                 let pending = Arc::clone(&client.pending);
                 let server_pool = Arc::clone(&client.server_pool);
                 let cleanup = ConnectionAssemblyCleanup {
