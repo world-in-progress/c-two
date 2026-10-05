@@ -50,6 +50,8 @@ pub(crate) mod background;
 pub(crate) mod conn_pool;
 pub(crate) mod disseminator;
 pub(crate) mod gossip;
+#[cfg(test)]
+mod memory_tests;
 pub(crate) mod peer;
 pub(crate) mod peer_handlers;
 pub(crate) mod route_table;
