@@ -2959,8 +2959,7 @@ impl IpcClient {
                 {
                     return self
                         .call_buddy_stream(&identity, method_idx, block, data_len, chunks)
-                        .await
-                        .map_err(classified_call_error);
+                        .await;
                 }
                 match choose_request_transport(&self.config, false, data_len) {
                     RequestTransportKind::Chunked => {
@@ -3140,7 +3139,7 @@ impl IpcClient {
         block: RequestBlock,
         data_size: usize,
         chunks: S,
-    ) -> Result<ResponseData, IpcError>
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>>,
         B: AsRef<[u8]>,
@@ -3155,7 +3154,7 @@ impl IpcClient {
             let chunk = match next {
                 Ok(chunk) => chunk,
                 Err(err) => {
-                    return Err(stream_error(err));
+                    return Err(pre_dispatch_call_error(stream_error(err)));
                 }
             };
             let data = chunk.as_ref();
@@ -3163,27 +3162,33 @@ impl IpcClient {
                 continue;
             }
             let Some(next_written) = written.checked_add(data.len()) else {
-                return Err(IpcError::Config(
+                return Err(pre_dispatch_call_error(IpcError::Config(
                     "request body size overflow while streaming to SHM".into(),
-                ));
+                )));
             };
             if next_written > data_size {
-                return Err(IpcError::Config(format!(
+                return Err(pre_dispatch_call_error(IpcError::Config(format!(
                     "request body exceeded declared content length {data_size}"
-                )));
+                ))));
             }
-            block.write_at(written, data)?;
+            block
+                .write_at(written, data)
+                .map_err(pre_dispatch_call_error)?;
             written = next_written;
         }
 
         if written != data_size {
-            return Err(IpcError::Config(format!(
+            return Err(pre_dispatch_call_error(IpcError::Config(format!(
                 "request body ended at {written} bytes, expected {data_size}"
-            )));
+            ))));
         }
 
+        // Preparation errors above are proven unpublished. Once the actual
+        // send function takes over, preserve its existing error classification
+        // and conservative ownership of any partially published buddy frame.
         self.call_with_prealloc(identity, method_idx, &block, data_size)
             .await
+            .map_err(classified_call_error)
     }
 
     /// Buddy SHM call path with pre-allocated data — sends buddy frame for
@@ -6170,6 +6175,22 @@ mod tests {
         );
         assert!(before_dispatch.is_retry_safe());
         assert!(!after_frame_attempt.is_retry_safe());
+
+        let source_error = pre_dispatch_call_error(stream_error("upload EOF"));
+        let chunk_error = stream_call_error(stream_error("upload EOF"), true);
+        let generic_io = classified_call_error(stream_error("upload EOF"));
+        assert_eq!(
+            source_error.phase(),
+            crate::sync_client::TransportPhase::PreDispatch
+        );
+        assert_eq!(
+            chunk_error.phase(),
+            crate::sync_client::TransportPhase::DispatchUncertain
+        );
+        assert_eq!(
+            generic_io.phase(),
+            crate::sync_client::TransportPhase::DispatchUncertain
+        );
     }
 
     #[test]
@@ -6630,6 +6651,7 @@ mod tests {
             .await
             .expect_err("a short stream must be rejected before sending");
         assert!(err.to_string().contains("expected 32"), "{err}");
+        assert_eq!(err.phase(), crate::sync_client::TransportPhase::PreDispatch);
 
         assert_eq!(
             old_pool.lock().stats().alloc_count,
@@ -6747,6 +6769,53 @@ mod tests {
             .expect("cached test route should bind");
         let pool = client.request_pool().expect("transport-owned request pool");
         (client, binding, pool)
+    }
+
+    #[tokio::test]
+    async fn buddy_fill_source_error_is_pre_dispatch_and_releases_the_block() {
+        let (client, binding, pool) = cancellation_client("buddy_fill_source_error");
+        pool.lock()
+            .ensure_buddy_segments(1)
+            .expect("SHM backing is required for this regression");
+        let body = futures_util::stream::iter(vec![
+            Ok(vec![7u8; 8]),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "upload EOF",
+            )),
+        ])
+        .inspect(|_| {
+            assert_eq!(
+                pool.lock().stats().alloc_count,
+                1,
+                "the body must fill SHM, not an allocation-failure fallback"
+            );
+        });
+        let err = client
+            .call_bound_sized_stream_phased(&binding, "ping", 64, body)
+            .await
+            .expect_err("the body fails while the SHM block is still unpublished");
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+        assert_eq!(client.pending_len_for_test(), 0);
+        assert!(matches!(err.source_error(), IpcError::Io(_)));
+        assert_eq!(err.phase(), crate::sync_client::TransportPhase::PreDispatch);
+        assert!(err.is_retry_safe());
+
+        // A complete body reaches the send function. Preserve its existing
+        // Closed classification rather than relabelling every Buddy error.
+        let complete = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(vec![7u8; 64])]);
+        let err = client
+            .call_bound_sized_stream_phased(&binding, "ping", 64, complete)
+            .await
+            .expect_err("this controlled client has no writer");
+        assert!(matches!(err.source_error(), IpcError::Closed));
+        assert_eq!(
+            err.phase(),
+            crate::sync_client::TransportPhase::DispatchUncertain
+        );
+        assert!(!err.is_retry_safe());
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+        assert_eq!(client.pending_len_for_test(), 0);
     }
 
     /// Cancelling a sized-stream call while its body stream stalls must

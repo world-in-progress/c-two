@@ -2768,6 +2768,120 @@ mod lazy_policy_roundtrip_tests {
         )
     }
 
+    /// A failed upload during SHM preparation must leave a healthy connection
+    /// and an unrelated dispatched call alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buddy_fill_source_error_preserves_connection_and_in_flight_call() {
+        use crate::sync_client::TransportPhase;
+        use futures_util::{StreamExt, stream};
+
+        let (callback, seen, started, release, finished) = stalling_echo();
+        let base = small_base(64 * 1024, 2);
+        let server = start_echo_server(
+            "buddy_fill_source_error",
+            cancellation_server_config(base.clone(), 1024, 2),
+            callback,
+        )
+        .await;
+        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        client.connect().await.unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("buddy_fill_source_error"))
+            .await
+            .unwrap();
+        let pool = client.request_pool().expect("request pool");
+
+        // An inline call is already executing and waiting for its reply.
+        let live = client.call_bound(&binding, "echo", b"live");
+        tokio::pin!(live);
+        tokio::select! {
+            result = &mut live => panic!("the callback must stall: {result:?}"),
+            result = timeout(Duration::from_secs(5), started) => result.unwrap().unwrap(),
+        }
+        assert_eq!(*seen.lock(), vec!["inline"]);
+        assert_eq!(client.pending_len_for_test(), 1);
+
+        let (filling_tx, filling_rx) = tokio::sync::oneshot::channel();
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
+        let body = stream::iter(vec![Ok::<_, std::io::Error>(vec![7u8; 64])]).chain(stream::once(
+            async move {
+                filling_tx.send(()).unwrap();
+                fail_rx.await.unwrap();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "upload EOF",
+                ))
+            },
+        ));
+        let upload = client.call_bound_sized_stream_phased(&binding, "echo", 8192, body);
+        tokio::pin!(upload);
+        tokio::select! {
+            result = &mut upload => panic!("the upload must stall in SHM preparation: {result:?}"),
+            result = timeout(Duration::from_secs(5), filling_rx) => result.unwrap().unwrap(),
+        }
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            1,
+            "must exercise SHM, not fallback"
+        );
+        assert_eq!(
+            client.pending_len_for_test(),
+            1,
+            "upload has not published a request"
+        );
+        fail_tx.send(()).unwrap();
+        let err = timeout(Duration::from_secs(5), &mut upload)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.phase(), TransportPhase::PreDispatch);
+        assert!(err.is_retry_safe());
+        assert!(matches!(err.source_error(), IpcError::Io(_)));
+        assert_eq!(
+            pool.lock().stats().alloc_count,
+            0,
+            "unpublished block must be released"
+        );
+        assert_eq!(
+            seen.lock().len(),
+            1,
+            "failed upload executes zero callbacks"
+        );
+        assert_eq!(
+            client.pending_len_for_test(),
+            1,
+            "unrelated waiter survives"
+        );
+        assert!(client.is_connected());
+
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(5), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = timeout(Duration::from_secs(5), &mut live)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response_bytes(&client, response), b"live");
+        // The next call uses the same client and the same pool incarnation.
+        release.send(()).unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            client.call_bound(&binding, "echo", b"next"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response_bytes(&client, response), b"next");
+        assert_eq!(*seen.lock(), vec!["inline", "inline"]);
+        assert!(client.is_connected());
+        assert!(Arc::ptr_eq(&pool, &client.request_pool().unwrap()));
+        assert_eq!(client.pending_len_for_test(), 0);
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
     /// Buddy request whose caller is cancelled after dispatch: the server
     /// owns the cross-process free, so the client must keep the allocation
     /// charged (never free it locally), let the server's free land exactly
@@ -3070,6 +3184,16 @@ mod lazy_policy_roundtrip_tests {
         String,
         tokio::sync::oneshot::Receiver<c2_local::LocalStream>,
     ) {
+        raw_handshake_peer_with_routes(label, Vec::new()).await
+    }
+
+    async fn raw_handshake_peer_with_routes(
+        label: &str,
+        routes: Vec<c2_wire::handshake::RouteInfo>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<c2_local::LocalStream>,
+    ) {
         let address = unique_address(label);
         let endpoint = c2_local::LocalEndpoint::from_address(&address).expect("test endpoint");
         let mut listener = c2_local::LocalListener::bind(&endpoint).expect("test listener");
@@ -3093,7 +3217,7 @@ mod lazy_policy_roundtrip_tests {
                 c2_wire::handshake::CAP_CALL_V2
                     | c2_wire::handshake::CAP_METHOD_IDX
                     | c2_wire::handshake::CAP_CHUNKED,
-                &[],
+                &routes,
                 "",
                 &identity,
             )
@@ -3120,6 +3244,115 @@ mod lazy_policy_roundtrip_tests {
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
         }
+    }
+
+    /// The same upload source error is uncertain once a chunk frame really
+    /// reached the peer; no later call may reuse the incomplete message stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunk_source_error_after_frame_is_uncertain_and_closes_connection() {
+        use crate::sync_client::TransportPhase;
+        use futures_util::{StreamExt, stream};
+        use tokio::io::AsyncReadExt as _;
+
+        let identity = raw_peer_identity();
+        let route = c2_wire::handshake::RouteInfo {
+            name: identity.route_name.clone(),
+            route_uid: identity.route_uid.clone(),
+            route_revision: identity.observed_route_revision,
+            crm_ns: identity.crm_ns.clone(),
+            crm_name: identity.crm_name.clone(),
+            crm_ver: identity.crm_ver.clone(),
+            abi_hash: identity.abi_hash.clone(),
+            signature_hash: identity.signature_hash.clone(),
+            max_payload_size: 8192,
+            methods: vec![c2_wire::handshake::MethodEntry {
+                name: "echo".into(),
+                index: 0,
+            }],
+        };
+        let (address, peer_rx) =
+            raw_handshake_peer_with_routes("chunk_source_error", vec![route]).await;
+        let mut client = IpcClient::with_config(
+            &address,
+            client_config(
+                BaseIpcConfig {
+                    chunk_size: 64,
+                    ..small_base(64 * 1024, 2)
+                },
+                8192, // force chunking for this 8192-byte request
+            ),
+        );
+        client.connect().await.unwrap();
+        let binding = client
+            .bind_cached_route(&expected_contract("grid"))
+            .unwrap();
+        let mut peer = peer_rx.await.unwrap();
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
+        let body = stream::iter(vec![Ok::<_, std::io::Error>(vec![7u8; 64])]).chain(stream::once(
+            async move {
+                fail_rx.await.unwrap();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "upload EOF",
+                ))
+            },
+        ));
+        let upload = client.call_bound_sized_stream_phased(&binding, "echo", 8192, body);
+        tokio::pin!(upload);
+        let read_frame = async {
+            let mut len = [0u8; 4];
+            peer.read_exact(&mut len).await.unwrap();
+            let mut bytes = vec![0u8; u32::from_le_bytes(len) as usize];
+            peer.read_exact(&mut bytes).await.unwrap();
+            let mut frame = len.to_vec();
+            frame.extend_from_slice(&bytes);
+            frame
+        };
+        let frame = tokio::select! {
+            result = &mut upload => panic!("upload must wait after its first chunk: {result:?}"),
+            result = timeout(Duration::from_secs(5), read_frame) => result.unwrap(),
+        };
+        let (header, payload) = c2_wire::frame::decode_frame(&frame).unwrap();
+        assert!(c2_wire::flags::is_chunked(header.flags));
+        assert!(!c2_wire::flags::is_chunk_last(header.flags));
+        let (chunk_idx, total_chunks, offset) =
+            c2_wire::chunk::decode_chunk_header(payload, 0).unwrap();
+        assert_eq!(chunk_idx, 0);
+        assert_eq!(total_chunks, 128);
+        let (_, consumed) = c2_wire::control::decode_call_control(payload, offset).unwrap();
+        assert_eq!(&payload[offset + consumed..], &[7u8; 64]);
+        fail_tx.send(()).unwrap();
+        let err = timeout(Duration::from_secs(5), &mut upload)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.phase(), TransportPhase::DispatchUncertain);
+        assert!(!err.is_retry_safe());
+        assert!(matches!(err.source_error(), IpcError::Io(_)));
+        assert!(!client.is_connected());
+        assert_eq!(client.pending_len_for_test(), 0);
+        timeout(
+            Duration::from_secs(3),
+            client.call_bound(&binding, "echo", b"next"),
+        )
+        .await
+        .unwrap()
+        .expect_err("the damaged connection cannot carry another call");
+        // Graceful close sends its control signal before EOF. Reject any
+        // additional call/chunk frame: the failed later call must not publish.
+        let mut trailing = Vec::new();
+        timeout(Duration::from_secs(3), peer.read_to_end(&mut trailing))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            trailing,
+            c2_wire::frame::encode_frame(
+                0,
+                c2_wire::flags::FLAG_SIGNAL,
+                &[0x08], // SIG_DISCONNECT on the existing wire protocol
+            )
+        );
     }
 
     /// A released block must never be sent: `pool_free` followed by a call
@@ -3717,7 +3950,11 @@ mod lazy_policy_roundtrip_tests {
         let response = echo_roundtrip(&reacquired, "partial_write_reacquire", &payload).await;
         assert_eq!(response_bytes(&reacquired, response), payload);
         assert_eq!(*seen_kinds.lock(), vec!["shm_buddy"]);
-        assert!(reacquired.close_shared_bounded(Duration::from_secs(2)).await);
+        assert!(
+            reacquired
+                .close_shared_bounded(Duration::from_secs(2))
+                .await
+        );
         drop(client);
         assert_eq!(budget.snapshot().shm.used_bytes, 0);
         stop_server(&server).await;
