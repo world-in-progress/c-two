@@ -20,6 +20,16 @@ fn owner_control_child_fixture() {
         return;
     };
     match action.as_str() {
+        "closed_probe" => {
+            // Create the capability after this exact fixture has exec'd. No other case
+            // in this process can fork and temporarily copy its writer before exec.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(assert_preclosed_probe());
+            write_fixture_stdout(b"CLOSED_PROBE_PASSED\n");
+        }
         "unrelated" => thread::sleep(Duration::from_millis(700)),
         "target" => {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -342,8 +352,7 @@ fn inherited_file_and_invalid_handle_are_rejected_with_os_errors() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn prepare_probes_already_closed_without_reactor_turn_and_activates_once() {
+async fn assert_preclosed_probe() {
     let (keepalive, mut receiver) = owner_control_pair().unwrap();
     drop(keepalive);
     assert!(!receiver.prepare().await.unwrap());
@@ -351,6 +360,41 @@ async fn prepare_probes_already_closed_without_reactor_turn_and_activates_once()
     assert!(!receiver.prepare().await.unwrap());
     receiver.wait_closed().await.unwrap();
     assert!(receiver.take_stdio().is_err());
+}
+
+#[test]
+fn prepare_probes_already_closed_without_reactor_turn_and_activates_once() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = ChildGuard(
+        fixture_command("closed_probe")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = io::BufReader::new(stdout)
+            .lines()
+            .collect::<io::Result<Vec<_>>>();
+        let _ = tx.send(result);
+    });
+    let lines = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("isolated closed probe deadline")
+        .unwrap();
+    assert!(
+        lines.iter().any(|line| line == "CLOSED_PROBE_PASSED"),
+        "{lines:?}"
+    );
+    assert!(child.0.wait().unwrap().success());
 }
 
 #[tokio::test(flavor = "current_thread")]

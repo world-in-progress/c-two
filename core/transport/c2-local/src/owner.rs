@@ -15,7 +15,7 @@
 //!
 //! 1. In the controller, [`OwnerControlReceiver::take_stdio`] is the only way to hand the receiver
 //!    to a child. It moves the controller's endpoint copy into `Stdio`, so an unrelated child
-//!    cannot inherit the capability.
+//!    cannot retain the capability after exec.
 //! 2. In the receiving process, the first call to [`OwnerControlReceiver::wait_closed`] activates
 //!    the endpoint. Activation builds the single native watcher (Tokio `AsyncFd` on Unix, Tokio
 //!    `NamedPipeServer` on Windows) from the one handle this process owns. Every later wait,
@@ -24,6 +24,15 @@
 //! 3. After activation, [`OwnerControlReceiver::take_stdio`] fails with
 //!    [`std::io::ErrorKind::InvalidInput`] instead of tearing down or re-registering the live
 //!    watcher, and [`OwnerControlReceiver::shutdown`] or `Drop` releases the watcher exactly once.
+//!
+//! # Unix fork boundary
+//!
+//! Unix non-inheritance here means close-on-exec, not close-on-fork. A raw fork copies open
+//! pipe descriptors into the child until that child execs or closes them. Therefore a child
+//! that has not exec'd can temporarily, or indefinitely if it never execs, keep the controller's
+//! writer alive. EOF means the last actual OS writer closed; it is not a PID-death inference.
+//! Trusted launchers using raw fork must close unintended capability copies in their children.
+//! An unrelated successfully exec'd `std::process::Command` child does not retain the writer.
 //!
 //! # Terminal closure and trust boundary
 //!
@@ -64,7 +73,8 @@ mod platform;
 ///
 /// Both OS handles are created non-inheritable, and neither is registered with a reactor or
 /// completion port. The returned receiver must be explicitly converted to [`Stdio`] for the target
-/// child process; ordinary child processes cannot extend the owner's lifetime.
+/// child process; unrelated exec'd children cannot extend the owner's lifetime. Raw Unix fork
+/// copies live until explicit close or exec, as described in the module-level fork boundary.
 pub fn owner_control_pair() -> io::Result<(OwnerControlKeepalive, OwnerControlReceiver)> {
     let (keepalive, receiver) = platform::pair()?;
     Ok((

@@ -32,3 +32,11 @@ The deliberate restoration of former name/server-id matching fails the same-inst
 This is a native slice handed to Host for independent fixed-source acceptance. SDK thin projection and full SDK/cross-language/runtime gates remain Host work; no final P3/P4 acceptance is claimed by this report.
 
 Windows Peek behavior reference: [Microsoft PeekNamedPipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-peeknamedpipe). The receiver validates overlapped mode; no synchronous-handle blocking guarantee is assumed.
+
+## Exact preclosed probes and Unix fork boundary
+
+The strict immediate-EOF primitive and preclosed-before-readiness integration assertions run in dedicated exact post-exec fixtures. Their pipes are created inside those fixtures, where no concurrent libtest case can fork. The immediate false result and refusal of readiness are unchanged; no probe retry, sleep-based confirmation or global test serialization is used. The other process-control cases still run with normal harness parallelism, including the live unrelated exec'd child negative.
+
+FD_CLOEXEC closes a writer at exec, not at fork. An arbitrary raw-fork child that has not exec'd can retain the OS writer; a concurrent Command spawn's pre-exec window can do so transiently. Native EAGAIN in that window is truthful and must not be converted into EOF. EOF follows the last actual OS writer close, so raw-fork launchers must close unintended capability copies. Killing the named controller cannot close an arbitrary unclosed writer copy in another raw-fork process. This is a capability-reference lifetime boundary, not proof of a native read defect.
+
+The fixture-isolation companion passed OwnerBound 18/18 and OwnerControl 12/12 with ordinary parallel harness settings in `/tmp/c2-ownerbound-fork-isolation-tests.log`. The complete OwnerControl harness then passed 100 separate default-parallel runs (1,200 test executions) in `/tmp/c2-ownercontrol-isolation-stress.log`. Windows local `--tests` target compilation passed in `/tmp/c2-ownerbound-isolation-windows-tests-check.log`. These are the checks affected by fixture isolation; no unrelated runtime gates were repeated for this test-only correction.

@@ -222,8 +222,7 @@ fn owner_bound_grace_is_validated_by_rust_against_the_bounded_range() {
     );
 }
 
-#[test]
-fn already_gone_capability_is_refused_before_readiness() {
+fn assert_already_gone_is_refused() {
     let runtime = test_runtime();
     let (mut keepalive, receiver) = owner_control_pair().unwrap();
     runtime.attach_owner_control(receiver).expect("attach");
@@ -242,6 +241,38 @@ fn already_gone_capability_is_refused_before_readiness() {
         "unexpected error: {message}"
     );
     assert!(!runtime.owner_control_attached());
+}
+
+#[test]
+fn already_gone_capability_is_refused_before_readiness() {
+    // Pipe creation happens inside an exact post-exec fixture, outside the
+    // other libtest cases' concurrent fork/exec windows.
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "owner_bound_fixture", "--nocapture"])
+            .env(FIXTURE_ACTION, "preclosed")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = BufReader::new(stdout)
+            .lines()
+            .collect::<std::io::Result<Vec<_>>>();
+        let _ = tx.send(result);
+    });
+    let lines = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("isolated preclosed Host deadline")
+        .unwrap();
+    assert!(
+        lines.iter().any(|line| line == "PRE_READY_REFUSED"),
+        "{lines:?}"
+    );
+    assert!(child.0.wait().unwrap().success());
 }
 
 #[test]
@@ -540,6 +571,10 @@ fn owner_bound_fixture() {
         return;
     };
     match action.as_str() {
+        "preclosed" => {
+            assert_already_gone_is_refused();
+            write_fixture_stdout(b"PRE_READY_REFUSED\n");
+        }
         "controller" => {
             let (keepalive, mut receiver) = owner_control_pair().unwrap();
             let mut service = Command::new(std::env::current_exe().unwrap())
