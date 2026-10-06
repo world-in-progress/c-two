@@ -57,6 +57,23 @@ def _expected_contract_headers(crm_class: type = Hello) -> dict[str, str]:
     }
 
 
+def _registration_scope(http: httpx.Client, relay_url: str, name: str) -> dict:
+    expected = crm_contract(Hello)
+    response = http.get(
+        f'{relay_url}/_resolve/{name}',
+        params={
+            'crm_ns': expected.crm_ns, 'crm_name': expected.crm_name,
+            'crm_ver': expected.crm_ver, 'abi_hash': expected.abi_hash,
+            'signature_hash': expected.signature_hash,
+        },
+    )
+    assert response.status_code == 200, response.text
+    route = response.json()[0]
+    return {key: route[key] for key in (
+        'name', 'server_id', 'server_instance_id', 'route_uid', 'route_revision',
+    )}
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -256,7 +273,7 @@ class TestCcConnectHttp:
             with httpx.Client(trust_env=False, timeout=5.0) as http:
                 resp = http.post(
                     f'{relay_url}/_unregister',
-                    json={'name': 'hello', 'server_id': server_id},
+                    json=_registration_scope(http, relay_url, 'hello'),
                 )
                 assert resp.status_code == 200, resp.text
 
@@ -612,7 +629,7 @@ class TestRelayControlPlane:
 
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             # Register, then unregister.
-            http.post(
+            registered = http.post(
                 f'{relay_url}/_register',
                 json={
                     'name': 'hello',
@@ -622,9 +639,30 @@ class TestRelayControlPlane:
                     'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
-            resp = http.post(
+            assert registered.status_code == 201, registered.text
+            scope = _registration_scope(http, relay_url, 'hello')
+            # A stale incarnation, UID, owner or revision cannot remove this route.
+            for key, value in (
+                ('server_id', 'other-server'),
+                ('server_instance_id', 'stale-instance'),
+                ('route_uid', 'stale-route'),
+                ('route_revision', scope['route_revision'] + 1),
+            ):
+                rejected = http.post(
+                    f'{relay_url}/_unregister', json={**scope, key: value},
+                )
+                assert rejected.status_code == 202, rejected.text
+                assert rejected.json()['status'] == 'superseded'
+                assert _registration_scope(http, relay_url, 'hello') == scope
+            incomplete = http.post(
                 f'{relay_url}/_unregister',
                 json={'name': 'hello', 'server_id': server_id},
+            )
+            assert incomplete.status_code == 422
+            assert _registration_scope(http, relay_url, 'hello') == scope
+            resp = http.post(
+                f'{relay_url}/_unregister',
+                json=_registration_scope(http, relay_url, 'hello'),
             )
             assert resp.status_code == 200
 
@@ -649,7 +687,11 @@ class TestRelayControlPlane:
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_unregister',
-                json={'name': 'nonexistent', 'server_id': 'missing-server'},
+                json={
+                    'name': 'nonexistent', 'server_id': 'missing-server',
+                    'server_instance_id': 'missing-instance',
+                    'route_uid': 'missing-route', 'route_revision': 1,
+                },
             )
             assert resp.status_code == 404
 

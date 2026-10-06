@@ -4237,7 +4237,22 @@ mod tests {
         // A restart bind must not drift to another endpoint namespace: the one
         // resolved protocol is the only derivation both binds use.
         let mut config = ServerIpcConfig::default();
-        config.base.endpoint_protocol = c2_config::LocalEndpointProtocol::ManagedV2;
+        #[cfg(unix)]
+        {
+            config.base.endpoint_protocol = c2_config::LocalEndpointProtocol::ManagedV2;
+        }
+        #[cfg(windows)]
+        {
+            let mut unsupported = config.clone();
+            unsupported.base.endpoint_protocol = c2_config::LocalEndpointProtocol::ManagedV2;
+            let error = match Server::new("ipc://protocol_restart_unsupported", unsupported) {
+                Err(error) => error,
+                Ok(_) => panic!("managed-v2 must be rejected before a Windows server is created"),
+            };
+            assert!(matches!(error, IpcError::Config(message)
+                if message == "managed-v2 IPC endpoints are not supported on Windows"));
+        }
+        let expected_protocol = config.base.endpoint_protocol;
         let address = "ipc://protocol_restart_srv";
         let first = Server::new(address, config.clone()).unwrap();
         let first_endpoint = first.local_endpoint().clone();
@@ -4245,10 +4260,7 @@ mod tests {
 
         let second = Server::new(address, config).unwrap();
         assert_eq!(second.local_endpoint(), &first_endpoint);
-        assert_eq!(
-            second.local_endpoint().protocol(),
-            c2_config::LocalEndpointProtocol::ManagedV2
-        );
+        assert_eq!(second.local_endpoint().protocol(), expected_protocol);
     }
 
     #[test]

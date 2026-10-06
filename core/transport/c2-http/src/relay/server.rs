@@ -1012,8 +1012,13 @@ mod tests {
         let suffix = NEXT_IPC_SUFFIX.fetch_add(1, Ordering::Relaxed);
         let address = format!("ipc://relay-attest-protocol-{suffix}");
         let server_id = "relay-attest-server";
+        let protocol = if cfg!(windows) {
+            LocalEndpointProtocol::LegacyV1
+        } else {
+            LocalEndpointProtocol::ManagedV2
+        };
         let mut server_config = c2_config::ServerIpcConfig::default();
-        server_config.base.endpoint_protocol = LocalEndpointProtocol::ManagedV2;
+        server_config.base.endpoint_protocol = protocol;
         let server = Arc::new(
             c2_server::Server::new_with_identity(
                 &address,
@@ -1034,23 +1039,37 @@ mod tests {
         server
             .wait_until_ready(std::time::Duration::from_secs(5))
             .await
-            .expect("managed server ready");
+            .expect("configured server ready");
 
         // The legacy namespace at the same logical address holds no listener,
         // so a legacy attestation client cannot complete a handshake.
-        let mut legacy_config = c2_ipc::ClientIpcConfig::default();
-        legacy_config.base.endpoint_protocol = LocalEndpointProtocol::LegacyV1;
-        let mut legacy = c2_ipc::IpcClient::with_config(&address, legacy_config);
-        assert!(
-            legacy.connect().await.is_err(),
-            "a legacy attestation client must not reach a managed-v2 server"
-        );
+        #[cfg(unix)]
+        {
+            let mut legacy_config = c2_ipc::ClientIpcConfig::default();
+            legacy_config.base.endpoint_protocol = LocalEndpointProtocol::LegacyV1;
+            let mut legacy = c2_ipc::IpcClient::with_config(&address, legacy_config);
+            assert!(
+                legacy.connect().await.is_err(),
+                "a legacy attestation client must not reach a managed-v2 server"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let error = super::connect_register_attestation_client(
+                &address,
+                LocalEndpointProtocol::ManagedV2,
+            )
+            .await
+            .err()
+            .expect("managed-v2 must fail before Windows attestation connects");
+            assert!(matches!(error, c2_ipc::IpcError::Config(message)
+                if message == "managed-v2 IPC endpoints are not supported on Windows"));
+        }
 
         // The managed client the relay actually builds connects.
-        let client =
-            super::connect_register_attestation_client(&address, LocalEndpointProtocol::ManagedV2)
-                .await
-                .expect("managed attestation client connects");
+        let client = super::connect_register_attestation_client(&address, protocol)
+            .await
+            .expect("configured attestation client connects");
         assert_eq!(client.server_id(), Some(server_id));
         super::close_client(client);
 

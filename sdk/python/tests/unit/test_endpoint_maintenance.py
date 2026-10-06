@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import uuid
 
 import pytest
@@ -52,6 +53,25 @@ MANAGED_V2_DOCUMENT = json.dumps(
     },
     separators=(',', ':'),
 )
+
+
+@pytest.fixture(scope='module', autouse=True)
+def native_legacy_namespace():
+    """A real isolated bind prepares the namespace that read-only sweeps open."""
+    session = _native.RuntimeSession(
+        server_id=f'sweep-prepare-{uuid.uuid4().hex}',
+        server_ipc_overrides={'endpoint_protocol': 'legacy-v1'},
+        use_process_relay_anchor=False,
+    )
+    bridge = session.ensure_server_bridge()
+    try:
+        bridge.start()
+    finally:
+        outcome = session.shutdown(timeout_seconds=5.0)
+        assert outcome['completed'], outcome
+    # The native listener removes only its owned socket; its legacy rendezvous
+    # lock follows native retention policy. No scoped sweep selects that slot.
+    yield
 
 
 def _legacy_document(address: str = 'ipc://unit-legacy-endpoint') -> str:
@@ -247,10 +267,19 @@ def test_inspect_defaults_to_the_configured_process_protocol(
     # process environment.
     protocol = 'legacy-v1' if IS_WINDOWS else 'managed-v2'
     monkeypatch.setenv('C2_IPC_ENDPOINT_PROTOCOL', protocol)
-    explicit = cc.inspect_endpoint(
-        'ipc://unit-default-protocol', endpoint_protocol=protocol
-    )
-    implicit = cc.inspect_endpoint('ipc://unit-default-protocol')
+    def inspect_when_gate_available(**kwargs):
+        deadline = time.monotonic() + 1.0
+        while True:
+            result = cc.inspect_endpoint('ipc://unit-default-protocol', **kwargs)
+            if result['status'] != 'io-error':
+                return result
+            assert result['io_kind'] == 'WouldBlock', result
+            assert result['retryable'] is True, result
+            assert time.monotonic() < deadline, result
+            time.sleep(0.001)
+
+    explicit = inspect_when_gate_available(endpoint_protocol=protocol)
+    implicit = inspect_when_gate_available()
     assert implicit == explicit
     assert implicit['status'] == ('not-applicable' if IS_WINDOWS else 'absent')
 

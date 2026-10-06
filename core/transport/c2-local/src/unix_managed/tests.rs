@@ -23,7 +23,7 @@ impl TestNamespace {
             .tempdir_in("/tmp")
             .expect("isolated managed parent under /tmp");
         std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let root = parent.path().join("v2");
+        let root = parent.path().join("v2.2");
         assert!(root.as_os_str().as_bytes().len() <= 40);
         Self {
             _parent: parent,
@@ -556,6 +556,127 @@ async fn managed_missing_or_replaced_gate_never_creates_a_second_lock() {
         marker_before,
         "marker must not be rewritten to adopt a replacement gate"
     );
+
+    // Deterministically model inode ABA even on filesystems that do not reuse
+    // the just-unlinked inode: keep the original marker's persistent identity,
+    // but make its device/inode describe the new, empty gate. A dev/ino-only
+    // protocol incorrectly adopts this fresh OS object.
+    let replacement_identity = identity_of(&gate);
+    let mut aba_marker = marker_before.clone();
+    aba_marker[9..17].copy_from_slice(&replacement_identity.device.to_le_bytes());
+    aba_marker[17..25].copy_from_slice(&replacement_identity.inode.to_le_bytes());
+    std::fs::write(root.join(MARKER_NAME), &aba_marker).unwrap();
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+    ));
+    assert_eq!(
+        bind_managed_at(&endpoint, root).err().unwrap().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    assert_eq!(std::fs::read(root.join(MARKER_NAME)).unwrap(), aba_marker);
+    assert_eq!(
+        std::fs::metadata(&gate).unwrap().len(),
+        0,
+        "replacement gate must never be initialized"
+    );
+
+    // A well-formed new coordinator identity is also rejected when dev/ino
+    // match the old marker: validity of the object does not prove continuity.
+    let mut new_identity = Vec::new();
+    new_identity.extend_from_slice(GATE_MAGIC);
+    new_identity.push(GATE_VERSION);
+    new_identity.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    std::fs::write(&gate, &new_identity).unwrap();
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+    ));
+    assert_eq!(bind_managed_at(&endpoint, root).err().unwrap().kind(), io::ErrorKind::AddrInUse);
+    assert_eq!(std::fs::read(&gate).unwrap(), new_identity);
+    assert_eq!(std::fs::read(root.join(MARKER_NAME)).unwrap(), aba_marker);
+}
+
+#[tokio::test]
+async fn managed_listener_pins_original_gate_until_lease_ownership_ends() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("gate-pin");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let gate = root.join(GATE_NAME);
+    let original = fstat(listener._gate_pin.as_raw_fd()).unwrap();
+    std::fs::remove_file(&gate).unwrap();
+    let unlinked = fstat(listener._gate_pin.as_raw_fd()).unwrap();
+    assert!(same_file(&original, &unlinked));
+    assert_eq!(
+        unlinked.st_nlink, 0,
+        "listener keeps the unlinked OS object alive"
+    );
+    let replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&gate)
+        .unwrap();
+    assert!(!same_file(
+        &original,
+        &fstat(replacement.as_raw_fd()).unwrap()
+    ));
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+    ));
+    assert_eq!(
+        bind_managed_at(&endpoint, root).err().unwrap().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert!(matches!(
+        listener.close(),
+        EndpointReapResult::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+    ));
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "failed closed retirement must still end the old listener's lease"
+    );
+    assert_eq!(replacement.metadata().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn managed_device_inode_only_marker_is_rejected_without_online_upgrade() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("old-gate-marker");
+    assert!(matches!(
+        bind_managed_at(&endpoint, root).unwrap().close(),
+        EndpointReapResult::Reaped
+    ));
+    let gate = root.join(GATE_NAME);
+    let marker = root.join(MARKER_NAME);
+    let mut old_marker = std::fs::read(&marker).unwrap();
+    old_marker.truncate(25);
+    old_marker[8] = 1;
+    std::fs::write(&marker, &old_marker).unwrap();
+    std::fs::write(&gate, []).unwrap();
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+    ));
+    assert_eq!(
+        bind_managed_at(&endpoint, root).err().unwrap().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), old_marker);
+    assert_eq!(std::fs::metadata(gate).unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -821,7 +942,7 @@ async fn managed_directory_rename_inside_the_gate_window_never_binds_into_the_re
         .tempdir_in("/tmp")
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let root = parent.path().join("v2");
+    let root = parent.path().join("v2.2");
     let moved = parent.path().join("moved");
     let endpoint = managed_endpoint("rename-window");
 
@@ -908,7 +1029,7 @@ async fn managed_parallel_first_initialization_shares_one_gate_inode() {
         .tempdir_in("/tmp")
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let root = parent.path().join("v2");
+    let root = parent.path().join("v2.2");
     let endpoints: Vec<_> = (0..6)
         .map(|i| managed_endpoint(&format!("first-{i}")))
         .collect();
@@ -983,7 +1104,7 @@ async fn managed_interrupted_sweep_never_reports_a_completed_round() {
         .tempdir_in("/tmp")
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let root = parent.path().join("v2");
+    let root = parent.path().join("v2.2");
     test_namespace_root(&root).unwrap();
     let endpoint = managed_endpoint("sweep-interrupt");
     let listener = bind_managed_at(&endpoint, &root).unwrap();
@@ -1018,7 +1139,7 @@ fn managed_initialization_window_stays_unverified_without_creating_locks() {
         .tempdir_in("/tmp")
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let root = parent.path().join("v2");
+    let root = parent.path().join("v2.2");
     std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let endpoint = managed_endpoint("window");
@@ -1106,6 +1227,9 @@ fn managed_record_decode_rejects_hash_only_and_oversized_payloads() {
     let mut oversized = encoded.clone();
     oversized.push(0);
     assert_eq!(OwnerRecord::decode(&oversized), None);
+    let mut old_format = encoded.clone();
+    old_format[8] = 1;
+    assert_eq!(OwnerRecord::decode(&old_format), None);
     let mut wrong_protocol = encoded.clone();
     wrong_protocol[9] = 1;
     assert_eq!(OwnerRecord::decode(&wrong_protocol), None);
@@ -1239,7 +1363,8 @@ fn managed_bind_does_not_change_cwd_in_an_independent_subprocess() {
         .expect("isolated parent directory")
         .to_owned();
 
-    let output = Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
             "unix_managed::tests::managed_process_fixture",
@@ -1247,9 +1372,13 @@ fn managed_bind_does_not_change_cwd_in_an_independent_subprocess() {
         ])
         .env("C2_LOCAL_MANAGED_TEST_ADDRESS", endpoint.address())
         .env("C2_LOCAL_MANAGED_TEST_ACTION", "cwd-probe")
-        .env("C2_LOCAL_MANAGED_TEST_CWD", &elsewhere_dir)
-        .output()
-        .unwrap();
+        .env("C2_LOCAL_MANAGED_TEST_CWD", &elsewhere_dir);
+    // Linux shares its process cwd across threads. Change it only in this
+    // isolated child, so the real public bind proves an arbitrary launch cwd is
+    // preserved without mutating the parallel parent harness.
+    #[cfg(target_os = "linux")]
+    command.current_dir(&elsewhere_dir);
+    let output = command.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1533,7 +1662,7 @@ fn managed_first_initialization_scan_is_bounded_and_fails_closed() {
         .tempdir_in("/tmp")
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let root = parent.path().join("v2");
+    let root = parent.path().join("v2.2");
     std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     for index in 0..(INIT_SCAN_LIMIT + 4) {
@@ -1578,9 +1707,13 @@ async fn managed_bind_never_changes_the_calling_thread_directory() {
         .parent()
         .expect("isolated parent directory")
         .to_owned();
-    let expected_caller_dir = std::fs::canonicalize(&other_root).unwrap();
-
     let process_cwd_before = std::env::current_dir().unwrap();
+    #[cfg(target_os = "macos")]
+    let expected_caller_dir = std::fs::canonicalize(&other_root).unwrap();
+    // Linux has no thread-local cwd API here: the caller follows the process
+    // cwd and /proc/self/fd binds must leave that exact directory untouched.
+    #[cfg(not(target_os = "macos"))]
+    let expected_caller_dir = process_cwd_before.clone();
     // Keep the namespace tempdir alive inside the thread for the whole test.
     let caller = std::thread::spawn(move || {
         let _namespace = namespace;
@@ -1642,7 +1775,7 @@ async fn managed_bind_never_changes_the_calling_thread_directory() {
     );
     assert_eq!(
         caller_after, expected_caller_dir,
-        "the calling thread keeps exactly the directory it set, not the process default"
+        "the calling thread keeps its platform-specific directory unchanged"
     );
     assert_eq!(
         inside_a, caller_before,
@@ -1795,7 +1928,7 @@ async fn sweep_scope_interrupted_namespace_never_reports_completion() {
         .tempdir_in("/tmp")
         .unwrap();
     std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let root = parent.path().join("v2");
+    let root = parent.path().join("v2.2");
     test_namespace_root(&root).unwrap();
     let endpoint = managed_endpoint("sweep-interrupt");
     let listener = bind_managed_at(&endpoint, &root).unwrap();

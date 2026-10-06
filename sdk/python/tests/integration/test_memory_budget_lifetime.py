@@ -263,46 +263,60 @@ def test_held_portable_reassembly_budget_survives_public_shutdown(tier: str) -> 
 
 @pytest.mark.timeout(60)
 def test_early_zero_retirement_survives_an_inflight_response() -> None:
-    """A zero snapshot is provisional until the old direct IPC call ends.
+    """A weak zero capture follows late allocation without premature shutdown.
 
-    Shutdown closes the client cache before draining the server callback. The
-    pending call therefore ends with a correlated closed-client error; it
-    cannot produce a held response after the client close barrier. This test
-    observes the public early-zero handoff while the callback is still live.
+    An independent native observer adopts the real session's handoff before
+    the blocked callback produces a response. Public shutdown is tested later:
+    its pending drain retains the session and Python hooks until completion.
     """
+    from c_two import _native
+
     cc.shutdown()
     route = f'memory-retire-race-{uuid.uuid4().hex[:12]}'
     entered = threading.Event()
     proceed = threading.Event()
-    shutdown_done = threading.Event()
     call_outcome: dict[str, object] = {}
-    shutdown_outcome: dict[str, BaseException] = {}
     call_thread = None
-    shutdown_thread = None
     proxy = None
-    payload: Payload | None = None
+    payload = None
+    held = None
+    checked = None
+    old_session = None
+    observer = _native.RuntimeSession(use_process_relay_anchor=False)
+    hooks: list[str] = []
+
+    @cc.crm(namespace='test.memory-budget-retire', version='0.1.0')
+    class ObservedLargeOutput:
+        @cc.transfer(output=BLOB_SPEC)
+        def produce(self) -> Payload:
+            ...
+
+        @cc.on_shutdown
+        def stopped(self) -> None:
+            ...
+
+    class ObservedBlockedResource(BlockedLargeOutputResource):
+        def stopped(self) -> None:
+            hooks.append('stopped')
+
     try:
-        cc.set_server(ipc_overrides={
+        overrides = {
             'pool_prewarm_segments': 0,
             'shm_backing_budget_bytes': 0,
             'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,
             'live_reassembly_budget_bytes': REASSEMBLY_SEGMENT_SIZE,
             'chunk_size': CHUNK_SIZE,
-        })
-        cc.set_client(ipc_overrides={
-            'pool_prewarm_segments': 0,
-            'shm_backing_budget_bytes': 0,
-            'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,
-            'live_reassembly_budget_bytes': REASSEMBLY_SEGMENT_SIZE,
-            'chunk_size': CHUNK_SIZE,
-        })
+        }
+        cc.set_server(ipc_overrides=overrides)
+        cc.set_client(ipc_overrides=overrides)
         payload = _build_payload()
-        resource = BlockedLargeOutputResource(payload, entered, proceed)
-        cc.register(LargeOutput, resource, name=route)
+        resource = ObservedBlockedResource(payload, entered, proceed)
+        cc.register(ObservedLargeOutput, resource, name=route)
         address = cc.server_address()
         assert address is not None
         _wait_ready(address)
-        proxy = cc.connect(LargeOutput, name=route, address=address)
+        proxy = cc.connect(ObservedLargeOutput, name=route, address=address)
+        old_session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
         initial = _outgoing_cells(cc.memory_stats())
         assert all(initial[kind]['used_bytes'] == 0 for kind in ('shm', 'file', 'reassembly'))
         assert cc.hold_stats()['active_holds'] == 0
@@ -313,87 +327,109 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
             except BaseException as exc:
                 call_outcome['error'] = exc
 
-        def shut_down() -> None:
-            try:
-                cc.shutdown()
-            except BaseException as exc:
-                shutdown_outcome['error'] = exc
-            finally:
-                shutdown_done.set()
-
         call_thread = threading.Thread(target=call_held, daemon=True)
         call_thread.start()
         assert entered.wait(timeout=5), 'real resource callback never started'
-
-        shutdown_thread = threading.Thread(target=shut_down, daemon=True)
-        shutdown_thread.start()
-        # The public facade changes to the replacement session before the old
-        # callback drains. Poll that condition, not a guessed scheduling delay.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if cc.memory_stats()['runtime_outgoing'] is None:
-                break
-            shutdown_done.wait(timeout=0.01)
-        else:
-            pytest.fail('public shutdown did not publish a replacement session')
-        assert not proceed.is_set()
-        assert shutdown_thread.is_alive(), 'old callback should hold shutdown open'
-
+        observation = old_session.retire_memory_observation()
+        observer.adopt_retired_memory_observation(observation)
+        # Re-adoption must not double-count the same domains or lease tracker.
+        observer.adopt_retired_memory_observation(observation)
+        del observation
         for _ in range(3):
-            early = cc.memory_stats()
-            assert early['runtime_outgoing'] is None
-            retired = [
-                scope for scope in early['retired']
-                if scope['role'] == 'runtime_outgoing'
-            ]
-            assert len(retired) == 1, early
-            assert all(
-                retired[0]['cells'][kind]['used_bytes'] == 0
-                for kind in ('shm', 'file', 'reassembly')
-            )
+            early = observer.memory_stats()
+            retired = _retired_outgoing_cells(early)
+            assert all(retired[kind]['used_bytes'] == 0 for kind in ('shm', 'file', 'reassembly'))
             assert early['holds']['active_holds'] == 0
-
-        # The client close barrier cancels this pending call before the blocked
-        # resource is allowed to return. A held success here would contradict
-        # the current native shutdown contract.
-        call_thread.join(timeout=8)
-        assert not call_thread.is_alive(), 'pending call was not canceled by shutdown'
-        assert isinstance(call_outcome.get('error'), ClientCallResource), call_outcome
-        assert 'held' not in call_outcome
+        assert not proceed.is_set()
 
         proceed.set()
-        shutdown_thread.join(timeout=10)
-        assert not shutdown_thread.is_alive(), 'public shutdown did not terminate'
-        assert not shutdown_outcome, shutdown_outcome
+        call_thread.join(timeout=10)
+        assert not call_thread.is_alive(), 'held response did not finish'
+        assert 'error' not in call_outcome, call_outcome
+        held = call_outcome.pop('held')
+        with held.value.entry_view(0) as sequence:
+            checked = sequence.at(0)
+        with checked.acquire() as access:
+            assert access.bytes() == BLOB
+        capacity = math.ceil(len(held.unsafe_buffer) / CHUNK_SIZE) * CHUNK_SIZE
+        late = observer.memory_stats()
+        retired = _retired_outgoing_cells(late)
+        current = _outgoing_cells(cc.memory_stats())
+        for kind in ('shm', 'file', 'reassembly'):
+            assert retired[kind] == current[kind]
+        assert retired['shm']['used_bytes'] == 0
+        assert retired['file']['used_bytes'] == capacity
+        assert retired['reassembly']['used_bytes'] == capacity
+        assert late['holds']['active_holds'] == cc.hold_stats()['active_holds'] == 1
 
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            final = cc.memory_stats()
-            charged = any(
-                cell['used_bytes'] > 0
-                for scope in final['retired']
-                for cell in scope['cells'].values()
-            )
-            if final['holds']['active_holds'] == 0 and not charged:
-                break
-            shutdown_done.wait(timeout=0.01)
-        else:
-            pytest.fail(f'retired charges or holds survived terminal call: {final}')
+        # A second real callback blocks drain while the first held owner lives.
+        entered.clear()
+        proceed.clear()
+        call_thread = threading.Thread(target=call_held, daemon=True)
+        call_thread.start()
+        assert entered.wait(timeout=5)
+        bridge = _ProcessRegistry.get()._server  # noqa: SLF001
+        pending = cc.shutdown(timeout=0.05)
+        assert pending['completed'] is False, pending
+        assert _ProcessRegistry.get()._runtime_session is old_session  # noqa: SLF001
+        assert _ProcessRegistry.get()._server is bridge  # noqa: SLF001
+        assert route in _ProcessRegistry.get().names
+        assert hooks == []
+        assert not proceed.is_set()
+        proceed.set()
+        call_thread.join(timeout=10)
+        assert not call_thread.is_alive()
+        assert isinstance(call_outcome.get('error'), ClientCallResource), call_outcome
+        assert 'held' not in call_outcome
+        completed = cc.shutdown(timeout=10)
+        assert completed['completed'] is True, completed
+        assert hooks == ['stopped']
+        assert _ProcessRegistry.get()._runtime_session is not old_session  # noqa: SLF001
+        with checked.acquire() as access:
+            assert access.bytes() == BLOB
+        after_shutdown = observer.memory_stats()
+        retired = _retired_outgoing_cells(after_shutdown)
+        assert retired['file']['used_bytes'] == capacity
+        assert retired['reassembly']['used_bytes'] == capacity
+        assert after_shutdown['holds']['active_holds'] == 1
+
+        held.release()
+        with pytest.raises(PayloadError) as invalidated:
+            checked.kind()
+        assert invalidated.value.symbol == 'VIEW_INVALIDATED'
+        checked.close()
+        checked = None
+        held = None
+        for _ in range(3):
+            released = observer.memory_stats()
+            cells = _retired_outgoing_cells(released)
+            assert all(cells[kind]['used_bytes'] == 0 for kind in ('shm', 'file', 'reassembly'))
+            assert released['holds']['active_holds'] == 0
+        # Zero stays observable while old_session/proxy are real producers;
+        # the weak bundle disappears only after their final release.
+        cc.close(proxy)
+        proxy = None
+        old_session = None
+        bridge = None
+        call_thread = None
+        call_outcome.clear()
+        gc.collect()
+        assert observer.memory_stats()['retired'] == []
     finally:
         proceed.set()
         if call_thread is not None:
             call_thread.join(timeout=10)
-        if shutdown_thread is not None:
-            shutdown_thread.join(timeout=10)
-        held = call_outcome.get('held')
+        extra_held = call_outcome.get('held')
+        if extra_held is not None:
+            extra_held.release()
         if held is not None:
-            with suppress(Exception):
-                held.release()
+            held.release()
+        if checked is not None:
+            checked.close()
         if proxy is not None:
-            with suppress(Exception):
-                cc.close(proxy)
-        if shutdown_thread is None or not shutdown_thread.is_alive():
-            cc.shutdown()
+            cc.close(proxy)
+        cc.shutdown(timeout=10)
+        observer.shutdown(timeout_seconds=5)
         if payload is not None:
             payload.close()
 

@@ -1,5 +1,7 @@
 # Local endpoint protocol configuration slice
 
+Current-format correction: the unreleased ManagedV2 authority now derives `/tmp/c2-<effective-uid-hex>/v2.2`, with gate marker and owner record format 2. The `/v2` paths and results below describe the earlier implementation evidence; the old root is preserved and never probed or adopted by the corrected runtime. See [the Linux acceptance repair report](2026-10-07-managed-linux-boundaries.md) for the format boundary and final focused macOS evidence.
+
 Baseline: `0f72d072e3f4f5aa3c51c8251c15d306fc1cafd0`.
 
 This slice adds a Rust-owned `LocalEndpointProtocol` enum with strict

@@ -1,5 +1,7 @@
 # Managed-v2 Unix endpoint ownership and retirement (c2-local native slice)
 
+Current-format correction: the unreleased ManagedV2 authority now derives `/tmp/c2-<effective-uid-hex>/v2.2`, with gate marker and owner record format 2. The `/v2` paths and results below describe the earlier implementation evidence; the old root is preserved and never probed or adopted by the corrected runtime. See [the Linux acceptance repair report](2026-10-07-managed-linux-boundaries.md) for the format boundary and final focused macOS evidence.
+
 Status: the `c2-local` native layer now implements the managed-v2 ownership and retirement protocol for explicitly selected `managed-v2` endpoints. Legacy `legacy-v1` listeners, records, reap, and sweep behavior are unchanged, and remain the default through `LocalEndpoint::from_address`. This is a native-layer slice only: `c2-core`, `c2-server`, the Rust SDK, and Python/PyO3 still do not select `managed-v2`, and no Runtime/SDK routing behavior was touched.
 
 Baseline: `fbc2f7a387572b3f924cc4d5f160f03d5ff8dbb3`.

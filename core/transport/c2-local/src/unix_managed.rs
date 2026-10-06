@@ -2,13 +2,14 @@
 //! per live listener, and identity-checked retirement.
 //!
 //! The namespace is the `managed-v2` directory derived by
-//! [`c2_config::LocalEndpoint`] (`/tmp/c2-<uid>/v2`). Everything in this module
+//! [`c2_config::LocalEndpoint`] (`/tmp/c2-<uidhex>/v2.2`). Everything in this module
 //! operates on that namespace through verified directory descriptors:
 //!
 //! - `.gate` is the single long-lived coordinator lock. Every open, create,
 //!   delete, and retire of an endpoint lease happens while holding it.
-//! - `.gate.marker` records the gate device/inode so a replaced, missing, or
-//!   damaged gate is detected instead of silently creating a second lock.
+//! - `.gate.marker` records the gate device/inode and random identity so a
+//!   replaced, missing, or damaged gate is detected instead of creating a
+//!   second lock.
 //! - `<sha256(address)>.lease` is the per-endpoint lease, locked exclusively by
 //!   its listener for life. It stores the bounded owner record (protocol,
 //!   complete logical address, fresh incarnation, socket identity).
@@ -145,11 +146,14 @@ pub(crate) mod barrier {
 }
 
 const GATE_MAGIC: &[u8; 8] = b"c2mgatv2";
-const GATE_VERSION: u8 = 1;
-const MARKER_LEN: usize = 8 + 1 + 8 + 8;
+// Version 1 had only dev/ino and could accept a recycled inode. Existing
+// markers are never upgraded online: their namespace must remain unverified.
+const GATE_VERSION: u8 = 2;
+const GATE_IDENTITY_LEN: usize = 8 + 1 + 16;
+const MARKER_LEN: usize = 8 + 1 + 8 + 8 + 16;
 
 const RECORD_MAGIC: &[u8; 8] = b"c2mgrec2";
-const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION: u8 = 2;
 const RECORD_PROTOCOL: u8 = 2;
 const RECORD_ADDRESS_LIMIT: usize = 1024;
 const RECORD_FIXED_LEN: usize = 8 + 1 + 1 + 2 + 16 + 8 + 8 + 8 + 8;
@@ -603,13 +607,39 @@ fn namespace_has_endpoint_entries(root: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+fn gate_nonce(gate: &File) -> Result<[u8; 16], NamespaceError> {
+    let bytes = read_bounded(gate, GATE_IDENTITY_LEN).map_err(NamespaceError::Io)?;
+    let Some(bytes) = bytes.filter(|bytes| {
+        bytes.len() == GATE_IDENTITY_LEN && &bytes[..8] == GATE_MAGIC && bytes[8] == GATE_VERSION
+    }) else {
+        return Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::CoordinatorReplaced,
+        ));
+    };
+    Ok(bytes[9..25].try_into().unwrap())
+}
+
 fn write_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), NamespaceError> {
+    // Only first initialization, under the gate and after the bounded scan,
+    // may assign an identity. A marker-bearing empty/replaced gate is rejected
+    // by validate_marker and never reaches this path.
+    if gate.metadata().map_err(NamespaceError::Io)?.len() == 0 {
+        let mut identity = Vec::with_capacity(GATE_IDENTITY_LEN);
+        identity.extend_from_slice(GATE_MAGIC);
+        identity.push(GATE_VERSION);
+        identity.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        gate.write_all_at(&identity, 0)
+            .map_err(NamespaceError::Io)?;
+        gate.sync_all().map_err(NamespaceError::Io)?;
+    }
+    let nonce = gate_nonce(gate)?;
     let stat = fstat(gate.as_raw_fd()).map_err(NamespaceError::Io)?;
     let mut bytes = Vec::with_capacity(MARKER_LEN);
     bytes.extend_from_slice(GATE_MAGIC);
     bytes.push(GATE_VERSION);
     bytes.extend_from_slice(&(stat.st_dev as u64).to_le_bytes());
     bytes.extend_from_slice(&(stat.st_ino as u64).to_le_bytes());
+    bytes.extend_from_slice(&nonce);
     let mut file = directory
         .open_file(
             &marker_name(),
@@ -677,7 +707,8 @@ fn validate_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), Nam
         && &bytes[..8] == GATE_MAGIC
         && bytes[8] == GATE_VERSION
         && u64::from_le_bytes(bytes[9..17].try_into().unwrap()) == gate_stat.st_dev as u64
-        && u64::from_le_bytes(bytes[17..25].try_into().unwrap()) == gate_stat.st_ino as u64;
+        && u64::from_le_bytes(bytes[17..25].try_into().unwrap()) == gate_stat.st_ino as u64
+        && bytes[25..41] == gate_nonce(gate)?;
     if !decoded {
         return Err(NamespaceError::Unverified(
             EndpointUnverifiedReason::CoordinatorReplaced,
@@ -1012,6 +1043,11 @@ pub(crate) struct ManagedListener {
     record: OwnerRecord,
     root: PathBuf,
     lease: Option<Lease>,
+    // Pin the original OS coordinator object for the entire listener lifetime,
+    // including a close/drop that cannot reacquire its named gate. Namespace
+    // Drop releases the shared OFD flock; this descriptor holds only the inode.
+    // Field order releases the lease before this last listener pin closes.
+    _gate_pin: File,
     #[cfg(test)]
     gate_identity: SocketIdentity,
     cleaned: bool,
@@ -1138,6 +1174,7 @@ pub(crate) fn bind_managed_at(
     root: &Path,
 ) -> io::Result<ManagedListener> {
     let namespace = open_root_bounded(root, true).map_err(namespace_bind_error)?;
+    let gate_pin = namespace.gate.try_clone()?;
     let names = managed_names(endpoint)?;
     let lease = namespace
         .directory
@@ -1226,6 +1263,7 @@ pub(crate) fn bind_managed_at(
         record,
         root: root.to_owned(),
         lease: Some(Lease(Some(lease))),
+        _gate_pin: gate_pin,
         #[cfg(test)]
         gate_identity,
         cleaned: false,

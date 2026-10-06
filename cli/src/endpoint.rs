@@ -14,8 +14,8 @@ use anyhow::{Result, anyhow, bail};
 use c2_config::{ClientIpcConfigOverrides, ConfigResolver, ConfigSources, LocalEndpointProtocol};
 use c2_core::{
     ENDPOINT_CREDENTIAL_MAX_BYTES, EndpointCredential, EndpointInspection, EndpointReapResult,
-    EndpointSweep, EndpointUnverifiedReason, LocalEndpoint, SweepBatch, SweepBudget, inspect_endpoint,
-    reap_endpoint,
+    EndpointSweep, EndpointUnverifiedReason, LocalEndpoint, SweepBatch, SweepBudget,
+    inspect_endpoint, reap_endpoint,
 };
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -86,6 +86,10 @@ pub struct SweepArgs {
     /// Endpoint protocol. Required: a sweep never guesses the namespace.
     #[arg(long, value_parser = parse_protocol)]
     pub protocol: LocalEndpointProtocol,
+    /// Restrict maintenance to this logical IPC address. Repeat for multiple
+    /// targets; omission explicitly selects the full protocol namespace.
+    #[arg(long = "address", value_name = "IPC_ADDRESS")]
+    pub addresses: Vec<String>,
     /// Maximum entries visited in one batch.
     #[arg(long, default_value_t = 64)]
     pub max_entries: usize,
@@ -109,10 +113,7 @@ pub fn run(args: EndpointArgs) -> Result<ExitCode> {
     }
 }
 
-fn endpoint_for(
-    address: &str,
-    protocol: Option<LocalEndpointProtocol>,
-) -> Result<LocalEndpoint> {
+fn endpoint_for(address: &str, protocol: Option<LocalEndpointProtocol>) -> Result<LocalEndpoint> {
     // An explicit protocol is strictly first. Otherwise the configured process
     // policy decides; the address is always derived purely from the logical
     // name through `LocalEndpoint`, never by probing an existing path.
@@ -129,15 +130,14 @@ fn inspect(args: InspectArgs) -> Result<ExitCode> {
     let report = match inspect_endpoint(&endpoint) {
         EndpointInspection::Absent => Report::status("absent"),
         EndpointInspection::Present(credential) => {
-            let json = credential
-                .to_json()
-                .map_err(|error| anyhow!("{error}"))?;
+            let json = credential.to_json().map_err(|error| anyhow!("{error}"))?;
             Report::present(json)
         }
         // A kernel-managed namespace observes the platform, not a live
         // instance, so it is reported as not-applicable rather than alive.
-        EndpointInspection::KernelManaged => Report::status("not-applicable")
-            .with_reason(Some("kernel-managed".to_string())),
+        EndpointInspection::KernelManaged => {
+            Report::status("not-applicable").with_reason(Some("kernel-managed".to_string()))
+        }
         EndpointInspection::Unverified(reason) => {
             Report::status("unverified").with_reason(Some(reason_name(reason)))
         }
@@ -190,9 +190,23 @@ fn sweep(args: SweepArgs) -> Result<ExitCode> {
         bail!("--max-batches must be between 1 and {MAX_BATCHES}");
     }
 
-    let endpoint = LocalEndpoint::from_address_with_protocol("ipc://c3-endpoint-sweep", args.protocol)?;
-    let mut sweep = EndpointSweep::for_endpoint(&endpoint)
-        .map_err(|error| anyhow!("cannot open the {} namespace: {error}", args.protocol.as_str()))?;
+    let endpoint =
+        LocalEndpoint::from_address_with_protocol("ipc://c3-endpoint-sweep", args.protocol)?;
+    // Native scope construction validates every logical address and the 4096
+    // target limit before opening any iterator or taking a sweep lease.
+    let mut sweep = if args.addresses.is_empty() {
+        EndpointSweep::for_endpoint(&endpoint)
+    } else {
+        let scope = EndpointSweep::scope_for_addresses(&endpoint, &args.addresses)
+            .map_err(|error| anyhow!("invalid endpoint sweep scope: {error}"))?;
+        EndpointSweep::for_scope(&scope)
+    }
+    .map_err(|error| {
+        anyhow!(
+            "cannot open the {} namespace: {error}",
+            args.protocol.as_str()
+        )
+    })?;
     let budget = SweepBudget {
         max_entries: args.max_entries,
         max_duration: std::time::Duration::from_millis(args.max_ms),
@@ -218,7 +232,9 @@ fn sweep(args: SweepArgs) -> Result<ExitCode> {
 
     // An unfinished round is reported honestly: coverage is not claimed.
     let exhausted = !totals.round_complete && !totals.round_interrupted;
-    Report::new(if exhausted { "batch-limit" } else if totals.round_interrupted {
+    Report::new(if exhausted {
+        "batch-limit"
+    } else if totals.round_interrupted {
         "round-interrupted"
     } else {
         "complete"
@@ -306,7 +322,9 @@ fn reap_report(result: &EndpointReapResult) -> (&'static str, Option<String>) {
         EndpointReapResult::Busy => ("busy", Some("coordinator-held".to_string())),
         EndpointReapResult::StaleTarget => ("stale-target", Some("identity-mismatch".to_string())),
         EndpointReapResult::Unverified(reason) => ("unverified", Some(reason_name(*reason))),
-        EndpointReapResult::NotApplicable => ("not-applicable", Some("no-filesystem-entry".to_string())),
+        EndpointReapResult::NotApplicable => {
+            ("not-applicable", Some("no-filesystem-entry".to_string()))
+        }
         EndpointReapResult::IoError(error) => ("io-error", io_reason(error)),
     }
 }

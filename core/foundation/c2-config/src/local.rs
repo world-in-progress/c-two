@@ -117,9 +117,11 @@ fn endpoint_name(server_id: &str, protocol: LocalEndpointProtocol) -> io::Result
         LocalEndpointProtocol::ManagedV2 => {
             use sha2::{Digest, Sha256};
 
+            // The unreleased managed protocol's gate/record format 2 gets its
+            // own rendezvous root. Never probe or adopt the older v2 root.
             let uid = unsafe { libc::geteuid() };
             let identity = format!("{:x}", Sha256::digest(server_id.as_bytes()));
-            std::path::PathBuf::from(format!("/tmp/c2-{uid:x}/v2")).join(format!("{identity}.sock"))
+            std::path::PathBuf::from(format!("/tmp/c2-{uid:x}/v2.2")).join(format!("{identity}.sock"))
         }
     };
     let os_name = path.into_os_string();
@@ -196,7 +198,7 @@ mod tests {
         let server_id = format!("slice-{}", uuid::Uuid::new_v4());
         let uid = unsafe { libc::geteuid() };
         let digest = format!("{:x}", Sha256::digest(server_id.as_bytes()));
-        let expected = format!("/tmp/c2-{uid:x}/v2/{digest}.sock");
+        let expected = format!("/tmp/c2-{uid:x}/v2.2/{digest}.sock");
         let expected_path = std::path::Path::new(&expected);
         let existed_before = expected_path.exists();
         assert!(!existed_before);
