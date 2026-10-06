@@ -15,6 +15,8 @@ mod core_error_ffi;
 #[cfg(feature = "python")]
 mod core_ffi;
 #[cfg(feature = "python")]
+mod endpoint_ffi;
+#[cfg(feature = "python")]
 mod error_ffi;
 #[cfg(feature = "python")]
 mod lease_ffi;
@@ -47,6 +49,7 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     control_ffi::register_module(m)?;
     config_ffi::register_module(m)?;
     codegen_ffi::register_module(m)?;
+    endpoint_ffi::register_module(m)?;
     lease_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;
     route_concurrency_ffi::register_module(m)?;

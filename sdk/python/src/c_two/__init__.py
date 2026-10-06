@@ -20,6 +20,13 @@ from .crm.infer import infer_crm_from_resource
 from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import hold, transfer, Held, HeldResult
 from .mem import MemoryCellStats, MemoryLimits, MemoryScopeStats, MemoryStats
+from .transport.endpoint import (
+    EndpointCredential,
+    EndpointSweep,
+    inspect_endpoint,
+    reap_endpoint,
+    sweep_endpoints,
+)
 from .transport.input_lifetime import InputLifetime
 from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 from .transport.registry import (
@@ -68,6 +75,11 @@ __all__ = [
     'MemoryLimits',
     'MemoryScopeStats',
     'MemoryStats',
+    'EndpointCredential',
+    'EndpointSweep',
+    'inspect_endpoint',
+    'reap_endpoint',
+    'sweep_endpoints',
     'InputLifetime',
     'ConcurrencyConfig',
     'ConcurrencyMode',
