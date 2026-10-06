@@ -247,6 +247,10 @@ jobs:
           ../emsdk/emsdk install 5.0.2
           ../emsdk/emsdk activate 5.0.2
           source ../emsdk/emsdk_env.sh
+          # The complete runner checks for WASM before collecting tests.
+          # npm ci installs dependencies but does not build this artifact.
+          npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
+          git -C ../fastdb diff --exit-code -- ts/fastdb4ts/src/wasm
           {
             for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do
               value="${!name:-}"
