@@ -305,15 +305,40 @@ async fn rejects_trailing_garbage_and_non_object_documents() {
 #[tokio::test]
 async fn decoding_does_not_create_filesystem_state() {
     let (listener, credential) = managed();
-    let json = credential.to_json().unwrap();
-    let root = std::path::Path::new(credential.endpoint().os_name())
+    // Decode a syntactically valid credential for an unbound, unique target.
+    // Other parallel listeners may change the shared namespace, so observe
+    // only this target's native-derived backing names, never a global count.
+    let endpoint = LocalEndpoint::from_address_with_protocol(
+        &format!("ipc://codec-unbound-{}", uuid::Uuid::new_v4().simple()),
+        LocalEndpointProtocol::ManagedV2,
+    )
+    .unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_str(&credential.to_json().unwrap()).unwrap();
+    document["address"] = endpoint.address().into();
+    let json = document.to_string();
+    let socket = std::path::Path::new(endpoint.os_name());
+    let stem = socket.file_stem().unwrap().to_str().unwrap();
+    let root = socket
         .parent()
         .unwrap()
         .to_path_buf();
-    let before = std::fs::read_dir(&root).unwrap().count();
+    let target_entries = || {
+        std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name();
+                name.to_str().unwrap().starts_with(stem).then_some(name)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(target_entries().is_empty());
     let round_tripped = decoded(&json).unwrap();
-    let after = std::fs::read_dir(&root).unwrap().count();
-    assert_eq!(before, after, "decoding must not create locks or markers");
+    assert_eq!(round_tripped.endpoint(), &endpoint);
+    assert!(
+        target_entries().is_empty(),
+        "decoding must not create target socket, locks, or markers"
+    );
     drop(round_tripped);
     drop(listener);
 }

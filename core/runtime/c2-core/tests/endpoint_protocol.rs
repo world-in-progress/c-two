@@ -258,7 +258,7 @@ fn explicit_protocol_selects_exactly_one_os_endpoint() {
         assert_eq!(managed.protocol(), LocalEndpointProtocol::ManagedV2);
         let managed_name = managed.os_name().to_string_lossy();
         assert!(
-            managed_name.starts_with("/tmp/c2-") && managed_name.contains("/v2/"),
+            managed_name.starts_with("/tmp/c2-") && managed_name.contains("/v2.2/"),
             "managed endpoint must live in the private versioned namespace: {managed_name}"
         );
         assert_ne!(legacy.os_name(), managed.os_name());

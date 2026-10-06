@@ -4249,7 +4249,7 @@ mod tests {
                 Err(error) => error,
                 Ok(_) => panic!("managed-v2 must be rejected before a Windows server is created"),
             };
-            assert!(matches!(error, IpcError::Config(message)
+            assert!(matches!(error, ServerError::Config(message)
                 if message == "managed-v2 IPC endpoints are not supported on Windows"));
         }
         let expected_protocol = config.base.endpoint_protocol;
