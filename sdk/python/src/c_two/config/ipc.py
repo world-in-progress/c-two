@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from .settings import C2Settings
 
@@ -15,6 +15,8 @@ __all__ = [
 
 class BaseIPCOverrides(TypedDict, total=False):
     """Shared IPC code-level overrides for server and client resolution."""
+
+    endpoint_protocol: Literal['legacy-v1', 'managed-v2']
 
     # Buddy-pool policy switch. Disabling it skips only the buddy tiers;
     # dedicated SHM, chunked transfer, and file spill stay available.

@@ -121,6 +121,7 @@ dependencies = [
  "c2-local-security",
  "dotenvy",
  "gethostname",
+ "libc",
  "sha2 0.10.9",
  "uuid",
 ]

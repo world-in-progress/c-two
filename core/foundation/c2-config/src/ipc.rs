@@ -11,6 +11,8 @@
 use std::ops::Deref;
 use std::time::Duration;
 
+use crate::LocalEndpointProtocol;
+
 pub const MAX_EXECUTION_WORKERS: u32 = 64;
 
 /// Canonical upper bound on configured buddy pool segments
@@ -40,6 +42,7 @@ pub const BASE_IPC_OVERRIDE_KEYS: &[&str] = &[
     "shm_backing_budget_bytes",
     "file_backing_budget_bytes",
     "live_reassembly_budget_bytes",
+    "endpoint_protocol",
 ];
 
 /// Code-level IPC override fields accepted for server config resolution.
@@ -60,6 +63,7 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "shm_backing_budget_bytes",
     "file_backing_budget_bytes",
     "live_reassembly_budget_bytes",
+    "endpoint_protocol",
     "max_frame_size",
     "max_payload_size",
     "max_pending_requests",
@@ -87,6 +91,7 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
     "shm_backing_budget_bytes",
     "file_backing_budget_bytes",
     "live_reassembly_budget_bytes",
+    "endpoint_protocol",
     "pool_decay_seconds",
 ];
 
@@ -104,6 +109,8 @@ pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &["shm_threshold"];
 /// than mutating a shared value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BaseIpcConfig {
+    /// Protocol used to derive the local OS endpoint from an IPC address.
+    pub endpoint_protocol: LocalEndpointProtocol,
     // ── Pool SHM settings ────────────────────────────────────────────────
     /// Buddy-pool policy switch. Disabling it skips only the buddy tiers
     /// (reuse and expansion); dedicated SHM, chunked transfer, inline frames,
@@ -183,6 +190,7 @@ impl Default for BaseIpcConfig {
     fn default() -> Self {
         let budget_limits = crate::MemoryBudgetLimits::default();
         Self {
+            endpoint_protocol: LocalEndpointProtocol::LegacyV1,
             pool_enabled: true,
             pool_segment_size: 268_435_456, // 256 MB
             max_pool_segments: 4,
@@ -600,7 +608,10 @@ mod tests {
     fn override_key_catalogs_exclude_derived_and_global_fields() {
         // The client catalog is the shared base keys plus exactly one
         // role-specific key: the client-side idle decay window.
-        assert_eq!(CLIENT_IPC_OVERRIDE_KEYS.len(), BASE_IPC_OVERRIDE_KEYS.len() + 1);
+        assert_eq!(
+            CLIENT_IPC_OVERRIDE_KEYS.len(),
+            BASE_IPC_OVERRIDE_KEYS.len() + 1
+        );
         for key in BASE_IPC_OVERRIDE_KEYS {
             assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(key));
         }
@@ -611,7 +622,11 @@ mod tests {
         assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
         assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"heartbeat_interval"));
 
-        for keys in [BASE_IPC_OVERRIDE_KEYS, SERVER_IPC_OVERRIDE_KEYS, CLIENT_IPC_OVERRIDE_KEYS] {
+        for keys in [
+            BASE_IPC_OVERRIDE_KEYS,
+            SERVER_IPC_OVERRIDE_KEYS,
+            CLIENT_IPC_OVERRIDE_KEYS,
+        ] {
             assert!(!keys.contains(&"max_pool_memory"));
             assert!(!keys.contains(&"shm_threshold"));
         }
@@ -761,7 +776,10 @@ mod tests {
         let cfg = BaseIpcConfig::default();
         let limits = crate::MemoryBudgetLimits::default();
 
-        assert_eq!(cfg.shm_backing_budget_bytes, limits.shm_backing_budget_bytes);
+        assert_eq!(
+            cfg.shm_backing_budget_bytes,
+            limits.shm_backing_budget_bytes
+        );
         assert_eq!(
             cfg.file_backing_budget_bytes,
             limits.file_backing_budget_bytes
@@ -815,7 +833,10 @@ mod tests {
             ..BaseIpcConfig::default()
         };
         assert!(cfg.validate().is_ok());
-        assert_eq!(cfg.memory_budget_limits(), crate::MemoryBudgetLimits::zeroed());
+        assert_eq!(
+            cfg.memory_budget_limits(),
+            crate::MemoryBudgetLimits::zeroed()
+        );
     }
 
     #[test]
@@ -993,7 +1014,10 @@ mod tests {
         assert_eq!(pool.buddy_idle_decay_secs, 12.0);
         assert_eq!(pool.dedicated_crash_timeout_secs, 5.0);
         assert_eq!(pool.max_dedicated_segments, 7);
-        assert_eq!(pool.spill_dir, std::path::PathBuf::from("/tmp/projection_test"));
+        assert_eq!(
+            pool.spill_dir,
+            std::path::PathBuf::from("/tmp/projection_test")
+        );
     }
 
     #[test]
@@ -1010,7 +1034,10 @@ mod tests {
         assert!(!pool.buddy_enabled);
         // Dedicated storage must stay reachable when buddy is disabled.
         assert!(pool.max_dedicated_segments > 0);
-        assert_eq!(pool.min_retained_segments, cfg.pool_min_retained_segments as usize);
+        assert_eq!(
+            pool.min_retained_segments,
+            cfg.pool_min_retained_segments as usize
+        );
     }
 
     #[test]
@@ -1036,11 +1063,7 @@ mod tests {
 
         cfg.max_pool_segments = MAX_IPC_POOL_SEGMENTS + 1;
         cfg.max_pool_memory = cfg_pool_memory(MAX_IPC_POOL_SEGMENTS + 1);
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("max_pool_segments")
-        );
+        assert!(cfg.validate().unwrap_err().contains("max_pool_segments"));
 
         cfg = BaseIpcConfig {
             reassembly_max_segments: MAX_IPC_POOL_SEGMENTS,
@@ -1071,25 +1094,13 @@ mod tests {
         assert!(cfg.validate().is_ok());
 
         cfg.pool_decay_seconds = -1.0; // negative is rejected like the server
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("pool_decay_seconds")
-        );
+        assert!(cfg.validate().unwrap_err().contains("pool_decay_seconds"));
 
         cfg.pool_decay_seconds = f64::NAN;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("pool_decay_seconds")
-        );
+        assert!(cfg.validate().unwrap_err().contains("pool_decay_seconds"));
 
         cfg.pool_decay_seconds = f64::INFINITY;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("pool_decay_seconds")
-        );
+        assert!(cfg.validate().unwrap_err().contains("pool_decay_seconds"));
 
         cfg.pool_decay_seconds = 1e100;
         assert!(
@@ -1131,6 +1142,10 @@ mod tests {
         assert_eq!(pristine, pristine.clone());
 
         let base_mutations = [
+            BaseIpcConfig {
+                endpoint_protocol: crate::LocalEndpointProtocol::ManagedV2,
+                ..base.clone()
+            },
             BaseIpcConfig {
                 pool_enabled: !base.pool_enabled,
                 ..base.clone()
