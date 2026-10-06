@@ -536,17 +536,16 @@ fn unix_rejects_a_windows_platform_document() {
     assert_rejected(&document, &[EndpointCredentialErrorKind::UnsupportedPlatform]);
 }
 
-/// `managedunsupported`: a managed-v2 document needs an incarnation and a
-/// managed listener, neither of which a Windows kernel pipe can provide, so it
-/// is rejected instead of being downgraded into a collectable credential.
+/// Windows refuses managed-v2 during canonical endpoint derivation, before
+/// interpreting Unix incarnation or identity fields. It must never downgrade
+/// that explicit protocol into a collectable legacy pipe credential.
 #[cfg(windows)]
 #[test]
 fn windows_rejects_managed_v2_documents() {
     let with_incarnation = r#"{"schemaVersion":2,"address":"ipc://codec-managedunsupported","protocol":"managed-v2","platform":"windows","incarnation":"00112233445566778899aabbccddeeff"}"#;
-    assert_rejected(
-        with_incarnation,
-        &[EndpointCredentialErrorKind::IncarnationRequired],
-    );
+    let error = decoded(with_incarnation).expect_err("Windows cannot derive a managed endpoint");
+    assert_eq!(error.kind(), EndpointCredentialErrorKind::InvalidValue);
+    assert_eq!(error.field(), Some("address"));
     // A Unix identity field is not a Windows pipe property either.
     let with_identity = r#"{"schemaVersion":1,"address":"ipc://codec-managedunsupported","protocol":"legacy-v1","platform":"windows","device":1,"inode":2}"#;
     assert_rejected(with_identity, &[EndpointCredentialErrorKind::InvalidValue]);
