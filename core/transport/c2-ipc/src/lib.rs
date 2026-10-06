@@ -27,7 +27,10 @@ pub use c2_wire::shutdown_control::{DirectShutdownAck, ShutdownControlRouteOutco
 pub use client::{
     ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestBlock, RouteBinding, ServerPoolState,
 };
-pub use control::{local_endpoint_from_ipc_address, ping, shutdown};
+pub use control::{
+    local_endpoint_from_ipc_address, local_endpoint_from_ipc_address_with_protocol, ping,
+    ping_with_protocol, shutdown, shutdown_with_protocol,
+};
 pub use pool::{ClientCacheMemorySnapshot, ClientPool};
 pub use response::{ResponseData, ResponseLease};
 pub use sync_client::{IpcCallError, SyncClient, TransportPhase};

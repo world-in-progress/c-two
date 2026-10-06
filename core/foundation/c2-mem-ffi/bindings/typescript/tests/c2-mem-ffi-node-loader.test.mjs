@@ -7,9 +7,11 @@ import test from 'node:test';
 
 import {
   C2_MEM_FFI_ABI_VERSION,
+  C2_LOCAL_ENDPOINT_PROTOCOLS,
   createBundledC2MemFfiNodeRuntime,
   createC2MemFfiRequestPoolFromSymbols,
   createC2MemFfiResponsePoolFromSymbols,
+  createNodeIpcConnect,
   loadBundledC2MemFfiNodeNativeSymbols,
   loadC2MemFfiNodeNativeSymbols,
   resolveBundledC2MemFfiNodeNativeLibraryPath,
@@ -19,6 +21,89 @@ import {
 function libraryPath() {
   return resolveBundledC2MemFfiNodeNativeLibraryPath();
 }
+
+/**
+ * The protocol projection is validated before any native symbol is loaded, so
+ * these rejections are provable without the compiled addon.
+ */
+test('endpoint protocol names are the canonical Rust vocabulary only', () => {
+  assert.deepEqual([...C2_LOCAL_ENDPOINT_PROTOCOLS], ['legacy-v1', 'managed-v2']);
+  for (const invalid of ['MANAGED-V2', 'future-v3', 'managed_v2', 1, null, {}]) {
+    assert.throws(
+      () => resolveLocalIpcEndpoint('ipc://protocol-projection', { endpointProtocol: invalid }),
+      /must be one of legacy-v1, managed-v2/,
+    );
+  }
+});
+
+test('endpoint protocol resolution rejects NUL and non-object options first', () => {
+  assert.throws(
+    () => resolveLocalIpcEndpoint('ipc://bad\0name', { endpointProtocol: 'managed-v2' }),
+    /NUL/,
+  );
+  assert.throws(
+    () => resolveLocalIpcEndpoint('ipc://protocol-projection', null),
+    /options must be an object/,
+  );
+});
+
+test('createNodeIpcConnect rejects a protocol and a custom resolver together', () => {
+  assert.throws(
+    () => createNodeIpcConnect({
+      endpointProtocol: 'managed-v2',
+      resolveEndpoint: (address) => address,
+    }),
+    /cannot be combined with a custom resolveEndpoint resolver/,
+  );
+  assert.throws(
+    () => createNodeIpcConnect({ endpointProtocol: 'not-a-protocol' }),
+    /must be one of legacy-v1, managed-v2/,
+  );
+});
+
+test('a named endpoint protocol resolves exactly one OS endpoint', () => {
+  const address = `ipc://protocol-strict-${process.pid}`;
+  const legacy = resolveLocalIpcEndpoint(address, { endpointProtocol: 'legacy-v1' });
+  const resolved = resolveLocalIpcEndpoint(address);
+
+  // A named protocol is a strict derivation and an omitted protocol keeps the
+  // resolved policy.
+  assert.equal(resolved, legacy);
+
+  if (process.platform === 'win32') {
+    // Windows has no managed-v2 endpoint: the request must be refused by the
+    // concrete platform rule instead of quietly resolving the legacy pipe.
+    assert.match(legacy, /^\\\\\.\\pipe\\c_two-/);
+    assert.throws(
+      () => resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' }),
+      /managed-v2/,
+    );
+    const runtime = createBundledC2MemFfiNodeRuntime();
+    assert.equal(typeof runtime.resolveEndpointWithProtocol, 'function');
+    assert.throws(
+      () => runtime.resolveEndpointWithProtocol(address, { endpointProtocol: 'managed-v2' }),
+      /managed-v2/,
+    );
+    assert.equal(runtime.resolveEndpoint(address), legacy);
+    return;
+  }
+
+  const managed = resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' });
+  // The two vocabularies name distinct endpoints.
+  assert.notEqual(legacy, managed);
+  assert.equal(legacy, `/tmp/c_two_ipc/protocol-strict-${process.pid}.sock`);
+  assert.match(managed, /^\/tmp\/c2-[0-9a-f]+\/v2\/[0-9a-f]{64}\.sock$/);
+  // The derivation is pure and repeatable.
+  assert.equal(managed, resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' }));
+
+  const runtime = createBundledC2MemFfiNodeRuntime();
+  assert.equal(typeof runtime.resolveEndpointWithProtocol, 'function');
+  assert.equal(
+    runtime.resolveEndpointWithProtocol(address, { endpointProtocol: 'managed-v2' }),
+    managed,
+  );
+  assert.equal(runtime.resolveEndpoint(address), legacy);
+});
 
 test('c2-mem-ffi bundled Node native loader resolves packaged runtime artifacts', () => {
   const bundled = resolveBundledC2MemFfiNodeNativeLibraryPath();

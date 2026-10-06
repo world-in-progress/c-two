@@ -97,8 +97,8 @@ typedef void (*response_pool_destroy_fn)(C2MemFfiResponsePool *);
 typedef C2MemFfiStatus (*response_pool_read_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock, uint8_t *, size_t, size_t *);
 typedef C2MemFfiStatus (*response_pool_release_fn)(C2MemFfiResponsePool *, C2MemFfiResponseBlock);
 typedef uint32_t (*abi_version_fn)(void);
-typedef C2MemFfiStatus (*local_endpoint_len_fn)(const char *, size_t *);
-typedef C2MemFfiStatus (*local_endpoint_copy_fn)(const char *, char *, size_t, size_t *);
+typedef C2MemFfiStatus (*local_endpoint_len_fn)(const char *, const char *, size_t *);
+typedef C2MemFfiStatus (*local_endpoint_copy_fn)(const char *, const char *, char *, size_t, size_t *);
 
 typedef struct C2MemFfiNodeSymbols {
     void *library;
@@ -777,8 +777,11 @@ static napi_value response_pool_release(napi_env env, napi_callback_info info) {
 }
 
 static napi_value local_endpoint(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
+    /* One strict endpoint protocol per call: "" (or a missing argument) keeps
+     * the resolved process policy, any other value names exactly one
+     * canonical protocol and never falls back to another namespace. */
+    size_t argc = 2;
+    napi_value args[2];
     C2MemFfiNodeSymbols *symbols = NULL;
     if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc < 1) {
         return throw_type_error(env, "c2_mem_ffi_local_endpoint expects an ipc:// address.");
@@ -787,23 +790,44 @@ static napi_value local_endpoint(napi_env env, napi_callback_info info) {
     if (address == NULL) {
         return NULL;
     }
+    const char *protocol = "";
+    char *protocol_buffer = NULL;
+    if (argc >= 2) {
+        napi_valuetype protocol_type = napi_undefined;
+        if (!check_napi(napi_typeof(env, args[1], &protocol_type))) {
+            free(address);
+            return NULL;
+        }
+        if (protocol_type != napi_undefined && protocol_type != napi_null) {
+            protocol_buffer = read_string_arg(env, args[1], "IPC endpoint protocol must be a string.");
+            if (protocol_buffer == NULL) {
+                free(address);
+                return NULL;
+            }
+            protocol = protocol_buffer;
+        }
+    }
     size_t length = 0;
-    C2MemFfiStatus status = symbols->local_endpoint_len(address, &length);
+    C2MemFfiStatus status = symbols->local_endpoint_len(address, protocol, &length);
     if (status != C2_MEM_FFI_STATUS_OK) {
+        free(protocol_buffer);
         free(address);
         return make_status_result(env, status, NULL);
     }
     if (length == SIZE_MAX) {
+        free(protocol_buffer);
         free(address);
         return throw_error(env, "IPC endpoint name is too large.");
     }
     char *buffer = (char *)malloc(length + 1);
     if (buffer == NULL) {
+        free(protocol_buffer);
         free(address);
         return throw_error(env, "Out of memory.");
     }
     size_t written = 0;
-    status = symbols->local_endpoint_copy(address, buffer, length + 1, &written);
+    status = symbols->local_endpoint_copy(address, protocol, buffer, length + 1, &written);
+    free(protocol_buffer);
     free(address);
     napi_value value = NULL;
     if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_string_utf8(env, buffer, written, &value))) {

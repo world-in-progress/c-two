@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 use crate::client::IpcError;
+use c2_config::LocalEndpointProtocol;
 use c2_local::{LocalEndpoint, LocalStream};
 use c2_wire::flags::{FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{self, HEADER_SIZE};
@@ -11,8 +12,24 @@ use c2_wire::msg_type::{PING_BYTES, PONG_BYTES};
 use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_ack, encode_shutdown_initiate};
 
 pub fn local_endpoint_from_ipc_address(address: &str) -> Result<LocalEndpoint, IpcError> {
-    LocalEndpoint::from_address(address).map_err(|error| {
-        if error.kind() == io::ErrorKind::InvalidInput {
+    local_endpoint_from_ipc_address_with_protocol(address, LocalEndpointProtocol::LegacyV1)
+}
+
+/// Project a logical IPC address with one strict endpoint protocol.
+///
+/// There is no protocol probing here: the caller's resolved or configured
+/// protocol alone decides the OS endpoint, and a managed-v2 request on a
+/// platform that cannot serve it is a configuration error, never a silent
+/// legacy fallback.
+pub fn local_endpoint_from_ipc_address_with_protocol(
+    address: &str,
+    protocol: LocalEndpointProtocol,
+) -> Result<LocalEndpoint, IpcError> {
+    LocalEndpoint::from_address_with_protocol(address, protocol).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+        ) {
             IpcError::Config(error.to_string())
         } else {
             IpcError::Io(error)
@@ -165,7 +182,20 @@ mod test_seam {
 }
 
 pub fn ping(address: &str, timeout: Duration) -> Result<bool, IpcError> {
-    let endpoint = local_endpoint_from_ipc_address(address)?;
+    ping_with_protocol(address, LocalEndpointProtocol::LegacyV1, timeout)
+}
+
+/// Ping through one strict endpoint protocol.
+///
+/// Administrative probes must never probe old and new endpoint derivations to
+/// find a live server: `protocol` alone selects the OS endpoint, so a probe
+/// either reaches the server the resolved policy names or reports absence.
+pub fn ping_with_protocol(
+    address: &str,
+    protocol: LocalEndpointProtocol,
+    timeout: Duration,
+) -> Result<bool, IpcError> {
+    let endpoint = local_endpoint_from_ipc_address_with_protocol(address, protocol)?;
     #[cfg(test)]
     let address = address.to_owned();
     blocking(async move {
@@ -214,8 +244,42 @@ fn unacknowledged() -> DirectShutdownAck {
     }
 }
 
+/// The one endpoint this probe was addressed to owns no listener.
+///
+/// This is the only absence-shaped success: it is scoped to the single OS
+/// endpoint `protocol` named, so it is not a cross-namespace probe result.
+fn already_stopped() -> DirectShutdownAck {
+    DirectShutdownAck {
+        acknowledged: true,
+        shutdown_started: false,
+        server_stopped: true,
+        route_outcomes: Vec::new(),
+    }
+}
+
 pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectShutdownAck, IpcError> {
-    let endpoint = local_endpoint_from_ipc_address(address)?;
+    shutdown_with_protocol(address, LocalEndpointProtocol::LegacyV1, timeout)
+}
+
+/// Initiate shutdown through one strict endpoint protocol.
+///
+/// The same no-probing rule as [`ping_with_protocol`]: a legacy probe can
+/// never stop a managed-v2 server by accident, and a managed-v2 probe can
+/// never stop a legacy server.
+///
+/// An absent endpoint is reported as already stopped: this address names one
+/// operating-system endpoint under `protocol`, no listener owns it, and a
+/// later server on that same endpoint would be a new incarnation rather than
+/// the one this probe was addressed to. The reply `server_stopped: false` is
+/// *not* re-derivable from absence — only a live server's acknowledgement
+/// carries route outcomes — so absence is answered here instead of being
+/// confused with a probe that reached the wrong namespace.
+pub fn shutdown_with_protocol(
+    address: &str,
+    protocol: LocalEndpointProtocol,
+    timeout: Duration,
+) -> Result<DirectShutdownAck, IpcError> {
+    let endpoint = local_endpoint_from_ipc_address_with_protocol(address, protocol)?;
     blocking(async move {
         let started = Instant::now();
         let request = encode_shutdown_initiate();
@@ -231,12 +295,7 @@ pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectShutdownAck, I
             .await?
             {
                 Exchange::Absent => {
-                    return Ok(DirectShutdownAck {
-                        acknowledged: true,
-                        shutdown_started: false,
-                        server_stopped: true,
-                        route_outcomes: Vec::new(),
-                    });
+                    return Ok(already_stopped());
                 }
                 Exchange::Reply(flags, payload) => {
                     if flags & FLAG_SIGNAL == 0 || flags & FLAG_RESPONSE == 0 {
@@ -427,6 +486,67 @@ mod tests {
         let result = shutdown(&address, Duration::from_millis(20)).unwrap();
         assert!(result.acknowledged && result.server_stopped && !result.shutdown_started);
         assert!(result.route_outcomes.is_empty());
+    }
+
+    /// Absence is only ever reported for the exact endpoint a protocol names:
+    /// a probe that resolves elsewhere must not reach the live responder, and
+    /// must not claim the live server was stopped.
+    #[test]
+    fn strict_protocol_probe_never_reaches_the_other_endpoint_namespace() {
+        #[cfg(unix)]
+        {
+            let address = address("strict-protocol");
+            let legacy = local_endpoint_from_ipc_address_with_protocol(
+                &address,
+                LocalEndpointProtocol::LegacyV1,
+            )
+            .unwrap();
+            let managed = local_endpoint_from_ipc_address_with_protocol(
+                &address,
+                LocalEndpointProtocol::ManagedV2,
+            )
+            .unwrap();
+            assert_ne!(legacy.os_name(), managed.os_name());
+
+            // A responder bound on the legacy endpoint answers only the
+            // legacy probe; the managed probe is answered by absence.
+            let responder = responder(
+                address.clone(),
+                false,
+                PING_BYTES.to_vec(),
+                PONG_BYTES.to_vec(),
+            );
+            responder.wait_ready();
+            responder.bind();
+            assert!(
+                ping_with_protocol(&address, LocalEndpointProtocol::LegacyV1, PROBE_BUDGET)
+                    .unwrap()
+            );
+            let managed_ping = ping_with_protocol(
+                &address,
+                LocalEndpointProtocol::ManagedV2,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+            let managed_shutdown = shutdown_with_protocol(
+                &address,
+                LocalEndpointProtocol::ManagedV2,
+                Duration::from_millis(50),
+            )
+            .unwrap();
+            // The legacy responder is still serving after the managed probe.
+            let still_live =
+                ping_with_protocol(&address, LocalEndpointProtocol::LegacyV1, PROBE_BUDGET)
+                    .unwrap();
+            responder.stop();
+
+            assert!(!managed_ping, "the managed namespace must not answer");
+            assert!(
+                managed_shutdown.server_stopped && !managed_shutdown.shutdown_started,
+                "absence on the managed endpoint is scoped to that endpoint: {managed_shutdown:?}"
+            );
+            assert!(still_live, "the legacy responder must be untouched");
+        }
     }
 
     #[cfg(unix)]

@@ -2,18 +2,19 @@ use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
+use c2_http::relay::{RelayConfig, RelayServer};
 use c_two::generated::{
-    C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess, MethodDefinition,
-    ServiceDefinition, fastdb_cause_details,
+    fastdb_cause_details, C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess,
+    MethodDefinition, ServiceDefinition,
 };
 use c_two::{
     Connect, ContractLimits, ContractRelease, ContractReleaseRef, Error, HostOptions, Runtime,
     RuntimeOptions, ServiceConcurrencyMode,
 };
-use c2_http::relay::{RelayConfig, RelayServer};
 use fastdb::{BuildPolicy, Builder, CompiledSpec};
 
 const DESCRIPTOR: &str = r#"{
@@ -229,6 +230,70 @@ fn package_identity_and_root_imports_are_exact() {
 
     let semantic = Error::Semantic(C2Error::new(ErrorCode::Unknown, "type assertion"));
     accepts_error(&semantic);
+}
+
+#[test]
+fn explicit_endpoint_protocol_and_admin_probes_are_thin_facade_reexports() {
+    use c_two::{
+        direct_ipc_endpoint, direct_ipc_endpoint_with_protocol, ping_direct_ipc,
+        ping_direct_ipc_with_protocol, shutdown_direct_ipc_with_protocol, LocalEndpointProtocol,
+    };
+
+    let address = format!("ipc://{}", unique_name("rust-sdk-protocol"));
+    // The protocol vocabulary is the Core configuration type, not an SDK copy.
+    let legacy = direct_ipc_endpoint_with_protocol(&address, LocalEndpointProtocol::LegacyV1)
+        .expect("the legacy endpoint derives on every platform");
+    assert_eq!(legacy.protocol().as_str(), "legacy-v1");
+
+    // The unresolved facade resolves the process policy, which is legacy-v1
+    // unless the process configured otherwise, and it agrees with the explicit
+    // legacy derivation exactly.
+    assert_eq!(
+        direct_ipc_endpoint(&address).expect("resolved endpoint"),
+        legacy
+    );
+
+    // A strict admin probe on an endpoint with no listener reports absence.
+    assert!(!ping_direct_ipc(&address, Duration::from_millis(20)).expect("valid address"));
+
+    match direct_ipc_endpoint_with_protocol(&address, LocalEndpointProtocol::ManagedV2) {
+        Ok(managed) => {
+            // Unix: managed-v2 is a real, distinct endpoint namespace.
+            assert_eq!(managed.protocol().as_str(), "managed-v2");
+            assert_ne!(legacy.os_name(), managed.os_name());
+            assert!(!ping_direct_ipc_with_protocol(
+                &address,
+                LocalEndpointProtocol::ManagedV2,
+                Duration::from_millis(20)
+            )
+            .expect("valid address"));
+            let managed_outcome = shutdown_direct_ipc_with_protocol(
+                &address,
+                LocalEndpointProtocol::ManagedV2,
+                Duration::from_millis(20),
+            )
+            .expect("valid address");
+            assert!(managed_outcome.server_stopped && !managed_outcome.shutdown_started);
+            assert!(managed_outcome.route_outcomes.is_empty());
+        }
+        Err(error) => {
+            // Windows: the platform has no managed-v2 endpoint at all, so the
+            // refusal must stay the concrete unsupported-platform
+            // configuration error rather than a silent legacy fallback.
+            #[cfg(windows)]
+            {
+                let message = error.to_string();
+                assert!(
+                    message.contains("managed-v2") && message.contains("not supported on Windows"),
+                    "the refusal must name the unsupported protocol and platform: {message}"
+                );
+            }
+            #[cfg(unix)]
+            {
+                panic!("managed-v2 must resolve on Unix: {error}");
+            }
+        }
+    }
 }
 
 #[test]

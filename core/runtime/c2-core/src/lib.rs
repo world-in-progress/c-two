@@ -18,7 +18,8 @@ mod session;
 pub use client::{Client, Connect, EncodedClient, ObservedPath, ObservedRoute, PathCounters};
 pub use control::{
     DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
-    ping_direct_ipc, shutdown_direct_ipc,
+    direct_ipc_endpoint_with_protocol, ping_direct_ipc, ping_direct_ipc_with_protocol,
+    shutdown_direct_ipc, shutdown_direct_ipc_with_protocol,
 };
 pub use error::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, TransportError,

@@ -148,9 +148,18 @@ fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
     )
 }
 
-async fn connect_register_attestation_client(address: &str) -> Result<IpcClient, c2_ipc::IpcError> {
+async fn connect_register_attestation_client(
+    address: &str,
+    endpoint_protocol: c2_config::LocalEndpointProtocol,
+) -> Result<IpcClient, c2_ipc::IpcError> {
     for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
-        let mut client = IpcClient::with_config(address, ClientIpcConfig::default());
+        // Attestation clients keep their private, lazy default memory context
+        // outside the data-plane budget, but the endpoint protocol is the one
+        // resolved upstream policy: attestation and data-plane must name the
+        // same OS endpoint without probing across protocols.
+        let mut config = ClientIpcConfig::default();
+        config.base.endpoint_protocol = endpoint_protocol;
+        let mut client = IpcClient::with_config(address, config);
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err)
@@ -496,7 +505,12 @@ impl RelayServer {
                         }
                     };
                     let result = {
-                        match connect_register_attestation_client(&address).await {
+                        match connect_register_attestation_client(
+                            &address,
+                            state.config().upstream_ipc.base.endpoint_protocol,
+                        )
+                        .await
+                        {
                             Ok(client) => {
                                 let server_identity_matches =
                                     client.server_id() == Some(server_id.as_str());
@@ -813,7 +827,7 @@ mod tests {
             .find(".prepare_candidate_registration(")
             .expect("command registration must prepare replacement eligibility");
         let connect = body
-            .find("connect_register_attestation_client(&address).await")
+            .find("connect_register_attestation_client(")
             .expect("command registration must connect candidate IPC");
         let read = body
             .find("read_ipc_route_contract")
@@ -981,6 +995,69 @@ mod tests {
         assert!(!should_retry_register_attestation_connect(
             &c2_ipc::IpcError::ContractMismatch("wrong contract".into())
         ));
+    }
+
+    /// Attestation and the data plane must name the same OS endpoint.
+    ///
+    /// The attestation client is built from the relay's resolved upstream
+    /// policy rather than a private default, so a relay configured for
+    /// managed-v2 attests over managed-v2 and never reaches a legacy listener
+    /// at the same logical address. This test binds a managed-v2 server and
+    /// proves the attestation client built by the production helper resolves
+    /// the managed endpoint and completes its handshake there.
+    #[tokio::test]
+    async fn register_attestation_client_uses_the_resolved_upstream_protocol() {
+        use c2_config::LocalEndpointProtocol;
+
+        let suffix = NEXT_IPC_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        let address = format!("ipc://relay-attest-protocol-{suffix}");
+        let server_id = "relay-attest-server";
+        let mut server_config = c2_config::ServerIpcConfig::default();
+        server_config.base.endpoint_protocol = LocalEndpointProtocol::ManagedV2;
+        let server = Arc::new(
+            c2_server::Server::new_with_identity(
+                &address,
+                server_config,
+                c2_server::ServerIdentity {
+                    server_id: server_id.to_string(),
+                    server_instance_id: format!("{server_id}-instance"),
+                },
+            )
+            .unwrap(),
+        );
+        let server_task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            })
+        };
+        server
+            .wait_until_ready(std::time::Duration::from_secs(5))
+            .await
+            .expect("managed server ready");
+
+        // The legacy namespace at the same logical address holds no listener,
+        // so a legacy attestation client cannot complete a handshake.
+        let mut legacy_config = c2_ipc::ClientIpcConfig::default();
+        legacy_config.base.endpoint_protocol = LocalEndpointProtocol::LegacyV1;
+        let mut legacy = c2_ipc::IpcClient::with_config(&address, legacy_config);
+        assert!(
+            legacy.connect().await.is_err(),
+            "a legacy attestation client must not reach a managed-v2 server"
+        );
+
+        // The managed client the relay actually builds connects.
+        let client =
+            super::connect_register_attestation_client(&address, LocalEndpointProtocol::ManagedV2)
+                .await
+                .expect("managed attestation client connects");
+        assert_eq!(client.server_id(), Some(server_id));
+        super::close_client(client);
+
+        let _ = server
+            .shutdown_and_wait(std::time::Duration::from_secs(5))
+            .await;
+        let _ = server_task.await;
     }
 
     #[test]

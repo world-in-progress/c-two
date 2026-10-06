@@ -45,10 +45,16 @@ typedef struct C2MemFfiResponsePool C2MemFfiResponsePool;
 
 uint32_t c2_mem_ffi_abi_version(void);
 
-/* Resolve a logical ipc:// address through c2-config's native endpoint owner. */
-C2MemFfiStatus c2_mem_ffi_local_endpoint_len(const char *address, size_t *out_len);
+/*
+ * Resolve a logical ipc:// address through c2-config's native endpoint owner.
+ * `protocol` is NULL or "" for the resolved process client IPC policy, or one
+ * canonical protocol name ("legacy-v1" / "managed-v2"). Protocol selection is
+ * strict: there is no fallback across endpoint namespaces.
+ */
+C2MemFfiStatus c2_mem_ffi_local_endpoint_len(
+    const char *address, const char *protocol, size_t *out_len);
 C2MemFfiStatus c2_mem_ffi_local_endpoint_copy(
-    const char *address, char *dst, size_t dst_len, size_t *out_written);
+    const char *address, const char *protocol, char *dst, size_t dst_len, size_t *out_written);
 
 /* Creates a native buddy/dedicated request pool. max_segments must be 1..16. */
 C2MemFfiStatus c2_mem_ffi_request_pool_new(

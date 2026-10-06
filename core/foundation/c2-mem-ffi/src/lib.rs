@@ -288,15 +288,46 @@ pub extern "C" fn c2_mem_ffi_abi_version() -> u32 {
     C2_MEM_FFI_ABI_VERSION
 }
 
-fn local_endpoint_name(address: *const c_char) -> Result<String, C2MemFfiStatus> {
+/// Resolve the endpoint protocol a native caller asked for.
+///
+/// An empty name keeps the resolved process client IPC policy, exactly like
+/// the Python and Rust admin facades. Any other name must be a canonical
+/// protocol (`legacy-v1` / `managed-v2`); there is no fallback, so a
+/// `managed-v2` request on a platform that cannot serve it fails here instead
+/// of quietly naming a legacy endpoint.
+fn requested_endpoint_protocol(
+    protocol: *const c_char,
+) -> Result<Option<c2_config::LocalEndpointProtocol>, C2MemFfiStatus> {
+    if protocol.is_null() {
+        return Ok(None);
+    }
+    let name = unsafe { CStr::from_ptr(protocol) }
+        .to_str()
+        .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+    if name.is_empty() {
+        return Ok(None);
+    }
+    name.parse::<c2_config::LocalEndpointProtocol>()
+        .map(Some)
+        .map_err(|_| C2MemFfiStatus::InvalidArgument)
+}
+
+fn local_endpoint_name(
+    address: *const c_char,
+    protocol: *const c_char,
+) -> Result<String, C2MemFfiStatus> {
     if address.is_null() {
         return Err(C2MemFfiStatus::NullPointer);
     }
     let address = unsafe { CStr::from_ptr(address) }
         .to_str()
         .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
-    let endpoint =
-        LocalEndpoint::from_address(address).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+    let requested = requested_endpoint_protocol(protocol)?;
+    let endpoint = match requested {
+        Some(protocol) => LocalEndpoint::from_address_with_protocol(address, protocol),
+        None => LocalEndpoint::from_address(address),
+    }
+    .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
     endpoint
         .os_name()
         .to_str()
@@ -306,27 +337,41 @@ fn local_endpoint_name(address: *const c_char) -> Result<String, C2MemFfiStatus>
 
 /// Project the native local endpoint name without duplicating platform rules.
 ///
+/// `protocol` may be NULL or an empty string to keep the resolved process
+/// client IPC policy; otherwise it names one canonical protocol strictly.
+///
 /// # Safety
-/// `address` must be NUL-terminated and `out_len` valid for one `usize`.
+/// `address` must be NUL-terminated, `protocol` must be NULL or
+/// NUL-terminated, and `out_len` valid for one `usize`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_len(
     address: *const c_char,
+    protocol: *const c_char,
     out_len: *mut usize,
 ) -> C2MemFfiStatus {
-    guard_status(|| write_len(out_len, local_endpoint_name(address)?.len()))
+    guard_status(|| write_len(out_len, local_endpoint_name(address, protocol)?.len()))
 }
 
 /// # Safety
-/// `address` must be NUL-terminated; `dst` and `out_written` must be writable
-/// for `dst_len` bytes and one `usize`, respectively.
+/// `address` must be NUL-terminated, `protocol` must be NULL or
+/// NUL-terminated; `dst` and `out_written` must be writable for `dst_len`
+/// bytes and one `usize`, respectively.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_copy(
     address: *const c_char,
+    protocol: *const c_char,
     dst: *mut c_char,
     dst_len: usize,
     out_written: *mut usize,
 ) -> C2MemFfiStatus {
-    guard_status(|| copy_c_string(&local_endpoint_name(address)?, dst, dst_len, out_written))
+    guard_status(|| {
+        copy_c_string(
+            &local_endpoint_name(address, protocol)?,
+            dst,
+            dst_len,
+            out_written,
+        )
+    })
 }
 
 /// # Safety
