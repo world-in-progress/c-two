@@ -17,6 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub use c2_config::LocalEndpoint;
 
+pub mod owner;
+pub use owner::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};
+
 #[cfg(unix)]
 mod unix_endpoint;
 
