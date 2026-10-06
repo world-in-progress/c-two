@@ -1,0 +1,318 @@
+name: Local Endpoint Validation
+
+# Run the same immutable C-Two/FastDB pair on real Linux workers.
+# Each job owns its installation and build outputs. Python test sharding and
+# strict cross-language matrices use the existing complete runner.
+
+on:
+  push:
+    branches: [socu/local-endpoint-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-endpoint-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FASTDB_SOURCE_SHA: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
+  C2_ENV_FILE: ""
+  C2_RELAY_ANCHOR_ADDRESS: ""
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  PYTHONUTF8: "1"
+
+jobs:
+  core-test:
+    name: core workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: c-two
+          ref: ${{ github.sha }}
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: world-in-progress/fastdb
+          ref: ${{ env.FASTDB_SOURCE_SHA }}
+          path: fastdb
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+          check-latest: true
+
+      # c2-codegen typechecks generated TypeScript against the sibling
+      # fastdb4ts sources and reads the FastDB golden specs from the same
+      # sibling tree, so this snapshot is a real prerequisite.
+      - name: Install FastDB TypeScript compiler dependencies
+        working-directory: c-two
+        run: npm ci --prefix ../fastdb/ts/fastdb4ts
+
+      # Registry fastdb-sys uses the official system CoreSDK. App CLI and
+      # Python workspaces separately opt into their immutable source patch.
+      - name: Provision the official FastDB CoreSDK
+        working-directory: c-two
+        run: >-
+          python .github/scripts/prepare_fastdb_sdk.py
+          --target x86_64-unknown-linux-gnu
+          --output "${{ runner.temp }}/fastdb-core-sdk"
+          --emit-github
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            c-two/core -> target
+            c-two/cli -> target
+            c-two/sdk/rust -> target
+            c-two/sdk/python/native -> target
+            fastdb/bindings/rust -> target
+          key: local-endpoint-ubuntu2404-${{ env.FASTDB_SOURCE_SHA }}
+
+      - name: Record the validated source pair
+        working-directory: c-two
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/local-endpoint-validation
+          {
+            echo "c-two $(git rev-parse HEAD)"
+            echo "fastdb ${{ env.FASTDB_SOURCE_SHA }}"
+            echo "runner ${{ runner.os }}-${{ runner.arch }}"
+          } | tee artifacts/local-endpoint-validation/source-pair.txt
+
+      # The Core workspace owns the c2-local integration targets, so this
+      # already runs the new integration tests; the focused job below only
+      # narrows the failure surface. The pipeline status is read back from
+      # PIPESTATUS so a failing cargo step cannot be masked by a successful
+      # `tee`, and the log is still retained for the artifact upload.
+      - name: Test the Core workspace, including the new integration
+        working-directory: c-two
+        run: |
+          set -euxo pipefail
+          set -o pipefail
+          cargo test --locked --manifest-path core/Cargo.toml --workspace --all-features \
+            2>&1 | tee artifacts/local-endpoint-validation/core-workspace-tests.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Test the Rust SDK with all features
+        working-directory: c-two
+        run: |
+          set -euxo pipefail
+          cargo test --locked --manifest-path sdk/rust/Cargo.toml --all-features \
+            2>&1 | tee artifacts/local-endpoint-validation/rust-sdk-tests.log
+
+      - name: Test and build the source-linked CLI
+        working-directory: c-two
+        env:
+          FASTDB_PAYLOAD_LINK_MODE: source
+        run: |
+          set -euxo pipefail
+          cargo test --locked --manifest-path cli/Cargo.toml \
+            2>&1 | tee artifacts/local-endpoint-validation/cli-tests.log
+          cargo build --locked --manifest-path cli/Cargo.toml --bin c3
+
+      - name: Upload logs and run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-endpoint-validation-${{ github.sha }}-core-test
+          path: c-two/artifacts/local-endpoint-validation/
+          if-no-files-found: error
+          retention-days: 14
+
+  focused-local:
+    name: focused c2-local endpoint suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FASTDB_PAYLOAD_LINK_MODE: source
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: c-two
+          ref: ${{ github.sha }}
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: world-in-progress/fastdb
+          ref: ${{ env.FASTDB_SOURCE_SHA }}
+          path: fastdb
+
+      # This job runs the lib, integration, and doc targets of the two crates
+      # the endpoint change touches plus their direct transport dependencies.
+      # It deliberately does NOT reuse the `--lib`-only local-platform subset
+      # from the Windows runner: the owner-control and endpoint integration
+      # tests are exactly what must run here.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            c-two/core -> target
+            fastdb/bindings/rust -> target
+          key: local-endpoint-focused-ubuntu2404-${{ env.FASTDB_SOURCE_SHA }}
+
+      - name: Record the validated source pair
+        working-directory: c-two
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/local-endpoint-validation
+          {
+            echo "c-two $(git rev-parse HEAD)"
+            echo "fastdb ${{ env.FASTDB_SOURCE_SHA }}"
+            echo "runner ${{ runner.os }}-${{ runner.arch }}"
+          } | tee artifacts/local-endpoint-validation/source-pair.txt
+
+      - name: Test the local endpoint crates
+        working-directory: c-two
+        run: |
+          set -euxo pipefail
+          cargo test --locked --manifest-path core/Cargo.toml --all-features \
+            -p c2-config -p c2-local -p c2-local-security -p c2-mem -p c2-server \
+            2>&1 | tee artifacts/local-endpoint-validation/focused-local-tests.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Upload logs and run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-endpoint-validation-${{ github.sha }}-focused-local
+          path: c-two/artifacts/local-endpoint-validation/
+          if-no-files-found: error
+          retention-days: 14
+
+  python-suite:
+    name: python suite through the local runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: c-two
+          ref: ${{ github.sha }}
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: world-in-progress/fastdb
+          ref: ${{ env.FASTDB_SOURCE_SHA }}
+          path: fastdb
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: emscripten-core/emsdk
+          ref: c817c0ca4ba889ee24a185fd954cff7de1bd8afa # 5.0.2
+          path: emsdk
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+          check-latest: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Provision the official FastDB CoreSDK
+        working-directory: c-two
+        run: >-
+          python .github/scripts/prepare_fastdb_sdk.py
+          --target x86_64-unknown-linux-gnu
+          --output "${{ runner.temp }}/fastdb-core-sdk"
+          --emit-github
+
+      # The 12-row TypeScript matrix generates and packs the consumers from
+      # the sibling FastDB tree (including the WASM built by the FastDB build
+      # script), so both npm trees and Emscripten 5.0.2 are required inputs.
+      - name: Install Emscripten 5.0.2 and the TypeScript prerequisites
+        working-directory: c-two
+        run: |
+          set -euxo pipefail
+          npm ci --prefix ../fastdb/ts/fastdb4ts
+          npm ci --prefix core/foundation/c2-mem-ffi/bindings/typescript
+          ../emsdk/emsdk install 5.0.2
+          ../emsdk/emsdk activate 5.0.2
+          source ../emsdk/emsdk_env.sh
+          {
+            for name in EMSDK EMSDK_NODE EMSDK_PYTHON EM_CONFIG; do
+              value="${!name:-}"
+              if [[ -n "$value" ]]; then
+                echo "$name=$value"
+              fi
+            done
+          } >> "$GITHUB_ENV"
+          # Keep setup-node's Node 22 as the application runtime; only the
+          # compiler paths cross the step boundary. The runner also probes
+          # `cargo`, `node`, and `npm` on PATH and refuses to start without
+          # them, so the c3 build output directory is exposed as well.
+          {
+            echo "$GITHUB_WORKSPACE/emsdk"
+            echo "$GITHUB_WORKSPACE/emsdk/upstream/emscripten"
+            echo "$GITHUB_WORKSPACE/c-two/cli/target/debug"
+          } >> "$GITHUB_PATH"
+          emcc --version
+          npm --version
+
+      # The runner loads the SDK Python sources from this checkout, the
+      # payload fixtures from the sibling FastDB tree, and the CoreSDK in
+      # system link mode. Python 3.10 must be installed because the minimum
+      # syntax gate refuses to skip.
+      - name: Prepare the local runner environment
+        working-directory: c-two
+        env:
+          FASTDB_PAYLOAD_LINK_MODE: source
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/local-endpoint-validation
+          uv python install 3.10
+          uv sync --locked
+          cargo build --locked --manifest-path cli/Cargo.toml
+          # The extension and every test dependency live in the uv venv this
+          # step just built. Resolve it once, after the sync, as the absolute
+          # interpreter path the runner hands to its own child processes.
+          "$(uv run --no-sync python -c 'import sys; print(sys.executable)')" -m pytest --version
+          uv run --no-sync python -c 'import sys; print(sys.executable)' > .runner-python
+
+      # tools/dev/test_python.py is the existing complete entry point: it
+      # collects the whole SDK once per group and requires the union of the
+      # strict 18-row Rust/Python matrix, the 12-row TypeScript matrix, and
+      # the ordinary suite to equal the full collection exactly. It is run
+      # through `uv run` so nested harness builds resolve uv offline.
+      - name: Run the complete Python suite and matrices
+        working-directory: c-two
+        run: |
+          set -euxo pipefail
+          FASTDB_PAYLOAD_LINK_MODE=system \
+          FASTDB_PAYLOAD_SYSTEM_LIB_DIR="${{ runner.temp }}/fastdb-core-sdk/lib" \
+          LD_LIBRARY_PATH="${{ runner.temp }}/fastdb-core-sdk/lib" \
+          uv run --no-sync python tools/dev/test_python.py \
+            --python "$(cat .runner-python)" \
+            --c3 cli/target/debug/c3 \
+            --workers 2 \
+            --stage-timeout 2400 \
+            --output artifacts/local-endpoint-validation/python-suite \
+            2>&1 | tee artifacts/local-endpoint-validation/python-suite.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Upload logs and run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-endpoint-validation-${{ github.sha }}-python-suite
+          path: c-two/artifacts/local-endpoint-validation/
+          if-no-files-found: error
+          retention-days: 14
