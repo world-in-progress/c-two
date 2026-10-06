@@ -65,6 +65,21 @@ fn decoded(json: &str) -> Result<EndpointCredential, EndpointCredentialError> {
     EndpointCredential::from_json(json)
 }
 
+#[cfg(unix)]
+async fn inspect_managed_when_gate_available(endpoint: &LocalEndpoint) -> EndpointCredential {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match inspect_endpoint(endpoint) {
+            EndpointInspection::Present(credential) => return credential,
+            EndpointInspection::IoError(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline, "namespace gate stayed busy");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            other => panic!("a live managed listener must inspect as present, got {other:?}"),
+        }
+    }
+}
+
 fn reject(json: &str) -> EndpointCredentialErrorKind {
     decoded(json).expect_err("document must be rejected").kind()
 }
@@ -351,29 +366,22 @@ async fn a_decoded_managed_credential_reaps_through_the_native_gate() {
     let decoded = decoded(&json).unwrap();
 
     // Inspecting the live endpoint must reproduce an equivalent credential,
-    // proving the file round-trip preserves exactly the native identity. A
-    // contended coordinator gate is reported as unverified rather than as a
-    // live endpoint, so retry until the gate is observed.
-    let inspected = loop {
-        match inspect_endpoint(decoded.endpoint()) {
-            EndpointInspection::Present(inspected) => break inspected,
-            EndpointInspection::Unverified(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            other => panic!("a live managed listener must inspect as present, got {other:?}"),
-        }
-    };
+    // proving the file round-trip preserves exactly the native identity.
+    // Only classified namespace contention may delay this observation.
+    let inspected = inspect_managed_when_gate_available(decoded.endpoint()).await;
     assert_eq!(inspected.to_json().unwrap(), json);
 
     // The listener is dropped without an explicit close, leaving the slot for
     // the reaper; the decoded credential is still the proof for that object.
     drop(listener);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let result = loop {
         match reap_endpoint(decoded.endpoint(), &decoded) {
             // A gate held by another process is not a cleanup decision, so
             // retry rather than treat contention as a verdict.
             EndpointReapResult::Busy => {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                assert!(std::time::Instant::now() < deadline, "retired target stayed busy");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             result => break result,
         }
@@ -401,10 +409,8 @@ async fn a_credential_for_another_endpoint_is_stale_not_authority() {
         matches!(result, EndpointReapResult::StaleTarget),
         "a foreign credential must be stale, got {result:?}"
     );
-    assert!(matches!(
-        inspect_endpoint(other.endpoint()),
-        EndpointInspection::Present(_)
-    ));
+    let inspected = inspect_managed_when_gate_available(other.endpoint()).await;
+    assert_eq!(inspected.to_json().unwrap(), other.to_json().unwrap());
     // The other listener still closes its own object cleanly.
     let _ = other_listener.close();
     drop(listener);
