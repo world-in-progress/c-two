@@ -1055,6 +1055,13 @@ mod tests {
         }
         #[cfg(windows)]
         {
+            let endpoint_error = c2_ipc::control::local_endpoint_from_ipc_address_with_protocol(
+                &address,
+                LocalEndpointProtocol::ManagedV2,
+            )
+            .expect_err("managed-v2 endpoint derivation must reject Windows");
+            assert!(matches!(&endpoint_error, c2_ipc::IpcError::Config(message)
+                if message == "managed-v2 IPC endpoints are not supported on Windows"));
             let error = super::connect_register_attestation_client(
                 &address,
                 LocalEndpointProtocol::ManagedV2,
@@ -1062,8 +1069,10 @@ mod tests {
             .await
             .err()
             .expect("managed-v2 must fail before Windows attestation connects");
+            // IpcClient stores the derivation error's Display text, then
+            // connect wraps that stored text as a configuration error.
             assert!(matches!(error, c2_ipc::IpcError::Config(message)
-                if message == "managed-v2 IPC endpoints are not supported on Windows"));
+                if message == endpoint_error.to_string()));
         }
 
         // The managed client the relay actually builds connects.

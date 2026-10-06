@@ -7,7 +7,9 @@ import test from 'node:test';
 
 import {
   C2_MEM_FFI_ABI_VERSION,
+  C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
   C2_LOCAL_ENDPOINT_PROTOCOLS,
+  C2NodeIpcConnectionError,
   createBundledC2MemFfiNodeRuntime,
   createC2MemFfiRequestPoolFromSymbols,
   createC2MemFfiResponsePoolFromSymbols,
@@ -74,15 +76,27 @@ test('a named endpoint protocol resolves exactly one OS endpoint', () => {
     // Windows has no managed-v2 endpoint: the request must be refused by the
     // concrete platform rule instead of quietly resolving the legacy pipe.
     assert.match(legacy, /^\\\\\.\\pipe\\c_two-/);
+    const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+    assert.deepEqual(symbols.c2_mem_ffi_local_endpoint(address, 'managed-v2'), {
+      status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
+    });
+    const rejectsManagedEndpoint = (error) => {
+      assert.ok(error instanceof C2NodeIpcConnectionError);
+      assert.equal(
+        error.message,
+        `C-Two native endpoint resolution failed for ${address} (status ${C2_MEM_FFI_STATUS_INVALID_ARGUMENT}).`,
+      );
+      return true;
+    };
     assert.throws(
       () => resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' }),
-      /managed-v2/,
+      rejectsManagedEndpoint,
     );
     const runtime = createBundledC2MemFfiNodeRuntime();
     assert.equal(typeof runtime.resolveEndpointWithProtocol, 'function');
     assert.throws(
       () => runtime.resolveEndpointWithProtocol(address, { endpointProtocol: 'managed-v2' }),
-      /managed-v2/,
+      rejectsManagedEndpoint,
     );
     assert.equal(runtime.resolveEndpoint(address), legacy);
     return;
@@ -92,7 +106,7 @@ test('a named endpoint protocol resolves exactly one OS endpoint', () => {
   // The two vocabularies name distinct endpoints.
   assert.notEqual(legacy, managed);
   assert.equal(legacy, `/tmp/c_two_ipc/protocol-strict-${process.pid}.sock`);
-  assert.match(managed, /^\/tmp\/c2-[0-9a-f]+\/v2\/[0-9a-f]{64}\.sock$/);
+  assert.match(managed, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
   // The derivation is pure and repeatable.
   assert.equal(managed, resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' }));
 
