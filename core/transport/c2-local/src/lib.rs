@@ -18,6 +18,168 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 pub use c2_config::LocalEndpoint;
 
 #[cfg(unix)]
+mod unix_endpoint;
+
+/// An opaque proof of one exact OS endpoint object created by this runtime.
+///
+/// Unix credentials contain the v1 socket identity recorded beside the
+/// endpoint. They are bound to the logical address and cannot authorize
+/// removal of a replacement socket. Windows credentials describe a
+/// kernel-managed named pipe and are not Unix cleanup capabilities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EndpointCredential {
+    endpoint: LocalEndpoint,
+    #[cfg(unix)]
+    identity: UnixSocketIdentity,
+}
+
+impl EndpointCredential {
+    pub fn endpoint(&self) -> &LocalEndpoint {
+        &self.endpoint
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unix(endpoint: LocalEndpoint, identity: UnixSocketIdentity) -> Self {
+        Self { endpoint, identity }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn kernel_managed(endpoint: LocalEndpoint) -> Self {
+        Self { endpoint }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnixSocketIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) changed_secs: i64,
+    pub(crate) changed_nanos: i64,
+}
+
+/// Why the native layer could not prove that an endpoint is safe to reap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointUnverifiedReason {
+    UnsafeDirectory,
+    Symlink,
+    UnexpectedObject,
+    ForeignOwner,
+    MissingOwnership,
+    InvalidOwnership,
+    InvalidRecord,
+    RecordMismatch,
+}
+
+/// A read-only observation of a local endpoint.
+#[derive(Debug)]
+pub enum EndpointInspection {
+    Absent,
+    Present(EndpointCredential),
+    Unverified(EndpointUnverifiedReason),
+    /// The platform owns endpoint lifetime inside a kernel namespace (Windows
+    /// named pipes). This observes the platform, not existence: there is no
+    /// filesystem entry that could prove one live instance is present.
+    KernelManaged,
+    IoError(io::Error),
+}
+
+/// Result of an identity-constrained, nonblocking endpoint reap.
+#[derive(Debug)]
+pub enum EndpointReapResult {
+    Reaped,
+    AlreadyAbsent,
+    Busy,
+    StaleTarget,
+    Unverified(EndpointUnverifiedReason),
+    /// There is no Unix socket directory entry to collect on this platform.
+    /// This does not claim that a matching live endpoint exists.
+    NotApplicable,
+    IoError(io::Error),
+}
+
+/// Bounded OS error details retained in a sweep batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndpointIoError {
+    pub kind: io::ErrorKind,
+    pub raw_os_error: Option<i32>,
+}
+
+impl From<&io::Error> for EndpointIoError {
+    fn from(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+
+/// Bounds one incremental maintenance batch. The default is a scheduling
+/// target, not a hard real-time guarantee for filesystem calls.
+#[derive(Clone, Copy, Debug)]
+pub struct SweepBudget {
+    pub max_entries: usize,
+    pub max_duration: Duration,
+}
+
+impl Default for SweepBudget {
+    fn default() -> Self {
+        Self {
+            max_entries: 64,
+            max_duration: Duration::from_millis(10),
+        }
+    }
+}
+
+/// Bounded counters for one sweep batch. No directory-wide entry list is
+/// retained or returned.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SweepBatch {
+    pub entries_visited: usize,
+    pub endpoints_examined: usize,
+    pub reaped: usize,
+    pub already_absent: usize,
+    pub busy: usize,
+    pub stale_target: usize,
+    pub unverified: usize,
+    pub io_errors: usize,
+    pub last_io_error: Option<EndpointIoError>,
+    pub not_applicable: usize,
+    /// True only on the batch of a round that reached directory EOF.
+    pub round_complete: bool,
+    /// True when the round ended before EOF because the verified namespace
+    /// directory was replaced. Every later batch of the same sweep keeps this
+    /// set and never reports `round_complete`, so a caller that only checks
+    /// `round_complete` cannot mistake an interrupted round for full coverage.
+    pub round_interrupted: bool,
+    /// True when the managed namespace no longer names the verified directory
+    /// this sweep opened, including the terminal batches after that detection.
+    pub namespace_changed: bool,
+}
+
+/// Stateful, explicitly driven maintenance over the current user's local
+/// endpoint namespace. Dropping this value interrupts the round; a new sweep
+/// always starts at the beginning and does not inherit completion state.
+pub struct EndpointSweep(platform::EndpointSweep);
+
+impl EndpointSweep {
+    /// Opens the default managed namespace derived from `LocalEndpoint`
+    /// authority. It is not a second hardcoded directory.
+    pub fn open() -> io::Result<Self> {
+        platform::EndpointSweep::open().map(Self)
+    }
+
+    /// Opens the managed namespace that contains `endpoint`.
+    pub fn for_endpoint(endpoint: &LocalEndpoint) -> io::Result<Self> {
+        platform::EndpointSweep::for_endpoint(endpoint).map(Self)
+    }
+
+    pub fn next_batch(&mut self, budget: SweepBudget) -> SweepBatch {
+        self.0.next_batch(budget)
+    }
+}
+
+#[cfg(unix)]
 #[path = "unix.rs"]
 mod platform;
 #[cfg(windows)]
@@ -296,6 +458,32 @@ impl LocalListener {
     pub async fn accept(&mut self) -> io::Result<LocalStream> {
         self.0.accept().await.map(LocalStream::from_inner)
     }
+
+    /// Returns the exact endpoint object credential for explicit lifecycle
+    /// management by a caller that already owns this listener.
+    pub fn credential(&self) -> EndpointCredential {
+        self.0.credential()
+    }
+
+    /// Closes the listener and reports the native socket cleanup result.
+    /// The v1 ownership `.lock` file is deliberately retained.
+    pub fn close(self) -> EndpointReapResult {
+        self.0.close()
+    }
+}
+
+/// Inspects an endpoint without creating ownership metadata or contacting a
+/// business listener.
+pub fn inspect_endpoint(endpoint: &LocalEndpoint) -> EndpointInspection {
+    platform::inspect_endpoint(endpoint)
+}
+
+/// Reaps only the exact endpoint object represented by `credential`.
+pub fn reap_endpoint(
+    endpoint: &LocalEndpoint,
+    credential: &EndpointCredential,
+) -> EndpointReapResult {
+    platform::reap_endpoint(endpoint, credential)
 }
 
 #[cfg(test)]
