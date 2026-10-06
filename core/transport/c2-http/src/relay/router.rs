@@ -20,8 +20,8 @@ use futures::StreamExt;
 
 use crate::relay::authority::{
     ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
-    RouteAuthority, attest_ipc_pending_route_contract, attest_ipc_route_contract,
-    read_ipc_route_contract,
+    RegistrationWithdrawal, RouteAuthority, attest_ipc_pending_route_contract,
+    attest_ipc_route_contract, read_ipc_route_contract,
 };
 use crate::relay::conn_pool::UpstreamLease;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
@@ -646,6 +646,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
     let control_router = Router::new()
         .route("/_register", post(handle_register))
         .route("/_unregister", post(handle_unregister))
+        .route("/_admin/unregister", post(handle_admin_unregister))
         .route("/_routes", get(handle_list_routes))
         .route("/_resolve/{*name}", get(handle_resolve))
         .route("/_probe/{*name}", get(handle_probe))
@@ -1152,11 +1153,49 @@ fn close_client(client: IpcClient) {
     });
 }
 
-/// `POST /_unregister` — remove a CRM upstream.
+/// Compare-remove an exact captured registration; no name-only Runtime teardown is accepted.
+async fn handle_unregister(
+    State(state): State<Arc<RelayState>>,
+    Json(scope): Json<crate::client::RelayRegistrationScope>,
+) -> Response {
+    match RouteAuthority::new(&state).unregister_registration(&scope) {
+        Ok(RegistrationWithdrawal::Removed {
+            entry,
+            removed_at,
+            removed_revision,
+            client,
+        }) => {
+            state.stop_upstream_control_if_owner_idle_for_route(&entry);
+            if let Some(client) = client {
+                close_arc_client(client);
+            }
+            broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "removed"})),
+            )
+                .into_response()
+        }
+        Ok(RegistrationWithdrawal::AlreadyRemoved) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RegistrationWithdrawal::Superseded) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "superseded"})),
+        )
+            .into_response(),
+        Ok(RegistrationWithdrawal::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            format!("invalid registration withdrawal: {error:?}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /_admin/unregister` — explicit administrative name/server-id removal.
 ///
 /// Body: `{"name": "grid", "server_id": "..."}`
 /// Returns: 200 on success, 403 on owner mismatch, 404 on missing.
-async fn handle_unregister(
+async fn handle_admin_unregister(
     State(state): State<Arc<RelayState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -2487,7 +2526,7 @@ mod tests {
                 .expect("handle_register body should be found");
         let unregister_body = source_between(
             source,
-            "async fn handle_unregister",
+            "async fn handle_admin_unregister",
             "async fn handle_list_routes",
         )
         .expect("handle_unregister body should be found");
@@ -2759,7 +2798,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/_unregister")
+                    .uri("/_admin/unregister")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -5824,5 +5863,114 @@ mod tests {
     fn unique_suffix() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+    async fn post_registration_withdrawal(
+        state: Arc<RelayState>,
+        scope: &crate::client::RelayRegistrationScope,
+    ) -> StatusCode {
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_unregister")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(scope).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    fn captured_scope(
+        entry: &crate::relay::types::RouteEntry,
+    ) -> crate::client::RelayRegistrationScope {
+        crate::client::RelayRegistrationScope {
+            name: entry.name.clone(),
+            server_id: entry.server_id.clone().unwrap(),
+            server_instance_id: entry.server_instance_id.clone().unwrap(),
+            route_uid: entry.route_uid.clone(),
+            route_revision: entry.route_revision,
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_registration_withdrawal_cannot_remove_new_uid_in_same_server_instance() {
+        let state = test_state();
+        let address = format!(
+            "ipc://scope-withdraw-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-scope").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-scope", &address).await,
+            StatusCode::CREATED
+        );
+        let old = captured_scope(&state.route_table_write().local_route("grid").unwrap());
+        assert!(server.unregister_route("grid").await);
+        crate::relay::test_support::register_echo_route(&server, "grid").await;
+        assert!(matches!(
+            post_register(state.clone(), "grid", "server-scope", &address).await,
+            StatusCode::CREATED | StatusCode::OK
+        ));
+        let new = captured_scope(&state.route_table_write().local_route("grid").unwrap());
+        assert_eq!(old.server_instance_id, new.server_instance_id);
+        assert_ne!(old.route_uid, new.route_uid);
+        assert_eq!(
+            post_registration_withdrawal(state.clone(), &old).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            state
+                .route_table_write()
+                .local_route("grid")
+                .unwrap()
+                .route_uid,
+            new.route_uid
+        );
+        let mut wrong_revision = new.clone();
+        wrong_revision.route_revision += 1;
+        assert_eq!(
+            post_registration_withdrawal(state.clone(), &wrong_revision).await,
+            StatusCode::ACCEPTED
+        );
+        let mut wrong_instance = new.clone();
+        wrong_instance.server_instance_id.push_str("-old");
+        assert_eq!(
+            post_registration_withdrawal(state.clone(), &wrong_instance).await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            post_registration_withdrawal(state.clone(), &new).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_registration_withdrawal(state.clone(), &new).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post_registration_withdrawal(state.clone(), &old).await,
+            StatusCode::NOT_FOUND
+        );
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_registration_withdrawal_refuses_name_only_body() {
+        let response = build_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_unregister")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"grid","server_id":"server-grid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

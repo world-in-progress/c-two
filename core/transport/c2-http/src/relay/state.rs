@@ -670,6 +670,15 @@ impl RelayState {
         self.clear_upstream_control_watch_unavailable(&key);
     }
 
+    /// Called by route authority while it holds the route-table write lock and
+    /// has proved that no remaining route uses this captured endpoint.
+    pub(crate) fn remove_connection_for_withdraw(
+        &self,
+        key: &UpstreamEndpointKey,
+    ) -> Option<Arc<IpcClient>> {
+        self.conn_pool.remove(key)
+    }
+
     pub(crate) fn remove_connection_if_endpoint_unused(
         &self,
         key: &UpstreamEndpointKey,

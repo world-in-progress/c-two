@@ -368,3 +368,47 @@ async fn prepare_establishes_live_watcher_and_reuses_it_for_closure() {
     receiver.shutdown();
     assert!(receiver.prepare().await.is_err());
 }
+
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn adopted_unconnected_overlapped_pipe_prepare_is_cancellable() {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_INBOUND};
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+    let name = format!(
+        r"\\.\pipe\LOCAL\c2-unconnected-{}",
+        uuid::Uuid::new_v4().simple()
+    )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect::<Vec<_>>();
+    let raw = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            0,
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert!(!raw.is_null() && raw != INVALID_HANDLE_VALUE);
+    let owned = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut receiver =
+        unsafe { OwnerControlReceiver::from_inherited_handle(owned.as_raw_handle()) }.unwrap();
+    drop(owned);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), receiver.prepare())
+            .await
+            .is_err()
+    );
+    assert!(receiver.is_activated());
+    receiver.shutdown();
+    assert!(!receiver.is_activated());
+    assert!(receiver.wait_closed().await.is_err());
+}

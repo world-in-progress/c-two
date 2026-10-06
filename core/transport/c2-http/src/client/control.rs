@@ -99,8 +99,19 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Identity of one concrete registration, captured before beginning retirement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayRegistrationScope {
+    pub name: String,
+    pub server_id: String,
+    pub server_instance_id: String,
+    pub route_uid: String,
+    pub route_revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
-struct UnregisterRequest<'a> {
+struct AdminUnregisterRequest<'a> {
     name: &'a str,
     server_id: &'a str,
 }
@@ -209,10 +220,22 @@ impl RelayControlClient {
         Ok(())
     }
 
-    pub fn unregister(&self, name: &str, server_id: &str) -> Result<(), HttpError> {
-        let request = UnregisterRequest { name, server_id };
+    /// Compare-remove one registration. A superseded or already absent target is a safe no-op.
+    pub fn unregister_registration(&self, scope: &RelayRegistrationScope) -> Result<(), HttpError> {
         runtime().handle().block_on(self.post_json_with_retry(
             "/_unregister",
+            scope,
+            &[200, 202, 204, 404],
+        ))?;
+        self.invalidate(&scope.name);
+        Ok(())
+    }
+
+    /// Explicit administrative name/server-id removal; never used for ordinary Runtime teardown.
+    pub fn admin_unregister(&self, name: &str, server_id: &str) -> Result<(), HttpError> {
+        let request = AdminUnregisterRequest { name, server_id };
+        runtime().handle().block_on(self.post_json_with_retry(
+            "/_admin/unregister",
             &request,
             &[200, 204],
         ))?;

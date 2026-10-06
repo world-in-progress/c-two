@@ -680,7 +680,6 @@ fn shutdown_deadline_does_not_cancel_pending_native_drain() {
         .host(
             HostOptions::default()
                 .without_relay()
-                .with_shutdown_timeout(Duration::from_millis(100))
                 .with_owner_bound(Duration::ZERO),
         )
         .unwrap();
@@ -725,13 +724,13 @@ fn shutdown_deadline_does_not_cancel_pending_native_drain() {
         Duration::from_secs(3),
     );
     let started = Instant::now();
-    let incomplete = host.shutdown();
+    let incomplete = host.shutdown_with_timeout(Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(incomplete.runtime_barrier_error.is_some());
     assert!(host.shutdown_outcome().is_none());
     assert_ne!(host.lifecycle_snapshot().work_drained, Some(true));
     let started = Instant::now();
-    let again = host.shutdown();
+    let again = host.shutdown_with_timeout(Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(again.runtime_barrier_error.is_some());
     {
@@ -909,4 +908,86 @@ fn persistent_runtime_new_host_does_not_inherit_a_previous_shutdown_journal() {
         drop(registration);
         drop(host);
     }
+}
+
+#[test]
+fn delayed_old_registration_withdrawal_preserves_new_runtime_with_same_server_id() {
+    use c2_http::client::{RelayControlClient, RelayRegistrationScope};
+    use c2_http::relay::{RelayConfig, RelayServer};
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let url = format!("http://{address}");
+    let mut relay = RelayServer::start(RelayConfig {
+        bind: address.to_string(),
+        advertise_url: url.clone(),
+        anti_entropy_interval: Duration::ZERO,
+        heartbeat_interval: Duration::ZERO,
+        ..Default::default()
+    })
+    .unwrap();
+    let server_id = unique_name("scope-same-server");
+    let options = RuntimeOptions {
+        server_id: Some(server_id),
+        use_process_relay_anchor: false,
+        ..Default::default()
+    };
+    let old_runtime = Runtime::new(options.clone()).unwrap();
+    let old_host = old_runtime
+        .host(
+            HostOptions::default()
+                .with_relay_anchor_address(&url)
+                .with_relay_use_proxy(false),
+        )
+        .unwrap();
+    let route = unique_name("scope-same-route");
+    let old_registration = register_echo(&old_host, &route);
+    let original = old_registration.outcome();
+    let scope = RelayRegistrationScope {
+        name: route.clone(),
+        server_id: original.server_id.clone(),
+        server_instance_id: original.server_instance_id.clone(),
+        route_uid: original.route_uid.clone(),
+        route_revision: original.route_revision,
+    };
+    assert!(old_host.shutdown().relay_errors.is_empty());
+    let new_runtime = Runtime::new(options).unwrap();
+    let new_host = new_runtime
+        .host(
+            HostOptions::default()
+                .with_relay_anchor_address(&url)
+                .with_relay_use_proxy(false),
+        )
+        .unwrap();
+    let new_registration = register_echo(&new_host, &route);
+    assert_ne!(
+        new_registration.outcome().server_instance_id,
+        scope.server_instance_id
+    );
+    // The original wire target arrives after the replacement registration has committed.
+    let control = RelayControlClient::new(&url, false).unwrap();
+    control.unregister_registration(&scope).unwrap();
+    assert!(
+        relay
+            .list_routes()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == &route)
+    );
+    let client = new_runtime
+        .connect(
+            release().expected_route(&route).unwrap(),
+            Connect::ExplicitRelay { relay_url: url },
+        )
+        .unwrap();
+    assert_eq!(
+        client.call_owned("echo", b"new-resource").unwrap(),
+        b"new-resource"
+    );
+    assert!(new_host.shutdown().relay_errors.is_empty());
+    drop(new_registration);
+    drop(new_host);
+    drop(old_registration);
+    drop(old_host);
+    relay.stop().unwrap();
 }

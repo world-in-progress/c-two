@@ -252,6 +252,7 @@ pub struct Server {
     /// must stop before the shutdown transaction itself begins. Existing work
     /// keeps draining under the original rules; the listener stays open.
     business_admission_closed: AtomicBool,
+    run_entered: AtomicBool,
     execution_scheduler: Scheduler,
 }
 
@@ -476,6 +477,7 @@ impl Server {
             shutdown_generation: AtomicU64::new(0),
             shutdown_close_reason: parking_lot::Mutex::new(DIRECT_IPC_SHUTDOWN_REASON),
             business_admission_closed: AtomicBool::new(false),
+            run_entered: AtomicBool::new(false),
             execution_scheduler,
         })
     }
@@ -1036,6 +1038,7 @@ impl Server {
             | ServerLifecycleState::Failed(_) => {
                 self.shutdown_tx.send_replace(false);
                 self.shutdown_route_outcomes.lock().clear();
+                self.run_entered.store(false, Ordering::Release);
                 self.set_lifecycle_state(ServerLifecycleState::Starting);
                 Ok(())
             }
@@ -1234,6 +1237,11 @@ impl Server {
         self.config.max_payload_size
     }
 
+    /// Capture a concrete route identity before starting its retirement transaction.
+    pub fn registered_route_identity(&self, name: &str) -> Option<(String, u64)> {
+        self.route_catalog.read().registered_identity(name)
+    }
+
     /// Return true if a route is currently registered.
     pub async fn contains_route(&self, name: &str) -> bool {
         self.dispatcher.read().await.resolve(name).is_some()
@@ -1254,6 +1262,7 @@ impl Server {
             self.begin_start_attempt()?;
         }
 
+        self.run_entered.store(true, Ordering::Release);
         let startup = LocalListener::bind(&self.endpoint).map_err(ServerError::Io);
 
         let mut listener = match startup {
@@ -1440,14 +1449,16 @@ impl Server {
 
     /// Reject a start attempt that has not published readiness yet.
     ///
-    /// This moves a `Starting` server straight to `Failed`, which makes every
+    /// This moves an unpolled `Starting` or cancelled `Stopping` attempt to `Failed`, which makes every
     /// readiness waiter fail fast with `message`. It exists for owners that
     /// must refuse to serve before readiness — for example an owner-bound
     /// host whose controller capability is already gone. It never touches a
     /// server that is running or already terminal.
     pub fn reject_start_attempt(&self, message: String) -> Result<(), ServerError> {
         match self.lifecycle_state() {
-            ServerLifecycleState::Starting => {
+            ServerLifecycleState::Starting | ServerLifecycleState::Stopping
+                if !self.run_entered.load(Ordering::Acquire) =>
+            {
                 self.set_lifecycle_state(ServerLifecycleState::Failed(message));
                 Ok(())
             }
@@ -7238,7 +7249,7 @@ mod tests {
     async fn chunked_request_admission_failure_writes_correlated_error_reply() {
         use crate::scheduler::SchedulerLimits;
         use c2_wire::chunk::encode_chunk_header;
-        use c2_wire::control::{decode_reply_control, encode_call_control, ReplyControl};
+        use c2_wire::control::{ReplyControl, decode_reply_control, encode_call_control};
         use std::num::NonZeroUsize;
 
         // Tiny reassembly budget: a 1024-byte assembly cannot be admitted.

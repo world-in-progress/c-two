@@ -356,6 +356,18 @@ pub(crate) enum RouteCommandResult {
     PeerRoutesRemoved,
 }
 
+pub(crate) enum RegistrationWithdrawal {
+    Removed {
+        entry: RouteEntry,
+        removed_at: f64,
+        removed_revision: u64,
+        client: Option<Arc<IpcClient>>,
+    },
+    AlreadyRemoved,
+    Superseded,
+    NotFound,
+}
+
 pub(crate) struct RouteAuthority<'a> {
     state: &'a RelayState,
 }
@@ -842,6 +854,60 @@ impl<'a> RouteAuthority<'a> {
             }
             CachedClient::Missing => Err(ControlError::DuplicateRoute { existing_address }),
         }
+    }
+
+    pub(crate) fn unregister_registration(
+        &self,
+        scope: &crate::client::RelayRegistrationScope,
+    ) -> Result<RegistrationWithdrawal, ControlError> {
+        self.validate_route_name(&scope.name)?;
+        self.validate_server_id(&scope.server_id)?;
+        validate_server_instance_id_value(&scope.server_instance_id)
+            .map_err(|reason| ControlError::InvalidServerInstanceId { reason })?;
+        if !valid_route_name(&scope.route_uid) || scope.route_revision == 0 {
+            return Err(ControlError::ContractMismatch {
+                reason: "registration must include a bounded route_uid and nonzero route_revision"
+                    .into(),
+            });
+        }
+        let (entry, removed_at, removed_revision, client) = {
+            let mut table = self.state.route_table_write();
+            let Some(existing) = table.local_route(&scope.name) else {
+                return Ok(if table.registration_already_withdrawn(scope) {
+                    RegistrationWithdrawal::AlreadyRemoved
+                } else {
+                    RegistrationWithdrawal::NotFound
+                });
+            };
+            if existing.server_id.as_deref() != Some(scope.server_id.as_str())
+                || existing.server_instance_id.as_deref() != Some(scope.server_instance_id.as_str())
+                || existing.route_uid != scope.route_uid
+                || existing.route_revision != scope.route_revision
+            {
+                return Ok(RegistrationWithdrawal::Superseded);
+            }
+            let expected = existing.clone();
+            let (entry, removed_at, removed_revision) =
+                table.unregister_local_route_if_matches(&expected);
+            let Some(entry) = entry else {
+                return Ok(RegistrationWithdrawal::Superseded);
+            };
+            table.record_registration_withdrawal(scope.clone());
+            let client = UpstreamEndpointKey::from_route(&entry).and_then(|key| {
+                if table.has_local_route_for_endpoint(&key) {
+                    None
+                } else {
+                    self.state.remove_connection_for_withdraw(&key)
+                }
+            });
+            (entry, removed_at, removed_revision, client)
+        };
+        Ok(RegistrationWithdrawal::Removed {
+            entry,
+            removed_at,
+            removed_revision,
+            client,
+        })
     }
 
     fn unregister_local(

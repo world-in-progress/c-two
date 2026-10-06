@@ -537,7 +537,11 @@ impl HostInner {
     }
 
     fn shutdown(&self) -> ShutdownOutcome {
-        let deadline = Instant::now() + self.shutdown_timeout;
+        self.shutdown_with_timeout(self.shutdown_timeout)
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> ShutdownOutcome {
+        let deadline = Instant::now() + timeout;
         self.refresh_shutdown_outcome();
         if let Some(outcome) = self.shutdown_outcome.lock().clone() {
             return outcome;
@@ -727,6 +731,11 @@ impl Host {
         self.inner.shutdown()
     }
 
+    /// Bound this caller's observation without changing or cancelling the native drain.
+    pub fn shutdown_with_timeout(&self, timeout: Duration) -> ShutdownOutcome {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
     pub fn is_running(&self) -> bool {
         self.inner.server.is_running()
     }
@@ -875,6 +884,7 @@ impl Runtime {
         let run_server = Arc::clone(&server);
         let watch = lifecycle;
         let owner_grace = options.lifecycle.owner_missing_grace();
+        let owner_startup_timeout = options.startup_timeout;
         let thread = std::thread::Builder::new()
             .name(format!("c2-host-{}", server.server_id()))
             .spawn(move || {
@@ -895,9 +905,10 @@ impl Runtime {
                     // Arm the owner watcher before the accept loop runs, so
                     // readiness can only be published behind a live watcher
                     // and an already-gone capability is refused pre-ready.
-                    match crate::owner_bound::arm_owner_watch(&mut receiver).await {
+                    match crate::owner_bound::arm_owner_watch_with_fence(crate::owner_bound::arm_owner_watch(&mut receiver), &run_server, owner_startup_timeout).await {
                         crate::owner_bound::OwnerArmOutcome::Alive => {}
                         crate::owner_bound::OwnerArmOutcome::Closed => {
+                            receiver.shutdown();
                             let _ = run_server.reject_start_attempt(
                                 "owner control capability was already closed before the host became ready"
                                     .to_string(),
@@ -905,6 +916,7 @@ impl Runtime {
                             return ThreadOutcome::PreReadyRefused;
                         }
                         crate::owner_bound::OwnerArmOutcome::IoError(message) => {
+                            receiver.shutdown();
                             let _ = run_server.reject_start_attempt(format!(
                                 "owner control watcher failed before the host became ready: {message}"
                             ));

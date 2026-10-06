@@ -16,7 +16,7 @@ use parking_lot::{Condvar, Mutex};
 use c2_contract::ExpectedRouteContract;
 use c2_http::client::{
     HttpError, RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient,
-    RelayLocalIpcCandidate, RelayRegistration, RelayResolvedTarget,
+    RelayLocalIpcCandidate, RelayRegistration, RelayRegistrationScope, RelayResolvedTarget,
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
@@ -166,6 +166,7 @@ struct RuntimeState {
     lifecycle_policy: c2_config::ServerLifecyclePolicy,
     lifecycle_frozen: bool,
     shutdown_transactions: HashMap<String, Arc<ShutdownTransaction>>,
+    registration_scopes: HashMap<String, HashMap<String, RelayRegistrationScope>>,
     #[cfg(test)]
     forced_relay_config_error: Option<String>,
 }
@@ -236,6 +237,7 @@ impl Runtime {
                 lifecycle_policy: Default::default(),
                 lifecycle_frozen: false,
                 shutdown_transactions: HashMap::new(),
+                registration_scopes: HashMap::new(),
                 #[cfg(test)]
                 forced_relay_config_error: None,
             })),
@@ -468,10 +470,6 @@ impl Runtime {
         Ok(())
     }
 
-    fn current_identity(&self) -> Option<RuntimeIdentity> {
-        self.state.lock().identity.clone()
-    }
-
     pub fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) {
         let mut state = self.state.lock();
         let relay_anchor_address =
@@ -617,6 +615,13 @@ impl Runtime {
         let route_name = spec.name.clone();
         let route_uid = route.route_uid().to_string();
         let route_revision = route.route_revision();
+        let registration_scope = RelayRegistrationScope {
+            name: route_name.clone(),
+            server_id: identity.server_id.clone(),
+            server_instance_id: identity.server_instance_id.clone(),
+            route_uid: route_uid.clone(),
+            route_revision,
+        };
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
         if route.name() != spec.name {
@@ -741,6 +746,18 @@ impl Runtime {
             relay_projection = Some(projection);
         }
 
+        // Save the concrete token before native commit can make the route observable.
+        // Owner EOF may retire it while final relay publish is still awaiting a response.
+        self.state
+            .lock()
+            .registration_scopes
+            .entry(format!(
+                "{}:{:p}",
+                server.server_instance_id(),
+                server.as_ref()
+            ))
+            .or_default()
+            .insert(route_name.clone(), registration_scope.clone());
         let relay_needs_final_publish = relay_projection.is_some();
         let route_admission_token = if relay_needs_final_publish {
             match rt.block_on(server.commit_reserved_route_closed(
@@ -798,8 +815,7 @@ impl Runtime {
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
-                    &spec.name,
-                    &identity.server_id,
+                    &registration_scope,
                 );
                 let (status_code, error_message) = http_error_parts(err);
                 return Err(LifecycleError::RegisterFailure(Box::new(
@@ -820,8 +836,7 @@ impl Runtime {
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
-                    &spec.name,
-                    &identity.server_id,
+                    &registration_scope,
                 );
                 return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
@@ -858,30 +873,84 @@ impl Runtime {
         let route_name = name.to_string();
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
+        let scopes = self.capture_registration_scopes(server, std::slice::from_ref(&route_name));
         let rt = Self::server_runtime()?;
         let local_removed = rt.block_on(server.unregister_route(&route_name));
         if !local_removed {
             return Err(LifecycleError::MissingRoute(route_name));
         }
 
-        let relay_error =
-            if let Some(relay_anchor_address) = effective_relay_anchor_address.as_deref() {
-                let identity = self.ensure_server()?;
-                self.relay_cleanup(
-                    Some(relay_anchor_address),
-                    relay_use_proxy,
-                    &route_name,
-                    &identity.server_id,
-                )
-            } else {
-                None
-            };
+        let relay_error = if let Some(relay_anchor_address) =
+            effective_relay_anchor_address.as_deref()
+        {
+            match scopes.get(&route_name) {
+                Some(scope) => {
+                    self.relay_cleanup(Some(relay_anchor_address), relay_use_proxy, scope)
+                }
+                None => Some(RelayCleanupError {
+                    route_name: route_name.clone(),
+                    status_code: None,
+                    message: "no captured registration scope; refusing unsafe name-only withdrawal"
+                        .into(),
+                }),
+            }
+        } else {
+            None
+        };
+        self.retire_registration_scopes(server, &scopes);
         Ok(UnregisterOutcome {
             route_name: route_name.clone(),
             local_removed,
             close: route_close_success(&route_name, "unregister"),
             relay_error,
         })
+    }
+
+    fn capture_registration_scopes(
+        &self,
+        server: &c2_server::Server,
+        names: &[String],
+    ) -> HashMap<String, RelayRegistrationScope> {
+        let key = format!("{}:{:p}", server.server_instance_id(), server);
+        let mut scopes = self
+            .state
+            .lock()
+            .registration_scopes
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        for name in names {
+            if !scopes.contains_key(name) {
+                if let Some((route_uid, route_revision)) = server.registered_route_identity(name) {
+                    scopes.insert(
+                        name.clone(),
+                        RelayRegistrationScope {
+                            name: name.clone(),
+                            server_id: server.server_id().to_owned(),
+                            server_instance_id: server.server_instance_id().to_owned(),
+                            route_uid,
+                            route_revision,
+                        },
+                    );
+                }
+            }
+        }
+        scopes
+    }
+
+    fn retire_registration_scopes(
+        &self,
+        server: &c2_server::Server,
+        scopes: &HashMap<String, RelayRegistrationScope>,
+    ) {
+        let key = format!("{}:{:p}", server.server_instance_id(), server);
+        let mut state = self.state.lock();
+        if let Some(current) = state.registration_scopes.get_mut(&key) {
+            current.retain(|name, scope| scopes.get(name) != Some(scope));
+            if current.is_empty() {
+                state.registration_scopes.remove(&key);
+            }
+        }
     }
 
     pub(crate) fn shutdown_pending(&self, server: &c2_server::Server) -> bool {
@@ -919,6 +988,9 @@ impl Runtime {
         shutdown_timeout: Duration,
     ) -> ShutdownOutcome {
         let deadline = Instant::now() + shutdown_timeout;
+        let scopes = server
+            .map(|server| self.capture_registration_scopes(server, &route_names))
+            .unwrap_or_default();
         let Some(server) = server else {
             return self.shutdown_transaction(
                 None,
@@ -927,6 +999,7 @@ impl Runtime {
                 relay_use_proxy,
                 relay_cleanup_config_error,
                 shutdown_timeout,
+                scopes,
             );
         };
         // Construct before transferring work so construction failures cannot signal a server.
@@ -939,6 +1012,7 @@ impl Runtime {
                 relay_use_proxy,
                 relay_cleanup_config_error,
                 shutdown_timeout,
+                scopes,
             );
         }
         let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
@@ -976,7 +1050,9 @@ impl Runtime {
                             relay_use_proxy,
                             relay_cleanup_config_error,
                             shutdown_timeout,
+                            scopes.clone(),
                         );
+                        worker_runtime.retire_registration_scopes(&worker_server, &scopes);
                         *worker_transaction.outcome.lock() = Some(outcome);
                         worker_transaction.completed.notify_all();
                     });
@@ -1022,6 +1098,7 @@ impl Runtime {
         relay_use_proxy: bool,
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
+        scopes: HashMap<String, RelayRegistrationScope>,
     ) -> ShutdownOutcome {
         let (mut effective_relay_anchor_address, mut relay_config_errors) =
             match self.effective_relay_anchor_address_arg(relay_anchor_address) {
@@ -1032,12 +1109,6 @@ impl Runtime {
             effective_relay_anchor_address = None;
             relay_config_errors.push(message);
         }
-        let identity = if effective_relay_anchor_address.is_some() && !route_names.is_empty() {
-            self.current_identity()
-                .or_else(|| self.ensure_server().ok())
-        } else {
-            self.current_identity()
-        };
         let server_was_started = server.map(|server| server.is_running()).unwrap_or(false);
         let mut outcome = ShutdownOutcome {
             server_was_started,
@@ -1199,31 +1270,30 @@ impl Runtime {
                     }
                 }
             }
-            if let Some(identity) = identity.as_ref() {
-                let mut cleaned = std::collections::HashSet::new();
-                for close in &outcome.route_outcomes {
-                    if close.local_removed && cleaned.insert(close.route_name.as_str()) {
+            let mut cleaned = std::collections::HashSet::new();
+            for close in &outcome.route_outcomes {
+                if close.local_removed && cleaned.insert(close.route_name.as_str()) {
+                    if let Some(scope) = scopes.get(&close.route_name) {
                         if let Some(error) = self.relay_cleanup(
                             effective_relay_anchor_address.as_deref(),
                             relay_use_proxy,
-                            &close.route_name,
-                            &identity.server_id,
+                            scope,
                         ) {
                             outcome.relay_errors.push(error);
                         }
+                    } else if effective_relay_anchor_address.is_some() {
+                        outcome.relay_errors.push(RelayCleanupError { route_name: close.route_name.clone(), status_code: None,
+                            message: "no captured registration scope; refusing unsafe name-only withdrawal".into() });
                     }
                 }
             }
-        } else if let Some(identity) = identity.as_ref() {
+        } else if effective_relay_anchor_address.is_some() {
             for route_name in &route_names {
-                if let Some(relay_error) = self.relay_cleanup(
-                    effective_relay_anchor_address.as_deref(),
-                    relay_use_proxy,
-                    route_name,
-                    &identity.server_id,
-                ) {
-                    outcome.relay_errors.push(relay_error);
-                }
+                outcome.relay_errors.push(RelayCleanupError {
+                    route_name: route_name.clone(),
+                    status_code: None,
+                    message: "hostless shutdown has no captured registration scope".into(),
+                });
             }
         }
 
@@ -1384,9 +1454,9 @@ impl Runtime {
         &self,
         relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
-        route_name: &str,
-        server_id: &str,
+        scope: &RelayRegistrationScope,
     ) -> Option<RelayCleanupError> {
+        let route_name = scope.name.as_str();
         let relay_anchor_address = relay_anchor_address?;
         let projection =
             match self.relay_projection_for_address(relay_anchor_address, relay_use_proxy) {
@@ -1399,7 +1469,7 @@ impl Runtime {
                     });
                 }
             };
-        match projection.control.unregister(route_name, server_id) {
+        match projection.control.unregister_registration(scope) {
             Ok(()) => None,
             Err(HttpError::ServerError(status_code, body)) => Some(RelayCleanupError {
                 route_name: route_name.to_string(),
@@ -2080,6 +2150,7 @@ mod tests {
                 .expect("write final publish response");
         });
 
+        let registration_observer = session.clone();
         let server_for_thread = Arc::clone(&server);
         let register_thread = thread::spawn(move || {
             session.register_route(&server_for_thread, route, spec, Some(&relay_url), false)
@@ -2102,6 +2173,22 @@ mod tests {
             .block_on(server.route_scheduler_snapshot(&route_name))
             .expect("committed route should have scheduler state");
         let was_closed_during_final_publish = snapshot.closed;
+        let native_identity = server.registered_route_identity(&route_name).unwrap();
+        let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
+        let observed_scope = registration_observer
+            .state
+            .lock()
+            .registration_scopes
+            .get(&key)
+            .unwrap()
+            .get(&route_name)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (observed_scope.route_uid, observed_scope.route_revision),
+            native_identity,
+            "registration scope must be saved before final publish can return or owner drain can remove the catalog record"
+        );
 
         release_tx.send(()).unwrap();
         relay_thread.join().unwrap();

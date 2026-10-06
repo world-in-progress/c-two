@@ -151,6 +151,24 @@ pub(crate) async fn arm_owner_watch(receiver: &mut OwnerControlReceiver) -> Owne
     }
 }
 
+/// Fence only capability establishment, before any accept loop has been polled.
+/// Cancelling this future never cancels a running Server drain.
+pub(crate) async fn arm_owner_watch_with_fence<F>(
+    prepare: F,
+    server: &Server,
+    timeout: Duration,
+) -> OwnerArmOutcome
+where
+    F: std::future::Future<Output = OwnerArmOutcome>,
+{
+    tokio::select! {
+        biased;
+        _ = server.wait_for_shutdown_requested() => OwnerArmOutcome::IoError("owner control establishment cancelled by shutdown".into()),
+        _ = tokio::time::sleep(timeout) => OwnerArmOutcome::IoError("owner control establishment exceeded startup deadline".into()),
+        outcome = prepare => outcome,
+    }
+}
+
 /// Why the owner supervision ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OwnerWatchEvent {
@@ -264,5 +282,42 @@ mod tests {
             cell.phase(),
             HostLifecyclePhase::WatcherIoError(_)
         ));
+    }
+    #[test]
+    fn pending_pre_ready_establishment_is_cancelled_by_deadline_and_shutdown() {
+        for shutdown in [false, true] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let server = Arc::new(
+                Server::new(
+                    &format!("ipc://pending-arm-{}", uuid::Uuid::new_v4().simple()),
+                    c2_server::config::ServerIpcConfig::default(),
+                )
+                .unwrap(),
+            );
+            server.begin_start_attempt().unwrap();
+            if shutdown {
+                server.request_shutdown_signal_with_reason("shutdown");
+            }
+            let started = std::time::Instant::now();
+            let result = runtime.block_on(arm_owner_watch_with_fence(
+                std::future::pending(),
+                &server,
+                Duration::from_millis(20),
+            ));
+            let OwnerArmOutcome::IoError(message) = result else {
+                panic!("pending prepare cannot arm");
+            };
+            server.reject_start_attempt(message).unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(matches!(
+                server.lifecycle_state(),
+                c2_server::ServerLifecycleState::Failed(_)
+            ));
+            assert!(!server.is_running());
+            runtime.block_on(server.wait_until_terminal()).unwrap();
+        }
     }
 }

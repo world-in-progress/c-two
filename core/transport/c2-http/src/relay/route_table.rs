@@ -17,6 +17,7 @@ pub struct RouteTable {
     /// Deleted routes keyed by (name, relay_id). Tombstones are short-lived
     /// control-plane state used by anti-entropy to converge deletions.
     tombstones: HashMap<(String, String), RouteTombstone>,
+    withdrawn_registrations: HashMap<(String, String), crate::client::RelayRegistrationScope>,
     /// Known peer relays keyed by relay_id.
     peers: HashMap<String, PeerInfo>,
     /// This relay's ID (for distinguishing LOCAL vs PEER).
@@ -106,6 +107,7 @@ impl RouteTable {
         Self {
             routes: HashMap::new(),
             tombstones: HashMap::new(),
+            withdrawn_registrations: HashMap::new(),
             peers: HashMap::new(),
             relay_id,
             next_timestamp: current_epoch_millis().saturating_sub(1) as f64,
@@ -207,6 +209,7 @@ impl RouteTable {
         );
         let key = (entry.name.clone(), entry.relay_id.clone());
         self.tombstones.remove(&key);
+        self.withdrawn_registrations.remove(&key);
         let catalog_revision = self.advance_catalog_revision();
         self.routes.insert(key, entry.clone());
         self.push_event(RouteAuthorityWatchEvent::Upserted {
@@ -350,6 +353,22 @@ impl RouteTable {
             wall
         };
         self.next_timestamp
+    }
+
+    pub(crate) fn record_registration_withdrawal(
+        &mut self,
+        scope: crate::client::RelayRegistrationScope,
+    ) {
+        self.withdrawn_registrations
+            .insert((scope.name.clone(), self.relay_id.clone()), scope);
+    }
+
+    pub(crate) fn registration_already_withdrawn(
+        &self,
+        scope: &crate::client::RelayRegistrationScope,
+    ) -> bool {
+        let key = (scope.name.clone(), self.relay_id.clone());
+        self.tombstones.contains_key(&key) && self.withdrawn_registrations.get(&key) == Some(scope)
     }
 
     pub fn local_tombstone_matches_server(&self, name: &str, server_id: &str) -> bool {
@@ -558,6 +577,7 @@ impl RouteTable {
         let mut removed = Vec::with_capacity(expired.len());
         for (key, reason) in expired {
             if let Some(tombstone) = self.tombstones.remove(&key) {
+                self.withdrawn_registrations.remove(&key);
                 removed.push(TombstoneGcEntry {
                     tombstone,
                     reason,
