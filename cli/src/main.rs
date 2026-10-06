@@ -1,4 +1,5 @@
 mod contract;
+mod endpoint;
 mod registry;
 mod relay;
 mod version;
@@ -6,6 +7,7 @@ mod version;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
+use std::process::ExitCode;
 
 const BANNER: &str = include_str!("../assets/banner_unicode.txt");
 const BANNER_COLOR: &str = "\x1b[38;2;102;237;173m";
@@ -26,19 +28,22 @@ struct Cli {
 enum Commands {
     /// Validate and inspect portable C-Two contract descriptors.
     Contract(contract::ContractArgs),
+    /// Inspect, reap, or sweep native local endpoints.
+    Endpoint(endpoint::EndpointArgs),
     /// Start the C-Two HTTP relay server.
     Relay(relay::RelayArgs),
     /// Query relay registry state.
     Registry(registry::RegistryArgs),
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let matches = Cli::command().before_help(render_banner()).get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
-        Commands::Contract(args) => contract::run(args),
-        Commands::Relay(args) => relay::run(args),
-        Commands::Registry(args) => registry::run(args),
+        Commands::Contract(args) => contract::run(args).map(|()| ExitCode::SUCCESS),
+        Commands::Endpoint(args) => endpoint::run(args),
+        Commands::Relay(args) => relay::run(args).map(|()| ExitCode::SUCCESS),
+        Commands::Registry(args) => registry::run(args).map(|()| ExitCode::SUCCESS),
     }
 }
 

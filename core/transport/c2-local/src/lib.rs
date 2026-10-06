@@ -17,6 +17,12 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub use c2_config::LocalEndpoint;
 
+mod credential;
+pub use credential::{
+    ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredentialError,
+    EndpointCredentialErrorKind,
+};
+
 pub mod owner;
 pub use owner::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};
 
@@ -46,6 +52,13 @@ impl EndpointCredential {
         &self.endpoint
     }
 
+    /// The listener incarnation carried by a managed-v2 credential. A v1
+    /// legacy credential returns `None`; this is metadata, not a capability.
+    #[cfg(unix)]
+    pub fn incarnation(&self) -> Option<[u8; 16]> {
+        self.incarnation
+    }
+
     #[cfg(unix)]
     pub(crate) fn unix(endpoint: LocalEndpoint, identity: UnixSocketIdentity) -> Self {
         Self {
@@ -71,11 +84,6 @@ impl EndpointCredential {
     #[cfg(unix)]
     pub(crate) fn identity(&self) -> Option<UnixSocketIdentity> {
         Some(self.identity)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn incarnation(&self) -> Option<[u8; 16]> {
-        self.incarnation
     }
 
     #[cfg(windows)]
@@ -535,3 +543,5 @@ pub fn reap_endpoint(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod credential_tests;

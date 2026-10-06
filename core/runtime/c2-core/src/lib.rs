@@ -36,6 +36,15 @@ pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
 };
 pub use lifetime::HeldResponse;
+// The native local-endpoint lifecycle surface is owned by `c2-local`. Core
+// re-exports it so SDKs and the CLI share one implementation instead of
+// writing their own paths, parsers, or management loops.
+pub use c2_local::{
+    ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
+    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
+    EndpointReapResult, EndpointSweep, EndpointUnverifiedReason, LocalEndpoint, SweepBatch,
+    SweepBudget, inspect_endpoint, reap_endpoint,
+};
 pub use memory::{
     MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
     RetirementHandoff, RuntimeMemoryStats, scope,

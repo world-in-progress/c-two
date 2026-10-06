@@ -19,12 +19,17 @@ pub use c2_contract::{
     ExpectedRouteContract,
 };
 pub use c2_core::{
-    Client, Connect, DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, Host, HostOptions,
+    Client, Connect, DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome,
+    ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
+    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
+    EndpointReapResult, EndpointSweep, EndpointUnverifiedReason, Host, HostOptions, LocalEndpoint,
     MemoryCellStats, MemoryScopeStats, ObservedPath, ObservedRoute, PathCounters, Registration,
     RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot,
     Runtime, RuntimeIdentity, RuntimeMemoryStats, RuntimeOptions, ServiceConcurrencyMode,
-    ServiceDefinition, direct_ipc_endpoint, direct_ipc_endpoint_with_protocol, ping_direct_ipc,
-    ping_direct_ipc_with_protocol, shutdown_direct_ipc, shutdown_direct_ipc_with_protocol,
+    ServiceDefinition, SweepBatch, SweepBudget, direct_ipc_endpoint,
+    direct_ipc_endpoint_with_protocol, inspect_endpoint, ping_direct_ipc,
+    ping_direct_ipc_with_protocol, reap_endpoint, shutdown_direct_ipc,
+    shutdown_direct_ipc_with_protocol,
 };
 pub use error::Error;
 pub use held::Held;

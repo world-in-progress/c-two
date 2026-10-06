@@ -225,6 +225,8 @@ dependencies = [
  "c2-local-security",
  "futures-util",
  "libc",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "socket2",
  "tempfile",
