@@ -193,7 +193,7 @@ impl Keepalive {
 }
 
 impl Receiver {
-    pub(super) async fn wait_closed(&mut self) -> io::Result<()> {
+    fn activate(&mut self) -> io::Result<()> {
         if self.active.is_none() {
             let pending = self.pending.take().ok_or_else(closed_receiver)?;
             // The first wait activates the endpoint: this is the only reactor registration for
@@ -203,6 +203,44 @@ impl Receiver {
             // report the receiver as closed.
             self.active = Some(AsyncFd::with_interest(pending, Interest::READABLE)?);
         }
+        Ok(())
+    }
+
+    pub(super) async fn prepare(&mut self) -> io::Result<bool> {
+        self.activate()?;
+        let fd = self
+            .active
+            .as_ref()
+            .ok_or_else(closed_receiver)?
+            .get_ref()
+            .as_raw_fd();
+        loop {
+            let mut byte = 0u8;
+            // Probe the actual nonblocking pipe, independently of reactor readiness delivery.
+            let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+            match read {
+                0 => return Ok(false),
+                1 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "owner control pipe unexpectedly carried data",
+                    ));
+                }
+                _ => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        return Ok(true);
+                    }
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) async fn wait_closed(&mut self) -> io::Result<()> {
+        self.activate()?;
         let receiver = self.active.as_ref().ok_or_else(closed_receiver)?;
         let fd = receiver.get_ref().as_raw_fd();
         receiver

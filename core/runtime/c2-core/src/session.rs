@@ -5,11 +5,13 @@
 //! callbacks and local direct-call bindings, but must not duplicate the runtime
 //! authority implemented here.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use c2_contract::ExpectedRouteContract;
 use c2_http::client::{
@@ -127,6 +129,13 @@ impl fmt::Debug for Runtime {
     }
 }
 
+struct ShutdownTransaction {
+    server: std::sync::Weak<c2_server::Server>,
+    outcome: Mutex<Option<ShutdownOutcome>>,
+    completed: Condvar,
+    delivered: AtomicBool,
+}
+
 struct RuntimeState {
     server_id_override: Option<String>,
     server_ipc_overrides: Option<ServerIpcConfigOverrides>,
@@ -146,6 +155,17 @@ struct RuntimeState {
     use_process_relay_anchor: bool,
     relay_projection: Option<RelayProjection>,
     path_counters: PathCounters,
+    /// Native owner control capability attached by an explicit call. It is
+    /// deliberately not part of [`RuntimeOptions`]: the capability never
+    /// travels through cloneable option data, argv, environment variables,
+    /// or logs.
+    owner_control: Option<c2_local::OwnerControlReceiver>,
+    /// Set once an owner-bound host consumed the capability; later attach or
+    /// consume attempts are rejected.
+    owner_control_consumed: bool,
+    lifecycle_policy: c2_config::ServerLifecyclePolicy,
+    lifecycle_frozen: bool,
+    shutdown_transactions: HashMap<String, Arc<ShutdownTransaction>>,
     #[cfg(test)]
     forced_relay_config_error: Option<String>,
 }
@@ -176,6 +196,19 @@ pub(crate) enum RelayResolvedConnection {
     },
 }
 
+impl RuntimeState {
+    fn ensure_no_pending_teardown(&self) -> Result<(), LifecycleError> {
+        if self
+            .shutdown_transactions
+            .values()
+            .any(|transaction| transaction.outcome.lock().is_none())
+        {
+            return Err(LifecycleError::Configuration("pending native teardown must finish before starting a new Host or resetting server identity".into()));
+        }
+        Ok(())
+    }
+}
+
 impl Runtime {
     pub fn new(options: RuntimeOptions) -> Result<Self, LifecycleError> {
         if let Some(server_id) = options.server_id.as_deref() {
@@ -198,6 +231,11 @@ impl Runtime {
                 use_process_relay_anchor: options.use_process_relay_anchor,
                 relay_projection: None,
                 path_counters: PathCounters::default(),
+                owner_control: None,
+                owner_control_consumed: false,
+                lifecycle_policy: Default::default(),
+                lifecycle_frozen: false,
+                shutdown_transactions: HashMap::new(),
                 #[cfg(test)]
                 forced_relay_config_error: None,
             })),
@@ -257,6 +295,7 @@ impl Runtime {
             validate_server_id(server_id)?;
         }
         let mut state = self.state.lock();
+        state.ensure_no_pending_teardown()?;
         state.server_id_override = server_id;
         state.server_ipc_overrides = server_ipc_overrides;
         state.identity = None;
@@ -422,8 +461,11 @@ impl Runtime {
             .map_err(|error| LifecycleError::Configuration(error.to_string()))
     }
 
-    pub fn clear_server_identity(&self) {
-        self.state.lock().identity = None;
+    pub fn clear_server_identity(&self) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        state.ensure_no_pending_teardown()?;
+        state.identity = None;
+        Ok(())
     }
 
     fn current_identity(&self) -> Option<RuntimeIdentity> {
@@ -442,6 +484,96 @@ impl Runtime {
 
     pub fn relay_anchor_address_override(&self) -> Option<String> {
         self.state.lock().relay_anchor_address_override.clone()
+    }
+
+    /// Set the native policy before the first Host freezes it.
+    pub fn set_lifecycle_policy(
+        &self,
+        policy: c2_config::ServerLifecyclePolicy,
+    ) -> Result<(), LifecycleError> {
+        policy.validate().map_err(LifecycleError::Configuration)?;
+        let mut state = self.state.lock();
+        if state.lifecycle_frozen {
+            return Err(LifecycleError::Configuration(
+                "server lifecycle policy is frozen".into(),
+            ));
+        }
+        state.lifecycle_policy = policy;
+        Ok(())
+    }
+
+    pub fn lifecycle_policy(&self) -> c2_config::ServerLifecyclePolicy {
+        self.state.lock().lifecycle_policy
+    }
+
+    pub(crate) fn freeze_lifecycle_policy(
+        &self,
+        policy: c2_config::ServerLifecyclePolicy,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        state.ensure_no_pending_teardown()?;
+        if state.lifecycle_frozen && state.lifecycle_policy != policy {
+            return Err(LifecycleError::Configuration(
+                "server lifecycle policy is frozen".into(),
+            ));
+        }
+        state.lifecycle_policy = policy;
+        state.lifecycle_frozen = true;
+        Ok(())
+    }
+
+    /// Attach one private native capability, outside cloneable configuration data.
+    /// Once a Host consumes it, reattachment and takeover are rejected.
+    pub fn attach_owner_control(
+        &self,
+        receiver: c2_local::OwnerControlReceiver,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        if state.owner_control_consumed {
+            return Err(LifecycleError::Configuration(
+                "owner control capability was already consumed by an owner-bound host; late capability changes are rejected"
+                    .to_string(),
+            ));
+        }
+        if state.owner_control.is_some() {
+            return Err(LifecycleError::Configuration(
+                "owner control capability already attached; a Runtime accepts exactly one owner control receiver"
+                    .to_string(),
+            ));
+        }
+        state.owner_control = Some(receiver);
+        Ok(())
+    }
+
+    /// Whether an unconsumed native owner control capability is attached.
+    pub fn owner_control_attached(&self) -> bool {
+        let state = self.state.lock();
+        state.owner_control.is_some() && !state.owner_control_consumed
+    }
+
+    /// Consume the attached capability for one owner-bound host start.
+    ///
+    /// This is the freeze point: naming the `OwnerBound` policy without an
+    /// attached capability fails here, before the host can publish readiness.
+    /// A second consume attempt also fails, so one Runtime can never run two
+    /// owner-bound hosts from one capability.
+    pub(crate) fn consume_owner_control(
+        &self,
+    ) -> Result<c2_local::OwnerControlReceiver, LifecycleError> {
+        let mut state = self.state.lock();
+        match state.owner_control.take() {
+            Some(receiver) => {
+                state.owner_control_consumed = true;
+                Ok(receiver)
+            }
+            None if state.owner_control_consumed => Err(LifecycleError::Configuration(
+                "owner control capability was already consumed by an owner-bound host".to_string(),
+            )),
+            None => Err(LifecycleError::Configuration(
+                "OwnerBound host policy requires an attached native owner control capability before the host can publish readiness"
+                    .to_string(),
+            )),
+        }
     }
 
     pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, LifecycleError> {
@@ -752,7 +884,137 @@ impl Runtime {
         })
     }
 
+    pub(crate) fn shutdown_pending(&self, server: &c2_server::Server) -> bool {
+        let transaction = self
+            .state
+            .lock()
+            .shutdown_transactions
+            .get(&format!("{}:{:p}", server.server_instance_id(), server))
+            .cloned();
+        transaction.is_some_and(|transaction| transaction.outcome.lock().is_none())
+    }
+
+    /// Observe a pending native transaction without consuming the route journal.
+    pub(crate) fn shutdown_observation(
+        &self,
+        server: &c2_server::Server,
+    ) -> Option<ShutdownOutcome> {
+        let transaction = self
+            .state
+            .lock()
+            .shutdown_transactions
+            .get(&format!("{}:{:p}", server.server_instance_id(), server))
+            .cloned()?;
+        let outcome = transaction.outcome.lock().clone();
+        outcome
+    }
+
     pub(crate) fn shutdown(
+        &self,
+        server: Option<&Arc<c2_server::Server>>,
+        route_names: Vec<String>,
+        relay_anchor_address: Option<&str>,
+        relay_use_proxy: bool,
+        relay_cleanup_config_error: Option<String>,
+        shutdown_timeout: Duration,
+    ) -> ShutdownOutcome {
+        let deadline = Instant::now() + shutdown_timeout;
+        let Some(server) = server else {
+            return self.shutdown_transaction(
+                None,
+                route_names,
+                relay_anchor_address,
+                relay_use_proxy,
+                relay_cleanup_config_error,
+                shutdown_timeout,
+            );
+        };
+        // Construct before transferring work so construction failures cannot signal a server.
+        #[cfg(test)]
+        if FORCE_SERVER_RUNTIME_FAILURE.with(std::cell::Cell::get) {
+            return self.shutdown_transaction(
+                Some(server),
+                route_names,
+                relay_anchor_address,
+                relay_use_proxy,
+                relay_cleanup_config_error,
+                shutdown_timeout,
+            );
+        }
+        let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
+        let transaction = {
+            let mut state = self.state.lock();
+            // A completed transaction retains only a Weak concrete Server identity.
+            // Repeated Persistent hosts do not inherit old outcomes or retain stale pools.
+            state.shutdown_transactions.retain(|_, transaction| {
+                transaction.server.strong_count() > 0 || transaction.outcome.lock().is_none()
+            });
+            if let Some(transaction) = state.shutdown_transactions.get(&key) {
+                Arc::clone(transaction)
+            } else {
+                let transaction = Arc::new(ShutdownTransaction {
+                    server: Arc::downgrade(server),
+                    outcome: Mutex::new(None),
+                    completed: Condvar::new(),
+                    delivered: AtomicBool::new(false),
+                });
+                state
+                    .shutdown_transactions
+                    .insert(key, Arc::clone(&transaction));
+                let worker_runtime = self.clone();
+                let worker_server = Arc::clone(server);
+                let worker_transaction = Arc::clone(&transaction);
+                let relay = relay_anchor_address.map(str::to_owned);
+                // Only actual pending work retains Runtime/Server. No watcher retains Host.
+                let spawn = std::thread::Builder::new()
+                    .name("c2-shutdown".into())
+                    .spawn(move || {
+                        let outcome = worker_runtime.shutdown_transaction(
+                            Some(&worker_server),
+                            route_names,
+                            relay.as_deref(),
+                            relay_use_proxy,
+                            relay_cleanup_config_error,
+                            shutdown_timeout,
+                        );
+                        *worker_transaction.outcome.lock() = Some(outcome);
+                        worker_transaction.completed.notify_all();
+                    });
+                if let Err(error) = spawn {
+                    *transaction.outcome.lock() = Some(ShutdownOutcome {
+                        runtime_barrier_error: Some(error.to_string()),
+                        ..Default::default()
+                    });
+                    transaction.completed.notify_all();
+                }
+                transaction
+            }
+        };
+        let mut result = transaction.outcome.lock();
+        while result.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return ShutdownOutcome {
+                    server_was_started: server.is_running(),
+                    runtime_barrier_error: Some(
+                        "native shutdown transaction is still draining after the caller deadline"
+                            .into(),
+                    ),
+                    ..Default::default()
+                };
+            }
+            transaction.completed.wait_for(&mut result, remaining);
+        }
+        if transaction.delivered.swap(true, Ordering::AcqRel) {
+            return ShutdownOutcome {
+                ipc_clients_drained: true,
+                ..Default::default()
+            };
+        }
+        result.as_ref().unwrap().clone()
+    }
+
+    fn shutdown_transaction(
         &self,
         server: Option<&Arc<c2_server::Server>>,
         route_names: Vec<String>,
@@ -791,6 +1053,34 @@ impl Runtime {
             }
         }
 
+        if let Some(server) = server {
+            // A running Server owns the only drain and route journal. Request its close
+            // immediately so explicit shutdown cancels owner observation/grace while callbacks
+            // continue in the run loop. Never race a separate unregister future against it.
+            if matches!(
+                server.lifecycle_state(),
+                ServerLifecycleState::Starting | ServerLifecycleState::Ready
+            ) {
+                match Self::server_runtime() {
+                    Ok(rt) => {
+                        rt.block_on(server.close_business_admission("shutdown"));
+                        server.request_shutdown_signal_with_reason("shutdown");
+                    }
+                    Err(err) => {
+                        outcome.route_close_error = Some(err.to_string());
+                        for route_name in &route_names {
+                            outcome.route_outcomes.push(route_close_failure(
+                                route_name,
+                                "shutdown",
+                                err.to_string(),
+                            ));
+                        }
+                        return outcome;
+                    }
+                }
+            }
+        }
+
         // Close this Runtime's outgoing IPC client cache before touching the
         // server, in both hosted and hostless lifecycles. The cache handle is
         // cloned under the state lock; every connect and close barrier runs
@@ -799,7 +1089,14 @@ impl Runtime {
         // confirmed its bounded close AND the drain was not blocked behind a
         // concurrent drain transaction or in-flight detached-close barriers.
         let client_pool = Arc::clone(&self.state.lock().client_pool);
-        let client_close = client_pool.close_all(shutdown_timeout);
+        let mut client_close = client_pool.close_all(shutdown_timeout);
+        if server.is_some() {
+            // This native transaction owns outstanding client barriers as well as routes.
+            // Its callers time out independently; keep retrying actual unconfirmed work.
+            while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
+                client_close = client_pool.close_all(Duration::from_secs(1));
+            }
+        }
         outcome.ipc_clients_drained =
             client_close.unconfirmed.is_empty() && client_close.error.is_none();
         if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {
@@ -822,15 +1119,15 @@ impl Runtime {
                 ServerLifecycleState::Stopping | ServerLifecycleState::Stopped
             ) {
                 match Self::server_runtime() {
-                    Ok(rt) => match rt
-                        .block_on(server.observe_external_shutdown_outcomes(shutdown_timeout))
-                    {
-                        Ok(outcomes) => outcomes,
-                        Err(err) => {
-                            outcome.runtime_barrier_error = Some(err.to_string());
-                            Vec::new()
+                    Ok(rt) => {
+                        match rt.block_on(server.observe_external_shutdown_outcomes_unbounded()) {
+                            Ok(outcomes) => outcomes,
+                            Err(err) => {
+                                outcome.runtime_barrier_error = Some(err.to_string());
+                                Vec::new()
+                            }
                         }
-                    },
+                    }
                     Err(err) => {
                         outcome.runtime_barrier_error = Some(err.to_string());
                         Vec::new()
@@ -866,18 +1163,6 @@ impl Runtime {
                                 .route_outcomes
                                 .push(route_close_from_server_outcome(close));
                         }
-                        for route_name in &pending_runtime_unregisters {
-                            if let Some(identity) = identity.as_ref()
-                                && let Some(relay_error) = self.relay_cleanup(
-                                    effective_relay_anchor_address.as_deref(),
-                                    relay_use_proxy,
-                                    route_name,
-                                    &identity.server_id,
-                                )
-                            {
-                                outcome.relay_errors.push(relay_error);
-                            }
-                        }
                     }
                     Err(err) => {
                         outcome.route_close_error = Some(err.to_string());
@@ -894,7 +1179,7 @@ impl Runtime {
             }
             if can_signal_shutdown && server_was_started {
                 match Self::server_runtime() {
-                    Ok(rt) => match rt.block_on(server.shutdown_and_wait(shutdown_timeout)) {
+                    Ok(rt) => match rt.block_on(server.shutdown_and_wait_unbounded()) {
                         Ok(close_outcomes) => {
                             for close in close_outcomes {
                                 if !outcome.removed_routes.contains(&close.route_name) {
@@ -911,6 +1196,21 @@ impl Runtime {
                     },
                     Err(err) => {
                         outcome.runtime_barrier_error = Some(err.to_string());
+                    }
+                }
+            }
+            if let Some(identity) = identity.as_ref() {
+                let mut cleaned = std::collections::HashSet::new();
+                for close in &outcome.route_outcomes {
+                    if close.local_removed && cleaned.insert(close.route_name.as_str()) {
+                        if let Some(error) = self.relay_cleanup(
+                            effective_relay_anchor_address.as_deref(),
+                            relay_use_proxy,
+                            &close.route_name,
+                            &identity.server_id,
+                        ) {
+                            outcome.relay_errors.push(error);
+                        }
                     }
                 }
             }
@@ -1358,7 +1658,7 @@ mod tests {
 
         let first = session.ensure_server().expect("ensure server");
         assert_eq!(first.server_id, "unit-retry");
-        session.clear_server_identity();
+        session.clear_server_identity().unwrap();
         assert_eq!(session.server_id(), None);
         assert_eq!(session.server_address(), None);
 

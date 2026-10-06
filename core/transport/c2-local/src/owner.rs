@@ -95,6 +95,13 @@ impl OwnerControlKeepalive {
 pub struct OwnerControlReceiver(platform::Receiver);
 
 impl OwnerControlReceiver {
+    /// Activate the single runtime watcher, then probe the native endpoint for peer closure.
+    /// `true` means no closure was observable at the probe; `false` is peer EOF.
+    /// This is an establishment check, not a promise against a later concurrent owner exit.
+    pub async fn prepare(&mut self) -> io::Result<bool> {
+        self.0.prepare().await
+    }
+
     /// Wait until the controller endpoint closes or the control handle becomes invalid.
     ///
     /// The first call activates the endpoint and creates its single runtime watcher. Dropping this

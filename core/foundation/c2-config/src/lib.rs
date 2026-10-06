@@ -5,6 +5,7 @@
 
 mod identity;
 mod ipc;
+mod lifecycle;
 mod local;
 mod memory;
 mod pool;
@@ -13,6 +14,9 @@ mod remote;
 mod resolver;
 
 pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id};
+pub use lifecycle::{
+    MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace,
+};
 pub use ipc::{
     BASE_IPC_OVERRIDE_KEYS, BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig,
     FORBIDDEN_IPC_OVERRIDE_KEYS, MAX_EXECUTION_WORKERS, MAX_IPC_POOL_SEGMENTS, PoolRoleTuning,

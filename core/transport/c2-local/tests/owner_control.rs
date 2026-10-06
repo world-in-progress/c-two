@@ -341,3 +341,30 @@ fn inherited_file_and_invalid_handle_are_rejected_with_os_errors() {
         Some(ERROR_INVALID_HANDLE as i32)
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_probes_already_closed_without_reactor_turn_and_activates_once() {
+    let (keepalive, mut receiver) = owner_control_pair().unwrap();
+    drop(keepalive);
+    assert!(!receiver.prepare().await.unwrap());
+    assert!(receiver.is_activated());
+    assert!(!receiver.prepare().await.unwrap());
+    receiver.wait_closed().await.unwrap();
+    assert!(receiver.take_stdio().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_establishes_live_watcher_and_reuses_it_for_closure() {
+    let (keepalive, mut receiver) = owner_control_pair().unwrap();
+    assert!(receiver.prepare().await.unwrap());
+    assert!(receiver.is_activated());
+    assert!(receiver.prepare().await.unwrap());
+    drop(keepalive);
+    tokio::time::timeout(Duration::from_secs(2), receiver.wait_closed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!receiver.prepare().await.unwrap());
+    receiver.shutdown();
+    assert!(receiver.prepare().await.is_err());
+}

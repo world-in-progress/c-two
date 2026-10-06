@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use c2_local::{
@@ -88,6 +88,21 @@ const SHUTDOWN_INITIATE_FRAME_BODY_LEN: u32 =
     FRAME_FIXED_BODY_LEN + c2_wire::msg_type::SHUTDOWN_CLIENT_BYTES.len() as u32;
 const POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS: u64 = 100;
 const CONTROL_ACK_PEER_CLOSE_TIMEOUT_MS: u64 = 50;
+/// Default journal reason for an explicit direct IPC shutdown transaction.
+pub const DIRECT_IPC_SHUTDOWN_REASON: &str = "direct_ipc_shutdown";
+/// Journal reason for the shutdown transaction an owner-bound host starts
+/// after its controller's grace window expired. The owner control EOF is a
+/// separate channel from business stream EOF, idle eviction, ping failures,
+/// cancellation, and relay reconnects, and must stay distinguishable here.
+pub const OWNER_BOUND_SHUTDOWN_REASON: &str = "owner_bound_grace_expired";
+/// Journal reason when an owner-bound host stops because its own control
+/// watcher failed locally and the owner relationship can no longer be
+/// observed. This is not a business-stream failure and not a peer EOF.
+pub const OWNER_WATCHER_ERROR_SHUTDOWN_REASON: &str = "owner_bound_watcher_error";
+/// Admission-closure reason when the controller closed the control channel.
+pub const OWNER_MISSING_ADMISSION_REASON: &str = "owner_missing";
+/// Admission-closure reason when the control watcher itself failed.
+pub const OWNER_WATCHER_ERROR_ADMISSION_REASON: &str = "owner_watcher_error";
 
 fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
     C2Error::new(code, message).to_wire_bytes()
@@ -95,7 +110,11 @@ fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
 
 fn close_reason_to_route_state_reason(closed_reason: &str) -> RouteStateReasonWire {
     match closed_reason {
-        "shutdown" | "direct_ipc_shutdown" => RouteStateReasonWire::Shutdown,
+        "shutdown" | "direct_ipc_shutdown" | OWNER_BOUND_SHUTDOWN_REASON
+        | OWNER_WATCHER_ERROR_SHUTDOWN_REASON => RouteStateReasonWire::Shutdown,
+        OWNER_MISSING_ADMISSION_REASON | OWNER_WATCHER_ERROR_ADMISSION_REASON => {
+            RouteStateReasonWire::OwnerWatchDisconnected
+        }
         _ => RouteStateReasonWire::ExplicitUnregister,
     }
 }
@@ -225,6 +244,14 @@ pub struct Server {
     active_connections_notify: Notify,
     shutdown_route_outcomes: parking_lot::Mutex<Vec<ServerRouteCloseOutcome>>,
     shutdown_generation: AtomicU64,
+    /// Close reason stamped into the run loop's shutdown route journal.
+    /// `direct_ipc_shutdown` is the default; owner-bound owners select their
+    /// own reason so a control-EOF shutdown is distinguishable in outcomes.
+    shutdown_close_reason: parking_lot::Mutex<&'static str>,
+    /// Set when an owner-bound controller closes and new business admission
+    /// must stop before the shutdown transaction itself begins. Existing work
+    /// keeps draining under the original rules; the listener stays open.
+    business_admission_closed: AtomicBool,
     execution_scheduler: Scheduler,
 }
 
@@ -444,6 +471,8 @@ impl Server {
             active_connections_notify: Notify::new(),
             shutdown_route_outcomes: parking_lot::Mutex::new(Vec::new()),
             shutdown_generation: AtomicU64::new(0),
+            shutdown_close_reason: parking_lot::Mutex::new(DIRECT_IPC_SHUTDOWN_REASON),
+            business_admission_closed: AtomicBool::new(false),
             execution_scheduler,
         })
     }
@@ -631,6 +660,12 @@ impl Server {
         }
     }
 
+    /// Read-only count of native connections still owned by this server.
+    /// Connection count does not select the server lifecycle policy.
+    pub fn active_connection_count(&self) -> usize {
+        self.active_connections.lock().len()
+    }
+
     #[cfg(test)]
     fn active_connection_ids(&self) -> Vec<u64> {
         self.active_connections.lock().keys().copied().collect()
@@ -726,6 +761,12 @@ impl Server {
                 route_name
             )));
         }
+        if self.business_admission_closed() {
+            return Err(ServerError::Protocol(format!(
+                "server business admission is closed; cannot reserve route {}",
+                route_name
+            )));
+        }
         drop(dispatcher);
         let registration_token = uuid::Uuid::new_v4().simple().to_string();
         pending_routes.insert(
@@ -790,11 +831,19 @@ impl Server {
         let _guard = self.route_registration.lock().await;
         if reservation.shutdown_generation != self.shutdown_generation.load(Ordering::Acquire)
             || matches!(self.lifecycle_state(), ServerLifecycleState::Stopping)
+            || self.business_admission_closed()
         {
+            let refusal = if self.business_admission_closed()
+                && !matches!(self.lifecycle_state(), ServerLifecycleState::Stopping)
+            {
+                "server business admission is closed"
+            } else {
+                "server is shutting down"
+            };
             reservation.close_scheduler_for_abort();
             reservation.resolve();
             return Err(ServerError::Protocol(format!(
-                "server is shutting down; cannot commit route {}",
+                "{refusal}; cannot commit route {}",
                 reservation.route_name()
             )));
         }
@@ -1077,6 +1126,53 @@ impl Server {
         })?
     }
 
+    /// Observe initiation so an owner can cancel control observation and its grace immediately.
+    pub async fn wait_for_shutdown_requested(&self) {
+        let mut rx = self.shutdown_tx.subscribe();
+        wait_for_shutdown(&mut rx).await;
+    }
+
+    /// Wait for actual terminal runtime work without imposing a caller deadline.
+    /// Pending shutdown owners use this while their callers observe bounded waits separately.
+    pub async fn wait_until_terminal(&self) -> Result<(), ServerError> {
+        let mut rx = self.lifecycle_tx.subscribe();
+        loop {
+            if matches!(
+                *rx.borrow(),
+                ServerLifecycleState::Initialized
+                    | ServerLifecycleState::Stopped
+                    | ServerLifecycleState::Failed(_)
+            ) {
+                return Ok(());
+            }
+            rx.changed()
+                .await
+                .map_err(|_| ServerError::Config("server lifecycle channel closed".into()))?;
+        }
+    }
+
+    pub async fn observe_external_shutdown_outcomes_unbounded(
+        &self,
+    ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
+        if matches!(
+            self.lifecycle_state(),
+            ServerLifecycleState::Stopping | ServerLifecycleState::Stopped
+        ) {
+            self.wait_until_terminal().await?;
+            Ok(self.take_shutdown_route_outcomes())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn shutdown_and_wait_unbounded(
+        &self,
+    ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
+        self.request_shutdown_signal();
+        self.wait_until_terminal().await?;
+        Ok(self.take_shutdown_route_outcomes())
+    }
+
     /// Mark runtime-backed server work as stopped after its runtime is gone.
     ///
     /// This is a shutdown cleanup fence for runtime owners. It does not erase
@@ -1230,9 +1326,10 @@ impl Server {
                     shutdown_close_started = true;
                     let server = Arc::clone(self);
                     let done_tx = shutdown_done_tx.clone();
+                    let close_reason = *server.shutdown_close_reason.lock();
                     tokio::spawn(async move {
                         let outcomes = server
-                            .close_registered_routes_for_shutdown("direct_ipc_shutdown")
+                            .close_registered_routes_for_shutdown(close_reason)
                             .await;
                         let _ = done_tx.send(outcomes);
                     });
@@ -1283,6 +1380,78 @@ impl Server {
         self.request_shutdown_signal();
         self.wait_until_stopped(timeout).await?;
         Ok(self.take_shutdown_route_outcomes())
+    }
+
+    /// Initiate the shutdown transaction with an explicit journal reason.
+    ///
+    /// Owner-bound hosts use this so the recorded route-close reason says the
+    /// controller relationship ended, not an anonymous direct IPC stop. The
+    /// reason must be a static string because it is stored for the lifetime of
+    /// the shutdown transaction.
+    pub fn request_shutdown_signal_with_reason(&self, close_reason: &'static str) {
+        *self.shutdown_close_reason.lock() = close_reason;
+        self.request_shutdown_signal();
+    }
+
+    /// Suspend new business admission without starting the shutdown
+    /// transaction.
+    ///
+    /// This is the owner-bound `OwnerMissing` action: every registered route
+    /// scheduler closes so new requests are rejected, later route
+    /// registrations fail, and existing work continues to drain under the
+    /// original rules. The listener stays open and the lifecycle state is
+    /// unchanged; the full shutdown transaction still has to run separately.
+    /// Returns the number of routes whose admission was closed by this call
+    /// (already-closed routes are not counted again).
+    pub async fn close_business_admission(&self, reason: &str) -> usize {
+        self.business_admission_closed
+            .store(true, Ordering::Release);
+        let route_state_reason = close_reason_to_route_state_reason(reason);
+        let routes = {
+            let _guard = self.route_registration.lock().await;
+            let dispatcher = self.dispatcher.read().await;
+            dispatcher.routes_snapshot()
+        };
+        let mut closed = 0usize;
+        for route in &routes {
+            let scheduler_closed = !route.scheduler.snapshot().closed;
+            if scheduler_closed {
+                route.scheduler.close();
+            }
+            let _ = self
+                .route_catalog
+                .write()
+                .close_route(&route.name, route_state_reason.clone());
+            if scheduler_closed {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    /// Whether [`Server::close_business_admission`] suspended new business
+    /// admission on this server.
+    pub fn business_admission_closed(&self) -> bool {
+        self.business_admission_closed.load(Ordering::Acquire)
+    }
+
+    /// Reject a start attempt that has not published readiness yet.
+    ///
+    /// This moves a `Starting` server straight to `Failed`, which makes every
+    /// readiness waiter fail fast with `message`. It exists for owners that
+    /// must refuse to serve before readiness — for example an owner-bound
+    /// host whose controller capability is already gone. It never touches a
+    /// server that is running or already terminal.
+    pub fn reject_start_attempt(&self, message: String) -> Result<(), ServerError> {
+        match self.lifecycle_state() {
+            ServerLifecycleState::Starting => {
+                self.set_lifecycle_state(ServerLifecycleState::Failed(message));
+                Ok(())
+            }
+            state => Err(ServerError::Config(format!(
+                "cannot reject a start attempt while lifecycle state is {state:?}",
+            ))),
+        }
     }
 
     fn request_shutdown_signal(&self) {

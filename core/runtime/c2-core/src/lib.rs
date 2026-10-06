@@ -11,6 +11,7 @@ mod host;
 mod identity;
 mod lifetime;
 pub mod memory;
+mod owner_bound;
 mod outcome;
 mod session;
 
@@ -38,6 +39,7 @@ pub use memory::{
     MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
     RetirementHandoff, RuntimeMemoryStats, scope,
 };
+pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
 pub use outcome::{
     RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome, ShutdownOutcome,
     UnregisterOutcome,

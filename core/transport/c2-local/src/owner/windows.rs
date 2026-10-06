@@ -26,7 +26,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, GetNamedPipeInfo, PIPE_REJECT_REMOTE_CLIENTS, PIPE_SERVER_END,
-    PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+    PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE, PIPE_WAIT, PeekNamedPipe,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -264,12 +264,9 @@ impl Keepalive {
 }
 
 impl Receiver {
-    pub(super) async fn wait_closed(&mut self) -> io::Result<()> {
-        // The first observed remote closure is terminal. Later waits must report the same stable
-        // `Ok(())` and must not issue another overlapped operation, which on Windows can return
-        // ERROR_PIPE_NOT_CONNECTED instead of the original EOF.
+    pub(super) async fn prepare(&mut self) -> io::Result<bool> {
         if self.peer_closed {
-            return Ok(());
+            return Ok(false);
         }
         if self.active.is_none() {
             let pending = self.pending.take().ok_or_else(closed_receiver)?;
@@ -290,11 +287,64 @@ impl Receiver {
             // Tokio documents `connect` as cancel safe: a cancelled wait leaves the pending
             // `ConnectNamedPipe` on the same completion port, and this call resumes it without a
             // new registration. `connected` is only set after a full success.
-            watcher.connect().await?;
-            self.connected = true;
+            match watcher.connect().await {
+                Ok(()) => self.connected = true,
+                Err(error) if is_peer_closed(&error) => {
+                    self.peer_closed = true;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let watcher = self.active.as_ref().ok_or_else(closed_receiver)?;
+        let mut available = 0u32;
+        // This handle is validated FILE_FLAG_OVERLAPPED. Peek does not create another
+        // IOCP registration or pending read, and detects an already broken peer.
+        let ok = unsafe {
+            PeekNamedPipe(
+                watcher.as_raw_handle() as HANDLE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            if is_peer_closed(&error) {
+                self.peer_closed = true;
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        if available != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "owner control pipe unexpectedly carried data",
+            ));
+        }
+        Ok(true)
+    }
+
+    pub(super) async fn wait_closed(&mut self) -> io::Result<()> {
+        // The first observed remote closure is terminal. Later waits must report the same stable
+        // `Ok(())` and must not issue another overlapped operation, which on Windows can return
+        // ERROR_PIPE_NOT_CONNECTED instead of the original EOF.
+        if self.peer_closed {
+            return Ok(());
+        }
+        if !self.prepare().await? {
+            return Ok(());
         }
         let mut byte = [0u8; 1];
-        match watcher.read(&mut byte).await {
+        match self
+            .active
+            .as_mut()
+            .ok_or_else(closed_receiver)?
+            .read(&mut byte)
+            .await
+        {
             Ok(0) => self.record_peer_closed(),
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
