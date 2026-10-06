@@ -11,8 +11,8 @@ mod host;
 mod identity;
 mod lifetime;
 pub mod memory;
-mod owner_bound;
 mod outcome;
+mod owner_bound;
 mod session;
 
 pub use client::{Client, Connect, EncodedClient, ObservedPath, ObservedRoute, PathCounters};
@@ -42,16 +42,20 @@ pub use lifetime::HeldResponse;
 pub use c2_local::{
     ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
     EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
-    EndpointReapResult, EndpointSweep, EndpointUnverifiedReason, LocalEndpoint, SweepBatch,
-    SweepBudget, inspect_endpoint, reap_endpoint,
+    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint,
+    SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
 };
 pub use memory::{
     MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
     RetirementHandoff, RuntimeMemoryStats, scope,
 };
-pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
 pub use outcome::{
     RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome, ShutdownOutcome,
     UnregisterOutcome,
 };
+pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
 pub use session::{Runtime, RuntimeIdentity, RuntimeOptions};
+
+// SDK facades use the canonical Core owner capability types.
+pub use c2_config::{MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace};
+pub use c2_local::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};

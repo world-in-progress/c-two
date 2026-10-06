@@ -690,6 +690,10 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
         def __init__(self, **_kwargs) -> None:
             pass
 
+        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
+            assert route_names == []
+            return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
+
         def retire_memory_observation(self):
             # Test double: the registry moves a retirement bundle between
             # sessions on shutdown, so the double models the full interface.
@@ -785,6 +789,10 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
 
         def __init__(self, **_kwargs) -> None:
             pass
+
+        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
+            assert route_names == []
+            return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
 
         def retire_memory_observation(self):
             return _FakeRetiredObservation()

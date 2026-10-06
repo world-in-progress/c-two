@@ -387,6 +387,7 @@ impl PyEndpointSweep {
     fn open<'py>(
         py: Python<'py>,
         protocol: &str,
+        addresses: Option<Vec<String>>,
         max_entries: Option<Bound<'py, PyAny>>,
         max_ms: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
@@ -404,10 +405,18 @@ impl PyEndpointSweep {
         // reserved probe address; it is never a hardcoded directory.
         let probe = LocalEndpoint::from_address_with_protocol("ipc://c2-endpoint-sweep", protocol)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let scope = addresses
+            .as_ref()
+            .map(|addresses| EndpointSweep::scope_for_addresses(&probe, addresses))
+            .transpose()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let lease = SweepLease::acquire()?;
         // Opening walks and validates the namespace directory, so the GIL is
         // released for the real filesystem work.
-        let opened = py.detach(|| EndpointSweep::for_endpoint(&probe));
+        let opened = py.detach(|| match scope.as_ref() {
+            Some(scope) => EndpointSweep::for_scope(scope),
+            None => EndpointSweep::for_endpoint(&probe),
+        });
         let inner = match opened {
             Ok(sweep) => sweep,
             Err(error) => {
@@ -529,14 +538,15 @@ impl PyEndpointSweep {
     /// default budget. They are validated here, before the process lease and
     /// iterator exist.
     #[new]
-    #[pyo3(signature = (protocol, *, max_entries=None, max_ms=None))]
+    #[pyo3(signature = (protocol, *, addresses=None, max_entries=None, max_ms=None))]
     fn new<'py>(
         py: Python<'py>,
         protocol: &str,
+        addresses: Option<Vec<String>>,
         max_entries: Option<Bound<'py, PyAny>>,
         max_ms: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
-        Self::open(py, protocol, max_entries, max_ms)
+        Self::open(py, protocol, addresses, max_entries, max_ms)
     }
 
     /// Advances the native iterator by one bounded batch.

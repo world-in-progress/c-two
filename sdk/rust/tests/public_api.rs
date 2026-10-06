@@ -580,3 +580,25 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
     );
     std::fs::remove_dir_all(root).expect("temporary crate cleanup");
 }
+
+#[test]
+fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
+    let pair: fn() -> std::io::Result<(c2_core::OwnerControlKeepalive, c2_core::OwnerControlReceiver)> =
+        c_two::owner_control_pair;
+    assert_eq!(
+        std::any::TypeId::of::<c_two::ServerLifecyclePolicy>(),
+        std::any::TypeId::of::<c2_core::ServerLifecyclePolicy>(),
+    );
+    assert_eq!(
+        std::any::TypeId::of::<c_two::HostLifecycleSnapshot>(),
+        std::any::TypeId::of::<c2_core::HostLifecycleSnapshot>(),
+    );
+    let (mut keepalive, receiver) = pair().expect("native capability pair");
+    let runtime = Runtime::new(RuntimeOptions::default()).expect("runtime");
+    runtime
+        .set_lifecycle_policy(c_two::ServerLifecyclePolicy::owner_bound(Duration::ZERO).unwrap())
+        .expect("Core validates the policy");
+    runtime.attach_owner_control(receiver).expect("Core takes receiver");
+    assert!(runtime.owner_control_attached());
+    keepalive.shutdown();
+}

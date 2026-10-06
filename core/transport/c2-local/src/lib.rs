@@ -216,7 +216,54 @@ pub struct SweepBatch {
 /// always starts at the beginning and does not inherit completion state.
 pub struct EndpointSweep(platform::EndpointSweep);
 
+/// A bounded set of logical addresses in one canonical protocol namespace.
+/// Constructing a scope performs no filesystem access and takes no sweep lease.
+#[derive(Clone)]
+pub struct EndpointSweepScope {
+    endpoint: LocalEndpoint,
+    targets: Vec<LocalEndpoint>,
+}
+
+impl EndpointSweepScope {
+    pub const MAX_ADDRESSES: usize = 4096;
+
+    pub fn from_addresses(endpoint: &LocalEndpoint, addresses: &[String]) -> io::Result<Self> {
+        if addresses.len() > Self::MAX_ADDRESSES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many endpoint sweep addresses",
+            ));
+        }
+        let root = std::path::Path::new(endpoint.os_name()).parent();
+        let mut targets = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let target = LocalEndpoint::from_address_with_protocol(address, endpoint.protocol())?;
+            if target.protocol() != endpoint.protocol()
+                || std::path::Path::new(target.os_name()).parent() != root
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "endpoint sweep target is outside its namespace",
+                ));
+            }
+            targets.push(target);
+        }
+        Ok(Self {
+            endpoint: endpoint.clone(),
+            targets,
+        })
+    }
+}
+
 impl EndpointSweep {
+    /// Validates an address scope before any iterator or process lease exists.
+    pub fn scope_for_addresses(
+        endpoint: &LocalEndpoint,
+        addresses: &[String],
+    ) -> io::Result<EndpointSweepScope> {
+        EndpointSweepScope::from_addresses(endpoint, addresses)
+    }
+
     /// Opens the default managed namespace derived from `LocalEndpoint`
     /// authority. It is not a second hardcoded directory.
     pub fn open() -> io::Result<Self> {
@@ -226,6 +273,12 @@ impl EndpointSweep {
     /// Opens the managed namespace that contains `endpoint`.
     pub fn for_endpoint(endpoint: &LocalEndpoint) -> io::Result<Self> {
         platform::EndpointSweep::for_endpoint(endpoint).map(Self)
+    }
+
+    /// Opens a sweep restricted to the validated logical-address slots.
+    /// An empty scope selects no endpoint or ownership entries.
+    pub fn for_scope(scope: &EndpointSweepScope) -> io::Result<Self> {
+        platform::EndpointSweep::for_scope(&scope.endpoint, &scope.targets).map(Self)
     }
 
     pub fn next_batch(&mut self, budget: SweepBudget) -> SweepBatch {

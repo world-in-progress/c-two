@@ -261,6 +261,7 @@ class EndpointSweep:
 def sweep_endpoints(
     protocol: str,
     *,
+    addresses: list[str] | None = None,
     max_entries: int | None = None,
     max_ms: int | None = None,
 ) -> EndpointSweep:
@@ -271,6 +272,10 @@ def sweep_endpoints(
 
     Args:
         protocol: ``'legacy-v1'`` or ``'managed-v2'``.
+        addresses: Optional logical IPC addresses to select. ``None`` covers
+            the whole protocol namespace; an empty list selects no slots.
+            Rust derives and validates canonical socket and ownership names
+            before opening the iterator or acquiring the maintenance lease.
         max_entries: Optional entry-budget override for every batch. ``None``
             keeps the native ``SweepBudget`` default stored by the Rust sweep.
         max_ms: Optional wall-clock budget override in milliseconds. ``None``
@@ -287,7 +292,7 @@ def sweep_endpoints(
     # the default budget and validates every explicit dimension before it
     # takes the process lease or opens the iterator.
     return EndpointSweep(
-        native.PyEndpointSweep(protocol, max_entries=max_entries, max_ms=max_ms)
+        native.PyEndpointSweep(protocol, addresses=addresses, max_entries=max_entries, max_ms=max_ms)
     )
 
 

@@ -174,6 +174,13 @@ impl EndpointSweep {
         Ok(Self)
     }
 
+    pub(crate) fn for_scope(
+        _endpoint: &LocalEndpoint,
+        _targets: &[LocalEndpoint],
+    ) -> io::Result<Self> {
+        Ok(Self)
+    }
+
     pub(crate) fn next_batch(&mut self, _budget: SweepBudget) -> SweepBatch {
         SweepBatch {
             not_applicable: 1,

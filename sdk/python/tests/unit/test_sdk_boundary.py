@@ -629,7 +629,7 @@ def test_python_native_server_bridge_does_not_expose_public_bool_unit_lifecycle_
     assert "runtime_session.shutdown(" in bridge_source
     assert "host.register(definition)" in runtime_session_source
     assert "registration.close()" in runtime_session_source
-    assert "Host::shutdown" in runtime_session_source
+    assert "host.shutdown_with_timeout(timeout)" in runtime_session_source
     assert "outcome.get('removed_routes')" not in bridge_source
     assert "_close_outcome_is_hook_safe" in bridge_source
 

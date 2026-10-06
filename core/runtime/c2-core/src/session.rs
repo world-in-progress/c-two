@@ -500,6 +500,66 @@ impl Runtime {
         Ok(())
     }
 
+    /// Atomically move the unstarted server lifecycle to a prepared Runtime.
+    ///
+    /// Session replacement is a pre-use configuration transaction. Both sides
+    /// are checked before moving the opaque receiver, so a refused handoff
+    /// leaves the source usable. Lock order is stable even for opposing calls.
+    /// A host-frozen or consumed capability can never be transferred or reused.
+    pub fn transfer_unstarted_lifecycle_to(
+        &self,
+        replacement: &Runtime,
+    ) -> Result<(), LifecycleError> {
+        if Arc::ptr_eq(&self.state, &replacement.state) {
+            return Err(LifecycleError::Configuration(
+                "cannot transfer lifecycle to the same Runtime".into(),
+            ));
+        }
+        let transfer = |source: &mut RuntimeState, target: &mut RuntimeState| {
+            source.ensure_no_pending_teardown()?;
+            target.ensure_no_pending_teardown()?;
+            if source.lifecycle_frozen
+                || source.owner_control_consumed
+                || source.client_config_frozen
+            {
+                return Err(LifecycleError::Configuration(
+                    "cannot transfer lifecycle after Runtime use".into(),
+                ));
+            }
+            if target.lifecycle_frozen
+                || target.owner_control_consumed
+                || target.owner_control.is_some()
+                || target.client_config_frozen
+                || target.lifecycle_policy != Default::default()
+            {
+                return Err(LifecycleError::Configuration(
+                    "replacement Runtime already owns a lifecycle".into(),
+                ));
+            }
+            target.lifecycle_policy = source.lifecycle_policy;
+            target.owner_control = source.owner_control.take();
+            // The retired source cannot adopt another capability after moving
+            // its original receiver. Closing it remains a hostless operation.
+            if target.owner_control.is_some() {
+                source.owner_control_consumed = true;
+            }
+            Ok(())
+        };
+        if Arc::as_ptr(&self.state) < Arc::as_ptr(&replacement.state) {
+            transfer(&mut self.state.lock(), &mut replacement.state.lock())
+        } else {
+            let mut target = replacement.state.lock();
+            transfer(&mut self.state.lock(), &mut target)
+        }
+    }
+
+    /// Observe native teardown authority without consuming a Host journal.
+    /// SDK start projections use this while the listener can still report
+    /// running as active callbacks drain.
+    pub fn has_pending_teardown(&self) -> bool {
+        self.state.lock().ensure_no_pending_teardown().is_err()
+    }
+
     pub fn lifecycle_policy(&self) -> c2_config::ServerLifecyclePolicy {
         self.state.lock().lifecycle_policy
     }
@@ -547,6 +607,11 @@ impl Runtime {
     pub fn owner_control_attached(&self) -> bool {
         let state = self.state.lock();
         state.owner_control.is_some() && !state.owner_control_consumed
+    }
+
+    /// Read-only one-way consumption state for SDK capability preflight.
+    pub fn owner_control_consumed(&self) -> bool {
+        self.state.lock().owner_control_consumed
     }
 
     /// Consume the attached capability for one owner-bound host start.

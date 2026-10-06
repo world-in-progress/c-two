@@ -1,8 +1,14 @@
 from importlib.metadata import version
 __version__ = version('c-two')
 
+from ._native import NativeOwnerReceiver, OwnerControlKeepalive, OwnedChild
 from . import error
-from .config import BaseIPCOverrides, ClientIPCOverrides, ServerIPCOverrides
+from .config import (
+    BaseIPCOverrides,
+    ClientIPCOverrides,
+    LifecycleConfig,
+    ServerIPCOverrides,
+)
 from .codegen import (
     ContractArtifact,
     ContractArtifactSet,
@@ -44,6 +50,11 @@ from .transport.registry import (
     serve,
     hold_stats,
     memory_stats,
+    owner_control_pair,
+    adopt_owner_stdin,
+    spawn_owned_child,
+    native_lifecycle_snapshot,
+    native_terminal_outcome,
 )
 
 __all__ = [
@@ -51,6 +62,10 @@ __all__ = [
     'error',
     'BaseIPCOverrides',
     'ClientIPCOverrides',
+    'LifecycleConfig',
+    'NativeOwnerReceiver',
+    'OwnerControlKeepalive',
+    'OwnedChild',
     'ServerIPCOverrides',
     'ContractArtifact',
     'ContractArtifactSet',
@@ -97,4 +112,9 @@ __all__ = [
     'serve',
     'hold_stats',
     'memory_stats',
+    'owner_control_pair',
+    'adopt_owner_stdin',
+    'spawn_owned_child',
+    'native_lifecycle_snapshot',
+    'native_terminal_outcome',
 ]

@@ -1740,3 +1740,85 @@ async fn managed_bind_target_is_descriptor_relative_not_the_absolute_path() {
     // The derived production slot was never created by this bind.
     assert!(!socket_path(&endpoint).exists());
 }
+
+/// Two real abandoned listeners share a private test root. Scope selects one
+/// orphan and one active listener, leaving every byte and identity of the
+/// unselected orphan and its ownership record unchanged.
+#[tokio::test]
+async fn sweep_scope_reaps_only_selected_slots_and_preserves_active_owner() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let selected = managed_endpoint("scope-selected");
+    let unselected = managed_endpoint("scope-unselected");
+    let active = managed_endpoint("scope-active");
+    bind_managed_at(&selected, root).unwrap().abandon_for_test();
+    bind_managed_at(&unselected, root).unwrap().abandon_for_test();
+    let active_listener = bind_managed_at(&active, root).unwrap();
+    let untouched_socket = socket_path_at(root, &unselected);
+    let untouched_lease = lease_path_at(root, &unselected);
+    let socket_identity = identity_of(&untouched_socket);
+    let lease_identity = identity_of(&untouched_lease);
+    let lease_bytes = std::fs::read(&untouched_lease).unwrap();
+    for _ in 0..2 {
+        let mut sweep = retry_sweep(|| ManagedSweep::open_scoped_at(root, &[selected.clone(), active.clone()]));
+        let mut complete = false;
+        let mut busy = 0;
+        for _ in 0..32 {
+            let batch = sweep.next_batch(SweepBudget { max_entries: 1, max_duration: Duration::ZERO });
+            assert!(batch.entries_visited <= 1);
+            assert!(!batch.round_interrupted);
+            busy += batch.busy;
+            if batch.round_complete { complete = true; break; }
+        }
+        assert!(complete, "private stable scope must reach EOF");
+        assert!(busy >= 1, "selected active listener must remain protected");
+        assert!(sweep.next_batch(SweepBudget::default()).round_complete);
+        assert!(!socket_path_at(root, &selected).exists());
+        assert!(!lease_path_at(root, &selected).exists());
+        assert_eq!(identity_of(&untouched_socket), socket_identity);
+        assert_eq!(identity_of(&untouched_lease), lease_identity);
+        assert_eq!(std::fs::read(&untouched_lease).unwrap(), lease_bytes);
+    }
+    assert!(matches!(active_listener.close(), EndpointReapResult::Reaped));
+    let mut empty = retry_sweep(|| ManagedSweep::open_scoped_at(root, &[]));
+    let batch = empty.next_batch(SweepBudget::default());
+    assert!(batch.round_complete);
+    assert_eq!(batch.endpoints_examined, 0);
+    assert_eq!(identity_of(&untouched_socket), socket_identity);
+    assert_eq!(std::fs::read(&untouched_lease).unwrap(), lease_bytes);
+}
+
+#[tokio::test]
+async fn sweep_scope_interrupted_namespace_never_reports_completion() {
+    let parent = tempfile::Builder::new()
+        .prefix("c2m2-int-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("v2");
+    test_namespace_root(&root).unwrap();
+    let endpoint = managed_endpoint("sweep-interrupt");
+    let listener = bind_managed_at(&endpoint, &root).unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+
+    let mut sweep = retry_sweep(|| ManagedSweep::open_scoped_at(&root, &[endpoint.clone()]));
+    let first = sweep.next_batch(SweepBudget {
+        max_entries: 1,
+        max_duration: Duration::ZERO,
+    });
+    assert!(!first.round_complete && !first.round_interrupted);
+
+    let moved = parent.path().join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let interrupted = sweep.next_batch(SweepBudget::default());
+    assert!(interrupted.namespace_changed, "{interrupted:?}");
+    assert!(interrupted.round_interrupted, "{interrupted:?}");
+    assert!(!interrupted.round_complete, "{interrupted:?}");
+    let terminal = sweep.next_batch(SweepBudget::default());
+    assert!(terminal.round_interrupted, "{terminal:?}");
+    assert!(!terminal.round_complete, "{terminal:?}");
+    assert_eq!(terminal.entries_visited, 0);
+}

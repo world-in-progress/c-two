@@ -23,6 +23,8 @@ mod lease_ffi;
 #[cfg(feature = "python")]
 mod mem_ffi;
 #[cfg(feature = "python")]
+mod owner_ffi;
+#[cfg(feature = "python")]
 mod route_concurrency_ffi;
 #[cfg(feature = "python")]
 mod runtime_session_ffi;
@@ -52,6 +54,7 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     endpoint_ffi::register_module(m)?;
     lease_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;
+    owner_ffi::register_module(m)?;
     route_concurrency_ffi::register_module(m)?;
     runtime_session_ffi::register_module(m)?;
     shm_buffer::register_module(m)?;

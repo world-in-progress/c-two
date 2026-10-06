@@ -868,8 +868,10 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             self._outcome = outcome if outcome is not None else {'relay_errors': []}
             self.adopted_observations: list[object] = []
 
-        def shutdown(self, *, route_names, relay_anchor_address):
-            return self._outcome
+        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
+            assert timeout_seconds == 30.0
+            return {**self._outcome, 'completed': not any(self._outcome.get(key) for key in (
+                'ipc_client_close_error', 'runtime_barrier_error'))}
 
         def retire_memory_observation(self) -> FakeRetiredObservation:
             observation = FakeRetiredObservation()
@@ -887,16 +889,22 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
 
     logger_name = 'c_two.transport.registry'
     with caplog.at_level(logging.WARNING, logger=logger_name):
-        hostless_registry({
+        pending_ipc = hostless_registry({
             'relay_errors': [],
             'ipc_client_close_error': (
                 'unconfirmed IPC client cache closes for ["ipc://blocked"]'
             ),
-        }).shutdown()
-        hostless_registry({
+        })
+        ipc_session = pending_ipc._runtime_session
+        assert not pending_ipc.shutdown()["completed"]
+        assert pending_ipc._runtime_session is ipc_session
+        pending_runtime = hostless_registry({
             'relay_errors': [],
             'runtime_barrier_error': 'runtime barrier did not quiesce',
-        }).shutdown()
+        })
+        runtime_session = pending_runtime._runtime_session
+        assert not pending_runtime.shutdown()["completed"]
+        assert pending_runtime._runtime_session is runtime_session
         # Absent keys stay silent: apparent full cleanup is only reported
         # when the native outcome actually reports a failure.
         hostless_registry({'relay_errors': []}).shutdown()
@@ -913,10 +921,10 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
     assert len(messages) == 2, f'clean outcomes must stay silent, saw {messages!r}'
 
     # Barrier confirmation is transport cleanup reporting only: it never
-    # touches the retirement observation. Every retirement is handed to the
-    # replacement unchanged, and the observation interface exposes no fence
+    # touches the retirement observation. Pending sessions stay owned; only
+    # completed cleanup retires once, and the observation exposes no fence
     # the registry could mark — its lifetime is decided by real owners.
-    assert len(retired_observations) == 3
+    assert len(retired_observations) == 1
     for observation in retired_observations:
         surface = {name for name in dir(observation) if not name.startswith('_')}
         assert not hasattr(observation, 'mark_close_confirmed')

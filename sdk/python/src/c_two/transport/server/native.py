@@ -129,11 +129,21 @@ def _close_outcome_by_route(outcome: Mapping[str, Any]) -> dict[str, Mapping[str
 
 
 def _close_outcome_is_hook_safe(close: Mapping[str, Any] | None) -> bool:
+    """Whether one route close proves the native side reached a terminal state.
+
+    ``local_removed`` alone is not enough: it says the route left the local
+    table, not that its active callbacks drained. A route whose close reports
+    an error, or whose ``active_drained`` is false (or absent, so nothing
+    proved it), is still draining and must keep its Python slot so a later
+    native outcome can run ``@on_shutdown`` exactly once.
+    """
     if not isinstance(close, Mapping):
         return False
     if not bool(close.get('local_removed', False)):
         return False
     if not bool(close.get('active_drained', False)):
+        return False
+    if close.get('close_error'):
         return False
     return close.get('closed_reason') != 'registration_rollback'
 
@@ -350,6 +360,10 @@ class NativeServerBridge:
             raise KeyError(f'Name not registered in native server: {name!r}')
         close = outcome.get('close')
         if not _close_outcome_is_hook_safe(close):
+            # The route is gone from the native table but its work is still
+            # draining (or the close reported an error). Keep the Python slot:
+            # dropping it here would either run the hook early or lose it, and
+            # the same slot must serve the later structured completion.
             return outcome
 
         with self._slots_lock:
@@ -393,7 +407,31 @@ class NativeServerBridge:
     # ------------------------------------------------------------------
 
     def is_started(self) -> bool:
+        """Whether the Core host is actually running.
+
+        Delegates to the native ``Host.is_running()`` projection, so a host
+        that already stopped (explicit shutdown, owner EOF) does not read as
+        started even while this bridge object is still alive.
+        """
         return bool(self._runtime_session.host_started)
+
+    def native_lifecycle_snapshot(self) -> dict[str, Any] | None:
+        """Thin read-only Core lifecycle observation for the bridge.
+
+        Reports the native policy and phase plus the separate listener,
+        drained-work and client-held-lease facts. ``None`` means no host
+        exists, never "stopped". ``owner_missing`` and ``draining`` are not
+        terminal.
+        """
+        return self._runtime_session.native_lifecycle_snapshot()
+
+    def native_terminal_outcome(self) -> dict[str, Any] | None:
+        """Terminal native shutdown outcome, or ``None`` while not terminal.
+
+        Repeated observation returns the same one outcome; observing never
+        initiates or consumes shutdown.
+        """
+        return self._runtime_session.native_terminal_outcome()
 
     def start(self, timeout: float = 5.0) -> None:
         timeout = float(timeout)
@@ -424,6 +462,9 @@ class NativeServerBridge:
             relay_anchor_address=relay_anchor_address,
             timeout_seconds=float(timeout),
         ))
+
+        if not outcome['completed']:
+            return outcome
 
         close_by_route = _close_outcome_by_route(outcome)
         removed_names = [

@@ -1102,6 +1102,7 @@ pub(crate) struct EndpointSweep {
     finished: bool,
     interrupted: bool,
     _lease: Option<SweepLease>,
+    selected: Option<std::collections::HashSet<OsString>>,
 }
 
 static SWEEP_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1160,6 +1161,34 @@ impl EndpointSweep {
         Self::open_path(path)
     }
 
+    pub(crate) fn for_scope(
+        endpoint: &LocalEndpoint,
+        targets: &[LocalEndpoint],
+    ) -> io::Result<Self> {
+        let selected = Self::target_names(targets)?;
+        let mut sweep = Self::for_endpoint(endpoint)?;
+        sweep.selected = Some(selected);
+        Ok(sweep)
+    }
+
+    fn target_names(targets: &[LocalEndpoint]) -> io::Result<std::collections::HashSet<OsString>> {
+        let mut selected = std::collections::HashSet::new();
+        for target in targets {
+            let names = endpoint_names(target)?;
+            selected.insert(names.socket_os);
+            selected.insert(OsStr::from_bytes(names.lock.as_bytes()).to_owned());
+        }
+        Ok(selected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_scoped_at(root: &Path, targets: &[LocalEndpoint]) -> io::Result<Self> {
+        let selected = Self::target_names(targets)?;
+        let mut sweep = Self::open_path(root)?;
+        sweep.selected = Some(selected);
+        Ok(sweep)
+    }
+
     fn open_path(path: &Path) -> io::Result<Self> {
         let lease = SweepLease::acquire()?;
         let directory = EndpointDirectory::open(path, false)?;
@@ -1176,6 +1205,7 @@ impl EndpointSweep {
             finished: false,
             interrupted: false,
             _lease: Some(lease),
+            selected: None,
         })
     }
 
@@ -1243,6 +1273,13 @@ impl EndpointSweep {
     }
 
     fn inspect_entry(&self, filename: OsString, batch: &mut SweepBatch) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(filename.as_os_str()))
+        {
+            return;
+        }
         let Some(filename) = filename.to_str() else {
             return;
         };

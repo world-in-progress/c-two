@@ -14,8 +14,9 @@ use c2_contract::{
     PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
 use c2_core::{
-    Connect, Host, HostOptions, MethodDefinition, RegisterOutcome, Registration, RelayCleanupError,
-    RetiredMemoryObservation, RouteCloseOutcome, Runtime, RuntimeOptions, ServiceConcurrencyMode,
+    Connect, Host, HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot, HostOptions,
+    MethodDefinition, RegisterOutcome, Registration, RelayCleanupError, RetiredMemoryObservation,
+    RouteCloseOutcome, Runtime, RuntimeOptions, ServerLifecyclePolicy, ServiceConcurrencyMode,
     ServiceDefinition, ShutdownOutcome, UnregisterOutcome,
 };
 use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
@@ -27,9 +28,10 @@ use crate::config_ffi::{
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
 use crate::core_ffi::{PyCoreClient, PyCoreService};
 use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
+use crate::owner_ffi::PyNativeOwnerReceiver;
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 
-fn checked_shutdown_timeout(seconds: f64) -> Result<Duration, &'static str> {
+pub(crate) fn checked_shutdown_timeout(seconds: f64) -> Result<Duration, &'static str> {
     const INVALID: &str =
         "timeout_seconds must be finite, non-negative, and representable as a Duration";
     if !seconds.is_finite() || seconds < 0.0 {
@@ -105,15 +107,45 @@ pub struct PyRetiredMemoryObservation {
 }
 
 impl PyRuntimeSession {
+    /// Start this session's one Core host.
+    ///
+    /// The default [`HostOptions`] inherits the native lifecycle policy the
+    /// Runtime has frozen (or the one `set_lifecycle_policy` pinned), so an
+    /// `OwnerBound` policy consumes the attached owner capability here and a
+    /// `Persistent` one does not. The capability is consumed at most once: a
+    /// second `ensure_host` reuses the live host and never re-consumes.
     fn ensure_host(&self) -> PyResult<Host> {
-        if let Some(host) = self.host.lock().as_ref() {
-            return Ok(host.clone());
+        let mut host_guard = self.host.lock();
+        if let Some(host) = host_guard.as_ref() {
+            if host.shutdown_outcome().is_none() {
+                if !host.is_running() || self.inner.has_pending_teardown() {
+                    return Err(PyRuntimeError::new_err(
+                        "Core host is still draining; consume terminal shutdown before restarting",
+                    ));
+                }
+                return Ok(host.clone());
+            }
+            if !matches!(
+                self.inner.lifecycle_policy(),
+                ServerLifecyclePolicy::Persistent
+            ) {
+                return Err(PyRuntimeError::new_err(
+                    "owner-bound host cannot restart with an already consumed owner capability",
+                ));
+            }
+            if !self.registrations.lock().is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "consume terminal shutdown route outcomes before restarting the Core host",
+                ));
+            }
+            // Persistent restart publishes a fresh Host only after its native
+            // start succeeds. Keep the old terminal journal on every error.
         }
         let host = self
             .inner
             .host(HostOptions::default())
             .map_err(core_error_to_py)?;
-        *self.host.lock() = Some(host.clone());
+        *host_guard = Some(host.clone());
         Ok(host)
     }
 
@@ -494,9 +526,110 @@ impl PyRuntimeSession {
         self.ensure_host().map(|_| ())
     }
 
+    /// True while the Core host is actually running.
+    ///
+    /// This reports the native `Host.is_running()` observation instead of the
+    /// SDK's mere handle presence, so a host that already stopped (explicit
+    /// shutdown, owner EOF, or a failed start attempt) does not read as
+    /// started.
     #[getter]
     fn host_started(&self) -> bool {
-        self.host.lock().is_some()
+        self.host
+            .lock()
+            .as_ref()
+            .is_some_and(c2_core::Host::is_running)
+    }
+
+    /// Thin read-only lifecycle observation for the bridge.
+    ///
+    /// The projection exposes only the native policy/phase and the separate
+    /// listener, drained-work and client-held-lease facts. `None` means no
+    /// host exists, never "stopped". It never initiates or consumes shutdown
+    /// and never exposes the owner capability.
+    fn native_lifecycle_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let host = self.host.lock().clone();
+        host.map(|host| lifecycle_snapshot_to_dict(py, &host.lifecycle_snapshot()))
+            .transpose()
+    }
+
+    /// Terminal native shutdown observation, or `None` while the host has not
+    /// produced a completed transaction.
+    fn native_terminal_outcome<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let host = self.host.lock().clone();
+        let Some(host) = host else {
+            return Ok(None);
+        };
+        match host.shutdown_outcome() {
+            Some(outcome) => {
+                let dict = shutdown_outcome_to_dict(py, outcome)?;
+                dict.set_item("completed", true)?;
+                Ok(Some(dict))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Whether the native owner capability is attached and not yet consumed.
+    #[getter]
+    fn owner_control_attached(&self) -> bool {
+        self.inner.owner_control_attached()
+    }
+
+    /// Attach one opaque native owner control receiver.
+    ///
+    /// The receiver is consumed exactly once. A duplicate attach, a late
+    /// attach after a host consumed the capability, and a capability that is
+    /// already closed are all rejected by Core before any host can publish
+    /// readiness, so a policy name alone can never create an owner-bound host.
+    fn attach_owner_control(&self, receiver: &PyNativeOwnerReceiver) -> PyResult<()> {
+        let host_guard = self.host.lock();
+        if host_guard.is_some() || self.inner.owner_control_consumed() {
+            return Err(PyRuntimeError::new_err(
+                "owner control capability must be attached before the Core host starts",
+            ));
+        }
+        if !matches!(
+            self.inner.lifecycle_policy(),
+            ServerLifecyclePolicy::OwnerBound { .. }
+        ) {
+            return Err(PyValueError::new_err(
+                "owner_control requires the owner_bound lifecycle policy",
+            ));
+        }
+        if self.inner.owner_control_attached() {
+            return Err(PyRuntimeError::new_err(
+                "owner control capability already attached",
+            ));
+        }
+        let receiver = receiver.take_for_attach()?;
+        self.inner
+            .attach_owner_control(receiver)
+            .map_err(runtime_configuration_error_to_py)
+    }
+
+    /// Set the native lifecycle policy before the first host freezes it.
+    #[pyo3(signature = (policy=None, owner_missing_grace_seconds=None))]
+    fn set_lifecycle_policy(
+        &self,
+        policy: Option<&str>,
+        owner_missing_grace_seconds: Option<f64>,
+    ) -> PyResult<()> {
+        let policy = parse_lifecycle_policy(policy, owner_missing_grace_seconds)?;
+        self.inner
+            .set_lifecycle_policy(policy)
+            .map_err(runtime_configuration_error_to_py)
+    }
+
+    /// Read-only projection of the frozen native lifecycle policy.
+    #[getter]
+    fn lifecycle_policy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        lifecycle_policy_to_dict(py, &self.inner.lifecycle_policy())
     }
 
     #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json, relay_anchor_address=None))]
@@ -592,7 +725,11 @@ impl PyRuntimeSession {
         // Validate before taking the Host or changing any session state.
         let timeout = checked_shutdown_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
         let _ = relay_anchor_address;
-        if let Some(route_names) = route_names {
+        let host = self.host.lock().clone();
+        if let Some(route_names) = route_names.filter(|_| {
+            host.as_ref()
+                .is_none_or(|host| host.shutdown_outcome().is_none())
+        }) {
             let registered = self.registrations.lock();
             for route_name in route_names {
                 if !registered.contains_key(&route_name) {
@@ -602,27 +739,58 @@ impl PyRuntimeSession {
                 }
             }
         }
-        let host = self.host.lock().take();
-        let outcome = py.detach(move || {
-            // Hostless sessions still own outgoing IPC clients; the Core
-            // client-only shutdown detaches and closes them through the same
-            // bounded barrier as the hosted path.
-            host.as_ref()
-                .map_or_else(|| self.inner.shutdown_without_host(timeout), Host::shutdown)
+        let (outcome, completed) = py.detach(|| {
+            // Completion and the projected result are one immutable native
+            // observation. Rust may finish while this thread reacquires the
+            // GIL; never combine that later completion with an earlier pending
+            // result whose route outcomes have not been consumed by Python.
+            if let Some(host) = host.as_ref() {
+                let pending = host.shutdown_with_timeout(timeout);
+                match host.shutdown_outcome() {
+                    Some(terminal) => (terminal, true),
+                    None => (pending, false),
+                }
+            } else {
+                let outcome = self.inner.shutdown_without_host(timeout);
+                let completed = !shutdown_outcome_is_incomplete(&outcome);
+                (outcome, completed)
+            }
         });
-        self.registrations.lock().clear();
-        self.server_bridge.lock().take();
-        shutdown_outcome_to_dict(py, outcome)
+        if completed {
+            self.registrations.lock().clear();
+            self.server_bridge.lock().take();
+        }
+        // Keep the Host journal for repeated consumption and observation. A
+        // pending drain retains every Registration instead of invoking Drop close.
+        let dict = shutdown_outcome_to_dict(py, outcome)?;
+        dict.set_item("completed", completed)?;
+        Ok(dict)
+    }
+
+    /// Move an unstarted lifecycle into a fully prepared replacement. Rust
+    /// owns the capability transfer; Python never observes or clones it.
+    fn transfer_unstarted_lifecycle_to(&self, replacement: &PyRuntimeSession) -> PyResult<()> {
+        self.inner
+            .transfer_unstarted_lifecycle_to(&replacement.inner)
+            .map_err(lifecycle_error_to_py)
     }
 
     fn clear_server_identity(&self) -> PyResult<()> {
-        if self.host.lock().is_some() {
+        if self
+            .host
+            .lock()
+            .as_ref()
+            .is_some_and(|host| host.shutdown_outcome().is_none())
+        {
             return Err(PyRuntimeError::new_err(
                 "cannot clear server identity while the Core host is active",
             ));
         }
-        self.inner.clear_server_identity();
-        Ok(())
+        // Core now reports why identity reset is refused (pending native
+        // teardown), so this must never silently report success.
+        self.inner
+            .clear_server_identity()
+            .map_err(runtime_configuration_error_to_py)
     }
 
     fn clear_relay_projection_cache(&self) {
@@ -983,6 +1151,115 @@ fn shutdown_outcome_to_dict<'py>(
     dict.set_item("route_close_error", outcome.route_close_error)?;
     dict.set_item("runtime_barrier_error", outcome.runtime_barrier_error)?;
     dict.set_item("ipc_client_close_error", outcome.ipc_client_close_error)?;
+    Ok(dict)
+}
+
+/// Whether a shutdown outcome still has work that no later close may treat
+/// as finished.
+///
+/// An incomplete transaction is not terminal: the native host keeps the
+/// actual server, its route journal and the outgoing client barriers, and a
+/// later consume observes the real completion. No SDK-side state may claim
+/// the host stopped, release its registration slots, or clear its identity
+/// while this is true.
+fn shutdown_outcome_is_incomplete(outcome: &ShutdownOutcome) -> bool {
+    outcome.runtime_barrier_error.is_some()
+        || outcome.route_close_error.is_some()
+        || outcome.ipc_client_close_error.is_some()
+        || outcome
+            .route_outcomes
+            .iter()
+            .any(|route| !route.active_drained || route.close_error.is_some())
+}
+
+fn lifecycle_policy_to_dict<'py>(
+    py: Python<'py>,
+    policy: &ServerLifecyclePolicy,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    match policy {
+        ServerLifecyclePolicy::Persistent => {
+            dict.set_item("policy", "persistent")?;
+            dict.set_item("owner_bound", false)?;
+            dict.set_item("owner_missing_grace_seconds", py.None())?;
+        }
+        ServerLifecyclePolicy::OwnerBound {
+            owner_missing_grace,
+        } => {
+            dict.set_item("policy", "owner_bound")?;
+            dict.set_item("owner_bound", true)?;
+            dict.set_item(
+                "owner_missing_grace_seconds",
+                owner_missing_grace.as_secs_f64(),
+            )?;
+        }
+    }
+    Ok(dict)
+}
+
+fn parse_lifecycle_policy(
+    policy: Option<&str>,
+    owner_missing_grace_seconds: Option<f64>,
+) -> PyResult<ServerLifecyclePolicy> {
+    match policy {
+        None | Some("persistent") => {
+            if owner_missing_grace_seconds.is_some() {
+                return Err(PyValueError::new_err(
+                    "owner_missing_grace_seconds is only valid with the owner_bound policy",
+                ));
+            }
+            Ok(ServerLifecyclePolicy::Persistent)
+        }
+        Some("owner_bound") => {
+            let seconds = owner_missing_grace_seconds.ok_or_else(|| {
+                PyValueError::new_err(
+                    "owner_bound requires an explicit owner_missing_grace_seconds window",
+                )
+            })?;
+            let grace = checked_shutdown_timeout(seconds).map_err(PyValueError::new_err)?;
+            ServerLifecyclePolicy::owner_bound(grace).map_err(PyValueError::new_err)
+        }
+        Some(other) => Err(PyValueError::new_err(format!(
+            "invalid lifecycle policy {other:?}; expected \"persistent\" or \"owner_bound\"",
+        ))),
+    }
+}
+
+fn lifecycle_phase_name(phase: &HostLifecyclePhase) -> PyResult<&'static str> {
+    Ok(match phase {
+        HostLifecyclePhase::Persistent => "persistent",
+        HostLifecyclePhase::Armed => "armed",
+        HostLifecyclePhase::OwnerMissing => "owner_missing",
+        HostLifecyclePhase::Draining => "draining",
+        HostLifecyclePhase::Finished => "finished",
+        HostLifecyclePhase::WatcherIoError(_) => "watcher_io_error",
+    })
+}
+
+fn lifecycle_snapshot_to_dict<'py>(
+    py: Python<'py>,
+    snapshot: &HostLifecycleSnapshot,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("policy", lifecycle_policy_to_dict(py, &snapshot.policy)?)?;
+    dict.set_item("phase", lifecycle_phase_name(&snapshot.phase)?)?;
+    match &snapshot.phase {
+        HostLifecyclePhase::WatcherIoError(message) => {
+            dict.set_item("watcher_error", message)?;
+        }
+        _ => dict.set_item("watcher_error", py.None())?,
+    }
+    // A finished transaction is terminal; every earlier phase, including a
+    // bounded draining transaction, still has native work outstanding.
+    dict.set_item("terminal", snapshot.phase == HostLifecyclePhase::Finished)?;
+    dict.set_item("listener_closed", snapshot.listener_closed)?;
+    dict.set_item("work_drained", snapshot.work_drained)?;
+    let leases: HostClientHeldLeases = snapshot.client_held_leases;
+    let held = PyDict::new(py);
+    held.set_item("response_shm_bytes", leases.response_shm_bytes)?;
+    held.set_item("response_file_bytes", leases.response_file_bytes)?;
+    held.set_item("reassembly_bytes", leases.reassembly_bytes)?;
+    dict.set_item("client_held_leases", held)?;
     Ok(dict)
 }
 

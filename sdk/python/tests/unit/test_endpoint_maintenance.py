@@ -16,12 +16,17 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import uuid
 
 import pytest
 
 import c_two as cc
 from c_two import _native
 from c_two.transport import endpoint as endpoint_module
+
+# This address is never bound. Every maintenance constructor selects only this
+# fresh slot, including calls directly to PyO3; shared-root history cannot be reaped.
+SWEEP_ADDRESSES = [f'ipc://sweep-test-{uuid.uuid4().hex}']
 
 MAX_CREDENTIAL_BYTES = 4096
 #: The native gate's published hard ceilings. The tests own these expectations
@@ -338,14 +343,42 @@ def test_reap_does_not_accept_a_decoded_credential_for_a_new_incarnation() -> No
         result = cc.reap_endpoint('ipc://unit-windows-incarnation', credential)
         assert result['status'] == 'not-applicable'
         return
-    credential = cc.EndpointCredential.from_json(MANAGED_V2_DOCUMENT)
-    address = credential.address
-    # Re-derive the same logical address with a *different* live incarnation by
-    # reusing the address under a fresh credential is not possible from Python;
-    # what is observable is that the stale document still reports a
-    # non-removing outcome for an endpoint this process never bound.
-    result = cc.reap_endpoint(address, credential)
-    assert result['status'] in {'already-absent', 'stale-target', 'unverified'}
+    @cc.crm(namespace='cc.test.endpoint.scope', version='0.1.0')
+    class ScopeProbe:
+        def echo(self, value: int) -> int:
+            ...
+
+    class ProbeResource:
+        def echo(self, value: int) -> int:
+            return value
+
+    server_id = f'scope-incarnation-{uuid.uuid4().hex}'
+    current = None
+    address = None
+    try:
+        cc.set_server(server_id=server_id, ipc_overrides={'endpoint_protocol': 'managed-v2'})
+        cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
+        address = cc.server_address()
+        first = cc.inspect_endpoint(address, endpoint_protocol='managed-v2')
+        assert first['status'] == 'present'
+        old = cc.EndpointCredential.from_json(first['credential'].to_json())
+        cc.shutdown()
+        cc.set_server(server_id=server_id, ipc_overrides={'endpoint_protocol': 'managed-v2'})
+        cc.register(ScopeProbe, ProbeResource(), name='scope-probe')
+        assert cc.server_address() == address
+        second = cc.inspect_endpoint(address, endpoint_protocol='managed-v2')
+        assert second['status'] == 'present'
+        current = second['credential']
+        assert current.to_json() != old.to_json()
+        result = cc.reap_endpoint(address, old)
+        assert result['status'] in {'busy', 'stale-target'}
+        after = cc.inspect_endpoint(address, endpoint_protocol='managed-v2')
+        assert after['status'] == 'present'
+        assert after['credential'].to_json() == current.to_json()
+    finally:
+        cc.shutdown()
+        if current is not None:
+            assert cc.reap_endpoint(address, current)['status'] in {'already-absent', 'reaped'}
 
 
 def test_reap_uses_the_recorded_protocol_not_the_process_default(
@@ -371,40 +404,40 @@ class TestSweepLease:
     """The process lease is owned by Rust and allows exactly one sweep."""
 
     def test_one_sweep_at_a_time(self) -> None:
-        first = cc.sweep_endpoints('legacy-v1')
+        first = cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES)
         try:
             with pytest.raises(RuntimeError) as excinfo:
-                cc.sweep_endpoints('legacy-v1')
+                cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES)
             assert 'already active' in str(excinfo.value)
         finally:
             first.close()
 
     def test_close_releases_the_lease(self) -> None:
-        first = cc.sweep_endpoints('legacy-v1')
+        first = cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES)
         first.close()
         assert first.closed is True
-        second = cc.sweep_endpoints('legacy-v1')
+        second = cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES)
         second.close()
 
     def test_close_is_idempotent(self) -> None:
-        sweep = cc.sweep_endpoints('legacy-v1')
+        sweep = cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES)
         sweep.close()
         sweep.close()
         assert sweep.closed is True
 
     def test_context_manager_releases_the_lease(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             assert sweep.closed is False
         assert sweep.closed is True
         # The lease is free again after the context exits.
-        cc.sweep_endpoints('legacy-v1').close()
+        cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES).close()
 
     def test_dropping_an_abandoned_sweep_releases_the_lease(self) -> None:
-        abandoned = cc.sweep_endpoints('legacy-v1')
+        abandoned = cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES)
         # Dropping without close is the abandoned path; the native Drop impl
         # must still release the process lease.
         del abandoned
-        cc.sweep_endpoints('legacy-v1').close()
+        cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES).close()
 
     def test_lease_admits_exactly_one_sweep_under_concurrent_open(self) -> None:
         # The lease is one atomic compare-exchange, so two concurrent openers
@@ -414,7 +447,7 @@ class TestSweepLease:
 
         def open_sweep() -> None:
             try:
-                outcomes.append(cc.sweep_endpoints('legacy-v1'))
+                outcomes.append(cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES))
             except RuntimeError as error:
                 outcomes.append(error)
 
@@ -437,7 +470,7 @@ class TestSweepLease:
                 sweep.close()
 
     def test_next_batch_after_close_is_rejected(self) -> None:
-        sweep = cc.sweep_endpoints('legacy-v1')
+        sweep = cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES)
         sweep.close()
         with pytest.raises(ValueError):
             sweep.next_batch()
@@ -455,27 +488,27 @@ class TestSweepBudget:
     """Budgets are validated in Rust before any `Duration` arithmetic."""
 
     def test_zero_entries_is_rejected(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_entries=0)
 
     def test_entries_above_the_ceiling_are_rejected(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES + 1)
 
     def test_zero_milliseconds_is_rejected(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_ms=0)
 
     def test_milliseconds_above_the_ceiling_are_rejected(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_ms=MAX_SWEEP_MS + 1)
 
     def test_non_integer_budgets_are_rejected(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(TypeError):
                 sweep.next_batch(max_entries=1.5)  # type: ignore[arg-type]
             with pytest.raises(TypeError):
@@ -484,16 +517,16 @@ class TestSweepBudget:
     def test_boolean_budget_is_rejected_as_a_non_integer(self) -> None:
         # `bool` is an `int` subclass; a sweep budget is not a flag.
         with pytest.raises(TypeError):
-            cc.sweep_endpoints('legacy-v1', max_entries=True)  # type: ignore[arg-type]
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_entries=True)  # type: ignore[arg-type]
 
     def test_huge_budget_cannot_panic_or_overflow_native_duration(self) -> None:
         # Values far beyond `u64` milliseconds would overflow a `Duration`
         # multiplication in a naive implementation. The Rust gate bounds the
         # budget before any arithmetic, so this is a clean ValueError.
         with pytest.raises(ValueError):
-            cc.sweep_endpoints('legacy-v1', max_ms=10**19)
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_ms=10**19)
         with pytest.raises(ValueError):
-            cc.sweep_endpoints('legacy-v1', max_entries=10**19)
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_entries=10**19)
 
     @pytest.mark.parametrize('value', [2**32, 2**64, 2**70, 10**40])
     def test_out_of_range_budget_never_reaches_native_duration_arithmetic(
@@ -503,14 +536,14 @@ class TestSweepBudget:
         # accepted at open time and only surface later (or overflow). It must
         # be a clean ValueError at open time for both budget fields.
         with pytest.raises(ValueError):
-            cc.sweep_endpoints('legacy-v1', max_ms=value)
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_ms=value)
         with pytest.raises(ValueError):
-            cc.sweep_endpoints('legacy-v1', max_entries=value)
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_entries=value)
 
     def test_boundary_budgets_are_accepted(self) -> None:
         # The inclusive ceilings are legal; only values beyond them are not.
         with cc.sweep_endpoints(
-            'legacy-v1', max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS
+            'legacy-v1', addresses=SWEEP_ADDRESSES, max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS
         ) as sweep:
             batch = sweep.next_batch(
                 max_entries=MAX_SWEEP_ENTRIES, max_ms=MAX_SWEEP_MS
@@ -521,7 +554,7 @@ class TestSweepBudget:
         # Every batch re-enters the native gate, and the override may differ
         # from the budget validated at open time. There is no Python pre-check
         # to bypass, so the ValueError can only be the native rejection.
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_ms=2**64)
             with pytest.raises(ValueError):
@@ -543,7 +576,7 @@ class TestSweepBudget:
         # the Python precheck" path is every path. A ValueError here proves the
         # native gate rejects the value, and a rejected budget must leave both
         # the iterator and the process lease intact.
-        sweep = _native.PyEndpointSweep('legacy-v1')
+        sweep = _native.PyEndpointSweep('legacy-v1', addresses=SWEEP_ADDRESSES)
         try:
             with pytest.raises(ValueError):
                 sweep.next_batch(**kwargs)
@@ -560,7 +593,7 @@ class TestSweepBudget:
         # beyond the widest exact parse is still one clean ValueError instead
         # of an interpreter-level conversion error. The property under test is
         # that the rejection is a clean exception, never a panic or a clamp.
-        sweep = _native.PyEndpointSweep('legacy-v1')
+        sweep = _native.PyEndpointSweep('legacy-v1', addresses=SWEEP_ADDRESSES)
         try:
             with pytest.raises(ValueError):
                 sweep.next_batch(**kwargs)
@@ -570,17 +603,17 @@ class TestSweepBudget:
 
     def test_negative_budget_is_rejected(self) -> None:
         with pytest.raises(ValueError):
-            cc.sweep_endpoints('legacy-v1', max_entries=-1)
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_entries=-1)
 
     def test_open_validates_every_budget_before_taking_the_process_lease(self) -> None:
         # Both dimensions are validated by the native constructor before it
         # takes the process lease or opens the iterator, so a rejected open
         # cannot leave the lease held or wedge the next sweep.
         with pytest.raises(ValueError):
-            cc.sweep_endpoints('legacy-v1', max_entries=0)
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_entries=0)
         with pytest.raises(TypeError):
-            cc.sweep_endpoints('legacy-v1', max_ms=True)
-        cc.sweep_endpoints('legacy-v1').close()
+            cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES, max_ms=True)
+        cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES).close()
 
     def test_rejected_batch_override_keeps_the_iterator_and_stored_default(
         self,
@@ -588,7 +621,7 @@ class TestSweepBudget:
         # An explicit override is validated by the same native gate that
         # validated the stored default. Rejection must not close the sweep or
         # lose the default, so a bare next_batch still advances batch 1.
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             with pytest.raises(ValueError):
                 sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES + 1)
             with pytest.raises(TypeError):
@@ -619,7 +652,7 @@ class TestSweepBatches:
     }
 
     def test_first_batch_reports_the_full_counter_set(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch()
         assert set(batch) == self.EXPECTED_KEYS
         assert batch['batch'] == 1
@@ -629,7 +662,7 @@ class TestSweepBatches:
         assert isinstance(batch['namespace_changed'], bool)
 
     def test_batch_index_advances(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             first = sweep.next_batch()
             assert first['batch'] == 1
             if not (first['round_complete'] or first['round_interrupted']):
@@ -638,20 +671,20 @@ class TestSweepBatches:
                 assert second['entries_visited'] > 0
 
     def test_budget_is_consumed_per_batch_not_dropped(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch(max_entries=1, max_ms=1)
         # A single-entry budget can never exceed one visited entry.
         assert batch['entries_visited'] <= 1
 
     def test_round_never_claims_completion_while_interrupted(self) -> None:
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch()
         if batch['round_interrupted']:
             assert batch['round_complete'] is False
 
     def test_windows_sweep_reports_not_applicable(self) -> None:
         # The Windows branch must produce an executable observation, not a skip.
-        with cc.sweep_endpoints('legacy-v1') as sweep:
+        with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
             batch = sweep.next_batch()
         if IS_WINDOWS:
             assert batch['not_applicable'] >= 1
@@ -664,7 +697,7 @@ class TestSweepBatches:
 
     def test_repeated_sweeps_do_not_leak_the_lease(self) -> None:
         for _ in range(3):
-            with cc.sweep_endpoints('legacy-v1') as sweep:
+            with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES) as sweep:
                 sweep.next_batch(max_entries=1, max_ms=1)
 
 
@@ -713,3 +746,23 @@ def test_no_liveness_status_is_fabricated_for_kernel_managed_platforms() -> None
     # `not-applicable` describes endpoint ownership, never a live instance.
     assert 'not-applicable' in endpoint_module.NON_LIVENESS_STATUSES
     assert 'present' not in endpoint_module.NON_LIVENESS_STATUSES
+
+
+@pytest.mark.parametrize('addresses', [['http://wrong'], ['/tmp/forged.sock'], [SWEEP_ADDRESSES[0]] * 4097])
+def test_sweep_address_scope_rejects_before_taking_the_lease(addresses: list[str]) -> None:
+    with pytest.raises(ValueError):
+        cc.sweep_endpoints('legacy-v1', addresses=addresses)
+    with cc.sweep_endpoints('legacy-v1', addresses=SWEEP_ADDRESSES):
+        pass
+
+
+def test_empty_sweep_scope_never_inspects_endpoints() -> None:
+    with cc.sweep_endpoints('legacy-v1', addresses=[]) as sweep:
+        for _ in range(10000):
+            batch = sweep.next_batch(max_entries=MAX_SWEEP_ENTRIES)
+            assert batch['endpoints_examined'] == 0
+            assert batch['reaped'] == batch['leases_retired'] == 0
+            if batch['round_complete'] or batch['round_interrupted']:
+                break
+        else:
+            pytest.fail('finite namespace did not reach a terminal round')

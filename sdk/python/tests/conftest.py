@@ -78,6 +78,16 @@ def pytest_configure(config: Any) -> None:
                 )
 
 
+def pytest_collection_finish(session: Any) -> None:
+    """Build the real Rust parent before the per-test timeout starts."""
+    if session.config.option.collectonly:
+        return
+    if any(Path(str(item.path)).name == 'test_owner_bound_lifecycle.py' for item in session.items):
+        from tests.integration.test_owner_bound_lifecycle import _prepare_owner_launcher
+
+        _prepare_owner_launcher()
+
+
 def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
     """矩阵依赖模块内完整累积收据，任何xdist分发都会破坏该契约。"""
     if not (getattr(config.option, 'numprocesses', 0) or hasattr(config, 'workerinput')):

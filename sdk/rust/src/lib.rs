@@ -22,11 +22,11 @@ pub use c2_core::{
     Client, Connect, DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome,
     ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
     EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
-    EndpointReapResult, EndpointSweep, EndpointUnverifiedReason, Host, HostOptions, LocalEndpoint,
-    MemoryCellStats, MemoryScopeStats, ObservedPath, ObservedRoute, PathCounters, Registration,
-    RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot,
-    Runtime, RuntimeIdentity, RuntimeMemoryStats, RuntimeOptions, ServiceConcurrencyMode,
-    ServiceDefinition, SweepBatch, SweepBudget, direct_ipc_endpoint,
+    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, Host,
+    HostOptions, LocalEndpoint, MemoryCellStats, MemoryScopeStats, ObservedPath, ObservedRoute,
+    PathCounters, Registration, RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard,
+    RouteConcurrencySnapshot, Runtime, RuntimeIdentity, RuntimeMemoryStats, RuntimeOptions,
+    ServiceConcurrencyMode, ServiceDefinition, SweepBatch, SweepBudget, direct_ipc_endpoint,
     direct_ipc_endpoint_with_protocol, inspect_endpoint, ping_direct_ipc,
     ping_direct_ipc_with_protocol, reap_endpoint, shutdown_direct_ipc,
     shutdown_direct_ipc_with_protocol,
@@ -52,3 +52,9 @@ pub mod generated {
     pub use crate::error::{adapter_error, fastdb_adapter_error, fastdb_cause_details};
     pub use crate::payload::{BorrowedPayload, open_borrowed, open_held, open_owned};
 }
+
+/// Native lifecycle and private owner capability, projected from Core.
+pub use c2_core::{
+    HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot, OwnerControlKeepalive,
+    OwnerControlReceiver, ServerLifecyclePolicy, owner_control_pair,
+};

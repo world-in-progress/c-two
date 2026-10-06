@@ -232,6 +232,17 @@ impl EndpointSweep {
         }
     }
 
+    pub(crate) fn for_scope(
+        endpoint: &LocalEndpoint,
+        targets: &[LocalEndpoint],
+    ) -> io::Result<Self> {
+        if endpoint.protocol() == c2_config::LocalEndpointProtocol::ManagedV2 {
+            crate::unix_managed::ManagedSweep::for_scope(endpoint, targets).map(Self::Managed)
+        } else {
+            crate::unix_endpoint::EndpointSweep::for_scope(endpoint, targets).map(Self::Legacy)
+        }
+    }
+
     pub(crate) fn next_batch(&mut self, budget: SweepBudget) -> SweepBatch {
         match self {
             Self::Legacy(sweep) => sweep.next_batch(budget),
@@ -904,4 +915,52 @@ mod tests {
         );
         assert_eq!(terminal.entries_visited, 0);
     }
+    #[tokio::test]
+    async fn sweep_scope_legacy_does_not_inspect_unselected_orphans() {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        let selected = test_endpoint("scope-selected");
+        let unselected = test_endpoint("scope-unselected");
+        let active = test_endpoint("scope-active");
+        let _listener = test_bind_in(&active, root).unwrap();
+        for endpoint in [&selected, &unselected] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::tests::crash_owner_child", "--nocapture"])
+                .env("C2_LOCAL_TEST_CRASH_OWNER", endpoint.address())
+                .env("C2_LOCAL_TEST_CRASH_ROOT", root).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let untouched = socket_path(root, &unselected);
+        let identity = identity_of(&untouched);
+        let lock = lock_path(root, &unselected);
+        let lock_identity = identity_of(&lock);
+        let bytes = std::fs::read(&lock).unwrap();
+        let mut sweep = EndpointSweep::open_scoped_at(root, &[selected.clone(), active]).unwrap();
+        let mut complete = false;
+        let mut busy = 0;
+        for _ in 0..32 {
+            let batch = sweep.next_batch(SweepBudget { max_entries: 1, max_duration: Duration::ZERO });
+            assert!(batch.entries_visited <= 1);
+            busy += batch.busy;
+            if batch.round_complete { complete = true; break; }
+        }
+        assert!(complete);
+        assert!(busy >= 1);
+        assert!(!socket_path(root, &selected).exists());
+        assert!(lock_path(root, &selected).exists(), "legacy ownership records persist");
+        assert_eq!(identity_of(&untouched), identity);
+        assert_eq!(identity_of(&lock), lock_identity);
+        assert_eq!(std::fs::read(&lock).unwrap(), bytes);
+    }
+
+    #[test]
+    fn sweep_scope_rejects_invalid_and_unbounded_targets_before_open() {
+        let endpoint = test_endpoint("scope-validation");
+        assert!(crate::EndpointSweepScope::from_addresses(&endpoint, &["http://wrong".into()]).is_err());
+        assert!(crate::EndpointSweepScope::from_addresses(&endpoint, &["/tmp/forged.sock".into()]).is_err());
+        let too_many = vec![endpoint.address().to_owned(); crate::EndpointSweepScope::MAX_ADDRESSES + 1];
+        assert!(crate::EndpointSweepScope::from_addresses(&endpoint, &too_many).is_err());
+        assert!(crate::EndpointSweepScope::from_addresses(&endpoint, &[]).is_ok());
+    }
+
 }

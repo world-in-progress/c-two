@@ -1562,6 +1562,7 @@ pub(crate) struct ManagedSweep {
     finished: bool,
     interrupted: bool,
     _lease: Option<SweepLease>,
+    selected: Option<std::collections::HashSet<OsString>>,
 }
 
 impl ManagedSweep {
@@ -1590,6 +1591,34 @@ impl ManagedSweep {
         Self::open_root(root)
     }
 
+    pub(crate) fn for_scope(
+        endpoint: &LocalEndpoint,
+        targets: &[LocalEndpoint],
+    ) -> io::Result<Self> {
+        let selected = Self::target_names(targets)?;
+        let mut sweep = Self::for_endpoint(endpoint)?;
+        sweep.selected = Some(selected);
+        Ok(sweep)
+    }
+
+    fn target_names(targets: &[LocalEndpoint]) -> io::Result<std::collections::HashSet<OsString>> {
+        let mut selected = std::collections::HashSet::new();
+        for target in targets {
+            let names = managed_names(target)?;
+            selected.insert(names.socket_os);
+            selected.insert(OsStr::from_bytes(names.lock.as_bytes()).to_owned());
+        }
+        Ok(selected)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_scoped_at(root: &Path, targets: &[LocalEndpoint]) -> io::Result<Self> {
+        let selected = Self::target_names(targets)?;
+        let mut sweep = Self::open_root(root)?;
+        sweep.selected = Some(selected);
+        Ok(sweep)
+    }
+
     fn open_root(root: &Path) -> io::Result<Self> {
         let lease = SweepLease::acquire()?;
         let directory = EndpointDirectory::open(root, false)?;
@@ -1613,6 +1642,7 @@ impl ManagedSweep {
             finished: false,
             interrupted: false,
             _lease: Some(lease),
+            selected: None,
         })
     }
 
@@ -1678,6 +1708,13 @@ impl ManagedSweep {
     }
 
     fn inspect_entry(&self, filename: &OsStr, batch: &mut SweepBatch) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(filename))
+        {
+            return;
+        }
         let bytes = filename.as_bytes();
         if bytes == GATE_NAME.as_bytes() || bytes == MARKER_NAME.as_bytes() {
             return;
