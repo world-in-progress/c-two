@@ -335,7 +335,7 @@ def test_python_does_not_own_buffer_lease_accounting():
         "class " + "Hold" + "Registry",
         "weakref." + "ref(request_buf",
         "_hold" + "_registry",
-        "_entr" + "ies",
+        "_hold" + "_entries",
         "total_held_bytes " + "+=",
     ]
     for path in root.rglob("*.py"):
@@ -343,6 +343,13 @@ def test_python_does_not_own_buffer_lease_accounting():
         for needle in forbidden:
             if needle in text:
                 offenders.append(f"{path.relative_to(root)}:{needle}")
+        # Match the old registry's identifier, without rejecting unrelated
+        # public budgets such as max_entries.
+        for node in ast.walk(ast.parse(text)):
+            if (isinstance(node, ast.Name) and node.id == "_entries") or (
+                isinstance(node, ast.Attribute) and node.attr == "_entries"
+            ):
+                offenders.append(f"{path.relative_to(root)}:_entries")
     assert offenders == []
 
 
@@ -685,7 +692,9 @@ def test_route_authority_reports_invalid_ipc_address_as_validation_error():
     state_source = state.read_text(encoding="utf-8")
 
     assert "InvalidAddress { reason: String }" in authority_source
-    assert "local_endpoint_from_ipc_address(address)" in authority_source
+    assert "c2_ipc::local_endpoint_from_ipc_address_with_protocol(" in authority_source
+    assert "self.state.config().upstream_ipc.base.endpoint_protocol" in authority_source
+    assert ".map_err(|err| ControlError::InvalidAddress {" in authority_source
     assert "ControlError::InvalidAddress { reason }" in state_source
 
 
