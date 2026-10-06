@@ -1,4 +1,7 @@
-use super::{EndpointCredential, EndpointInspection, EndpointReapResult, LocalEndpoint};
+use super::{
+    EndpointCredential, EndpointInspection, EndpointReapResult, LocalEndpoint, SweepBatch,
+    SweepBudget,
+};
 use crate::unix_endpoint::{
     BoundSocketGuard, EndpointDirectory, EndpointNames, Ownership, SocketIdentity, bind_lock_error,
     cleanup_listener_socket, endpoint_names, inspect_endpoint as inspect_native, ownership_lock,
@@ -33,6 +36,15 @@ pub fn poll_flush(stream: &mut Stream, cx: &mut Context<'_>) -> Poll<io::Result<
 }
 
 pub struct Listener {
+    state: ListenerState,
+}
+
+enum ListenerState {
+    Legacy(LegacyListener),
+    Managed(crate::unix_managed::ManagedListener),
+}
+
+struct LegacyListener {
     // Keep this order: cleanup occurs in Drop while the listening socket is
     // still open; the listener field then closes before the v1 flock is
     // released. The lock inode is intentionally never unlinked.
@@ -47,10 +59,57 @@ pub struct Listener {
 
 impl Listener {
     pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        let directory = EndpointDirectory::for_endpoint(endpoint, true)?;
-        Self::bind_in(endpoint, directory)
+        match endpoint.protocol() {
+            c2_config::LocalEndpointProtocol::ManagedV2 => {
+                crate::unix_managed::bind_managed(endpoint).map(|listener| Self {
+                    state: ListenerState::Managed(listener),
+                })
+            }
+            _ => {
+                let directory = EndpointDirectory::for_endpoint(endpoint, true)?;
+                Self::bind_legacy(endpoint, directory)
+            }
+        }
     }
 
+    fn bind_legacy(endpoint: &LocalEndpoint, directory: EndpointDirectory) -> io::Result<Self> {
+        let legacy = LegacyListener::bind_in(endpoint, directory)?;
+        Ok(Self {
+            state: ListenerState::Legacy(legacy),
+        })
+    }
+
+    pub fn credential(&self) -> EndpointCredential {
+        match &self.state {
+            ListenerState::Legacy(listener) => listener.credential(),
+            ListenerState::Managed(listener) => listener.credential(),
+        }
+    }
+
+    pub fn close(self) -> EndpointReapResult {
+        match self.state {
+            ListenerState::Legacy(listener) => listener.close(),
+            ListenerState::Managed(listener) => listener.close(),
+        }
+    }
+
+    pub async fn accept(&mut self) -> io::Result<Stream> {
+        match &mut self.state {
+            ListenerState::Legacy(listener) => listener.accept().await,
+            ListenerState::Managed(listener) => listener.accept().await,
+        }
+    }
+
+    #[cfg(test)]
+    fn ownership_file(&self) -> Option<&std::fs::File> {
+        match &self.state {
+            ListenerState::Legacy(listener) => Some(&listener._ownership.0),
+            ListenerState::Managed(_) => None,
+        }
+    }
+}
+
+impl LegacyListener {
     fn bind_in(endpoint: &LocalEndpoint, directory: EndpointDirectory) -> io::Result<Self> {
         let names = endpoint_names(endpoint)?;
         let ownership = ownership_lock(&directory, &names.lock).map_err(bind_lock_error)?;
@@ -87,22 +146,22 @@ impl Listener {
         )
     }
 
-    pub fn credential(&self) -> EndpointCredential {
+    fn credential(&self) -> EndpointCredential {
         EndpointCredential::unix(self.endpoint.clone(), self.identity)
     }
 
-    pub fn close(mut self) -> EndpointReapResult {
+    fn close(mut self) -> EndpointReapResult {
         let result = self.cleanup();
         self.cleaned = true;
         result
     }
 
-    pub async fn accept(&mut self) -> io::Result<Stream> {
+    async fn accept(&mut self) -> io::Result<Stream> {
         self.inner.accept().await.map(|(stream, _)| stream)
     }
 }
 
-impl Drop for Listener {
+impl Drop for LegacyListener {
     fn drop(&mut self) {
         if !self.cleaned {
             let _ = self.cleanup();
@@ -113,7 +172,7 @@ impl Drop for Listener {
 
 #[cfg(test)]
 fn test_bind_in(endpoint: &LocalEndpoint, root: &std::path::Path) -> io::Result<Listener> {
-    Listener::bind_in(endpoint, EndpointDirectory::open(root, false)?)
+    Listener::bind_legacy(endpoint, EndpointDirectory::open(root, false)?)
 }
 
 #[cfg(test)]
@@ -137,6 +196,9 @@ fn reap_in(
 }
 
 pub(crate) fn inspect_endpoint(endpoint: &LocalEndpoint) -> EndpointInspection {
+    if endpoint.protocol() == c2_config::LocalEndpointProtocol::ManagedV2 {
+        return crate::unix_managed::inspect_managed(endpoint);
+    }
     inspect_native(endpoint)
 }
 
@@ -144,10 +206,39 @@ pub(crate) fn reap_endpoint(
     endpoint: &LocalEndpoint,
     credential: &EndpointCredential,
 ) -> EndpointReapResult {
+    if endpoint.protocol() == c2_config::LocalEndpointProtocol::ManagedV2 {
+        return crate::unix_managed::reap_managed(endpoint, credential);
+    }
     reap_native(endpoint, credential)
 }
 
-pub(crate) use crate::unix_endpoint::EndpointSweep;
+/// Protocol-aware maintenance sweep. Managed-v2 endpoints enumerate their real
+/// versioned namespace; legacy endpoints keep the v1 namespace unchanged.
+pub(crate) enum EndpointSweep {
+    Legacy(crate::unix_endpoint::EndpointSweep),
+    Managed(crate::unix_managed::ManagedSweep),
+}
+
+impl EndpointSweep {
+    pub(crate) fn open() -> io::Result<Self> {
+        crate::unix_endpoint::EndpointSweep::open().map(Self::Legacy)
+    }
+
+    pub(crate) fn for_endpoint(endpoint: &LocalEndpoint) -> io::Result<Self> {
+        if endpoint.protocol() == c2_config::LocalEndpointProtocol::ManagedV2 {
+            crate::unix_managed::ManagedSweep::for_endpoint(endpoint).map(Self::Managed)
+        } else {
+            crate::unix_endpoint::EndpointSweep::for_endpoint(endpoint).map(Self::Legacy)
+        }
+    }
+
+    pub(crate) fn next_batch(&mut self, budget: SweepBudget) -> SweepBatch {
+        match self {
+            Self::Legacy(sweep) => sweep.next_batch(budget),
+            Self::Managed(sweep) => sweep.next_batch(budget),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -273,7 +364,7 @@ mod tests {
         let listener = test_bind_in(&endpoint, root).unwrap();
         // fork during a concurrent process spawn duplicates this open file
         // description until CLOEXEC takes effect in the child.
-        let inherited = listener._ownership.0.try_clone().unwrap();
+        let inherited = listener.ownership_file().unwrap().try_clone().unwrap();
         drop(listener);
         let _next = test_bind_in(&endpoint, root).unwrap();
         drop(inherited);

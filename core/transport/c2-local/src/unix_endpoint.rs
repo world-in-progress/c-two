@@ -34,6 +34,14 @@ pub(crate) mod fault {
         /// The record cannot be written because a foreign object replaced the
         /// bound socket entry first.
         RecordWriteAfterReplacement,
+        /// A managed-v2 owner record write fails outright.
+        ManagedRecordWrite,
+        /// A managed-v2 owner record write lands only partially, so the
+        /// read-back cannot equal what was written.
+        ManagedRecordPartialWrite,
+        /// The managed socket entry is replaced by a foreign object before the
+        /// owner record is written.
+        ManagedRecordWriteAfterReplacement,
     }
 
     thread_local! {
@@ -152,8 +160,17 @@ impl EndpointDirectory {
         Ok(directory)
     }
 
-    fn fd(&self) -> libc::c_int {
+    pub(crate) fn fd(&self) -> libc::c_int {
         self.file.as_raw_fd()
+    }
+
+    /// Strict managed-namespace check: the directory must be owned by the
+    /// current user with exactly `0700` permissions.
+    pub(crate) fn strict_private(&self) -> bool {
+        let Ok(stat) = fstat(self.fd()) else {
+            return false;
+        };
+        stat.st_uid == unsafe { libc::geteuid() } && stat.st_mode as libc::mode_t & 0o777 == 0o700
     }
 
     pub(crate) fn path_still_names_open_directory(&self) -> bool {
@@ -167,7 +184,7 @@ impl EndpointDirectory {
             && metadata.mode() & 0o022 == 0
     }
 
-    fn stat(&self, name: &CString) -> io::Result<Option<libc::stat>> {
+    pub(crate) fn stat(&self, name: &CString) -> io::Result<Option<libc::stat>> {
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe {
             libc::fstatat(
@@ -188,7 +205,7 @@ impl EndpointDirectory {
         }
     }
 
-    fn open_file(
+    pub(crate) fn open_file(
         &self,
         name: &CString,
         flags: libc::c_int,
@@ -214,7 +231,7 @@ impl EndpointDirectory {
         }
     }
 
-    fn unlink(&self, name: &CString) -> io::Result<()> {
+    pub(crate) fn unlink(&self, name: &CString) -> io::Result<()> {
         if unsafe { libc::unlinkat(self.fd(), name.as_ptr(), 0) } == 0 {
             Ok(())
         } else {
@@ -239,7 +256,7 @@ impl EndpointDirectory {
     }
 }
 
-fn fstat(fd: libc::c_int) -> io::Result<libc::stat> {
+pub(crate) fn fstat(fd: libc::c_int) -> io::Result<libc::stat> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstat(fd, &mut stat) } == 0 {
         Ok(stat)
@@ -287,11 +304,206 @@ fn verify_directory_stat(stat: &libc::stat) -> io::Result<()> {
     Ok(())
 }
 
-fn same_file(left: &libc::stat, right: &libc::stat) -> bool {
+pub(crate) fn same_file(left: &libc::stat, right: &libc::stat) -> bool {
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
 }
 
-fn stat_is(stat: &libc::stat, file_type: libc::mode_t) -> bool {
+// macOS spells the thread-local `fchdir` as `pthread_fchdir_np`. The libc
+// crate does not bind it on Apple targets, so it is declared here. The symbol
+// has no equivalent on other Unix systems, so the binding is confined to
+// Apple targets and every other target compiles the fail-closed stub instead.
+//
+// `pthread_fchdir_np` changes only the calling thread's working directory; the
+// process-wide directory of every other thread is untouched. Callers must
+// therefore own the thread they call it on for the whole switch, which is why
+// the managed bind runs it on a short-lived dedicated thread that exits
+// immediately afterwards: the caller's own thread directory is never read,
+// written, or restored, so an existing per-thread cwd cannot be disturbed.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+}
+
+/// Switches the *calling* thread's working directory to `fd` on macOS.
+///
+/// This is a macOS-only primitive. Linux expresses a descriptor-relative bind
+/// through `/proc/self/fd/<fd>` instead, and every other Unix target has no
+/// verified way to make the kernel resolve a socket bind against a descriptor,
+/// so it reports `Unsupported` and the managed bind fails closed rather than
+/// falling back to a path a concurrent rename can redirect.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_thread_directory(fd: libc::c_int) -> io::Result<()> {
+    if unsafe { pthread_fchdir_np(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn set_thread_directory(_fd: libc::c_int) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a per-thread working directory is not available on this platform",
+    ))
+}
+
+/// The dirfd-relative socket path to bind, expressed in a form the kernel
+/// resolves through the descriptor itself rather than through a directory name.
+///
+/// Linux exposes the descriptor as `/proc/self/fd/<fd>`. macOS and every other
+/// Unix target have no equivalent path (`/dev/fd/<n>/name` returns `ENOENT` for
+/// a socket bind on macOS), so they return `None` and the caller must use its
+/// platform's descriptor-anchored bind primitive or fail closed. This never
+/// returns the absolute path derived from the endpoint, which is exactly the
+/// string a concurrent rename can redirect.
+pub(crate) fn dirfd_relative_socket_path(
+    directory: &EndpointDirectory,
+    socket_name: &OsStr,
+) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = directory;
+        let mut path = PathBuf::from(format!("/proc/self/fd/{}", directory.fd()));
+        path.push(socket_name);
+        Some(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        let _ = socket_name;
+        None
+    }
+}
+
+/// Binds a Unix stream socket named `socket_name` inside `directory` through a
+/// *dedicated short-lived thread* whose own working directory is switched to
+/// the verified descriptor for the duration of the `bind` and then destroyed
+/// with the thread.
+///
+/// This is the macOS primitive. `unix_endpoint::dirfd_relative_socket_path`
+/// returns `None` there because `/dev/fd/<n>/name` is not resolvable for a
+/// socket bind, so the only descriptor-anchored option is
+/// `pthread_fchdir_np(dirfd)`. That switch is per-thread, and this function
+/// owns the thread it switches: it never consults, alters, or restores the
+/// *caller's* thread directory, so a thread that already had its own working
+/// directory keeps it exactly. The thread ends immediately after the bind is
+/// attempted, which destroys its thread-local directory state with it.
+///
+/// The raw descriptor is duplicated before it crosses the thread boundary so
+/// the bind thread owns a descriptor whose lifetime it fully controls; the
+/// duplicate is closed when the thread returns. The freshly bound listener is
+/// sent back as a `std::os::unix::net::UnixListener` and registered with the
+/// caller's reactor afterwards, so no descriptor is ever polled from two
+/// reactors.
+///
+/// Every target that is not macOS reports `Unsupported`; there is deliberately
+/// no fallback to the absolute path, which a concurrent rename can redirect.
+#[cfg(target_os = "macos")]
+pub(crate) fn bind_in_directory_on_thread(
+    directory: &EndpointDirectory,
+    socket_name: &OsStr,
+) -> io::Result<std::os::unix::net::UnixListener> {
+    let name = CString::new(socket_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket name contains NUL"))?;
+    let thread_dir = duplicate_directory_descriptor(directory)?;
+    let joined = std::thread::Builder::new()
+        .name("c2-managed-bind".to_owned())
+        .spawn(move || {
+            // `thread_dir` is owned by this thread; the guard closes it when the
+            // thread returns, and its thread-local cwd dies with the thread.
+            let thread_dir = thread_dir;
+            if let Err(error) = set_thread_directory(thread_dir.as_raw_fd()) {
+                return Err(error);
+            }
+            let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = name.as_bytes();
+            if bytes.len() >= addr.sun_path.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "socket name does not fit in sockaddr_un",
+                ));
+            }
+            for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+                *slot = *byte as libc::c_char;
+            }
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Set close-on-exec explicitly: macOS does not accept
+            // `SOCK_CLOEXEC` in the socket type.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(error);
+            }
+            // SAFETY: `fd` is a fresh descriptor owned here until either the
+            // bind fails (closed below) or it is handed to UnixListener.
+            let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let length = (std::mem::size_of::<libc::sa_family_t>() + 1 + name.as_bytes().len() + 1)
+                as libc::socklen_t;
+            if unsafe {
+                libc::bind(
+                    socket.as_raw_fd(),
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    length,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { libc::listen(socket.as_raw_fd(), 128) } != 0 {
+                let error = io::Error::last_os_error();
+                // Withdraw the just-bound socket so a failed listen never leaves
+                // this call's object behind.
+                unsafe {
+                    libc::unlinkat(thread_dir.as_raw_fd(), name.as_ptr(), 0);
+                }
+                return Err(error);
+            }
+            Ok(std::os::unix::net::UnixListener::from(socket))
+        });
+    let handle = match joined {
+        Ok(handle) => handle,
+        Err(error) => return Err(error),
+    };
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "managed namespace bind thread panicked",
+        )),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn bind_in_directory_on_thread(
+    _directory: &EndpointDirectory,
+    _socket_name: &OsStr,
+) -> io::Result<std::os::unix::net::UnixListener> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-anchored socket bind is only available on macOS",
+    ))
+}
+
+/// Duplicates a directory descriptor with `dup(2)` so a thread can own it
+/// independently of the `EndpointDirectory` that created it.
+#[cfg(target_os = "macos")]
+fn duplicate_directory_descriptor(directory: &EndpointDirectory) -> io::Result<File> {
+    let fd = unsafe { libc::dup(directory.fd()) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `dup` returned a fresh descriptor that File now owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+pub(crate) fn stat_is(stat: &libc::stat, file_type: libc::mode_t) -> bool {
     stat.st_mode as libc::mode_t & libc::S_IFMT == file_type
 }
 
@@ -396,7 +608,7 @@ fn lock_entry_matches(
         .is_some_and(|current| stat_is(&current, libc::S_IFREG) && same_file(opened, &current)))
 }
 
-fn socket_unverified(stat: &libc::stat) -> Option<EndpointUnverifiedReason> {
+pub(crate) fn socket_unverified(stat: &libc::stat) -> Option<EndpointUnverifiedReason> {
     if stat_is(stat, libc::S_IFLNK) {
         Some(EndpointUnverifiedReason::Symlink)
     } else if !stat_is(stat, libc::S_IFSOCK) {
@@ -814,6 +1026,38 @@ impl Drop for BoundSocketGuard<'_> {
     }
 }
 
+/// Denial-only replacement probe shared by the v1 and managed protocols.
+///
+/// `true` means a live or undecidable listener owns the path, so replacement
+/// must be refused. `false` means the kernel reported a dead rendezvous; a
+/// failed connect is never positive proof of death by itself, which is why the
+/// caller still requires a matching owner record for the exact inode.
+pub(crate) fn probe_listener_is_live(path: &Path) -> io::Result<bool> {
+    let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    probe.set_nonblocking(true)?;
+    match probe.connect(&socket2::SockAddr::unix(path)?) {
+        Ok(()) => Ok(true),
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock
+                || matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINPROGRESS | libc::EALREADY)
+                ) =>
+        {
+            Ok(true)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Bind-time stale replacement uses the exact same identity, lock-file, and
 /// dirfd checks as public reaping. The advisory connect only vetoes cleanup;
 /// failure to connect is never the proof that authorizes unlink.
@@ -829,27 +1073,8 @@ pub(crate) fn remove_stale_socket(
     if !stat_is(&socket_stat, libc::S_IFSOCK) || socket_stat.st_uid != unsafe { libc::geteuid() } {
         return Err(endpoint_in_use());
     }
-    let probe = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    probe.set_nonblocking(true)?;
-    match probe.connect(&socket2::SockAddr::unix(
-        directory.socket_path(&names.socket_os),
-    )?) {
-        Ok(()) => return Err(endpoint_in_use()),
-        Err(error)
-            if error.kind() == io::ErrorKind::WouldBlock
-                || matches!(
-                    error.raw_os_error(),
-                    Some(libc::EINPROGRESS | libc::EALREADY)
-                ) =>
-        {
-            return Err(endpoint_in_use());
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) => {}
-        Err(error) => return Err(error),
+    if probe_listener_is_live(&directory.socket_path(&names.socket_os))? {
+        return Err(endpoint_in_use());
     }
     let identity = SocketIdentity::from_stat(&socket_stat);
     if SocketIdentity::read(ownership)? != Some(identity) {
@@ -881,10 +1106,12 @@ pub(crate) struct EndpointSweep {
 
 static SWEEP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-struct SweepLease;
+/// Process-wide lease for explicit maintenance sweeps. Both the v1 and the
+/// managed sweep share it so one process never runs two maintenance tasks.
+pub(crate) struct SweepLease;
 
 impl SweepLease {
-    fn acquire() -> io::Result<Self> {
+    pub(crate) fn acquire() -> io::Result<Self> {
         SWEEP_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| Self)

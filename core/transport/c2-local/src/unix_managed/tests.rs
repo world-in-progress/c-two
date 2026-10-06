@@ -1,0 +1,1742 @@
+//! Managed-v2 protocol tests: real processes, real public paths, and the
+//! conservative boundaries of the gate and owner record.
+
+use super::*;
+use crate::{SweepBatch, SweepBudget};
+use std::fs::OpenOptions;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::process::{Child, Command};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+
+/// An isolated managed namespace with a private parent: exactly the two-level
+/// `0700` layout the production path verifies.
+struct TestNamespace {
+    _parent: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl TestNamespace {
+    fn new() -> Self {
+        let parent = tempfile::Builder::new()
+            .prefix("c2m2-")
+            .tempdir_in("/tmp")
+            .expect("isolated managed parent under /tmp");
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.path().join("v2");
+        assert!(root.as_os_str().as_bytes().len() <= 40);
+        Self {
+            _parent: parent,
+            root,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+fn managed_endpoint(label: &str) -> LocalEndpoint {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    LocalEndpoint::from_address_with_protocol(
+        &format!("ipc://{label}-{}", &unique[..16]),
+        LocalEndpointProtocol::ManagedV2,
+    )
+    .unwrap()
+}
+
+fn socket_path(endpoint: &LocalEndpoint) -> PathBuf {
+    PathBuf::from(endpoint.os_name())
+}
+
+fn slot_in(root: &Path, endpoint: &LocalEndpoint, suffix: &str) -> PathBuf {
+    let stem = endpoint_stem(endpoint).unwrap();
+    let mut name = stem.into_vec();
+    name.extend_from_slice(suffix.as_bytes());
+    root.join(OsString::from_vec(name))
+}
+
+fn socket_path_at(root: &Path, endpoint: &LocalEndpoint) -> PathBuf {
+    slot_in(root, endpoint, SOCKET_SUFFIX)
+}
+
+fn lease_path_at(root: &Path, endpoint: &LocalEndpoint) -> PathBuf {
+    slot_in(root, endpoint, LEASE_SUFFIX)
+}
+
+fn lease_path(endpoint: &LocalEndpoint) -> PathBuf {
+    let names = managed_names(endpoint).unwrap();
+    PathBuf::from(endpoint.os_name())
+        .parent()
+        .unwrap()
+        .join(OsStr::from_bytes(names.lock.as_bytes()))
+}
+
+fn identity_of(path: &Path) -> SocketIdentity {
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        changed_secs: metadata.ctime(),
+        changed_nanos: metadata.ctime_nsec(),
+    }
+}
+
+fn managed_credential(
+    endpoint: &LocalEndpoint,
+    path: &Path,
+    incarnation: [u8; 16],
+) -> EndpointCredential {
+    EndpointCredential::unix_managed(endpoint.clone(), identity_of(path), incarnation)
+}
+
+fn write_lease(path: &Path, record: &OwnerRecord) {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    write_record(&file, record).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// The process-wide maintenance lease is shared with the v1 sweep tests that
+/// run in parallel; a real caller retries on `WouldBlock` instead of failing.
+fn retry_sweep<T>(mut attempt: impl FnMut() -> io::Result<T>) -> T {
+    for _ in 0..400 {
+        match attempt() {
+            Ok(value) => return value,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("sweep open failed: {error}"),
+        }
+    }
+    panic!("process-wide sweep lease never became available");
+}
+
+fn unreachable_portal() -> [u8; 16] {
+    [0x5a; 16]
+}
+
+/// Guards the handful of tests that inspect slots in the *shared* derived
+/// namespace while another test may be running an explicit maintenance sweep
+/// over that same namespace. A concurrent sweep is allowed to retire a
+/// registered leftover, so those tests would otherwise race a legitimate
+/// retirement. Only these tests take the guard; the rest of the suite keeps
+/// running in parallel.
+fn shared_namespace_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Child fixture for real-process ownership and crash convergence.
+#[test]
+fn managed_process_fixture() {
+    let Ok(action) = std::env::var("C2_LOCAL_MANAGED_TEST_ACTION") else {
+        return;
+    };
+    let address = std::env::var("C2_LOCAL_MANAGED_TEST_ADDRESS").unwrap();
+    let endpoint =
+        LocalEndpoint::from_address_with_protocol(&address, LocalEndpointProtocol::ManagedV2)
+            .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    match action.as_str() {
+        "duplicate" => assert_eq!(
+            crate::LocalListener::bind(&endpoint).err().unwrap().kind(),
+            io::ErrorKind::AddrInUse,
+        ),
+        "exit-owner" => {
+            let _listener = crate::LocalListener::bind(&endpoint).unwrap();
+            // Process exit releases kernel handles and flock without Rust Drop.
+            std::process::exit(0);
+        }
+        "hold" => {
+            let _listener = crate::LocalListener::bind(&endpoint).unwrap();
+            loop {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        "cwd-probe" => {
+            // Independent subprocess negative: prove that a real managed bind
+            // changes neither the default follow-process cwd nor a thread that
+            // already carries its own thread-local cwd, and that the process
+            // working directory itself never moves.
+            #[cfg(target_os = "macos")]
+            {
+                let elsewhere = std::env::var("C2_LOCAL_MANAGED_TEST_CWD").unwrap();
+                let elsewhere = PathBuf::from(elsewhere);
+                let process_before = std::env::current_dir().unwrap();
+
+                // Thread P: an existing thread-local cwd set via the same
+                // primitive the bind thread uses. It stays alive for the whole
+                // probe so its thread-local directory is observable across the
+                // bind.
+                let pinned_before_ready =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let pinned_observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let pinned = {
+                    let elsewhere = elsewhere.clone();
+                    let ready = pinned_before_ready.clone();
+                    let observed = pinned_observed.clone();
+                    std::thread::spawn(move || {
+                        let other_dir =
+                            crate::unix_endpoint::EndpointDirectory::open(&elsewhere, false)
+                                .unwrap();
+                        crate::unix_endpoint::set_thread_directory(other_dir.fd()).unwrap();
+                        let before = std::env::current_dir().unwrap();
+                        *observed.lock().unwrap() = Some((before.clone(), before));
+                        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // Hold the thread alive across the bind.
+                        let _ = release_rx.recv();
+                        let after = std::env::current_dir().unwrap();
+                        let mut guard = observed.lock().unwrap();
+                        let entry = guard.as_mut().unwrap();
+                        entry.1 = after;
+                    })
+                };
+                while !pinned_before_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let (pinned_before, _) = pinned_observed
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("pinned thread recorded its directory");
+
+                // Thread F: default follow-process. It reads the process-wide
+                // cwd, which must not move either.
+                let follow_before = std::env::current_dir().unwrap();
+                assert_ne!(
+                    pinned_before, follow_before,
+                    "the pinned thread must actually differ from the process cwd"
+                );
+
+                let _listener = crate::LocalListener::bind(&endpoint).unwrap();
+
+                let follow_after = std::env::current_dir().unwrap();
+                let process_after = std::env::current_dir().unwrap();
+                release_tx.send(()).unwrap();
+                pinned.join().unwrap();
+                let (_, pinned_after) = pinned_observed
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("pinned thread recorded both readings");
+
+                assert_eq!(follow_after, follow_before, "follow-process cwd moved");
+                assert_eq!(pinned_after, pinned_before, "pinned thread cwd moved");
+                assert_eq!(process_after, process_before, "process cwd moved");
+
+                // The strongest form of the Host's probe: the *calling* thread
+                // itself carries a thread-local cwd, and a real managed bind on
+                // it must leave that directory exactly as it was. An
+                // implementation that switched and restored the caller's thread
+                // directory would be indistinguishable from a no-op only if its
+                // restore were perfectly faithful; requiring that the bind never
+                // touches the caller at all is what this asserts.
+                let caller_dir =
+                    crate::unix_endpoint::EndpointDirectory::open(&elsewhere, false).unwrap();
+                crate::unix_endpoint::set_thread_directory(caller_dir.fd()).unwrap();
+                let caller_before = std::env::current_dir().unwrap();
+                let endpoint2 = managed_endpoint("cwd-caller");
+                let _listener2 = crate::LocalListener::bind(&endpoint2).unwrap();
+                let caller_after = std::env::current_dir().unwrap();
+                assert_eq!(
+                    caller_after, caller_before,
+                    "the calling thread's own directory moved across a managed bind"
+                );
+
+                println!("cwd-probe-ok {process_before:?} {pinned_before:?}");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // On Linux the descriptor is named through /proc/self/fd, so the
+                // process cwd is the only observable and must not move either.
+                let before = std::env::current_dir().unwrap();
+                let _listener = crate::LocalListener::bind(&endpoint).unwrap();
+                assert_eq!(std::env::current_dir().unwrap(), before);
+                println!("cwd-probe-ok {before:?}");
+            }
+        }
+        _ => panic!("unknown managed test action: {action}"),
+    }
+}
+
+fn run_managed_process(endpoint: &LocalEndpoint, action: &str) -> std::process::Output {
+    Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unix_managed::tests::managed_process_fixture",
+            "--nocapture",
+        ])
+        .env("C2_LOCAL_MANAGED_TEST_ADDRESS", endpoint.address())
+        .env("C2_LOCAL_MANAGED_TEST_ACTION", action)
+        .output()
+        .unwrap()
+}
+
+fn spawn_managed_holder(endpoint: &LocalEndpoint) -> Child {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unix_managed::tests::managed_process_fixture",
+            "--nocapture",
+        ])
+        .env("C2_LOCAL_MANAGED_TEST_ADDRESS", endpoint.address())
+        .env("C2_LOCAL_MANAGED_TEST_ACTION", "hold")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if socket_path(endpoint).exists() {
+            return child;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "holder child never bound {}",
+        socket_path(endpoint).display()
+    );
+}
+
+#[test]
+fn legacy_derivation_remains_the_default_and_untouched() {
+    let endpoint = LocalEndpoint::from_address("ipc://managed-dispatch-check").unwrap();
+    assert_eq!(endpoint.protocol(), LocalEndpointProtocol::LegacyV1);
+    assert_eq!(
+        Path::new(endpoint.os_name()),
+        Path::new("/tmp/c_two_ipc/managed-dispatch-check.sock")
+    );
+}
+
+/// The real public path: derived namespace, bind, accept, and retirement. Each
+/// of the 120 iterations must return the namespace to gate + marker only.
+#[tokio::test]
+async fn managed_public_namespace_lifecycle_converges_over_repeated_runs() {
+    let _shared = shared_namespace_guard();
+    let guard = managed_endpoint("public-guard");
+    let guard_root = socket_path(&guard).parent().unwrap().to_owned();
+    for _ in 0..120 {
+        let endpoint = managed_endpoint("public");
+        let mut listener = crate::LocalListener::bind(&endpoint).unwrap();
+        assert_eq!(
+            crate::LocalListener::bind(&endpoint).err().unwrap().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let (mut client, mut server) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(
+                crate::LocalStream::connect(&endpoint, crate::DEFAULT_CONNECT_TIMEOUT),
+                listener.accept(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        server.write_all(b"managed").await.unwrap();
+        let mut bytes = [0_u8; 7];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"managed");
+        assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+        assert!(!socket_path(&endpoint).exists());
+        assert!(!lease_path(&endpoint).exists());
+    }
+    assert!(guard_root.join(GATE_NAME).exists());
+    assert!(guard_root.join(MARKER_NAME).exists());
+}
+
+#[tokio::test]
+async fn managed_concurrent_same_address_bind_has_exactly_one_winner() {
+    let endpoint = managed_endpoint("race");
+    let root = socket_path(&endpoint).parent().unwrap().to_owned();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let runtime = tokio::runtime::Handle::current();
+    let results = std::thread::scope(|scope| {
+        let contenders: Vec<_> = (0..8)
+            .map(|_| {
+                let start = start.clone();
+                let endpoint = &endpoint;
+                let root = &root;
+                let runtime = &runtime;
+                scope.spawn(move || {
+                    let _entered = runtime.enter();
+                    start.wait();
+                    bind_managed_at(endpoint, root)
+                })
+            })
+            .collect();
+        contenders
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let mut winners = Vec::new();
+    for result in results {
+        match result {
+            Ok(listener) => winners.push(listener),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}"),
+        }
+    }
+    assert_eq!(winners.len(), 1, "one managed endpoint must have one owner");
+    let winner = winners.pop().unwrap();
+    let credential = winner.credential();
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, &root),
+        EndpointReapResult::Busy
+    ));
+    assert!(matches!(winner.close(), EndpointReapResult::Reaped));
+}
+
+/// A real second process holds the address: duplicate bind is refused, and a
+/// registered SIGKILL leaves socket and lease that a later reap converges.
+#[tokio::test]
+async fn managed_two_process_competition_and_registered_kill_converge() {
+    let _shared = shared_namespace_guard();
+    let endpoint = managed_endpoint("two-process");
+    let mut holder = spawn_managed_holder(&endpoint);
+    assert_eq!(
+        crate::LocalListener::bind(&endpoint).err().unwrap().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    let duplicate = run_managed_process(&endpoint, "duplicate");
+    assert!(duplicate.status.success(), "{duplicate:?}");
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(socket_path(&endpoint).exists());
+    assert!(lease_path(&endpoint).exists());
+
+    let EndpointInspection::Present(credential) = inspect_managed(&endpoint) else {
+        panic!("killed registered owner must leave a verifiable record");
+    };
+    assert!(matches!(
+        reap_managed(&endpoint, &credential),
+        EndpointReapResult::Reaped
+    ));
+    assert!(!socket_path(&endpoint).exists());
+    assert!(!lease_path(&endpoint).exists());
+    assert!(matches!(
+        reap_managed(&endpoint, &credential),
+        EndpointReapResult::AlreadyAbsent
+    ));
+}
+
+#[tokio::test]
+async fn managed_registered_exit_without_destructors_is_reapable() {
+    let _shared = shared_namespace_guard();
+    let endpoint = managed_endpoint("exit-owner");
+    let output = run_managed_process(&endpoint, "exit-owner");
+    assert!(output.status.success(), "{output:?}");
+    assert!(socket_path(&endpoint).exists());
+    assert!(lease_path(&endpoint).exists());
+    let EndpointInspection::Present(credential) = inspect_managed(&endpoint) else {
+        panic!("registered owner exit must leave a complete record");
+    };
+    assert!(matches!(
+        reap_managed(&endpoint, &credential),
+        EndpointReapResult::Reaped
+    ));
+    assert!(!socket_path(&endpoint).exists());
+    assert!(!lease_path(&endpoint).exists());
+}
+
+#[tokio::test]
+async fn managed_live_listener_is_busy_and_disconnects_keep_service_available() {
+    let _shared = shared_namespace_guard();
+    let endpoint = managed_endpoint("busy");
+    let mut listener = crate::LocalListener::bind(&endpoint).unwrap();
+    let credential = listener.credential();
+    assert!(matches!(
+        reap_managed(&endpoint, &credential),
+        EndpointReapResult::Busy
+    ));
+    for _ in 0..2 {
+        let (client, server) = tokio::try_join!(
+            crate::LocalStream::connect(&endpoint, crate::DEFAULT_CONNECT_TIMEOUT),
+            listener.accept(),
+        )
+        .unwrap();
+        drop(client);
+        drop(server);
+    }
+    assert!(socket_path(&endpoint).exists());
+    assert!(lease_path(&endpoint).exists());
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+}
+
+#[tokio::test]
+async fn managed_old_credential_never_removes_a_new_incarnation() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("stale-credential");
+    let first = bind_managed_at(&endpoint, root).unwrap();
+    let old = first.credential();
+    assert!(matches!(first.close(), EndpointReapResult::Reaped));
+
+    let second = bind_managed_at(&endpoint, root).unwrap();
+    let current = second.credential();
+    assert_ne!(
+        old, current,
+        "a retired credential must not equal a new one"
+    );
+    // A live new incarnation is Busy for any credential, old or current.
+    assert!(matches!(
+        reap_managed_at(&endpoint, &old, root),
+        EndpointReapResult::Busy
+    ));
+    // After the new incarnation is gone, the old credential still cannot
+    // remove its replacement: identity plus incarnation must both match.
+    second.abandon_for_test();
+    assert!(matches!(
+        reap_managed_at(&endpoint, &old, root),
+        EndpointReapResult::StaleTarget
+    ));
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Present(_)
+    ));
+    assert!(socket_path_at(root, &endpoint).exists());
+    assert!(matches!(
+        reap_managed_at(&endpoint, &current, root),
+        EndpointReapResult::Reaped
+    ));
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+}
+
+#[tokio::test]
+async fn managed_missing_or_replaced_gate_never_creates_a_second_lock() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("gate");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    let gate = root.join(GATE_NAME);
+    let marker_before = std::fs::read(root.join(MARKER_NAME)).unwrap();
+
+    std::fs::remove_file(&gate).unwrap();
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorMissing)
+    ));
+    assert_eq!(
+        bind_managed_at(&endpoint, root).err().unwrap().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    assert!(
+        !gate.exists(),
+        "a marker without its gate must never create a second coordinator inode"
+    );
+
+    // A replacement inode with the right permissions and ownership is still a
+    // different coordinator: the marker identity refuses it.
+    let replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&gate)
+        .unwrap();
+    drop(replacement);
+    assert!(matches!(
+        inspect_managed_at(&endpoint, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::CoordinatorReplaced)
+    ));
+    assert_eq!(
+        std::fs::read(root.join(MARKER_NAME)).unwrap(),
+        marker_before,
+        "marker must not be rewritten to adopt a replacement gate"
+    );
+}
+
+#[tokio::test]
+async fn managed_corrupt_record_and_symlink_are_unverified_and_untouched() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    test_namespace_root(root).unwrap();
+
+    let corrupt = managed_endpoint("corrupt");
+    let stem = endpoint_stem(&corrupt)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let corrupt_socket = root.join(format!("{stem}{SOCKET_SUFFIX}"));
+    drop(std::os::unix::net::UnixListener::bind(&corrupt_socket).unwrap());
+    let corrupt_lease = root.join(format!("{stem}{LEASE_SUFFIX}"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&corrupt_lease)
+        .unwrap();
+    file.write_all(b"not-a-managed-record").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert!(matches!(
+        inspect_managed_at(&corrupt, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::InvalidRecord)
+    ));
+    let credential = managed_credential(&corrupt, &corrupt_socket, unreachable_portal());
+    assert!(matches!(
+        reap_managed_at(&corrupt, &credential, root),
+        EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord)
+    ));
+    assert!(corrupt_socket.exists());
+    assert!(corrupt_lease.exists());
+
+    let linked = managed_endpoint("symlink");
+    let target = root.join("target-marker");
+    std::fs::write(&target, b"keep").unwrap();
+    let linked_socket = socket_path_at(root, &linked);
+    std::os::unix::fs::symlink(&target, &linked_socket).unwrap();
+    assert!(matches!(
+        inspect_managed_at(&linked, root),
+        EndpointInspection::Unverified(EndpointUnverifiedReason::Symlink)
+    ));
+    let credential = managed_credential(&linked, &target, unreachable_portal());
+    assert!(matches!(
+        reap_managed_at(&linked, &credential, root),
+        EndpointReapResult::Unverified(EndpointUnverifiedReason::Symlink)
+    ));
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    std::fs::remove_file(&linked_socket).unwrap();
+}
+
+#[tokio::test]
+async fn managed_budgeted_sweep_advances_past_busy_and_corrupt_slots() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+
+    let live = managed_endpoint("sweep-live");
+    let live_listener = bind_managed_at(&live, root).unwrap();
+
+    let crashed = managed_endpoint("sweep-crashed");
+    let crashed_listener = bind_managed_at(&crashed, root).unwrap();
+    crashed_listener.abandon_for_test();
+    assert!(socket_path_at(root, &crashed).exists());
+
+    let orphan = managed_endpoint("sweep-orphan");
+    let orphan_record = OwnerRecord {
+        address: orphan.address().to_owned(),
+        incarnation: uuid::Uuid::new_v4().into_bytes(),
+        identity: SocketIdentity {
+            device: 11,
+            inode: 22,
+            changed_secs: 33,
+            changed_nanos: 44,
+        },
+    };
+    write_lease(&lease_path_at(root, &orphan), &orphan_record);
+    assert!(!socket_path_at(root, &orphan).exists());
+
+    let corrupt = managed_endpoint("sweep-corrupt");
+    let corrupt_lease = lease_path_at(root, &corrupt);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&corrupt_lease)
+        .unwrap();
+    file.write_all(b"broken").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let mut sweep = retry_sweep(|| ManagedSweep::open_at(root));
+    let mut total = SweepBatch::default();
+    let mut complete = false;
+    for _ in 0..64 {
+        let batch = sweep.next_batch(SweepBudget {
+            max_entries: 1,
+            max_duration: Duration::ZERO,
+        });
+        assert!(
+            batch.entries_visited <= 1,
+            "entry budget exceeded: {batch:?}"
+        );
+        total.entries_visited += batch.entries_visited;
+        total.endpoints_examined += batch.endpoints_examined;
+        total.reaped += batch.reaped;
+        total.busy += batch.busy;
+        total.unverified += batch.unverified;
+        total.leases_retired += batch.leases_retired;
+        assert!(!batch.round_interrupted, "{batch:?}");
+        complete = batch.round_complete;
+        if complete {
+            break;
+        }
+    }
+    assert!(complete, "stable namespace must finish a bounded round");
+    assert!(total.entries_visited > total.endpoints_examined);
+    assert!(total.busy >= 1, "live lease must stay Busy");
+    assert!(total.unverified >= 1, "corrupt slot must stay Unverified");
+    assert!(
+        total.reaped >= 2,
+        "crashed socket and orphan lease converge"
+    );
+    assert!(total.leases_retired >= 1, "socket-less lease retires");
+    assert!(!socket_path_at(root, &crashed).exists());
+    assert!(!lease_path_at(root, &crashed).exists());
+    assert!(!lease_path_at(root, &orphan).exists());
+    assert!(corrupt_lease.exists());
+    assert!(socket_path_at(root, &live).exists());
+    assert!(lease_path_at(root, &live).exists());
+    assert!(matches!(live_listener.close(), EndpointReapResult::Reaped));
+}
+
+/// Public sweep dispatch: `EndpointSweep::for_endpoint` enumerates the real
+/// managed-v2 namespace, converges registered leftovers, and never touches the
+/// legacy `/tmp/c_two_ipc` history.
+#[tokio::test]
+async fn managed_public_sweep_targets_the_versioned_namespace_only() {
+    let _shared = shared_namespace_guard();
+    let live = managed_endpoint("public-sweep-live");
+    let live_listener = crate::LocalListener::bind(&live).unwrap();
+    let dead = managed_endpoint("public-sweep-dead");
+    let output = run_managed_process(&dead, "exit-owner");
+    assert!(output.status.success(), "{output:?}");
+    assert!(socket_path(&dead).exists());
+
+    // A legacy v1 namespace entry must remain untouched by a managed sweep.
+    let legacy = PathBuf::from("/tmp/c_two_ipc");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let legacy_socket = legacy.join(format!(
+        "c2p2-legacy-{}.sock",
+        uuid::Uuid::new_v4().simple()
+    ));
+    drop(std::os::unix::net::UnixListener::bind(&legacy_socket).unwrap());
+
+    let mut sweep = retry_sweep(|| crate::EndpointSweep::for_endpoint(&live));
+    let mut complete = false;
+    let mut reaped = 0;
+    for _ in 0..64 {
+        let batch = sweep.next_batch(SweepBudget {
+            max_entries: 1,
+            max_duration: Duration::ZERO,
+        });
+        reaped += batch.reaped;
+        assert!(!batch.round_interrupted, "{batch:?}");
+        if batch.round_complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete, "managed namespace must finish its bounded round");
+    assert!(reaped >= 1, "registered leftover must converge: {reaped}");
+    assert!(!socket_path(&dead).exists());
+    assert!(!lease_path(&dead).exists());
+    assert!(socket_path(&live).exists());
+    assert!(lease_path(&live).exists());
+    assert!(legacy_socket.exists(), "legacy history must not be swept");
+    std::fs::remove_file(&legacy_socket).unwrap();
+    assert!(matches!(live_listener.close(), EndpointReapResult::Reaped));
+}
+
+/// Bind rollback: a failed managed initialization withdraws only the socket it
+/// created and leaves the address reusable.
+#[tokio::test]
+async fn managed_failed_initialization_withdraws_its_socket_and_rebinds() {
+    use crate::unix_endpoint::fault;
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("managed-rollback");
+    fault::inject(fault::Failure::SocketPermissions);
+    let error = bind_managed_at(&endpoint, root)
+        .err()
+        .expect("injected socket permission failure must fail bind");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    assert!(
+        !socket_path_at(root, &endpoint).exists(),
+        "failed initialization must withdraw the socket it bound"
+    );
+
+    let listener = bind_managed_at(&endpoint, root).expect("the fixed address must be reusable");
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+}
+
+/// A Drop that cannot take the gate stays bounded, releases its handles in
+/// order, and leaves complete metadata for the reaper.
+#[tokio::test]
+async fn managed_drop_without_gate_leaves_metadata_for_the_reaper() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("drop-gate");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let credential = listener.credential();
+
+    let held_root = root.to_owned();
+    let holder = std::thread::spawn(move || {
+        let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        drop(namespace);
+    });
+    // Wait until the gate is provably held by the other thread.
+    let mut holding = false;
+    for _ in 0..400 {
+        match ManagedNamespace::open_root(root, false, false) {
+            Err(NamespaceError::Busy) => {
+                holding = true;
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    assert!(holding, "gate holder never acquired the coordinator lock");
+
+    drop(listener);
+    assert!(
+        socket_path_at(root, &endpoint).exists(),
+        "a Drop without the gate must keep its registered metadata"
+    );
+    assert!(lease_path_at(root, &endpoint).exists());
+    holder.join().unwrap();
+
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, root),
+        EndpointReapResult::Reaped
+    ));
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+}
+
+/// The P1 blocker as a real concurrent negative case: an opener is parked
+/// inside the gate-hold window while the verified `v2` directory is renamed
+/// away and a fresh `v2` takes its name. The opener must never create its
+/// socket in the replacement directory, and the replacement must keep exactly
+/// its own objects.
+#[tokio::test]
+async fn managed_directory_rename_inside_the_gate_window_never_binds_into_the_replacement() {
+    let parent = tempfile::Builder::new()
+        .prefix("c2m2-rename-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("v2");
+    let moved = parent.path().join("moved");
+    let endpoint = managed_endpoint("rename-window");
+
+    // Every future managed open now parks just after the gate is held.
+    barrier::arm(&root);
+
+    let opener_root = root.clone();
+    let opener_endpoint = endpoint.clone();
+    let opener = std::thread::spawn(move || bind_managed_at(&opener_endpoint, &opener_root));
+
+    assert!(
+        barrier::wait_entered(),
+        "opener never reached the gate-hold window"
+    );
+
+    // The rename race the blocker describes: the verified directory leaves its
+    // name and a different, private directory takes the same name.
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A pre-existing foreign object in the replacement directory must survive.
+    let foreign = root.join("foreign-marker");
+    std::fs::write(&foreign, b"keep").unwrap();
+
+    barrier::release();
+    let result = opener.join().unwrap();
+
+    // The stale opener must fail rather than bind into the replacement, and
+    // must not adopt or delete anything there.
+    assert!(
+        result.is_err(),
+        "an opener whose namespace was renamed away must not succeed"
+    );
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"keep");
+    let replacement_entries: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        replacement_entries.len(),
+        1,
+        "replacement directory must contain only its own object: {replacement_entries:?}"
+    );
+
+    // The decisive property: no socket for this endpoint was created in the
+    // replacement directory, and none was created in the moved-aside directory
+    // either. Whatever is left there names the directory the opener actually
+    // verified through its descriptor, never the path that was renamed away.
+    assert!(
+        !socket_path_at(&root, &endpoint).exists(),
+        "the replacement directory must never receive this process's socket"
+    );
+    assert!(
+        !socket_path_at(&moved, &endpoint).exists(),
+        "the opener must fail before binding once its directory identity moved"
+    );
+    // The lease alone may already exist in the verified directory: it is
+    // created under the gate before the rename is observable. With no readable
+    // record it stays conservatively Unverified rather than being guessed
+    // away; a fresh owner reuses the slot and converges it.
+    if lease_path_at(&moved, &endpoint).exists() {
+        let retired = reap_slot(&moved, &endpoint_stem(&endpoint).unwrap());
+        assert!(
+            matches!(
+                retired,
+                EndpointReapResult::Reaped
+                    | EndpointReapResult::AlreadyAbsent
+                    | EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord)
+            ),
+            "a socket-less slot without a readable record stays conservative: {retired:?}"
+        );
+        let _ = std::fs::remove_file(lease_path_at(&moved, &endpoint));
+    }
+    barrier::disarm();
+}
+
+/// Two concurrent first initializations of a brand-new namespace must share the
+/// single coordinator inode: exactly one gate file, one marker, and every
+/// successful opener bound to the same gate.
+#[tokio::test]
+async fn managed_parallel_first_initialization_shares_one_gate_inode() {
+    let parent = tempfile::Builder::new()
+        .prefix("c2m2-firstinit-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("v2");
+    let endpoints: Vec<_> = (0..6)
+        .map(|i| managed_endpoint(&format!("first-{i}")))
+        .collect();
+    let root = std::sync::Arc::new(root);
+    let start = std::sync::Arc::new(std::sync::Barrier::new(endpoints.len()));
+    // Every opener binds a real Tokio listener, so each thread enters the
+    // reactor this test-harness runtime already owns.
+    let runtime = tokio::runtime::Handle::current();
+
+    let listeners = std::thread::scope(|scope| {
+        let handles: Vec<_> = endpoints
+            .iter()
+            .map(|endpoint| {
+                let root = root.clone();
+                let start = start.clone();
+                let runtime = &runtime;
+                scope.spawn(move || {
+                    let _entered = runtime.enter();
+                    start.wait();
+                    bind_managed_at(endpoint, &root)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    let mut live = Vec::new();
+    for result in listeners {
+        live.push(result.expect("a fresh namespace must be adoptable by every opener"));
+    }
+
+    let gate = root.join(GATE_NAME);
+    let marker = root.join(MARKER_NAME);
+    assert!(gate.exists() && marker.exists());
+    let gate_identity = identity_of(&gate);
+
+    // Every live endpoint must be present and verifiable against that same
+    // coordinator, and every successful opener must have used the one gate.
+    for (endpoint, listener) in endpoints.iter().zip(live.iter()) {
+        assert!(
+            matches!(
+                inspect_managed_at(endpoint, &root),
+                EndpointInspection::Present(_)
+            ),
+            "endpoint under the shared gate must be verifiable"
+        );
+        assert_eq!(
+            listener.gate_identity_for_test(),
+            gate_identity,
+            "every opener must have bound under the same coordinator inode"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(root.as_path())
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() == GATE_NAME)
+            .count(),
+        1,
+        "there must never be a second coordinator entry"
+    );
+    for listener in live {
+        assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    }
+}
+#[tokio::test]
+async fn managed_interrupted_sweep_never_reports_a_completed_round() {
+    let parent = tempfile::Builder::new()
+        .prefix("c2m2-int-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("v2");
+    test_namespace_root(&root).unwrap();
+    let endpoint = managed_endpoint("sweep-interrupt");
+    let listener = bind_managed_at(&endpoint, &root).unwrap();
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+
+    let mut sweep = retry_sweep(|| ManagedSweep::open_at(&root));
+    let first = sweep.next_batch(SweepBudget {
+        max_entries: 1,
+        max_duration: Duration::ZERO,
+    });
+    assert!(!first.round_complete && !first.round_interrupted);
+
+    let moved = parent.path().join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let interrupted = sweep.next_batch(SweepBudget::default());
+    assert!(interrupted.namespace_changed, "{interrupted:?}");
+    assert!(interrupted.round_interrupted, "{interrupted:?}");
+    assert!(!interrupted.round_complete, "{interrupted:?}");
+    let terminal = sweep.next_batch(SweepBudget::default());
+    assert!(terminal.round_interrupted, "{terminal:?}");
+    assert!(!terminal.round_complete, "{terminal:?}");
+    assert_eq!(terminal.entries_visited, 0);
+}
+
+#[test]
+fn managed_initialization_window_stays_unverified_without_creating_locks() {
+    let parent = tempfile::Builder::new()
+        .prefix("c2m2-window-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("v2");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = managed_endpoint("window");
+    let stem = endpoint_stem(&endpoint)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    drop(
+        std::os::unix::net::UnixListener::bind(root.join(format!("{stem}{SOCKET_SUFFIX}")))
+            .unwrap(),
+    );
+
+    // An endpoint object without a verifiable first-initialization identity is
+    // never adopted: no marker is written and the namespace stays Unverified.
+    let error = ManagedNamespace::open_root(&root, true, true).map(|_| ());
+    assert!(matches!(
+        error,
+        Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::InitializationIncomplete
+        ))
+    ));
+    assert!(!root.join(MARKER_NAME).exists());
+
+    // The fixed coordinator is a long-lived constant and is never unlinked,
+    // not even by a refused first initialization: a drop-then-unlink window
+    // would let a third party bind a *different* gate inode at the same name.
+    let gate = root.join(GATE_NAME);
+    assert!(gate.exists(), "the fixed gate is never unlinked online");
+    let gate_identity = identity_of(&gate);
+    // A retried initialization keeps the same coordinator and stays refused.
+    assert!(matches!(
+        ManagedNamespace::open_root(&root, true, true).map(|_| ()),
+        Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::InitializationIncomplete
+        ))
+    ));
+    assert_eq!(
+        identity_of(&gate),
+        gate_identity,
+        "a refused initialization must not replace the coordinator inode"
+    );
+
+    // Read-only maintenance reports the same boundary.
+    assert!(matches!(
+        ManagedNamespace::open_root(&root, false, true).map(|_| ()),
+        Err(NamespaceError::Unverified(
+            EndpointUnverifiedReason::InitializationIncomplete
+        ))
+    ));
+    assert_eq!(identity_of(&gate), gate_identity);
+    assert!(!root.join(MARKER_NAME).exists());
+}
+
+#[test]
+fn managed_record_decode_rejects_hash_only_and_oversized_payloads() {
+    let endpoint = managed_endpoint("record-shape");
+    let incarnation = uuid::Uuid::new_v4().into_bytes();
+    let identity = SocketIdentity {
+        device: 1,
+        inode: 2,
+        changed_secs: 3,
+        changed_nanos: 4,
+    };
+    let record = OwnerRecord {
+        address: endpoint.address().to_owned(),
+        incarnation,
+        identity,
+    };
+    let encoded = record.encode().unwrap();
+    assert!(encoded.len() <= RECORD_MAX_LEN);
+    assert_eq!(OwnerRecord::decode(&encoded), Some(record.clone()));
+    assert!(record_matches_endpoint(&record, &endpoint));
+
+    // A different logical address cannot reuse the same hashed basename.
+    let other = LocalEndpoint::from_address_with_protocol(
+        "ipc://record-shape-other",
+        LocalEndpointProtocol::ManagedV2,
+    )
+    .unwrap();
+    assert!(!record_matches_endpoint(&record, &other));
+
+    // Undecodable shapes never become a record: truncated, oversized, and a
+    // corrupt protocol byte.
+    assert_eq!(OwnerRecord::decode(&encoded[..encoded.len() - 1]), None);
+    let mut oversized = encoded.clone();
+    oversized.push(0);
+    assert_eq!(OwnerRecord::decode(&oversized), None);
+    let mut wrong_protocol = encoded.clone();
+    wrong_protocol[9] = 1;
+    assert_eq!(OwnerRecord::decode(&wrong_protocol), None);
+}
+
+/// P2 blocker: a coordinator held by another process must not block
+/// maintenance. `inspect`, `reap`, and a budgeted sweep all return promptly and
+/// still advance their budget, and a later pass converges the slot once the
+/// foreign gate is released.
+#[tokio::test]
+async fn managed_busy_gate_never_blocks_maintenance_and_budget_still_advances() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+
+    let dead = managed_endpoint("busy-gate-dead");
+    let dead_listener = bind_managed_at(&dead, root).unwrap();
+    let dead_credential = dead_listener.credential();
+    dead_listener.abandon_for_test();
+    assert!(socket_path_at(root, &dead).exists());
+
+    let live = managed_endpoint("busy-gate-live");
+    let live_listener = bind_managed_at(&live, root).unwrap();
+
+    // A foreign holder takes the same coordinator the maintenance paths need.
+    let held_root = root.to_owned();
+    let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holder = {
+        let holding = holding.clone();
+        let release = release.clone();
+        std::thread::spawn(move || {
+            let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
+            holding.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            drop(namespace);
+        })
+    };
+    for _ in 0..1000 {
+        if holding.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        holding.load(std::sync::atomic::Ordering::SeqCst),
+        "foreign gate holder never acquired the coordinator"
+    );
+
+    // Every maintenance entry point answers Busy instead of waiting.
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        reap_managed_at(&dead, &dead_credential, root),
+        EndpointReapResult::Busy
+    ));
+    assert!(matches!(
+        reap_slot(root, &endpoint_stem(&dead).unwrap()),
+        EndpointReapResult::Busy
+    ));
+    match inspect_managed_at(&dead, root) {
+        EndpointInspection::IoError(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        }
+        other => panic!("busy gate must be an observable WouldBlock, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "maintenance waited on a foreign gate for {:?}",
+        started.elapsed()
+    );
+
+    // A budgeted sweep round still advances: it must visit entries, count the
+    // busy candidate against the budget, and finish the round while the foreign
+    // holder is still in place.
+    let mut sweep = retry_sweep(|| ManagedSweep::open_at(root));
+    let mut visited = 0;
+    let mut busy = 0;
+    let mut complete = false;
+    for _ in 0..128 {
+        let batch = sweep.next_batch(SweepBudget {
+            max_entries: 2,
+            max_duration: Duration::ZERO,
+        });
+        visited += batch.entries_visited;
+        busy += batch.busy;
+        assert!(!batch.round_interrupted, "{batch:?}");
+        if batch.round_complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(
+        complete,
+        "a busy gate must not stop a bounded round from reaching EOF"
+    );
+    assert!(visited >= 2, "round must still advance: {visited}");
+    assert!(
+        busy >= 1,
+        "the blocked candidate must be counted as Busy: {busy}"
+    );
+
+    // The foreign holder leaves and a later pass converges the slot.
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    holder.join().unwrap();
+    assert!(matches!(
+        reap_managed_at(&dead, &dead_credential, root),
+        EndpointReapResult::Reaped
+    ));
+    assert!(!socket_path_at(root, &dead).exists());
+    assert!(!lease_path_at(root, &dead).exists());
+    assert!(matches!(live_listener.close(), EndpointReapResult::Reaped));
+}
+
+/// Independent subprocess negative: a real managed bind in a fresh process
+/// leaves both the default follow-process cwd and an already-established
+/// thread-local cwd untouched, and never moves the process working directory.
+/// Running this in its own process keeps the ambient-cwd assertion honest
+/// without this suite ever being forced to run serially.
+#[test]
+fn managed_bind_does_not_change_cwd_in_an_independent_subprocess() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    test_namespace_root(root).unwrap();
+    let endpoint = managed_endpoint("cwd-probe");
+    // A real, existing directory the probe thread can pin as its thread cwd.
+    let elsewhere = TestNamespace::new();
+    let elsewhere_dir = elsewhere
+        .path()
+        .parent()
+        .expect("isolated parent directory")
+        .to_owned();
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unix_managed::tests::managed_process_fixture",
+            "--nocapture",
+        ])
+        .env("C2_LOCAL_MANAGED_TEST_ADDRESS", endpoint.address())
+        .env("C2_LOCAL_MANAGED_TEST_ACTION", "cwd-probe")
+        .env("C2_LOCAL_MANAGED_TEST_CWD", &elsewhere_dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("cwd-probe-ok"),
+        "subprocess cwd probe failed:\nstdout={stdout}\nstderr={stderr}"
+    );
+}
+
+/// A held coordinator must never make `bind_managed_at` wait unboundedly: server
+/// startup reaches it, so a foreign gate holder becomes a bounded `AddrInUse`
+/// that the upper start layer can retry with its own timeout.
+#[tokio::test]
+async fn managed_bind_is_bounded_when_the_gate_is_held() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    // Establish the namespace first so the bind path only contends on the gate.
+    let seed = bind_managed_at(&managed_endpoint("bounded-seed"), root).unwrap();
+    seed.abandon_for_test();
+
+    // A foreign holder keeps the coordinator for well past the bind's bounded
+    // retry window.
+    let held_root = root.to_owned();
+    let holding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holder = {
+        let holding = holding.clone();
+        let release = release.clone();
+        std::thread::spawn(move || {
+            let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
+            holding.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            drop(namespace);
+        })
+    };
+    for _ in 0..1000 {
+        if holding.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        holding.load(std::sync::atomic::Ordering::SeqCst),
+        "foreign gate holder never acquired the coordinator"
+    );
+
+    let endpoint = managed_endpoint("bounded-bind");
+    let started = std::time::Instant::now();
+    let error = bind_managed_at(&endpoint, root)
+        .err()
+        .expect("a held gate must refuse a bind, not block it");
+    let elapsed = started.elapsed();
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a held gate blocked bind for {elapsed:?}; startup must stay bounded"
+    );
+    // The refused bind created nothing.
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+
+    // Once the caller (not the bind) releases the gate, a fresh attempt wins the
+    // address under the normal retry timeout.
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    holder.join().unwrap();
+    let mut listener = bind_managed_at(&endpoint, root).expect("retry after release must bind");
+    assert!(socket_path_at(root, &endpoint).exists());
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+}
+
+/// Managed record failures are conservative: a failed or partial write rolls
+/// back only this call's socket, and a foreign replacement is never deleted.
+#[tokio::test]
+async fn managed_record_failures_roll_back_conservatively() {
+    use crate::unix_endpoint::fault;
+
+    // 1. The owner record write fails outright: the bound socket is withdrawn
+    //    and the address is reusable.
+    {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        let endpoint = managed_endpoint("record-write");
+        fault::inject(fault::Failure::ManagedRecordWrite);
+        let error = bind_managed_at(&endpoint, root)
+            .err()
+            .expect("injected record write failure must fail bind");
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero, "{error}");
+        assert!(
+            !socket_path_at(root, &endpoint).exists(),
+            "a failed record write must withdraw this call's socket"
+        );
+        // The lease entry itself is created under the gate before the record
+        // write. With no readable record it cannot prove ownership, so it stays
+        // Unverified rather than being deleted -- but it is never a live
+        // endpoint either, so a fresh bind simply reuses the same slot.
+        let lease = lease_path_at(root, &endpoint);
+        assert!(
+            lease.exists(),
+            "the lease entry is created before the record write and is retained"
+        );
+        assert!(
+            matches!(
+                reap_slot(root, &endpoint_stem(&endpoint).unwrap()),
+                EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord)
+                    | EndpointReapResult::Reaped
+                    | EndpointReapResult::AlreadyAbsent
+            ),
+            "a socket-less slot without a readable record stays unverified"
+        );
+        assert!(
+            matches!(
+                inspect_managed_at(&endpoint, root),
+                EndpointInspection::Absent
+            ),
+            "a withdrawn socket must not be reported present"
+        );
+    }
+
+    // 2. A partial record write cannot read back, so the slot is Unverified and
+    //    the incomplete record is never mistaken for ownership.
+    {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        let endpoint = managed_endpoint("record-partial");
+        fault::inject(fault::Failure::ManagedRecordPartialWrite);
+        assert!(
+            bind_managed_at(&endpoint, root).is_err(),
+            "a partial record must not be accepted"
+        );
+        assert!(matches!(
+            inspect_managed_at(&endpoint, root),
+            EndpointInspection::Unverified(EndpointUnverifiedReason::InvalidRecord)
+                | EndpointInspection::Absent
+        ));
+        assert!(!socket_path_at(root, &endpoint).exists());
+        // The address is still usable once the fault is gone.
+        let listener = bind_managed_at(&endpoint, root).unwrap();
+        assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    }
+
+    // 3. A foreign replacement between bind and record write is never removed.
+    {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        let endpoint = managed_endpoint("record-replaced");
+        fault::inject(fault::Failure::ManagedRecordWriteAfterReplacement);
+        let error = bind_managed_at(&endpoint, root)
+            .err()
+            .expect("a replaced socket entry must fail bind");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        let replacement = socket_path_at(root, &endpoint);
+        assert!(
+            replacement.exists(),
+            "the foreign replacement must be left in place"
+        );
+        assert_eq!(std::fs::read(&replacement).unwrap(), b"replacement-marker");
+        assert!(matches!(
+            inspect_managed_at(&endpoint, root),
+            EndpointInspection::Unverified(_)
+        ));
+    }
+}
+
+/// A duplicate lease handle inherited across a fork-style clone cannot extend
+/// listener ownership.
+///
+/// The duplicate shares the listener's own open file description, exactly like
+/// a descriptor inherited across `fork`: *closing* the listener's descriptor
+/// would leave the flock held by the duplicate. The listener's explicit
+/// `LOCK_UN` on that shared description is what releases ownership, and every
+/// assertion below holds while the duplicate is still open -- never after it is
+/// dropped.
+#[tokio::test]
+async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("dup-lease");
+
+    // --- Part 1: explicit close under the gate. ---
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    // A true duplicate of this listener's lease open file description.
+    let duplicate = listener.duplicate_lease_fd_for_test();
+
+    // Retirement under the gate is refused while the duplicate's flock is the
+    // same one the listener holds, so ownership is never silently transferred.
+    assert!(matches!(
+        reap_managed_at(&endpoint, &listener.credential(), root),
+        EndpointReapResult::Busy
+    ));
+
+    // The listener retires while the duplicate is STILL OPEN. The explicit
+    // `LOCK_UN` on the shared open file description releases ownership even
+    // though the duplicate keeps the OFD alive.
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    assert!(
+        !socket_path_at(root, &endpoint).exists(),
+        "an explicit close must withdraw its socket even with a live duplicate"
+    );
+    assert!(!lease_path_at(root, &endpoint).exists());
+
+    // Ownership transferred deterministically: a fresh bind wins the address
+    // while the unrelated duplicate is still open.
+    let replacement =
+        bind_managed_at(&endpoint, root).expect("re-bind must win the released lease");
+    assert!(matches!(replacement.close(), EndpointReapResult::Reaped));
+    drop(duplicate);
+
+    // --- Part 2: a Drop that never takes the gate. ---
+    // This is the case where the duplicate would otherwise keep the *same*
+    // lease inode locked forever: the entry is not unlinked, so the reaper must
+    // observe a released flock on the surviving inode even though the duplicate
+    // still references it.
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let duplicate = listener.duplicate_lease_fd_for_test();
+
+    // Hold the coordinator so the Drop cannot retire and is forced onto the
+    // bounded "leave metadata for the reaper" path.
+    let held_root = root.to_owned();
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holder = {
+        let release = release.clone();
+        std::thread::spawn(move || {
+            let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            drop(namespace);
+        })
+    };
+    // Wait until the gate is provably held, then Drop the listener.
+    let mut holding = false;
+    for _ in 0..1000 {
+        if matches!(
+            ManagedNamespace::open_root(root, false, false),
+            Err(NamespaceError::Busy)
+        ) {
+            holding = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(holding, "gate holder never acquired the coordinator");
+
+    let credential = listener.credential();
+    drop(listener);
+    assert!(
+        socket_path_at(root, &endpoint).exists(),
+        "a Drop without the gate must keep its registered metadata"
+    );
+
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    holder.join().unwrap();
+
+    // The duplicate is STILL OPEN. The reaper must not be blocked by it: the
+    // listener already issued `LOCK_UN` on the shared description during Drop.
+    assert!(
+        matches!(
+            reap_managed_at(&endpoint, &credential, root),
+            EndpointReapResult::Reaped
+        ),
+        "a live duplicate must not keep the retired lease locked"
+    );
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
+    // The retired lease entry never comes back, so the duplicate cannot
+    // recreate ownership.
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, root),
+        EndpointReapResult::AlreadyAbsent
+    ));
+    drop(duplicate);
+}
+
+/// A first-initialization scan is bounded: a namespace that exceeds the entry
+/// cap fails closed instead of traversing an unbounded directory.
+#[test]
+fn managed_first_initialization_scan_is_bounded_and_fails_closed() {
+    let parent = tempfile::Builder::new()
+        .prefix("c2m2-scan-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = parent.path().join("v2");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for index in 0..(INIT_SCAN_LIMIT + 4) {
+        std::fs::write(root.join(format!("noise-{index:03}")), b"x").unwrap();
+    }
+
+    let error = ManagedNamespace::open_root(&root, true, true).map(|_| ());
+    assert!(matches!(
+        error,
+        Err(NamespaceError::Io(_)) | Err(NamespaceError::Unverified(_))
+    ));
+    assert!(
+        !root.join(MARKER_NAME).exists(),
+        "an over-budget namespace must never be adopted"
+    );
+}
+
+/// The descriptor-anchored bind never touches the *calling* thread's working
+/// directory.
+///
+/// On macOS the bind switches a dedicated short-lived thread's directory; that
+/// thread exits with the bind, so a caller thread that already had its own
+/// working directory keeps exactly that directory. The real public bind path is
+/// exercised, not a helper, and the process-wide directory is asserted
+/// unchanged too. On Linux the descriptor is named through `/proc/self/fd` and
+/// no directory switch happens at all.
+#[tokio::test]
+async fn managed_bind_never_changes_the_calling_thread_directory() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path().to_owned();
+    test_namespace_root(&root).unwrap();
+    let endpoint = managed_endpoint("thread-cwd");
+    let endpoint_a = managed_endpoint("thread-cwd-a");
+    let endpoint_b = managed_endpoint("thread-cwd-b");
+
+    // A second, unrelated existing directory the calling thread will switch to,
+    // so a bind that restored the process default instead of the thread
+    // directory would be observable.
+    let other = TestNamespace::new();
+    let other_root = other
+        .path()
+        .parent()
+        .expect("isolated parent directory")
+        .to_owned();
+    let expected_caller_dir = std::fs::canonicalize(&other_root).unwrap();
+
+    let process_cwd_before = std::env::current_dir().unwrap();
+    // Keep the namespace tempdir alive inside the thread for the whole test.
+    let caller = std::thread::spawn(move || {
+        let _namespace = namespace;
+        // Give the calling thread its own *thread-local* directory distinct from
+        // the process default, using the same primitive the bind thread uses but
+        // on this thread. On macOS this never moves the process-wide directory,
+        // so parallel tests and unrelated threads are unaffected.
+        let other_dir = EndpointDirectory::open(&other_root, false).unwrap();
+        #[cfg(target_os = "macos")]
+        crate::unix_endpoint::set_thread_directory(other_dir.fd()).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let _ = &other_dir;
+        let caller_dir_before = std::env::current_dir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (bound_a, bound_b, inside_a, inside_b) = runtime.block_on(async {
+            let mut first = bind_managed_at(&endpoint_a, &root).unwrap();
+            let inside_a = std::env::current_dir().unwrap();
+            let mut second = bind_managed_at(&endpoint_b, &root).unwrap();
+            let inside_b = std::env::current_dir().unwrap();
+            // Both bindings are live rendezvous in the verified directory.
+            let probe_a = tokio::net::UnixStream::connect(socket_path_at(&root, &endpoint_a))
+                .await
+                .is_ok();
+            let probe_b = tokio::net::UnixStream::connect(socket_path_at(&root, &endpoint_b))
+                .await
+                .is_ok();
+            assert!(probe_a && probe_b, "both managed sockets must be reachable");
+            let _ = first.accept().await;
+            let _ = second.accept().await;
+            (
+                matches!(first.close(), EndpointReapResult::Reaped),
+                matches!(second.close(), EndpointReapResult::Reaped),
+                inside_a,
+                inside_b,
+            )
+        });
+        let caller_dir_after = std::env::current_dir().unwrap();
+        (
+            bound_a,
+            bound_b,
+            caller_dir_before,
+            caller_dir_after,
+            inside_a,
+            inside_b,
+        )
+    });
+    let (bound_a, bound_b, caller_before, caller_after, inside_a, inside_b) =
+        caller.join().unwrap();
+
+    assert!(bound_a && bound_b, "managed binds must retire cleanly");
+    // The calling thread's own directory survived every bind unchanged: the
+    // dedicated bind thread never wrote, read, or restored it.
+    assert_eq!(
+        caller_before, caller_after,
+        "the managed bind must not move the calling thread's directory"
+    );
+    assert_eq!(
+        caller_after, expected_caller_dir,
+        "the calling thread keeps exactly the directory it set, not the process default"
+    );
+    assert_eq!(
+        inside_a, caller_before,
+        "binding must not change the caller's directory mid-call"
+    );
+    assert_eq!(inside_b, caller_before);
+
+    // The process-wide directory was never moved by the dedicated bind thread.
+    assert_eq!(std::env::current_dir().unwrap(), process_cwd_before);
+
+    // The derived production slot was never created by these binds.
+    assert!(!socket_path(&endpoint).exists());
+}
+
+/// Every Unix target that is not Linux or macOS cannot anchor a socket bind to
+/// a verified descriptor, so `bind_in_directory_on_thread` fails closed instead
+/// of falling back to the absolute path. On the two supported targets the same
+/// call either binds through the descriptor (macOS) or is not used because the
+/// `/proc/self/fd` path exists (Linux).
+#[test]
+fn managed_descriptor_bind_support_matches_the_platform() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Supported targets never take the fail-closed branch; this is asserted
+        // by the real bind tests above rather than a fabricated call.
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let namespace = TestNamespace::new();
+        let root = namespace.path();
+        test_namespace_root(root).unwrap();
+        let directory = EndpointDirectory::open(root, false).unwrap();
+        let error = crate::unix_endpoint::bind_in_directory_on_thread(
+            &directory,
+            OsStr::new("whatever.sock"),
+        )
+        .err()
+        .expect("unsupported targets must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+}
+
+/// The dirfd-relative bind target is never the absolute path a concurrent
+/// rename can redirect, and on macOS there is no descriptor path at all so the
+/// dedicated-thread primitive is the only descriptor-anchored option.
+#[tokio::test]
+async fn managed_bind_target_is_descriptor_relative_not_the_absolute_path() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    test_namespace_root(root).unwrap();
+    let directory = EndpointDirectory::open(root, false).unwrap();
+    let endpoint = managed_endpoint("dirfd-probe");
+    let names = managed_names(&endpoint).unwrap();
+
+    let absolute = directory.socket_path(&names.socket_os);
+    match dirfd_relative_socket_path(&directory, &names.socket_os) {
+        // Linux names the descriptor explicitly.
+        Some(relative) => assert_ne!(relative, absolute),
+        // macOS has no descriptor path, so the bind runs on a dedicated thread
+        // with a bare relative name instead of the absolute path.
+        None => {
+            assert!(
+                !names.socket_os.to_string_lossy().contains('/'),
+                "the dedicated-thread bind name must be relative, never the absolute path"
+            );
+            assert_ne!(Path::new(&names.socket_os), absolute.as_path());
+        }
+    }
+
+    // A real bind through the descriptor still lands in the verified directory
+    // and produces a working rendezvous. The client connects to the actual
+    // socket path in that root, proving the bind did not go to the derived
+    // production path.
+    let mut listener = bind_managed_at(&endpoint, root).unwrap();
+    let bound_path = socket_path_at(root, &endpoint);
+    assert!(bound_path.exists());
+    let (mut client, mut server) = tokio::try_join!(
+        async {
+            let stream = tokio::net::UnixStream::connect(&bound_path).await?;
+            Ok::<_, io::Error>(stream)
+        },
+        listener.accept(),
+    )
+    .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut server, b"dirfd")
+        .await
+        .unwrap();
+    let mut bytes = [0_u8; 5];
+    tokio::io::AsyncReadExt::read_exact(&mut client, &mut bytes)
+        .await
+        .unwrap();
+    assert_eq!(&bytes, b"dirfd");
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    assert!(!bound_path.exists());
+    // The derived production slot was never created by this bind.
+    assert!(!socket_path(&endpoint).exists());
+}

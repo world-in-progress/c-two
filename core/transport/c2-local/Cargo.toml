@@ -18,6 +18,7 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 socket2 = "0.6"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 c2-local-security = { version = "0.1.0", path = "../../foundation/c2-local-security" }

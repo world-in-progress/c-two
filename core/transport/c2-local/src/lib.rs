@@ -22,18 +22,23 @@ pub use owner::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair}
 
 #[cfg(unix)]
 mod unix_endpoint;
+#[cfg(unix)]
+mod unix_managed;
 
 /// An opaque proof of one exact OS endpoint object created by this runtime.
 ///
 /// Unix credentials contain the v1 socket identity recorded beside the
-/// endpoint. They are bound to the logical address and cannot authorize
-/// removal of a replacement socket. Windows credentials describe a
+/// endpoint. A managed-v2 credential additionally carries the listener
+/// incarnation, so an old credential can never authorize removal of a newer
+/// listener that reused the same socket path. Windows credentials describe a
 /// kernel-managed named pipe and are not Unix cleanup capabilities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointCredential {
     endpoint: LocalEndpoint,
     #[cfg(unix)]
     identity: UnixSocketIdentity,
+    #[cfg(unix)]
+    incarnation: Option<[u8; 16]>,
 }
 
 impl EndpointCredential {
@@ -43,7 +48,34 @@ impl EndpointCredential {
 
     #[cfg(unix)]
     pub(crate) fn unix(endpoint: LocalEndpoint, identity: UnixSocketIdentity) -> Self {
-        Self { endpoint, identity }
+        Self {
+            endpoint,
+            identity,
+            incarnation: None,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unix_managed(
+        endpoint: LocalEndpoint,
+        identity: UnixSocketIdentity,
+        incarnation: [u8; 16],
+    ) -> Self {
+        Self {
+            endpoint,
+            identity,
+            incarnation: Some(incarnation),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn identity(&self) -> Option<UnixSocketIdentity> {
+        Some(self.identity)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn incarnation(&self) -> Option<[u8; 16]> {
+        self.incarnation
     }
 
     #[cfg(windows)]
@@ -72,6 +104,15 @@ pub enum EndpointUnverifiedReason {
     InvalidOwnership,
     InvalidRecord,
     RecordMismatch,
+    /// The managed namespace records a coordinator gate but the gate entry is
+    /// gone. Creating a replacement inode would be a second lock.
+    CoordinatorMissing,
+    /// The coordinator gate entry no longer names the inode the namespace
+    /// marker recorded.
+    CoordinatorReplaced,
+    /// A managed namespace contains endpoint objects but no verifiable first
+    /// initialization identity. Nothing in it may be retired automatically.
+    InitializationIncomplete,
 }
 
 /// A read-only observation of a local endpoint.
@@ -148,6 +189,8 @@ pub struct SweepBatch {
     pub io_errors: usize,
     pub last_io_error: Option<EndpointIoError>,
     pub not_applicable: usize,
+    /// Managed-v2 lease entries retired whose socket was already absent.
+    pub leases_retired: usize,
     /// True only on the batch of a round that reached directory EOF.
     pub round_complete: bool,
     /// True when the round ended before EOF because the verified namespace
@@ -469,7 +512,8 @@ impl LocalListener {
     }
 
     /// Closes the listener and reports the native socket cleanup result.
-    /// The v1 ownership `.lock` file is deliberately retained.
+    /// The v1 ownership `.lock` file is deliberately retained; a managed-v2
+    /// listener retires its own lease entry under the namespace gate.
     pub fn close(self) -> EndpointReapResult {
         self.0.close()
     }
