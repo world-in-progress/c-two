@@ -24,7 +24,7 @@ jobs:
       ci: ${{ steps.filter.outputs.ci }}
       workflow_policy: ${{ steps.filter.outputs.workflow_policy }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dorny/paths-filter@v4
         if: github.event_name == 'pull_request'
@@ -61,13 +61,13 @@ jobs:
     runs-on: ubuntu-latest
     name: core
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # c2-codegen tests include_str! the FastDB golden payload specs and
       # typecheck generated TypeScript against the sibling fastdb4ts sources,
       # so the official v0.2.1 source must exist as the sibling checkout.
       - name: Checkout official FastDB source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: world-in-progress/fastdb
           ref: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
@@ -78,7 +78,7 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE/../fastdb"
           ln -s "$GITHUB_WORKSPACE/fastdb" "$GITHUB_WORKSPACE/../fastdb"
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
 
@@ -111,7 +111,7 @@ jobs:
     env:
       FASTDB_PAYLOAD_LINK_MODE: source
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -137,9 +137,9 @@ jobs:
     runs-on: ubuntu-latest
     name: workflow policy
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -179,7 +179,7 @@ jobs:
         python: ["3.12", "3.14t"]
     name: test (py${{ matrix.python }})
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Skip full Python tests for unrelated changes
         if: github.event_name != 'merge_group' && needs.changes.outputs.sdk != 'true' && needs.changes.outputs.core != 'true' && needs.changes.outputs.ci != 'true'
@@ -189,7 +189,7 @@ jobs:
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' && matrix.python != '3.12'
         run: echo "Skipping this matrix leg for Dependabot pull requests"
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
           python-version: ${{ matrix.python }}
@@ -199,7 +199,7 @@ jobs:
       # source for harness compilation.
       - name: Checkout official FastDB source
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: world-in-progress/fastdb
           ref: 4f99f86a662b0e950a0dd29800c25a1c9fca4def
@@ -232,12 +232,12 @@ jobs:
           python .github/scripts/prepare_fastdb_sdk.py
           --output "$RUNNER_TEMP/fastdb-core-sdk"
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
           node-version: "22"
 
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
           repository: emscripten-core/emsdk
