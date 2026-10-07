@@ -1,6 +1,6 @@
 # @c-two/c2-mem-ffi
 
-Version 0.1.0, not published on npm. See the [0.7 development preparation](../../../../../docs/releases/0.7.0.md) and [canonical source validation](../../../../../docs/reports/canonical-local-endpoint-validation.md); these are not official package-release receipts.
+Version 0.1.0, not published on npm. This guide uses the shared Python 0.7.0 / c3 0.3.0 runtime baseline. See [version availability, upgrades and validation progress](../../../../../docs/releases/0.7.0.md) and [canonical source validation](../../../../../docs/reports/canonical-local-endpoint-validation.md); these are not official package-release receipts.
 
 TypeScript facade and Node-API loader for the Rust `c2-mem-ffi` memory pool. The native library owns backing names, pool incarnations, buddy generations, allocation and release. JavaScript passes the native block coordinates through unchanged; it does not implement a second allocator or construct OS object names.
 

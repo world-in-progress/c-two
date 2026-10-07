@@ -2,11 +2,9 @@
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
-Published [c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0)
-pairs with Python c-two 0.6.0 and includes Windows x64 binaries. This checkout
-prepares **c3 0.3.0 with Python 0.7.0**, both unpublished; the manifest remains
-0.2.0. New endpoint maintenance and upstream memory policy below require a
-same-source development build. See the [upgrade notes](../docs/releases/0.7.0.md).
+This guide describes **c3 0.3.0**, paired with Python C-Two **0.7.0**. See
+[release preparation](../docs/releases/0.7.0.md) for version availability, upgrades
+and validation progress.
 
 ## Scope
 
@@ -158,7 +156,7 @@ fallback and retained-owner accounting.
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 
-## Local endpoint maintenance (development source)
+## Local endpoint maintenance
 
 Only pass logical addresses; Rust selects the OS endpoint. Credentials carry
 format metadata, never a backend choice. On Unix, save the credential after
@@ -234,10 +232,7 @@ python tools/dev/generate_banner.py
 
 ## Release
 
-Published c3 0.2.0 has binaries for the following targets. The release-candidate
-workflow builds them; `.github/workflows/cli-release.yml` promotes only the
-verified candidate bytes after the same-source gates pass, without rebuilding.
-The complete c3 0.3.0 candidate matrix is still pending.
+The [c3 0.3.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) uses the following binary target convention. Availability and candidate gates are tracked in [release preparation](../docs/releases/0.7.0.md):
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
@@ -245,16 +240,38 @@ The complete c3 0.3.0 candidate matrix is still pending.
 - `x86_64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 
-Unix binary assets are named `c3-${target}`; Windows uses `c3-${target}.exe`. Each has a matching `.sha256` checksum. The release also includes a PowerShell installer for Windows; use the [published release page](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0).
+Unix assets are named `c3-${target}`; Windows uses `c3-${target}.exe`.
+Each has a matching `.sha256`; installers verify it before installation.
+The matching release's `rc-manifest.json` identifies the artifact source.
 
-Install the latest released binary with the installer asset:
-
-```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
-```
-
-The installer auto-detects Linux/macOS and x86_64/aarch64 targets, verifies the downloaded checksum, and installs to `/usr/local/bin` when run as root or `~/.local/bin` otherwise. Pass `-b` to choose another directory:
+### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- -b /usr/local/bin
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
 ```
+
+The installer detects Linux/macOS and x86_64/aarch64. It defaults to
+`/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0 --bin-dir "$HOME/bin"
+```
+
+### Windows x64
+
+Download the PowerShell installer and select the coordinated version explicitly:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.0 -Target x86_64-pc-windows-msvc
+$env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
+c3.exe --version
+```
+
+PowerShell 5.1 is supported. The default per-user directory is
+`$env:LOCALAPPDATA\Programs\c3`; `-BinDir` selects another directory.
+The installer verifies SHA-256 and copies the binary to `c3.exe`, without
+requiring an administrator or persistently registering PATH. The example adds
+it to the current session only. Windows ARM64 has no release exe target.
+For direct exe download, checksum verification and relay execution, see
+[Windows installation](../docs/windows-native-usage.md#install-python-and-c3).

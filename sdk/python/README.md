@@ -4,45 +4,41 @@ C-Two exposes stateful Python resources through typed CRM contracts over
 same-process calls, local IPC, or an external HTTP relay. This package projects
 the shared Rust runtime into Python.
 
-[Python c-two 0.6.0](https://pypi.org/project/c-two/0.6.0/) and
-[c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0)
-are published, including Windows x64 wheels and CLI binaries. Install the
-published Python runtime with `uv pip install c-two` in an activated environment.
-FastDB 0.2.1 is the exact published package dependency.
-See the [project introduction and quickstart](https://github.com/world-in-progress/c-two/blob/main/README.md)
-and its [Chinese edition](https://github.com/world-in-progress/c-two/blob/main/README.zh-CN.md).
+This guide describes Python C-Two **0.7.0** with c3 **0.3.0**. See
+[version availability, upgrades and validation progress](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.7.0.md).
+In an activated environment (including Windows PowerShell):
 
-Current development targets Python 0.7.0 and c3 0.3.0; neither target is
-published, and manifests still identify 0.6.0 / 0.2.0. Release/documentation work on local
-`socu/local-endpoint-lifecycle` has not been pushed or merged into canonical `main`.
-The fork source-validation branch `socu/local-endpoint-validation` provides the
-tested mechanisms; use it or a matching development artifact pair. The 0.7
-preparation and upgrade draft is `docs/releases/0.7.0.md` in the documentation checkout.
+```bash
+uv pip install 'c-two==0.7.0'
+```
 
-Local IPC uses Unix domain sockets or Windows Named Pipes. Current source
-passed Linux and Windows Server 2022/2025 x64 hosted gates at the source pair in
-the [Linux](https://github.com/Dsssyc/c-two/actions/runs/37559074669) and
-[Windows](https://github.com/Dsssyc/c-two/actions/runs/37559074657) runs:
-C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` and FastDB
-`4f99f86a662b0e950a0dd29800c25a1c9fca4def`. The local summary is
-`docs/reports/canonical-local-endpoint-validation.md`.
-These development wheels still carry version 0.6.0; they do not prove the 0.7
-release matrix. Windows 11 desktop, ARM64 and services remain unvalidated.
+FastDB is pinned to `fastdb4py==0.2.1`. See the
+[project quickstart](https://github.com/world-in-progress/c-two/blob/main/README.md)
+and [Chinese edition](https://github.com/world-in-progress/c-two/blob/main/README.zh-CN.md).
 
-The 0.7 source removes endpoint backend selectors and changes the Unix local
-namespace; upgrade clients, resource servers and c3 together. Rust owns default
-`Persistent` and explicit `OwnerBound` lifecycle, shutdown completion and scoped
-endpoint maintenance. Follow the lifecycle guide, `docs/local-endpoint-lifecycle.md` in the documentation checkout.
-IPC uses lazy buddy pools and finite backing/reassembly budgets; disabling
-buddy does not disable dedicated SHM. The relay is a separate process with its
-own upstream policy. See the memory guide, `docs/memory-policy.md`.
+Local IPC uses one automatic OS endpoint: Unix domain sockets or Windows Named
+Pipes. Rust owns default `Persistent`, explicit `OwnerBound`, structured shutdown
+completion and scoped endpoint maintenance. Upgrade communicating clients,
+resource servers and c3 together across the old Unix namespace boundary. See
+[lifecycle integration](https://github.com/world-in-progress/c-two/blob/main/docs/local-endpoint-lifecycle.md).
+IPC uses lazy buddy pools, idle decay and finite backing/reassembly budgets;
+`pool_enabled=False` skips only buddy. `cc.memory_stats()` is read-only, and
+held responses and borrowed inputs keep independent leases. The standalone
+relay has its own upstream policy. See
+[memory policy](https://github.com/world-in-progress/c-two/blob/main/docs/memory-policy.md).
+
+The [canonical source report](https://github.com/world-in-progress/c-two/blob/main/docs/reports/canonical-local-endpoint-validation.md)
+retains the exact C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB
+`4f99f86a662b0e950a0dd29800c25a1c9fca4def` evidence. Windows Server 2022/2025
+x64 CPython 3.12 source validation does not establish a release-wide ABI matrix;
+Windows 11 desktop, ARM64 and services remain unvalidated.
 
 ## Development
 
-Select the current development branch, then run commands from the repository root:
+Use canonical main for source development and run commands from the repository root. The matching c3 release's `rc-manifest.json` identifies release source:
 
 ```bash
-git clone --branch socu/local-endpoint-validation https://github.com/Dsssyc/c-two.git
+git clone https://github.com/world-in-progress/c-two.git
 cd c-two
 ```
 
@@ -97,7 +93,7 @@ treated as `1`). Ambiguous data-plane failures are not replayed.
 After the source-mode build, configure the absolute Core SDK library directory
 for Rust consumers spawned by interoperability tests. Follow the
 development setup in the repository README and
-`docs/windows-native-usage.md`
+[Windows guide](https://github.com/world-in-progress/c-two/blob/main/docs/windows-native-usage.md)
 for platform-specific loader paths and test prerequisites. Keep the existing
 extension build while running the Python tests:
 
@@ -111,7 +107,7 @@ Run Rust core checks when validating shared native runtime changes:
 cargo test --manifest-path core/Cargo.toml --workspace
 ```
 
-For CLI build, link, and test commands, see the CLI guide, `cli/README.md`.
+For CLI build, link, and test commands, see the [CLI guide](https://github.com/world-in-progress/c-two/blob/main/cli/README.md).
 
 ## Examples
 

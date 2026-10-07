@@ -2,11 +2,10 @@
 
 Status refreshed: 2026-10-07; product ordering retains the July design priorities.
 
-This is the maintained roadmap for C-Two's 0.x line.
-Published Python c-two 0.6.0 and c3 0.2.0 now include Windows x64 distribution;
-FastDB 0.2.1 is published. Python 0.7.0 / c3 0.3.0 are unpublished targets,
-with manifests unchanged. Rust SDK/Core/TypeScript stay 0.1.0 and are not
-published on crates.io/npm. See [release preparation](releases/0.7.0.md).
+This is the maintained roadmap for C-Two's 0.x line, using Python 0.7.0 / c3
+0.3.0 as the product baseline. FastDB is pinned to 0.2.1. Rust SDK/Core/TypeScript
+retain independent 0.1.0 versions with no C-Two crates.io/npm publication.
+See [release preparation](releases/0.7.0.md) for availability and release gates.
 
 Current endpoint/lifecycle and memory source evidence is the
 [canonical validation](reports/canonical-local-endpoint-validation.md), with
@@ -47,7 +46,7 @@ Documents under `docs/plans/`, `docs/reviews/`, and older `docs/superpowers/` da
 | Generated TypeScript proof | The candidate receipt contains exactly 12/12 passing Node rows across direct IPC, explicit relay, relay-aware verified local IPC, and relay-aware HTTP with real `c3`, Rust/Python hosts, package tarballs, route/path observations, lifetime negatives, and non-replay checks. |
 | Bounded admission and strict gates | Versioned `ContractLimits` bounds outer contract input before unbounded work. Core and Python native pass strict Clippy without blanket suppression, followed by complete language and repository gates. |
 | Local package closure | One canonical 42-artifact manifest binds FastDB and C-Two implementation commits. Version-only Rust, no-index CPython 3.10/current, and tarball-only Node consumers pass outside sibling/source checkouts. |
-| Local endpoint and lifecycle | One OS-derived endpoint, default Persistent, explicit OwnerBound and exact/scoped native maintenance are implemented and hosted-validated; 0.7 publication is pending. |
+| Local endpoint and lifecycle | One OS-derived endpoint, default Persistent, explicit OwnerBound and exact/scoped native maintenance are implemented and hosted-validated. See release preparation for publication progress. |
 | IPC memory policy | Lazy buddy allocation, idle decay and three finite direction-scoped budgets are implemented; HTTP buffer governance and broader cancellation/queue telemetry remain open. |
 | Honest backing boundary | The proven Rust and Python receive adapters are copy-backed. `cc.hold()` and borrowed-input policy enforce owner/lease invalidation; they do not prove direct construction in final response shared memory. |
 | Python-only prototype path | Ordinary Python methods without an explicit portable binding may still use pickle locally. Portable descriptor export/codegen rejects them with diagnostics. |
@@ -60,7 +59,7 @@ Start at the first incomplete item whose prerequisites and authorization are ava
 
 | Order | Workstream | Why it comes here | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Official immutable FastDB and C-Two package distribution | FastDB 0.2.1 and Python 0.6.0 / c3 0.2.0 are published; 0.7 / 0.3 candidates and official C-Two Rust/TypeScript distribution remain open. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
+| 1 | Official immutable FastDB and C-Two package distribution | FastDB 0.2.1 is published; coordinated Python 0.7.0 / c3 0.3.0 release gates and official C-Two Rust/TypeScript distribution remain open. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
 | 2 | Contract compatibility | Exact release matching is the safety floor; semver/range rules need stable official release content first. | Rust-owned rules reject ambiguity and ABI-incompatible matches and project identical behavior across SDKs. |
 | 3 | Call metadata and admission hooks | Upper layers need a transport-consistent mechanism for identity and policy decisions, but C-Two must not own policy. | Thread-local, IPC, and relay calls carry bounded metadata; hooks can accept/reject calls; downstream systems remain the policy authority. |
 | 4 | Dry-run mechanism | Impact analysis depends on the same explicit metadata/admission boundary. | Dry-run semantics state what is evaluated, which side effects are forbidden, and how unsupported methods fail. |

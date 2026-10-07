@@ -31,46 +31,45 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 - **Portable payloads** — methods that cross language boundaries bind an official FastDB `Payload` explicitly with `@cc.transfer(...)`; ordinary Python values remain available for Python-scoped prototyping.
 - **One Rust core** — routing, client/host calls, retry classification, wire codec, shared memory, relay transport, and configuration live in language-neutral Rust crates; the Python and Rust SDKs are facades over the same runtime.
 
-## Status
+## Version and runtime
 
-C-Two is 0.x software under active development. Status as of 2026-10-07:
+This guide describes Python C-Two **0.7.0** / c3 **0.3.0**. See [release preparation](docs/releases/0.7.0.md) for version availability, upgrades and validation progress.
 
-| Area | Status |
+| Area | Capability and boundary |
 | --- | --- |
-| Published Python package | [c-two 0.6.0](https://pypi.org/project/c-two/0.6.0/) was published on 2026-09-25 with 30 wheels and one sdist, including Windows x64 wheels. It includes portable FastDB payloads and native Windows IPC. |
-| Published CLI | [c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0) supplies Windows x64, Linux x86_64/aarch64 and macOS x86_64/aarch64 binaries. |
-| Current development | Targets Python `c-two` 0.7.0 and `c3` 0.3.0; **not published**. New endpoint, lifecycle and memory policies require this source checkout or matching development artifacts. Manifests still say 0.6.0 / 0.2.0. See [preparation and upgrade notes](docs/releases/0.7.0.md). |
+| Python | Typed CRM, same-process calls, portable FastDB payloads and native IPC. |
+| c3 | Standalone relay, contract tooling and scoped endpoint maintenance; Unix and Windows x64 installation entries are below. |
 | FastDB dependency | [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) is published; Python and Rust dependencies are pinned to 0.2.1, with native source builds pinned to `4f99f86a662b0e950a0dd29800c25a1c9fca4def`. |
-| Source validation | Current endpoint development passed hosted Linux and Windows Server 2022/2025 x64 gates at the exact source pair in [canonical validation](docs/reports/canonical-local-endpoint-validation.md). These are development builds, not 0.7 release-package evidence. Windows 11 desktop, ARM64 and services remain unvalidated. |
+| Source validation | [Canonical validation](docs/reports/canonical-local-endpoint-validation.md) records Linux and Windows Server 2022/2025 x64 CPython 3.12 source gates plus macOS component evidence and its rerun limits. Its exact source pair is C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`; this does not prove all 0.7 release packages/ABIs. Windows 11 desktop, ARM64 and services remain unvalidated. |
 | Rust / TypeScript | Rust SDK, Core and TypeScript package versions remain 0.1.0; no C-Two crates.io or npm release. Rust SDK has `publish = false`; generated Node interoperability is proven, browser runtime remains open. |
 | Benchmarks | No reviewed throughput benchmark exists for the portable `Payload` API. Historical numbers from removed integrations are not valid claims for the current architecture. |
 
 The 0.x line takes clean cuts over compatibility shims. For 0.7, upgrade communicating clients, resource servers and `c3` together: the Unix endpoint namespace changes from `/tmp/c_two_ipc` to the private native v2.2 namespace. Old endpoints do not migrate automatically.
 
-### What changes in the 0.7 source
+### Local endpoints, lifecycle and memory
 
 Rust derives one local endpoint per OS, with no backend selector. Services remain `Persistent` by default; dedicated controller-owned children can opt into `OwnerBound`. Shutdown completion, listener closure and retained payload leases are separate observations. See the [lifecycle integration guide](docs/local-endpoint-lifecycle.md).
 
-IPC buddy pools now allocate lazily, can decay to zero idle mappings, and share finite backing/reassembly budgets per runtime direction. `pool_enabled=False` skips buddy allocation while dedicated SHM, checked chunks and receiving-side file spill remain available. The standalone relay has its own upstream IPC policy. See the [memory guide](docs/memory-policy.md) and [CLI guide](cli/README.md).
+IPC buddy pools allocate lazily, can decay to zero idle mappings, and share finite backing/reassembly budgets per runtime direction. `pool_enabled=False` skips buddy allocation while dedicated SHM, checked chunks and receiving-side file spill remain available. The standalone relay has its own upstream IPC policy. See the [memory guide](docs/memory-policy.md) and [CLI guide](cli/README.md).
 
 ## Installation
 
-### Stable line (PyPI)
+### Python 0.7.0
+
+In an activated environment, select the version explicitly; `fastdb4py==0.2.1` is installed automatically:
 
 ```bash
-pip install c-two
+uv pip install 'c-two==0.7.0'
 ```
 
-This currently installs the published 0.6.0 runtime. Wheels cover CPython 3.10–3.14 and free-threaded 3.14t on Windows x64, manylinux x86_64/aarch64 and macOS x86_64/aarch64; other builds can use the sdist with a [Rust toolchain](https://rustup.rs). The `fastdb4py` dependency is installed automatically.
-
-The quickstart and portable payload example below are available in 0.6.0. The 0.7 endpoint, owner-bound lifecycle and memory changes require development source or matching candidate artifacts; installing 0.6.0 does not provide them.
+Use the same command in Windows PowerShell. See [release preparation](docs/releases/0.7.0.md) for package availability and the [Windows guide](docs/windows-native-usage.md) for platform instructions.
 
 ### Development checkout
 
-The canonical repository is [world-in-progress/c-two](https://github.com/world-in-progress/c-two). The release/documentation work remains in the local `socu/local-endpoint-lifecycle` branch and has not been merged into canonical `main`. The command below fetches the published source-validation branch at `e49652e85a384f1dd3489f393c13f4d9fff27f9f`; it contains the tested new mechanisms, while the 0.7 documentation draft remains local. `dev-feature` does not select this work.
+For source development, check out canonical main from [world-in-progress/c-two](https://github.com/world-in-progress/c-two). Use the matching c3 release's `rc-manifest.json` to identify release source; a development checkout is not a release artifact.
 
 ```bash
-git clone --branch socu/local-endpoint-validation https://github.com/Dsssyc/c-two.git
+git clone https://github.com/world-in-progress/c-two.git
 cd c-two
 # Full interoperability tests, golden fixtures, and TypeScript fixtures also
 # need the pinned FastDB source checkout as a sibling:
@@ -106,15 +105,24 @@ scopes FastDB system linking to Rust consumers. After building the Python
 extension, use `uv run --no-sync pytest ...` when running with that system-link
 environment so the test command does not rebuild the extension.
 
-### c3 CLI
+### c3 CLI: Linux / macOS
 
-The `c3` CLI runs the relay server and contract tooling. The published version is [c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0). Install it on Linux or macOS with:
+Python 0.7.0 pairs with c3 0.3.0. Availability of the [release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) is tracked in [release preparation](docs/releases/0.7.0.md). Pass the version explicitly; the installer verifies the checksum:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
 ```
 
-Windows x64 binaries and a PowerShell installer are available on that release page. This published CLI pairs with Python 0.6.0. For the 0.7 source mechanisms, build the CLI from the same checkout with `python tools/dev/c3_tool.py --build --link`; c3 0.3.0 is a target, not an available release. See the [Windows guide](docs/windows-native-usage.md) for Windows source builds.
+### c3 CLI: Windows x64
+
+Use the standalone [Windows x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-x86_64-pc-windows-msvc.exe), its [SHA-256 file](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-x86_64-pc-windows-msvc.exe.sha256), or the [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-installer.ps1). See the [Windows guide](docs/windows-native-usage.md#install-python-and-c3) for checksum verification and installation with `-Version 0.3.0`. After verifying the downloaded executable:
+
+```powershell
+.\c3-x86_64-pc-windows-msvc.exe --version
+.\c3-x86_64-pc-windows-msvc.exe relay --bind 127.0.0.1:8300
+```
+
+The [CLI guide](cli/README.md#windows-x64) covers directories and options. No administrator privileges are required for the per-user installer; this exe target does not cover Windows ARM64.
 
 ## Quickstart
 
@@ -211,7 +219,7 @@ IPC can fall back to checked chunks when SHM is unavailable; relay HTTP response
 
 ## Portable payloads (FastDB)
 
-The explicit portable FastDB binding is available in published Python 0.6.0 and current development source.
+Portable methods use the explicit FastDB binding below.
 
 Methods that must move structured data across language boundaries bind an explicit FastDB specification. FastDB Core owns the nested payload semantics — validation, canonical identity, binary layout, builders, views, invalidation, and payload-only codegen — while C-Two owns the outer contract, routing, transport, and lifetimes:
 
@@ -296,12 +304,12 @@ The main user surface, shown throughout this README. The top-level `cc` namespac
 - Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`, `cc.InputLifetime`
 - Registry: `cc.register`, `cc.connect`, `cc.close`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`
 - Contracts: `cc.export_contract_descriptor`, `cc.export_contract_release_ref`, `cc.compile_contract_artifacts`, `cc.infer_crm_from_resource`
-- Development lifecycle and maintenance: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`
-- Monitoring: `cc.hold_stats`; development source also exposes `cc.memory_stats`
+- Lifecycle and maintenance: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`
+- Monitoring: `cc.hold_stats`; `cc.memory_stats` (read-only)
 
 ### Rust SDK
 
-The user-facing Rust SDK lives at [`sdk/rust`](sdk/rust/README.md): Cargo package `c-two`, imported as `c_two`, version 0.1.0, `publish = false` (local candidate — no crates.io release). It reuses the same `c2-core` runtime as Python for direct IPC, explicit relay, and relay-aware calls, and provides generated typed clients and service traits. Portable values remain official `fastdb::Payload` owners:
+The user-facing Rust SDK lives at [`sdk/rust`](sdk/rust/README.md): Cargo package `c-two`, imported as `c_two`, version 0.1.0, `publish = false` (source-only; no crates.io release). It reuses the same `c2-core` runtime as Python for direct IPC, explicit relay, and relay-aware calls, and provides generated typed clients and service traits. Portable values remain official `fastdb::Payload` owners:
 
 ```rust
 use c_two::{Connect, ContractLimits, ContractRelease, Runtime};

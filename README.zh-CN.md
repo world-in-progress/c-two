@@ -31,23 +31,22 @@ C-Two 是面向分布式科学计算的 resource-oriented RPC runtime。它不�
 - **Portable 载荷** — 需要跨语言的方法用 `@cc.transfer(...)` 显式绑定官方 FastDB `Payload`；普通 Python 值仍可用于 Python 范围内的原型开发。
 - **单一 Rust core** — 路由、client/host 调用、重试分类、wire codec、共享内存、relay transport 和配置都实现在语言中立的 Rust crate 中；Python 与 Rust SDK 只是同一 runtime 的 facade。
 
-## 现状
+## 版本与能力
 
-C-Two 是处于活跃开发中的 0.x 软件。以下状态截至 2026-10-07：
+本文以 Python C-Two **0.7.0** / c3 **0.3.0** 为使用基线。版本可用性、升级与验证进度见[发布准备页](docs/releases/0.7.0.md)。
 
-| 方面 | 状态 |
+| 方面 | 能力与边界 |
 | --- | --- |
-| 已发布 Python 包 | [c-two 0.6.0](https://pypi.org/project/c-two/0.6.0/) 于 2026-09-25 发布，包含 30 个 wheel 与 1 个 sdist，其中有 Windows x64 wheel。已提供 portable FastDB 载荷与原生 Windows IPC。 |
-| 已发布 CLI | [c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0) 提供 Windows x64、Linux x86_64/aarch64 与 macOS x86_64/aarch64 二进制。 |
-| 当前开发 | 目标为 Python `c-two` 0.7.0 与 `c3` 0.3.0，**尚未发布**。新的端点、生命周期与内存策略需使用当前源码或配套开发产物；manifest 仍为 0.6.0 / 0.2.0。见[准备与升级说明](docs/releases/0.7.0.md)。 |
+| Python | typed CRM、同进程调用、portable FastDB 载荷与原生 IPC。 |
+| c3 | 独立 relay、契约工具与 scoped 端点维护；Unix 与 Windows x64 安装入口见下文。 |
 | FastDB 依赖 | [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) 已发布；Python 与 Rust 依赖固定 0.2.1，原生源码构建固定 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`。 |
-| 源码验证 | 当前端点开发已按[统一验收](docs/reports/canonical-local-endpoint-validation.md)中的确切源码组合通过 Linux 与 Windows Server 2022/2025 x64 hosted 门禁。这是开发构建，不能作为 0.7 正式包证据；Windows 11 桌面、ARM64 与服务仍未验证。 |
+| 源码验证 | [统一验收](docs/reports/canonical-local-endpoint-validation.md)记录 Linux、Windows Server 2022/2025 x64 CPython 3.12 源码门禁，以及 macOS 组件证据与重跑边界。确切源码组合为 C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，不证明全部 0.7 正式包/ABI；Windows 11 桌面、ARM64 与服务仍未验证。 |
 | Rust / TypeScript | Rust SDK、Core 与 TypeScript 包仍为 0.1.0，无 C-Two crates.io 或 npm 发布。Rust SDK 的 `publish = false`；已证明生成的 Node 互操作，浏览器 runtime 仍未闭环。 |
 | 基准测试 | portable `Payload` API 尚无经过评审的吞吐基准。来自已移除集成的历史数字不能作为当前架构的性能声明。 |
 
 0.x 版本线优先干净切割而非兼容垫片。升级到 0.7 时，相互通信的 client、resource server 与 `c3` 必须一起升级：Unix 端点从 `/tmp/c_two_ipc` 改为原生私有 v2.2 命名空间，旧端点不会自动迁移。
 
-### 0.7 源码的主要变化
+### 本地端点、生命周期与内存
 
 Rust 按 OS 唯一派生本地端点，无后端选择开关。服务默认 `Persistent` 常驻，控制器专用子进程可显式选择 `OwnerBound`。shutdown 完成、监听关闭与载荷租约保留分别观察，见[生命周期接入指南](docs/local-endpoint-lifecycle.md)。
 
@@ -55,22 +54,22 @@ IPC buddy 池默认惰性分配，空闲时可衰减到零映射；每个 runtim
 
 ## 安装
 
-### 稳定线（PyPI）
+### Python 0.7.0
+
+在已激活的环境中明确选择版本；`fastdb4py==0.2.1` 自动安装：
 
 ```bash
-pip install c-two
+uv pip install 'c-two==0.7.0'
 ```
 
-当前安装已发布的 0.6.0 runtime。wheel 覆盖 Windows x64、manylinux x86_64/aarch64 与 macOS x86_64/aarch64 上的 CPython 3.10–3.14 及自由线程 3.14t；其他构建可使用 sdist，需要 [Rust 工具链](https://rustup.rs)。`fastdb4py` 依赖会自动安装。
-
-下面的快速开始与 portable 载荷示例可在 0.6.0 使用。0.7 的端点、OwnerBound 生命周期与内存变更需要开发源码或配套候选产物；安装 0.6.0 不会获得这些新机制。
+Windows PowerShell 使用相同命令。包可用性见[发布准备页](docs/releases/0.7.0.md)，Windows 操作见[Windows 指南](docs/windows-native-usage.md)。
 
 ### 开发环境（源码 checkout）
 
-正式仓库为 [world-in-progress/c-two](https://github.com/world-in-progress/c-two)。发布与文档工作仍在本地 `socu/local-endpoint-lifecycle` 分支，尚未合入正式 `main`。以下命令获取已推送的源码验证分支，对应 `e49652e85a384f1dd3489f393c13f4d9fff27f9f`，包含已验收的新机制；0.7 文档草稿目前保留在本地。`dev-feature` 不包含此项工作。
+源码开发默认检出 [world-in-progress/c-two](https://github.com/world-in-progress/c-two) 的 canonical main。版本对应源码以同版本 c3 release 的 `rc-manifest.json` 为准；开发检出不代表发行产物。
 
 ```bash
-git clone --branch socu/local-endpoint-validation https://github.com/Dsssyc/c-two.git
+git clone https://github.com/world-in-progress/c-two.git
 cd c-two
 # 完整互操作测试、golden fixture 与 TypeScript fixture 还需要将固定版本的
 # FastDB 源码 checkout 放在同级目录：
@@ -106,15 +105,24 @@ uv python install 3.10
 若在该 system 链接环境下运行测试，请使用 `uv run --no-sync pytest ...`，
 避免测试命令重新构建扩展。
 
-### c3 CLI
+### c3 CLI：Linux / macOS
 
-`c3` CLI 运行 relay server 与契约工具。已发布版本为 [c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0)，Linux 或 macOS 可用：
+Python 0.7.0 配套 c3 0.3.0；[发布入口](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0)的当前可用性见[准备页](docs/releases/0.7.0.md)。显式传版本，安装器会校验 checksum：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
 ```
 
-该发布页也提供 Windows x64 二进制与 PowerShell installer。此正式 CLI 与 Python 0.6.0 配套；使用 0.7 源码机制时，请从同一 checkout 用 `python tools/dev/c3_tool.py --build --link` 构建 CLI。c3 0.3.0 是目标版本，尚未发布。Windows 源码构建见 [Windows 指南](docs/windows-native-usage.md)。
+### c3 CLI：Windows x64
+
+可以直接下载 [Windows x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-x86_64-pc-windows-msvc.exe)、[SHA-256 校验文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-x86_64-pc-windows-msvc.exe.sha256)，或使用 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-installer.ps1)。校验方法与 `-Version 0.3.0` 安装步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。下载并完成校验后，可直接运行：
+
+```powershell
+.\c3-x86_64-pc-windows-msvc.exe --version
+.\c3-x86_64-pc-windows-msvc.exe relay --bind 127.0.0.1:8300
+```
+
+安装目录与参数见 [CLI 指南](cli/README.md#windows-x64)。安装器默认安装到当前用户目录，无需管理员；Windows ARM64 不在该 exe 目标中。
 
 ## 快速开始
 
@@ -210,7 +218,7 @@ IPC 在 SHM 不可用时可回退到检查过的分块；relay HTTP 响应全量
 
 ## Portable 载荷（FastDB）
 
-显式 portable FastDB binding 已可在正式 Python 0.6.0 与当前开发源码中使用。
+portable 方法使用下面的显式 FastDB binding。
 
 需要跨语言传递结构化数据的方法显式绑定 FastDB specification。FastDB Core 拥有嵌套载荷语义 — 校验、canonical identity、二进制布局、builder、view、失效与 payload-only codegen — C-Two 拥有外层契约、路由、transport 与生命周期：
 
@@ -295,8 +303,8 @@ with cc.hold(echo.echo)(source) as held:
 - 契约编写：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`、`cc.InputLifetime`
 - 注册与连接：`cc.register`、`cc.connect`、`cc.close`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.set_transport_policy`
 - 契约工具：`cc.export_contract_descriptor`、`cc.export_contract_release_ref`、`cc.compile_contract_artifacts`、`cc.infer_crm_from_resource`
-- 开发版生命周期与维护：`cc.LifecycleConfig`、`cc.owner_control_pair`、`cc.spawn_owned_child`、`cc.adopt_owner_stdin`、`cc.inspect_endpoint`、`cc.reap_endpoint`、`cc.sweep_endpoints`
-- 监控：`cc.hold_stats`；开发源码另有 `cc.memory_stats`
+- 生命周期与维护：`cc.LifecycleConfig`、`cc.owner_control_pair`、`cc.spawn_owned_child`、`cc.adopt_owner_stdin`、`cc.inspect_endpoint`、`cc.reap_endpoint`、`cc.sweep_endpoints`
+- 监控：`cc.hold_stats`；`cc.memory_stats`（只读）
 
 ### Rust SDK
 

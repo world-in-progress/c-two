@@ -1,6 +1,6 @@
 # IPC Memory Pressure And Backpressure
 
-This describes the unpublished [Python 0.7.0 / c3 0.3.0 source preparation](releases/0.7.0.md). See [memory policy](memory-policy.md) for configuration and retained-owner accounting; published 0.6.0 is a separate runtime.
+This guide describes Python 0.7.0 / c3 0.3.0. See [release preparation](releases/0.7.0.md) for version availability, upgrades and validation progress, and [memory policy](memory-policy.md) for configuration and retained-owner accounting.
 
 ## Current Model
 
@@ -50,7 +50,7 @@ Current high-level callers should expect transport failures to surface through t
 When memory pressure is observed in tests or production:
 
 1. Lower request concurrency or payload size.
-2. Inspect `cc.memory_stats()` in development source, then adjust the relevant backing budget or pool size/count through typed IPC overrides.
+2. Inspect the read-only `cc.memory_stats()` snapshot, then adjust the relevant backing budget or pool size/count through typed IPC overrides.
 3. Increase reassembly limits only when the receiving side is expected to accept larger chunked payloads.
 4. Keep `shm_threshold` as a process-wide transport policy, set before creating servers or clients.
 
