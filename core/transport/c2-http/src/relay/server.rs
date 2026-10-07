@@ -148,17 +148,12 @@ fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
     )
 }
 
-async fn connect_register_attestation_client(
-    address: &str,
-    endpoint_protocol: c2_config::LocalEndpointProtocol,
-) -> Result<IpcClient, c2_ipc::IpcError> {
+async fn connect_register_attestation_client(address: &str) -> Result<IpcClient, c2_ipc::IpcError> {
     for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
         // Attestation clients keep their private, lazy default memory context
-        // outside the data-plane budget, but the endpoint protocol is the one
-        // resolved upstream policy: attestation and data-plane must name the
-        // same OS endpoint without probing across protocols.
-        let mut config = ClientIpcConfig::default();
-        config.base.endpoint_protocol = endpoint_protocol;
+        // outside the data-plane budget. Both paths use the same canonical
+        // platform native endpoint.
+        let config = ClientIpcConfig::default();
         let mut client = IpcClient::with_config(address, config);
         match client.connect().await {
             Ok(()) => return Ok(client),
@@ -505,12 +500,7 @@ impl RelayServer {
                         }
                     };
                     let result = {
-                        match connect_register_attestation_client(
-                            &address,
-                            state.config().upstream_ipc.base.endpoint_protocol,
-                        )
-                        .await
-                        {
+                        match connect_register_attestation_client(&address).await {
                             Ok(client) => {
                                 let server_identity_matches =
                                     client.server_id() == Some(server_id.as_str());
@@ -999,26 +989,14 @@ mod tests {
 
     /// Attestation and the data plane must name the same OS endpoint.
     ///
-    /// The attestation client is built from the relay's resolved upstream
-    /// policy rather than a private default, so a relay configured for
-    /// managed-v2 attests over managed-v2 and never reaches a legacy listener
-    /// at the same logical address. This test binds a managed-v2 server and
-    /// proves the attestation client built by the production helper resolves
-    /// the managed endpoint and completes its handshake there.
+    /// The production attestation helper connects to the same native endpoint
+    /// the relay data plane uses and completes its identity handshake.
     #[tokio::test]
-    async fn register_attestation_client_uses_the_resolved_upstream_protocol() {
-        use c2_config::LocalEndpointProtocol;
-
+    async fn register_attestation_client_uses_the_native_endpoint() {
         let suffix = NEXT_IPC_SUFFIX.fetch_add(1, Ordering::Relaxed);
-        let address = format!("ipc://relay-attest-protocol-{suffix}");
+        let address = format!("ipc://relay-attest-native-{suffix}");
         let server_id = "relay-attest-server";
-        let protocol = if cfg!(windows) {
-            LocalEndpointProtocol::LegacyV1
-        } else {
-            LocalEndpointProtocol::ManagedV2
-        };
-        let mut server_config = c2_config::ServerIpcConfig::default();
-        server_config.base.endpoint_protocol = protocol;
+        let server_config = c2_config::ServerIpcConfig::default();
         let server = Arc::new(
             c2_server::Server::new_with_identity(
                 &address,
@@ -1041,42 +1019,8 @@ mod tests {
             .await
             .expect("configured server ready");
 
-        // The legacy namespace at the same logical address holds no listener,
-        // so a legacy attestation client cannot complete a handshake.
-        #[cfg(unix)]
-        {
-            let mut legacy_config = c2_ipc::ClientIpcConfig::default();
-            legacy_config.base.endpoint_protocol = LocalEndpointProtocol::LegacyV1;
-            let mut legacy = c2_ipc::IpcClient::with_config(&address, legacy_config);
-            assert!(
-                legacy.connect().await.is_err(),
-                "a legacy attestation client must not reach a managed-v2 server"
-            );
-        }
-        #[cfg(windows)]
-        {
-            let endpoint_error = c2_ipc::control::local_endpoint_from_ipc_address_with_protocol(
-                &address,
-                LocalEndpointProtocol::ManagedV2,
-            )
-            .expect_err("managed-v2 endpoint derivation must reject Windows");
-            assert!(matches!(&endpoint_error, c2_ipc::IpcError::Config(message)
-                if message == "managed-v2 IPC endpoints are not supported on Windows"));
-            let error = super::connect_register_attestation_client(
-                &address,
-                LocalEndpointProtocol::ManagedV2,
-            )
-            .await
-            .err()
-            .expect("managed-v2 must fail before Windows attestation connects");
-            // IpcClient stores the derivation error's Display text, then
-            // connect wraps that stored text as a configuration error.
-            assert!(matches!(error, c2_ipc::IpcError::Config(message)
-                if message == endpoint_error.to_string()));
-        }
-
         // The managed client the relay actually builds connects.
-        let client = super::connect_register_attestation_client(&address, protocol)
+        let client = super::connect_register_attestation_client(&address)
             .await
             .expect("configured attestation client connects");
         assert_eq!(client.server_id(), Some(server_id));

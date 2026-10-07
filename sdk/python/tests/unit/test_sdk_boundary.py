@@ -692,8 +692,7 @@ def test_route_authority_reports_invalid_ipc_address_as_validation_error():
     state_source = state.read_text(encoding="utf-8")
 
     assert "InvalidAddress { reason: String }" in authority_source
-    assert "c2_ipc::local_endpoint_from_ipc_address_with_protocol(" in authority_source
-    assert "self.state.config().upstream_ipc.base.endpoint_protocol" in authority_source
+    assert "c2_ipc::local_endpoint_from_ipc_address(" in authority_source
     assert ".map_err(|err| ControlError::InvalidAddress {" in authority_source
     assert "ControlError::InvalidAddress { reason }" in state_source
 

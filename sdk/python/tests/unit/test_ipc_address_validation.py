@@ -40,14 +40,15 @@ def test_client_util_accepts_plain_ipc_region():
     if sys.platform == 'win32':
         assert endpoint.startswith('\\\\.\\pipe\\c_two-')
     else:
-        assert endpoint == '/tmp/c_two_ipc/unit-server.sock'
+        import re
+        assert re.fullmatch(r'/tmp/c2-[0-9a-f]+/v2\.2/[0-9a-f]{64}\.sock', endpoint)
 
 
 def test_client_util_uses_native_endpoint_name(monkeypatch):
     calls = []
 
-    def fake_socket_path(address: str, protocol=None) -> str:
-        calls.append((address, protocol))
+    def fake_socket_path(address: str) -> str:
+        calls.append(address)
         return '/tmp/native.sock'
 
     import c_two._native as native
@@ -55,25 +56,7 @@ def test_client_util_uses_native_endpoint_name(monkeypatch):
     monkeypatch.setattr(native, 'ipc_endpoint_name', fake_socket_path)
 
     assert util._endpoint_name_from_address('ipc://unit-server') == '/tmp/native.sock'
-    assert calls == [('ipc://unit-server', None)]
-
-
-def test_client_util_forwards_the_explicit_endpoint_protocol(monkeypatch):
-    calls = []
-
-    def fake_socket_path(address: str, protocol=None) -> str:
-        calls.append((address, protocol))
-        return '/tmp/native.sock'
-
-    import c_two._native as native
-
-    monkeypatch.setattr(native, 'ipc_endpoint_name', fake_socket_path)
-
-    assert (
-        util._endpoint_name_from_address('ipc://unit-server', endpoint_protocol='managed-v2')
-        == '/tmp/native.sock'
-    )
-    assert calls == [('ipc://unit-server', 'managed-v2')]
+    assert calls == ['ipc://unit-server']
 
 
 def test_client_util_keeps_the_historical_call_shapes():
@@ -89,23 +72,6 @@ def test_client_util_keeps_the_historical_call_shapes():
         'server_stopped': True,
         'route_outcomes': [],
     }
-
-
-def test_client_util_ping_and_shutdown_accept_only_canonical_protocols():
-    """A rejected protocol is caller input, never an "absent server" answer.
-
-    The probe helpers historically flatten a native ``ValueError`` into a
-    negative result, which would report a non-canonical protocol as a missing
-    server. An explicit protocol must surface the native rejection while an
-    omitted protocol and an invalid address keep their historical shapes.
-    """
-    with pytest.raises(ValueError):
-        util.ping(_absent_address(), timeout=0.01, endpoint_protocol='MANAGED-V2')
-    with pytest.raises(ValueError):
-        util.shutdown(_absent_address(), timeout=0.01, endpoint_protocol='future-v3')
-    # An omitted protocol still resolves the process policy and still reports
-    # absence rather than raising.
-    assert util.ping(_absent_address(), 0.01) is False
 
 
 def test_ping_invalid_address_returns_false():

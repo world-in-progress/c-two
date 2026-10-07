@@ -22,7 +22,7 @@ pub use ipc::{
     FORBIDDEN_IPC_OVERRIDE_KEYS, MAX_EXECUTION_WORKERS, MAX_IPC_POOL_SEGMENTS, PoolRoleTuning,
     SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
 };
-pub use local::{LocalEndpoint, LocalEndpointNamespace, LocalEndpointProtocol};
+pub use local::{LocalEndpoint, LocalEndpointNamespace};
 pub use memory::MemoryBudgetLimits;
 pub use pool::{PoolConfig, default_spill_dir};
 pub use relay::RelayConfig;

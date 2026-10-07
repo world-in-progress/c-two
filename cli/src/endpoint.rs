@@ -3,7 +3,7 @@
 //! This is a thin facade over the `c2-local` lifecycle surface. It derives the
 //! OS endpoint through `LocalEndpoint`, parses credentials with the one Rust
 //! codec, and reports exactly what the native layer returned. It never scans
-//! arbitrary directories, never enumerates a legacy namespace by default,
+//! arbitrary directories, uses only the platform native namespace,
 //! never treats `WindowsNotApplicable` or `KernelManaged` as a live endpoint,
 //! and never upgrades an interrupted round into full coverage.
 //!
@@ -11,7 +11,6 @@
 //! `Unverified` are never written as success.
 
 use anyhow::{Result, anyhow, bail};
-use c2_config::{ClientIpcConfigOverrides, ConfigResolver, ConfigSources, LocalEndpointProtocol};
 use c2_core::{
     ENDPOINT_CREDENTIAL_MAX_BYTES, EndpointCredential, EndpointInspection, EndpointReapResult,
     EndpointSweep, EndpointUnverifiedReason, LocalEndpoint, SweepBatch, SweepBudget,
@@ -20,22 +19,6 @@ use c2_core::{
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-
-/// Default protocol when a caller does not name one, matching the configured
-/// Rust process default.
-///
-/// A build-time constant would silently override the configured policy, so the
-/// default is resolved from the current process environment and `.env` through
-/// the same Rust resolver the SDK uses. An explicit `--protocol` always wins.
-fn configured_protocol() -> Result<LocalEndpointProtocol> {
-    ConfigResolver::resolve_client_ipc(
-        ClientIpcConfigOverrides::default(),
-        Default::default(),
-        ConfigSources::from_process(),
-    )
-    .map(|config| config.base.endpoint_protocol)
-    .map_err(|error| anyhow!("cannot resolve the configured endpoint protocol: {error}"))
-}
 
 /// Hard ceiling for one sweep batch's entry budget.
 const MAX_SWEEP_ENTRIES: usize = 4096;
@@ -58,7 +41,7 @@ pub enum EndpointCommand {
     Inspect(InspectArgs),
     /// Reap the exact endpoint object named by a credential file.
     Reap(ReapArgs),
-    /// Run a bounded maintenance sweep over one protocol's namespace.
+    /// Run a bounded maintenance sweep over the platform native namespace.
     Sweep(SweepArgs),
 }
 
@@ -66,10 +49,6 @@ pub enum EndpointCommand {
 pub struct InspectArgs {
     /// Logical IPC address, for example ipc://my_server.
     pub address: String,
-    /// Endpoint protocol. Defaults to the configured process policy resolved
-    /// from environment and .env.
-    #[arg(long, value_parser = parse_protocol)]
-    pub protocol: Option<LocalEndpointProtocol>,
 }
 
 #[derive(Debug, Args)]
@@ -83,11 +62,8 @@ pub struct ReapArgs {
 
 #[derive(Debug, Args)]
 pub struct SweepArgs {
-    /// Endpoint protocol. Required: a sweep never guesses the namespace.
-    #[arg(long, value_parser = parse_protocol)]
-    pub protocol: LocalEndpointProtocol,
     /// Restrict maintenance to this logical IPC address. Repeat for multiple
-    /// targets; omission explicitly selects the full protocol namespace.
+    /// targets; omission explicitly selects the full native namespace.
     #[arg(long = "address", value_name = "IPC_ADDRESS")]
     pub addresses: Vec<String>,
     /// Maximum entries visited in one batch.
@@ -101,10 +77,6 @@ pub struct SweepArgs {
     pub max_batches: u32,
 }
 
-fn parse_protocol(value: &str) -> std::result::Result<LocalEndpointProtocol, String> {
-    value.parse()
-}
-
 pub fn run(args: EndpointArgs) -> Result<ExitCode> {
     match args.command {
         EndpointCommand::Inspect(args) => inspect(args),
@@ -113,20 +85,8 @@ pub fn run(args: EndpointArgs) -> Result<ExitCode> {
     }
 }
 
-fn endpoint_for(address: &str, protocol: Option<LocalEndpointProtocol>) -> Result<LocalEndpoint> {
-    // An explicit protocol is strictly first. Otherwise the configured process
-    // policy decides; the address is always derived purely from the logical
-    // name through `LocalEndpoint`, never by probing an existing path.
-    let protocol = match protocol {
-        Some(protocol) => protocol,
-        None => configured_protocol()?,
-    };
-    LocalEndpoint::from_address_with_protocol(address, protocol)
-        .map_err(|error| anyhow!("invalid local endpoint {address}: {error}"))
-}
-
 fn inspect(args: InspectArgs) -> Result<ExitCode> {
-    let endpoint = endpoint_for(&args.address, args.protocol)?;
+    let endpoint = endpoint_for(&args.address)?;
     let report = match inspect_endpoint(&endpoint) {
         EndpointInspection::Absent => Report::status("absent"),
         EndpointInspection::Present(credential) => {
@@ -156,11 +116,8 @@ fn inspect(args: InspectArgs) -> Result<ExitCode> {
 
 fn reap(args: ReapArgs) -> Result<ExitCode> {
     let credential = read_credential(&args.credential)?;
-    // The address is derived with the protocol the credential itself records,
-    // so a managed credential is not misread as stale merely because the
-    // process default happens to be legacy-v1. The credential is still only a
-    // description: the native identity check decides the outcome.
-    let endpoint = endpoint_for(&args.address, Some(credential.endpoint().protocol()))?;
+    // The strict credential and this operation use the same native derivation.
+    let endpoint = endpoint_for(&args.address)?;
     // The credential must describe this exact endpoint; a mismatch is caught
     // natively as StaleTarget, but reject it early with a clear reason too.
     if credential.endpoint() != &endpoint {
@@ -190,8 +147,7 @@ fn sweep(args: SweepArgs) -> Result<ExitCode> {
         bail!("--max-batches must be between 1 and {MAX_BATCHES}");
     }
 
-    let endpoint =
-        LocalEndpoint::from_address_with_protocol("ipc://c3-endpoint-sweep", args.protocol)?;
+    let endpoint = LocalEndpoint::from_address("ipc://c3-endpoint-sweep")?;
     // Native scope construction validates every logical address and the 4096
     // target limit before opening any iterator or taking a sweep lease.
     let mut sweep = if args.addresses.is_empty() {
@@ -201,12 +157,7 @@ fn sweep(args: SweepArgs) -> Result<ExitCode> {
             .map_err(|error| anyhow!("invalid endpoint sweep scope: {error}"))?;
         EndpointSweep::for_scope(&scope)
     }
-    .map_err(|error| {
-        anyhow!(
-            "cannot open the {} namespace: {error}",
-            args.protocol.as_str()
-        )
-    })?;
+    .map_err(|error| anyhow!("cannot open the {} namespace: {error}", endpoint.protocol()))?;
     let budget = SweepBudget {
         max_entries: args.max_entries,
         max_duration: std::time::Duration::from_millis(args.max_ms),
@@ -470,4 +421,8 @@ impl Report {
         println!("{line}");
         Ok(())
     }
+}
+
+fn endpoint_for(address: &str) -> Result<LocalEndpoint> {
+    LocalEndpoint::from_address(address).map_err(|error| anyhow!("invalid local endpoint: {error}"))
 }

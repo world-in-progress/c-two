@@ -2067,11 +2067,8 @@ impl IpcClient {
         // The resolved config owns the endpoint protocol: construction,
         // reconnect, and every fallback reuse this one derivation instead of
         // probing old and new endpoint namespaces.
-        let endpoint = crate::control::local_endpoint_from_ipc_address_with_protocol(
-            address,
-            config.base.endpoint_protocol,
-        )
-        .map_err(|error| error.to_string());
+        let endpoint = crate::control::local_endpoint_from_ipc_address(address)
+            .map_err(|error| error.to_string());
 
         Self {
             endpoint,

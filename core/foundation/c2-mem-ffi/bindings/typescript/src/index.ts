@@ -9,7 +9,7 @@ export const C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-export const C2_MEM_FFI_ABI_VERSION = 2;
+export const C2_MEM_FFI_ABI_VERSION = 3;
 
 export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_OK
@@ -123,11 +123,9 @@ export interface C2MemFfiResponsePoolSymbols<Handle = unknown> extends C2MemFfiA
 
 export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> {
   /**
-   * `protocolName` is the canonical Rust protocol name (`legacy-v1` or
-   * `managed-v2`) or `""` for the resolved process policy. There is no
-   * protocol fallback: the requested endpoint is the only one resolved.
+   * Resolve the automatic platform endpoint through the Rust configuration owner.
    */
-  c2_mem_ffi_local_endpoint(address: string, protocolName: string): C2MemFfiCallResult<string>;
+  c2_mem_ffi_local_endpoint(address: string): C2MemFfiCallResult<string>;
   c2_mem_ffi_request_pool_read_local(pool: Handle, block: C2MemFfiRequestBlock, destination: Uint8Array): MaybePromise<C2MemFfiCallResult<number>>;
 }
 
@@ -150,57 +148,9 @@ export interface C2MemFfiResponsePoolFactory {
   createResponsePool(config: C2MemFfiPoolConfig): Promise<C2MemFfiNativeResponsePool>;
 }
 
-/**
- * Canonical local endpoint protocol names owned by Rust `c2-config`.
- *
- * The binding does not define a second protocol vocabulary: these are exactly
- * the names `LocalEndpointProtocol::from_str` accepts, and the native
- * projection is a pure derivation from one of them.
- */
-export type C2LocalEndpointProtocol = "legacy-v1" | "managed-v2";
-
-export const C2_LOCAL_ENDPOINT_PROTOCOLS: readonly C2LocalEndpointProtocol[] = [
-  "legacy-v1",
-  "managed-v2",
-];
-
-/** The empty name asks Rust for the resolved process client IPC policy. */
-const C2_LOCAL_ENDPOINT_PROTOCOL_RESOLVED = "";
-
-export interface C2MemFfiEndpointResolutionOptions {
-  /**
-   * Strict endpoint protocol. Omitted (or explicitly `undefined`) keeps the
-   * resolved process policy; a named protocol selects exactly one OS
-   * endpoint and never retries across endpoint namespaces.
-   */
-  readonly endpointProtocol?: C2LocalEndpointProtocol;
-}
-
-function canonicalEndpointProtocolName(
-  protocol: C2LocalEndpointProtocol | undefined,
-  label: string,
-): string {
-  if (protocol === undefined) {
-    return C2_LOCAL_ENDPOINT_PROTOCOL_RESOLVED;
-  }
-  if (
-    typeof protocol !== "string"
-    || !(C2_LOCAL_ENDPOINT_PROTOCOLS as readonly string[]).includes(protocol)
-  ) {
-    throw new C2NodeIpcConnectionError(
-      `${label} must be one of ${C2_LOCAL_ENDPOINT_PROTOCOLS.join(", ")}.`,
-    );
-  }
-  return protocol;
-}
-
 export interface C2MemFfiNodeRuntime {
   readonly connect: C2NodeIpcConnect;
   readonly resolveEndpoint: (address: string) => string;
-  readonly resolveEndpointWithProtocol: (
-    address: string,
-    options?: C2MemFfiEndpointResolutionOptions,
-  ) => string;
   readonly responsePoolFactory: C2MemFfiResponsePoolFactory;
 }
 
@@ -231,11 +181,6 @@ export interface C2NodeIpcSocket {
 export interface C2NodeIpcConnectOptions {
   readonly resolveEndpoint?: (address: string) => string;
   readonly createConnection?: (socketPath: string) => C2NodeIpcSocket;
-  /**
-   * Strict endpoint protocol used by the default resolver. Passed through to
-   * `resolveLocalIpcEndpoint`; there is no fallback to another namespace.
-   */
-  readonly endpointProtocol?: C2LocalEndpointProtocol;
 }
 
 interface C2MemFfiNodeNativeAddon<Handle = unknown> {
@@ -277,14 +222,9 @@ export function createBundledC2MemFfiNodeRuntime(
   options: C2MemFfiNodeNativeLoadOptions = {},
 ): C2MemFfiNodeRuntime {
   const resolveEndpoint = (address: string): string => resolveLocalIpcEndpoint(address, options);
-  const resolveEndpointWithProtocol = (
-    address: string,
-    resolution: C2MemFfiEndpointResolutionOptions = {},
-  ): string => resolveLocalIpcEndpoint(address, { ...options, ...resolution });
   return Object.freeze({
     connect: createNodeIpcConnect({ resolveEndpoint }),
     resolveEndpoint,
-    resolveEndpointWithProtocol,
     responsePoolFactory: Object.freeze({
       async createResponsePool(
         config: C2MemFfiPoolConfig,
@@ -302,14 +242,11 @@ export function createBundledC2MemFfiNodeRuntime(
 /**
  * Resolve a logical `ipc://` address to its OS endpoint.
  *
- * `options.endpointProtocol` is strict: a named protocol selects exactly one
- * endpoint derivation and a platform that cannot serve it fails loudly (for
- * example `managed-v2` on Windows) instead of silently falling back to the
- * legacy namespace. Omitting it keeps the resolved process client IPC policy.
+ * The native resolver owns the platform backend and logical address validation.
  */
 export function resolveLocalIpcEndpoint(
   address: string,
-  options: C2MemFfiNodeNativeLoadOptions & C2MemFfiEndpointResolutionOptions = {},
+  options: C2MemFfiNodeNativeLoadOptions = {},
 ): string {
   if (typeof address !== "string" || address.includes("\0")) {
     throw new C2NodeIpcConnectionError("C-Two IPC address must be a string without NUL characters.");
@@ -317,12 +254,8 @@ export function resolveLocalIpcEndpoint(
   if (typeof options !== "object" || options === null) {
     throw new C2NodeIpcConnectionError("C-Two endpoint resolution options must be an object.");
   }
-  const protocolName = canonicalEndpointProtocolName(
-    options.endpointProtocol,
-    "C-Two endpoint protocol",
-  );
   const { symbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
-  const result = symbols.c2_mem_ffi_local_endpoint(address, protocolName);
+  const result = symbols.c2_mem_ffi_local_endpoint(address);
   if (result.status !== C2_MEM_FFI_STATUS_OK || typeof result.value !== "string") {
     throw new C2NodeIpcConnectionError(`C-Two native endpoint resolution failed for ${address} (status ${result.status}).`);
   }
@@ -334,25 +267,7 @@ export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2N
     throw new C2NodeIpcConnectionError("C-Two Node IPC connect options must be an object.");
   }
   const openSocket = options.createConnection ?? createConnection;
-  const protocolName = canonicalEndpointProtocolName(
-    options.endpointProtocol,
-    "C-Two Node IPC endpoint protocol",
-  );
-  const configuredProtocol = options.endpointProtocol;
-  const configuredResolveEndpoint = options.resolveEndpoint;
-  if (typeof configuredResolveEndpoint === "function") {
-    if (configuredProtocol !== undefined) {
-      throw new C2NodeIpcConnectionError(
-        "C-Two Node IPC endpointProtocol cannot be combined with a custom resolveEndpoint resolver.",
-      );
-    }
-  }
-  const resolveEndpoint =
-    configuredResolveEndpoint
-    ?? ((address: string): string =>
-      configuredProtocol === undefined
-        ? resolveLocalIpcEndpoint(address)
-        : resolveLocalIpcEndpoint(address, { endpointProtocol: configuredProtocol }));
+  const resolveEndpoint = options.resolveEndpoint ?? resolveLocalIpcEndpoint;
   if (typeof resolveEndpoint !== "function") {
     throw new C2NodeIpcConnectionError("C-Two Node IPC resolveEndpoint option must be a function.");
   }

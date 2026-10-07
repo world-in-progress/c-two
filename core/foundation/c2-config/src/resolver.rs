@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{BaseIpcConfig, ClientIpcConfig, LocalEndpointProtocol, RelayConfig, ServerIpcConfig};
+use crate::{BaseIpcConfig, ClientIpcConfig, RelayConfig, ServerIpcConfig};
 
 pub type EnvMap = BTreeMap<String, String>;
 const MAX_RELAY_ROUTE_ATTEMPTS: u64 = 32;
@@ -76,7 +76,6 @@ impl EnvCatalog {
 
 #[derive(Debug, Clone, Default)]
 pub struct BaseIpcConfigOverrides {
-    pub endpoint_protocol: Option<LocalEndpointProtocol>,
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
@@ -621,9 +620,6 @@ fn resolve_client_ipc_config(
 }
 
 fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), ConfigError> {
-    if let Some(value) = catalog.optional_string("C2_IPC_ENDPOINT_PROTOCOL") {
-        cfg.endpoint_protocol = value.parse().map_err(ConfigError::new)?;
-    }
     if let Some(v) = catalog.optional_bool("C2_IPC_POOL_ENABLED").transpose()? {
         cfg.pool_enabled = v;
     }
@@ -718,9 +714,6 @@ fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), C
 }
 
 fn apply_base_overrides(cfg: &mut BaseIpcConfig, overrides: &BaseIpcConfigOverrides) {
-    if let Some(value) = overrides.endpoint_protocol {
-        cfg.endpoint_protocol = value;
-    }
     if let Some(v) = overrides.pool_enabled {
         cfg.pool_enabled = v;
     }
@@ -1023,74 +1016,6 @@ mod tests {
         assert_eq!(resolved.relay.bind, "0.0.0.0:8080");
         assert_eq!(resolved.relay.idle_timeout_secs, 60);
         assert!(!resolved.relay_use_proxy);
-        assert_eq!(
-            resolved.client_ipc.endpoint_protocol,
-            LocalEndpointProtocol::LegacyV1
-        );
-    }
-
-    #[test]
-    fn endpoint_protocol_resolution_obeys_override_env_file_and_default_priority() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let env_file = tempdir.path().join(".env");
-        fs::write(&env_file, "C2_IPC_ENDPOINT_PROTOCOL=managed-v2\n").expect("write env file");
-        let sources = ConfigSources {
-            env_file: EnvFilePolicy::Path(env_file),
-            process_env: env(&[("C2_IPC_ENDPOINT_PROTOCOL", "legacy-v1")]),
-        };
-        let from_env = ConfigResolver::resolve_client_ipc(
-            ClientIpcConfigOverrides::default(),
-            RuntimeConfigOverrides::default(),
-            sources.clone(),
-        )
-        .expect("environment resolves");
-        assert_eq!(from_env.endpoint_protocol, LocalEndpointProtocol::LegacyV1);
-
-        let from_override = ConfigResolver::resolve_client_ipc(
-            ClientIpcConfigOverrides {
-                base: BaseIpcConfigOverrides {
-                    endpoint_protocol: Some(LocalEndpointProtocol::ManagedV2),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            RuntimeConfigOverrides::default(),
-            sources,
-        )
-        .expect("explicit override resolves");
-        assert_eq!(
-            from_override.endpoint_protocol,
-            LocalEndpointProtocol::ManagedV2
-        );
-
-        let from_file = ConfigResolver::resolve_client_ipc(
-            ClientIpcConfigOverrides::default(),
-            RuntimeConfigOverrides::default(),
-            ConfigSources {
-                env_file: EnvFilePolicy::Path(tempdir.path().join(".env")),
-                process_env: EnvMap::new(),
-            },
-        )
-        .expect("env file resolves");
-        assert_eq!(
-            from_file.endpoint_protocol,
-            LocalEndpointProtocol::ManagedV2
-        );
-    }
-
-    #[test]
-    fn invalid_endpoint_protocol_fails_closed() {
-        let error = ConfigResolver::resolve_client_ipc(
-            ClientIpcConfigOverrides::default(),
-            RuntimeConfigOverrides::default(),
-            ConfigSources {
-                env_file: EnvFilePolicy::Disabled,
-                process_env: env(&[("C2_IPC_ENDPOINT_PROTOCOL", "future-v3")]),
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("unknown IPC endpoint protocol"));
-        assert!("MANAGED-V2".parse::<LocalEndpointProtocol>().is_err());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -8,7 +8,6 @@ import test from 'node:test';
 import {
   C2_MEM_FFI_ABI_VERSION,
   C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
-  C2_LOCAL_ENDPOINT_PROTOCOLS,
   C2NodeIpcConnectionError,
   createBundledC2MemFfiNodeRuntime,
   createC2MemFfiRequestPoolFromSymbols,
@@ -24,99 +23,21 @@ function libraryPath() {
   return resolveBundledC2MemFfiNodeNativeLibraryPath();
 }
 
-/**
- * The protocol projection is validated before any native symbol is loaded, so
- * these rejections are provable without the compiled addon.
- */
-test('endpoint protocol names are the canonical Rust vocabulary only', () => {
-  assert.deepEqual([...C2_LOCAL_ENDPOINT_PROTOCOLS], ['legacy-v1', 'managed-v2']);
-  for (const invalid of ['MANAGED-V2', 'future-v3', 'managed_v2', 1, null, {}]) {
-    assert.throws(
-      () => resolveLocalIpcEndpoint('ipc://protocol-projection', { endpointProtocol: invalid }),
-      /must be one of legacy-v1, managed-v2/,
-    );
-  }
+test('native endpoint resolution rejects NUL and non-object options first', () => {
+  assert.throws(() => resolveLocalIpcEndpoint('ipc://bad\0name'), /NUL/);
+  assert.throws(() => resolveLocalIpcEndpoint('ipc://invalid-options', null), /options must be an object/);
 });
-
-test('endpoint protocol resolution rejects NUL and non-object options first', () => {
-  assert.throws(
-    () => resolveLocalIpcEndpoint('ipc://bad\0name', { endpointProtocol: 'managed-v2' }),
-    /NUL/,
-  );
-  assert.throws(
-    () => resolveLocalIpcEndpoint('ipc://protocol-projection', null),
-    /options must be an object/,
-  );
-});
-
-test('createNodeIpcConnect rejects a protocol and a custom resolver together', () => {
-  assert.throws(
-    () => createNodeIpcConnect({
-      endpointProtocol: 'managed-v2',
-      resolveEndpoint: (address) => address,
-    }),
-    /cannot be combined with a custom resolveEndpoint resolver/,
-  );
-  assert.throws(
-    () => createNodeIpcConnect({ endpointProtocol: 'not-a-protocol' }),
-    /must be one of legacy-v1, managed-v2/,
-  );
-});
-
-test('a named endpoint protocol resolves exactly one OS endpoint', () => {
-  const address = `ipc://protocol-strict-${process.pid}`;
-  const legacy = resolveLocalIpcEndpoint(address, { endpointProtocol: 'legacy-v1' });
-  const resolved = resolveLocalIpcEndpoint(address);
-
-  // A named protocol is a strict derivation and an omitted protocol keeps the
-  // resolved policy.
-  assert.equal(resolved, legacy);
-
+test('logical addresses resolve to one deterministic native OS endpoint', () => {
+  const address = `ipc://native-strict-${process.pid}`;
+  const endpoint = resolveLocalIpcEndpoint(address);
   if (process.platform === 'win32') {
-    // Windows has no managed-v2 endpoint: the request must be refused by the
-    // concrete platform rule instead of quietly resolving the legacy pipe.
-    assert.match(legacy, /^\\\\\.\\pipe\\c_two-/);
-    const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-    assert.deepEqual(symbols.c2_mem_ffi_local_endpoint(address, 'managed-v2'), {
-      status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
-    });
-    const rejectsManagedEndpoint = (error) => {
-      assert.ok(error instanceof C2NodeIpcConnectionError);
-      assert.equal(
-        error.message,
-        `C-Two native endpoint resolution failed for ${address} (status ${C2_MEM_FFI_STATUS_INVALID_ARGUMENT}).`,
-      );
-      return true;
-    };
-    assert.throws(
-      () => resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' }),
-      rejectsManagedEndpoint,
-    );
-    const runtime = createBundledC2MemFfiNodeRuntime();
-    assert.equal(typeof runtime.resolveEndpointWithProtocol, 'function');
-    assert.throws(
-      () => runtime.resolveEndpointWithProtocol(address, { endpointProtocol: 'managed-v2' }),
-      rejectsManagedEndpoint,
-    );
-    assert.equal(runtime.resolveEndpoint(address), legacy);
-    return;
+    assert.ok(endpoint.startsWith('\\\\.\\pipe\\c_two-'));
+  } else {
+    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
   }
-
-  const managed = resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' });
-  // The two vocabularies name distinct endpoints.
-  assert.notEqual(legacy, managed);
-  assert.equal(legacy, `/tmp/c_two_ipc/protocol-strict-${process.pid}.sock`);
-  assert.match(managed, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
-  // The derivation is pure and repeatable.
-  assert.equal(managed, resolveLocalIpcEndpoint(address, { endpointProtocol: 'managed-v2' }));
-
+  assert.equal(endpoint, resolveLocalIpcEndpoint(address));
   const runtime = createBundledC2MemFfiNodeRuntime();
-  assert.equal(typeof runtime.resolveEndpointWithProtocol, 'function');
-  assert.equal(
-    runtime.resolveEndpointWithProtocol(address, { endpointProtocol: 'managed-v2' }),
-    managed,
-  );
-  assert.equal(runtime.resolveEndpoint(address), legacy);
+  assert.equal(runtime.resolveEndpoint(address), endpoint);
 });
 
 test('c2-mem-ffi bundled Node native loader resolves packaged runtime artifacts', () => {
@@ -331,7 +252,7 @@ test('native endpoint resolution preserves logical identity and rejects path inp
   if (process.platform === 'win32') {
     assert.match(endpoint, /^\\\\\.\\pipe\\c_two-/);
   } else {
-    assert.equal(endpoint, `/tmp/c_two_ipc/node-native-${process.pid}.sock`);
+    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
   }
   for (const invalid of ['/tmp/node.sock', 'ipc://../bad', 'ipc://bad\0name']) {
     assert.throws(() => resolveLocalIpcEndpoint(invalid));
@@ -423,5 +344,27 @@ test('native dedicated requests and responses complete repeatedly without exhaus
   } finally {
     await peer.close();
     await owner.close();
+  }
+});
+
+
+test('native addon rejects a stale core ABI before exposing endpoint or pool calls', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi-'));
+  try {
+    const source = readFileSync(new URL('../native/node_c2_mem_ffi_loader.c', import.meta.url), 'utf8');
+    const symbols = [...source.matchAll(/LOAD_REQUIRED\(\w+, "([^"]+)"\)/g)].map((match) => match[1]);
+    const body = symbols.map((name) => name === 'c2_mem_ffi_abi_version'
+      ? `#[unsafe(no_mangle)] pub extern "C" fn ${name}() -> u32 { 2 }`
+      : `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`).join('\n');
+    const fixture = resolve(directory, 'stale.rs');
+    writeFileSync(fixture, body);
+    const library = resolve(directory, process.platform === 'win32' ? 'stale.dll' : process.platform === 'darwin' ? 'stale.dylib' : 'stale.so');
+    const output = spawnSync(process.env.RUSTC ?? 'rustc',
+      ['--edition=2024', '--crate-type=cdylib', fixture, '-o', library],
+      { cwd: directory, encoding: 'utf8' });
+    assert.equal(output.status, 0, `${output.error ?? ''} ${output.stdout} ${output.stderr}`);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 2.*expected version 3/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });

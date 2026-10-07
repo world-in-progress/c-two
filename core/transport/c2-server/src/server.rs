@@ -338,7 +338,7 @@ impl Server {
     /// Create a new server for the given IPC address.
     ///
     /// Address format: `ipc://region_id`
-    /// → socket at `/tmp/c_two_ipc/region_id.sock`
+    /// → platform native endpoint derived by `LocalEndpoint`
     pub fn new(address: &str, config: ServerIpcConfig) -> Result<Self, ServerError> {
         let identity = ServerIdentity {
             server_id: server_id_from_ipc_address(address)?,
@@ -355,7 +355,7 @@ impl Server {
     ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
         validate_server_identity(&identity)?;
-        parse_local_endpoint_with_protocol(address, config.base.endpoint_protocol)?;
+        parse_local_endpoint(address)?;
         // One server direction, one finite budget: the response pool, the
         // chunk-reassembly pool, and response prewarm all charge the same
         // context, so the server cannot double its configured cap by owning
@@ -399,10 +399,9 @@ impl Server {
     ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
         validate_server_identity(&identity)?;
-        // The resolved config alone selects the endpoint protocol; bind and
-        // every restart bind reuse this one derivation.
+        // Bind and restart use the same canonical platform endpoint.
         let endpoint =
-            parse_local_endpoint_with_protocol(address, config.base.endpoint_protocol)?;
+            parse_local_endpoint(address)?;
         let (shutdown_tx, _) = watch::channel(false);
         // The injected test pool and the production reassembly pool both
         // carry the server's accounting authority. Derive the response-pool
@@ -1599,19 +1598,9 @@ fn server_id_from_ipc_address(address: &str) -> Result<String, ServerError> {
     Ok(region.to_string())
 }
 
-#[cfg(test)]
 fn parse_local_endpoint(address: &str) -> Result<LocalEndpoint, ServerError> {
-    parse_local_endpoint_with_protocol(address, c2_config::LocalEndpointProtocol::LegacyV1)
-}
-
-fn parse_local_endpoint_with_protocol(
-    address: &str,
-    protocol: c2_config::LocalEndpointProtocol,
-) -> Result<LocalEndpoint, ServerError> {
-    // The resolved server config selects the endpoint protocol. A managed-v2
-    // request on a platform that cannot serve it is a normalized configuration
-    // error at construction, never a silent legacy fallback.
-    LocalEndpoint::from_address_with_protocol(address, protocol).map_err(|error| {
+    // c2-config owns platform endpoint derivation and address validation.
+    LocalEndpoint::from_address(address).map_err(|error| {
         if matches!(
             error.kind(),
             std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
@@ -4233,26 +4222,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_restart_reuses_the_resolved_endpoint_protocol() {
-        // A restart bind must not drift to another endpoint namespace: the one
-        // resolved protocol is the only derivation both binds use.
-        let mut config = ServerIpcConfig::default();
-        #[cfg(unix)]
-        {
-            config.base.endpoint_protocol = c2_config::LocalEndpointProtocol::ManagedV2;
-        }
-        #[cfg(windows)]
-        {
-            let mut unsupported = config.clone();
-            unsupported.base.endpoint_protocol = c2_config::LocalEndpointProtocol::ManagedV2;
-            let error = match Server::new("ipc://protocol_restart_unsupported", unsupported) {
-                Err(error) => error,
-                Ok(_) => panic!("managed-v2 must be rejected before a Windows server is created"),
-            };
-            assert!(matches!(error, ServerError::Config(message)
-                if message == "managed-v2 IPC endpoints are not supported on Windows"));
-        }
-        let expected_protocol = config.base.endpoint_protocol;
+    async fn server_restart_reuses_the_native_endpoint() {
+        // A restart bind must reuse the platform native endpoint.
+        let config = ServerIpcConfig::default();
         let address = "ipc://protocol_restart_srv";
         let first = Server::new(address, config.clone()).unwrap();
         let first_endpoint = first.local_endpoint().clone();
@@ -4260,7 +4232,6 @@ mod tests {
 
         let second = Server::new(address, config).unwrap();
         assert_eq!(second.local_endpoint(), &first_endpoint);
-        assert_eq!(second.local_endpoint().protocol(), expected_protocol);
     }
 
     #[test]

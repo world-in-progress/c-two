@@ -1,37 +1,12 @@
-"""Thin Python projection of the native local-endpoint maintenance API.
+"""Thin projection of native endpoint inspection, identity-constrained reaping,
+and bounded maintenance. Rust owns platform address derivation, strict credential
+parsing and the process sweep lease.
 
-Every decision that matters is made in Rust. This module owns no credential
-field table, derives no OS path, reassembles no native endpoint, and keeps no
-independent sweep state. It only names the native entry points and presents
-their honest result dictionaries.
+Use ``inspect_endpoint(address)`` to observe an endpoint and ``reap_endpoint(address,
+credential)`` to retire that exact native instance. Maintenance accepts optional logical
+address scope and budgets::
 
-The three operations map onto the `c2-core` / `c2-local` lifecycle surface:
-
-``inspect_endpoint(address, *, endpoint_protocol=None)``
-    Observe one logical endpoint. ``None`` resolves the configured process
-    endpoint policy through the Rust resolver; an explicit
-    ``'legacy-v1'`` / ``'managed-v2'`` value is parsed by the Rust enum.
-    ``KernelManaged`` (Windows named pipes) and ``NotApplicable`` describe
-    which layer owns endpoint lifetime and are never reported as ``alive``.
-
-``reap_endpoint(address, credential)``
-    Remove the exact endpoint object a credential names. The endpoint is
-    derived with the protocol the credential itself records, so a managed
-    credential is not misread as stale because the process default happens to
-    be legacy-v1. The native identity check decides the outcome.
-
-``sweep_endpoints(protocol, *, max_entries=None, max_ms=None)``
-    Open one bounded, explicitly driven maintenance sweep. ``protocol`` is
-    required and is never guessed. ``max_entries`` / ``max_ms`` are optional
-    native budget overrides; ``None`` keeps the native ``SweepBudget`` default
-    stored inside the Rust sweep. At most one sweep may be active per process;
-    that lease is owned by Rust.
-
-A sweep holds exactly one native iterator. Iterate it with ``next_batch()``
-and always ``close()`` it (or use it as a context manager) so the native
-iterator and the process lease are released deterministically::
-
-    with sweep_endpoints('legacy-v1') as sweep:
+    with sweep_endpoints(addresses=['ipc://my-server']) as sweep:
         while True:
             batch = sweep.next_batch()
             if batch['round_complete'] or batch['round_interrupted']:
@@ -111,17 +86,11 @@ class EndpointCredential:
         return f'EndpointCredential(address={self.address!r}, protocol={self.protocol!r})'
 
 
-def inspect_endpoint(
-    address: str,
-    *,
-    endpoint_protocol: str | None = None,
-) -> dict[str, Any]:
+def inspect_endpoint(address: str) -> dict[str, Any]:
     """Inspect one logical local endpoint without creating ownership metadata.
 
     Args:
         address: Logical IPC address, for example ``'ipc://my_server'``.
-        endpoint_protocol: ``'legacy-v1'`` or ``'managed-v2'``. ``None``
-            resolves the configured process policy through the Rust resolver.
 
     Returns:
         A result dictionary with ``status``, ``credential``, ``reason``,
@@ -134,13 +103,12 @@ def inspect_endpoint(
     Raises:
         TypeError: ``address`` is not a string.
         ValueError: the address is not a valid ``ipc://`` address, the
-            protocol is unknown, or the configured process protocol could not
-            be resolved.
+            logical identifier is rejected by the native resolver.
     """
     if not isinstance(address, str):
         raise TypeError('address must be a str')
     result = dict(
-        _native().inspect_endpoint_endpoint(address, endpoint_protocol=endpoint_protocol)
+        _native().inspect_endpoint_endpoint(address)
     )
     _wrap_credential(result)
     return result
@@ -259,21 +227,18 @@ class EndpointSweep:
 
 
 def sweep_endpoints(
-    protocol: str,
     *,
     addresses: list[str] | None = None,
     max_entries: int | None = None,
     max_ms: int | None = None,
 ) -> EndpointSweep:
-    """Open one bounded maintenance sweep over ``protocol``.
+    """Open one bounded maintenance sweep over the platform native namespace.
 
-    ``protocol`` is required and is never guessed: a sweep must not silently
-    cover the wrong namespace. The returned sweep must be closed.
+    The returned sweep must be closed.
 
     Args:
-        protocol: ``'legacy-v1'`` or ``'managed-v2'``.
         addresses: Optional logical IPC addresses to select. ``None`` covers
-            the whole protocol namespace; an empty list selects no slots.
+            the whole native namespace; an empty list selects no slots.
             Rust derives and validates canonical socket and ownership names
             before opening the iterator or acquiring the maintenance lease.
         max_entries: Optional entry-budget override for every batch. ``None``
@@ -284,15 +249,15 @@ def sweep_endpoints(
 
     Raises:
         RuntimeError: another sweep is already active in this process.
-        TypeError: ``protocol`` is not a string, or a budget is not an int.
-        ValueError: the protocol is unknown, or a budget is out of range.
+        TypeError: a budget is not an int.
+        ValueError: a budget is out of range.
     """
     native = _native()
     # The facade forwards the caller's values unchanged: the Rust sweep stores
     # the default budget and validates every explicit dimension before it
     # takes the process lease or opens the iterator.
     return EndpointSweep(
-        native.PyEndpointSweep(protocol, addresses=addresses, max_entries=max_entries, max_ms=max_ms)
+        native.PyEndpointSweep(addresses=addresses, max_entries=max_entries, max_ms=max_ms)
     )
 
 

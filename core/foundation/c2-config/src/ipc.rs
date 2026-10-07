@@ -11,8 +11,6 @@
 use std::ops::Deref;
 use std::time::Duration;
 
-use crate::LocalEndpointProtocol;
-
 pub const MAX_EXECUTION_WORKERS: u32 = 64;
 
 /// Canonical upper bound on configured buddy pool segments
@@ -42,7 +40,6 @@ pub const BASE_IPC_OVERRIDE_KEYS: &[&str] = &[
     "shm_backing_budget_bytes",
     "file_backing_budget_bytes",
     "live_reassembly_budget_bytes",
-    "endpoint_protocol",
 ];
 
 /// Code-level IPC override fields accepted for server config resolution.
@@ -63,7 +60,6 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "shm_backing_budget_bytes",
     "file_backing_budget_bytes",
     "live_reassembly_budget_bytes",
-    "endpoint_protocol",
     "max_frame_size",
     "max_payload_size",
     "max_pending_requests",
@@ -91,7 +87,6 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
     "shm_backing_budget_bytes",
     "file_backing_budget_bytes",
     "live_reassembly_budget_bytes",
-    "endpoint_protocol",
     "pool_decay_seconds",
 ];
 
@@ -109,8 +104,6 @@ pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &["shm_threshold"];
 /// than mutating a shared value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BaseIpcConfig {
-    /// Protocol used to derive the local OS endpoint from an IPC address.
-    pub endpoint_protocol: LocalEndpointProtocol,
     // ── Pool SHM settings ────────────────────────────────────────────────
     /// Buddy-pool policy switch. Disabling it skips only the buddy tiers
     /// (reuse and expansion); dedicated SHM, chunked transfer, inline frames,
@@ -190,7 +183,6 @@ impl Default for BaseIpcConfig {
     fn default() -> Self {
         let budget_limits = crate::MemoryBudgetLimits::default();
         Self {
-            endpoint_protocol: LocalEndpointProtocol::LegacyV1,
             pool_enabled: true,
             pool_segment_size: 268_435_456, // 256 MB
             max_pool_segments: 4,
@@ -1142,10 +1134,6 @@ mod tests {
         assert_eq!(pristine, pristine.clone());
 
         let base_mutations = [
-            BaseIpcConfig {
-                endpoint_protocol: crate::LocalEndpointProtocol::ManagedV2,
-                ..base.clone()
-            },
             BaseIpcConfig {
                 pool_enabled: !base.pool_enabled,
                 ..base.clone()

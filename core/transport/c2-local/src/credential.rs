@@ -13,7 +13,7 @@
 //! rejected rather than upgraded: an unknown record never becomes a UUID
 //! incarnation credential.
 
-use c2_config::{LocalEndpoint, LocalEndpointNamespace, LocalEndpointProtocol};
+use c2_config::{LocalEndpoint, LocalEndpointNamespace};
 use serde::{Deserialize, Serialize};
 
 // `EndpointCredential` is the codec's return type on every platform, including
@@ -32,8 +32,8 @@ pub const ENDPOINT_CREDENTIAL_MAX_BYTES: usize = 4096;
 
 const SCHEMA_VERSION_V1: u32 = 1;
 const SCHEMA_VERSION_V2: u32 = 2;
-const PROTOCOL_LEGACY: &str = "legacy-v1";
-const PROTOCOL_MANAGED: &str = "managed-v2";
+#[cfg(windows)]
+const PROTOCOL_WINDOWS: &str = "named-pipe";
 const PLATFORM_UNIX: &str = "unix";
 const PLATFORM_WINDOWS: &str = "windows";
 
@@ -53,7 +53,7 @@ pub enum EndpointCredentialErrorKind {
     InvalidValue,
     /// A record describes a platform or protocol this build cannot verify.
     UnsupportedPlatform,
-    /// A schema-v2 record must name an incarnation; a legacy record must not.
+    /// A Unix schema-v2 record must name its listener incarnation.
     IncarnationRequired,
 }
 
@@ -173,23 +173,15 @@ impl EndpointCredential {
     /// exists or is alive.
     pub fn to_json(&self) -> Result<String, EndpointCredentialError> {
         let endpoint = self.endpoint();
-        // The schema version follows the protocol: a managed-v2 credential is
-        // the only one that may carry an incarnation, and a legacy credential
-        // is encoded as v1 so it is never presented as a UUID credential. A
-        // Windows credential is kernel-managed metadata and has no incarnation
-        // at all, so it is always v1.
+        // Unix credentials always require a listener incarnation.
         #[cfg(unix)]
-        let schema_version = if self.incarnation().is_some() {
-            SCHEMA_VERSION_V2
-        } else {
-            SCHEMA_VERSION_V1
-        };
+        let schema_version = SCHEMA_VERSION_V2;
         #[cfg(not(unix))]
         let schema_version = SCHEMA_VERSION_V1;
         let document = CredentialDocument {
             schema_version,
             address: endpoint.address(),
-            protocol: protocol_name(endpoint.protocol()),
+            protocol: endpoint.protocol(),
             platform: platform_name(),
             #[cfg(unix)]
             incarnation: self.incarnation().map(encode_incarnation),
@@ -241,17 +233,21 @@ impl EndpointCredential {
         })?;
         let schema_version = schema_version(&wire)?;
         let address = required_string(&wire.address, "address")?;
-        let protocol = protocol(&wire.protocol)?;
+        let recorded_protocol = required_string(&wire.protocol, "protocol")?;
         let platform = platform(&wire.platform)?;
-        let endpoint = LocalEndpoint::from_address_with_protocol(address, protocol)
-            .map_err(|_| EndpointCredentialError::at(
-                EndpointCredentialErrorKind::InvalidValue,
-                "address",
-            ))?;
+        let endpoint = LocalEndpoint::from_address(address).map_err(|_| {
+            EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, "address")
+        })?;
         if platform != effective_namespace() {
             return Err(EndpointCredentialError::at(
                 EndpointCredentialErrorKind::UnsupportedPlatform,
                 "platform",
+            ));
+        }
+        if recorded_protocol != endpoint.protocol() {
+            return Err(EndpointCredentialError::at(
+                EndpointCredentialErrorKind::InvalidValue,
+                "protocol",
             ));
         }
         match platform {
@@ -283,13 +279,6 @@ fn effective_namespace() -> Platform {
     }
 }
 
-fn protocol_name(protocol: LocalEndpointProtocol) -> &'static str {
-    match protocol {
-        LocalEndpointProtocol::LegacyV1 => PROTOCOL_LEGACY,
-        LocalEndpointProtocol::ManagedV2 => PROTOCOL_MANAGED,
-    }
-}
-
 /// Rebinds the derived value to the namespace this build actually supports.
 fn bind_namespace(endpoint: LocalEndpoint) -> Result<LocalEndpoint, EndpointCredentialError> {
     let supported = match effective_namespace() {
@@ -305,17 +294,12 @@ fn bind_namespace(endpoint: LocalEndpoint) -> Result<LocalEndpoint, EndpointCred
 }
 
 fn schema_version(wire: &CredentialWire) -> Result<u32, EndpointCredentialError> {
-    let version = wire
-        .schema_version
-        .as_u64()
-        .ok_or_else(|| {
-            EndpointCredentialError::at(
-                EndpointCredentialErrorKind::InvalidValue,
-                "schemaVersion",
-            )
-        })?;
-    let version = u32::try_from(version)
-        .map_err(|_| EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, "schemaVersion"))?;
+    let version = wire.schema_version.as_u64().ok_or_else(|| {
+        EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, "schemaVersion")
+    })?;
+    let version = u32::try_from(version).map_err(|_| {
+        EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, "schemaVersion")
+    })?;
     match version {
         SCHEMA_VERSION_V1 | SCHEMA_VERSION_V2 => Ok(version),
         _ => Err(EndpointCredentialError::at(
@@ -329,20 +313,9 @@ fn required_string<'a>(
     value: &'a serde_json::Value,
     field: &'static str,
 ) -> Result<&'a str, EndpointCredentialError> {
-    value
-        .as_str()
-        .ok_or_else(|| EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, field))
-}
-
-fn protocol(value: &serde_json::Value) -> Result<LocalEndpointProtocol, EndpointCredentialError> {
-    match required_string(value, "protocol")? {
-        PROTOCOL_LEGACY => Ok(LocalEndpointProtocol::LegacyV1),
-        PROTOCOL_MANAGED => Ok(LocalEndpointProtocol::ManagedV2),
-        _ => Err(EndpointCredentialError::at(
-            EndpointCredentialErrorKind::InvalidValue,
-            "protocol",
-        )),
-    }
+    value.as_str().ok_or_else(|| {
+        EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, field)
+    })
 }
 
 fn platform(value: &serde_json::Value) -> Result<Platform, EndpointCredentialError> {
@@ -392,14 +365,20 @@ fn decode_incarnation(value: &serde_json::Value) -> Result<[u8; 16], EndpointCre
 }
 
 #[cfg(unix)]
-fn required_u64(value: &serde_json::Value, field: &'static str) -> Result<u64, EndpointCredentialError> {
+fn required_u64(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<u64, EndpointCredentialError> {
     value.as_u64().ok_or_else(|| {
         EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, field)
     })
 }
 
 #[cfg(unix)]
-fn required_i64(value: &serde_json::Value, field: &'static str) -> Result<i64, EndpointCredentialError> {
+fn required_i64(
+    value: &serde_json::Value,
+    field: &'static str,
+) -> Result<i64, EndpointCredentialError> {
     value.as_i64().ok_or_else(|| {
         EndpointCredentialError::at(EndpointCredentialErrorKind::InvalidValue, field)
     })
@@ -412,12 +391,18 @@ fn unix_credential(
     endpoint: LocalEndpoint,
 ) -> Result<EndpointCredential, EndpointCredentialError> {
     let endpoint = bind_namespace(endpoint)?;
-    let device = required_u64(wire.device.as_ref().ok_or_else(|| {
-        EndpointCredentialError::at(EndpointCredentialErrorKind::MissingField, "device")
-    })?, "device")?;
-    let inode = required_u64(wire.inode.as_ref().ok_or_else(|| {
-        EndpointCredentialError::at(EndpointCredentialErrorKind::MissingField, "inode")
-    })?, "inode")?;
+    let device = required_u64(
+        wire.device.as_ref().ok_or_else(|| {
+            EndpointCredentialError::at(EndpointCredentialErrorKind::MissingField, "device")
+        })?,
+        "device",
+    )?;
+    let inode = required_u64(
+        wire.inode.as_ref().ok_or_else(|| {
+            EndpointCredentialError::at(EndpointCredentialErrorKind::MissingField, "inode")
+        })?,
+        "inode",
+    )?;
     let changed_secs = required_i64(
         wire.changedSecs.as_ref().ok_or_else(|| {
             EndpointCredentialError::at(EndpointCredentialErrorKind::MissingField, "changedSecs")
@@ -451,24 +436,16 @@ fn build_unix(
     schema_version: u32,
 ) -> Result<EndpointCredential, EndpointCredentialError> {
     match (schema_version, incarnation) {
-        // An incarnation belongs only to a managed-v2 endpoint, so pairing it
-        // with the legacy protocol is an internally inconsistent record.
-        (SCHEMA_VERSION_V2, Some(incarnation))
-            if endpoint.protocol() == LocalEndpointProtocol::ManagedV2 =>
-        {
-            Ok(EndpointCredential::unix_managed(endpoint, identity, incarnation))
-        }
-        (SCHEMA_VERSION_V2, Some(_)) => Err(EndpointCredentialError::at(
-            EndpointCredentialErrorKind::InvalidValue,
-            "protocol",
+        // Only schema-v2 records with a native incarnation describe Unix listeners.
+        (SCHEMA_VERSION_V2, Some(incarnation)) => Ok(EndpointCredential::unix_managed(
+            endpoint,
+            identity,
+            incarnation,
         )),
         (SCHEMA_VERSION_V2, None) => Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::IncarnationRequired,
             "incarnation",
         )),
-        (SCHEMA_VERSION_V1, None) if endpoint.protocol() == LocalEndpointProtocol::LegacyV1 => {
-            Ok(EndpointCredential::unix(endpoint, identity))
-        }
         // A v1 record can never be promoted into a UUID incarnation, and a
         // managed-v2 endpoint is not representable without one.
         (SCHEMA_VERSION_V1, _) => Err(EndpointCredentialError::at(
@@ -525,7 +502,7 @@ fn windows_credential(
         ));
     }
     let endpoint = bind_namespace(endpoint)?;
-    if endpoint.protocol() != LocalEndpointProtocol::LegacyV1 {
+    if endpoint.protocol() != PROTOCOL_WINDOWS {
         return Err(EndpointCredentialError::at(
             EndpointCredentialErrorKind::UnsupportedPlatform,
             "protocol",

@@ -13,7 +13,6 @@ Outputs: QPS=<number>
 """
 from __future__ import annotations
 
-import glob
 import json
 import os
 import pickle
@@ -177,11 +176,6 @@ def _best_effort_unregister_relay_upstream(
 
 
 def cleanup_stale():
-    for f in glob.glob('/tmp/c_two_ipc/relay_bench_*.sock'):
-        try:
-            os.unlink(f)
-        except OSError:
-            pass
     try:
         from c_two.mem import cleanup_stale_shm
         cleanup_stale_shm()

@@ -27,14 +27,13 @@ pub mod owner;
 pub use owner::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};
 
 #[cfg(unix)]
-mod unix_endpoint;
+mod unix_common;
 #[cfg(unix)]
 mod unix_managed;
 
 /// An opaque proof of one exact OS endpoint object created by this runtime.
 ///
-/// Unix credentials contain the v1 socket identity recorded beside the
-/// endpoint. A managed-v2 credential additionally carries the listener
+/// Unix credentials contain the socket identity and listener
 /// incarnation, so an old credential can never authorize removal of a newer
 /// listener that reused the same socket path. Windows credentials describe a
 /// kernel-managed named pipe and are not Unix cleanup capabilities.
@@ -52,20 +51,10 @@ impl EndpointCredential {
         &self.endpoint
     }
 
-    /// The listener incarnation carried by a managed-v2 credential. A v1
-    /// legacy credential returns `None`; this is metadata, not a capability.
+    /// The listener incarnation; this is metadata, not a capability.
     #[cfg(unix)]
     pub fn incarnation(&self) -> Option<[u8; 16]> {
         self.incarnation
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn unix(endpoint: LocalEndpoint, identity: UnixSocketIdentity) -> Self {
-        Self {
-            endpoint,
-            identity,
-            incarnation: None,
-        }
     }
 
     #[cfg(unix)]
@@ -237,10 +226,8 @@ impl EndpointSweepScope {
         let root = std::path::Path::new(endpoint.os_name()).parent();
         let mut targets = Vec::with_capacity(addresses.len());
         for address in addresses {
-            let target = LocalEndpoint::from_address_with_protocol(address, endpoint.protocol())?;
-            if target.protocol() != endpoint.protocol()
-                || std::path::Path::new(target.os_name()).parent() != root
-            {
+            let target = LocalEndpoint::from_address(address)?;
+            if std::path::Path::new(target.os_name()).parent() != root {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "endpoint sweep target is outside its namespace",
@@ -573,8 +560,7 @@ impl LocalListener {
     }
 
     /// Closes the listener and reports the native socket cleanup result.
-    /// The v1 ownership `.lock` file is deliberately retained; a managed-v2
-    /// listener retires its own lease entry under the namespace gate.
+    /// Unix listeners retire their lease entry under the namespace gate.
     pub fn close(self) -> EndpointReapResult {
         self.0.close()
     }

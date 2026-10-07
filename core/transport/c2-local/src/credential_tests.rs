@@ -11,38 +11,15 @@
 
 use super::*;
 
-/// The protocol type is named directly because this test module is a sibling of
-/// the codec module, not a child, so `super::*` is the crate root.
-#[cfg(any(unix, windows))]
-use c2_config::LocalEndpointProtocol;
-
-/// The platform name this build must accept, derived the same way the codec
-/// derives it. Keeping it local avoids widening the codec's API for a test.
 fn host_platform() -> &'static str {
     if cfg!(windows) { "windows" } else { "unix" }
 }
-
-/// Binds a real managed listener so credentials under test are genuine native
-/// values, never hand-built structs.
 #[cfg(unix)]
 fn managed() -> (LocalListener, EndpointCredential) {
-    let unique = uuid::Uuid::new_v4().simple().to_string();
-    let endpoint = LocalEndpoint::from_address_with_protocol(
-        &format!("ipc://codec-{}", &unique[..16]),
-        c2_config::LocalEndpointProtocol::ManagedV2,
-    )
-    .unwrap();
-    let listener = LocalListener::bind(&endpoint).expect("bind managed listener");
-    let credential = listener.credential();
-    (listener, credential)
-}
-
-#[cfg(unix)]
-fn legacy() -> (LocalListener, EndpointCredential) {
-    let unique = uuid::Uuid::new_v4().simple().to_string();
     let endpoint =
-        LocalEndpoint::from_address(&format!("ipc://codec-{:016}", &unique[..16])).unwrap();
-    let listener = LocalListener::bind(&endpoint).expect("bind legacy listener");
+        LocalEndpoint::from_address(&format!("ipc://codec-{}", uuid::Uuid::new_v4().simple()))
+            .unwrap();
+    let listener = LocalListener::bind(&endpoint).expect("bind native listener");
     let credential = listener.credential();
     (listener, credential)
 }
@@ -53,11 +30,7 @@ fn legacy() -> (LocalListener, EndpointCredential) {
 fn kernel_managed() -> EndpointCredential {
     let unique = uuid::Uuid::new_v4().simple().to_string();
     let endpoint =
-        LocalEndpoint::from_address_with_protocol(
-            &format!("ipc://codec-{:016}", &unique[..16]),
-            LocalEndpointProtocol::LegacyV1,
-        )
-        .unwrap();
+        LocalEndpoint::from_address(&format!("ipc://codec-{:016}", &unique[..16])).unwrap();
     EndpointCredential::kernel_managed(endpoint)
 }
 
@@ -71,8 +44,13 @@ async fn inspect_managed_when_gate_available(endpoint: &LocalEndpoint) -> Endpoi
     loop {
         match inspect_endpoint(endpoint) {
             EndpointInspection::Present(credential) => return credential,
-            EndpointInspection::IoError(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(std::time::Instant::now() < deadline, "namespace gate stayed busy");
+            EndpointInspection::IoError(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "namespace gate stayed busy"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             other => panic!("a live managed listener must inspect as present, got {other:?}"),
@@ -119,20 +97,6 @@ async fn managed_credential_round_trips_without_a_path() {
         round_tripped.endpoint().os_name(),
         credential.endpoint().os_name()
     );
-    drop(listener);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn legacy_v1_credential_round_trips_without_an_incarnation() {
-    let (listener, credential) = legacy();
-    assert_eq!(credential.incarnation(), None);
-    let json = credential.to_json().unwrap();
-    assert!(!json.contains("incarnation"));
-
-    let round_tripped = decoded(&json).unwrap();
-    assert_eq!(round_tripped, credential);
-    assert_eq!(round_tripped.incarnation(), None);
     drop(listener);
 }
 
@@ -193,25 +157,19 @@ async fn v2_requires_an_incarnation_and_legacy_records_are_never_upgraded() {
         }),
         &[EndpointCredentialErrorKind::IncarnationRequired],
     );
-    drop(listener);
-
-    // A legacy endpoint claiming v2 is not promoted: it has no incarnation,
-    // so it fails rather than becoming a UUID credential.
-    let (listener, credential) = legacy();
-    let json = credential.to_json().unwrap();
+    for schema_version in [1, 2] {
+        assert_rejected(
+            &mutate(&json, |object| {
+                object.insert("schemaVersion".into(), schema_version.into());
+                object.insert("protocol".into(), "legacy-v1".into());
+                object.remove("incarnation");
+            }),
+            &[EndpointCredentialErrorKind::InvalidValue],
+        );
+    }
     assert_rejected(
         &mutate(&json, |object| {
-            object.insert("schemaVersion".into(), 2.into());
-        }),
-        &[EndpointCredentialErrorKind::IncarnationRequired],
-    );
-    // A v1 record must not smuggle an incarnation in either.
-    assert_rejected(
-        &mutate(&json, |object| {
-            object.insert(
-                "incarnation".into(),
-                "00112233445566778899aabbccddeeff".into(),
-            );
+            object.insert("schemaVersion".into(), 1.into());
         }),
         &[EndpointCredentialErrorKind::InvalidValue],
     );
@@ -323,10 +281,10 @@ async fn decoding_does_not_create_filesystem_state() {
     // Decode a syntactically valid credential for an unbound, unique target.
     // Other parallel listeners may change the shared namespace, so observe
     // only this target's native-derived backing names, never a global count.
-    let endpoint = LocalEndpoint::from_address_with_protocol(
-        &format!("ipc://codec-unbound-{}", uuid::Uuid::new_v4().simple()),
-        LocalEndpointProtocol::ManagedV2,
-    )
+    let endpoint = LocalEndpoint::from_address(&format!(
+        "ipc://codec-unbound-{}",
+        uuid::Uuid::new_v4().simple()
+    ))
     .unwrap();
     let mut document: serde_json::Value =
         serde_json::from_str(&credential.to_json().unwrap()).unwrap();
@@ -334,10 +292,7 @@ async fn decoding_does_not_create_filesystem_state() {
     let json = document.to_string();
     let socket = std::path::Path::new(endpoint.os_name());
     let stem = socket.file_stem().unwrap().to_str().unwrap();
-    let root = socket
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let root = socket.parent().unwrap().to_path_buf();
     let target_entries = || {
         std::fs::read_dir(&root)
             .unwrap()
@@ -380,7 +335,10 @@ async fn a_decoded_managed_credential_reaps_through_the_native_gate() {
             // A gate held by another process is not a cleanup decision, so
             // retry rather than treat contention as a verdict.
             EndpointReapResult::Busy => {
-                assert!(std::time::Instant::now() < deadline, "retired target stayed busy");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "retired target stayed busy"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
             result => break result,
@@ -523,17 +481,21 @@ fn windows_kernel_managed_credential_round_trips_as_v1() {
 #[cfg(windows)]
 #[test]
 fn windows_rejects_a_unix_platform_document() {
-    let document =
-        r#"{"schemaVersion":1,"address":"ipc://codec-badplatform","protocol":"legacy-v1","platform":"unix"}"#;
-    assert_rejected(&document, &[EndpointCredentialErrorKind::UnsupportedPlatform]);
+    let document = r#"{"schemaVersion":1,"address":"ipc://codec-badplatform","protocol":"legacy-v1","platform":"unix"}"#;
+    assert_rejected(
+        &document,
+        &[EndpointCredentialErrorKind::UnsupportedPlatform],
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn unix_rejects_a_windows_platform_document() {
-    let document =
-        r#"{"schemaVersion":1,"address":"ipc://codec-badplatform","protocol":"legacy-v1","platform":"windows"}"#;
-    assert_rejected(&document, &[EndpointCredentialErrorKind::UnsupportedPlatform]);
+    let document = r#"{"schemaVersion":1,"address":"ipc://codec-badplatform","protocol":"named-pipe","platform":"windows"}"#;
+    assert_rejected(
+        &document,
+        &[EndpointCredentialErrorKind::UnsupportedPlatform],
+    );
 }
 
 /// Windows refuses managed-v2 during canonical endpoint derivation, before
@@ -547,6 +509,6 @@ fn windows_rejects_managed_v2_documents() {
     assert_eq!(error.kind(), EndpointCredentialErrorKind::InvalidValue);
     assert_eq!(error.field(), Some("address"));
     // A Unix identity field is not a Windows pipe property either.
-    let with_identity = r#"{"schemaVersion":1,"address":"ipc://codec-managedunsupported","protocol":"legacy-v1","platform":"windows","device":1,"inode":2}"#;
+    let with_identity = r#"{"schemaVersion":1,"address":"ipc://codec-managedunsupported","protocol":"named-pipe","platform":"windows","device":1,"inode":2}"#;
     assert_rejected(with_identity, &[EndpointCredentialErrorKind::InvalidValue]);
 }

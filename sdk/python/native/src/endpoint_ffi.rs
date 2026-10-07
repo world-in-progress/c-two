@@ -30,7 +30,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyDict, PyInt};
 
-use c2_config::{ConfigResolver, ConfigSources, LocalEndpoint, LocalEndpointProtocol};
+use c2_config::LocalEndpoint;
 use c2_core::{
     EndpointCredential, EndpointInspection, EndpointReapResult, EndpointSweep,
     EndpointUnverifiedReason, SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
@@ -82,42 +82,6 @@ impl Drop for SweepLease {
     }
 }
 
-/// Parses an endpoint protocol name. The set of accepted names belongs to the
-/// Rust enum, never to a Python table.
-fn parse_protocol(value: &str) -> PyResult<LocalEndpointProtocol> {
-    value.parse().map_err(PyValueError::new_err)
-}
-
-/// Resolves the configured endpoint protocol from the current process
-/// environment and `.env` through the same Rust resolver the SDK uses.
-///
-/// This is the `endpoint_protocol=None` path of `inspect_endpoint`. A
-/// build-time constant would silently override the configured policy, so the
-/// default is never hardcoded here.
-fn configured_protocol() -> PyResult<LocalEndpointProtocol> {
-    ConfigResolver::resolve_client_ipc(
-        Default::default(),
-        Default::default(),
-        ConfigSources::from_process(),
-    )
-    .map(|config| config.base.endpoint_protocol)
-    .map_err(|error| {
-        PyValueError::new_err(format!(
-            "cannot resolve the configured endpoint protocol: {error}"
-        ))
-    })
-}
-
-/// The endpoint for `address`, honoring an explicit protocol first.
-fn endpoint_for(address: &str, protocol: Option<&str>) -> PyResult<LocalEndpoint> {
-    let protocol = match protocol {
-        Some(protocol) => parse_protocol(protocol)?,
-        None => configured_protocol()?,
-    };
-    LocalEndpoint::from_address_with_protocol(address, protocol)
-        .map_err(|error| PyValueError::new_err(error.to_string()))
-}
-
 fn unverified_reason_name(reason: EndpointUnverifiedReason) -> &'static str {
     match reason {
         EndpointUnverifiedReason::UnsafeDirectory => "unsafe-directory",
@@ -165,22 +129,16 @@ fn result_dict<'py>(py: Python<'py>, status: &str) -> PyResult<Bound<'py, PyDict
 
 /// Projects a reap result. Only the native outcome is reported; a partial or
 /// unverifiable cleanup never becomes a fabricated success.
-fn reap_dict<'py>(
-    py: Python<'py>,
-    result: &EndpointReapResult,
-) -> PyResult<Bound<'py, PyDict>> {
+fn reap_dict<'py>(py: Python<'py>, result: &EndpointReapResult) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     match result {
         EndpointReapResult::Reaped => set_result_fields(&dict, "reaped", None, None)?,
         EndpointReapResult::AlreadyAbsent => {
             set_result_fields(&dict, "already-absent", None, None)?
         }
-        EndpointReapResult::Busy => set_result_fields(
-            &dict,
-            "busy",
-            None,
-            Some("coordinator-held".to_string()),
-        )?,
+        EndpointReapResult::Busy => {
+            set_result_fields(&dict, "busy", None, Some("coordinator-held".to_string()))?
+        }
         // A decoded credential that does not describe this endpoint, or that
         // no longer matches the live endpoint object, is a stale target. It is
         // never retried as if it were a transient failure.
@@ -264,13 +222,12 @@ impl PyEndpointCredential {
         self.inner.endpoint().address()
     }
 
-    /// The endpoint protocol this credential records. Metadata only.
+    /// Native backend credential metadata.
     #[getter]
     fn protocol(&self) -> &'static str {
-        self.inner.endpoint().protocol().as_str()
+        self.inner.endpoint().protocol()
     }
 
-    /// The OS namespace this credential lives in. Metadata only.
     #[getter]
     fn platform(&self) -> &'static str {
         if cfg!(windows) { "windows" } else { "unix" }
@@ -282,23 +239,17 @@ impl PyEndpointCredential {
         format!(
             "PyEndpointCredential(address={:?}, protocol={:?})",
             self.inner.endpoint().address(),
-            self.inner.endpoint().protocol().as_str(),
+            self.inner.endpoint().protocol(),
         )
     }
 }
 
 /// Inspects one logical local endpoint without creating ownership metadata.
 ///
-/// `endpoint_protocol=None` resolves the configured process policy through the
-/// Rust resolver. An explicit value is parsed by the Rust enum.
 #[pyfunction]
-#[pyo3(signature = (address, *, endpoint_protocol=None))]
-fn inspect_endpoint_endpoint<'py>(
-    py: Python<'py>,
-    address: &str,
-    endpoint_protocol: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let endpoint = endpoint_for(address, endpoint_protocol)?;
+#[pyo3(signature = (address))]
+fn inspect_endpoint_endpoint<'py>(py: Python<'py>, address: &str) -> PyResult<Bound<'py, PyDict>> {
+    let endpoint = endpoint_for(address)?;
     // The inspection may touch the filesystem; it runs without the GIL.
     let inspection = py.detach(|| inspect_endpoint(&endpoint));
     match inspection {
@@ -320,10 +271,7 @@ fn inspect_endpoint_endpoint<'py>(
         }
         EndpointInspection::Unverified(reason) => {
             let dict = result_dict(py, "unverified")?;
-            dict.set_item(
-                "reason",
-                Some(unverified_reason_name(reason).to_string()),
-            )?;
+            dict.set_item("reason", Some(unverified_reason_name(reason).to_string()))?;
             Ok(dict)
         }
         EndpointInspection::IoError(error) => {
@@ -339,11 +287,7 @@ fn inspect_endpoint_endpoint<'py>(
 
 /// Reaps the exact endpoint object named by `credential`.
 ///
-/// The protocol used to derive the endpoint comes from the credential itself,
-/// so a managed-v2 credential is never misread as stale because the process
-/// default happens to be legacy-v1. The logical address is compared first so a
-/// credential for a different endpoint is reported as `stale-target` rather
-/// than being probed against this endpoint's root.
+/// Reap the native endpoint only after validating the credential address.
 #[pyfunction]
 fn reap_endpoint_credential<'py>(
     py: Python<'py>,
@@ -357,10 +301,9 @@ fn reap_endpoint_credential<'py>(
         return Ok(dict);
     }
     // Re-derive through the same authority: a decoded credential never supplies
-    // a path, only the logical address and protocol it recorded.
-    let endpoint =
-        LocalEndpoint::from_address_with_protocol(recorded.address(), recorded.protocol())
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    // a path, only its logical address and native backend metadata.
+    let endpoint = LocalEndpoint::from_address(recorded.address())
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
     let result = py.detach(|| reap_endpoint(&endpoint, &credential.inner));
     reap_dict(py, &result)
 }
@@ -377,7 +320,6 @@ fn reap_endpoint_credential<'py>(
 pub(crate) struct PyEndpointSweep {
     inner: Option<EndpointSweep>,
     lease: Option<SweepLease>,
-    protocol: String,
     default_budget: SweepBudget,
     batches: u64,
     closed: bool,
@@ -386,12 +328,10 @@ pub(crate) struct PyEndpointSweep {
 impl PyEndpointSweep {
     fn open<'py>(
         py: Python<'py>,
-        protocol: &str,
         addresses: Option<Vec<String>>,
         max_entries: Option<Bound<'py, PyAny>>,
         max_ms: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
-        let protocol = parse_protocol(protocol)?;
         // Both explicit dimensions are validated here, before the process
         // lease is taken or the native iterator is opened: a rejected budget
         // can never leave a held lease or a half-open sweep behind. `None`
@@ -403,7 +343,7 @@ impl PyEndpointSweep {
         );
         // The namespace is derived from `LocalEndpoint` authority using a
         // reserved probe address; it is never a hardcoded directory.
-        let probe = LocalEndpoint::from_address_with_protocol("ipc://c2-endpoint-sweep", protocol)
+        let probe = LocalEndpoint::from_address("ipc://c2-endpoint-sweep")
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let scope = addresses
             .as_ref()
@@ -423,14 +363,13 @@ impl PyEndpointSweep {
                 drop(lease);
                 return Err(PyValueError::new_err(format!(
                     "cannot open the {} endpoint namespace: {error}",
-                    protocol.as_str()
+                    probe.protocol()
                 )));
             }
         };
         Ok(Self {
             inner: Some(inner),
             lease: Some(lease),
-            protocol: protocol.as_str().to_string(),
             default_budget,
             batches: 0,
             closed: false,
@@ -514,10 +453,7 @@ fn batch_dict<'py>(
     dict.set_item(
         "last_io_error",
         match batch.last_io_error {
-            Some(error) => Some((
-                io_error_kind_name(error.kind),
-                error.raw_os_error,
-            )),
+            Some(error) => Some((io_error_kind_name(error.kind), error.raw_os_error)),
             None => None,
         },
     )?;
@@ -531,22 +467,16 @@ fn batch_dict<'py>(
 
 #[pymethods]
 impl PyEndpointSweep {
-    /// Opens the namespace for one protocol. The parameter is required and is
-    /// never guessed: a sweep must not silently cover the wrong namespace.
-    ///
-    /// ``max_entries`` / ``max_ms`` are optional overrides of the stored
-    /// default budget. They are validated here, before the process lease and
-    /// iterator exist.
+    /// Opens the native namespace with optional address scope and bounded budgets.
     #[new]
-    #[pyo3(signature = (protocol, *, addresses=None, max_entries=None, max_ms=None))]
+    #[pyo3(signature = (*, addresses=None, max_entries=None, max_ms=None))]
     fn new<'py>(
         py: Python<'py>,
-        protocol: &str,
         addresses: Option<Vec<String>>,
         max_entries: Option<Bound<'py, PyAny>>,
         max_ms: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
-        Self::open(py, protocol, addresses, max_entries, max_ms)
+        Self::open(py, addresses, max_entries, max_ms)
     }
 
     /// Advances the native iterator by one bounded batch.
@@ -584,7 +514,11 @@ impl PyEndpointSweep {
 
     #[getter]
     fn protocol(&self) -> &str {
-        &self.protocol
+        if cfg!(windows) {
+            "named-pipe"
+        } else {
+            "managed-v2"
+        }
     }
 
     #[getter]
@@ -621,10 +555,7 @@ impl PyEndpointSweep {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "PyEndpointSweep(protocol={:?}, closed={})",
-            self.protocol, self.closed
-        )
+        format!("PyEndpointSweep(closed={})", self.closed)
     }
 }
 
@@ -651,4 +582,8 @@ pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(inspect_endpoint_endpoint, module)?)?;
     module.add_function(wrap_pyfunction!(reap_endpoint_credential, module)?)?;
     Ok(())
+}
+
+fn endpoint_for(address: &str) -> PyResult<LocalEndpoint> {
+    LocalEndpoint::from_address(address).map_err(|e| PyValueError::new_err(e.to_string()))
 }

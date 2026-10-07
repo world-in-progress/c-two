@@ -160,11 +160,11 @@ test('createNodeIpcConnect rejects sockets that close before connect', async () 
 });
 
 test('c2-mem-ffi symbol adapters validate ABI version before creating pools', async () => {
-  assert.equal(C2_MEM_FFI_ABI_VERSION, 2);
+  assert.equal(C2_MEM_FFI_ABI_VERSION, 3);
   let createCount = 0;
   const symbols = {
     c2_mem_ffi_abi_version() {
-      return C2_MEM_FFI_ABI_VERSION + 1;
+      return C2_MEM_FFI_ABI_VERSION - 1;
     },
     c2_mem_ffi_request_pool_new() {
       createCount += 1;
@@ -201,7 +201,7 @@ test('c2-mem-ffi symbol adapters validate ABI version before creating pools', as
       maxSegments: 1,
       minBlockSize: 512,
     }),
-    /ABI version 3.*expected version 2/,
+    /ABI version 2.*expected version 3/,
   );
   assert.equal(createCount, 0);
 });

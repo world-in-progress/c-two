@@ -416,14 +416,11 @@ impl<'a> RouteAuthority<'a> {
         // protocol: a managed-v2 upstream on a platform that cannot serve it
         // is rejected here as a configuration error, never probed across
         // endpoint namespaces.
-        c2_ipc::local_endpoint_from_ipc_address_with_protocol(
-            address,
-            self.state.config().upstream_ipc.base.endpoint_protocol,
-        )
-        .map(|_| ())
-        .map_err(|err| ControlError::InvalidAddress {
-            reason: err.to_string(),
-        })
+        c2_ipc::local_endpoint_from_ipc_address(address)
+            .map(|_| ())
+            .map_err(|err| ControlError::InvalidAddress {
+                reason: err.to_string(),
+            })
     }
 
     pub(crate) fn validate_crm_tag(

@@ -19,7 +19,7 @@
 //! (`LOCK_EX | LOCK_NB`), so a listener that holds its lease and is dropping can
 //! never deadlock against a maintenance path that holds the gate.
 
-use crate::unix_endpoint::{
+use crate::unix_common::{
     BoundSocketGuard, EndpointDirectory, EndpointNames, SocketIdentity, SweepLease,
     dirfd_relative_socket_path, fstat, probe_listener_is_live, same_file, set_socket_permissions,
     socket_unverified, stat_is,
@@ -28,7 +28,6 @@ use crate::{
     EndpointCredential, EndpointInspection, EndpointReapResult, EndpointUnverifiedReason,
     LocalEndpoint, SweepBatch, SweepBudget,
 };
-use c2_config::LocalEndpointProtocol;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, ReadDir};
 use std::io::{self, Write};
@@ -244,9 +243,7 @@ fn read_record(file: &File) -> io::Result<Option<OwnerRecord>> {
 fn write_record(file: &File, record: &OwnerRecord) -> io::Result<()> {
     let bytes = record.encode()?;
     #[cfg(test)]
-    if crate::unix_endpoint::fault::take_if(
-        crate::unix_endpoint::fault::Failure::ManagedRecordWrite,
-    ) {
+    if crate::unix_common::fault::take_if(crate::unix_common::fault::Failure::ManagedRecordWrite) {
         return Err(io::Error::new(
             io::ErrorKind::WriteZero,
             "injected managed owner record write failure",
@@ -265,8 +262,8 @@ fn write_record(file: &File, record: &OwnerRecord) -> io::Result<()> {
 /// error code.
 #[cfg(test)]
 fn partial_write_limit(bytes: &[u8]) -> Option<usize> {
-    if crate::unix_endpoint::fault::take_if(
-        crate::unix_endpoint::fault::Failure::ManagedRecordPartialWrite,
+    if crate::unix_common::fault::take_if(
+        crate::unix_common::fault::Failure::ManagedRecordPartialWrite,
     ) {
         Some(bytes.len().saturating_sub(1).max(1))
     } else {
@@ -324,10 +321,7 @@ fn record_matches_endpoint(record: &OwnerRecord, endpoint: &LocalEndpoint) -> bo
     if record.address != endpoint.address() {
         return false;
     }
-    let Ok(derived) = LocalEndpoint::from_address_with_protocol(
-        &record.address,
-        LocalEndpointProtocol::ManagedV2,
-    ) else {
+    let Ok(derived) = LocalEndpoint::from_address(&record.address) else {
         return false;
     };
     derived.os_name() == endpoint.os_name()
@@ -887,7 +881,7 @@ fn bind_in_verified_directory(
         return tokio::net::UnixListener::bind(path);
     }
     let std_listener =
-        crate::unix_endpoint::bind_in_directory_on_thread(directory, &names.socket_os)?;
+        crate::unix_common::bind_in_directory_on_thread(directory, &names.socket_os)?;
     std_listener.set_nonblocking(true)?;
     tokio::net::UnixListener::from_std(std_listener)
 }
@@ -927,7 +921,7 @@ fn remove_stale_managed_socket(
         return Err(endpoint_in_use());
     }
     let opened_lock = fstat(lease.as_raw_fd())?;
-    match crate::unix_endpoint::unlink_verified(
+    match crate::unix_common::unlink_verified(
         &namespace.directory,
         names,
         &opened_lock,
@@ -975,7 +969,7 @@ fn retire_owned(
         if identity_of(&socket_stat) != expected.identity {
             return EndpointReapResult::StaleTarget;
         }
-        match crate::unix_endpoint::unlink_verified(
+        match crate::unix_common::unlink_verified(
             &namespace.directory,
             &names,
             &opened_lock,
@@ -1054,6 +1048,9 @@ pub(crate) struct ManagedListener {
 }
 
 impl ManagedListener {
+    pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
+        bind_managed(endpoint)
+    }
     pub(crate) fn credential(&self) -> EndpointCredential {
         EndpointCredential::unix_managed(
             self.endpoint.clone(),
@@ -1218,7 +1215,7 @@ pub(crate) fn bind_managed_at(
     };
     #[cfg(test)]
     {
-        use crate::unix_endpoint::fault;
+        use crate::unix_common::fault;
         if fault::take_if(fault::Failure::ManagedRecordWriteAfterReplacement) {
             // Simulate a foreign object taking the socket entry between bind and
             // record write. The record then cannot describe this bind's socket,
@@ -1402,7 +1399,7 @@ fn reap_locked(
                     EndpointUnverifiedReason::CoordinatorReplaced,
                 );
             }
-            match crate::unix_endpoint::unlink_verified(
+            match crate::unix_common::unlink_verified(
                 &namespace.directory,
                 &names,
                 &opened_lock,
@@ -1487,9 +1484,7 @@ pub(crate) fn reap_slot(root: &Path, stem: &OsStr) -> EndpointReapResult {
         Err(reason) => return EndpointReapResult::Unverified(reason),
     };
     let address = record.address.clone();
-    let Ok(endpoint) =
-        LocalEndpoint::from_address_with_protocol(&address, LocalEndpointProtocol::ManagedV2)
-    else {
+    let Ok(endpoint) = LocalEndpoint::from_address(&address) else {
         return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord);
     };
     let Ok(stem_expected) = endpoint_stem(&endpoint) else {
@@ -1605,12 +1600,6 @@ pub(crate) struct ManagedSweep {
 
 impl ManagedSweep {
     pub(crate) fn for_endpoint(endpoint: &LocalEndpoint) -> io::Result<Self> {
-        if endpoint.protocol() != LocalEndpointProtocol::ManagedV2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a managed-v2 endpoint",
-            ));
-        }
         let root = Path::new(endpoint.os_name())
             .parent()
             .ok_or_else(|| {
