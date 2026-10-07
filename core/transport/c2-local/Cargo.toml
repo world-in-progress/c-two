@@ -24,5 +24,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 c2-local-security = { version = "0.1.0", path = "../../foundation/c2-local-security" }
-sha2 = "0.10"
+sha2 = "0.11.0"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Wdk_Storage_FileSystem"] }

@@ -14,7 +14,7 @@ dotenvy = "0.15"
 gethostname = "1.1"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
-sha2 = "0.10"
+sha2 = "0.11.0"
 
 [target.'cfg(windows)'.dependencies]
 c2-local-security = { version = "0.1.0", path = "../c2-local-security" }
