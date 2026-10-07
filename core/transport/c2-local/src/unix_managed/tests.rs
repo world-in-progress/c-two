@@ -799,7 +799,7 @@ async fn managed_budgeted_sweep_advances_past_busy_and_corrupt_slots() {
     assert!(matches!(live_listener.close(), EndpointReapResult::Reaped));
 }
 
-/// Public sweep dispatch: `EndpointSweep::for_endpoint` enumerates the real
+/// Public sweep dispatch: `EndpointSweep::for_scope` enumerates the real
 /// managed-v2 namespace, converges registered leftovers, and never touches the
 /// unselected slots.
 #[tokio::test]
@@ -820,19 +820,31 @@ async fn managed_public_sweep_targets_the_versioned_namespace_only() {
     let mut sweep = retry_sweep(|| crate::EndpointSweep::for_scope(&scope));
     let mut complete = false;
     let mut reaped = 0;
-    for _ in 0..64 {
+    // Scope constrains retirement, not directory enumeration. Other native
+    // runtimes may add names, so a fixed batch count cannot prove directory EOF.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut visited = 0;
+    while std::time::Instant::now() < deadline {
         let batch = sweep.next_batch(SweepBudget {
             max_entries: 1,
             max_duration: Duration::ZERO,
         });
+        assert!(batch.entries_visited <= 1, "{batch:?}");
+        assert_eq!(batch.io_errors, 0, "{batch:?}");
         reaped += batch.reaped;
+        visited += batch.entries_visited;
         assert!(!batch.round_interrupted, "{batch:?}");
+        assert!(!batch.namespace_changed, "{batch:?}");
         if batch.round_complete {
             complete = true;
             break;
         }
+        assert_eq!(batch.entries_visited, 1, "round stopped advancing: {batch:?}");
     }
-    assert!(complete, "managed namespace must finish its bounded round");
+    assert!(
+        complete,
+        "managed namespace must reach EOF before deadline; visited={visited}, reaped={reaped}"
+    );
     assert!(reaped >= 1, "registered leftover must converge: {reaped}");
     assert!(!socket_path(&dead).exists());
     assert!(!lease_path(&dead).exists());
