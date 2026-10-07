@@ -1,0 +1,11 @@
+# 唯一原生本地端点实施记录
+
+2026-10-07。当前实现按用户要求移除未发布新版的旧Unix端点路径及公开选择开关。Unix自动使用托管v2.2，Windows使用当前登录SID Named Pipe；Persistent和OwnerBound保留。C ABI discriminator为3，正式包版本未变。
+
+生产者129cedad27bb9ba71d030aeea4c17a18c268c72d相对9e34991d24bc25bc46416e0d12edacc19de780a1修改44个源码/测试路径。独立审查确认内存池C callback与父提交完全一致。Host集成为75d518f，收尾d3d175c修正Windows credential错误字段预期、补回未知socket的MissingOwnership/reap/不制造lease负例、移除Unix identity/incarnation不可达空值。JSON输入缺失字段验证保留。
+
+Host本机c2-local/owner共77项通过，纯MSVC测试编译检查通过；后者不表示Windows执行通过。生产者config102/local65/owner12、其他聚焦51、Node37和独立包消费者以及Core/PyO3编译检查通过。完整固定源码门禁及产物验证仍待执行，不能据此宣称全部完成。
+
+删除仅验证已移除旧协议的测试，实际有效行为要求逐项有替代覆盖；当前不沿用此前候选所有函数ID零删除的说法。旧证据保持原始源码与计数。最终源码、完整门禁、测试迁移账目与产物哈希在真实验证后补入本记录。
+
+旧/tmp/c_two_ipc数据未被删除。未知/损坏/部分初始化的保守边界、已安装hey-my-buddy接入、正式发布及Windows11桌面验收分别保留实际状态。
