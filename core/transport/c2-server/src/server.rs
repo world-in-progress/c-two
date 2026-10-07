@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use c2_local::{
-    DEFAULT_CONNECT_TIMEOUT, LocalEndpoint, LocalListener, LocalReadHalf, LocalStream,
-    LocalWriteHalf,
+    DEFAULT_CONNECT_TIMEOUT, EndpointReapResult, LocalEndpoint, LocalListener, LocalReadHalf,
+    LocalStream, LocalWriteHalf,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
@@ -1161,10 +1161,12 @@ impl Server {
     ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
         if matches!(
             self.lifecycle_state(),
-            ServerLifecycleState::Stopping | ServerLifecycleState::Stopped
+            ServerLifecycleState::Stopping
+                | ServerLifecycleState::Stopped
+                | ServerLifecycleState::Failed(_)
         ) {
             self.wait_until_terminal().await?;
-            Ok(self.take_shutdown_route_outcomes())
+            self.completed_shutdown_outcomes()
         } else {
             Ok(Vec::new())
         }
@@ -1175,6 +1177,15 @@ impl Server {
     ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
         self.request_shutdown_signal();
         self.wait_until_terminal().await?;
+        self.completed_shutdown_outcomes()
+    }
+
+    // Terminal observation is a lifecycle fence even for Failed. Shutdown
+    // completion must also report that failure instead of claiming success.
+    fn completed_shutdown_outcomes(&self) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
+        if let ServerLifecycleState::Failed(message) = self.lifecycle_state() {
+            return Err(ServerError::Config(message));
+        }
         Ok(self.take_shutdown_route_outcomes())
     }
 
@@ -1354,13 +1365,40 @@ impl Server {
                             .extend(shutdown_route_outcomes);
                     }
                     let _ = gc_handle.await;
-                    drop(listener);
-                    self.set_lifecycle_state(ServerLifecycleState::Stopped);
+                    self.close_listener_for_shutdown(listener).await?;
                     break;
                 }
             }
         }
         Ok(())
+    }
+
+    async fn close_listener_for_shutdown(
+        &self,
+        listener: LocalListener,
+    ) -> Result<(), ServerError> {
+        // Drop is deliberately opportunistic. Normal shutdown must wait for
+        // bounded owner retirement and observe its result. Keep that synchronous
+        // gate wait off Tokio workers: a task on this same runtime may release it.
+        let result = tokio::task::spawn_blocking(move || listener.close())
+            .await
+            .map_err(|error| ServerError::Config(format!("listener cleanup task failed: {error}")))
+            .and_then(|outcome| match outcome {
+                EndpointReapResult::Reaped
+                | EndpointReapResult::AlreadyAbsent
+                | EndpointReapResult::NotApplicable => Ok(()),
+                EndpointReapResult::IoError(error) => Err(ServerError::Io(error)),
+                other => Err(ServerError::Config(format!(
+                    "listener cleanup failed: {other:?}"
+                ))),
+            });
+        // The close task has finished and released its listener/lease before
+        // either terminal state is published. Failed remains restartable.
+        match &result {
+            Ok(()) => self.set_lifecycle_state(ServerLifecycleState::Stopped),
+            Err(error) => self.set_lifecycle_state(ServerLifecycleState::Failed(error.to_string())),
+        }
+        result
     }
 
     /// Observe route-close outcomes from an already initiated external shutdown.
@@ -1374,10 +1412,12 @@ impl Server {
     ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
         if matches!(
             self.lifecycle_state(),
-            ServerLifecycleState::Stopping | ServerLifecycleState::Stopped
+            ServerLifecycleState::Stopping
+                | ServerLifecycleState::Stopped
+                | ServerLifecycleState::Failed(_)
         ) {
             self.wait_until_stopped(timeout).await?;
-            Ok(self.take_shutdown_route_outcomes())
+            self.completed_shutdown_outcomes()
         } else {
             Ok(Vec::new())
         }
@@ -1390,7 +1430,7 @@ impl Server {
     ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
         self.request_shutdown_signal();
         self.wait_until_stopped(timeout).await?;
-        Ok(self.take_shutdown_route_outcomes())
+        self.completed_shutdown_outcomes()
     }
 
     /// Initiate the shutdown transaction with an explicit journal reason.
@@ -4357,6 +4397,42 @@ mod tests {
             .is_ok()
     }
 
+    #[cfg(unix)]
+    struct TestEndpointCleanup(c2_local::EndpointCredential);
+
+    #[cfg(unix)]
+    impl Drop for TestEndpointCleanup {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                // Preserve the failing assertion first. Cleanup is restricted
+                // to this test's exact object and cannot remove a successor.
+                eprintln!(
+                    "test endpoint cleanup: {:?}",
+                    c2_local::reap_endpoint(self.0.endpoint(), &self.0)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn cleanup_endpoint_on_failure(endpoint: &LocalEndpoint) -> TestEndpointCleanup {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match c2_local::inspect_endpoint(endpoint) {
+                    c2_local::EndpointInspection::Present(credential) => {
+                        return TestEndpointCleanup(credential);
+                    }
+                    c2_local::EndpointInspection::IoError(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    other => panic!("cannot capture test endpoint identity: {other:?}"),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test endpoint credential acquisition must finish")
+    }
+
     #[tokio::test]
     async fn wait_until_ready_times_out_before_start() {
         let server = Arc::new(
@@ -4406,6 +4482,177 @@ mod tests {
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
         assert!(!server.is_ready());
         assert!(!server.is_running());
+    }
+
+    /// A transient namespace operation must not turn a successful shutdown
+    /// into the best-effort Drop path, which leaves the socket for a reaper.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_join_retires_socket_after_namespace_gate_contention() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("shutdown_gate_contention"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let _cleanup = cleanup_endpoint_on_failure(server.local_endpoint()).await;
+
+        let socket = std::path::Path::new(server.local_endpoint().os_name());
+        // Open the existing coordinator only; do not create or replace any
+        // namespace object. On Unix File::lock uses the same flock as bind.
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(socket.parent().unwrap().join(".gate"))
+            .unwrap();
+        gate.lock().unwrap();
+        server.request_shutdown_signal();
+
+        // Release on a concrete close observation, not after a guessed delay.
+        // Old run publishes Stopped after Drop misses this held gate. Explicit
+        // close closes its descriptor first, letting this probe release the
+        // gate while owner retirement is still waiting. No sleeps or reap.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !server.is_running() || tokio::net::UnixStream::connect(socket).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        gate.unlock().unwrap();
+        closed.expect("shutdown must close the listener while its namespace gate is busy");
+
+        server
+            .shutdown_and_wait(Duration::from_secs(2))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(
+            !socket.exists(),
+            "successful shutdown/join must retire its socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cleanup_failure_is_terminal_observable_and_restartable() {
+        use std::os::unix::fs::FileExt;
+
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("shutdown_bad_record"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let _cleanup = cleanup_endpoint_on_failure(server.local_endpoint()).await;
+        let socket = std::path::Path::new(server.local_endpoint().os_name());
+        let lease_path = socket.with_extension("lease");
+        let record = std::fs::read(&lease_path).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .unwrap();
+        // Corrupt only our own record through its pinned descriptor, leaving
+        // the shared coordinator and every other endpoint untouched.
+        lease.write_all_at(b"invalid", 0).unwrap();
+        let shutdown = server.shutdown_and_wait(Duration::from_secs(2)).await;
+        let joined = tokio::time::timeout(Duration::from_secs(2), runner).await;
+        // Restore the fixture before any assertions can panic. Recovery and
+        // later bind use the original identity; no name-only unlink or reap.
+        lease.write_all_at(&record, 0).unwrap();
+
+        let run_error = joined
+            .unwrap()
+            .unwrap()
+            .expect_err("retirement failure must fail run");
+        assert!(
+            run_error.to_string().contains("InvalidRecord"),
+            "{run_error}"
+        );
+        assert!(shutdown.unwrap_err().to_string().contains("InvalidRecord"));
+        assert!(matches!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+        assert!(!server.is_running());
+        assert!(socket.exists(), "unverified socket must be preserved");
+        assert!(tokio::net::UnixStream::connect(socket).await.is_err());
+        lease
+            .try_lock()
+            .expect("failed close must release its listener lease");
+        lease.unlock().unwrap();
+        drop(lease);
+
+        // Lifecycle observation still fences terminal work. Every shutdown
+        // completion facade must retain the actual error, including reobservation.
+        server.wait_until_terminal().await.unwrap();
+        server
+            .wait_until_stopped(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(server.shutdown_and_wait_unbounded().await.is_err());
+        assert!(
+            server
+                .observe_external_shutdown_outcomes_unbounded()
+                .await
+                .is_err()
+        );
+        assert!(
+            server
+                .observe_external_shutdown_outcomes(Duration::from_secs(2))
+                .await
+                .is_err()
+        );
+        server.finalize_runtime_stopped();
+        assert!(matches!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+
+        server.begin_start_attempt().unwrap();
+        let restarted = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let _restart_cleanup = cleanup_endpoint_on_failure(server.local_endpoint()).await;
+        assert!(endpoint_connects(server.local_endpoint()).await);
+        server
+            .shutdown_and_wait(Duration::from_secs(2))
+            .await
+            .unwrap();
+        restarted.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(!socket.exists());
     }
 
     #[test]

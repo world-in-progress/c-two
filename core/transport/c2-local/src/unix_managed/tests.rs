@@ -922,6 +922,45 @@ async fn managed_drop_without_gate_leaves_metadata_for_the_reaper() {
     assert!(!lease_path_at(root, &endpoint).exists());
 }
 
+/// Explicit close cannot wait forever for a foreign coordinator. A bounded
+/// failure preserves exact retirement metadata and releases listener ownership.
+#[tokio::test]
+async fn managed_close_busy_gate_is_bounded_and_preserves_owner_record() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint("close-busy-gate");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let credential = listener.credential();
+    let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn(move || tx.send(listener.close()).unwrap());
+    let result = rx.recv_timeout(Duration::from_secs(2));
+    // Keep the gate held until close itself returns, rather than ending the
+    // contention after a delay. Release before asserting so a broken close
+    // cannot strand a test worker.
+    drop(held_gate);
+    closer.join().unwrap();
+    assert!(matches!(result.unwrap(), EndpointReapResult::Busy));
+    assert!(socket_path_at(root, &endpoint).exists());
+    assert!(lease_path_at(root, &endpoint).exists());
+    assert!(std::os::unix::net::UnixStream::connect(socket_path_at(root, &endpoint)).is_err());
+
+    let lease = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "a failed close must release its listener lease"
+    );
+    let record = read_record(&lease).unwrap().unwrap();
+    assert_eq!(record.identity, credential.identity());
+    assert_eq!(record.incarnation, credential.incarnation());
+}
+
 /// The P1 blocker as a real concurrent negative case: an opener is parked
 /// inside the gate-hold window while the verified `v2` directory is renamed
 /// away and a fresh `v2` takes its name. The opener must never create its
