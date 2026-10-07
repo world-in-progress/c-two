@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::ffi::c_void;
+use std::fmt::Write as _;
 use std::io;
 use std::mem::size_of;
 use std::ptr;
@@ -69,10 +70,15 @@ pub fn current_logon_sid() -> io::Result<String> {
 
 /// Stable hexadecimal identity for the current logon session.
 pub fn current_scope_id() -> io::Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(current_logon_sid()?.as_bytes())
-    ))
+    Ok(scope_id_from_sid(&current_logon_sid()?))
+}
+
+fn scope_id_from_sid(sid: &str) -> String {
+    let mut identity = String::with_capacity(64);
+    for byte in Sha256::digest(sid.as_bytes()) {
+        write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    identity
 }
 
 /// An owned, non-inheritable security descriptor allowing only this logon SID.
@@ -130,6 +136,14 @@ impl Drop for LocalSecurityAttributes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_id_preserves_sha256_hex_golden_value() {
+        assert_eq!(
+            scope_id_from_sid("S-1-5-5-123-456"),
+            "bc484936aeef0b0d16a8e27487182ac53bab2df5d723a51d15e3f52244acaac6"
+        );
+    }
 
     #[test]
     fn scope_and_acl_follow_the_current_logon() {

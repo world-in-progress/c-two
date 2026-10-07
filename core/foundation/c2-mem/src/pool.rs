@@ -2466,6 +2466,19 @@ mod tests {
         assert!(owner.dedicated_name(allocation.seg_idx).is_none());
     }
 
+    #[test]
+    fn backing_names_preserve_sha256_and_base64_golden_values() {
+        let prefix = "label_1234567800112233445566778899aabbccddeeff";
+        assert_eq!(
+            MemPool::buddy_segment_name(prefix, 2, 3),
+            "/c2eFY0EgcB2GSVR4WiMn8x6vp-SH"
+        );
+        assert_eq!(
+            MemPool::dedicated_segment_name(prefix, 2),
+            "/c2eFY0Eg2SpSqOYgE0GThVNu4U5i"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn cleanup_name_parser_accepts_only_current_bounded_namespace() {

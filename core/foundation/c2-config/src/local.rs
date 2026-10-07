@@ -1,6 +1,7 @@
 //! Logical local addresses and their operating-system endpoint names.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::io;
 
 /// Native OS namespace used by an endpoint.
@@ -69,13 +70,22 @@ impl LocalEndpoint {
     }
 }
 
+fn endpoint_identity(server_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut identity = String::with_capacity(64);
+    for byte in Sha256::digest(server_id.as_bytes()) {
+        write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    identity
+}
+
 #[cfg(unix)]
 fn endpoint_name(server_id: &str) -> io::Result<OsString> {
     use std::os::unix::ffi::OsStrExt;
 
-    use sha2::{Digest, Sha256};
     let uid = unsafe { libc::geteuid() };
-    let identity = format!("{:x}", Sha256::digest(server_id.as_bytes()));
+    let identity = endpoint_identity(server_id);
     let path =
         std::path::PathBuf::from(format!("/tmp/c2-{uid:x}/v2.2")).join(format!("{identity}.sock"));
     let os_name = path.into_os_string();
@@ -96,9 +106,8 @@ fn offset_of_sun_path() -> usize {
 
 #[cfg(windows)]
 fn endpoint_name(server_id: &str) -> io::Result<OsString> {
-    use sha2::{Digest, Sha256};
     let scope = c2_local_security::current_scope_id()?;
-    let identity = format!("{:x}", Sha256::digest(server_id.as_bytes()));
+    let identity = endpoint_identity(server_id);
     Ok(format!(r"\\.\pipe\c_two-{scope}-{identity}").into())
 }
 
@@ -136,6 +145,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn endpoint_names_preserve_sha256_hex_golden_values() {
+        for (server_id, digest) in [
+            (
+                "Server-A",
+                "1118fcf083aa343ac0caf420a35a30251f311befab9f337abdf921977668e0cd",
+            ),
+            (
+                "server-a",
+                "a79b8498a1fb0114738f243cfd7c1eeae3d52e888e79000e31cb6f0bf2c077eb",
+            ),
+            (
+                "资源-Server-A",
+                "4ad7b4ee929ad2c148664fcaa37c16e8fd17455d6cbb20f33fc14e9313a23e36",
+            ),
+        ] {
+            let endpoint = LocalEndpoint::from_address(&format!("ipc://{server_id}")).unwrap();
+            #[cfg(unix)]
+            let expected = format!("/tmp/c2-{:x}/v2.2/{digest}.sock", unsafe {
+                libc::geteuid()
+            });
+            #[cfg(windows)]
+            let expected = format!(
+                r"\\.\pipe\c_two-{}-{digest}",
+                c2_local_security::current_scope_id().unwrap()
+            );
+            assert_eq!(endpoint.os_name(), OsStr::new(&expected));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_v2_derivation_is_private_versioned_bounded_and_pure() {
@@ -145,7 +184,10 @@ mod tests {
         // deployed server name that might already own its derived socket path.
         let server_id = format!("slice-{}", uuid::Uuid::new_v4());
         let uid = unsafe { libc::geteuid() };
-        let digest = format!("{:x}", Sha256::digest(server_id.as_bytes()));
+        let digest: String = Sha256::digest(server_id.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let expected = format!("/tmp/c2-{uid:x}/v2.2/{digest}.sock");
         let expected_path = std::path::Path::new(&expected);
         let existed_before = expected_path.exists();

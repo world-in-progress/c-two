@@ -4,6 +4,8 @@ use super::{
 };
 use c2_local_security::LocalSecurityAttributes;
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -190,15 +192,23 @@ impl EndpointSweep {
     }
 }
 
+fn listener_lease_name(endpoint_name: &OsStr) -> String {
+    let mut digest = Sha256::new();
+    for unit in endpoint_name.encode_wide() {
+        digest.update(unit.to_le_bytes());
+    }
+    let mut name = String::from(r"Local\c_two_listener-");
+    for byte in digest.finalize() {
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    name
+}
+
 fn claim_listener(
     endpoint: &LocalEndpoint,
     security: &mut LocalSecurityAttributes,
 ) -> io::Result<OwnedHandle> {
-    let mut digest = Sha256::new();
-    for unit in endpoint.os_name().encode_wide() {
-        digest.update(unit.to_le_bytes());
-    }
-    let name: Vec<u16> = format!(r"Local\c_two_listener-{:x}", digest.finalize())
+    let name: Vec<u16> = listener_lease_name(endpoint.os_name())
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -244,6 +254,25 @@ fn create_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_lease_names_preserve_utf16le_sha256_hex_golden_values() {
+        for (name, digest) in [
+            (
+                r"\\.\pipe\c_two-test",
+                "0e3d89fd810afdf674e32748ed63ddd71a6bf0a236499c62f610643f1669a9fe",
+            ),
+            (
+                r"\\.\pipe\c_two-资源",
+                "781d479e4484e161fc15ec59e3e623a3faad207938d2c8c4a5c8dd5c9fbdf593",
+            ),
+        ] {
+            assert_eq!(
+                listener_lease_name(OsStr::new(name)),
+                format!(r"Local\c_two_listener-{digest}")
+            );
+        }
+    }
 
     fn endpoint(name: &str) -> LocalEndpoint {
         LocalEndpoint::from_address(&format!("ipc://{name}")).unwrap()
