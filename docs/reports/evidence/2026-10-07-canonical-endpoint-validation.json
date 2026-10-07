@@ -1,0 +1,944 @@
+{
+  "schema": "c-two.canonical-endpoint-host-validation-summary.v1",
+  "status": "accepted-development-candidate",
+  "source_sha": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+  "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "input_sha": "9e34991d24bc25bc46416e0d12edacc19de780a1",
+  "producer_sha": "129cedad27bb9ba71d030aeea4c17a18c268c72d",
+  "c_abi": 3,
+  "linux": {
+    "status": "passed",
+    "run_id": 37559074669,
+    "source_sha": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+    "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "artifacts": [
+      {
+        "artifact_id": 11456250936,
+        "name": "local-endpoint-validation-e49652e85a384f1dd3489f393c13f4d9fff27f9f-python-suite",
+        "zip_sha256": "b1cb20c27920fc041dd70b62a3be802d1bffccb80564b0fe4799822a624a4220",
+        "python_counts": {
+          "full": 1023,
+          "ordinary": 984,
+          "portable": 25,
+          "typescript": 14
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "20416138a432ce28749d8f84470e2bd29caeca3717f2c8bae2a39082323f1a9c"
+      },
+      {
+        "artifact_id": 11455269746,
+        "name": "local-endpoint-validation-e49652e85a384f1dd3489f393c13f4d9fff27f9f-core-test",
+        "zip_sha256": "3e60b61de832ccbdba89bd2d16533742f8307d643d668abbb7d9e78b0a5dcb49",
+        "rust_test_counts": {
+          "core-workspace-tests.log": 1337,
+          "cli-tests.log": 65,
+          "rust-sdk-tests.log": 12
+        }
+      },
+      {
+        "artifact_id": 11454864904,
+        "name": "local-endpoint-validation-e49652e85a384f1dd3489f393c13f4d9fff27f9f-focused-local",
+        "zip_sha256": "f6bd05044c214b27911a885f0abc80ec2c241ea982c1e2626212b3f65fb8a5b1",
+        "rust_test_counts": {
+          "focused-local-tests.log": 502
+        }
+      }
+    ]
+  },
+  "windows": {
+    "status": "passed",
+    "run_id": 37559074657,
+    "workflow_attempt": 1,
+    "source_sha": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+    "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "artifacts": [
+      {
+        "artifact_id": 11457155432,
+        "name": "windows-native-windows-2025-full-e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "zip_sha256": "307434b6625f4666f4490883112932d11aa101b320415c9d2e717409ebf631fe",
+        "gates": 23,
+        "source_sha": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112592301348,
+        "required_endpoint_tests_proven": 8,
+        "junit_counts": {
+          "portable-tests.xml": 25,
+          "typescript-tests.xml": 14,
+          "python-tests.xml": 984,
+          "windows-harness-tests.xml": 34
+        },
+        "rust_test_counts": {
+          "core-test.log": 1292,
+          "cli-test.log": 56
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "f1e259c36dbad9676398843b1bf4d165959e50f0599455e2d32bba7ab495bcc6",
+        "wheels": {
+          "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "a9362659ed965b3e8ccf8f54b6449d3edd54a1b1e5035d0ef2088fd6f5776644",
+          "c_two-0.6.0-cp312-cp312-win_amd64.whl": "6aa959c10ac25ba9cc9e7d7330a64e7eb8018e91747179969e6bc4c2e8aef44b"
+        },
+        "wheel_consumers": 2,
+        "standard_user_cleanup": true,
+        "memory_matrix": true
+      },
+      {
+        "artifact_id": 11456293082,
+        "name": "windows-native-windows-2022-full-e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "zip_sha256": "cc37dbddac684bec87c63eaf9a9312b7ddaf60b72da3e61f9c62c332c7f7e1a3",
+        "gates": 23,
+        "source_sha": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112592301496,
+        "required_endpoint_tests_proven": 8,
+        "junit_counts": {
+          "portable-tests.xml": 25,
+          "typescript-tests.xml": 14,
+          "python-tests.xml": 984,
+          "windows-harness-tests.xml": 34
+        },
+        "rust_test_counts": {
+          "core-test.log": 1292,
+          "cli-test.log": 56
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "75f149cc005104bd81171af17be8b0c42064752ebd4299a2ac5279fe0fe4ae56",
+        "wheels": {
+          "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "17e58fca0e3632a696587b106994fbbf73a9ca207a5b813e62fe52d6c63c40ab",
+          "c_two-0.6.0-cp312-cp312-win_amd64.whl": "d431ea2a5484a9c607b8ce4ef2906121a10e6ddc6371814f633a7d58d6d6a783"
+        },
+        "wheel_consumers": 2,
+        "standard_user_cleanup": true,
+        "memory_matrix": true
+      },
+      {
+        "artifact_id": 11455379792,
+        "name": "windows-native-windows-2022-local-platform-e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "zip_sha256": "fb0bd5f5b269cfe93241ec3f2ab223a758672ad75c5c4afeb0db320801627e66",
+        "gates": 1,
+        "source_sha": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112592301134,
+        "rust_test_counts": {
+          "local-platform-tests.log": 776
+        }
+      },
+      {
+        "artifact_id": 11455314681,
+        "name": "windows-native-windows-2025-local-platform-e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "zip_sha256": "b2fd521a84e30092dd6ec60155e6ae65b7dff5a6677e7f599ca3697cf3a14d19",
+        "gates": 1,
+        "source_sha": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112592301417,
+        "rust_test_counts": {
+          "local-platform-tests.log": 776
+        }
+      }
+    ]
+  },
+  "mac_component_evidence": {
+    "status": "accepted-component-evidence",
+    "runtime_source": "98d4e3d470857709d6c4a2e517eadb09d5115b1a",
+    "test_repair_source": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+    "fastdb_source": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "limits": "Original Core workspace contains1fixed batch-bound failure. All other98d targets passed; repaired e496 c2-local and owner77 pass. This is component evidence, not final-source complete Mac execution.",
+    "python_counts": {
+      "full": 1023,
+      "ordinary": 984,
+      "portable": 25,
+      "typescript": 14
+    },
+    "repo_tests": 392,
+    "cli_tests": 65,
+    "rust_sdk_tests": 12,
+    "native_tests": 2,
+    "repaired_local_and_owner_tests": 77,
+    "portable_rows": 18,
+    "typescript_rows": 12,
+    "native_sha256": "b0893c72f2ab15acc3c21ff28f8f7a333a06be4071c97599d4645deb783fadd9",
+    "c3_sha256": "03a1e4ff31904832b17bed4ac6a1f3f53dacb591b8052ff2996e258c87156e95",
+    "stress": {
+      "source_commit": "e49652e85a384f1dd3489f393c13f4d9fff27f9f",
+      "scope": "only the 10000 unique logical targets generated by this run",
+      "driver_sha256": "990933208e2ca2348dac66fdf9c2d492537679ac74f8c35faec4404782b44cdb",
+      "label": "epcanon-cc0f8bf6e754",
+      "verified_files_before": 688,
+      "exit_code": 0,
+      "seconds": 23.92,
+      "verified_files_after": 688,
+      "ok": true,
+      "stress": {
+        "cycles": 10000,
+        "normal": 9500,
+        "fully_registered_kill_wait": 500,
+        "stale_credentials_fenced": 100,
+        "restart_with_old_stream": 100,
+        "scope_rounds": 3,
+        "batches": 25,
+        "entries_visited": 1478,
+        "reaped": 400,
+        "max_batch_micros": 6902,
+        "seconds": 9.74,
+        "own_socket_and_lease_remaining": 0
+      }
+    },
+    "delta": [
+      "core/transport/c2-local/src/unix_managed/tests.rs"
+    ]
+  },
+  "test_migration": {
+    "fixed_input": "9e34991d24bc25bc46416e0d12edacc19de780a1",
+    "fastdb_source": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "changed_paths": [
+      "cli/src/endpoint.rs",
+      "cli/tests/endpoint_cli.rs",
+      "core/foundation/c2-config/src/ipc.rs",
+      "core/foundation/c2-config/src/lib.rs",
+      "core/foundation/c2-config/src/local.rs",
+      "core/foundation/c2-config/src/resolver.rs",
+      "core/foundation/c2-mem-ffi/bindings/typescript/native/node_c2_mem_ffi_loader.c",
+      "core/foundation/c2-mem-ffi/bindings/typescript/scripts/check-consumer-install.mjs",
+      "core/foundation/c2-mem-ffi/bindings/typescript/src/index.ts",
+      "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-binding.test.mjs",
+      "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+      "core/foundation/c2-mem-ffi/include/c2_mem_ffi.h",
+      "core/foundation/c2-mem-ffi/src/lib.rs",
+      "core/runtime/c2-core/src/control.rs",
+      "core/runtime/c2-core/src/lib.rs",
+      "core/runtime/c2-core/tests/endpoint_protocol.rs",
+      "core/runtime/c2-core/tests/native_endpoint.rs",
+      "core/transport/c2-http/src/relay/authority.rs",
+      "core/transport/c2-http/src/relay/server.rs",
+      "core/transport/c2-ipc/src/client.rs",
+      "core/transport/c2-ipc/src/control.rs",
+      "core/transport/c2-ipc/src/lib.rs",
+      "core/transport/c2-local/src/credential.rs",
+      "core/transport/c2-local/src/credential_tests.rs",
+      "core/transport/c2-local/src/lib.rs",
+      "core/transport/c2-local/src/unix.rs",
+      "core/transport/c2-local/src/unix_common.rs",
+      "core/transport/c2-local/src/unix_endpoint.rs",
+      "core/transport/c2-local/src/unix_managed.rs",
+      "core/transport/c2-local/src/unix_managed/tests.rs",
+      "core/transport/c2-server/src/server.rs",
+      "sdk/python/benchmarks/relay_qps_benchmark.py",
+      "sdk/python/benchmarks/three_mode_benchmark.py",
+      "sdk/python/native/src/config_ffi.rs",
+      "sdk/python/native/src/control_ffi.rs",
+      "sdk/python/native/src/endpoint_ffi.rs",
+      "sdk/python/src/c_two/config/ipc.py",
+      "sdk/python/src/c_two/transport/client/util.py",
+      "sdk/python/src/c_two/transport/endpoint.py",
+      "sdk/python/tests/unit/test_endpoint_maintenance.py",
+      "sdk/python/tests/unit/test_ipc_address_validation.py",
+      "sdk/python/tests/unit/test_sdk_boundary.py",
+      "sdk/rust/src/lib.rs",
+      "sdk/rust/tests/public_api.rs"
+    ],
+    "removed_or_renamed_tests": [
+      {
+        "path": "cli/tests/endpoint_cli.rs",
+        "test": "inspect_default_protocol_follows_the_configured_policy",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "cli/tests/endpoint_cli.rs",
+        "test": "inspect_rejects_an_unknown_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "cli/tests/endpoint_cli.rs",
+        "test": "reap_derives_the_endpoint_from_the_credential_protocol",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "reap_uses_the_native_credential_endpoint",
+            "paths": [
+              "cli/tests/endpoint_cli.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "cli/tests/endpoint_cli.rs",
+        "test": "sweep_requires_an_explicit_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/foundation/c2-config/src/local.rs",
+        "test": "managed_v2_is_explicitly_unsupported_on_windows",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "windows_pipe_name_is_bounded_and_has_no_nested_name_separators",
+            "paths": [
+              "core/foundation/c2-config/src/local.rs"
+            ]
+          },
+          {
+            "test": "logical addresses resolve to one deterministic native OS endpoint",
+            "paths": [
+              "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/foundation/c2-config/src/local.rs",
+        "test": "unix_endpoint_keeps_the_canonical_socket_location",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_v2_derivation_is_private_versioned_bounded_and_pure",
+            "paths": [
+              "core/foundation/c2-config/src/local.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/foundation/c2-config/src/local.rs",
+        "test": "unix_endpoint_rejects_encoded_paths_over_sun_path_capacity",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "long_logical_id_still_derives_a_bounded_native_name",
+            "paths": [
+              "core/foundation/c2-config/src/local.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/foundation/c2-config/src/resolver.rs",
+        "test": "endpoint_protocol_resolution_obeys_override_env_file_and_default_priority",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/foundation/c2-config/src/resolver.rs",
+        "test": "invalid_endpoint_protocol_fails_closed",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+        "test": "a named endpoint protocol resolves exactly one OS endpoint",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "logical addresses resolve to one deterministic native OS endpoint",
+            "paths": [
+              "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+        "test": "createNodeIpcConnect rejects a protocol and a custom resolver together",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+        "test": "endpoint protocol names are the canonical Rust vocabulary only",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+        "test": "endpoint protocol resolution rejects NUL and non-object options first",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native endpoint resolution rejects NUL and non-object options first",
+            "paths": [
+              "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "client_and_server_must_agree_on_the_endpoint_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "client_cannot_change_the_endpoint_protocol_after_the_domain_freezes",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "runtime_client_config_freezes_after_a_failed_native_connect",
+            "paths": [
+              "core/runtime/c2-core/tests/native_endpoint.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "explicit_protocol_selects_exactly_one_os_endpoint",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "managed_admin_shutdown_cannot_stop_a_legacy_server",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "managed_host_serves_calls_and_legacy_admin_probe_cannot_stop_it",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_host_serves_calls_and_admin_shutdown_initiates_draining",
+            "paths": [
+              "core/runtime/c2-core/tests/native_endpoint.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "resolved_admin_probe_follows_an_environment_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "resolved_protocol_restart_reuses_the_same_os_endpoint",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "runtime_restart_reuses_endpoint_and_gets_a_fresh_instance",
+            "paths": [
+              "core/runtime/c2-core/tests/native_endpoint.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/runtime/c2-core/tests/endpoint_protocol.rs",
+        "test": "unresolved_admin_probe_uses_the_process_client_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/transport/c2-http/src/relay/server.rs",
+        "test": "register_attestation_client_uses_the_resolved_upstream_protocol",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "register_attestation_client_uses_the_native_endpoint",
+            "paths": [
+              "core/transport/c2-http/src/relay/server.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-ipc/src/control.rs",
+        "test": "strict_protocol_probe_never_reaches_the_other_endpoint_namespace",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/transport/c2-local/src/credential_tests.rs",
+        "test": "legacy_v1_credential_round_trips_without_an_incarnation",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "active_reap_is_busy_and_normal_disconnect_keeps_listener_available",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_live_listener_is_busy_and_disconnects_keep_service_available",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "budgeted_sweep_advances_failures_and_finishes_a_stable_round",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_budgeted_sweep_advances_past_busy_and_corrupt_slots",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "concurrent_stale_startup_keeps_the_winner_reachable",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_concurrent_stale_bind_keeps_the_winner_reachable",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "crash_owner_child",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_process_fixture",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "crashed_owner_can_be_reaped_twice_without_removing_v1_lock",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_registered_exit_without_destructors_is_reapable",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          },
+          {
+            "test": "managed_two_process_competition_and_registered_kill_converge",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "default_sweep_namespace_comes_from_the_local_endpoint_mapping",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_v2_derivation_is_private_versioned_bounded_and_pure",
+            "paths": [
+              "core/foundation/c2-config/src/local.rs"
+            ]
+          },
+          {
+            "test": "managed_public_sweep_targets_the_versioned_namespace_only",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "explicit_close_reports_socket_removal_and_retains_lock_file",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_public_namespace_lifecycle_converges_over_repeated_runs",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          },
+          {
+            "test": "managed_duplicate_lease_cannot_extend_ownership_across_retirement",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "failed_initialization_withdraws_its_socket_and_allows_rebinding",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_failed_initialization_withdraws_its_socket_and_rebinds",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "inspect_and_reap_leave_unknown_and_corrupt_records_untouched",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_unknown_socket_and_unsafe_permissions_are_preserved",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          },
+          {
+            "test": "managed_corrupt_record_and_symlink_are_unverified_and_untouched",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "interrupted_sweep_never_reports_a_completed_round",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_interrupted_sweep_never_reports_a_completed_round",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          },
+          {
+            "test": "sweep_scope_interrupted_namespace_never_reports_completion",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "listener_unlocks_ownership_before_inherited_descriptors_are_closed",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_duplicate_lease_cannot_extend_ownership_across_retirement",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "new_namespace_directory_ignores_permissive_process_umask",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_namespace_creation_ignores_permissive_umask",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "old_credential_cannot_remove_a_new_listener_instance",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_old_credential_never_removes_a_new_incarnation",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "probing_a_full_backlog_never_waits_for_accept",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_full_backlog_probe_is_bounded_and_preserves_the_listener",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "rollback_never_removes_a_replacement_object",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_record_failures_roll_back_conservatively",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "sweep_scope_legacy_does_not_inspect_unselected_orphans",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "sweep_scope_reaps_only_selected_slots_and_preserves_active_owner",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "sweep_scope_rejects_invalid_and_unbounded_targets_before_open",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "sweep_rejects_invalid_and_oversized_address_scopes",
+            "paths": [
+              "cli/tests/endpoint_cli.rs"
+            ]
+          },
+          {
+            "test": "test_sweep_address_scope_rejects_before_taking_the_lease",
+            "paths": [
+              "sdk/python/tests/unit/test_endpoint_maintenance.py"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "symlink_endpoint_is_refused_without_following_its_target",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "managed_corrupt_record_and_symlink_are_unverified_and_untouched",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "umask_child",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_umask_child",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix.rs",
+        "test": "unknown_stale_socket_requires_explicit_cleanup",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_unknown_socket_and_unsafe_permissions_are_preserved",
+            "paths": [
+              "core/transport/c2-local/src/unix_managed/tests.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+        "test": "legacy_derivation_remains_the_default_and_untouched",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "core/transport/c2-server/src/server.rs",
+        "test": "server_restart_reuses_the_resolved_endpoint_protocol",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "server_restart_reuses_the_native_endpoint",
+            "paths": [
+              "core/transport/c2-server/src/server.rs"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "sdk/python/tests/unit/test_endpoint_maintenance.py",
+        "test": "test_inspect_defaults_to_the_configured_process_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "sdk/python/tests/unit/test_endpoint_maintenance.py",
+        "test": "test_inspect_rejects_an_unknown_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "sdk/python/tests/unit/test_endpoint_maintenance.py",
+        "test": "test_missing_protocol_fails_closed_on_an_invalid_process_policy",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "sdk/python/tests/unit/test_endpoint_maintenance.py",
+        "test": "test_sweep_endpoints_rejects_a_missing_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "sdk/python/tests/unit/test_endpoint_maintenance.py",
+        "test": "test_sweep_endpoints_rejects_an_unknown_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "sdk/python/tests/unit/test_ipc_address_validation.py",
+        "test": "test_client_util_forwards_the_explicit_endpoint_protocol",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "sdk/python/tests/unit/test_ipc_address_validation.py",
+        "test": "test_client_util_ping_and_shutdown_accept_only_canonical_protocols",
+        "reason": "Only tests deleted protocol selection, a deleted legacy round-trip, or deleted legacy/platform selection behavior; no applicable native behavior retained by this test.",
+        "replacement_coverage": []
+      },
+      {
+        "path": "sdk/rust/tests/public_api.rs",
+        "test": "explicit_endpoint_protocol_and_admin_probes_are_thin_facade_reexports",
+        "reason": "Migrated valid behavior to the automatic native endpoint; obsolete legacy lock retention or protocol selection assertions removed.",
+        "replacement_coverage": [
+          {
+            "test": "native_endpoint_and_admin_probes_are_thin_facade_reexports",
+            "paths": [
+              "sdk/rust/tests/public_api.rs"
+            ]
+          }
+        ]
+      }
+    ],
+    "added_or_renamed_tests": [
+      {
+        "path": "cli/tests/endpoint_cli.rs",
+        "test": "reap_uses_the_native_credential_endpoint"
+      },
+      {
+        "path": "core/foundation/c2-config/src/local.rs",
+        "test": "long_logical_id_still_derives_a_bounded_native_name"
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+        "test": "logical addresses resolve to one deterministic native OS endpoint"
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+        "test": "native addon rejects a stale core ABI before exposing endpoint or pool calls"
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+        "test": "native endpoint resolution rejects NUL and non-object options first"
+      },
+      {
+        "path": "core/foundation/c2-mem-ffi/src/lib.rs",
+        "test": "c_endpoint_projection_uses_the_same_platform_authority"
+      },
+      {
+        "path": "core/runtime/c2-core/tests/native_endpoint.rs",
+        "test": "native_host_serves_calls_and_admin_shutdown_initiates_draining"
+      },
+      {
+        "path": "core/runtime/c2-core/tests/native_endpoint.rs",
+        "test": "runtime_client_config_freezes_after_a_failed_native_connect"
+      },
+      {
+        "path": "core/runtime/c2-core/tests/native_endpoint.rs",
+        "test": "runtime_restart_reuses_endpoint_and_gets_a_fresh_instance"
+      },
+      {
+        "path": "core/transport/c2-http/src/relay/server.rs",
+        "test": "register_attestation_client_uses_the_native_endpoint"
+      },
+      {
+        "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+        "test": "native_concurrent_stale_bind_keeps_the_winner_reachable"
+      },
+      {
+        "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+        "test": "native_full_backlog_probe_is_bounded_and_preserves_the_listener"
+      },
+      {
+        "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+        "test": "native_namespace_creation_ignores_permissive_umask"
+      },
+      {
+        "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+        "test": "native_restart_does_not_close_existing_streams"
+      },
+      {
+        "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+        "test": "native_umask_child"
+      },
+      {
+        "path": "core/transport/c2-local/src/unix_managed/tests.rs",
+        "test": "native_unknown_socket_and_unsafe_permissions_are_preserved"
+      },
+      {
+        "path": "core/transport/c2-server/src/server.rs",
+        "test": "server_restart_reuses_the_native_endpoint"
+      },
+      {
+        "path": "sdk/rust/tests/public_api.rs",
+        "test": "native_endpoint_and_admin_probes_are_thin_facade_reexports"
+      }
+    ],
+    "delivered_commit": "129cedad27bb9ba71d030aeea4c17a18c268c72d"
+  },
+  "host_review_repairs": [
+    "Windows exact protocol error field",
+    "unknown socket reap MissingOwnership/no lease creation/identity unchanged",
+    "mandatory Unix identity/incarnation; input missing/version checks preserved",
+    "finite shared-directory EOF deadline with per-batch1 and progress checks"
+  ],
+  "independent_reviews": {
+    "native_producer_review": "gpt-6.1-sol/high,44paths,3findings repaired before final source",
+    "buddy_run": "d7ed1b98-a9b6-4a12-b0f2-db3270fffd15",
+    "buddy_final_artifact": "2ab5c908-2c23-439c-9a7b-379702e26e3e",
+    "buddy_integration": "int-76e2cbee-fb70-4f81-9d95-0f94112c0485",
+    "buddy_verdict": "accepted bounded source review",
+    "buddy_report_sha256": "fbdf8ea89823e156b990fd200e11eb4b0573b41a91a5a51530241d81a0d6359a",
+    "pool_callbacks": "all15exactparent9e functions",
+    "limits": "Review did not verify hosted artifact evidence; Host separate validators did."
+  },
+  "verifier_sha256": {
+    "verify_linux_final.py": "7d4ca4f5cc3d3f187c8fab411209502156d75da38fe48533cb319116bbc34115",
+    "verify_windows_final.py": "f6f8dfd2ffbecde50a07a63289c44654b55e75a77891c9eefac93334dded4e30"
+  },
+  "limits": [
+    "development evidence, no candidate formal publication/PR/merge",
+    "macOS runtime evidence98d plus test-only e496 repair, not final-source full Mac execution",
+    "Linux executable not retained in ZIP; hash bound in runner/matrix receipt",
+    "Rust counts are successful log-summary sums",
+    "unknown historical files untouched and legacy compatibility removed",
+    "incomplete initialization remains fail-closed",
+    "OwnerBound private control is non-reconnectable",
+    "Windows11 desktop not executed",
+    "installed Buddy runner adoption not demonstrated"
+  ]
+}

@@ -3,12 +3,20 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 
+/// Native OS namespace used by an endpoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LocalEndpointNamespace {
+    UnixFilesystem,
+    WindowsNamedPipe,
+}
+
 /// A validated local IPC endpoint. The OS name is not a filesystem existence
 /// probe: on Windows it names a pipe in the kernel namespace.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LocalEndpoint {
     address: String,
     os_name: OsString,
+    namespace: LocalEndpointNamespace,
 }
 
 impl LocalEndpoint {
@@ -24,6 +32,11 @@ impl LocalEndpoint {
         Ok(Self {
             address: address.to_owned(),
             os_name: endpoint_name(server_id)?,
+            namespace: if cfg!(windows) {
+                LocalEndpointNamespace::WindowsNamedPipe
+            } else {
+                LocalEndpointNamespace::UnixFilesystem
+            },
         })
     }
 
@@ -33,6 +46,18 @@ impl LocalEndpoint {
 
     pub fn os_name(&self) -> &OsStr {
         &self.os_name
+    }
+
+    /// Strict credential metadata for the platform's native backend.
+    pub const fn protocol(&self) -> &'static str {
+        match self.namespace {
+            LocalEndpointNamespace::UnixFilesystem => "managed-v2",
+            LocalEndpointNamespace::WindowsNamedPipe => "named-pipe",
+        }
+    }
+
+    pub const fn namespace(&self) -> LocalEndpointNamespace {
+        self.namespace
     }
 
     pub fn transport_kind(&self) -> &'static str {
@@ -46,9 +71,27 @@ impl LocalEndpoint {
 
 #[cfg(unix)]
 fn endpoint_name(server_id: &str) -> io::Result<OsString> {
-    Ok(std::path::Path::new("/tmp/c_two_ipc")
-        .join(format!("{server_id}.sock"))
-        .into_os_string())
+    use std::os::unix::ffi::OsStrExt;
+
+    use sha2::{Digest, Sha256};
+    let uid = unsafe { libc::geteuid() };
+    let identity = format!("{:x}", Sha256::digest(server_id.as_bytes()));
+    let path =
+        std::path::PathBuf::from(format!("/tmp/c2-{uid:x}/v2.2")).join(format!("{identity}.sock"));
+    let os_name = path.into_os_string();
+    let capacity = std::mem::size_of::<libc::sockaddr_un>() - offset_of_sun_path();
+    if os_name.as_os_str().as_bytes().len() >= capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix socket endpoint exceeds sun_path capacity",
+        ));
+    }
+    Ok(os_name)
+}
+
+#[cfg(unix)]
+fn offset_of_sun_path() -> usize {
+    std::mem::offset_of!(libc::sockaddr_un, sun_path)
 }
 
 #[cfg(windows)]
@@ -95,13 +138,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_endpoint_keeps_the_canonical_socket_location() {
-        assert_eq!(
-            LocalEndpoint::from_address("ipc://unit-server")
-                .unwrap()
-                .os_name(),
-            OsStr::new("/tmp/c_two_ipc/unit-server.sock")
+    fn managed_v2_derivation_is_private_versioned_bounded_and_pure() {
+        use sha2::{Digest, Sha256};
+
+        // A per-run logical ID keeps the purity check independent of any real
+        // deployed server name that might already own its derived socket path.
+        let server_id = format!("slice-{}", uuid::Uuid::new_v4());
+        let uid = unsafe { libc::geteuid() };
+        let digest = format!("{:x}", Sha256::digest(server_id.as_bytes()));
+        let expected = format!("/tmp/c2-{uid:x}/v2.2/{digest}.sock");
+        let expected_path = std::path::Path::new(&expected);
+        let existed_before = expected_path.exists();
+        assert!(!existed_before);
+
+        let endpoint = LocalEndpoint::from_address(&format!("ipc://{server_id}")).unwrap();
+        assert_eq!(endpoint.address(), format!("ipc://{server_id}"));
+        assert_eq!(endpoint.os_name(), OsStr::new(&expected));
+        assert_eq!(endpoint.protocol(), "managed-v2");
+        assert_eq!(endpoint.namespace(), LocalEndpointNamespace::UnixFilesystem);
+        assert!(expected.len() < std::mem::size_of::<libc::sockaddr_un>() - offset_of_sun_path());
+        // Derivation is pure: it must not create the endpoint file.
+        assert_eq!(expected_path.exists(), existed_before);
+
+        let lower = LocalEndpoint::from_address("ipc://server-a").unwrap();
+        let upper = LocalEndpoint::from_address("ipc://Server-A").unwrap();
+        let unicode = LocalEndpoint::from_address("ipc://资源-Server-A").unwrap();
+        assert_ne!(lower.os_name(), upper.os_name());
+        assert_ne!(upper.os_name(), unicode.os_name());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_logical_id_still_derives_a_bounded_native_name() {
+        let address = format!("ipc://{}", "资源".repeat(100));
+        let endpoint = LocalEndpoint::from_address(&address).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        assert!(
+            endpoint.os_name().as_bytes().len()
+                < std::mem::size_of::<libc::sockaddr_un>() - offset_of_sun_path()
         );
+        assert_eq!(endpoint.address(), address);
     }
 
     #[cfg(windows)]

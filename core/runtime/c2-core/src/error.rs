@@ -6,6 +6,7 @@ use c2_contract::ContractError;
 use c2_error::{C2Error, C2ErrorEnvelope, ErrorCode};
 use c2_http::client::HttpError;
 use c2_ipc::IpcError;
+use c2_ipc::client::ChunkError;
 
 use crate::RegisterFailureOutcome;
 
@@ -116,6 +117,7 @@ pub struct TransportError {
     phase: TransportPhase,
     kind: TransportKind,
     source: Box<dyn StdError + Send + Sync>,
+    semantic_error: Option<C2Error>,
 }
 
 impl TransportError {
@@ -127,6 +129,7 @@ impl TransportError {
             phase,
             kind,
             source: Box::new(source),
+            semantic_error: None,
         }
     }
 
@@ -136,6 +139,12 @@ impl TransportError {
 
     pub const fn kind(&self) -> TransportKind {
         self.kind
+    }
+
+    /// Canonical semantic information for a local transport admission failure.
+    /// Replay safety still comes from `phase`, even when a semantic code exists.
+    pub fn semantic_error(&self) -> Option<&C2Error> {
+        self.semantic_error.as_ref()
     }
 
     /// Fallback is legal only when dispatch is known not to have happened.
@@ -218,6 +227,28 @@ impl From<LifecycleError> for Error {
 /// Normalize an IPC error without flattening its transport source.
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
+        IpcError::Chunk(ChunkError::Capacity(message)) => {
+            let semantic = C2Error::new(ErrorCode::ResourceUnavailable, message.clone())
+                .with_details(BTreeMap::from([
+                    ("transport".to_string(), "ipc".to_string()),
+                    (
+                        "stage".to_string(),
+                        "response_reassembly_admission".to_string(),
+                    ),
+                    (
+                        "transport_phase".to_string(),
+                        "dispatch_uncertain".to_string(),
+                    ),
+                    ("fallback_eligible".to_string(), "false".to_string()),
+                ]));
+            let mut transport = TransportError::new(
+                TransportPhase::DispatchUncertain,
+                TransportKind::Ipc,
+                IpcError::Chunk(ChunkError::Capacity(message)),
+            );
+            transport.semantic_error = Some(semantic);
+            Error::Transport(transport)
+        }
         IpcError::CrmError(bytes) => normalize_ipc_semantic_bytes(&bytes),
         IpcError::RouteNotFound(route_name) => semantic_route_error(
             ErrorCode::ResourceNotFound,
@@ -478,6 +509,113 @@ pub fn normalize_adapter_failure(phase: AdapterFailurePhase, failure: AdapterFai
         AdapterFailure::Semantic(error) => error,
         AdapterFailure::Local { message, details } => {
             C2Error::new(phase.error_code(), message).with_details(details)
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_boundary_tests {
+    use super::*;
+    use c2_mem::{MemPool, MemoryBudget, PoolConfig};
+    use c2_wire::chunk::{
+        ChunkConfig, ChunkRegistry, decode_reply_chunk_meta, encode_reply_chunk_meta,
+    };
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    fn wire_admission_error(
+        total_size: u64,
+        chunks: u32,
+        data_len: usize,
+        file_limit: u64,
+        live_limit: u64,
+    ) -> (IpcError, MemoryBudget) {
+        let budget = MemoryBudget::new(0, file_limit, live_limit);
+        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
+            PoolConfig {
+                buddy_enabled: false,
+                spill_threshold: 0.0,
+                ..PoolConfig::default()
+            },
+            "error-boundary-pure".to_string(),
+            budget.clone(),
+        )));
+        let registry = ChunkRegistry::new(pool, ChunkConfig::default());
+        let mut bytes = encode_reply_chunk_meta(total_size, chunks, 0).to_vec();
+        bytes.resize(bytes.len() + data_len, 0x42);
+        let (size, chunks, index, consumed) = decode_reply_chunk_meta(&bytes, 0).unwrap();
+        assert_eq!(index, 0);
+        let failure = registry
+            .insert_reply(1, 9, size, chunks as usize, bytes.len() - consumed)
+            .unwrap_err();
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.total_bytes(), 0);
+        (IpcError::Chunk(failure.into()), budget)
+    }
+
+    #[test]
+    fn response_admission_keeps_capacity_code_and_dispatch_uncertainty() {
+        // Exercise encoded reply metadata, actual registry/allocator admission,
+        // IPC mapping, and Core normalization, rather than inventing a variant.
+        for (file_limit, live_limit) in [(1024, 0), (0, 1024)] {
+            for (chunks, data_len) in [(2, 64), (1, 128)] {
+                for supplied_phase in [
+                    TransportPhase::PreDispatch,
+                    TransportPhase::DispatchUncertain,
+                ] {
+                    let (source, budget) =
+                        wire_admission_error(128, chunks, data_len, file_limit, live_limit);
+                    assert!(matches!(source, IpcError::Chunk(ChunkError::Capacity(_))));
+                    let error = normalize_ipc_error(source, supplied_phase);
+                    let Error::Transport(transport) = error else {
+                        panic!("response admission must retain its transport safety phase");
+                    };
+                    assert_eq!(transport.phase(), TransportPhase::DispatchUncertain);
+                    assert_eq!(transport.kind(), TransportKind::Ipc);
+                    assert!(!transport.is_fallback_eligible());
+                    assert!(transport.source().unwrap().is::<IpcError>());
+                    let semantic = transport.semantic_error().unwrap();
+                    assert_eq!(semantic.code, ErrorCode::ResourceUnavailable);
+                    assert_eq!(semantic.details["stage"], "response_reassembly_admission");
+                    assert_eq!(semantic.details["transport_phase"], "dispatch_uncertain");
+                    assert_eq!(semantic.details["fallback_eligible"], "false");
+                    let decoded = C2Error::from_wire_bytes(&semantic.to_wire_bytes())
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(decoded, *semantic);
+                    let snapshot = budget.snapshot();
+                    assert_eq!(snapshot.reassembly.used_bytes, 0);
+                    assert_eq!(snapshot.file.used_bytes, 0);
+                    assert_eq!(snapshot.shm.used_bytes, 0);
+                    if live_limit > 0 {
+                        assert_eq!(snapshot.reassembly.peak_bytes, 128);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_invalid_geometry_never_becomes_capacity_error() {
+        for (size, chunks, data_len) in [
+            (128, 0, 64),
+            (0, 1, 1),
+            (0, 2, 64),
+            (128, 2, 0),
+            (128, 1, 0),
+            (128, 1, 129),
+            (1024, 513, 1),
+        ] {
+            // Zero budgets amplify an incorrect attempt to allocate invalid geometry.
+            let (source, budget) = wire_admission_error(size, chunks, data_len, 0, 0);
+            assert!(matches!(source, IpcError::Chunk(ChunkError::Protocol(_))));
+            let error = normalize_ipc_error(source, TransportPhase::DispatchUncertain);
+            let Error::Transport(transport) = error else {
+                panic!("expected protocol transport error")
+            };
+            assert!(transport.semantic_error().is_none());
+            assert!(!transport.is_fallback_eligible());
+            assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
         }
     }
 }

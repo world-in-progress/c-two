@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import glob
 import json
 import math
 import os
@@ -94,7 +93,6 @@ def _rounds(size: int) -> int:
     return 5                       # 500MB, 1GB
 
 WARMUP = 3
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 _ipc_counter = 0
 _relay_port = 19960 + (os.getpid() % 100)
 
@@ -207,11 +205,6 @@ def _server_instance_id_for(name: str, address: str, crm_class: type) -> str:
 
 def _cleanup():
     """Clean up stale IPC sockets and SHM."""
-    for f in glob.glob('/tmp/c_two_ipc/bench_3m_*.sock'):
-        try:
-            os.unlink(f)
-        except OSError:
-            pass
     try:
         from c_two.mem import cleanup_stale_shm
         cleanup_stale_shm()
@@ -220,11 +213,10 @@ def _cleanup():
 
 
 def _wait_sock(address: str, timeout: float = 5.0):
-    region_id = address.split('://')[-1]
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
+    from c_two.transport.client.util import ping
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sock_path):
+        if ping(address, timeout=0.05):
             return True
         time.sleep(0.05)
     return False

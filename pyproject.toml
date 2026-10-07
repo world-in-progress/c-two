@@ -17,6 +17,7 @@ dev = [
     "pyarrow>=23.0.1",
     "pytest>=8.0.0",
     "pytest-timeout>=2.0.0",
+    "pytest-xdist==3.8.0",
 ]
 examples = [
     "numpy>=2.2.4",

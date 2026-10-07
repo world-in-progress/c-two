@@ -6,6 +6,80 @@ from pathlib import Path
 import pytest
 
 
+BAD_SHUTDOWN_TIMEOUTS = [float('inf'), float('-inf'), float('nan'), -1.0, -0.001, 1e300, float(2**64)]
+
+
+@pytest.mark.parametrize('timeout', BAD_SHUTDOWN_TIMEOUTS)
+def test_native_shutdown_rejects_invalid_timeout_without_changing_identity(timeout: float) -> None:
+    from c_two._native import RuntimeSession
+
+    session = RuntimeSession(server_id='timeout-validation')
+    with pytest.raises(ValueError, match='timeout_seconds'):
+        session.shutdown(route_names=[], timeout_seconds=timeout)
+    assert session.server_id is None
+    assert session.server_address is None
+    # A rejected call leaves the session usable for an ordinary shutdown.
+    outcome = dict(session.shutdown(route_names=[], timeout_seconds=0.0))
+    assert outcome['ipc_clients_drained'] is True
+    assert outcome['runtime_barrier_error'] is None
+
+
+@pytest.mark.parametrize('timeout', [0.0, -0.0, 0.125, 5.0])
+def test_native_shutdown_accepts_zero_and_normal_timeout(timeout: float) -> None:
+    from c_two._native import RuntimeSession
+
+    outcome = dict(RuntimeSession().shutdown(route_names=[], timeout_seconds=timeout))
+    assert outcome['ipc_clients_drained'] is True
+    assert outcome['runtime_barrier_error'] is None
+
+
+def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -> None:
+    import c_two as cc
+    from c_two.transport.registry import _ProcessRegistry
+
+    @cc.crm(namespace='test.shutdown-timeout-boundary', version='0.1.0')
+    class Alive:
+        def ping(self) -> str:
+            ...
+
+        @cc.on_shutdown
+        def stop(self) -> None:
+            ...
+
+    class AliveResource:
+        shutdown_calls = 0
+
+        def ping(self) -> str:
+            return 'pong'
+
+        def stop(self) -> None:
+            self.shutdown_calls += 1
+
+    cc.shutdown()
+    resource = AliveResource()
+    proxy = None
+    try:
+        cc.register(Alive, resource, name='timeout-alive')
+        session = _ProcessRegistry.get()._runtime_session  # noqa: SLF001
+        identity = (session.server_id, session.server_address)
+        proxy = cc.connect(Alive, name='timeout-alive', address=cc.server_address())
+        assert proxy.ping() == 'pong'
+        for timeout in BAD_SHUTDOWN_TIMEOUTS:
+            with pytest.raises(ValueError, match='timeout_seconds'):
+                session.shutdown(route_names=['timeout-alive'], timeout_seconds=timeout)
+            assert (session.server_id, session.server_address) == identity
+            assert proxy.ping() == 'pong'
+            assert resource.shutdown_calls == 0
+        cc.shutdown()
+        assert resource.shutdown_calls == 1
+        cc.shutdown()
+        assert resource.shutdown_calls == 1
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        cc.shutdown()
+
+
 def test_native_runtime_session_explicit_identity_is_lazy() -> None:
     from c_two._native import RuntimeSession
 
@@ -780,3 +854,82 @@ def test_registry_restores_native_error_bytes_before_wrapping() -> None:
 
     assert isinstance(restored, FallbackDenied)
     assert restored.details == {'route': 'grid'}
+
+def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> None:
+    from c_two.transport.registry import _ProcessRegistry
+
+    class FakeRetiredObservation:
+        """Retirement bundle double: an opaque handoff token."""
+
+    retired_observations: list[FakeRetiredObservation] = []
+
+    class FakeSession:
+        def __init__(self, outcome: dict | None = None, **_kwargs) -> None:
+            self._outcome = outcome if outcome is not None else {'relay_errors': []}
+            self.adopted_observations: list[object] = []
+
+        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
+            assert timeout_seconds == 30.0
+            return {**self._outcome, 'completed': not any(self._outcome.get(key) for key in (
+                'ipc_client_close_error', 'runtime_barrier_error'))}
+
+        def retire_memory_observation(self) -> FakeRetiredObservation:
+            observation = FakeRetiredObservation()
+            retired_observations.append(observation)
+            return observation
+
+        def adopt_retired_memory_observation(self, observation: object) -> None:
+            self.adopted_observations.append(observation)
+
+    def hostless_registry(outcome: dict) -> _ProcessRegistry:
+        registry = _ProcessRegistry()
+        registry._runtime_session = FakeSession(outcome)  # noqa: SLF001
+        registry._server = None  # noqa: SLF001
+        return registry
+
+    logger_name = 'c_two.transport.registry'
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        pending_ipc = hostless_registry({
+            'relay_errors': [],
+            'ipc_client_close_error': (
+                'unconfirmed IPC client cache closes for ["ipc://blocked"]'
+            ),
+        })
+        ipc_session = pending_ipc._runtime_session
+        assert not pending_ipc.shutdown()["completed"]
+        assert pending_ipc._runtime_session is ipc_session
+        pending_runtime = hostless_registry({
+            'relay_errors': [],
+            'runtime_barrier_error': 'runtime barrier did not quiesce',
+        })
+        runtime_session = pending_runtime._runtime_session
+        assert not pending_runtime.shutdown()["completed"]
+        assert pending_runtime._runtime_session is runtime_session
+        # Absent keys stay silent: apparent full cleanup is only reported
+        # when the native outcome actually reports a failure.
+        hostless_registry({'relay_errors': []}).shutdown()
+
+    messages = [record.getMessage() for record in caplog.records]
+    ipc_warnings = [
+        message for message in messages if 'IPC client cache' in message
+    ]
+    assert ipc_warnings, 'an unconfirmed native IPC client close must be surfaced'
+    assert any('ipc://blocked' in message for message in ipc_warnings)
+    assert any(
+        'runtime barrier' in message for message in messages
+    ), 'an unconfirmed runtime barrier must be surfaced'
+    assert len(messages) == 2, f'clean outcomes must stay silent, saw {messages!r}'
+
+    # Barrier confirmation is transport cleanup reporting only: it never
+    # touches the retirement observation. Pending sessions stay owned; only
+    # completed cleanup retires once, and the observation exposes no fence
+    # the registry could mark — its lifetime is decided by real owners.
+    assert len(retired_observations) == 1
+    for observation in retired_observations:
+        surface = {name for name in dir(observation) if not name.startswith('_')}
+        assert not hasattr(observation, 'mark_close_confirmed')
+        assert not hasattr(observation, 'close_confirmed')
+        assert not surface & {
+            'track', 'track_retained', 'reserve', 'prune', 'scope_reports',
+            'lease_stats',
+        }, f'observation must stay an opaque handoff, saw {surface!r}'

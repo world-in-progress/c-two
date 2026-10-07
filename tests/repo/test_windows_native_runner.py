@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -11,6 +13,15 @@ from types import SimpleNamespace
 def _runner():
     path = Path(__file__).resolve().parents[2] / "tools/ci/windows_native.py"
     spec = importlib.util.spec_from_file_location("windows_native", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _benchmark():
+    path = Path(__file__).resolve().parents[2] / "tools/benchmarks/ipc_memory.py"
+    spec = importlib.util.spec_from_file_location("_ipc_memory_benchmark_gate_test", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -72,7 +83,7 @@ def test_full_scope_gate_inventory_preserves_receipt_order():
     runner = _runner()
     gates = runner.gates(sys.executable, Path("evidence"), runner.FULL_SCOPE)
     names = [name for name, _, _ in gates]
-    assert len(names) == 22 and len(set(names)) == 22
+    assert len(names) == 23 and len(set(names)) == 23
     index = {name: position for position, name in enumerate(names)}
     # Deployable application gates keep their static source-mode link path.
     assert runner.SOURCE_MODE_GATES <= set(names)
@@ -85,6 +96,49 @@ def test_full_scope_gate_inventory_preserves_receipt_order():
     assert dependencies["cli-artifact"] == ["cli-test"]
     assert set(dependencies["portable-tests"]) == {"python-build", "cli-artifact"}
     assert "cli-artifact" in dependencies["typescript-tests"]
+    # The IPC memory matrix launches real worker processes only after the venv
+    # build and the worker-dispatch/recursion harness tests have passed.
+    assert dependencies["windows-harness-tests"] == ["python-build"]
+    assert set(dependencies[runner.IPC_MEMORY_GATE]) == {"python-build", "windows-harness-tests"}
+    assert index["python-build"] < index["windows-harness-tests"] < index[runner.IPC_MEMORY_GATE]
+    # Local-platform selection stays a single native-library gate without the matrix.
+    local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE)
+    assert [name for name, _, _ in local] == ["local-platform-tests"]
+
+
+def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():
+    runner = _runner()
+    gate_list = runner.gates(sys.executable, Path("evidence"), runner.FULL_SCOPE)
+    command, dependencies = next(
+        (command, deps) for name, command, deps in gate_list if name == runner.IPC_MEMORY_GATE
+    )
+    # The driver runs inside the python-build venv, so its default --python
+    # (sys.executable) gives every spawned worker the same venv interpreter.
+    assert command[:5] == ["uv", "run", "--no-sync", "python",
+                           str(runner.ROOT / "tools/benchmarks/ipc_memory.py")]
+    assert "--python" not in command
+    def flag(name):
+        return command[command.index(name) + 1]
+    assert flag("--mode") == "matrix"
+    assert Path(flag("--output-dir")) == Path("evidence") / runner.IPC_MEMORY_EVIDENCE_DIR
+    assert "--memory-stats" in command
+    assert "--require-memory-stats" in command
+    # The complete table must run: no subset selector, no post-shutdown exemption.
+    assert "--only" not in command
+    assert "--allow-unavailable-stats-after-shutdown" not in command
+    assert dependencies == ("python-build", "windows-harness-tests")
+    child_timeout = float(flag("--child-timeout"))
+    row_timeout = float(flag("--row-timeout"))
+    benchmark = _benchmark()
+    rows = benchmark.matrix_rows()
+    assert len(rows) == 9
+    assert 0 < child_timeout <= benchmark.MAX_CHILD_TIMEOUT_S
+    assert 0 < row_timeout <= benchmark.MAX_ROW_TIMEOUT_S
+    step_timeout = runner.GATE_TIMEOUT_S[runner.IPC_MEMORY_GATE]
+    assert math.isfinite(step_timeout)
+    assert math.isfinite(runner.STEP_TIMEOUT_S)
+    # The step bound must cover every row consuming its whole row budget.
+    assert step_timeout >= len(rows) * row_timeout
 
 
 def test_gate_environment_selects_system_mode_except_for_app_gates(tmp_path):
@@ -221,3 +275,204 @@ def test_full_scope_fails_when_source_mode_gate_names_disappear(tmp_path, monkey
     evidence = json.loads((output / "run-evidence.json").read_text())
     assert result == 1
     assert "cli-build" in evidence["error"] and "no longer exist" in evidence["error"]
+
+
+def _stub_windows_main(monkeypatch, runner, tmp_path, stubbed, output_name="evidence"):
+    """Run main() on Windows with stubbed gates and a prepared system CoreSDK."""
+    monkeypatch.setattr(runner, "os", SimpleNamespace(name="nt", environ=os.environ))
+    monkeypatch.setattr(runner.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "capture", lambda command, cwd: {"exit_code": 0, "output": "a" * 40})
+    monkeypatch.setattr(runner, "gates", lambda python, output, scope: stubbed)
+    prepared = tmp_path / "coresdk" / "lib"
+    prepared.mkdir(parents=True, exist_ok=True)
+    (prepared / "fastdb.lib").write_bytes(b"import library")
+    return [
+        "--scope", "full", "--output", str(tmp_path / output_name),
+        "--expected-c-two-sha", "a" * 40, "--expected-fastdb-sha", "a" * 40,
+        "--fastdb-system-lib-dir", str(prepared),
+    ]
+
+
+def test_ipc_memory_matrix_gate_requires_harness_gates_to_pass(tmp_path, monkeypatch):
+    runner = _runner()
+    launched = []
+    real_run_step = runner.run_step
+
+    def spy(name, command, **kwargs):
+        launched.append(name)
+        return real_run_step(name, command, **kwargs)
+
+    monkeypatch.setattr(runner, "run_step", spy)
+    stubbed = [
+        ("python-build", [sys.executable, "-c", "print('venv built')"], ()),
+        ("windows-harness-tests", [sys.executable, "-c", "raise SystemExit(3)"], ("python-build",)),
+        (runner.IPC_MEMORY_GATE,
+         [sys.executable, "-c", "raise AssertionError('benchmark must not launch')"],
+         ("python-build", "windows-harness-tests")),
+        ("independent-after-matrix", [sys.executable, "-c", "print('still executed')"], ()),
+    ]
+    stubbed += [
+        (name, [sys.executable, "-c", "print('source gate')"], ())
+        for name in sorted(runner.SOURCE_MODE_GATES - {"python-build"})
+    ]
+    result = runner.main(_stub_windows_main(monkeypatch, runner, tmp_path, stubbed))
+    output = tmp_path / "evidence"
+    evidence = json.loads((output / "run-evidence.json").read_text())
+    assert result == 1 and evidence["status"] == "failed"
+    steps = {step["id"]: step for step in evidence["steps"]}
+    assert steps["windows-harness-tests"]["status"] == "failed"
+    assert steps["windows-harness-tests"]["exit_code"] == 3
+    assert steps[runner.IPC_MEMORY_GATE]["status"] == "not_run"
+    assert "windows-harness-tests" in steps[runner.IPC_MEMORY_GATE]["reason"]
+    assert steps["independent-after-matrix"]["status"] == "passed"
+    assert runner.IPC_MEMORY_GATE not in launched
+    assert not (output / f"{runner.IPC_MEMORY_GATE}.log").exists()
+    assert "still executed" in (output / "independent-after-matrix.log").read_text()
+
+
+def test_ipc_memory_matrix_gate_status_binds_full_required_stats_evidence(tmp_path, monkeypatch):
+    runner = _runner()
+    benchmark = _benchmark()
+    digest = "f" * 64
+
+    def complete_body():
+        specs = benchmark.matrix_rows()
+        rows = [
+            {"name": spec["name"], "workload": spec["workload"], "config": spec["config"],
+             "ok": True, "terminated_by_matrix": False, "exit_code": 0,
+             "worker_count": spec["workers"], "native_sha256": digest,
+             "result_file": f"rows/{spec['name']}.json"}
+            for spec in specs
+        ]
+        return {
+            "schema": "c-two.ipc-memory-matrix.v1", "complete": True,
+            "memory_stats": True, "require_memory_stats": True,
+            "allow_unavailable_stats_after_shutdown": False,
+            "rows": rows, "rows_not_selected": [], "failures": [],
+            "totals": {"rows_total": len(rows), "rows_selected": len(rows),
+                       "rows_not_selected": 0, "passed": len(rows), "failed": 0},
+            "native": {"per_row": {spec["name"]: digest for spec in specs},
+                       "rows_missing_provenance": [], "rows_inconsistent": [],
+                       "single_installed_hash": digest, "agreement": True},
+        }
+
+    def mutated(change):
+        body = complete_body()
+        change(body)
+        return body
+
+    def mark_missing_native(body):
+        name = body["rows"][0]["name"]
+        body["native"]["per_row"][name] = None
+        body["native"].update(rows_missing_provenance=[name], agreement=False, single_installed_hash=None)
+
+    def mark_inconsistent_native(body):
+        name = body["rows"][0]["name"]
+        body["rows"][0]["native_sha256"] = "a" * 64
+        body["native"]["per_row"][name] = f"inconsistent:{digest},{'a' * 64}"
+        body["native"].update(rows_inconsistent=[name], agreement=False, single_installed_hash=None)
+
+    header_only = {key: value for key, value in complete_body().items() if key in {
+        "schema", "complete", "memory_stats", "require_memory_stats",
+        "allow_unavailable_stats_after_shutdown",
+    }}
+    full_writer = (
+        "import json, pathlib, sys; "
+        "target = pathlib.Path(sys.argv[1]); target.mkdir(parents=True, exist_ok=True); "
+        "matrix = json.loads(sys.argv[2]); "
+        "(target / 'matrix.json').write_text(json.dumps(matrix)); "
+        "rows_dir = target / 'rows'; rows_dir.mkdir(exist_ok=True); "
+        "[(rows_dir / (row['name'] + '.json')).write_text(json.dumps(row)) for row in matrix.get('rows', [])]"
+    )
+    decoy_writer = (
+        "import json, pathlib, sys; "
+        "target = pathlib.Path(sys.argv[1]); target.mkdir(parents=True, exist_ok=True); "
+        "matrix = json.loads(sys.argv[2]); "
+        "(target / 'matrix.json').write_text(json.dumps(matrix)); "
+        "rows_dir = target / 'rows'; rows_dir.mkdir(exist_ok=True); "
+        "[(rows_dir / (row['name'] + '.json')).write_text(json.dumps(row)) for row in matrix.get('rows', [])]; "
+        "(rows_dir / 'decoy.json').write_text('{}')"
+    )
+    matrix_only_writer = (
+        "import json, pathlib, sys; "
+        "target = pathlib.Path(sys.argv[1]); target.mkdir(parents=True, exist_ok=True); "
+        "(target / 'matrix.json').write_text(json.dumps(json.loads(sys.argv[2])))"
+    )
+    empty_writer = "import pathlib, sys; pathlib.Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)"
+
+    variants = {
+        "complete": (complete_body(), "passed", full_writer),
+        "windows_result_paths": (mutated(lambda body: [
+            row.update(result_file=row["result_file"].replace("/", "\\"))
+            for row in body["rows"]
+        ]), "passed", full_writer),
+        # Header flags alone prove nothing: the pre-fix acceptance hole.
+        "header_only": (header_only, "failed", full_writer),
+        "only_subset": (mutated(lambda body: body.update(complete=False)), "failed", full_writer),
+        "stats_optional": (mutated(lambda body: body.update(memory_stats=False)), "failed", full_writer),
+        "stats_unrequired": (mutated(lambda body: body.update(require_memory_stats=False)), "failed", full_writer),
+        "shutdown_exempt": (mutated(lambda body: body.update(allow_unavailable_stats_after_shutdown=True)), "failed", full_writer),
+        "empty_rows": (mutated(lambda body: body.update(rows=[])), "failed", full_writer),
+        "missing_row": (mutated(lambda body: body["rows"].pop()), "failed", full_writer),
+        "duplicate_row": (mutated(lambda body: body["rows"].append(dict(body["rows"][0]))), "failed", full_writer),
+        "failed_row": (mutated(lambda body: body["rows"][0].update(ok=False)), "failed", full_writer),
+        "terminated_row": (mutated(lambda body: body["rows"][0].update(terminated_by_matrix=True)), "failed", full_writer),
+        "bool_exit_code": (mutated(lambda body: body["rows"][0].update(exit_code=False)), "failed", full_writer),
+        "float_exit_code": (mutated(lambda body: body["rows"][0].update(exit_code=0.0)), "failed", full_writer),
+        "bool_totals": (mutated(lambda body: body["totals"].update(passed=True)), "failed", full_writer),
+        "native_absent": (mutated(mark_missing_native), "failed", full_writer),
+        "native_inconsistent": (mutated(mark_inconsistent_native), "failed", full_writer),
+        "escaping_result_file": (mutated(lambda body: body["rows"][0].update(result_file="../matrix.json")), "failed", full_writer),
+        "escaping_windows_result_file": (mutated(lambda body: body["rows"][0].update(result_file="..\\matrix.json")), "failed", full_writer),
+        "row_files_absent": (complete_body(), "failed", matrix_only_writer),
+        "wrong_result_file": (mutated(lambda body: body["rows"][0].update(result_file="rows/decoy.json")), "failed", decoy_writer),
+        "missing_result_file": (mutated(lambda body: body["rows"][0].update(result_file="rows/absent.json")), "failed", full_writer),
+        "matrix_json_absent": (complete_body(), "failed", empty_writer),
+    }
+
+    timeouts = {}
+    real_run_step = runner.run_step
+
+    def spy(name, command, **kwargs):
+        timeouts[name] = kwargs["timeout"]
+        return real_run_step(name, command, **kwargs)
+
+    monkeypatch.setattr(runner, "run_step", spy)
+    expected_names = [spec["name"] for spec in benchmark.matrix_rows()]
+    for label, (body, expected_status, writer) in variants.items():
+        # Fresh output per variant so stale evidence files cannot leak between runs.
+        output = tmp_path / f"evidence-{label}"
+        stubbed = [
+            ("python-build", [sys.executable, "-c", "print('venv built')"], ()),
+            (runner.IPC_MEMORY_GATE,
+             [sys.executable, "-c", writer, str(output / runner.IPC_MEMORY_EVIDENCE_DIR), json.dumps(body)],
+             ("python-build",)),
+        ]
+        stubbed += [
+            (name, [sys.executable, "-c", "print('source gate')"], ())
+            for name in sorted(runner.SOURCE_MODE_GATES - {"python-build"})
+        ]
+        result = runner.main(_stub_windows_main(monkeypatch, runner, tmp_path, stubbed, output_name=f"evidence-{label}"))
+        evidence = json.loads((output / "run-evidence.json").read_text())
+        step = next(s for s in evidence["steps"] if s["id"] == runner.IPC_MEMORY_GATE)
+        assert step["status"] == expected_status, label
+        assert (result == 0) == (expected_status == "passed"), label
+        # The benchmark exit alone never decides acceptance: every negative here
+        # exits 0 and must still be recorded as a failed gate.
+        assert step["exit_code"] == 0, label
+        assert timeouts[runner.IPC_MEMORY_GATE] == runner.IPC_MEMORY_STEP_TIMEOUT_S, label
+        if expected_status == "passed":
+            assert "evidence_problem" not in step
+            matrix_artifact = [a for a in evidence["artifacts"]
+                               if a["path"] == f"{runner.IPC_MEMORY_EVIDENCE_DIR}/matrix.json"]
+            assert len(matrix_artifact) == 1
+            matrix_bytes = (output / runner.IPC_MEMORY_EVIDENCE_DIR / "matrix.json").read_bytes()
+            assert matrix_artifact[0]["sha256"] == hashlib.sha256(matrix_bytes).hexdigest()
+            row_artifacts = {a["path"] for a in evidence["artifacts"]
+                             if a["path"].startswith(f"{runner.IPC_MEMORY_EVIDENCE_DIR}/rows/")}
+            assert row_artifacts == {
+                f"{runner.IPC_MEMORY_EVIDENCE_DIR}/rows/{name}.json" for name in expected_names
+            }
+        else:
+            assert step["evidence_problem"], label

@@ -88,6 +88,12 @@ impl RouteCatalog {
         })
     }
 
+    pub(crate) fn registered_identity(&self, name: &str) -> Option<(String, u64)> {
+        self.routes
+            .get(name)
+            .map(|route| (route.route_uid.clone(), route.route_revision))
+    }
+
     pub(crate) fn catalog_revision(&self) -> u64 {
         self.catalog_revision
     }

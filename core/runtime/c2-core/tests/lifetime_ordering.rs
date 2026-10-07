@@ -228,17 +228,14 @@ fn held_release_attempts_invalidation_and_transport_cleanup_and_retains_both_fai
 #[test]
 fn held_response_copy_failure_attempts_cleanup_and_retains_both_causes() {
     let pool = Arc::new(RwLock::new(replacement_pool("copy_source")));
-    let handle = {
-        let mut pool = pool.write();
-        let mut handle = pool.alloc_handle(16).expect("handle allocation");
-        pool.handle_slice_mut(&mut handle)
-            .copy_from_slice(b"copy and release");
-        handle
-    };
+    let mut handle = c2_wire::chunk::ReassemblyBacking::admit(Arc::clone(&pool), 1, 16)
+        .expect("handle admission");
+    handle
+        .write_at(0, b"copy and release")
+        .expect("handle write");
     let lease = ResponseLease::new(
         ResponseData::Handle(handle),
         Arc::new(Mutex::new(None::<ServerPoolState>)),
-        Arc::clone(&pool),
     );
     *pool.write() = replacement_pool("copy_failure");
 
@@ -287,22 +284,21 @@ fn inline_response_lease(bytes: &[u8]) -> ResponseLease {
     ResponseLease::new(
         ResponseData::Inline(bytes.to_vec()),
         Arc::new(Mutex::new(None::<ServerPoolState>)),
-        Arc::new(RwLock::new(replacement_pool("inline"))),
     )
 }
 
 fn breakable_handle_response(bytes: &[u8]) -> (HeldResponse, Arc<RwLock<MemPool>>) {
     let pool = Arc::new(RwLock::new(replacement_pool("handle")));
-    let handle = {
-        let mut pool = pool.write();
-        let mut handle = pool.alloc_handle(bytes.len()).expect("handle allocation");
-        pool.handle_slice_mut(&mut handle).copy_from_slice(bytes);
-        handle
-    };
+    let mut handle = c2_wire::chunk::ReassemblyBacking::admit(
+        Arc::clone(&pool),
+        1,
+        bytes.len().max(1),
+    )
+    .expect("handle admission");
+    handle.write_at(0, bytes).expect("handle write");
     let lease = ResponseLease::new(
         ResponseData::Handle(handle),
         Arc::new(Mutex::new(None::<ServerPoolState>)),
-        pool.clone(),
     );
     (
         HeldResponse::from_response_lease(lease).expect("held handle response"),

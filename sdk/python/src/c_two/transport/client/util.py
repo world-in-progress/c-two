@@ -2,14 +2,22 @@
 from __future__ import annotations
 
 
-def _endpoint_name_from_address(server_address: str) -> str:
+def _endpoint_name_from_address(
+    server_address: str,
+) -> str:
     from c_two._native import ipc_endpoint_name
 
     return ipc_endpoint_name(server_address)
 
 
-def ping(server_address: str, timeout: float = 0.5) -> bool:
-    """Ping a direct IPC server to check whether it is alive."""
+def ping(
+    server_address: str,
+    timeout: float = 0.5,
+) -> bool:
+    """Ping a direct IPC server to check whether it is alive.
+
+    The native resolver derives the platform endpoint from the logical address.
+    """
     from c_two._native import ipc_ping
 
     try:
@@ -20,8 +28,14 @@ def ping(server_address: str, timeout: float = 0.5) -> bool:
         return False
 
 
-def shutdown(server_address: str, timeout: float = 0.5) -> dict[str, object]:
-    """Send a direct IPC shutdown signal to a server."""
+def shutdown(
+    server_address: str,
+    timeout: float = 0.5,
+) -> dict[str, object]:
+    """Send a direct IPC shutdown signal to a server.
+
+    The native resolver derives the platform endpoint from the logical address.
+    """
     from c_two._native import ipc_shutdown
 
     try:

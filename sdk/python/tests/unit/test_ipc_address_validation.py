@@ -1,8 +1,19 @@
 import sys
+import uuid
 
 import pytest
 
 from c_two.transport.client import util
+
+
+def _absent_address() -> str:
+    """A per-test logical address no live server can own.
+
+    The admin probes here are real calls: a fixed, guessable name could address
+    a developer's running server and ``shutdown`` would stop it. A fresh UUID
+    keeps every probe harmless and its outcome deterministic.
+    """
+    return f'ipc://unused-absent-{uuid.uuid4().hex}'
 
 
 @pytest.mark.parametrize(
@@ -29,7 +40,8 @@ def test_client_util_accepts_plain_ipc_region():
     if sys.platform == 'win32':
         assert endpoint.startswith('\\\\.\\pipe\\c_two-')
     else:
-        assert endpoint == '/tmp/c_two_ipc/unit-server.sock'
+        import re
+        assert re.fullmatch(r'/tmp/c2-[0-9a-f]+/v2\.2/[0-9a-f]{64}\.sock', endpoint)
 
 
 def test_client_util_uses_native_endpoint_name(monkeypatch):
@@ -45,6 +57,21 @@ def test_client_util_uses_native_endpoint_name(monkeypatch):
 
     assert util._endpoint_name_from_address('ipc://unit-server') == '/tmp/native.sock'
     assert calls == ['ipc://unit-server']
+
+
+def test_client_util_keeps_the_historical_call_shapes():
+    """The optional protocol arguments must not break existing callers.
+
+    Both probes address a fresh UUID region, so the historical one-argument and
+    two-argument shapes stay exercisable without ever touching a live server.
+    """
+    assert util.ping(_absent_address(), 0.01) is False
+    assert util.shutdown(_absent_address(), 0.01) == {
+        'acknowledged': True,
+        'shutdown_started': False,
+        'server_stopped': True,
+        'route_outcomes': [],
+    }
 
 
 def test_ping_invalid_address_returns_false():
@@ -63,10 +90,10 @@ def test_shutdown_invalid_address_returns_false():
 @pytest.mark.parametrize('timeout', [-1.0, float('nan'), float('inf')])
 def test_ping_rejects_invalid_timeout(timeout):
     with pytest.raises(ValueError, match='timeout'):
-        util.ping('ipc://unit-server', timeout=timeout)
+        util.ping(_absent_address(), timeout=timeout)
 
 
 @pytest.mark.parametrize('timeout', [-1.0, float('nan'), float('inf')])
 def test_shutdown_rejects_invalid_timeout(timeout):
     with pytest.raises(ValueError, match='timeout'):
-        util.shutdown('ipc://unit-server', timeout=timeout)
+        util.shutdown(_absent_address(), timeout=timeout)

@@ -14,13 +14,16 @@ fn timeout_duration(timeout_seconds: f64) -> PyResult<Duration> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (address))]
 fn ipc_endpoint_name(address: &str) -> PyResult<String> {
-    c2_core::direct_ipc_endpoint(address)
+    let endpoint = c2_core::direct_ipc_endpoint(address);
+    endpoint
         .map(|endpoint| endpoint.os_name().to_string_lossy().into_owned())
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[pyfunction]
+#[pyo3(signature = (address, timeout_seconds=0.5))]
 fn ipc_ping(py: Python<'_>, address: &str, timeout_seconds: f64) -> PyResult<bool> {
     let timeout = timeout_duration(timeout_seconds)?;
     py.detach(|| c2_core::ping_direct_ipc(address, timeout))
@@ -28,6 +31,7 @@ fn ipc_ping(py: Python<'_>, address: &str, timeout_seconds: f64) -> PyResult<boo
 }
 
 #[pyfunction]
+#[pyo3(signature = (address, timeout_seconds=0.5))]
 fn ipc_shutdown<'py>(
     py: Python<'py>,
     address: &str,

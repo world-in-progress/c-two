@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -816,7 +817,12 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
         .expect("local registration");
     let identity = runtime.ensure_server().expect("runtime identity");
     let address = runtime.server_address().expect("server address");
-    let inspector = c2_ipc::ClientPool::instance()
+    // Inspect the server's local route token through a standalone throwaway
+    // client pool. Runtime-owned caches stay private (no public escape
+    // hatch), and a plain ClientPool::acquire/release pair serves the
+    // inspection without any lifecycle coupling.
+    let inspector_pool = c2_ipc::ClientPool::new(Duration::from_secs(60));
+    let inspector = inspector_pool
         .acquire(&address, Some(&c2_ipc::ClientIpcConfig::default()))
         .expect("inspect local route token");
     let binding = inspector
@@ -838,7 +844,7 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
     runtime.set_relay_anchor_address(Some(registry.url.clone()));
 
     let result = runtime.connect(claimed_expected, Connect::RelayAware);
-    c2_ipc::ClientPool::instance().release(&address);
+    inspector_pool.release(&address);
     let Error::Semantic(error) = result.expect_err("contract mismatch must be terminal") else {
         panic!("contract mismatch must be semantic");
     };
@@ -1053,4 +1059,197 @@ fn service_error_is_not_replayed() {
     };
     assert_eq!(error.code, ErrorCode::ResourceFunctionExecuting);
     assert_eq!(service.calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn hostless_shutdown_closes_own_clients_and_isolates_sibling_runtimes_and_held_leases() {
+    // One hosting Runtime publishes the echo route; two distinct client-only
+    // (hostless) Runtimes connect over direct IPC. Each hostless Runtime owns
+    // its own outgoing IPC client cache: shutting down A must close only A's
+    // clients, leave B callable, and keep B's already-held response lease
+    // valid until it is explicitly released — even across B's own shutdown.
+    // Runtime construction and client-config resolution read the process
+    // environment, so this test joins the file-wide env isolation guard.
+    let _environment = relay_env_lock();
+    let server_runtime = Runtime::new(runtime_options(unique_name("iso-server"), None))
+        .expect("server runtime");
+    let host = server_runtime.host(HostOptions::default()).expect("host");
+    let route_name = unique_name("iso-echo");
+    let mut registration = host.register(definition(&route_name)).expect("registration");
+    let address = server_runtime.server_address().expect("server address");
+    let expected = release().expected_route(&route_name).expect("expected route");
+
+    let runtime_a =
+        Runtime::new(runtime_options(unique_name("iso-client-a"), None)).expect("runtime a");
+    let runtime_b =
+        Runtime::new(runtime_options(unique_name("iso-client-b"), None)).expect("runtime b");
+    let client_a = runtime_a
+        .connect(
+            expected.clone(),
+            Connect::DirectIpc {
+                address: address.clone(),
+            },
+        )
+        .expect("client a");
+    let client_b = runtime_b
+        .connect(
+            expected.clone(),
+            Connect::DirectIpc {
+                address: address.clone(),
+            },
+        )
+        .expect("client b");
+    assert_eq!(
+        client_a.call_owned("echo", b"a-before").expect("a call"),
+        b"a-before"
+    );
+    assert_eq!(
+        client_b.call_owned("echo", b"b-before").expect("b call"),
+        b"b-before"
+    );
+
+    // Held SHM-backed response on B: the payload is far above the default
+    // 4096-byte SHM threshold, so the held lease retains pool ownership
+    // after the call returns.
+    let big: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let mut held = client_b.call_held("echo", &big).expect("held response");
+    assert_eq!(held.bytes(), big.as_slice());
+
+    // Hostless shutdown of A closes A's cache through the same bounded
+    // barrier the native RuntimeSession hostless branch projects.
+    let outcome_a = runtime_a.shutdown_without_host(Duration::from_secs(5));
+    assert!(
+        outcome_a.ipc_clients_drained,
+        "A drain must confirm: {:?}",
+        outcome_a.ipc_client_close_error
+    );
+    assert!(
+        client_a.call_owned("echo", b"a-after").is_err(),
+        "A's client must be closed by its own hostless shutdown"
+    );
+    assert_eq!(
+        client_b
+            .call_owned("echo", b"b-after")
+            .expect("B must remain callable across A's shutdown"),
+        b"b-after"
+    );
+    assert_eq!(held.bytes(), big.as_slice());
+
+    // B's own hostless shutdown closes B's connection; the already-held
+    // lease and its pool Arcs must stay valid until explicitly released.
+    let outcome_b = runtime_b.shutdown_without_host(Duration::from_secs(5));
+    assert!(
+        outcome_b.ipc_clients_drained,
+        "B drain must confirm: {:?}",
+        outcome_b.ipc_client_close_error
+    );
+    assert!(
+        client_b.call_owned("echo", b"b-closed").is_err(),
+        "B's client must be closed by its own hostless shutdown"
+    );
+    assert_eq!(held.bytes(), big.as_slice());
+    held
+        .invalidate_then_release(|| Ok(()))
+        .expect("held lease must release cleanly after its connection closed");
+
+    drop(client_a);
+    drop(client_b);
+    registration.close().expect("registration close");
+    drop(host);
+    drop(server_runtime);
+}
+
+#[test]
+fn first_connection_attempt_freezes_client_config_atomically_before_connect_io() {
+    // A peer that accepts and reads the handshake request but never replies
+    // stalls the first client connect deterministically. The freeze is taken
+    // under the RuntimeState lock strictly before any connect I/O, so once
+    // the peer has observed the handshake bytes the frozen flag must already
+    // be visible, and a setter racing the stalled connect must observe
+    // ClientConfigFrozen instead of starting a second configuration. The
+    // first acquire resolves client config from the process environment, so
+    // this test joins the file-wide env isolation guard.
+    let _environment = relay_env_lock();
+    let address = format!("ipc://{}", unique_name("freeze-stall"));
+    let endpoint = LocalEndpoint::from_address(&address).unwrap();
+    let (listener_ready_tx, listener_ready_rx) = std::sync::mpsc::channel();
+    let (handshake_read_tx, handshake_read_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    let server_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut listener = LocalListener::bind(&endpoint).unwrap();
+            listener_ready_tx.send(()).unwrap();
+            let mut stream = listener.accept().await.unwrap();
+            let mut len_buf = [0_u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let body_len = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0_u8; body_len];
+            stream.read_exact(&mut body).await.unwrap();
+            handshake_read_tx.send(()).unwrap();
+            // Deterministic stall: answer the handshake with EOF only when
+            // the test releases the peer.
+            let _ = release_rx.recv();
+            drop(stream);
+        });
+    });
+    listener_ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("freeze-race listener readiness");
+
+    let runtime = Runtime::new(runtime_options(unique_name("freeze-race"), None)).expect("runtime");
+    let expected = release()
+        .expected_route(&unique_name("frozen-route"))
+        .expect("expected route");
+    // Setters still work before the first connection attempt.
+    runtime
+        .set_client_ipc_overrides(None)
+        .expect("setter must work before the first connection attempt");
+
+    let connect_runtime = runtime.clone();
+    let connect_address = address.clone();
+    let connect_thread = std::thread::spawn(move || {
+        connect_runtime.connect(expected, Connect::DirectIpc {
+            address: connect_address,
+        })
+    });
+
+    // The peer observed the handshake request bytes, which strictly happens
+    // after the freeze: no polling or timing tolerance is needed.
+    handshake_read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("handshake request observed while the connect is stalled");
+    assert!(
+        runtime.client_config_frozen(),
+        "config must freeze atomically before the first connection attempt performs I/O"
+    );
+
+    // The racing setter loses: it may not start a second configuration.
+    let raced = runtime.set_client_ipc_overrides(None);
+    assert!(
+        matches!(raced, Err(c2_core::LifecycleError::ClientConfigFrozen)),
+        "setter racing a stalled first connect must observe ClientConfigFrozen, got {raced:?}"
+    );
+
+    // Release the stall as a handshake EOF: the first attempt fails and the
+    // freeze survives it, because freezing on the first valid attempt
+    // (including failure) is the documented contract.
+    drop(release_tx);
+    assert!(
+        connect_thread.join().unwrap().is_err(),
+        "the stalled connect must fail on handshake EOF"
+    );
+    assert!(
+        runtime.client_config_frozen(),
+        "the freeze must survive the failed first attempt"
+    );
+    assert!(matches!(
+        runtime.set_client_ipc_overrides(None),
+        Err(c2_core::LifecycleError::ClientConfigFrozen)
+    ));
+    server_thread.join().unwrap();
 }

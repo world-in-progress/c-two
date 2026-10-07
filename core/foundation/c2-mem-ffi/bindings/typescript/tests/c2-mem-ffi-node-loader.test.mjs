@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -7,9 +7,12 @@ import test from 'node:test';
 
 import {
   C2_MEM_FFI_ABI_VERSION,
+  C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
+  C2NodeIpcConnectionError,
   createBundledC2MemFfiNodeRuntime,
   createC2MemFfiRequestPoolFromSymbols,
   createC2MemFfiResponsePoolFromSymbols,
+  createNodeIpcConnect,
   loadBundledC2MemFfiNodeNativeSymbols,
   loadC2MemFfiNodeNativeSymbols,
   resolveBundledC2MemFfiNodeNativeLibraryPath,
@@ -19,6 +22,23 @@ import {
 function libraryPath() {
   return resolveBundledC2MemFfiNodeNativeLibraryPath();
 }
+
+test('native endpoint resolution rejects NUL and non-object options first', () => {
+  assert.throws(() => resolveLocalIpcEndpoint('ipc://bad\0name'), /NUL/);
+  assert.throws(() => resolveLocalIpcEndpoint('ipc://invalid-options', null), /options must be an object/);
+});
+test('logical addresses resolve to one deterministic native OS endpoint', () => {
+  const address = `ipc://native-strict-${process.pid}`;
+  const endpoint = resolveLocalIpcEndpoint(address);
+  if (process.platform === 'win32') {
+    assert.ok(endpoint.startsWith('\\\\.\\pipe\\c_two-'));
+  } else {
+    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
+  }
+  assert.equal(endpoint, resolveLocalIpcEndpoint(address));
+  const runtime = createBundledC2MemFfiNodeRuntime();
+  assert.equal(runtime.resolveEndpoint(address), endpoint);
+});
 
 test('c2-mem-ffi bundled Node native loader resolves packaged runtime artifacts', () => {
   const bundled = resolveBundledC2MemFfiNodeNativeLibraryPath();
@@ -92,6 +112,51 @@ test('c2-mem-ffi Node native loader composes real request and response pools', a
 
   await responsePool.close?.();
   await fakeServerPool.close?.();
+});
+
+test('c2-mem-ffi response pool bootstraps a differently sized owner backing', async () => {
+  const { requestSymbols, responseSymbols } = loadC2MemFfiNodeNativeSymbols(libraryPath());
+  const owner = await createC2MemFfiRequestPoolFromSymbols(requestSymbols, {
+    prefix: '/cc2snode2',
+    segmentSize: 1024 * 1024,
+    maxSegments: 1,
+    minBlockSize: 4096,
+  });
+  // The reader only declares the minimum legal peer geometry: the real backing
+  // geometry must come from the mapped segment, never from this bootstrap floor.
+  const bootstrapFloor = 2 * 4096;
+  const responsePool = await createC2MemFfiResponsePoolFromSymbols(responseSymbols, {
+    prefix: owner.prefix,
+    segmentSize: bootstrapFloor,
+    maxSegments: 1,
+    minBlockSize: 4096,
+  });
+  assert.ok(owner.segments[0].size >= 1024 * 1024);
+
+  const payload = new Uint8Array(4096).fill(0x5a);
+  const block = await owner.write(payload);
+  await owner.forgetConsumed(block);
+
+  const destination = new Uint8Array(payload.byteLength);
+  await responsePool.read(block, destination);
+  assert.deepEqual(Array.from(destination), Array.from(payload));
+  await responsePool.release(block);
+  await assert.rejects(
+    () => responsePool.release(block),
+    /INVALID_ARGUMENT|POOL_ERROR/,
+  );
+
+  await assert.rejects(
+    () => responsePool.read(
+      { ...block, generation: block.generation + 1 },
+      new Uint8Array(payload.byteLength),
+    ),
+    /POOL_ERROR/,
+    'an unbacked generation must never be fabricated',
+  );
+
+  await responsePool.close?.();
+  await owner.close?.();
 });
 
 test('bundled Node runtime exposes generated-transport compatible IPC support', async () => {
@@ -187,7 +252,7 @@ test('native endpoint resolution preserves logical identity and rejects path inp
   if (process.platform === 'win32') {
     assert.match(endpoint, /^\\\\\.\\pipe\\c_two-/);
   } else {
-    assert.equal(endpoint, `/tmp/c_two_ipc/node-native-${process.pid}.sock`);
+    assert.match(endpoint, /^\/tmp\/c2-[0-9a-f]+\/v2\.2\/[0-9a-f]{64}\.sock$/);
   }
   for (const invalid of ['/tmp/node.sock', 'ipc://../bad', 'ipc://bad\0name']) {
     assert.throws(() => resolveLocalIpcEndpoint(invalid));
@@ -279,5 +344,27 @@ test('native dedicated requests and responses complete repeatedly without exhaus
   } finally {
     await peer.close();
     await owner.close();
+  }
+});
+
+
+test('native addon rejects a stale core ABI before exposing endpoint or pool calls', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi-'));
+  try {
+    const source = readFileSync(new URL('../native/node_c2_mem_ffi_loader.c', import.meta.url), 'utf8');
+    const symbols = [...source.matchAll(/LOAD_REQUIRED\(\w+, "([^"]+)"\)/g)].map((match) => match[1]);
+    const body = symbols.map((name) => name === 'c2_mem_ffi_abi_version'
+      ? `#[unsafe(no_mangle)] pub extern "C" fn ${name}() -> u32 { 2 }`
+      : `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`).join('\n');
+    const fixture = resolve(directory, 'stale.rs');
+    writeFileSync(fixture, body);
+    const library = resolve(directory, process.platform === 'win32' ? 'stale.dll' : process.platform === 'darwin' ? 'stale.dylib' : 'stale.so');
+    const output = spawnSync(process.env.RUSTC ?? 'rustc',
+      ['--edition=2024', '--crate-type=cdylib', fixture, '-o', library],
+      { cwd: directory, encoding: 'utf8' });
+    assert.equal(output.status, 0, `${output.error ?? ''} ${output.stdout} ${output.stderr}`);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 2.*expected version 3/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });

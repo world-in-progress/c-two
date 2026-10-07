@@ -41,6 +41,12 @@ def _reset_registry_and_settings(monkeypatch):
         'C2_REMOTE_PAYLOAD_CHUNK_SIZE',
         'C2_IPC_POOL_SEGMENT_SIZE',
         'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
+        'C2_IPC_POOL_PREWARM_SEGMENTS',
+        'C2_IPC_POOL_MIN_RETAINED_SEGMENTS',
+        'C2_IPC_POOL_DECAY_SECONDS',
+        'C2_IPC_SHM_BACKING_BUDGET_BYTES',
+        'C2_IPC_FILE_BACKING_BUDGET_BYTES',
+        'C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES',
         'C2_RELAY_ANCHOR_ADDRESS',
         'C2_RELAY_USE_PROXY',
         'C2_RELAY_ROUTE_MAX_ATTEMPTS',
@@ -85,11 +91,18 @@ def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields(
 
     assert base['pool_enabled'] is bool
     assert base['pool_segment_size'] is int
+    assert base['pool_prewarm_segments'] is int
+    assert base['pool_min_retained_segments'] is int
     assert base['chunk_gc_interval'] is float
+    assert base['shm_backing_budget_bytes'] is int
+    assert base['file_backing_budget_bytes'] is int
+    assert base['live_reassembly_budget_bytes'] is int
     assert server['heartbeat_interval'] is float
     assert server['max_pending_requests'] is int
     assert server['max_execution_workers'] is int
+    assert server['pool_decay_seconds'] is float
     assert client['reassembly_segment_size'] is int
+    assert client['pool_decay_seconds'] is float
 
     for hints in (base, server, client):
         assert 'shm_threshold' not in hints
@@ -238,6 +251,150 @@ def test_server_execution_workers_above_hard_limit_rejected(monkeypatch):
         )
 
 
+GIB = 1024 ** 3
+U64_MAX = 2 ** 64 - 1
+
+
+def test_resolved_ipc_config_exposes_canonical_memory_budget_defaults():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    server_cfg = native.resolve_server_ipc_config(None, None)
+    client_cfg = native.resolve_client_ipc_config(None, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == 8 * GIB
+        assert cfg['file_backing_budget_bytes'] == 16 * GIB
+        assert cfg['live_reassembly_budget_bytes'] == 8 * GIB
+
+
+def test_ipc_overrides_roundtrip_memory_budget_bytes():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = {
+        'shm_backing_budget_bytes': 3 * GIB,
+        'file_backing_budget_bytes': 5 * GIB,
+        'live_reassembly_budget_bytes': GIB,
+    }
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == 3 * GIB
+        assert cfg['file_backing_budget_bytes'] == 5 * GIB
+        assert cfg['live_reassembly_budget_bytes'] == GIB
+
+
+def test_memory_budget_zero_override_is_retained_not_unlimited():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = {
+        'shm_backing_budget_bytes': 0,
+        'file_backing_budget_bytes': 0,
+        'live_reassembly_budget_bytes': 0,
+    }
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == 0
+        assert cfg['file_backing_budget_bytes'] == 0
+        assert cfg['live_reassembly_budget_bytes'] == 0
+
+
+def test_memory_budget_full_u64_range_override_is_retained():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = {
+        'shm_backing_budget_bytes': U64_MAX,
+        'file_backing_budget_bytes': U64_MAX,
+        'live_reassembly_budget_bytes': U64_MAX,
+    }
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['shm_backing_budget_bytes'] == U64_MAX
+        assert cfg['file_backing_budget_bytes'] == U64_MAX
+        assert cfg['live_reassembly_budget_bytes'] == U64_MAX
+
+
+def test_memory_budget_env_resolves_and_explicit_overrides_win(monkeypatch):
+    monkeypatch.setenv('C2_IPC_SHM_BACKING_BUDGET_BYTES', str(GIB))
+    monkeypatch.setenv('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(2 * GIB))
+    monkeypatch.setenv('C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', str(4 * GIB))
+
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    from_env = native.resolve_client_ipc_config(None, None)
+    assert from_env['shm_backing_budget_bytes'] == GIB
+    assert from_env['file_backing_budget_bytes'] == 2 * GIB
+    assert from_env['live_reassembly_budget_bytes'] == 4 * GIB
+
+    from_env_server = native.resolve_server_ipc_config(None, None)
+    assert from_env_server['shm_backing_budget_bytes'] == GIB
+    assert from_env_server['live_reassembly_budget_bytes'] == 4 * GIB
+
+    overrides = {
+        'shm_backing_budget_bytes': 7 * GIB,
+        'file_backing_budget_bytes': 0,
+        'live_reassembly_budget_bytes': 8 * GIB,
+    }
+    from_explicit = native.resolve_client_ipc_config(overrides, None)
+    assert from_explicit['shm_backing_budget_bytes'] == 7 * GIB
+    assert from_explicit['file_backing_budget_bytes'] == 0
+    assert from_explicit['live_reassembly_budget_bytes'] == 8 * GIB
+
+
+def test_memory_budget_negative_and_overflow_overrides_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    for bad_value in (-1, 2 ** 64):
+        with pytest.raises(OverflowError):
+            native.resolve_client_ipc_config(
+                {'shm_backing_budget_bytes': bad_value}, None
+            )
+        with pytest.raises(OverflowError):
+            native.resolve_server_ipc_config(
+                {'live_reassembly_budget_bytes': bad_value}, None
+            )
+
+
+def test_memory_budget_invalid_env_value_rejected_by_native(monkeypatch):
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    for key, bad_value in (
+        ('C2_IPC_SHM_BACKING_BUDGET_BYTES', '-1'),
+        ('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(2 ** 64)),
+        ('C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', 'not-a-number'),
+    ):
+        monkeypatch.setenv(key, bad_value)
+        with pytest.raises(ValueError, match=key):
+            native.resolve_server_ipc_config(None, None)
+        with pytest.raises(ValueError, match=key):
+            native.resolve_client_ipc_config(None, None)
+        monkeypatch.delenv(key)
+
+
+def test_client_session_projects_memory_budget_overrides():
+    cc.set_client(ipc_overrides={'shm_backing_budget_bytes': 2 * GIB})
+    registry = _ProcessRegistry.get()
+
+    client_config = registry._runtime_session.client_ipc_config  # noqa: SLF001
+    assert client_config['shm_backing_budget_bytes'] == 2 * GIB
+    assert client_config['file_backing_budget_bytes'] == 16 * GIB
+
+
+def test_low_level_server_projects_memory_budget_env(monkeypatch):
+    monkeypatch.setenv('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(32 * GIB))
+
+    server = Server(bind_address='ipc://unit_budget_env_server')
+    try:
+        assert server._config['file_backing_budget_bytes'] == 32 * GIB  # noqa: SLF001
+        assert server._config['shm_backing_budget_bytes'] == 8 * GIB  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+
 def test_client_ipc_overrides_beat_env(monkeypatch):
     monkeypatch.setenv('C2_IPC_REASSEMBLY_SEGMENT_SIZE', str(32 * 1024 * 1024))
 
@@ -245,6 +402,120 @@ def test_client_ipc_overrides_beat_env(monkeypatch):
     registry = _ProcessRegistry.get()
 
     assert registry._runtime_session.client_ipc_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
+
+
+def test_client_pool_decay_defaults_and_projects_into_resolved_config():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    client_cfg = native.resolve_client_ipc_config(None, None)
+    assert client_cfg['pool_decay_seconds'] == 60.0
+
+    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 2.5}, None)
+    assert client_cfg['pool_decay_seconds'] == 2.5
+
+
+def test_client_pool_decay_zero_is_immediate_retirement_and_negative_is_rejected():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 0.0}, None)
+    assert client_cfg['pool_decay_seconds'] == 0.0
+
+    with pytest.raises(ValueError, match='pool_decay_seconds'):
+        native.resolve_client_ipc_config({'pool_decay_seconds': -1.0}, None)
+
+
+def test_client_pool_decay_env_resolves_and_override_beats_env(monkeypatch):
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', '12.5')
+
+    client_cfg = native.resolve_client_ipc_config(None, None)
+    assert client_cfg['pool_decay_seconds'] == 12.5
+
+    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 7.5}, None)
+    assert client_cfg['pool_decay_seconds'] == 7.5
+
+
+def test_buddy_policy_defaults_are_lazy_and_retire_to_zero():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    server_cfg = native.resolve_server_ipc_config(None, None)
+    client_cfg = native.resolve_client_ipc_config(None, None)
+
+    for cfg in (server_cfg, client_cfg):
+        assert cfg['pool_enabled'] is True
+        assert cfg['pool_prewarm_segments'] == 0
+        assert cfg['pool_min_retained_segments'] == 0
+
+
+def test_buddy_policy_overrides_beat_env(monkeypatch):
+    monkeypatch.setenv('C2_IPC_POOL_PREWARM_SEGMENTS', '1')
+    monkeypatch.setenv('C2_IPC_POOL_MIN_RETAINED_SEGMENTS', '1')
+
+    server = Server(
+        bind_address='ipc://unit_buddy_policy_override',
+        ipc_overrides={'pool_prewarm_segments': 2, 'pool_min_retained_segments': 3},
+    )
+    try:
+        assert server._config['pool_prewarm_segments'] == 2  # noqa: SLF001
+        assert server._config['pool_min_retained_segments'] == 3  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    client_cfg = native.resolve_client_ipc_config(
+        {'pool_prewarm_segments': 0, 'pool_min_retained_segments': 2}, None
+    )
+    assert client_cfg['pool_prewarm_segments'] == 0
+    assert client_cfg['pool_min_retained_segments'] == 2
+
+
+def test_buddy_policy_env_resolution(monkeypatch):
+    monkeypatch.setenv('C2_IPC_POOL_PREWARM_SEGMENTS', '1')
+    monkeypatch.setenv('C2_IPC_POOL_MIN_RETAINED_SEGMENTS', '2')
+
+    server = Server(bind_address='ipc://unit_buddy_policy_env')
+    try:
+        assert server._config['pool_prewarm_segments'] == 1  # noqa: SLF001
+        assert server._config['pool_min_retained_segments'] == 2  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+
+def test_prewarm_with_buddy_disabled_is_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    with pytest.raises(ValueError, match='pool_prewarm_segments'):
+        native.resolve_server_ipc_config(
+            {'pool_enabled': False, 'pool_prewarm_segments': 1}, None
+        )
+
+    with pytest.raises(ValueError, match='pool_prewarm_segments'):
+        native.resolve_client_ipc_config(
+            {'pool_enabled': False, 'pool_prewarm_segments': 1}, None
+        )
+
+
+def test_prewarm_exceeding_max_pool_segments_is_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    with pytest.raises(ValueError, match='pool_prewarm_segments'):
+        native.resolve_server_ipc_config(
+            {'max_pool_segments': 2, 'pool_prewarm_segments': 3}, None
+        )
+
+
+def test_min_retained_exceeding_limits_is_rejected_by_native():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+
+    with pytest.raises(ValueError, match='pool_min_retained_segments'):
+        native.resolve_client_ipc_config(
+            {'max_pool_segments': 2, 'pool_min_retained_segments': 3}, None
+        )
+
+    with pytest.raises(ValueError, match='reassembly_max_segments'):
+        native.resolve_client_ipc_config(
+            {'reassembly_max_segments': 2, 'pool_min_retained_segments': 3}, None
+        )
 
 
 @pytest.mark.parametrize('key', ['shm_threshold'])
@@ -395,6 +666,15 @@ def test_server_id_rejects_empty_or_path_like_values():
         cc.set_server(server_id='bad\nid')
 
 
+class _FakeRetiredObservation:
+    """Retirement-bundle double for registry test doubles.
+
+    The real observation is an opaque handoff token: its lifetime is decided
+    by real owners inside Rust, so the session interface has no fence to
+    model.
+    """
+
+
 def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(monkeypatch):
     registry = _ProcessRegistry.get()
     settings.relay_anchor_address = 'http://registry-relay.test'
@@ -406,6 +686,21 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
         server_id_override = None
         server_ipc_overrides = None
         client_ipc_overrides = None
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
+            assert route_names == []
+            return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
+
+        def retire_memory_observation(self):
+            # Test double: the registry moves a retirement bundle between
+            # sessions on shutdown, so the double models the full interface.
+            return _FakeRetiredObservation()
+
+        def adopt_retired_memory_observation(self, observation):  # noqa: ARG002
+            pass
 
         def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             self.relay_anchor_address_override = relay_address
@@ -491,6 +786,19 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
 
     class FakeRuntimeSession:
         client_config_frozen = False
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
+            assert route_names == []
+            return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
+
+        def retire_memory_observation(self):
+            return _FakeRetiredObservation()
+
+        def adopt_retired_memory_observation(self, observation):  # noqa: ARG002
+            pass
 
         def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             pass

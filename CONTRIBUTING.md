@@ -45,6 +45,20 @@ uv sync --reinstall-package c-two
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
+For local Unix validation with two Python workers, prepare the native extension,
+`c3`, Node 22, the pinned FastDB CoreSDK and TypeScript build inputs first, then use:
+
+```bash
+.venv/bin/python tools/dev/test_python.py --python .venv/bin/python \
+  --c3 cli/target/debug/c3 --workers 2 --output /tmp/c-two-python-validation
+```
+
+The output directory must be new. Ordinary test files run in parallel; the complete
+Rust/Python and TypeScript matrices run serially and retain strict receipts. The
+runner rejects missing inputs, skips, omitted tests and failed cleanup. See
+[the validation guide](docs/reports/2026-10-02-python-parallel-validation.md)
+for preparation and evidence details. Windows uses its existing native gates.
+
 All new code **must** include tests. Ensure the full suite passes before opening a PR.
 
 ## Submitting Changes

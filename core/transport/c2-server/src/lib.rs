@@ -1,4 +1,5 @@
 mod catalog;
+mod chunk_ordering;
 pub mod config;
 pub mod connection;
 mod dispatcher;
@@ -20,5 +21,8 @@ pub use scheduler::{
     SchedulerLimits, SchedulerSnapshot,
 };
 pub use server::{
-    Server, ServerError, ServerIdentity, ServerLifecycleState, ServerRouteCloseOutcome,
+    DIRECT_IPC_SHUTDOWN_REASON, OWNER_BOUND_SHUTDOWN_REASON, OWNER_MISSING_ADMISSION_REASON,
+    OWNER_WATCHER_ERROR_ADMISSION_REASON, OWNER_WATCHER_ERROR_SHUTDOWN_REASON, Server,
+    ServerError, ServerIdentity, ServerLifecycleState, ServerMemorySnapshot,
+    ServerRouteCloseOutcome, ServerShutdownCompletion,
 };

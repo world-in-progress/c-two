@@ -167,6 +167,7 @@ jobs:
           tests/repo/test_resolve_fastdb_release.py
           tests/repo/test_release_candidate_promotion.py
           tests/repo/test_windows_native_runner.py
+          tests/repo/test_ipc_memory_benchmark.py
           -q --timeout=30
 
   test:

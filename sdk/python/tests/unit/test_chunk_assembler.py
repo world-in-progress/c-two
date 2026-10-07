@@ -15,7 +15,7 @@ import pytest
 # Import assembler from Rust-backed module
 # ---------------------------------------------------------------------------
 
-from c_two.mem import ChunkAssembler as RustChunkAssembler, MemPool, PoolConfig
+from c_two.mem import ChunkAssembler as RustChunkAssembler, MemHandle, MemPool, PoolConfig
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +252,53 @@ class TestAssemblerEdgeCases:
         assert len(r2) == 712
         assert r1[:512] == b'\x01' * 512
         assert r2[:512] == b'\x02' * 512
+
+
+# ===========================================================================
+# MemHandle released-state contract
+# ===========================================================================
+
+class TestMemHandleReleasedState:
+    """After a successful ``release()`` the wrapper must report released state.
+
+    A released carrier is dropped, so ``len``/``repr``/accessors no longer
+    describe a live handle; a failed release keeps the carrier for retry.
+    """
+
+    def test_release_drops_carrier_and_reports_released(self, pool):
+        asm = RustChunkAssembler(pool, 1, 1024)
+        assert asm.feed_chunk(0, b'\x07' * 300)
+        handle = asm.finish()
+
+        assert isinstance(handle, MemHandle)
+        assert len(handle) == 300
+        assert handle.__len__() == 300
+        assert repr(handle) == 'MemHandle(len=300, type=buddy)'
+        assert handle.is_buddy
+        assert not handle.is_file_spill
+        assert not handle.is_dedicated
+        addr, length = handle.buffer_info()
+        assert length == 300
+        assert addr != 0
+
+        handle.release()
+
+        # Released state is observable in both directions: len raises and repr
+        # says released instead of reporting a zero-length live handle.
+        assert repr(handle) == 'MemHandle(released)'
+        with pytest.raises(RuntimeError, match='released'):
+            len(handle)
+        with pytest.raises(RuntimeError, match='released'):
+            handle.__len__()
+        with pytest.raises(RuntimeError, match='released'):
+            handle.buffer_info()
+        with pytest.raises(RuntimeError, match='released'):
+            handle.write_at(b'\x00', 0)
+        assert not handle.is_buddy
+        assert not handle.is_dedicated
+        assert not handle.is_file_spill
+
+        # Release stays idempotent once the carrier is gone, and the released
+        # handle is safe to drop.
+        handle.release()
+        handle.release()

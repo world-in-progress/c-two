@@ -1,8 +1,14 @@
 from importlib.metadata import version
 __version__ = version('c-two')
 
+from ._native import NativeOwnerReceiver, OwnerControlKeepalive, OwnedChild
 from . import error
-from .config import BaseIPCOverrides, ClientIPCOverrides, ServerIPCOverrides
+from .config import (
+    BaseIPCOverrides,
+    ClientIPCOverrides,
+    LifecycleConfig,
+    ServerIPCOverrides,
+)
 from .codegen import (
     ContractArtifact,
     ContractArtifactSet,
@@ -19,6 +25,14 @@ from .crm.descriptor import (
 from .crm.infer import infer_crm_from_resource
 from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import hold, transfer, Held, HeldResult
+from .mem import MemoryCellStats, MemoryLimits, MemoryScopeStats, MemoryStats
+from .transport.endpoint import (
+    EndpointCredential,
+    EndpointSweep,
+    inspect_endpoint,
+    reap_endpoint,
+    sweep_endpoints,
+)
 from .transport.input_lifetime import InputLifetime
 from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 from .transport.registry import (
@@ -35,6 +49,12 @@ from .transport.registry import (
     shutdown,
     serve,
     hold_stats,
+    memory_stats,
+    owner_control_pair,
+    adopt_owner_stdin,
+    spawn_owned_child,
+    native_lifecycle_snapshot,
+    native_terminal_outcome,
 )
 
 __all__ = [
@@ -42,6 +62,10 @@ __all__ = [
     'error',
     'BaseIPCOverrides',
     'ClientIPCOverrides',
+    'LifecycleConfig',
+    'NativeOwnerReceiver',
+    'OwnerControlKeepalive',
+    'OwnedChild',
     'ServerIPCOverrides',
     'ContractArtifact',
     'ContractArtifactSet',
@@ -62,6 +86,15 @@ __all__ = [
     'transfer',
     'Held',
     'HeldResult',
+    'MemoryCellStats',
+    'MemoryLimits',
+    'MemoryScopeStats',
+    'MemoryStats',
+    'EndpointCredential',
+    'EndpointSweep',
+    'inspect_endpoint',
+    'reap_endpoint',
+    'sweep_endpoints',
     'InputLifetime',
     'ConcurrencyConfig',
     'ConcurrencyMode',
@@ -78,4 +111,10 @@ __all__ = [
     'shutdown',
     'serve',
     'hold_stats',
+    'memory_stats',
+    'owner_control_pair',
+    'adopt_owner_stdin',
+    'spawn_owned_child',
+    'native_lifecycle_snapshot',
+    'native_terminal_outcome',
 ]

@@ -10,7 +10,7 @@ extern "C" {
 
 #define C2_MEM_FFI_MAX_SHM_PREFIX_LEN 255u
 #define C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS 16u
-#define C2_MEM_FFI_ABI_VERSION 2u
+#define C2_MEM_FFI_ABI_VERSION 3u
 
 typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_OK = 0,
@@ -45,8 +45,12 @@ typedef struct C2MemFfiResponsePool C2MemFfiResponsePool;
 
 uint32_t c2_mem_ffi_abi_version(void);
 
-/* Resolve a logical ipc:// address through c2-config's native endpoint owner. */
-C2MemFfiStatus c2_mem_ffi_local_endpoint_len(const char *address, size_t *out_len);
+/*
+ * Resolve a logical ipc:// address through c2-config's native endpoint owner.
+ * The backend is selected automatically by the native platform.
+ */
+C2MemFfiStatus c2_mem_ffi_local_endpoint_len(
+    const char *address, size_t *out_len);
 C2MemFfiStatus c2_mem_ffi_local_endpoint_copy(
     const char *address, char *dst, size_t dst_len, size_t *out_written);
 

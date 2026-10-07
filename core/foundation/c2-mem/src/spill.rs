@@ -10,12 +10,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::MmapMut;
 
+use crate::budget::BudgetReservation;
+
 /// The mapping closes before its backing file. On Windows the file carries
 /// DELETE_ON_CLOSE, so normal drop and process termination both remove it.
 #[derive(Debug)]
 pub struct SpillMapping {
     mapping: MmapMut,
     _file: std::fs::File,
+    /// File-backing budget charge. Declared last so it is dropped after the
+    /// mapping is unmapped and the file handle closed: the charge returns
+    /// exactly when the backing is released, surviving any handle movement or
+    /// logical-length trim in between.
+    _budget_guard: Option<BudgetReservation>,
 }
 
 impl std::ops::Deref for SpillMapping {
@@ -29,6 +36,26 @@ impl std::ops::Deref for SpillMapping {
 impl std::ops::DerefMut for SpillMapping {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.mapping
+    }
+}
+
+impl SpillMapping {
+    /// Attach this mapping's single file-backing budget reservation.
+    ///
+    /// Crate-private and single-shot by invariant: [`create_file_spill`]
+    /// stays a raw OS creator, and the pool layer that reserved the bytes
+    /// attaches the guard exactly once, immediately after creation succeeds —
+    /// so a failed creation simply drops its guard and releases the charge,
+    /// and no caller can replace or drop the charge while the mapping is
+    /// live. A second attachment is an internal bug and panics rather than
+    /// silently releasing the live charge. There is no way to clear the guard.
+    pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
+        assert!(
+            self._budget_guard.is_none(),
+            "a backing carries at most one owner-creation reservation"
+        );
+        self._budget_guard = Some(guard);
+        self
     }
 }
 
@@ -101,22 +128,11 @@ pub fn available_physical_memory() -> u64 {
 
 // ── Spill decision ─────────────────────────────────────────────────
 
-/// Returns `true` when the requested allocation should use file-backed
-/// mmap instead of shared memory.
-///
-/// The heuristic: if `requested > available_ram * threshold`, spill.
-/// A threshold of 0.0 forces all allocations to spill (useful for tests).
-/// A threshold of 1.0 effectively disables spilling.
-pub fn should_spill(requested: usize, threshold: f64) -> bool {
-    if threshold <= 0.0 {
-        return true;
-    }
-    if threshold >= 1.0 {
-        return false;
-    }
-    let available = available_physical_memory();
-    requested as u64 > (available as f64 * threshold) as u64
-}
+// The spill decision itself lives in `pressure.rs`: owner pools judge each
+// candidate backing's validated total mapped bytes at the buddy and dedicated
+// creation seams, with a cached OS observation and a recovery band. This
+// module remains the raw OS surface — availability query and file mapping
+// creator — and stays uncharged by design; pool entrypoints own all policy.
 
 // ── File-backed mmap ───────────────────────────────────────────────
 
@@ -171,6 +187,7 @@ pub fn create_file_spill(
         SpillMapping {
             mapping: mmap,
             _file: file,
+            _budget_guard: None,
         },
         path,
     ))
@@ -187,21 +204,6 @@ mod tests {
         let mem = available_physical_memory();
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         assert!(mem > 0, "expected nonzero available memory, got {mem}");
-    }
-
-    #[test]
-    fn test_should_spill_threshold_zero_always_spills() {
-        assert!(should_spill(1, 0.0));
-    }
-
-    #[test]
-    fn test_should_spill_threshold_one_never_spills() {
-        assert!(!should_spill(usize::MAX, 1.0));
-    }
-
-    #[test]
-    fn test_should_spill_small_allocation_does_not_spill() {
-        assert!(!should_spill(1, 0.8));
     }
 
     #[test]

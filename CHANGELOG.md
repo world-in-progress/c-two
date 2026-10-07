@@ -4,7 +4,54 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.7.0] — companion c3 0.3.0
+
+This entry describes Python `c-two` 0.7.0 and its companion CLI `c3` 0.3.0.
+See the [release and upgrade notes](docs/releases/0.7.0.md) for installation,
+migration requirements and the release evidence.
+
+### Added
+
+- Rust-owned `Persistent` and explicit `OwnerBound` service lifecycles, inherited
+  owner control, owned-child supervision and structured shutdown completion.
+- Exact endpoint credentials, reaping and bounded maintenance scoped to a
+  runner's own logical addresses.
+- Finite SHM/file/reassembly budgets, `cc.memory_stats()` and independent relay
+  upstream IPC policy with shared accounting across reconnects.
+
+### Changed
+
+- Unix IPC uses one private native v2.2 namespace. The superseded Unix backend
+  and experimental backend selectors have been removed. Upgrade communicating
+  clients, resource servers and c3 together; old endpoints are not migrated.
+- Buddy allocation is lazy by default, with explicit prewarm and idle retention.
+  `pool_enabled=False` skips buddy while dedicated SHM and checked transport
+  fallback remain available.
+- The C/Node memory binding uses ABI 3; addons and native libraries must match.
+  Payload leases remain independent of endpoint and runtime shutdown.
+
+### Validation status
+
+- [The source validation](docs/reports/canonical-local-endpoint-validation.md)
+  records Linux and Windows Server 2022/2025 gates, portable matrices and
+  installed-wheel consumers. These are development artifacts, not published
+  0.7 packages. The formal release retains its own source-bound candidate
+  manifest and promotion evidence with the [c3 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0).
+
+## [0.6.0] — 2026-09-25
+
+Python [c-two 0.6.0](https://pypi.org/project/c-two/0.6.0/) was published with
+30 wheels and one sdist, alongside
+[c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0)
+for Windows x64 and Linux/macOS x86_64/aarch64. This line includes portable
+FastDB payloads and native Windows IPC and consumes FastDB 0.2.1. The Rust SDK
+remains source-only; this entry does not imply a C-Two crates.io or npm release.
+
+## Historical portable local candidate — 2026-07-24
+
+The following record describes the earlier local candidate and its exact input
+commits. Its publication statements concern that candidate, not the later 0.6.0
+release or the 0.7 release.
 
 ### Added
 

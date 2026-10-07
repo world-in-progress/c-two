@@ -95,6 +95,49 @@ pub struct BufferLeaseStats {
     pub by_direction: BTreeMap<LeaseDirection, DirectionLeaseStats>,
 }
 
+impl BufferLeaseStats {
+    /// Merge another tracker's counters into this view.
+    ///
+    /// Used when one read-only snapshot must cover the live lease tracker plus
+    /// trackers retained for retired sessions. The trackers own disjoint
+    /// entries, so this only aggregates counters and takes the maximum hold
+    /// age. Saturating arithmetic keeps the reporting path safe; observing
+    /// never allocates or resets leases.
+    pub fn merge(&mut self, other: &BufferLeaseStats) {
+        self.active_leases = self.active_leases.saturating_add(other.active_leases);
+        self.active_holds = self.active_holds.saturating_add(other.active_holds);
+        self.total_leased_bytes = self
+            .total_leased_bytes
+            .saturating_add(other.total_leased_bytes);
+        self.total_held_bytes = self.total_held_bytes.saturating_add(other.total_held_bytes);
+        if other.oldest_hold_seconds > self.oldest_hold_seconds {
+            self.oldest_hold_seconds = other.oldest_hold_seconds;
+        }
+        for (storage, stats) in &other.by_storage {
+            let entry = self.by_storage.entry(*storage).or_default();
+            entry.active_leases = entry.active_leases.saturating_add(stats.active_leases);
+            entry.active_holds = entry.active_holds.saturating_add(stats.active_holds);
+            entry.total_leased_bytes = entry
+                .total_leased_bytes
+                .saturating_add(stats.total_leased_bytes);
+            entry.total_held_bytes = entry
+                .total_held_bytes
+                .saturating_add(stats.total_held_bytes);
+        }
+        for (direction, stats) in &other.by_direction {
+            let entry = self.by_direction.entry(*direction).or_default();
+            entry.active_leases = entry.active_leases.saturating_add(stats.active_leases);
+            entry.active_holds = entry.active_holds.saturating_add(stats.active_holds);
+            entry.total_leased_bytes = entry
+                .total_leased_bytes
+                .saturating_add(stats.total_leased_bytes);
+            entry.total_held_bytes = entry
+                .total_held_bytes
+                .saturating_add(stats.total_held_bytes);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BufferLeaseSnapshot {
     pub id: u64,
@@ -127,10 +170,69 @@ pub struct BufferLeaseTracker {
     inner: Arc<BufferLeaseTrackerInner>,
 }
 
+/// Weak, non-owning view of one tracker's lease metadata.
+///
+/// A retired observation stores this instead of a tracker `Arc`, so observing
+/// never keeps lease metadata alive: the record stays reportable exactly while
+/// a real owner — the session, a live proxy's tracker handle, or an
+/// outstanding [`BufferLeaseGuard`] — keeps the tracker alive, and it becomes
+/// prunable the moment the last such owner is gone. Only copied snapshots are
+/// public; an observer cannot recover the producer's `track` authority.
+///
+/// ```compile_fail
+/// use c2_mem::BufferLeaseObserver;
+/// fn recover_producer(observer: &BufferLeaseObserver) {
+///     let _producer = observer.upgrade();
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct BufferLeaseObserver {
+    inner: Weak<BufferLeaseTrackerInner>,
+}
+
+impl BufferLeaseObserver {
+    /// Whether some real owner still keeps this tracker's metadata alive.
+    pub fn is_alive(&self) -> bool {
+        self.inner.strong_count() > 0
+    }
+
+    /// Identity comparison for de-duplicating the same tracker observed
+    /// through more than one record.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Reattach to the live tracker, if any real owner still holds it.
+    ///
+    /// `None` once every owner of the tracker is gone; such a record carries
+    /// no observable metadata anymore and may be pruned.
+    fn upgrade(&self) -> Option<BufferLeaseTracker> {
+        self.inner
+            .upgrade()
+            .map(|inner| BufferLeaseTracker { inner })
+    }
+
+    /// Copy the current counters while a producer or lease still owns them.
+    pub fn stats(&self) -> Option<BufferLeaseStats> {
+        self.upgrade().map(|tracker| tracker.stats())
+    }
+
+    /// Copy retained-lease metadata without exposing the producer handle.
+    pub fn sweep_retained(&self, threshold: Duration) -> Option<Vec<BufferLeaseSnapshot>> {
+        self.upgrade()
+            .map(|tracker| tracker.sweep_retained(threshold))
+    }
+}
+
 #[derive(Debug)]
 pub struct BufferLeaseGuard {
     id: Option<u64>,
-    tracker: Weak<BufferLeaseTrackerInner>,
+    // Strong by design: a retained lease is itself a real owner of its
+    // tracker's metadata, so a hold published just before a session swap keeps
+    // that metadata — and its observation record — alive without the observer
+    // retaining anything. The tracker stores only lease metadata entries and
+    // never references its guards, so this cannot cycle or retain payloads.
+    tracker: Option<Arc<BufferLeaseTrackerInner>>,
 }
 
 impl BufferLeaseTracker {
@@ -144,11 +246,18 @@ impl BufferLeaseTracker {
         }
     }
 
+    /// Weak, non-owning view of this tracker for read-only observation.
+    pub fn observer(&self) -> BufferLeaseObserver {
+        BufferLeaseObserver {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub fn track(&self, meta: BufferLeaseMeta) -> BufferLeaseGuard {
         if meta.retention == LeaseRetention::Transient && !self.inner.track_transient {
             return BufferLeaseGuard {
                 id: None,
-                tracker: Weak::new(),
+                tracker: None,
             };
         }
 
@@ -161,7 +270,7 @@ impl BufferLeaseTracker {
 
         BufferLeaseGuard {
             id: Some(id),
-            tracker: Arc::downgrade(&self.inner),
+            tracker: Some(Arc::clone(&self.inner)),
         }
     }
 
@@ -246,10 +355,9 @@ impl Drop for BufferLeaseGuard {
         let Some(id) = self.id.take() else {
             return;
         };
-        let Some(inner) = self.tracker.upgrade() else {
-            return;
-        };
-        inner.entries().remove(&id);
+        if let Some(inner) = self.tracker.take() {
+            inner.entries().remove(&id);
+        }
     }
 }
 
@@ -383,5 +491,43 @@ mod tests {
                 .total_held_bytes,
             64
         );
+    }
+
+    #[test]
+    fn a_retained_guard_keeps_its_tracker_metadata_alive() {
+        // The tracker's owning session handle goes away, exactly like a
+        // session swap dropping the retired RuntimeSession. The outstanding
+        // hold is itself a real owner, so the metadata — and any weak
+        // observation of it — must stay alive until the hold releases.
+        let observer = {
+            let tracker = BufferLeaseTracker::new(false);
+            let observer = tracker.observer();
+            let _hold = tracker.track(retained_inline_meta());
+            drop(tracker);
+            assert!(observer.is_alive());
+            observer
+        };
+        // The guard dropped with the scope above; nothing owns the tracker
+        // anymore, so the weak observation detaches.
+        assert!(!observer.is_alive());
+    }
+
+    #[test]
+    fn observer_is_alive_while_any_owner_holds_the_tracker() {
+        let producer = BufferLeaseTracker::new(false);
+        let observer = producer.observer();
+        let other_observer = producer.observer();
+        assert!(observer.is_alive());
+        assert!(observer.ptr_eq(&other_observer));
+
+        let session_handle = producer.clone();
+        drop(producer);
+        assert!(observer.is_alive(), "clone is still a real owner");
+
+        drop(session_handle);
+        assert!(!observer.is_alive(), "last owner gone detaches the record");
+
+        let unrelated = BufferLeaseTracker::new(false).observer();
+        assert!(!observer.ptr_eq(&unrelated));
     }
 }

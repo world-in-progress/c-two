@@ -1,0 +1,299 @@
+{
+  "schema": "c-two.local-endpoint-host-validation-summary.v1",
+  "status": "accepted-development-candidate",
+  "source_sha": "bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+  "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "base_sha": "01667b8b02f2fb447628b96b4d9236897300e81f",
+  "source_function_inventory": {
+    "python": {
+      "baseline": 1037,
+      "current": 1128,
+      "removed": [],
+      "added_count": 91
+    },
+    "rust": {
+      "baseline": 1308,
+      "current": 1457,
+      "removed": [],
+      "added_count": 149
+    }
+  },
+  "linux": {
+    "status": "passed",
+    "run_id": 37517266473,
+    "source_sha": "bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+    "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "artifacts": [
+      {
+        "artifact_id": 11437726344,
+        "name": "local-endpoint-validation-bbfdbf48cb78d66eccccbc8ad7d33771b9dae344-focused-local",
+        "zip_sha256": "c9357d8b13c28d2ca77829344027e294a303e598525050fa6f731668e0323df6",
+        "rust_test_counts": {
+          "focused-local-tests.log": 521
+        }
+      },
+      {
+        "artifact_id": 11437707535,
+        "name": "local-endpoint-validation-bbfdbf48cb78d66eccccbc8ad7d33771b9dae344-python-suite",
+        "zip_sha256": "f653747a97f9c9b1964e10beb28e5b15857318ab9271076a7a1a8050a25aefe6",
+        "python_counts": {
+          "full": 1030,
+          "ordinary": 991,
+          "portable": 25,
+          "typescript": 14
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "19067e3c255463a1d95ebd811157c97e9287f338f483d7287cc3a9e4f63ac4b9"
+      },
+      {
+        "artifact_id": 11437079748,
+        "name": "local-endpoint-validation-bbfdbf48cb78d66eccccbc8ad7d33771b9dae344-core-test",
+        "zip_sha256": "fb0f9841cf9293b00dfa4ccdc4e9bcc03b7a760492eb3f558bbb69b9db6695f2",
+        "rust_test_counts": {
+          "core-workspace-tests.log": 1361,
+          "cli-tests.log": 68,
+          "rust-sdk-tests.log": 12
+        }
+      }
+    ]
+  },
+  "windows": {
+    "status": "passed",
+    "run_id": 37517266371,
+    "workflow_attempt": 1,
+    "source_sha": "bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+    "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "artifacts": [
+      {
+        "artifact_id": 11440641670,
+        "name": "windows-native-windows-2025-full-bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "zip_sha256": "1a931ababeb68de077d478606ace3207d75a6b4cf492aba6cccc321842dd0d0e",
+        "gates": 23,
+        "source_sha": "bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112453300723,
+        "required_endpoint_tests_proven": 8,
+        "junit_counts": {
+          "portable-tests.xml": 25,
+          "typescript-tests.xml": 14,
+          "python-tests.xml": 991,
+          "windows-harness-tests.xml": 34
+        },
+        "rust_test_counts": {
+          "core-test.log": 1300,
+          "cli-test.log": 59
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "b9a5246ba22d2aca746514bedd3adcb671044a5bf07c4493d1bf0c1006c93f03",
+        "wheels": {
+          "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "524e651df8388c00f31574ae4cf82e751578bee5813fbb11d457138919cca1dd",
+          "c_two-0.6.0-cp312-cp312-win_amd64.whl": "abaf91d0e4cc0442158bb7cf1741fccecba6e622cbd80652ff574fd3d1a757f9"
+        },
+        "wheel_consumers": 2,
+        "standard_user_cleanup": true,
+        "memory_matrix": true
+      },
+      {
+        "artifact_id": 11440280909,
+        "name": "windows-native-windows-2022-full-bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "zip_sha256": "79ea178dccb032b2e0b231150e2216b3b9bb11895a2da1ebee0ecd4141e7e256",
+        "gates": 23,
+        "source_sha": "bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112453300907,
+        "required_endpoint_tests_proven": 8,
+        "junit_counts": {
+          "portable-tests.xml": 25,
+          "typescript-tests.xml": 14,
+          "python-tests.xml": 991,
+          "windows-harness-tests.xml": 34
+        },
+        "rust_test_counts": {
+          "core-test.log": 1300,
+          "cli-test.log": 59
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "e3f296fa078fa61c114cb9c71c89014b8c78b7f09c1fe1c74cc877321131c7e0",
+        "wheels": {
+          "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "8b844b64406162c86266688659664cc4c929fe9c364d5e3057570f0e577e86d2",
+          "c_two-0.6.0-cp312-cp312-win_amd64.whl": "3d84bfa246732c3836db42f33367d9559fe4f5407422a45ba230897c3a37eeaf"
+        },
+        "wheel_consumers": 2,
+        "standard_user_cleanup": true,
+        "memory_matrix": true
+      },
+      {
+        "artifact_id": 11437846508,
+        "name": "windows-native-windows-2022-local-platform-bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "zip_sha256": "d3e65ac65636626ae840d092f068c65fd78e27122a16ab097e2e00ef39431319",
+        "gates": 1,
+        "source_sha": "bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112453300416,
+        "rust_test_counts": {
+          "local-platform-tests.log": 779
+        }
+      },
+      {
+        "artifact_id": 11437129491,
+        "name": "windows-native-windows-2025-local-platform-bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "zip_sha256": "0bcd8ced63cfdf26673ea99fe54db7b9e98092cea8e452f89f6982d892747bdc",
+        "gates": 1,
+        "source_sha": "bbfdbf48cb78d66eccccbc8ad7d33771b9dae344",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 112453300763,
+        "rust_test_counts": {
+          "local-platform-tests.log": 779
+        }
+      }
+    ]
+  },
+  "macos": {
+    "status": "passed",
+    "source_sha": "980acec1bd32d960771e6a4a14a1ba4fc4d786cb",
+    "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "gate_summaries": [
+      {
+        "gate": "c2-typescript-deps",
+        "seconds": 5.16,
+        "rust_passed": 0
+      },
+      {
+        "gate": "native-build",
+        "seconds": 14.22,
+        "rust_passed": 0
+      },
+      {
+        "gate": "native-tests",
+        "seconds": 0.74,
+        "rust_passed": 2
+      },
+      {
+        "gate": "cli",
+        "seconds": 3.06,
+        "rust_passed": 68
+      },
+      {
+        "gate": "c3-build",
+        "seconds": 0.19,
+        "rust_passed": 0
+      },
+      {
+        "gate": "core",
+        "seconds": 69.87,
+        "rust_passed": 1360
+      },
+      {
+        "gate": "rust-sdk",
+        "seconds": 1.48,
+        "rust_passed": 12
+      },
+      {
+        "gate": "repository-build-deps",
+        "seconds": 0.96,
+        "rust_passed": 0
+      },
+      {
+        "gate": "repository-contracts",
+        "seconds": 32.11,
+        "rust_passed": 0
+      },
+      {
+        "gate": "python-complete",
+        "seconds": 105.45,
+        "rust_passed": 0
+      }
+    ],
+    "repo_cases": 392,
+    "python_counts": {
+      "full": 1030,
+      "ordinary": 991,
+      "portable": 25,
+      "typescript": 14
+    },
+    "portable_rows": 18,
+    "typescript_rows": 12,
+    "provenance": {
+      "package": "/Users/soku/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/__init__.py",
+      "native": "/Users/soku/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so",
+      "build_target_reuse": "/tmp/c2-endpoint-targets/final-2cfd151949de",
+      "source_sha": "980acec1bd32d960771e6a4a14a1ba4fc4d786cb",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "verified_files_before": 684,
+      "verified_files_after": 684,
+      "fastdb_files_before": 750,
+      "fastdb_files_after": 750,
+      "native_sha256": "8e3713d966872659bb1a224d295d85ff0eac3f9c8e04e237ea5339c457d78e18",
+      "c3_sha256": "8284187878c6b701f586ec43b97384aceb70ff83a9bc553637fef434d1e6ce85"
+    }
+  },
+  "stress": {
+    "source_commit": "980acec1bd32d960771e6a4a14a1ba4fc4d786cb",
+    "scope": "only the 10000 unique logical targets generated by this run",
+    "driver_sha256": "64182ee3072a59b0a4890f9df79328de5d5f9d36a76a19d7128004bbad31caf0",
+    "label": "eptest-final-f623f4963208",
+    "verified_files_before": 684,
+    "exit_code": 0,
+    "seconds": 17.03,
+    "verified_files_after": 684,
+    "ok": true,
+    "stress": {
+      "cycles": 10000,
+      "normal": 9500,
+      "fully_registered_kill_wait": 500,
+      "stale_credentials_fenced": 100,
+      "restart_with_old_stream": 100,
+      "scope_rounds": 3,
+      "batches": 21,
+      "entries_visited": 1258,
+      "reaped": 400,
+      "max_batch_micros": 9686,
+      "seconds": 9.44,
+      "own_socket_and_lease_remaining": 0
+    }
+  },
+  "post_macos_changed_files": [
+    "core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-node-loader.test.mjs",
+    "core/transport/c2-http/src/relay/server.rs",
+    "core/transport/c2-local/src/credential_tests.rs"
+  ],
+  "verifier_sha256": {
+    "verify_linux_final.py": "7c02d45835a32575d8f3210f0f16ceeccd668133905bb0efe8788c78e066895f",
+    "verify_windows_final.py": "5902b6221d692fa2162c8cbffe81399ca3246f3b406e9d1b021563414fe7b52a",
+    "test_preservation_final.py": "094dab31b0b14b76f55cefccb3a4ec36538063d3bb37b0d360c8fa95603a938d"
+  },
+  "independent_review": {
+    "model": "gpt-6.1-sol",
+    "effort": "high",
+    "mode": "read-only",
+    "confirmed_blockers": 0,
+    "checked": [
+      "7 actual ZIP and unpacked bytes",
+      "Linux collection/plan/call reports and4 runner input blob hashes",
+      "Windows job/attempt/runner/source identities",
+      "strict18RustPython/12TypeScript receipts",
+      "Windows c3 and wheel artifact bytes",
+      "normal administrator and standard nonadministrator consumers and cleanup",
+      "public Python lifecycle API signatures"
+    ]
+  },
+  "limits": [
+    "development-stage evidence only",
+    "macOS complete execution source is980acec1, not finalbbfdbf4; subsequent3file diffs are tests only",
+    "Linux artifact binds c3 hash and unchanged before/after execution; executable itself is not included in Linux ZIP",
+    "Rust totals derive from successful test-result log summaries, not a separate exhaustive collection-ID inventory",
+    "installed hey-my-buddy runner adoption not demonstrated",
+    "no formal candidate package publication",
+    "Windows11 desktop not executed",
+    "unknown historical paths untouched",
+    "partial initialization or unverified identity remains fail-closed",
+    "OwnerBound capability is non-reconnectable"
+  ]
+}

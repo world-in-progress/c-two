@@ -5,16 +5,18 @@
 //! callbacks and local direct-call bindings, but must not duplicate the runtime
 //! authority implemented here.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use c2_contract::ExpectedRouteContract;
 use c2_http::client::{
     HttpError, RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient,
-    RelayLocalIpcCandidate, RelayRegistration, RelayResolvedTarget,
+    RelayLocalIpcCandidate, RelayRegistration, RelayRegistrationScope, RelayResolvedTarget,
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
@@ -127,6 +129,13 @@ impl fmt::Debug for Runtime {
     }
 }
 
+struct ShutdownTransaction {
+    server: std::sync::Weak<c2_server::Server>,
+    outcome: Mutex<Option<ShutdownOutcome>>,
+    completed: Condvar,
+    delivered: AtomicBool,
+}
+
 struct RuntimeState {
     server_id_override: Option<String>,
     server_ipc_overrides: Option<ServerIpcConfigOverrides>,
@@ -134,11 +143,30 @@ struct RuntimeState {
     shm_threshold: Option<u64>,
     remote_payload_chunk_size: Option<u64>,
     client_config_frozen: bool,
+    /// Resolved client IPC config fixed by the first valid connection
+    /// attempt. Later acquires reuse it verbatim so one Runtime can never
+    /// run two competing client configurations.
+    frozen_client_config: Option<c2_config::ClientIpcConfig>,
+    /// Outgoing IPC client cache owned by this Runtime. Clones of the
+    /// Runtime share it; distinct Runtimes are isolated.
+    client_pool: Arc<c2_ipc::ClientPool>,
     identity: Option<RuntimeIdentity>,
     relay_anchor_address_override: Option<String>,
     use_process_relay_anchor: bool,
     relay_projection: Option<RelayProjection>,
     path_counters: PathCounters,
+    /// Native owner control capability attached by an explicit call. It is
+    /// deliberately not part of [`RuntimeOptions`]: the capability never
+    /// travels through cloneable option data, argv, environment variables,
+    /// or logs.
+    owner_control: Option<c2_local::OwnerControlReceiver>,
+    /// Set once an owner-bound host consumed the capability; later attach or
+    /// consume attempts are rejected.
+    owner_control_consumed: bool,
+    lifecycle_policy: c2_config::ServerLifecyclePolicy,
+    lifecycle_frozen: bool,
+    shutdown_transactions: HashMap<String, Arc<ShutdownTransaction>>,
+    registration_scopes: HashMap<String, HashMap<String, RelayRegistrationScope>>,
     #[cfg(test)]
     forced_relay_config_error: Option<String>,
 }
@@ -169,6 +197,19 @@ pub(crate) enum RelayResolvedConnection {
     },
 }
 
+impl RuntimeState {
+    fn ensure_no_pending_teardown(&self) -> Result<(), LifecycleError> {
+        if self
+            .shutdown_transactions
+            .values()
+            .any(|transaction| transaction.outcome.lock().is_none())
+        {
+            return Err(LifecycleError::Configuration("pending native teardown must finish before starting a new Host or resetting server identity".into()));
+        }
+        Ok(())
+    }
+}
+
 impl Runtime {
     pub fn new(options: RuntimeOptions) -> Result<Self, LifecycleError> {
         if let Some(server_id) = options.server_id.as_deref() {
@@ -182,6 +223,8 @@ impl Runtime {
                 shm_threshold: options.shm_threshold,
                 remote_payload_chunk_size: options.remote_payload_chunk_size,
                 client_config_frozen: false,
+                frozen_client_config: None,
+                client_pool: Arc::new(c2_ipc::ClientPool::new(Duration::from_secs(60))),
                 identity: None,
                 relay_anchor_address_override: options
                     .relay_anchor_address
@@ -189,6 +232,12 @@ impl Runtime {
                 use_process_relay_anchor: options.use_process_relay_anchor,
                 relay_projection: None,
                 path_counters: PathCounters::default(),
+                owner_control: None,
+                owner_control_consumed: false,
+                lifecycle_policy: Default::default(),
+                lifecycle_frozen: false,
+                shutdown_transactions: HashMap::new(),
+                registration_scopes: HashMap::new(),
                 #[cfg(test)]
                 forced_relay_config_error: None,
             })),
@@ -248,6 +297,7 @@ impl Runtime {
             validate_server_id(server_id)?;
         }
         let mut state = self.state.lock();
+        state.ensure_no_pending_teardown()?;
         state.server_id_override = server_id;
         state.server_ipc_overrides = server_ipc_overrides;
         state.identity = None;
@@ -282,10 +332,6 @@ impl Runtime {
         self.state.lock().client_config_frozen
     }
 
-    pub fn mark_client_config_frozen(&self) {
-        self.state.lock().client_config_frozen = true;
-    }
-
     pub fn path_counters(&self) -> PathCounters {
         self.state.lock().path_counters
     }
@@ -294,38 +340,80 @@ impl Runtime {
         self.state.lock().path_counters.record(path);
     }
 
+    /// Read-only snapshot of this Runtime's outgoing client memory domain.
+    ///
+    /// `None` until the first valid connection attempt freezes the domain;
+    /// observing it never connects, maps memory, or freezes configuration.
+    /// Charges retained by completed or held data stay observable across a
+    /// shutdown for as long as the Runtime (or any budget guard) exists.
+    pub fn outgoing_memory_stats(&self) -> Option<crate::MemoryScopeStats> {
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.memory_budget_snapshot()
+            .map(|snapshot| crate::MemoryScopeStats::from_budget(snapshot.limits, snapshot.budget))
+    }
+
+    /// Read-only observer of this Runtime's frozen outgoing client domain.
+    ///
+    /// `None` until the first connection attempt freezes the domain. The
+    /// returned handle shares only the domain counters and resolved limits, so
+    /// a retired Runtime keeps charges held by outstanding owners observable
+    /// without retaining the cache, connections, or pools. Observing never
+    /// connects, maps memory, or freezes configuration.
+    pub fn outgoing_memory_observer(&self) -> Option<c2_mem::BudgetObserver> {
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.memory_budget_observer()
+    }
+
+    /// Read-only memory statistics for this Runtime without a host.
+    ///
+    /// The server scope is reported by [`Host::memory_stats`](crate::Host::memory_stats),
+    /// which composes this outgoing scope with its server direction.
+    pub fn memory_stats(&self) -> crate::RuntimeMemoryStats {
+        crate::RuntimeMemoryStats {
+            runtime_outgoing: self.outgoing_memory_stats(),
+            server: None,
+        }
+    }
+
+    /// Acquire an outgoing IPC client from this Runtime's cache.
+    ///
+    /// The resolved client config freezes atomically under the RuntimeState
+    /// lock before any connection I/O: the first valid connection attempt —
+    /// including one that later fails — fixes the config for this Runtime's
+    /// lifetime, and a setter racing a stalled first connect observes
+    /// `LifecycleError::ClientConfigFrozen` instead of producing a second
+    /// configuration. The connect itself runs outside the state lock through
+    /// the cache's epoch fence.
     pub(crate) fn acquire_ipc_client(
         &self,
         address: &str,
     ) -> Result<Arc<c2_ipc::SyncClient>, c2_ipc::IpcError> {
-        let config = self
-            .client_ipc_config()
-            .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
-        let client = c2_ipc::ClientPool::instance().acquire(address, Some(&config))?;
-        self.mark_client_config_frozen();
-        Ok(client)
+        let (config, pool) = {
+            let mut state = self.state.lock();
+            let config = match state.frozen_client_config.clone() {
+                Some(config) => config,
+                None => {
+                    let config = resolve_client_config_locked(&state)
+                        .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+                    state.frozen_client_config = Some(config.clone());
+                    state.client_config_frozen = true;
+                    config
+                }
+            };
+            (config, Arc::clone(&state.client_pool))
+        };
+        // Connect outside the RuntimeState lock.
+        pool.acquire(address, Some(&config))
     }
 
     pub(crate) fn release_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        c2_ipc::ClientPool::instance().release_if_same(address, client);
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.release_if_same(address, client);
     }
 
     pub(crate) fn discard_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        c2_ipc::ClientPool::instance().discard_if_same(address, client);
-    }
-
-    pub(crate) fn client_ipc_config(&self) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
-        let runtime_overrides = c2_config::RuntimeConfigOverrides {
-            client_ipc: self.client_ipc_overrides().unwrap_or_default(),
-            shm_threshold: self.shm_threshold_override(),
-            ..Default::default()
-        };
-        c2_config::ConfigResolver::resolve_client_ipc(
-            runtime_overrides.client_ipc.clone(),
-            runtime_overrides,
-            c2_config::ConfigSources::from_process(),
-        )
-        .map_err(|error| LifecycleError::Configuration(error.to_string()))
+        let pool = Arc::clone(&self.state.lock().client_pool);
+        pool.discard_if_same(address, client);
     }
 
     pub(crate) fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
@@ -375,12 +463,11 @@ impl Runtime {
             .map_err(|error| LifecycleError::Configuration(error.to_string()))
     }
 
-    pub fn clear_server_identity(&self) {
-        self.state.lock().identity = None;
-    }
-
-    fn current_identity(&self) -> Option<RuntimeIdentity> {
-        self.state.lock().identity.clone()
+    pub fn clear_server_identity(&self) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        state.ensure_no_pending_teardown()?;
+        state.identity = None;
+        Ok(())
     }
 
     pub fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) {
@@ -395,6 +482,161 @@ impl Runtime {
 
     pub fn relay_anchor_address_override(&self) -> Option<String> {
         self.state.lock().relay_anchor_address_override.clone()
+    }
+
+    /// Set the native policy before the first Host freezes it.
+    pub fn set_lifecycle_policy(
+        &self,
+        policy: c2_config::ServerLifecyclePolicy,
+    ) -> Result<(), LifecycleError> {
+        policy.validate().map_err(LifecycleError::Configuration)?;
+        let mut state = self.state.lock();
+        if state.lifecycle_frozen {
+            return Err(LifecycleError::Configuration(
+                "server lifecycle policy is frozen".into(),
+            ));
+        }
+        state.lifecycle_policy = policy;
+        Ok(())
+    }
+
+    /// Atomically move the unstarted server lifecycle to a prepared Runtime.
+    ///
+    /// Session replacement is a pre-use configuration transaction. Both sides
+    /// are checked before moving the opaque receiver, so a refused handoff
+    /// leaves the source usable. Lock order is stable even for opposing calls.
+    /// A host-frozen or consumed capability can never be transferred or reused.
+    pub fn transfer_unstarted_lifecycle_to(
+        &self,
+        replacement: &Runtime,
+    ) -> Result<(), LifecycleError> {
+        if Arc::ptr_eq(&self.state, &replacement.state) {
+            return Err(LifecycleError::Configuration(
+                "cannot transfer lifecycle to the same Runtime".into(),
+            ));
+        }
+        let transfer = |source: &mut RuntimeState, target: &mut RuntimeState| {
+            source.ensure_no_pending_teardown()?;
+            target.ensure_no_pending_teardown()?;
+            if source.lifecycle_frozen
+                || source.owner_control_consumed
+                || source.client_config_frozen
+            {
+                return Err(LifecycleError::Configuration(
+                    "cannot transfer lifecycle after Runtime use".into(),
+                ));
+            }
+            if target.lifecycle_frozen
+                || target.owner_control_consumed
+                || target.owner_control.is_some()
+                || target.client_config_frozen
+                || target.lifecycle_policy != Default::default()
+            {
+                return Err(LifecycleError::Configuration(
+                    "replacement Runtime already owns a lifecycle".into(),
+                ));
+            }
+            target.lifecycle_policy = source.lifecycle_policy;
+            target.owner_control = source.owner_control.take();
+            // The retired source cannot adopt another capability after moving
+            // its original receiver. Closing it remains a hostless operation.
+            if target.owner_control.is_some() {
+                source.owner_control_consumed = true;
+            }
+            Ok(())
+        };
+        if Arc::as_ptr(&self.state) < Arc::as_ptr(&replacement.state) {
+            transfer(&mut self.state.lock(), &mut replacement.state.lock())
+        } else {
+            let mut target = replacement.state.lock();
+            transfer(&mut self.state.lock(), &mut target)
+        }
+    }
+
+    /// Observe native teardown authority without consuming a Host journal.
+    /// SDK start projections use this while the listener can still report
+    /// running as active callbacks drain.
+    pub fn has_pending_teardown(&self) -> bool {
+        self.state.lock().ensure_no_pending_teardown().is_err()
+    }
+
+    pub fn lifecycle_policy(&self) -> c2_config::ServerLifecyclePolicy {
+        self.state.lock().lifecycle_policy
+    }
+
+    pub(crate) fn freeze_lifecycle_policy(
+        &self,
+        policy: c2_config::ServerLifecyclePolicy,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        state.ensure_no_pending_teardown()?;
+        if state.lifecycle_frozen && state.lifecycle_policy != policy {
+            return Err(LifecycleError::Configuration(
+                "server lifecycle policy is frozen".into(),
+            ));
+        }
+        state.lifecycle_policy = policy;
+        state.lifecycle_frozen = true;
+        Ok(())
+    }
+
+    /// Attach one private native capability, outside cloneable configuration data.
+    /// Once a Host consumes it, reattachment and takeover are rejected.
+    pub fn attach_owner_control(
+        &self,
+        receiver: c2_local::OwnerControlReceiver,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        if state.owner_control_consumed {
+            return Err(LifecycleError::Configuration(
+                "owner control capability was already consumed by an owner-bound host; late capability changes are rejected"
+                    .to_string(),
+            ));
+        }
+        if state.owner_control.is_some() {
+            return Err(LifecycleError::Configuration(
+                "owner control capability already attached; a Runtime accepts exactly one owner control receiver"
+                    .to_string(),
+            ));
+        }
+        state.owner_control = Some(receiver);
+        Ok(())
+    }
+
+    /// Whether an unconsumed native owner control capability is attached.
+    pub fn owner_control_attached(&self) -> bool {
+        let state = self.state.lock();
+        state.owner_control.is_some() && !state.owner_control_consumed
+    }
+
+    /// Read-only one-way consumption state for SDK capability preflight.
+    pub fn owner_control_consumed(&self) -> bool {
+        self.state.lock().owner_control_consumed
+    }
+
+    /// Consume the attached capability for one owner-bound host start.
+    ///
+    /// This is the freeze point: naming the `OwnerBound` policy without an
+    /// attached capability fails here, before the host can publish readiness.
+    /// A second consume attempt also fails, so one Runtime can never run two
+    /// owner-bound hosts from one capability.
+    pub(crate) fn consume_owner_control(
+        &self,
+    ) -> Result<c2_local::OwnerControlReceiver, LifecycleError> {
+        let mut state = self.state.lock();
+        match state.owner_control.take() {
+            Some(receiver) => {
+                state.owner_control_consumed = true;
+                Ok(receiver)
+            }
+            None if state.owner_control_consumed => Err(LifecycleError::Configuration(
+                "owner control capability was already consumed by an owner-bound host".to_string(),
+            )),
+            None => Err(LifecycleError::Configuration(
+                "OwnerBound host policy requires an attached native owner control capability before the host can publish readiness"
+                    .to_string(),
+            )),
+        }
     }
 
     pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, LifecycleError> {
@@ -438,6 +680,13 @@ impl Runtime {
         let route_name = spec.name.clone();
         let route_uid = route.route_uid().to_string();
         let route_revision = route.route_revision();
+        let registration_scope = RelayRegistrationScope {
+            name: route_name.clone(),
+            server_id: identity.server_id.clone(),
+            server_instance_id: identity.server_instance_id.clone(),
+            route_uid: route_uid.clone(),
+            route_revision,
+        };
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
         if route.name() != spec.name {
@@ -562,6 +811,18 @@ impl Runtime {
             relay_projection = Some(projection);
         }
 
+        // Save the concrete token before native commit can make the route observable.
+        // Owner EOF may retire it while final relay publish is still awaiting a response.
+        self.state
+            .lock()
+            .registration_scopes
+            .entry(format!(
+                "{}:{:p}",
+                server.server_instance_id(),
+                server.as_ref()
+            ))
+            .or_default()
+            .insert(route_name.clone(), registration_scope.clone());
         let relay_needs_final_publish = relay_projection.is_some();
         let route_admission_token = if relay_needs_final_publish {
             match rt.block_on(server.commit_reserved_route_closed(
@@ -619,8 +880,7 @@ impl Runtime {
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
-                    &spec.name,
-                    &identity.server_id,
+                    &registration_scope,
                 );
                 let (status_code, error_message) = http_error_parts(err);
                 return Err(LifecycleError::RegisterFailure(Box::new(
@@ -641,8 +901,7 @@ impl Runtime {
                 let relay_cleanup_error = self.relay_cleanup(
                     effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
-                    &spec.name,
-                    &identity.server_id,
+                    &registration_scope,
                 );
                 return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
@@ -679,30 +938,109 @@ impl Runtime {
         let route_name = name.to_string();
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
+        let scopes = self.capture_registration_scopes(server, std::slice::from_ref(&route_name));
         let rt = Self::server_runtime()?;
         let local_removed = rt.block_on(server.unregister_route(&route_name));
         if !local_removed {
             return Err(LifecycleError::MissingRoute(route_name));
         }
 
-        let relay_error =
-            if let Some(relay_anchor_address) = effective_relay_anchor_address.as_deref() {
-                let identity = self.ensure_server()?;
-                self.relay_cleanup(
-                    Some(relay_anchor_address),
-                    relay_use_proxy,
-                    &route_name,
-                    &identity.server_id,
-                )
-            } else {
-                None
-            };
+        let relay_error = if let Some(relay_anchor_address) =
+            effective_relay_anchor_address.as_deref()
+        {
+            match scopes.get(&route_name) {
+                Some(scope) => {
+                    self.relay_cleanup(Some(relay_anchor_address), relay_use_proxy, scope)
+                }
+                None => Some(RelayCleanupError {
+                    route_name: route_name.clone(),
+                    status_code: None,
+                    message: "no captured registration scope; refusing unsafe name-only withdrawal"
+                        .into(),
+                }),
+            }
+        } else {
+            None
+        };
+        self.retire_registration_scopes(server, &scopes);
         Ok(UnregisterOutcome {
             route_name: route_name.clone(),
             local_removed,
             close: route_close_success(&route_name, "unregister"),
             relay_error,
         })
+    }
+
+    fn capture_registration_scopes(
+        &self,
+        server: &c2_server::Server,
+        names: &[String],
+    ) -> HashMap<String, RelayRegistrationScope> {
+        let key = format!("{}:{:p}", server.server_instance_id(), server);
+        let mut scopes = self
+            .state
+            .lock()
+            .registration_scopes
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        for name in names {
+            if !scopes.contains_key(name) {
+                if let Some((route_uid, route_revision)) = server.registered_route_identity(name) {
+                    scopes.insert(
+                        name.clone(),
+                        RelayRegistrationScope {
+                            name: name.clone(),
+                            server_id: server.server_id().to_owned(),
+                            server_instance_id: server.server_instance_id().to_owned(),
+                            route_uid,
+                            route_revision,
+                        },
+                    );
+                }
+            }
+        }
+        scopes
+    }
+
+    fn retire_registration_scopes(
+        &self,
+        server: &c2_server::Server,
+        scopes: &HashMap<String, RelayRegistrationScope>,
+    ) {
+        let key = format!("{}:{:p}", server.server_instance_id(), server);
+        let mut state = self.state.lock();
+        if let Some(current) = state.registration_scopes.get_mut(&key) {
+            current.retain(|name, scope| scopes.get(name) != Some(scope));
+            if current.is_empty() {
+                state.registration_scopes.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn shutdown_pending(&self, server: &c2_server::Server) -> bool {
+        let transaction = self
+            .state
+            .lock()
+            .shutdown_transactions
+            .get(&format!("{}:{:p}", server.server_instance_id(), server))
+            .cloned();
+        transaction.is_some_and(|transaction| transaction.outcome.lock().is_none())
+    }
+
+    /// Observe a pending native transaction without consuming the route journal.
+    pub(crate) fn shutdown_observation(
+        &self,
+        server: &c2_server::Server,
+    ) -> Option<ShutdownOutcome> {
+        let transaction = self
+            .state
+            .lock()
+            .shutdown_transactions
+            .get(&format!("{}:{:p}", server.server_instance_id(), server))
+            .cloned()?;
+        let outcome = transaction.outcome.lock().clone();
+        outcome
     }
 
     pub(crate) fn shutdown(
@@ -714,6 +1052,119 @@ impl Runtime {
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
     ) -> ShutdownOutcome {
+        let deadline = Instant::now() + shutdown_timeout;
+        let scopes = server
+            .map(|server| self.capture_registration_scopes(server, &route_names))
+            .unwrap_or_default();
+        let Some(server) = server else {
+            return self.shutdown_transaction(
+                None,
+                route_names,
+                relay_anchor_address,
+                relay_use_proxy,
+                relay_cleanup_config_error,
+                shutdown_timeout,
+                scopes,
+            );
+        };
+        // Construct before transferring work so construction failures cannot signal a server.
+        #[cfg(test)]
+        if FORCE_SERVER_RUNTIME_FAILURE.with(std::cell::Cell::get) {
+            return self.shutdown_transaction(
+                Some(server),
+                route_names,
+                relay_anchor_address,
+                relay_use_proxy,
+                relay_cleanup_config_error,
+                shutdown_timeout,
+                scopes,
+            );
+        }
+        let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
+        let transaction = {
+            let mut state = self.state.lock();
+            // A completed transaction retains only a Weak concrete Server identity.
+            // Repeated Persistent hosts do not inherit old outcomes or retain stale pools.
+            state.shutdown_transactions.retain(|_, transaction| {
+                transaction.server.strong_count() > 0 || transaction.outcome.lock().is_none()
+            });
+            if let Some(transaction) = state.shutdown_transactions.get(&key) {
+                Arc::clone(transaction)
+            } else {
+                let transaction = Arc::new(ShutdownTransaction {
+                    server: Arc::downgrade(server),
+                    outcome: Mutex::new(None),
+                    completed: Condvar::new(),
+                    delivered: AtomicBool::new(false),
+                });
+                state
+                    .shutdown_transactions
+                    .insert(key, Arc::clone(&transaction));
+                let worker_runtime = self.clone();
+                let worker_server = Arc::clone(server);
+                let worker_transaction = Arc::clone(&transaction);
+                let relay = relay_anchor_address.map(str::to_owned);
+                // Only actual pending work retains Runtime/Server. No watcher retains Host.
+                let spawn = std::thread::Builder::new()
+                    .name("c2-shutdown".into())
+                    .spawn(move || {
+                        let outcome = worker_runtime.shutdown_transaction(
+                            Some(&worker_server),
+                            route_names,
+                            relay.as_deref(),
+                            relay_use_proxy,
+                            relay_cleanup_config_error,
+                            shutdown_timeout,
+                            scopes.clone(),
+                        );
+                        worker_runtime.retire_registration_scopes(&worker_server, &scopes);
+                        *worker_transaction.outcome.lock() = Some(outcome);
+                        worker_transaction.completed.notify_all();
+                    });
+                if let Err(error) = spawn {
+                    *transaction.outcome.lock() = Some(ShutdownOutcome {
+                        runtime_barrier_error: Some(error.to_string()),
+                        ..Default::default()
+                    });
+                    transaction.completed.notify_all();
+                }
+                transaction
+            }
+        };
+        let mut result = transaction.outcome.lock();
+        while result.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return ShutdownOutcome {
+                    server_was_started: server.is_running(),
+                    runtime_barrier_error: Some(
+                        "native shutdown transaction is still draining after the caller deadline"
+                            .into(),
+                    ),
+                    ..Default::default()
+                };
+            }
+            transaction.completed.wait_for(&mut result, remaining);
+        }
+        if transaction.delivered.swap(true, Ordering::AcqRel) {
+            return ShutdownOutcome {
+                ipc_clients_drained: true,
+                ..Default::default()
+            };
+        }
+        result.as_ref().unwrap().clone()
+    }
+
+    fn shutdown_transaction(
+        &self,
+        server: Option<&Arc<c2_server::Server>>,
+        route_names: Vec<String>,
+        relay_anchor_address: Option<&str>,
+        relay_use_proxy: bool,
+        relay_cleanup_config_error: Option<String>,
+        shutdown_timeout: Duration,
+        scopes: HashMap<String, RelayRegistrationScope>,
+    ) -> ShutdownOutcome {
         let (mut effective_relay_anchor_address, mut relay_config_errors) =
             match self.effective_relay_anchor_address_arg(relay_anchor_address) {
                 Ok(address) => (address, Vec::new()),
@@ -723,12 +1174,6 @@ impl Runtime {
             effective_relay_anchor_address = None;
             relay_config_errors.push(message);
         }
-        let identity = if effective_relay_anchor_address.is_some() && !route_names.is_empty() {
-            self.current_identity()
-                .or_else(|| self.ensure_server().ok())
-        } else {
-            self.current_identity()
-        };
         let server_was_started = server.map(|server| server.is_running()).unwrap_or(false);
         let mut outcome = ShutdownOutcome {
             server_was_started,
@@ -745,15 +1190,78 @@ impl Runtime {
         }
 
         if let Some(server) = server {
-            let recorded_direct_shutdown_outcomes = if matches!(
+            // A running Server owns the only drain and route journal. Request its close
+            // immediately so explicit shutdown cancels owner observation/grace while callbacks
+            // continue in the run loop. Never race a separate unregister future against it.
+            if matches!(
                 server.lifecycle_state(),
-                ServerLifecycleState::Stopping | ServerLifecycleState::Stopped
+                ServerLifecycleState::Starting | ServerLifecycleState::Ready
             ) {
                 match Self::server_runtime() {
-                    Ok(rt) => match rt
-                        .block_on(server.observe_external_shutdown_outcomes(shutdown_timeout))
-                    {
-                        Ok(outcomes) => outcomes,
+                    Ok(rt) => {
+                        rt.block_on(server.close_business_admission("shutdown"));
+                        server.request_shutdown_signal_with_reason("shutdown");
+                    }
+                    Err(err) => {
+                        outcome.route_close_error = Some(err.to_string());
+                        for route_name in &route_names {
+                            outcome.route_outcomes.push(route_close_failure(
+                                route_name,
+                                "shutdown",
+                                err.to_string(),
+                            ));
+                        }
+                        return outcome;
+                    }
+                }
+            }
+        }
+
+        // Close this Runtime's outgoing IPC client cache before touching the
+        // server, in both hosted and hostless lifecycles. The cache handle is
+        // cloned under the state lock; every connect and close barrier runs
+        // outside it. Other Runtimes keep their own caches untouched. The
+        // drain report is only a completed claim when every detached client
+        // confirmed its bounded close AND the drain was not blocked behind a
+        // concurrent drain transaction or in-flight detached-close barriers.
+        let client_pool = Arc::clone(&self.state.lock().client_pool);
+        let mut client_close = client_pool.close_all(shutdown_timeout);
+        if server.is_some() {
+            // This native transaction owns outstanding client barriers as well as routes.
+            // Its callers time out independently; keep retrying actual unconfirmed work.
+            while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
+                client_close = client_pool.close_all(Duration::from_secs(1));
+            }
+        }
+        outcome.ipc_clients_drained =
+            client_close.unconfirmed.is_empty() && client_close.error.is_none();
+        if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {
+            let mut detail = client_close.error.unwrap_or_default();
+            if !client_close.unconfirmed.is_empty() {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!(
+                    "unconfirmed IPC client cache closes for {:?}",
+                    client_close.unconfirmed
+                ));
+            }
+            outcome.ipc_client_close_error = Some(detail);
+        }
+
+        if let Some(server) = server {
+            let recorded_direct_shutdown_outcomes = if matches!(
+                server.lifecycle_state(),
+                ServerLifecycleState::Stopping
+                    | ServerLifecycleState::Stopped
+                    | ServerLifecycleState::Failed(_)
+            ) {
+                match Self::server_runtime() {
+                    Ok(rt) => match rt.block_on(server.observe_shutdown_completion_unbounded()) {
+                        Ok(completion) => {
+                            outcome.runtime_barrier_error = completion.runtime_error;
+                            completion.route_outcomes
+                        }
                         Err(err) => {
                             outcome.runtime_barrier_error = Some(err.to_string());
                             Vec::new()
@@ -794,18 +1302,6 @@ impl Runtime {
                                 .route_outcomes
                                 .push(route_close_from_server_outcome(close));
                         }
-                        for route_name in &pending_runtime_unregisters {
-                            if let Some(identity) = identity.as_ref()
-                                && let Some(relay_error) = self.relay_cleanup(
-                                    effective_relay_anchor_address.as_deref(),
-                                    relay_use_proxy,
-                                    route_name,
-                                    &identity.server_id,
-                                )
-                            {
-                                outcome.relay_errors.push(relay_error);
-                            }
-                        }
                     }
                     Err(err) => {
                         outcome.route_close_error = Some(err.to_string());
@@ -822,9 +1318,15 @@ impl Runtime {
             }
             if can_signal_shutdown && server_was_started {
                 match Self::server_runtime() {
-                    Ok(rt) => match rt.block_on(server.shutdown_and_wait(shutdown_timeout)) {
-                        Ok(close_outcomes) => {
-                            for close in close_outcomes {
+                    Ok(rt) => match rt.block_on(async {
+                        server.request_shutdown_signal_with_reason("shutdown");
+                        server.observe_shutdown_completion_unbounded().await
+                    }) {
+                        Ok(completion) => {
+                            if let Some(error) = completion.runtime_error {
+                                outcome.runtime_barrier_error = Some(error);
+                            }
+                            for close in completion.route_outcomes {
                                 if !outcome.removed_routes.contains(&close.route_name) {
                                     outcome.removed_routes.push(close.route_name.clone());
                                     outcome
@@ -842,20 +1344,44 @@ impl Runtime {
                     }
                 }
             }
-        } else if let Some(identity) = identity.as_ref() {
-            for route_name in &route_names {
-                if let Some(relay_error) = self.relay_cleanup(
-                    effective_relay_anchor_address.as_deref(),
-                    relay_use_proxy,
-                    route_name,
-                    &identity.server_id,
-                ) {
-                    outcome.relay_errors.push(relay_error);
+            let mut cleaned = std::collections::HashSet::new();
+            for close in &outcome.route_outcomes {
+                if close.local_removed && cleaned.insert(close.route_name.as_str()) {
+                    if let Some(scope) = scopes.get(&close.route_name) {
+                        if let Some(error) = self.relay_cleanup(
+                            effective_relay_anchor_address.as_deref(),
+                            relay_use_proxy,
+                            scope,
+                        ) {
+                            outcome.relay_errors.push(error);
+                        }
+                    } else if effective_relay_anchor_address.is_some() {
+                        outcome.relay_errors.push(RelayCleanupError { route_name: close.route_name.clone(), status_code: None,
+                            message: "no captured registration scope; refusing unsafe name-only withdrawal".into() });
+                    }
                 }
+            }
+        } else if effective_relay_anchor_address.is_some() {
+            for route_name in &route_names {
+                outcome.relay_errors.push(RelayCleanupError {
+                    route_name: route_name.clone(),
+                    status_code: None,
+                    message: "hostless shutdown has no captured registration scope".into(),
+                });
             }
         }
 
         outcome
+    }
+
+    /// Shut down a client-only (hostless) Runtime.
+    ///
+    /// Rust and native SDK lifecycles without a Host/server use this path so
+    /// outgoing IPC clients owned by this Runtime are still detached and
+    /// closed through the bounded shared-ownership barrier. Relay routes and
+    /// server state are not involved; nothing process-global is reset.
+    pub fn shutdown_without_host(&self, shutdown_timeout: Duration) -> ShutdownOutcome {
+        self.shutdown(None, Vec::new(), None, false, None, shutdown_timeout)
     }
 
     pub(crate) fn resolve_relay_connection(
@@ -1002,9 +1528,9 @@ impl Runtime {
         &self,
         relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
-        route_name: &str,
-        server_id: &str,
+        scope: &RelayRegistrationScope,
     ) -> Option<RelayCleanupError> {
+        let route_name = scope.name.as_str();
         let relay_anchor_address = relay_anchor_address?;
         let projection =
             match self.relay_projection_for_address(relay_anchor_address, relay_use_proxy) {
@@ -1017,7 +1543,7 @@ impl Runtime {
                     });
                 }
             };
-        match projection.control.unregister(route_name, server_id) {
+        match projection.control.unregister_registration(scope) {
             Ok(()) => None,
             Err(HttpError::ServerError(status_code, body)) => Some(RelayCleanupError {
                 route_name: route_name.to_string(),
@@ -1049,6 +1575,26 @@ impl Runtime {
 
 fn canonical_relay_anchor_address(address: &str) -> String {
     address.trim().trim_end_matches('/').to_string()
+}
+
+/// Resolve the client IPC config from one consistent RuntimeState snapshot.
+///
+/// Called with the state lock held so the first connection attempt resolves
+/// and freezes the config atomically before any connect I/O.
+fn resolve_client_config_locked(
+    state: &RuntimeState,
+) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
+    let runtime_overrides = c2_config::RuntimeConfigOverrides {
+        client_ipc: state.client_ipc_overrides.clone().unwrap_or_default(),
+        shm_threshold: state.shm_threshold,
+        ..Default::default()
+    };
+    c2_config::ConfigResolver::resolve_client_ipc(
+        runtime_overrides.client_ipc.clone(),
+        runtime_overrides,
+        c2_config::ConfigSources::from_process(),
+    )
+    .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
 fn runtime_http_error(err: HttpError) -> LifecycleError {
@@ -1256,7 +1802,7 @@ mod tests {
 
         let first = session.ensure_server().expect("ensure server");
         assert_eq!(first.server_id, "unit-retry");
-        session.clear_server_identity();
+        session.clear_server_identity().unwrap();
         assert_eq!(session.server_id(), None);
         assert_eq!(session.server_address(), None);
 
@@ -1678,6 +2224,7 @@ mod tests {
                 .expect("write final publish response");
         });
 
+        let registration_observer = session.clone();
         let server_for_thread = Arc::clone(&server);
         let register_thread = thread::spawn(move || {
             session.register_route(&server_for_thread, route, spec, Some(&relay_url), false)
@@ -1700,6 +2247,22 @@ mod tests {
             .block_on(server.route_scheduler_snapshot(&route_name))
             .expect("committed route should have scheduler state");
         let was_closed_during_final_publish = snapshot.closed;
+        let native_identity = server.registered_route_identity(&route_name).unwrap();
+        let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
+        let observed_scope = registration_observer
+            .state
+            .lock()
+            .registration_scopes
+            .get(&key)
+            .unwrap()
+            .get(&route_name)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (observed_scope.route_uid, observed_scope.route_revision),
+            native_identity,
+            "registration scope must be saved before final publish can return or owner drain can remove the catalog record"
+        );
 
         release_tx.send(()).unwrap();
         relay_thread.join().unwrap();
@@ -2043,5 +2606,258 @@ mod tests {
         );
 
         runner.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_preserves_failed_external_cleanup_error_and_route_journal() {
+        use std::os::unix::fs::FileExt;
+
+        let route_name = unique_route_name("direct-shutdown-cleanup-fail");
+        let session = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
+        let server = test_server("direct-shutdown-cleanup-fail-server");
+        let route = dummy_route(&server, &route_name);
+        let handle = route.route_handle();
+        session
+            .register_route(&server, route, dummy_route_spec(&route_name), None, false)
+            .expect("route should register");
+        let runner = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || {
+                let rt = Runtime::server_runtime().expect("runtime");
+                rt.block_on(server.run())
+            })
+        };
+        let rt = Runtime::server_runtime().expect("runtime");
+        rt.block_on(server.wait_until_ready(Duration::from_secs(2)))
+            .expect("server ready");
+        let credential = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match c2_local::inspect_endpoint(server.local_endpoint()) {
+                        c2_local::EndpointInspection::Present(credential) => return credential,
+                        c2_local::EndpointInspection::IoError(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        other => panic!("cannot capture test endpoint identity: {other:?}"),
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("test endpoint identity acquisition must finish")
+        });
+        let lease_path =
+            std::path::Path::new(server.local_endpoint().os_name()).with_extension("lease");
+        let record = std::fs::read(&lease_path).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .unwrap();
+        // Keep the real shutdown draining until after its IPC acknowledgement,
+        // so endpoint connection validation still sees the intact lease record.
+        let active = handle.blocking_acquire(0).expect("active route guard");
+        let ack = c2_ipc::shutdown(server.ipc_address(), Duration::from_secs(2))
+            .expect("direct shutdown must be acknowledged");
+        assert!(ack.acknowledged && ack.shutdown_started);
+        assert!(ack.route_outcomes.is_empty(), "ack is initiation only");
+        // Damage only this test's pinned lease record, then let actual active
+        // work drain before listener retirement detects the failure.
+        lease.write_all_at(b"invalid", 0).unwrap();
+        drop(active);
+        let stopped = rt.block_on(server.wait_until_stopped(Duration::from_secs(2)));
+        // Restore before assertions, then reclaim only the captured endpoint
+        // identity after the native run loop has released its listener lease.
+        lease.write_all_at(&record, 0).unwrap();
+        stopped.expect("external shutdown must reach a terminal fence");
+        let run_result = runner.join().expect("server thread must join");
+        drop(lease);
+        let reaped = c2_local::reap_endpoint(server.local_endpoint(), &credential);
+        assert!(
+            matches!(reaped, c2_local::EndpointReapResult::Reaped),
+            "{reaped:?}"
+        );
+        assert!(
+            run_result
+                .unwrap_err()
+                .to_string()
+                .contains("InvalidRecord")
+        );
+        assert!(matches!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+        assert!(!server.is_running());
+        assert!(handle.snapshot().closed);
+        assert!(!rt.block_on(server.contains_route(&route_name)));
+
+        let outcome = session.shutdown(
+            Some(&server),
+            vec![route_name.clone()],
+            None,
+            false,
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(
+            outcome
+                .runtime_barrier_error
+                .as_deref()
+                .is_some_and(|error| error.contains("InvalidRecord")),
+            "failed listener cleanup must remain observable: {outcome:?}",
+        );
+        assert!(
+            !outcome.server_was_started,
+            "Failed is not a running server"
+        );
+        assert!(outcome.ipc_clients_drained);
+        assert!(outcome.route_close_error.is_none());
+        assert_eq!(outcome.removed_routes, vec![route_name.clone()]);
+        assert_eq!(outcome.route_outcomes.len(), 1);
+        let close = &outcome.route_outcomes[0];
+        assert_eq!(close.route_name, route_name);
+        assert_eq!(close.closed_reason, "direct_ipc_shutdown");
+        assert!(close.local_removed && close.active_drained);
+        assert!(close.close_error.is_none());
+        assert!(matches!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+        rt.block_on(server.wait_until_terminal()).unwrap();
+
+        let repeated = session.shutdown(
+            Some(&server),
+            vec![route_name],
+            None,
+            false,
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(repeated.removed_routes.is_empty());
+        assert!(repeated.route_outcomes.is_empty());
+        assert_eq!(session.shutdown_observation(&server), Some(outcome));
+    }
+
+    // ── Read-only memory-budget snapshots ────────────────────────────────
+
+    #[test]
+    fn runtime_memory_stats_observe_without_freezing_and_track_outgoing_domain() {
+        let session = Runtime::new(RuntimeOptions {
+            server_id: None,
+            server_ipc_overrides: None,
+            client_ipc_overrides: Some(ClientIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(4096),
+                file_backing_budget_bytes: Some(0),
+                live_reassembly_budget_bytes: Some(2048),
+                ..Default::default()
+            }),
+            shm_threshold: None,
+            remote_payload_chunk_size: None,
+            relay_anchor_address: None,
+            use_process_relay_anchor: false,
+        })
+        .expect("runtime");
+
+        // Observing an unused Runtime must not create or freeze a context.
+        let stats = session.memory_stats();
+        assert!(stats.runtime_outgoing.is_none());
+        assert!(stats.server.is_none());
+        assert!(!session.client_config_frozen());
+        assert!(session.outgoing_memory_observer().is_none());
+
+        // A failed first attempt still freezes the domain limits atomically.
+        assert!(
+            session
+                .acquire_ipc_client("ipc://nonexistent_runtime_memory_domain")
+                .is_err(),
+            "no server is listening on this address"
+        );
+        assert!(session.client_config_frozen());
+
+        let stats = session.memory_stats();
+        let outgoing = stats
+            .runtime_outgoing
+            .expect("a frozen domain is observable");
+        assert_eq!(outgoing.limits.shm_backing_budget_bytes, 4096);
+        assert_eq!(outgoing.limits.file_backing_budget_bytes, 0);
+        assert_eq!(outgoing.limits.live_reassembly_budget_bytes, 2048);
+        assert_eq!(outgoing.shm.used_bytes, 0);
+        assert_eq!(outgoing.file.used_bytes, 0);
+        assert_eq!(outgoing.reassembly.used_bytes, 0);
+        assert_eq!(outgoing.shm.peak_bytes, 0);
+        assert_eq!(outgoing.shm.rejected_allocations, 0);
+
+        // The retired-observation handle carries the same limits and counters
+        // without touching the live cache again.
+        let observer = session
+            .outgoing_memory_observer()
+            .expect("the frozen domain is observable");
+        assert_eq!(*observer.limits(), outgoing.limits);
+        assert_eq!(observer.used_bytes(), 0);
+    }
+
+    #[test]
+    fn outgoing_domain_observer_outlives_runtime_shutdown_without_touching_others() {
+        let runtime_a = Runtime::new(RuntimeOptions {
+            server_id: None,
+            server_ipc_overrides: None,
+            client_ipc_overrides: Some(ClientIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(1111),
+                ..Default::default()
+            }),
+            shm_threshold: None,
+            remote_payload_chunk_size: None,
+            relay_anchor_address: None,
+            use_process_relay_anchor: false,
+        })
+        .expect("runtime a");
+        let runtime_b = Runtime::new(RuntimeOptions {
+            server_id: None,
+            server_ipc_overrides: None,
+            client_ipc_overrides: Some(ClientIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(2222),
+                ..Default::default()
+            }),
+            shm_threshold: None,
+            remote_payload_chunk_size: None,
+            relay_anchor_address: None,
+            use_process_relay_anchor: false,
+        })
+        .expect("runtime b");
+
+        let _ = runtime_a.acquire_ipc_client("ipc://nonexistent_runtime_a");
+        let _ = runtime_b.acquire_ipc_client("ipc://nonexistent_runtime_b");
+        let a = runtime_a
+            .memory_stats()
+            .runtime_outgoing
+            .expect("runtime a domain");
+        let b = runtime_b
+            .memory_stats()
+            .runtime_outgoing
+            .expect("runtime b domain");
+        assert_eq!(a.limits.shm_backing_budget_bytes, 1111);
+        assert_eq!(b.limits.shm_backing_budget_bytes, 2222);
+
+        // A retired observation taken before shutdown keeps reporting exactly
+        // its own domain after the Runtime is gone.
+        let retired_a = runtime_a
+            .outgoing_memory_observer()
+            .expect("runtime a observer");
+
+        // Shutting one Runtime must not reset or change the other's domain.
+        let outcome = runtime_a.shutdown_without_host(Duration::from_secs(2));
+        assert!(outcome.ipc_clients_drained);
+        assert_eq!(*retired_a.limits(), a.limits);
+        assert_eq!(retired_a.used_bytes(), 0);
+        let b_after = runtime_b
+            .memory_stats()
+            .runtime_outgoing
+            .expect("runtime b domain stays observable");
+        assert_eq!(b_after.limits.shm_backing_budget_bytes, 2222);
+        assert_eq!(b_after.shm.limit_bytes, 2222);
     }
 }

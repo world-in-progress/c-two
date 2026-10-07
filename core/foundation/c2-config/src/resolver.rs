@@ -79,6 +79,8 @@ pub struct BaseIpcConfigOverrides {
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
+    pub pool_prewarm_segments: Option<u32>,
+    pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
     pub max_total_chunks: Option<u32>,
@@ -87,6 +89,9 @@ pub struct BaseIpcConfigOverrides {
     pub chunk_assembler_timeout_secs: Option<f64>,
     pub max_reassembly_bytes: Option<u64>,
     pub chunk_size: Option<u64>,
+    pub shm_backing_budget_bytes: Option<u64>,
+    pub file_backing_budget_bytes: Option<u64>,
+    pub live_reassembly_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,6 +100,8 @@ pub struct ServerIpcConfigOverrides {
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
+    pub pool_prewarm_segments: Option<u32>,
+    pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
     pub max_total_chunks: Option<u32>,
@@ -103,6 +110,9 @@ pub struct ServerIpcConfigOverrides {
     pub chunk_assembler_timeout_secs: Option<f64>,
     pub max_reassembly_bytes: Option<u64>,
     pub chunk_size: Option<u64>,
+    pub shm_backing_budget_bytes: Option<u64>,
+    pub file_backing_budget_bytes: Option<u64>,
+    pub live_reassembly_budget_bytes: Option<u64>,
     pub max_frame_size: Option<u64>,
     pub max_payload_size: Option<u64>,
     pub max_pending_requests: Option<u32>,
@@ -118,6 +128,8 @@ pub struct ClientIpcConfigOverrides {
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
+    pub pool_prewarm_segments: Option<u32>,
+    pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
     pub max_total_chunks: Option<u32>,
@@ -126,6 +138,10 @@ pub struct ClientIpcConfigOverrides {
     pub chunk_assembler_timeout_secs: Option<f64>,
     pub max_reassembly_bytes: Option<u64>,
     pub chunk_size: Option<u64>,
+    pub pool_decay_seconds: Option<f64>,
+    pub shm_backing_budget_bytes: Option<u64>,
+    pub file_backing_budget_bytes: Option<u64>,
+    pub live_reassembly_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -211,13 +227,15 @@ impl ConfigResolver {
 
         let relay = resolve_relay_server_config(&catalog, overrides.relay.clone())?;
         let relay_client = resolve_relay_client_config(&catalog, &overrides)?;
+        let client_ipc = resolve_client_ipc_config(&catalog, overrides.client_ipc, shm_threshold)?;
         let relay = RelayConfig {
+            upstream_ipc: client_ipc.clone(),
             use_proxy: relay_client.relay_use_proxy,
             remote_payload_chunk_size: relay_client.remote_payload_chunk_size,
             ..relay
         };
         let server_ipc = resolve_server_ipc_config(&catalog, overrides.server_ipc, shm_threshold)?;
-        let client_ipc = resolve_client_ipc_config(&catalog, overrides.client_ipc, shm_threshold)?;
+        relay.validate().map_err(ConfigError::new)?;
 
         Ok(ResolvedRuntimeConfig {
             relay_anchor_address: relay_client.relay_anchor_address,
@@ -243,11 +261,17 @@ impl ConfigResolver {
         let relay_use_proxy = resolve_relay_use_proxy(&catalog, &overrides)?;
         let remote_payload_chunk_size =
             resolve_remote_payload_chunk_size(&catalog, overrides.remote_payload_chunk_size)?;
+        let shm_threshold = resolve_shm_threshold(&catalog, overrides.shm_threshold)?;
+        let upstream_ipc =
+            resolve_client_ipc_config(&catalog, overrides.client_ipc, shm_threshold)?;
         let relay = RelayConfig {
+            upstream_ipc,
             use_proxy: relay_use_proxy,
             remote_payload_chunk_size,
             ..relay
         };
+
+        relay.validate().map_err(ConfigError::new)?;
 
         Ok(ResolvedRelayConfig {
             relay_anchor_address,
@@ -578,8 +602,17 @@ fn resolve_client_ipc_config(
     };
 
     apply_base_env(&mut cfg.base, catalog)?;
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_POOL_DECAY_SECONDS")
+        .transpose()?
+    {
+        cfg.pool_decay_seconds = v;
+    }
     apply_base_overrides(&mut cfg.base, &overrides.base);
     apply_flat_base_overrides_to_client(&mut cfg, &overrides);
+    if let Some(v) = overrides.pool_decay_seconds {
+        cfg.pool_decay_seconds = v;
+    }
 
     derive_base(&mut cfg.base)?;
     cfg.validate().map_err(ConfigError::new)?;
@@ -601,6 +634,18 @@ fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), C
         .transpose()?
     {
         cfg.max_pool_segments = v;
+    }
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_POOL_PREWARM_SEGMENTS")
+        .transpose()?
+    {
+        cfg.pool_prewarm_segments = v;
+    }
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_POOL_MIN_RETAINED_SEGMENTS")
+        .transpose()?
+    {
+        cfg.pool_min_retained_segments = v;
     }
     if let Some(v) = catalog
         .optional_u64("C2_IPC_REASSEMBLY_SEGMENT_SIZE")
@@ -647,6 +692,24 @@ fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), C
     if let Some(v) = catalog.optional_u64("C2_IPC_CHUNK_SIZE").transpose()? {
         cfg.chunk_size = v;
     }
+    if let Some(v) = catalog
+        .optional_u64("C2_IPC_SHM_BACKING_BUDGET_BYTES")
+        .transpose()?
+    {
+        cfg.shm_backing_budget_bytes = v;
+    }
+    if let Some(v) = catalog
+        .optional_u64("C2_IPC_FILE_BACKING_BUDGET_BYTES")
+        .transpose()?
+    {
+        cfg.file_backing_budget_bytes = v;
+    }
+    if let Some(v) = catalog
+        .optional_u64("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES")
+        .transpose()?
+    {
+        cfg.live_reassembly_budget_bytes = v;
+    }
     Ok(())
 }
 
@@ -659,6 +722,12 @@ fn apply_base_overrides(cfg: &mut BaseIpcConfig, overrides: &BaseIpcConfigOverri
     }
     if let Some(v) = overrides.max_pool_segments {
         cfg.max_pool_segments = v;
+    }
+    if let Some(v) = overrides.pool_prewarm_segments {
+        cfg.pool_prewarm_segments = v;
+    }
+    if let Some(v) = overrides.pool_min_retained_segments {
+        cfg.pool_min_retained_segments = v;
     }
     if let Some(v) = overrides.reassembly_segment_size {
         cfg.reassembly_segment_size = v;
@@ -683,6 +752,15 @@ fn apply_base_overrides(cfg: &mut BaseIpcConfig, overrides: &BaseIpcConfigOverri
     }
     if let Some(v) = overrides.chunk_size {
         cfg.chunk_size = v;
+    }
+    if let Some(v) = overrides.shm_backing_budget_bytes {
+        cfg.shm_backing_budget_bytes = v;
+    }
+    if let Some(v) = overrides.file_backing_budget_bytes {
+        cfg.file_backing_budget_bytes = v;
+    }
+    if let Some(v) = overrides.live_reassembly_budget_bytes {
+        cfg.live_reassembly_budget_bytes = v;
     }
 }
 
@@ -716,6 +794,12 @@ fn apply_flat_base_overrides_to_server(
     if let Some(v) = overrides.max_pool_segments {
         cfg.base.max_pool_segments = v;
     }
+    if let Some(v) = overrides.pool_prewarm_segments {
+        cfg.base.pool_prewarm_segments = v;
+    }
+    if let Some(v) = overrides.pool_min_retained_segments {
+        cfg.base.pool_min_retained_segments = v;
+    }
     if let Some(v) = overrides.reassembly_segment_size {
         cfg.base.reassembly_segment_size = v;
     }
@@ -739,6 +823,15 @@ fn apply_flat_base_overrides_to_server(
     }
     if let Some(v) = overrides.chunk_size {
         cfg.base.chunk_size = v;
+    }
+    if let Some(v) = overrides.shm_backing_budget_bytes {
+        cfg.base.shm_backing_budget_bytes = v;
+    }
+    if let Some(v) = overrides.file_backing_budget_bytes {
+        cfg.base.file_backing_budget_bytes = v;
+    }
+    if let Some(v) = overrides.live_reassembly_budget_bytes {
+        cfg.base.live_reassembly_budget_bytes = v;
     }
 }
 
@@ -755,6 +848,12 @@ fn apply_flat_base_overrides_to_client(
     if let Some(v) = overrides.max_pool_segments {
         cfg.base.max_pool_segments = v;
     }
+    if let Some(v) = overrides.pool_prewarm_segments {
+        cfg.base.pool_prewarm_segments = v;
+    }
+    if let Some(v) = overrides.pool_min_retained_segments {
+        cfg.base.pool_min_retained_segments = v;
+    }
     if let Some(v) = overrides.reassembly_segment_size {
         cfg.base.reassembly_segment_size = v;
     }
@@ -778,6 +877,15 @@ fn apply_flat_base_overrides_to_client(
     }
     if let Some(v) = overrides.chunk_size {
         cfg.base.chunk_size = v;
+    }
+    if let Some(v) = overrides.shm_backing_budget_bytes {
+        cfg.base.shm_backing_budget_bytes = v;
+    }
+    if let Some(v) = overrides.file_backing_budget_bytes {
+        cfg.base.file_backing_budget_bytes = v;
+    }
+    if let Some(v) = overrides.live_reassembly_budget_bytes {
+        cfg.base.live_reassembly_budget_bytes = v;
     }
 }
 
@@ -1140,6 +1248,74 @@ mod tests {
     }
 
     #[test]
+    fn client_ipc_pool_decay_env_and_override_are_resolved() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_POOL_DECAY_SECONDS", "12.5")]),
+        };
+
+        let from_env = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            sources,
+        )
+        .expect("env pool decay should resolve");
+        assert_eq!(from_env.pool_decay_seconds, 12.5);
+
+        // Zero is the explicit immediate-retirement window and stays valid.
+        let immediate = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides {
+                pool_decay_seconds: Some(0.0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect("zero pool decay should resolve as immediate retirement");
+        assert_eq!(immediate.pool_decay_seconds, 0.0);
+
+        // Explicit code-level overrides beat the shared environment variable.
+        let from_override = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides {
+                pool_decay_seconds: Some(7.5),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_POOL_DECAY_SECONDS", "12.5")]),
+            },
+        )
+        .expect("explicit pool decay override should beat env");
+        assert_eq!(from_override.pool_decay_seconds, 7.5);
+    }
+
+    #[test]
+    fn client_ipc_pool_decay_rejects_negative_env_and_override() {
+        let env_err = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_POOL_DECAY_SECONDS", "-1")]),
+            },
+        )
+        .expect_err("negative env pool decay should fail like the server");
+        assert!(env_err.to_string().contains("pool_decay_seconds"));
+
+        let override_err = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides {
+                pool_decay_seconds: Some(-1.0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("negative explicit pool decay should fail like the server");
+        assert!(override_err.to_string().contains("pool_decay_seconds"));
+    }
+
+    #[test]
     fn relay_idle_timeout_must_fit_millisecond_sweeper_interval() {
         let sources = ConfigSources {
             env_file: EnvFilePolicy::Disabled,
@@ -1406,5 +1582,253 @@ mod tests {
             resolved.relay_anchor_address.as_deref(),
             Some("http://127.0.0.1:8080")
         );
+    }
+
+    // ── Memory budget limits ─────────────────────────────────────────────
+
+    #[test]
+    fn resolver_budget_defaults_come_from_memory_budget_limits() {
+        let resolved =
+            ConfigResolver::resolve(RuntimeConfigOverrides::default(), ConfigSources::empty())
+                .expect("defaults should resolve");
+
+        assert_eq!(
+            resolved.server_ipc.memory_budget_limits(),
+            crate::MemoryBudgetLimits::default()
+        );
+        assert_eq!(
+            resolved.client_ipc.memory_budget_limits(),
+            crate::MemoryBudgetLimits::default()
+        );
+        assert_eq!(
+            resolved.server_ipc.shm_backing_budget_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            resolved.server_ipc.file_backing_budget_bytes,
+            16 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            resolved.server_ipc.live_reassembly_budget_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn budget_limits_resolve_from_env_for_both_roles() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "1073741824"),
+                ("C2_IPC_FILE_BACKING_BUDGET_BYTES", "2147483648"),
+                ("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "536870912"),
+            ]),
+        };
+
+        let resolved = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
+            .expect("env budget limits should resolve");
+
+        assert_eq!(resolved.server_ipc.shm_backing_budget_bytes, 1_073_741_824);
+        assert_eq!(resolved.server_ipc.file_backing_budget_bytes, 2_147_483_648);
+        assert_eq!(
+            resolved.server_ipc.live_reassembly_budget_bytes,
+            536_870_912
+        );
+        assert_eq!(resolved.client_ipc.shm_backing_budget_bytes, 1_073_741_824);
+        assert_eq!(resolved.client_ipc.file_backing_budget_bytes, 2_147_483_648);
+        assert_eq!(
+            resolved.client_ipc.live_reassembly_budget_bytes,
+            536_870_912
+        );
+    }
+
+    #[test]
+    fn budget_limits_explicit_overrides_beat_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "1073741824"),
+                ("C2_IPC_FILE_BACKING_BUDGET_BYTES", "2147483648"),
+                ("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "536870912"),
+            ]),
+        };
+        let mut overrides = RuntimeConfigOverrides::default();
+        overrides.server_ipc.shm_backing_budget_bytes = Some(3_221_225_472);
+        overrides.client_ipc.file_backing_budget_bytes = Some(0);
+        overrides.client_ipc.base.live_reassembly_budget_bytes = Some(2_147_483_648);
+
+        let resolved = ConfigResolver::resolve(overrides, sources).expect("resolve");
+
+        assert_eq!(resolved.server_ipc.shm_backing_budget_bytes, 3_221_225_472);
+        assert_eq!(resolved.server_ipc.file_backing_budget_bytes, 2_147_483_648);
+        assert_eq!(resolved.client_ipc.shm_backing_budget_bytes, 1_073_741_824);
+        assert_eq!(resolved.client_ipc.file_backing_budget_bytes, 0);
+        assert_eq!(
+            resolved.client_ipc.live_reassembly_budget_bytes,
+            2_147_483_648
+        );
+    }
+
+    #[test]
+    fn budget_limits_accept_zero_and_full_u64_range() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "0"),
+                ("C2_IPC_FILE_BACKING_BUDGET_BYTES", "0"),
+                ("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "0"),
+            ]),
+        };
+
+        let from_zero_env = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
+            .expect("zero budget limits are valid finite configuration");
+        assert_eq!(
+            from_zero_env.server_ipc.memory_budget_limits(),
+            crate::MemoryBudgetLimits::zeroed()
+        );
+
+        let overrides = RuntimeConfigOverrides {
+            server_ipc: ServerIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(u64::MAX),
+                file_backing_budget_bytes: Some(u64::MAX),
+                live_reassembly_budget_bytes: Some(u64::MAX),
+                ..Default::default()
+            },
+            client_ipc: ClientIpcConfigOverrides {
+                shm_backing_budget_bytes: Some(u64::MAX),
+                file_backing_budget_bytes: Some(u64::MAX),
+                live_reassembly_budget_bytes: Some(u64::MAX),
+                ..Default::default()
+            },
+            ..RuntimeConfigOverrides::default()
+        };
+        let from_max_override = ConfigResolver::resolve(overrides, ConfigSources::empty())
+            .expect("full-range budget limits are valid");
+        assert_eq!(
+            from_max_override.server_ipc.shm_backing_budget_bytes,
+            u64::MAX
+        );
+        assert_eq!(
+            from_max_override.client_ipc.file_backing_budget_bytes,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn budget_limits_env_rejects_negative_and_overflow() {
+        for (key, value) in [
+            ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "-1"),
+            ("C2_IPC_FILE_BACKING_BUDGET_BYTES", "18446744073709551616"),
+            ("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "not-a-number"),
+        ] {
+            let sources = ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[(key, value)]),
+            };
+
+            let err = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
+                .expect_err("invalid budget env value should fail");
+
+            assert!(
+                err.to_string().contains(key),
+                "error should name {key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_upstream_ipc_rejects_invalid_configuration() {
+        for (key, value) in [
+            ("C2_IPC_POOL_ENABLED", "invalid"),
+            ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "-1"),
+            ("C2_IPC_FILE_BACKING_BUDGET_BYTES", "18446744073709551616"),
+            ("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "invalid"),
+            ("C2_SHM_THRESHOLD", "invalid"),
+        ] {
+            let sources = ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[(key, value)]),
+            };
+            let err =
+                ConfigResolver::resolve_relay_server(RuntimeConfigOverrides::default(), sources)
+                    .expect_err("relay must reject malformed upstream IPC policy before listening");
+            assert!(err.to_string().contains(key), "{err}");
+        }
+
+        let mut overrides = RuntimeConfigOverrides::default();
+        overrides.client_ipc.pool_enabled = Some(false);
+        overrides.client_ipc.pool_prewarm_segments = Some(1);
+        let err = ConfigResolver::resolve_relay_server(overrides, ConfigSources::empty())
+            .expect_err("disabled buddy cannot be prewarmed");
+        assert!(err.to_string().contains("pool_prewarm_segments"), "{err}");
+    }
+
+    #[test]
+    fn relay_upstream_ipc_defaults_match_client_and_both_entry_points() {
+        let runtime =
+            ConfigResolver::resolve(RuntimeConfigOverrides::default(), ConfigSources::empty())
+                .unwrap();
+        let relay = ConfigResolver::resolve_relay_server(
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .unwrap();
+        assert_eq!(relay.relay.upstream_ipc, ClientIpcConfig::default());
+        assert_eq!(runtime.relay.upstream_ipc, runtime.client_ipc);
+        assert_eq!(runtime.client_ipc, relay.relay.upstream_ipc);
+    }
+
+    #[test]
+    fn relay_upstream_ipc_resolves_full_policy_with_shared_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.env");
+        fs::write(&path, "C2_IPC_POOL_ENABLED=false\nC2_IPC_POOL_SEGMENT_SIZE=65536\nC2_IPC_MAX_POOL_SEGMENTS=3\nC2_IPC_POOL_PREWARM_SEGMENTS=0\nC2_IPC_POOL_DECAY_SECONDS=10\nC2_IPC_SHM_BACKING_BUDGET_BYTES=100\nC2_IPC_FILE_BACKING_BUDGET_BYTES=200\nC2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES=300\nC2_SHM_THRESHOLD=1024\n").unwrap();
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Path(path),
+            process_env: env(&[
+                ("C2_IPC_POOL_ENABLED", "true"),
+                ("C2_IPC_POOL_PREWARM_SEGMENTS", "1"),
+                ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "400"),
+                ("C2_IPC_POOL_DECAY_SECONDS", "20"),
+                ("C2_SHM_THRESHOLD", "2048"),
+            ]),
+        };
+        let from_env = ConfigResolver::resolve_relay_server(
+            RuntimeConfigOverrides::default(),
+            sources.clone(),
+        )
+        .unwrap();
+        let ipc = from_env.relay.upstream_ipc;
+        assert!(ipc.pool_enabled);
+        assert_eq!(ipc.pool_prewarm_segments, 1);
+        assert_eq!(ipc.pool_segment_size, 65536);
+        assert_eq!(ipc.max_pool_memory, 65536 * 3);
+        assert_eq!(ipc.shm_backing_budget_bytes, 400);
+        assert_eq!(ipc.file_backing_budget_bytes, 200);
+        assert_eq!(ipc.live_reassembly_budget_bytes, 300);
+        assert_eq!(ipc.pool_decay_seconds, 20.0);
+        assert_eq!(ipc.shm_threshold, 2048);
+
+        let mut overrides = RuntimeConfigOverrides::default();
+        overrides.client_ipc.base.pool_enabled = Some(false);
+        overrides.client_ipc.pool_prewarm_segments = Some(0);
+        overrides.client_ipc.shm_backing_budget_bytes = Some(0);
+        overrides.client_ipc.base.file_backing_budget_bytes = Some(0);
+        overrides.client_ipc.live_reassembly_budget_bytes = Some(0);
+        overrides.client_ipc.pool_decay_seconds = Some(30.0);
+        overrides.shm_threshold = Some(4096);
+        let runtime = ConfigResolver::resolve(overrides.clone(), sources.clone()).unwrap();
+        let relay = ConfigResolver::resolve_relay_server(overrides, sources).unwrap();
+        assert_eq!(relay.relay.upstream_ipc, runtime.client_ipc);
+        assert_eq!(runtime.relay.upstream_ipc, runtime.client_ipc);
+        let ipc = relay.relay.upstream_ipc;
+        assert!(!ipc.pool_enabled);
+        assert_eq!(ipc.pool_prewarm_segments, 0);
+        assert_eq!(
+            ipc.memory_budget_limits(),
+            crate::MemoryBudgetLimits::zeroed()
+        );
+        assert_eq!(ipc.pool_decay_seconds, 30.0);
+        assert_eq!(ipc.shm_threshold, 4096);
     }
 }

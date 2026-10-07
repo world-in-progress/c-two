@@ -10,13 +10,15 @@ pub mod error;
 mod host;
 mod identity;
 mod lifetime;
+pub mod memory;
 mod outcome;
+mod owner_bound;
 mod session;
 
 pub use client::{Client, Connect, EncodedClient, ObservedPath, ObservedRoute, PathCounters};
 pub use control::{
-    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
-    ping_direct_ipc, shutdown_direct_ipc,
+    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint, ping_direct_ipc,
+    shutdown_direct_ipc,
 };
 pub use error::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, TransportError,
@@ -33,8 +35,26 @@ pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
 };
 pub use lifetime::HeldResponse;
+// The native local-endpoint lifecycle surface is owned by `c2-local`. Core
+// re-exports it so SDKs and the CLI share one implementation instead of
+// writing their own paths, parsers, or management loops.
+pub use c2_local::{
+    ENDPOINT_CREDENTIAL_MAX_BYTES, ENDPOINT_CREDENTIAL_SCHEMA_VERSION, EndpointCredential,
+    EndpointCredentialError, EndpointCredentialErrorKind, EndpointInspection, EndpointIoError,
+    EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint,
+    SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
+};
+pub use memory::{
+    MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
+    RetirementHandoff, RuntimeMemoryStats, scope,
+};
 pub use outcome::{
     RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome, ShutdownOutcome,
     UnregisterOutcome,
 };
+pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot};
 pub use session::{Runtime, RuntimeIdentity, RuntimeOptions};
+
+// SDK facades use the canonical Core owner capability types.
+pub use c2_config::{MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace};
+pub use c2_local::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};

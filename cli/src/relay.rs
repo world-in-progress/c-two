@@ -2,7 +2,10 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use c2_config::{ConfigResolver, ConfigSources, RelayConfigOverrides, RuntimeConfigOverrides};
+use c2_config::{
+    ClientIpcConfigOverrides, ConfigResolver, ConfigSources, RelayConfigOverrides,
+    RuntimeConfigOverrides,
+};
 use c2_http::relay::RelayServer;
 use clap::Args;
 
@@ -31,6 +34,22 @@ pub struct RelayArgs {
     /// Publicly reachable URL for this relay.
     #[arg(long = "advertise-url")]
     pub advertise_url: Option<String>,
+
+    /// Enable buddy SHM for data-plane upstream IPC clients.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub ipc_pool_enabled: Option<bool>,
+
+    /// Shared upstream IPC SHM backing budget in bytes. Zero rejects positive charges.
+    #[arg(long)]
+    pub ipc_shm_backing_budget_bytes: Option<u64>,
+
+    /// Shared upstream IPC file backing budget in bytes. Zero rejects positive charges.
+    #[arg(long)]
+    pub ipc_file_backing_budget_bytes: Option<u64>,
+
+    /// Shared upstream IPC live reassembly budget in bytes. Zero rejects positive charges.
+    #[arg(long)]
+    pub ipc_live_reassembly_budget_bytes: Option<u64>,
 
     /// Validate and print relay configuration without starting the server.
     #[arg(long, hide = true)]
@@ -62,6 +81,13 @@ pub fn parse_upstream(value: &str) -> Result<(String, String, String), String> {
 
 pub fn run(args: RelayArgs) -> Result<()> {
     let overrides = RuntimeConfigOverrides {
+        client_ipc: ClientIpcConfigOverrides {
+            pool_enabled: args.ipc_pool_enabled,
+            shm_backing_budget_bytes: args.ipc_shm_backing_budget_bytes,
+            file_backing_budget_bytes: args.ipc_file_backing_budget_bytes,
+            live_reassembly_budget_bytes: args.ipc_live_reassembly_budget_bytes,
+            ..Default::default()
+        },
         relay: RelayConfigOverrides {
             bind: args.bind.clone(),
             relay_id: args.relay_id.clone(),
@@ -90,6 +116,23 @@ pub fn run(args: RelayArgs) -> Result<()> {
         println!(
             "remote_payload_chunk_size={}",
             config.remote_payload_chunk_size
+        );
+        println!("ipc_pool_enabled={}", config.upstream_ipc.pool_enabled);
+        println!(
+            "ipc_pool_prewarm_segments={}",
+            config.upstream_ipc.pool_prewarm_segments
+        );
+        println!(
+            "ipc_shm_backing_budget_bytes={}",
+            config.upstream_ipc.shm_backing_budget_bytes
+        );
+        println!(
+            "ipc_file_backing_budget_bytes={}",
+            config.upstream_ipc.file_backing_budget_bytes
+        );
+        println!(
+            "ipc_live_reassembly_budget_bytes={}",
+            config.upstream_ipc.live_reassembly_budget_bytes
         );
         for seed in &config.seeds {
             println!("seed={seed}");

@@ -2,6 +2,10 @@
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
+This guide describes **c3 0.3.0**, paired with Python C-Two **0.7.0**. See
+[release notes](../docs/releases/0.7.0.md) for version availability, upgrades
+and validation progress.
+
 ## Scope
 
 `c3` owns product-level runtime commands:
@@ -9,6 +13,7 @@
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
 - `c3 registry list-routes` lists resource names registered with a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
+- `c3 endpoint inspect/reap/sweep` projects native local endpoint maintenance.
 - `c3 contract` validates/releases `c-two.contract.v2` descriptors and composes complete Rust, Python, or TypeScript project trees.
 
 ## Build and install for development
@@ -102,7 +107,10 @@ Useful options:
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
-| none | `C2_RELAY_ROUTE_MAX_ATTEMPTS` | `3` | Maximum relay-aware route acquisition attempts before reporting failure; valid range is `1..=32` and `0` is treated as `1`. |
+| `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
+| `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
+| `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
+| `--ipc-live-reassembly-budget-bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Shared upstream reassembly/retention capacity budget. |
 | `--upstream`, `-u` | none | empty | Pre-register an upstream as `NAME=SERVER_ID@ADDRESS`. `SERVER_ID` must match the IPC server handshake identity. Repeatable. |
 
 Examples:
@@ -119,7 +127,56 @@ Use `--dry-run` to validate relay configuration and print the effective values w
 c3 relay --bind 127.0.0.1:9999 --idle-timeout 10 --dry-run
 ```
 
+The relay resolves and freezes its own upstream IPC policy at startup; an
+application's `cc.set_client()` does not configure this separate process.
+All data-plane upstream request/reassembly pools share the relay's budget,
+including after idle eviction and reconnect. Zero budgets reject positive
+reservations, and capacity refusal follows the existing transport error paths.
+Budget charges remain until storage is actually released. Control registration
+proof/watch contexts, peer mappings and HTTP buffers are outside this budget.
+Other IPC fields use the Rust resolver's environment inputs, including
+`C2_IPC_POOL_PREWARM_SEGMENTS`, `C2_IPC_POOL_MIN_RETAINED_SEGMENTS` and
+`C2_IPC_POOL_DECAY_SECONDS`. Disabled buddy requires zero prewarm.
+
+```bash
+c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \
+  --ipc-pool-enabled false \
+  --ipc-shm-backing-budget-bytes 134217728 \
+  --ipc-file-backing-budget-bytes 268435456 \
+  --ipc-live-reassembly-budget-bytes 134217728
+```
+
+Idle eviction disconnects the relay's cached IPC connection, not the resource
+server. Reconnect preserves full contract and server/instance identity
+validation; it does not replay ambiguous data-plane failures.
+`C2_RELAY_ROUTE_MAX_ATTEMPTS` belongs to relay-aware **clients**, not the relay
+server resolver (default 3, range 1..=32, zero treated as one).
+See the [memory policy](../docs/memory-policy.md) for lazy allocation,
+fallback and retained-owner accounting.
+
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
+
+## Local endpoint maintenance
+
+Only pass logical addresses; Rust selects the OS endpoint. Credentials carry
+format metadata, never a backend choice. On Unix, save the credential after
+server readiness, then confirm the child has exited with an OS wait before reaping:
+
+```bash
+c3 endpoint inspect ipc://this-run-server > endpoint-inspection.json
+python3 -c 'import json; r=json.load(open("endpoint-inspection.json")); assert r["status"] == "present"; print(json.dumps(r["credential"]))' > endpoint-credential.json
+# After the supervisor has confirmed child exit:
+c3 endpoint reap ipc://this-run-server --credential endpoint-credential.json
+c3 endpoint sweep --address ipc://this-run-server --max-entries 64 --max-ms 10 --max-batches 64
+```
+
+Inspect reports observation, not process liveness. Reap refuses stale or
+unverified objects. Keep sweep addresses scoped to the current run; report
+completion only when CLI JSON `sweep.roundComplete` is true, not merely when the batch limit
+is reached. The millisecond budget is a scheduling target, not hard real-time
+filesystem behavior. Windows reports kernel-managed/not-applicable cleanup.
+See the [lifecycle guide](../docs/local-endpoint-lifecycle.md); do not remove
+unknown historical directories based on age, PID or connection failure.
 
 ## Registry
 
@@ -175,23 +232,46 @@ python tools/dev/generate_banner.py
 
 ## Release
 
-`c3` is released by `.github/workflows/cli-release.yml`. The release pipeline builds native binaries for:
+The [c3 0.3.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) uses the following binary target convention. Availability and candidate gates are tracked in [release notes](../docs/releases/0.7.0.md):
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
+- `x86_64-pc-windows-msvc`
 
-Each release asset is named `c3-${target}` and is accompanied by a `c3-${target}.sha256` checksum.
+Unix assets are named `c3-${target}`; Windows uses `c3-${target}.exe`.
+Each has a matching `.sha256`; installers verify it before installation.
+The matching release's `rc-manifest.json` identifies the artifact source.
 
-Install the latest released binary with the installer asset:
-
-```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
-```
-
-The installer auto-detects Linux/macOS and x86_64/aarch64 targets, verifies the downloaded checksum, and installs to `/usr/local/bin` when run as root or `~/.local/bin` otherwise. Pass `-b` to choose another directory:
+### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- -b /usr/local/bin
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
 ```
+
+The installer detects Linux/macOS and x86_64/aarch64. It defaults to
+`/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0 --bin-dir "$HOME/bin"
+```
+
+### Windows x64
+
+Download the PowerShell installer and select the coordinated version explicitly:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.0 -Target x86_64-pc-windows-msvc
+$env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
+c3.exe --version
+```
+
+PowerShell 5.1 is supported. The default per-user directory is
+`$env:LOCALAPPDATA\Programs\c3`; `-BinDir` selects another directory.
+The installer verifies SHA-256 and copies the binary to `c3.exe`, without
+requiring an administrator or persistently registering PATH. The example adds
+it to the current session only. Windows ARM64 has no release exe target.
+For direct exe download, checksum verification and relay execution, see
+[Windows installation](../docs/windows-native-usage.md#install-python-and-c3).

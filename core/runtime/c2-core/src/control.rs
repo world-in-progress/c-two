@@ -20,7 +20,7 @@ pub struct DirectIpcShutdownOutcome {
     pub route_outcomes: Vec<DirectIpcShutdownRouteOutcome>,
 }
 
-/// Resolve a validated direct IPC address to its operating-system endpoint.
+/// Derive the platform native endpoint for a validated IPC address.
 pub fn direct_ipc_endpoint(address: &str) -> Result<LocalEndpoint, LifecycleError> {
     c2_ipc::local_endpoint_from_ipc_address(address)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))

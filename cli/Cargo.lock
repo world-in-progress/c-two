@@ -210,16 +210,18 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "c2-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "c2-codegen",
  "c2-config",
  "c2-contract",
+ "c2-core",
  "c2-http",
  "clap",
  "ctrlc",
+ "libc",
  "percent-encoding",
  "predicates",
  "reqwest",
@@ -248,6 +250,7 @@ dependencies = [
  "c2-local-security",
  "dotenvy",
  "gethostname",
+ "libc",
  "sha2 0.10.9",
  "uuid",
 ]
@@ -260,6 +263,24 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+]
+
+[[package]]
+name = "c2-core"
+version = "0.1.0"
+dependencies = [
+ "c2-config",
+ "c2-contract",
+ "c2-error",
+ "c2-http",
+ "c2-ipc",
+ "c2-local",
+ "c2-mem",
+ "c2-server",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -280,6 +301,7 @@ dependencies = [
  "c2-contract",
  "c2-error",
  "c2-ipc",
+ "c2-mem",
  "c2-wire",
  "futures",
  "hex",
@@ -319,9 +341,12 @@ dependencies = [
  "c2-local-security",
  "futures-util",
  "libc",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "socket2",
  "tokio",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 
@@ -345,6 +370,22 @@ dependencies = [
  "sha2 0.10.9",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "c2-server"
+version = "0.1.0"
+dependencies = [
+ "c2-config",
+ "c2-contract",
+ "c2-error",
+ "c2-local",
+ "c2-mem",
+ "c2-wire",
+ "parking_lot",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

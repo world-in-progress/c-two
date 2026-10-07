@@ -11,6 +11,7 @@ description = "User-facing Rust SDK for the C-Two resource RPC runtime"
 name = "c_two"
 
 [dependencies]
+c2-config = { version = "0.1.0", path = "../../core/foundation/c2-config" }
 c2-core = { version = "0.1.0", path = "../../core/runtime/c2-core" }
 c2-contract = { version = "0.1.0", path = "../../core/foundation/c2-contract" }
 c2-error = { version = "0.1.0", path = "../../core/foundation/c2-error" }

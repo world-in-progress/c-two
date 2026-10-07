@@ -1,0 +1,787 @@
+{
+  "schema": "c-two.relay-memory-validation.v1",
+  "status": "passed",
+  "baseline_sha": "b75e4d569fe7812edc0e70d88fbc306801529e01",
+  "implementation_sha": "d42c70ee53943ddfb6ba545f14c224b12f0fd31a",
+  "validation_sha": "ce01b462862603e18fd30655c5a7a502bd4128e5",
+  "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "local": {
+    "status": "passed",
+    "source_sha": "d42c70ee53943ddfb6ba545f14c224b12f0fd31a",
+    "counts": {
+      "native-tests": 2,
+      "cli": 51,
+      "core": 1239,
+      "rust-sdk": 10
+    },
+    "python_tests": 918,
+    "python_same_ids": true,
+    "new_rust_tests": 34,
+    "portable_rows": 18,
+    "typescript_rows": 12,
+    "c3_sha256": "fe6096782abbca98290230e13b1a1e2fe78a7523d40bea8f22697f789c8267eb",
+    "native_sha256": "26f4334cdaac1f61edba465c8f24d3fb08d4ca7de82714b08302a149996fc68c"
+  },
+  "windows": {
+    "status": "passed",
+    "run_id": 37378153376,
+    "workflow_attempt": 1,
+    "source_sha": "ce01b462862603e18fd30655c5a7a502bd4128e5",
+    "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+    "artifacts": [
+      {
+        "artifact_id": 11373791775,
+        "name": "windows-native-windows-2025-full-ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "zip_sha256": "99384a8745167229c631228662903de7e84bff2450ca2078f02b341c4a0ca635",
+        "gates": 23,
+        "source_sha": "ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 111992699555,
+        "new_rust_tests_proven": 34,
+        "junit_counts": {
+          "portable-tests.xml": 25,
+          "typescript-tests.xml": 14,
+          "python-tests.xml": 879,
+          "windows-harness-tests.xml": 34
+        },
+        "rust_test_counts": {
+          "core-test.log": 1232,
+          "cli-test.log": 42
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "e6f9abecdd9d2ea723182f10df1a9692eeba462c733ceccca71306ae716df87f",
+        "wheels": {
+          "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "9d6f7f76dce25e79ab307d8d0f01c33b657f77b3af5176baefb432279e76f67a",
+          "c_two-0.6.0-cp312-cp312-win_amd64.whl": "5424d741d8dd229d051dc32f95ed9ae31c219f6b9e431fb3c7b4a61225e44a8a"
+        },
+        "wheel_consumers": 2,
+        "standard_user_cleanup": true,
+        "memory_matrix": true
+      },
+      {
+        "artifact_id": 11373671023,
+        "name": "windows-native-windows-2022-full-ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "zip_sha256": "31c2457a81d737372d37d7fd8d13e18deaa2720b0abfee6133675ee948741bdf",
+        "gates": 23,
+        "source_sha": "ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 111992699025,
+        "new_rust_tests_proven": 34,
+        "junit_counts": {
+          "portable-tests.xml": 25,
+          "typescript-tests.xml": 14,
+          "python-tests.xml": 879,
+          "windows-harness-tests.xml": 34
+        },
+        "rust_test_counts": {
+          "core-test.log": 1232,
+          "cli-test.log": 42
+        },
+        "portable_rows": 18,
+        "typescript_rows": 12,
+        "c3_sha256": "7ef73abf7617a1264038eee9832c07f0da7b43f8e993bdb712d482f1147b9cdd",
+        "wheels": {
+          "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "1aadbbf5c83588b51756dd7b83f803563ef03d47e16ad477538491fb06c65650",
+          "c_two-0.6.0-cp312-cp312-win_amd64.whl": "199e41d2c37da08d86b15087284ac11a1bb75af1d61e2e37d6a7159cdd775249"
+        },
+        "wheel_consumers": 2,
+        "standard_user_cleanup": true,
+        "memory_matrix": true
+      },
+      {
+        "artifact_id": 11372750881,
+        "name": "windows-native-windows-2025-local-platform-ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "zip_sha256": "eee976ccd457c52df47f4a4f4af27fb2d8030f708ef3267b66a1d235755dec38",
+        "gates": 1,
+        "source_sha": "ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 111992699526,
+        "rust_test_counts": {
+          "local-platform-tests.log": 760
+        }
+      },
+      {
+        "artifact_id": 11372243882,
+        "name": "windows-native-windows-2022-local-platform-ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "zip_sha256": "a3c6a9451980ce68ac4bcf9932a855bdd35c511597ffb3dc3589d6a1625c85b7",
+        "gates": 1,
+        "source_sha": "ce01b462862603e18fd30655c5a7a502bd4128e5",
+        "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+        "execution_attempt": 1,
+        "execution_job_id": 111992699434,
+        "rust_test_counts": {
+          "local-platform-tests.log": 760
+        }
+      }
+    ]
+  },
+  "test_preservation": {
+    "baseline": "b75e4d569fe7812edc0e70d88fbc306801529e01",
+    "source": "d42c70ee53943ddfb6ba545f14c224b12f0fd31a",
+    "python_old_count": 918,
+    "python_new_count": 918,
+    "python_same_ids": true,
+    "rust_removed": [],
+    "rust_added": [
+      [
+        "cli/tests/relay_args.rs",
+        "relay_ipc_dry_run_reports_canonical_defaults"
+      ],
+      [
+        "cli/tests/relay_args.rs",
+        "relay_ipc_env_overrides_dotenv_and_reports_prewarm"
+      ],
+      [
+        "cli/tests/relay_args.rs",
+        "relay_ipc_flags_override_env_and_accept_zero_budgets"
+      ],
+      [
+        "cli/tests/relay_args.rs",
+        "relay_ipc_rejects_disabled_pool_with_prewarm_before_listening"
+      ],
+      [
+        "cli/tests/relay_args.rs",
+        "relay_ipc_rejects_malformed_cli_values"
+      ],
+      [
+        "cli/tests/relay_args.rs",
+        "relay_ipc_rejects_malformed_env_before_listening"
+      ],
+      [
+        "core/foundation/c2-config/src/relay.rs",
+        "relay_config_validates_upstream_ipc_and_accepts_zero_budgets"
+      ],
+      [
+        "core/foundation/c2-config/src/resolver.rs",
+        "relay_upstream_ipc_defaults_match_client_and_both_entry_points"
+      ],
+      [
+        "core/foundation/c2-config/src/resolver.rs",
+        "relay_upstream_ipc_rejects_invalid_configuration"
+      ],
+      [
+        "core/foundation/c2-config/src/resolver.rs",
+        "relay_upstream_ipc_resolves_full_policy_with_shared_precedence"
+      ],
+      [
+        "core/transport/c2-http/src/relay/conn_pool.rs",
+        "cancelled_connector_wakes_waiters_and_allows_reacquire"
+      ],
+      [
+        "core/transport/c2-http/src/relay/conn_pool.rs",
+        "connector_success_and_error_wake_waiters_and_preserve_owner"
+      ],
+      [
+        "core/transport/c2-http/src/relay/conn_pool.rs",
+        "retired_attempt_cancellation_success_and_error_do_not_touch_replacement_slot"
+      ],
+      [
+        "core/transport/c2-http/src/relay/conn_pool.rs",
+        "superseded_attempt_does_not_rollback_ready_client_or_new_attempt"
+      ],
+      [
+        "core/transport/c2-http/src/relay/memory_tests.rs",
+        "actual_http_incomplete_upload_and_completed_call_refund_after_idle_close"
+      ],
+      [
+        "core/transport/c2-http/src/relay/memory_tests.rs",
+        "different_upstreams_share_file_capacity_and_refund_failed_admission"
+      ],
+      [
+        "core/transport/c2-http/src/relay/memory_tests.rs",
+        "different_upstreams_share_live_reassembly_capacity"
+      ],
+      [
+        "core/transport/c2-http/src/relay/memory_tests.rs",
+        "different_upstreams_share_request_budget_and_checked_chunk_fallback"
+      ],
+      [
+        "core/transport/c2-http/src/relay/memory_tests.rs",
+        "finished_file_carrier_keeps_charge_across_idle_close_and_reconnect"
+      ],
+      [
+        "core/transport/c2-http/src/relay/memory_tests.rs",
+        "unpublished_request_and_reply_reassembly_compete_for_same_shm_budget"
+      ],
+      [
+        "core/transport/c2-http/src/relay/memory_tests.rs",
+        "zero_response_budgets_reject_real_allocation_without_charge_or_replay"
+      ],
+      [
+        "core/transport/c2-http/src/relay/router.rs",
+        "relay_reply_capacity_preserves_shared_connection_and_inflight_call"
+      ],
+      [
+        "core/transport/c2-http/src/relay/state.rs",
+        "relay_upstream_ipc_acquired_client_disables_buddy_on_reconnect"
+      ],
+      [
+        "core/transport/c2-http/src/relay/state.rs",
+        "relay_upstream_ipc_acquired_client_obeys_zero_budget"
+      ],
+      [
+        "core/transport/c2-http/src/relay/state.rs",
+        "relay_upstream_ipc_acquired_client_uses_prewarm_and_shared_budget"
+      ],
+      [
+        "core/transport/c2-http/src/relay/state.rs",
+        "relay_upstream_ipc_invalid_policy_is_rejected_before_bind"
+      ],
+      [
+        "core/transport/c2-ipc/src/client.rs",
+        "aborted_receiver_state_cannot_clear_a_new_connection_incarnation"
+      ],
+      [
+        "core/transport/c2-ipc/src/client.rs",
+        "buddy_fill_source_error_is_pre_dispatch_and_releases_the_block"
+      ],
+      [
+        "core/transport/c2-ipc/src/client.rs",
+        "owner_reader_panic_preserves_payload_and_does_not_block_retirement"
+      ],
+      [
+        "core/transport/c2-ipc/src/client.rs",
+        "terminal_pending_drain_keeps_ownership_after_contention"
+      ],
+      [
+        "core/transport/c2-ipc/src/tests.rs",
+        "buddy_fill_source_error_preserves_connection_and_in_flight_call"
+      ],
+      [
+        "core/transport/c2-ipc/src/tests.rs",
+        "chunk_source_error_after_frame_is_uncertain_and_closes_connection"
+      ],
+      [
+        "core/transport/c2-ipc/src/tests.rs",
+        "partial_frame_write_cancellation_retries_contended_drain"
+      ],
+      [
+        "core/transport/c2-ipc/src/tests.rs",
+        "terminal_dedicated_settlement_disconnects_before_waiter_and_cache_acquire"
+      ]
+    ],
+    "scope": "Changed Rust test definitions; execution verified separately. Python JUnit IDs identical to9f71 and its priorb75 comparison."
+  },
+  "format": {
+    "changed_file_rustfmt_edition2024_exit": 0,
+    "global_failed_files": [
+      {
+        "path": "core/foundation/c2-config/src/ipc.rs",
+        "changed_this_turn": false
+      },
+      {
+        "path": "core/foundation/c2-config/src/lib.rs",
+        "changed_this_turn": false
+      },
+      {
+        "path": "core/runtime/c2-core/src/lib.rs",
+        "changed_this_turn": false
+      },
+      {
+        "path": "core/runtime/c2-core/tests/client_modes.rs",
+        "changed_this_turn": false
+      },
+      {
+        "path": "core/runtime/c2-core/tests/lifetime_ordering.rs",
+        "changed_this_turn": false
+      },
+      {
+        "path": "core/transport/c2-ipc/src/pool.rs",
+        "changed_this_turn": false
+      },
+      {
+        "path": "core/transport/c2-server/src/connection.rs",
+        "changed_this_turn": false
+      },
+      {
+        "path": "core/transport/c2-server/src/server.rs",
+        "changed_this_turn": false
+      }
+    ],
+    "final_client_check": "Final client.rs passed rustfmt after sole-owner fix; other10changed Rust files unchanged from prior passed check."
+  },
+  "review": {
+    "relay_artifact": "4e59ec9a-fd33-46e8-b87b-fffcaee4e61b",
+    "drain_initial_finding_artifact": "b7dc8535-38b2-4434-9f62-cc0a0b3e00d8",
+    "drain_final_review_artifact": "e4b75224-6bd2-439a-a9bc-d1a6df08a64f",
+    "owner_fixture_scope": {
+      "base": "b49d5c6fde94ec3ec8032a4a76099c7c5492b3fa",
+      "changed_paths": [
+        "core/transport/c2-ipc/src/client.rs"
+      ],
+      "all_other_bytes_unchanged": true,
+      "source_sha256": "6ea79d0f098b0f91495e59d8d997a024dc196c35b7b8b5a96f5bad9b0e858112"
+    }
+  },
+  "negative_controls": {
+    "terminal_drain": {
+      "status": "passed",
+      "source_sha": "3357fcc066af2aed49ad7cbf05fb31b5b284a4fd",
+      "results": [
+        {
+          "name": "fixed-ipc-full",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "seconds": 24.28,
+          "log": "/tmp/c2-relay-followup-1006/drain-validation/fixed-ipc-full.log",
+          "summaries": [
+            "test result: ok. 156 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.87s"
+          ]
+        },
+        {
+          "name": "old-drain-real-connection",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "partial_frame_write_cancellation_retries_contended_drain",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 101,
+          "seconds": 8.1,
+          "log": "/tmp/c2-relay-followup-1006/drain-validation/old-drain-real-connection.log",
+          "summaries": [
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 155 filtered out; finished in 2.02s"
+          ]
+        },
+        {
+          "name": "old-drain-unit",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "terminal_pending_drain_keeps_ownership_after_contention",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 101,
+          "seconds": 0.14,
+          "log": "/tmp/c2-relay-followup-1006/drain-validation/old-drain-unit.log",
+          "summaries": [
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.00s"
+          ]
+        },
+        {
+          "name": "restored-partial-write",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "partial_frame_write_cancellation",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "seconds": 5.93,
+          "log": "/tmp/c2-relay-followup-1006/drain-validation/restored-partial-write.log",
+          "summaries": [
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 154 filtered out; finished in 0.04s"
+          ]
+        },
+        {
+          "name": "restored-terminal-drain",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "terminal_pending_drain_keeps_ownership_after_contention",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "seconds": 0.14,
+          "log": "/tmp/c2-relay-followup-1006/drain-validation/restored-terminal-drain.log",
+          "summaries": [
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.01s"
+          ]
+        }
+      ],
+      "files": {
+        "core/transport/c2-ipc/src/client.rs": "58cff9536478af9f38ea325a69e81f121ada213d634737468836845a38398a61",
+        "core/transport/c2-ipc/src/tests.rs": "9fdcbd237d345a3fd21cb93a927926cfadbf0ba81f59ca588a76aec4202ef379"
+      }
+    },
+    "connection_liveness": {
+      "status": "passed",
+      "source_sha": "1d321bcb4ed79b7fdce5a84ff1db90d71b7a34f8",
+      "results": [
+        {
+          "name": "fixed-real",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "terminal_dedicated_settlement_disconnects_before_waiter_and_cache_acquire",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "seconds": 14.31,
+          "log": "/tmp/c2-relay-followup-1006/liveness-validation-v2/fixed-real.log",
+          "summaries": [
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 157 filtered out; finished in 4.06s"
+          ]
+        },
+        {
+          "name": "fixed-state",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "pending_disconnect_tests",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "seconds": 0.28,
+          "log": "/tmp/c2-relay-followup-1006/liveness-validation-v2/fixed-state.log",
+          "summaries": [
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 156 filtered out; finished in 0.01s"
+          ]
+        },
+        {
+          "name": "late-disconnect-real",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "terminal_dedicated_settlement_disconnects_before_waiter_and_cache_acquire",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 101,
+          "seconds": 6.32,
+          "log": "/tmp/c2-relay-followup-1006/liveness-validation-v2/late-disconnect-real.log",
+          "summaries": [
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 157 filtered out; finished in 0.01s"
+          ]
+        },
+        {
+          "name": "restored-real",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "terminal_dedicated_settlement_disconnects_before_waiter_and_cache_acquire",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "seconds": 10.27,
+          "log": "/tmp/c2-relay-followup-1006/liveness-validation-v2/restored-real.log",
+          "summaries": [
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 157 filtered out; finished in 4.01s"
+          ]
+        },
+        {
+          "name": "fixed-ipc-full",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "seconds": 11.31,
+          "log": "/tmp/c2-relay-followup-1006/liveness-validation-v2/fixed-ipc-full.log",
+          "summaries": [
+            "test result: ok. 158 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.20s"
+          ]
+        }
+      ],
+      "files": {
+        "core/transport/c2-ipc/src/client.rs": "80d0a28e1873c70814f232ac089aad0dade4e6e81da6bda3c818933c3d74f4bc",
+        "core/transport/c2-ipc/src/tests.rs": "3a7b22e7dbe0e9200c4035b7092ffca26c7ad8106f2746ce731d91aa43639a57"
+      }
+    },
+    "owner_fixture": {
+      "green": {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "core/Cargo.toml",
+          "-p",
+          "c2-ipc",
+          "--all-features",
+          "--lib",
+          "client::tests::owner_",
+          "--",
+          "--skip",
+          "client::tests::owner_preallocated_block_survives_close_and_limits_same_budget_reacquire",
+          "--skip",
+          "client::tests::owner_aborted_real_receiver_file_cleanup_is_retryable",
+          "--nocapture"
+        ],
+        "returncode": 0,
+        "expected_verdict_observed": true,
+        "source_sha256": "a01925a95ec93be7dcad3279c3bc987fef5e9b90bafe0cfb570015a33c8efdec"
+      },
+      "negative-caught": {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "core/Cargo.toml",
+          "-p",
+          "c2-ipc",
+          "--all-features",
+          "--lib",
+          "client::tests::owner_reader_panic_preserves_payload_and_does_not_block_retirement",
+          "--",
+          "--exact",
+          "--nocapture"
+        ],
+        "returncode": 101,
+        "expected_verdict_observed": true,
+        "source_sha256": "a01925a95ec93be7dcad3279c3bc987fef5e9b90bafe0cfb570015a33c8efdec"
+      },
+      "negative-drop": {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "core/Cargo.toml",
+          "-p",
+          "c2-ipc",
+          "--all-features",
+          "--lib",
+          "client::tests::owner_reader_panic_preserves_payload_and_does_not_block_retirement",
+          "--",
+          "--exact",
+          "--nocapture"
+        ],
+        "returncode": 101,
+        "expected_verdict_observed": true,
+        "source_sha256": "a01925a95ec93be7dcad3279c3bc987fef5e9b90bafe0cfb570015a33c8efdec"
+      },
+      "restored-green": {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline",
+          "--manifest-path",
+          "core/Cargo.toml",
+          "-p",
+          "c2-ipc",
+          "--all-features",
+          "--lib",
+          "client::tests::owner_",
+          "--",
+          "--skip",
+          "client::tests::owner_preallocated_block_survives_close_and_limits_same_budget_reacquire",
+          "--skip",
+          "client::tests::owner_aborted_real_receiver_file_cleanup_is_retryable",
+          "--nocapture"
+        ],
+        "returncode": 0,
+        "expected_verdict_observed": true,
+        "source_sha256": "a01925a95ec93be7dcad3279c3bc987fef5e9b90bafe0cfb570015a33c8efdec"
+      }
+    },
+    "sole_pending_owner": {
+      "status": "passed",
+      "base_commit": "11855095c2d4d08628e251ed70185620ca4c9860",
+      "results": [
+        {
+          "label": "old-fixture-extra-owner",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "owner_receiver_request_completion_and_footer_are_retryable",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 101,
+          "log": "/tmp/c2-relay-followup-1006/sole-owner-validation/old-fixture-extra-owner.log",
+          "summaries": [
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 158 filtered out; finished in 0.00s"
+          ]
+        },
+        {
+          "label": "fixed-sole-owner",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "owner_receiver_request_completion_and_footer_are_retryable",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "log": "/tmp/c2-relay-followup-1006/sole-owner-validation/fixed-sole-owner.log",
+          "summaries": [
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 158 filtered out; finished in 0.43s"
+          ]
+        },
+        {
+          "label": "ipc-full",
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "--manifest-path",
+            "core/Cargo.toml",
+            "-p",
+            "c2-ipc",
+            "--all-features",
+            "--lib",
+            "--",
+            "--test-threads=4",
+            "--nocapture"
+          ],
+          "exit_code": 0,
+          "log": "/tmp/c2-relay-followup-1006/sole-owner-validation/ipc-full.log",
+          "summaries": [
+            "test result: ok. 159 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.70s"
+          ]
+        }
+      ],
+      "client_sha256": "63fbf83724921b06fa36ee38a827f6f9d52c9a2a9b59b8ff9736a1c0e8f6e4f3"
+    }
+  },
+  "retained_failed_runs": [
+    {
+      "run_id": 37358977203,
+      "source_sha": "4b0012b982de7cd001c09be870f54e61c54bcacc",
+      "description": "Win2022 local-platform partial frame pending drain timeout; three other jobs passed."
+    },
+    {
+      "run_id": 37364231858,
+      "source_sha": "a509f7a656e65cc5e13e61627d0a828857d56b38",
+      "description": "Host cancelled after independent liveness finding; Win2022 local-platform had already failed10retirement tests."
+    },
+    {
+      "run_id": 37367930487,
+      "attempt": 1,
+      "job_id": 111957540301,
+      "source_sha": "414e306e65b61447353591833fefd606fd1a4b4f",
+      "description": "Hosted runner lost communication; no job log or artifact uploaded. Cause unproven. Only this job rerun, at same source."
+    }
+  ],
+  "verification_scripts_sha256": {
+    "verify_local.py": "65c0d34a32767c37b25924d8ce596a37532b7dff7660f8d0d96c1e9df9795b71",
+    "verify_windows.py": "40f20672554b85f855b4fcc00a76f6674cf23dcd8428ae380f447ccd97dd2ee8"
+  },
+  "previous_verified_candidate": {
+    "implementation_sha": "78134c24a60e679e4a1d8b5ecd7ab1e2ee395bbe",
+    "validation_sha": "414e306e65b61447353591833fefd606fd1a4b4f",
+    "run_id": 37367930487,
+    "workflow_attempt": 2,
+    "status": "passed",
+    "reason_for_final_followup": "Host tightened the test fixture to preserve the original sole-pending-owner premise; no production behavior changed."
+  },
+  "buddy_objective_counts": {
+    "roots": 20,
+    "helpers": 0,
+    "active": 0,
+    "host": 0,
+    "review": 0,
+    "ended": 20,
+    "accepted": 20
+  }
+}

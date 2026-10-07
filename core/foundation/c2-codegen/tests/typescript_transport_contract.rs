@@ -30,6 +30,137 @@ fn generated_typescript() -> String {
     .expect("generated TypeScript must be UTF-8")
 }
 
+/// One compiled generated TypeScript transport, ready to run under Node.
+struct CompiledTransportProject {
+    directory: tempfile::TempDir,
+}
+
+impl CompiledTransportProject {
+    fn compile() -> Self {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("C-Two repository root");
+        let fastdb_typescript = repository
+            .parent()
+            .expect("WorldInProgress root")
+            .join("fastdb/ts/fastdb4ts");
+        let tsc = fastdb_typescript.join("node_modules/typescript/bin/tsc");
+        assert!(
+            tsc.is_file(),
+            "Task 9 requires the audited TypeScript compiler at {}",
+            tsc.display()
+        );
+
+        let directory = tempfile::tempdir().expect("temporary TypeScript project");
+        let tempdir = directory.path();
+        let generated = tempdir.join("generated");
+        let release = ContractRelease::from_descriptor_json(NO_PAYLOAD_DESCRIPTOR.as_bytes())
+            .expect("no-payload descriptor must remain admitted");
+        compile_admitted_contract_artifacts(
+            &release,
+            ContractCodegenTarget::TypeScript,
+            &ContractCodegenOptions::default(),
+        )
+        .expect("TypeScript codegen")
+        .publish_new_tree(&generated)
+        .expect("publish generated TypeScript");
+
+        let fastdb_package = tempdir.join("node_modules/fastdb4ts");
+        std::fs::create_dir_all(&fastdb_package).expect("FastDB unit stub package");
+        std::fs::write(
+            fastdb_package.join("package.json"),
+            r#"{"type":"module","exports":{"./payload":{"types":"./payload.d.ts","import":"./payload.js"}}}"#,
+        )
+        .expect("FastDB unit stub manifest");
+        std::fs::write(
+            fastdb_package.join("payload.d.ts"),
+            r#"export class Payload {}
+export class PayloadError extends Error {
+  readonly code: number;
+  readonly symbol: string;
+  readonly path: string;
+  readonly detailsJson: string;
+}"#,
+        )
+        .expect("FastDB unit stub types");
+        std::fs::write(
+            fastdb_package.join("payload.js"),
+            r#"export class Payload {}
+export class PayloadError extends Error {
+  constructor(code, symbol, path, message, detailsJson) {
+    super(message);
+    this.code = code;
+    this.symbol = symbol;
+    this.path = path;
+    this.detailsJson = detailsJson;
+  }
+}"#,
+        )
+        .expect("FastDB unit stub runtime");
+        std::fs::write(tempdir.join("package.json"), r#"{"type":"module"}"#)
+            .expect("unit project manifest");
+        std::fs::write(
+            tempdir.join("tsconfig.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "compilerOptions": {
+                    "target": "ES2022",
+                    "module": "NodeNext",
+                    "moduleResolution": "NodeNext",
+                    "lib": ["ES2022", "DOM"],
+                    "strict": true,
+                    "rootDir": generated,
+                    "outDir": tempdir.join("dist"),
+                },
+                "include": [generated.join("typescript/**/*.ts")],
+            }))
+            .expect("TypeScript config JSON"),
+        )
+        .expect("TypeScript config");
+
+        let compile = Command::new("node")
+            .args([
+                tsc.to_str().expect("UTF-8 tsc path"),
+                "--project",
+                tempdir
+                    .join("tsconfig.json")
+                    .to_str()
+                    .expect("UTF-8 config path"),
+            ])
+            .current_dir(tempdir)
+            .output()
+            .expect("run TypeScript compiler");
+        assert!(
+            compile.status.success(),
+            "transport contract fixture failed to compile:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr),
+        );
+
+        Self { directory }
+    }
+
+    fn root(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn run_node_fixture(&self, name: &str, source: &str) {
+        let path = self.root().join(name);
+        std::fs::write(&path, source).expect("Node fixture source");
+        let run = Command::new("node")
+            .arg(&path)
+            .current_dir(self.root())
+            .output()
+            .expect("run Node fixture");
+        assert!(
+            run.status.success(),
+            "{name} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+}
+
 #[test]
 fn generated_transport_declares_auditable_real_connection_modes() {
     let source = generated_typescript();
@@ -112,108 +243,9 @@ fn generated_fastdb_failures_preserve_the_frozen_outer_cause_fields() {
 
 #[test]
 fn generated_transports_bind_resolved_paths_and_prevent_unsafe_replay() {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .expect("C-Two repository root");
-    let fastdb_typescript = repository
-        .parent()
-        .expect("WorldInProgress root")
-        .join("fastdb/ts/fastdb4ts");
-    let tsc = fastdb_typescript.join("node_modules/typescript/bin/tsc");
-    assert!(
-        tsc.is_file(),
-        "Task 9 requires the audited TypeScript compiler at {}",
-        tsc.display()
-    );
-
-    let tempdir = tempfile::tempdir().expect("temporary TypeScript project");
-    let generated = tempdir.path().join("generated");
-    let release = ContractRelease::from_descriptor_json(NO_PAYLOAD_DESCRIPTOR.as_bytes())
-        .expect("no-payload descriptor must remain admitted");
-    compile_admitted_contract_artifacts(
-        &release,
-        ContractCodegenTarget::TypeScript,
-        &ContractCodegenOptions::default(),
-    )
-    .expect("TypeScript codegen")
-    .publish_new_tree(&generated)
-    .expect("publish generated TypeScript");
-
-    let fastdb_package = tempdir.path().join("node_modules/fastdb4ts");
-    std::fs::create_dir_all(&fastdb_package).expect("FastDB unit stub package");
-    std::fs::write(
-        fastdb_package.join("package.json"),
-        r#"{"type":"module","exports":{"./payload":{"types":"./payload.d.ts","import":"./payload.js"}}}"#,
-    )
-    .expect("FastDB unit stub manifest");
-    std::fs::write(
-        fastdb_package.join("payload.d.ts"),
-        r#"export class Payload {}
-export class PayloadError extends Error {
-  readonly code: number;
-  readonly symbol: string;
-  readonly path: string;
-  readonly detailsJson: string;
-}"#,
-    )
-    .expect("FastDB unit stub types");
-    std::fs::write(
-        fastdb_package.join("payload.js"),
-        r#"export class Payload {}
-export class PayloadError extends Error {
-  constructor(code, symbol, path, message, detailsJson) {
-    super(message);
-    this.code = code;
-    this.symbol = symbol;
-    this.path = path;
-    this.detailsJson = detailsJson;
-  }
-}"#,
-    )
-    .expect("FastDB unit stub runtime");
-    std::fs::write(tempdir.path().join("package.json"), r#"{"type":"module"}"#)
-        .expect("unit project manifest");
-    std::fs::write(
-        tempdir.path().join("tsconfig.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "compilerOptions": {
-                "target": "ES2022",
-                "module": "NodeNext",
-                "moduleResolution": "NodeNext",
-                "lib": ["ES2022", "DOM"],
-                "strict": true,
-                "rootDir": generated,
-                "outDir": tempdir.path().join("dist"),
-            },
-            "include": [generated.join("typescript/**/*.ts")],
-        }))
-        .expect("TypeScript config JSON"),
-    )
-    .expect("TypeScript config");
-
-    let compile = Command::new("node")
-        .args([
-            tsc.to_str().expect("UTF-8 tsc path"),
-            "--project",
-            tempdir
-                .path()
-                .join("tsconfig.json")
-                .to_str()
-                .expect("UTF-8 config path"),
-        ])
-        .current_dir(tempdir.path())
-        .output()
-        .expect("run TypeScript compiler");
-    assert!(
-        compile.status.success(),
-        "transport contract fixture failed to compile:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&compile.stdout),
-        String::from_utf8_lossy(&compile.stderr),
-    );
-
-    std::fs::write(
-        tempdir.path().join("transport_contract.mjs"),
+    let project = CompiledTransportProject::compile();
+    project.run_node_fixture(
+        "transport_contract.mjs",
         r#"import assert from "node:assert/strict";
 import {
   CONTRACT,
@@ -386,17 +418,107 @@ await assert.rejects(
 assert.equal(uncertainPosts, 1);
 await uncertainTransport.close();
 "#,
-    )
-    .expect("transport contract runner");
-    let run = Command::new("node")
-        .arg(tempdir.path().join("transport_contract.mjs"))
-        .current_dir(tempdir.path())
-        .output()
-        .expect("run same-path denial fixture");
-    assert!(
-        run.status.success(),
-        "transport contract fixture failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr),
+    );
+}
+
+#[test]
+fn generated_c2_mem_ffi_reader_bootstraps_unadvertised_lazy_segments() {
+    let project = CompiledTransportProject::compile();
+    project.run_node_fixture(
+        "lazy_reader.mjs",
+        r#"import assert from "node:assert/strict";
+import { createC2MemFfiNativeResponseShmReader } from "./dist/typescript/c_two_contract.js";
+
+const bootstrapFloor = 2 * 4096;
+const created = [];
+const reads = [];
+const releases = [];
+const binding = {
+  createResponsePool(options) {
+    created.push(options);
+    return {
+      read(block, destination) {
+        reads.push([options.prefix, block.segmentIndex, block.generation, block.offset, block.byteLength, destination.byteLength]);
+        destination.fill(0x2a);
+      },
+      release(block) {
+        releases.push([options.prefix, block.segmentIndex, block.generation]);
+      },
+    };
+  },
+};
+const reader = createC2MemFfiNativeResponseShmReader({ binding });
+
+// A lazy server pool advertises no segments at handshake; the reader must
+// bootstrap a legal peer pool instead of demanding the server's real geometry.
+const lazyBlock = {
+  prefix: "/lazy_peer",
+  segments: [],
+  segmentIndex: 0,
+  generation: 1,
+  offset: 0,
+  byteLength: 4,
+  dedicated: false,
+};
+const lazyBytes = await reader.read(lazyBlock);
+assert.deepEqual(Array.from(lazyBytes), [0x2a, 0x2a, 0x2a, 0x2a]);
+assert.equal(created.length, 1);
+assert.deepEqual(created[0], {
+  prefix: "/lazy_peer",
+  segmentSize: bootstrapFloor,
+  maxSegments: 16,
+  minBlockSize: 4096,
+});
+assert.deepEqual(reads, [["/lazy_peer", 0, 1, 0, 4, 4]]);
+
+await reader.release(lazyBlock);
+assert.equal(created.length, 1, "one pool per owner prefix");
+assert.deepEqual(releases, [["/lazy_peer", 0, 1]]);
+
+const secondOwner = { ...lazyBlock, prefix: "/second_peer", generation: 3 };
+await reader.read(secondOwner, new Uint8Array(4));
+assert.equal(created.length, 2, "each owner prefix gets its own peer pool");
+assert.equal(created[1].segmentSize, bootstrapFloor);
+
+// The handshake snapshot is descriptive: when present it seeds the bootstrap
+// capacity, and native still validates the real backing.
+const advertisedBlock = {
+  prefix: "/snapshot_peer",
+  segments: [{ name: "/snapshot_segment", size: 1 << 20 }],
+  segmentIndex: 0,
+  generation: 2,
+  offset: 8,
+  byteLength: 4,
+  dedicated: false,
+};
+await reader.read(advertisedBlock, new Uint8Array(4));
+assert.equal(created[2].segmentSize, 1 << 20);
+
+// Dedicated responses have no buddy snapshot and only need a legal bootstrap.
+const dedicatedBlock = {
+  prefix: "/dedicated_peer",
+  segments: [],
+  segmentIndex: 7,
+  generation: 0,
+  offset: 0,
+  byteLength: 4,
+  dedicated: true,
+};
+await reader.read(dedicatedBlock, new Uint8Array(4));
+assert.equal(created[3].segmentSize, bootstrapFloor);
+
+const configured = createC2MemFfiNativeResponseShmReader({
+  binding,
+  segmentSize: 65536,
+  maxSegments: 2,
+  minBlockSize: 4096,
+});
+await configured.read(advertisedBlock, new Uint8Array(4));
+assert.equal(created[4].segmentSize, 65536, "explicit configuration wins");
+assert.equal(created[4].maxSegments, 2);
+
+await reader.close();
+await configured.close();
+"#,
     );
 }

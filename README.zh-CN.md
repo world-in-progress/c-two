@@ -31,37 +31,45 @@ C-Two 是面向分布式科学计算的 resource-oriented RPC runtime。它不�
 - **Portable 载荷** — 需要跨语言的方法用 `@cc.transfer(...)` 显式绑定官方 FastDB `Payload`；普通 Python 值仍可用于 Python 范围内的原型开发。
 - **单一 Rust core** — 路由、client/host 调用、重试分类、wire codec、共享内存、relay transport 和配置都实现在语言中立的 Rust crate 中；Python 与 Rust SDK 只是同一 runtime 的 facade。
 
-## 现状
+## 版本与能力
 
-C-Two 是处于活跃开发中的 0.x 软件。以下事实截至 2026-09-25：
+本文以 Python C-Two **0.7.0** / c3 **0.3.0** 为使用基线。版本可用性、升级与验证进度见[发布说明](docs/releases/0.7.0.md)。
 
-| 方面 | 状态 |
+| 方面 | 能力与边界 |
 | --- | --- |
-| 已发布 Python 包 | `pip install c-two` 安装 0.5.x 稳定线（最新 0.5.1）。它早于下文描述的 portable FastDB 载荷面、原生 Windows IPC 和 Rust SDK。 |
-| 本仓库 | 正在准备 `c-two` 0.6.0 与 `c3` 0.2.0。尚未发布；release-candidate CI 仍在进行中。见 [docs/releases/0.6.0.md](docs/releases/0.6.0.md)。 |
-| FastDB 依赖 | [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) 已正式发布；本 checkout 固定 `fastdb4py==0.2.1` 与 Rust `fastdb = "=0.2.1"`。 |
-| Windows | 源码构建已在 Windows Server 2022/2025 x64（CPython 3.12）上按固定旧版源码组合完成验证 — 见[验证报告](docs/reports/windows-native-final-validation.md)。尚未发布 Windows wheel 或 CLI 二进制；Windows 11 桌面、ARM64 与 Windows 服务仍是未验证目标。 |
-| Rust SDK | `sdk/rust` 是 Cargo 包 `c-two` 0.1.0，`publish = false`。没有 crates.io 上的 C-Two 发布。 |
+| Python | typed CRM、同进程调用、portable FastDB 载荷与原生 IPC。 |
+| c3 | 独立 relay、契约工具与 scoped 端点维护；Unix 与 Windows x64 安装入口见下文。 |
+| FastDB 依赖 | [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) 已发布；Python 与 Rust 依赖固定 0.2.1，原生源码构建固定 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`。 |
+| 源码验证 | [统一验收](docs/reports/canonical-local-endpoint-validation.md)记录 Linux、Windows Server 2022/2025 x64 CPython 3.12 源码门禁，以及 macOS 组件证据与重跑边界。确切源码组合为 C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，不证明全部 0.7 正式包/ABI；Windows 11 桌面、Windows ARM64 与服务仍未验证。 |
+| Rust / TypeScript | Rust SDK、Core 与 TypeScript 包仍为 0.1.0，无 C-Two crates.io 或 npm 发布。Rust SDK 的 `publish = false`；已证明生成的 Node 互操作，浏览器 runtime 仍未闭环。 |
 | 基准测试 | portable `Payload` API 尚无经过评审的吞吐基准。来自已移除集成的历史数字不能作为当前架构的性能声明。 |
 
-0.x 版本线优先干净切割而非兼容垫片：portable 契约为 `c-two.contract.v2`，相互通信的 client、host 与 relay 必须一起升级。
+0.x 版本线优先干净切割而非兼容垫片。升级到 0.7 时，相互通信的 client、resource server 与 `c3` 必须一起升级：Unix 端点从 `/tmp/c_two_ipc` 改为原生私有 v2.2 命名空间，旧端点不会自动迁移。
+
+### 本地端点、生命周期与内存
+
+Rust 按 OS 唯一派生本地端点，无后端选择开关。服务默认 `Persistent` 常驻，控制器专用子进程可显式选择 `OwnerBound`。shutdown 完成、监听关闭与载荷租约保留分别观察，见[生命周期接入指南](docs/local-endpoint-lifecycle.md)。
+
+IPC buddy 池默认惰性分配，空闲时可衰减到零映射；每个 runtime 方向共享有限后备与组装预算。`pool_enabled=False` 只跳过 buddy，dedicated SHM、检查过的分块与接收侧文件回退仍可用。独立 relay 有自己的 upstream IPC 策略，见[内存指南](docs/memory-policy.md)与 [CLI 指南](cli/README.md)。
 
 ## 安装
 
-### 稳定线（PyPI）
+### Python 0.7.0
+
+在已激活的环境中明确选择版本；`fastdb4py==0.2.1` 自动安装：
 
 ```bash
-pip install c-two
+uv pip install 'c-two==0.7.0'
 ```
 
-安装已发布的 0.5.x runtime。预编译 wheel 覆盖 manylinux x86_64/aarch64 与 macOS aarch64/x86_64 上的 CPython 3.10–3.14 及自由线程 3.14t，其他平台使用 sdist（源码构建需要 [Rust 工具链](https://rustup.rs)）；`fastdb4py` 依赖会自动安装。
-
-> 0.5.x 早于本 README 描述的 portable FastDB 载荷面、原生 Windows IPC transport 和 Rust SDK。这些能力目前可从源码 checkout 使用，并正在为 0.6.0 发布做准备；`pip install` 成功不代表它们已经发布。
+Windows PowerShell 使用相同命令。包可用性见[发布说明](docs/releases/0.7.0.md)，Windows 操作见[Windows 指南](docs/windows-native-usage.md)。
 
 ### 开发环境（源码 checkout）
 
+源码开发默认检出 [world-in-progress/c-two](https://github.com/world-in-progress/c-two) 的 canonical main。版本对应源码以同版本 c3 release 的 `rc-manifest.json` 为准；开发检出不代表发行产物。
+
 ```bash
-git clone --branch dev-feature https://github.com/Dsssyc/c-two.git
+git clone https://github.com/world-in-progress/c-two.git
 cd c-two
 # 完整互操作测试、golden fixture 与 TypeScript fixture 还需要将固定版本的
 # FastDB 源码 checkout 放在同级目录：
@@ -74,9 +82,9 @@ case "$(uname -s)" in
   Darwin) export DYLD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
   Linux) export LD_LIBRARY_PATH="$FASTDB_PAYLOAD_SYSTEM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
 esac
-uv sync                                       # 安装依赖 + 编译 Rust 扩展
-uv sync --group examples                      # 可选：示例所需的 pandas/pyarrow
-python tools/dev/c3_tool.py --build --link    # 构建并链接原生 c3 CLI
+FASTDB_PAYLOAD_LINK_MODE=source uv sync        # 静态链接 FastDB，编译 Python 扩展
+FASTDB_PAYLOAD_LINK_MODE=source uv sync --group examples  # 可选：pandas/pyarrow
+FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link  # 构建并链接原生 c3 CLI
 cp .env.example .env                          # 可选：本地环境配置
 ```
 
@@ -97,15 +105,24 @@ uv python install 3.10
 若在该 system 链接环境下运行测试，请使用 `uv run --no-sync pytest ...`，
 避免测试命令重新构建扩展。
 
-### c3 CLI
+### c3 CLI：Linux / macOS
 
-`c3` CLI 运行 relay server 与契约工具。最新已发布版本是 c3 0.1.4，附带 Linux 与 macOS 二进制：
+Python 0.7.0 配套 c3 0.3.0；[发布入口](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0)的当前可用性见[发布说明](docs/releases/0.7.0.md)。显式传版本，安装器会校验 checksum：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
 ```
 
-尚无已发布的 Windows 二进制 — 请按 [Windows 构建指南](docs/windows-native-usage.md)从源码构建。源码 checkout 可用 `python tools/dev/c3_tool.py --build --link` 构建并链接当前开发版 CLI。
+### c3 CLI：Windows x64
+
+可以直接下载 [Windows x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-x86_64-pc-windows-msvc.exe)、[SHA-256 校验文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-x86_64-pc-windows-msvc.exe.sha256)，或使用 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.0/c3-installer.ps1)。校验方法与 `-Version 0.3.0` 安装步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。下载并完成校验后，可直接运行：
+
+```powershell
+.\c3-x86_64-pc-windows-msvc.exe --version
+.\c3-x86_64-pc-windows-msvc.exe relay --bind 127.0.0.1:8300
+```
+
+安装目录与参数见 [CLI 指南](cli/README.md#windows-x64)。安装器默认安装到当前用户目录，无需管理员；Windows ARM64 不在该 exe 目标中。
 
 ## 快速开始
 
@@ -193,15 +210,15 @@ counter = cc.connect(Counter, name='counter')
 | IPC | 显式 `address='ipc://...'` | Unix domain socket / Windows Named Pipe；载荷字节可经原生共享内存 | 同主机多进程 |
 | HTTP relay | `cc.set_relay_anchor(...)` 或 `C2_RELAY_ANCHOR_ADDRESS`，然后按名称连接 | HTTP 连向 relay 解析出的路由 | 跨机器调用与基于名称的发现 |
 
-直连 IPC 不依赖 relay：显式 `ipc://` 地址会绕过 relay 发现，在未配置 relay 时也可用。使用 relay 时，解析是契约作用域的 — client 从其 CRM 类派生预期路由契约，runtime 在任何调用前匹配路由名、CRM tag、ABI hash 与 signature hash。relay 响应默认选择 HTTP，仅当 anchor 是 loopback 时才可能在通过身份验证后选择直连 IPC 快路径。
+直连 IPC 不依赖 relay：显式 `ipc://` 地址会绕过 relay 发现，在未配置 relay 时也可用。使用 relay 时，解析是契约作用域的 — client 从其 CRM 类派生预期路由契约，runtime 在任何调用前匹配路由名、CRM tag、ABI hash 与 signature hash。relay 响应默认选择 HTTP，仅当 anchor 是 loopback 时才可能在核验 handshake 中 server 与 instance 身份及完整预期路由契约后选择直连 IPC 快路径。data-plane 不确定错误不会被自动重放。
 
 relay 是你自己运行和监控的独立进程 — `c3 relay`、Docker Compose 或你的编排系统；Python SDK 不会内嵌 relay。多个 relay 可通过 gossip 组成 mesh，mesh 内任意 relay 都能解析整个集群注册的路由。relay 端点面向可信网络边界：请用私有网络、防火墙等基础设施限制访问。完整调优面（超时、分块大小、内存池上限、路由尝试次数等）见 [.env.example](.env.example)。
 
-大体量载荷在 IPC 与 relay 路径上以有界分块传输。这是请求/响应模型下的传输分批，不是 streaming-RPC API — 流式调用语义尚未实现。
+IPC 在 SHM 不可用时可回退到检查过的分块；relay HTTP 响应全量物化后再分块发送。这是请求/响应模型下的传输分批，不是 streaming-RPC API — 流式调用语义尚未实现。
 
 ## Portable 载荷（FastDB）
 
-本节需要正在准备 0.6.0 的开发分支。已发布的 0.5.1 包没有 `cc.transfer`；前面的 Counter 快速开始示例也可用于该已发布版本。
+portable 方法使用下面的显式 FastDB binding。
 
 需要跨语言传递结构化数据的方法显式绑定 FastDB specification。FastDB Core 拥有嵌套载荷语义 — 校验、canonical identity、二进制布局、builder、view、失效与 payload-only codegen — C-Two 拥有外层契约、路由、transport 与生命周期：
 
@@ -286,7 +303,8 @@ with cc.hold(echo.echo)(source) as held:
 - 契约编写：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`、`cc.InputLifetime`
 - 注册与连接：`cc.register`、`cc.connect`、`cc.close`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.set_transport_policy`
 - 契约工具：`cc.export_contract_descriptor`、`cc.export_contract_release_ref`、`cc.compile_contract_artifacts`、`cc.infer_crm_from_resource`
-- 监控：`cc.hold_stats`
+- 生命周期与维护：`cc.LifecycleConfig`、`cc.owner_control_pair`、`cc.spawn_owned_child`、`cc.adopt_owner_stdin`、`cc.inspect_endpoint`、`cc.reap_endpoint`、`cc.sweep_endpoints`
+- 监控：`cc.hold_stats`；`cc.memory_stats`（只读）
 
 ### Rust SDK
 
@@ -344,7 +362,9 @@ c3 contract codegen rust geometry.contract.json --out-dir generated-rust   # 亦
 | 面向 agent 与维护者的仓库指南 | [AGENTS.md](AGENTS.md) |
 | 路线图 | [docs/roadmap.md](docs/roadmap.md) · [中文](docs/roadmap.zh-CN.md) |
 | 变更日志 | [CHANGELOG.md](CHANGELOG.md) |
-| 0.6.0 / c3 0.2.0 发布准备 | [docs/releases/0.6.0.md](docs/releases/0.6.0.md) |
+| 0.7.0 / c3 0.3.0 发布与升级 | [docs/releases/0.7.0.md](docs/releases/0.7.0.md) |
+| 本地端点生命周期 | [docs/local-endpoint-lifecycle.md](docs/local-endpoint-lifecycle.md) |
+| IPC 内存策略 | [docs/memory-policy.md](docs/memory-policy.md) |
 | Windows 构建与使用 | [docs/windows-native-usage.md](docs/windows-native-usage.md) |
 | Windows 实现记录 | [docs/windows-native-implementation.md](docs/windows-native-implementation.md) |
 | 环境变量参考 | [.env.example](.env.example) |

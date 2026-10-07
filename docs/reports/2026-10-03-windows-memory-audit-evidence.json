@@ -1,0 +1,156 @@
+{
+  "status": "passed",
+  "run_id": 37034344557,
+  "source_sha": "2d360875b09a65324879cd489dc4096ea8657178",
+  "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "artifacts": [
+    {
+      "artifact_id": 11241371320,
+      "name": "windows-native-windows-2022-full-2d360875b09a65324879cd489dc4096ea8657178",
+      "zip_sha256": "7508411b7bac3bf8e37a957bb82c7b258b48013604d16e5c9900e51d21c4e5c5",
+      "gates": 23,
+      "source_sha": "2d360875b09a65324879cd489dc4096ea8657178",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "c3_sha256": "e1296fe98e8f6e2599e6be4b606a19018827a1ae6065489ddb2a9a9c75b9b463",
+      "wheels": {
+        "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "a5fff0bba01edf9ed91fa620eeb6a10e54d6db2694fd5dd2997d97b728cdedac",
+        "c_two-0.6.0-cp312-cp312-win_amd64.whl": "5ba18a623072a9597183f93cb77b590c32b861c93922ce53a98e095c72476f23"
+      },
+      "wheel_consumers": 2,
+      "standard_user_cleanup": true,
+      "memory_matrix": true
+    },
+    {
+      "artifact_id": 11240358364,
+      "name": "windows-native-windows-2025-full-2d360875b09a65324879cd489dc4096ea8657178",
+      "zip_sha256": "b1d5959af8a1c55d2f3d00f521b4f37078a7b52f5644383745edab89fe674364",
+      "gates": 23,
+      "source_sha": "2d360875b09a65324879cd489dc4096ea8657178",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "c3_sha256": "64607021903dbbaf4da8afeecfbd5a8d35f93b4bf92f7d180ea6f40d6073a359",
+      "wheels": {
+        "fastdb4py-0.2.1-cp312-cp312-win_amd64.whl": "33a34fd9ea1d0549d10aacf2b94006b0e1c68ad49b3583edc62d23661cbb7afe",
+        "c_two-0.6.0-cp312-cp312-win_amd64.whl": "34cba157acdfdcc964317f861e1fd48ec6c8a94a68a386b0204c044c3bfdabf7"
+      },
+      "wheel_consumers": 2,
+      "standard_user_cleanup": true,
+      "memory_matrix": true
+    },
+    {
+      "artifact_id": 11238905780,
+      "name": "windows-native-windows-2025-local-platform-2d360875b09a65324879cd489dc4096ea8657178",
+      "zip_sha256": "fdfa65df6da0a3bc8b1cd6d264ecfecf8217a846c71400395a251d6609a9689c",
+      "gates": 1,
+      "source_sha": "2d360875b09a65324879cd489dc4096ea8657178",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+    },
+    {
+      "artifact_id": 11238693683,
+      "name": "windows-native-windows-2022-local-platform-2d360875b09a65324879cd489dc4096ea8657178",
+      "zip_sha256": "2dd7174548ccb06924cb970e9d7af180fc1ccdf4afe6ad1614ff7b7ef6f03838",
+      "gates": 1,
+      "source_sha": "2d360875b09a65324879cd489dc4096ea8657178",
+      "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
+    }
+  ],
+  "gate_test_counts": [
+    {
+      "runner": "windows-2022",
+      "scope": "local-platform",
+      "gates": 1,
+      "rust_test_counts": {
+        "local-platform-tests": 748
+      },
+      "junit": {}
+    },
+    {
+      "runner": "windows-2025",
+      "scope": "full",
+      "gates": 23,
+      "rust_test_counts": {
+        "fastdb-rust-test": 22,
+        "core-test": 1204,
+        "cli-test": 36,
+        "rust-sdk-test": 10,
+        "python-native-test": 2
+      },
+      "junit": {
+        "portable-tests.xml": {
+          "tests": 25,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "typescript-tests.xml": {
+          "tests": 14,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "python-tests.xml": {
+          "tests": 879,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "windows-harness-tests.xml": {
+          "tests": 34,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        }
+      }
+    },
+    {
+      "runner": "windows-2022",
+      "scope": "full",
+      "gates": 23,
+      "rust_test_counts": {
+        "fastdb-rust-test": 22,
+        "core-test": 1204,
+        "cli-test": 36,
+        "rust-sdk-test": 10,
+        "python-native-test": 2
+      },
+      "junit": {
+        "portable-tests.xml": {
+          "tests": 25,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "typescript-tests.xml": {
+          "tests": 14,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "python-tests.xml": {
+          "tests": 879,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "windows-harness-tests.xml": {
+          "tests": 34,
+          "failed": 0,
+          "errors": 0,
+          "skipped": 0
+        }
+      }
+    },
+    {
+      "runner": "windows-2025",
+      "scope": "local-platform",
+      "gates": 1,
+      "rust_test_counts": {
+        "local-platform-tests": 748
+      },
+      "junit": {}
+    }
+  ]
+}

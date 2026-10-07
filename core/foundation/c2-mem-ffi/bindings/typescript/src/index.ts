@@ -9,7 +9,7 @@ export const C2_MEM_FFI_STATUS_INSUFFICIENT_BUFFER = 4;
 
 export const C2_MEM_FFI_MAX_SHM_PREFIX_BYTES = 255;
 export const C2_MEM_FFI_MAX_IPC_SHM_SEGMENTS = 16;
-export const C2_MEM_FFI_ABI_VERSION = 2;
+export const C2_MEM_FFI_ABI_VERSION = 3;
 
 export type C2MemFfiStatus =
   | typeof C2_MEM_FFI_STATUS_OK
@@ -27,6 +27,14 @@ export interface C2MemFfiCallResult<T = void> {
 
 export interface C2MemFfiPoolConfig {
   readonly prefix: string;
+  /**
+   * Request pools create backings with this exact data capacity. Response
+   * pools only open peer backings, so for them this is a bootstrap capacity
+   * floor: c2-mem derives the real geometry from the mapped segment at
+   * prefix/index/generation and validates capacity, byte range, and
+   * generation. Response readers must not treat this value as a claim about
+   * the server's segment size.
+   */
   readonly segmentSize: number;
   readonly maxSegments: number;
   readonly minBlockSize: number;
@@ -114,6 +122,9 @@ export interface C2MemFfiResponsePoolSymbols<Handle = unknown> extends C2MemFfiA
 }
 
 export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> {
+  /**
+   * Resolve the automatic platform endpoint through the Rust configuration owner.
+   */
   c2_mem_ffi_local_endpoint(address: string): C2MemFfiCallResult<string>;
   c2_mem_ffi_request_pool_read_local(pool: Handle, block: C2MemFfiRequestBlock, destination: Uint8Array): MaybePromise<C2MemFfiCallResult<number>>;
 }
@@ -228,9 +239,20 @@ export function createBundledC2MemFfiNodeRuntime(
   });
 }
 
-export function resolveLocalIpcEndpoint(address: string, options: C2MemFfiNodeNativeLoadOptions = {}): string {
+/**
+ * Resolve a logical `ipc://` address to its OS endpoint.
+ *
+ * The native resolver owns the platform backend and logical address validation.
+ */
+export function resolveLocalIpcEndpoint(
+  address: string,
+  options: C2MemFfiNodeNativeLoadOptions = {},
+): string {
   if (typeof address !== "string" || address.includes("\0")) {
     throw new C2NodeIpcConnectionError("C-Two IPC address must be a string without NUL characters.");
+  }
+  if (typeof options !== "object" || options === null) {
+    throw new C2NodeIpcConnectionError("C-Two endpoint resolution options must be an object.");
   }
   const { symbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
   const result = symbols.c2_mem_ffi_local_endpoint(address);
@@ -443,6 +465,13 @@ export async function createC2MemFfiRequestPoolFromSymbols<Handle>(
   }
 }
 
+/**
+ * Open a peer response pool over an owner's advertised SHM prefix.
+ *
+ * The pool maps nothing until a block references a backing. `config.segmentSize`
+ * is only the minimum capacity accepted for buddy backings opened lazily by
+ * prefix/index/generation; actual geometry and validation stay in c2-mem.
+ */
 export async function createC2MemFfiResponsePoolFromSymbols<Handle>(
   symbols: C2MemFfiResponsePoolSymbols<Handle>,
   config: C2MemFfiPoolConfig,

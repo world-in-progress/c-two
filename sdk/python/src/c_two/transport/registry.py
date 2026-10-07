@@ -38,13 +38,14 @@ import signal
 import sys
 import threading
 from collections.abc import Mapping
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from c_two.crm.bridge import ResourceBridge, normalize_bridge_map
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.methods import rpc_method_names
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
+from c_two.config.lifecycle import LifecycleConfig
 from c_two.config.settings import settings
 from c_two.error import (
     CCError,
@@ -60,6 +61,10 @@ from .input_lifetime import (
 )
 from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
+
+if TYPE_CHECKING:
+    from c_two._native import NativeOwnerReceiver, OwnedChild
+    from c_two.mem import MemoryStats
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
@@ -151,9 +156,12 @@ class _ProcessRegistry:
         """Destroy the global singleton (for testing / process exit)."""
         with cls._instance_lock:
             inst = cls._instance
-            cls._instance = None
         if inst is not None:
-            inst.shutdown()
+            outcome = inst.shutdown()
+            if outcome['completed']:
+                with cls._instance_lock:
+                    if cls._instance is inst:
+                        cls._instance = None
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -190,32 +198,119 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
                 return
-            if shm_threshold is not _UNSET:
-                settings.shm_threshold = shm_threshold  # type: ignore[assignment]
-            if remote_payload_chunk_size is not _UNSET:
-                settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
-            runtime_session_kwargs = _runtime_session_kwargs_from_settings()
-            runtime_session = self._runtime_session.__class__(
-                server_id=(
-                    self._runtime_session.server_id
-                    or self._runtime_session.server_id_override
+            previous_threshold = settings._shm_threshold  # noqa: SLF001
+            previous_chunk_size = settings._remote_payload_chunk_size_override()  # noqa: SLF001
+            try:
+                if shm_threshold is not _UNSET:
+                    settings.shm_threshold = shm_threshold  # type: ignore[assignment]
+                if remote_payload_chunk_size is not _UNSET:
+                    settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
+                old_session, _retired_observation = self._swap_runtime_session(
+                    preserve_server_identity=True,
+                )
+            except Exception:
+                settings.shm_threshold = previous_threshold
+                settings.remote_payload_chunk_size = previous_chunk_size
+                raise
+
+        # Close the replaced session's client-only barrier outside the lock.
+        # The retirement observation needs no fence: it observes through weak
+        # handles, so its records stay reportable exactly while real owners
+        # (old proxies, in-flight responses, outstanding holds) keep the old
+        # session's accounting and lease metadata alive.
+        self._close_replaced_session(old_session)
+
+    def _swap_runtime_session(self, *, preserve_server_identity: bool):
+        """Retire the current session and publish its replacement atomically.
+
+        Must be called with ``self._lock`` held. Returns
+        ``(old_session, retired_observation)``.
+
+        The retirement observation is a pure re-capture that consumes nothing,
+        so a replacement that fails to construct or adopt leaves the old
+        session — and every observation it already carried — exactly as it
+        was, and a later retry re-captures the session's own domains and
+        tracker as they exist at that moment. The replacement adopts the
+        pending bundle and every earlier one in the same critical section that
+        publishes it, so the public session never shows a window in which
+        retired charges silently disappeared. Observation lifetime needs no
+        fence here: records stay reportable exactly while real owners keep
+        the old session's accounting and lease metadata alive.
+        """
+        runtime_session = self._runtime_session
+        retired_observation = runtime_session.retire_memory_observation()
+        kwargs = _runtime_session_kwargs_from_settings()
+        if preserve_server_identity:
+            kwargs = {
+                'server_id': (
+                    runtime_session.server_id
+                    or runtime_session.server_id_override
                 ),
-                server_ipc_overrides=self._runtime_session.server_ipc_overrides,
-                client_ipc_overrides=self._runtime_session.client_ipc_overrides,
-                **runtime_session_kwargs,
+                'server_ipc_overrides': runtime_session.server_ipc_overrides,
+                'client_ipc_overrides': runtime_session.client_ipc_overrides,
+                **kwargs,
+            }
+        new_session = runtime_session.__class__(**kwargs)
+        new_session.adopt_retired_memory_observation(retired_observation)
+        if preserve_server_identity:
+            new_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
+            runtime_session.transfer_unstarted_lifecycle_to(new_session)
+        self._runtime_session = new_session
+        self._server = None
+        return runtime_session, retired_observation
+
+    def _close_replaced_session(self, old_session) -> None:
+        """Drive a replaced session's bounded client-only close barrier.
+
+        This releases the old session's outgoing IPC cache and runtime
+        barrier. The retirement observation needs no separate lifecycle step:
+        it observes through weak handles, so its records detach exactly when
+        the last real owner of the old session's accounting or lease metadata
+        — an old proxy, an in-flight response, an outstanding hold — is gone.
+        """
+        try:
+            old_session.shutdown(
+                route_names=[],
+                relay_anchor_address=None,
             )
-            runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
-            self._runtime_session = runtime_session
+        except Exception:
+            log.warning(
+                'Error shutting down replaced RuntimeSession', exc_info=True,
+            )
 
     def set_server(
         self,
         *,
         server_id: str | None = None,
         ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
+        lifecycle: LifecycleConfig | None = None,
+        owner_control: NativeOwnerReceiver | None = None,
     ) -> None:
-        """Configure IPC server. Must be called before register()."""
+        """Configure IPC server and its native lifecycle. Call before register().
+
+        Parameters
+        ----------
+        server_id:
+            Explicit server identity.
+        ipc_overrides:
+            Typed server IPC override mapping.
+        lifecycle:
+            Typed :class:`~c_two.config.LifecycleConfig`. Rust validates the
+            policy and its bounded grace window before it is frozen. Naming the
+            ``owner_bound`` policy is never enough on its own: the native owner
+            control capability must also be attached through *owner_control*.
+        owner_control:
+            The controller-held opaque
+            :class:`c_two.NativeOwnerReceiver`. It is consumed exactly once and
+            is deliberately kept outside the IPC override mapping and every
+            other cloneable configuration path.
+        """
         with self._lock:
             if self._server is not None:
+                if lifecycle is not None:
+                    self._runtime_session.set_lifecycle_policy(*lifecycle.native_args())
+                if owner_control is not None:
+                    self._runtime_session.attach_owner_control(owner_control)
                 import warnings
                 warnings.warn(
                     'Server already started, set_server() ignored. '
@@ -225,6 +320,10 @@ class _ProcessRegistry:
                 )
                 return
             self._runtime_session.set_server_options(server_id, ipc_overrides)
+            if lifecycle is not None:
+                self._runtime_session.set_lifecycle_policy(*lifecycle.native_args())
+            if owner_control is not None:
+                self._runtime_session.attach_owner_control(owner_control)
 
     def set_client(
         self,
@@ -554,39 +653,30 @@ class _ProcessRegistry:
             server = self._server
         return server.names if server is not None else []
 
-    def shutdown(self) -> None:
-        """Full cleanup — shuts down server, terminates pooled clients.
-
-        If ``C2_RELAY_ANCHOR_ADDRESS`` is set, all registered CRMs are
-        unregistered from the relay before shutting down.
-
-        Called automatically at process exit via :func:`atexit`.
-        """
+    def shutdown(self, *, timeout: float = 30.0) -> dict:
+        """Consume native shutdown; retain the session until Core proves completion."""
         with self._lock:
             server = self._server
             runtime_session = self._runtime_session
-            from c_two._native import RuntimeSession
-            self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
-            self._server = None
-
         if server is not None:
-            try:
-                outcome = server.shutdown(
-                    runtime_session=runtime_session,
-                    relay_anchor_address=None,
-                )
-            except Exception:
-                log.warning('Error shutting down Server', exc_info=True)
-                outcome = {'relay_errors': []}
+            outcome = server.shutdown(runtime_session=runtime_session,
+                                      relay_anchor_address=None, timeout=timeout)
         else:
-            try:
-                outcome = dict(runtime_session.shutdown(
-                    route_names=[],
-                    relay_anchor_address=None,
-                ))
-            except Exception:
-                log.warning('Error shutting down RuntimeSession', exc_info=True)
-                outcome = {'relay_errors': []}
+            outcome = dict(runtime_session.shutdown(route_names=[],
+                relay_anchor_address=None, timeout_seconds=timeout))
+        for key, description in (
+                ('ipc_client_close_error', 'IPC client cache'),
+                ('runtime_barrier_error', 'runtime barrier')):
+            if outcome.get(key):
+                log.warning('Shutdown could not confirm %s cleanup: %s', description, outcome[key])
+        if not outcome['completed']:
+            return outcome
+        with self._lock:
+            if self._runtime_session is runtime_session:
+                self._swap_runtime_session(preserve_server_identity=False)
+                if self._serve_stop is not None:
+                    self._serve_stop.set()
+                    self._serve_stop = None
 
         for relay_error in outcome.get('relay_errors') or []:
             error = dict(relay_error)
@@ -607,6 +697,8 @@ class _ProcessRegistry:
                     name,
                     message,
                 )
+
+        return outcome
 
     # ------------------------------------------------------------------
     # Serve (daemon mode)
@@ -638,6 +730,7 @@ class _ProcessRegistry:
             return  # idempotent
 
         self._serve_stop = threading.Event()
+        serve_stop = self._serve_stop
 
         with self._lock:
             server = self._server
@@ -653,7 +746,7 @@ class _ProcessRegistry:
         # Signal handlers — install BEFORE banner so that SIGINT is
         # handled correctly as soon as the caller sees the output.
         def _handle_signal(signum, frame):  # noqa: ARG001
-            self._serve_stop.set()
+            serve_stop.set()
 
         try:
             signal.signal(signal.SIGINT, _handle_signal)
@@ -673,18 +766,42 @@ class _ProcessRegistry:
             return
 
         try:
-            while not self._serve_stop.wait(timeout=0.1):
-                pass
+            # The native lifecycle is the truth: an owner-bound host can stop
+            # itself when its controller closes, without any signal, so serve()
+            # must also watch the native terminal outcome instead of polling
+            # only for a stop request.
+            while not serve_stop.wait(timeout=0.1):
+                if self._native_host_terminated():
+                    break
         except KeyboardInterrupt:
             # On some platforms, SIGINT also raises KeyboardInterrupt
             # even when a custom handler is installed.
             pass
 
-        # Graceful shutdown.
+        # Graceful shutdown. A host that already drained (owner EOF) or that is
+        # still draining reaches the same consume path, which returns without
+        # fabricating a stopped SDK state while the transaction is incomplete;
+        # the loop stays alive until the real structured terminal appears.
         print('\n Shutting down…')
-        self.shutdown()
+        while True:
+            outcome = self.shutdown(timeout=0.1)
+            if outcome['completed']:
+                break
+            threading.Event().wait(0.05)
         self._serve_stop = None
         print(' Resource server stopped.')
+
+    def _native_host_terminated(self) -> bool:
+        """Whether the Core host reached its structured terminal outcome.
+
+        ``OwnerMissing`` (bounded grace) and ``Draining`` (in-flight work still
+        finishing) are not terminal and never read as stopped.
+        """
+        with self._lock:
+            server = self._server
+        if server is None:
+            return False
+        return bool(server.native_terminal_outcome() is not None)
 
     @staticmethod
     def _print_serve_banner(
@@ -713,6 +830,22 @@ class _ProcessRegistry:
     def _server_started(self) -> bool:
         return self._server is not None and self._server.is_started()
 
+    def native_lifecycle_snapshot(self) -> dict | None:
+        """Thin read-only Core host lifecycle observation, or ``None``."""
+        with self._lock:
+            server = self._server
+        if server is None:
+            return None
+        return server.native_lifecycle_snapshot()
+
+    def native_terminal_outcome(self) -> dict | None:
+        """Terminal native shutdown outcome, or ``None`` while not terminal."""
+        with self._lock:
+            server = self._server
+        if server is None:
+            return None
+        return server.native_terminal_outcome()
+
     def _sync_relay_override(self) -> None:
         self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
@@ -738,9 +871,62 @@ def set_server(
     *,
     server_id: str | None = None,
     ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
+    lifecycle: LifecycleConfig | None = None,
+    owner_control: NativeOwnerReceiver | None = None,
 ) -> None:
-    """Configure IPC server. Call before register()."""
-    _ProcessRegistry.get().set_server(server_id=server_id, ipc_overrides=ipc_overrides)
+    """Configure IPC server and its native lifecycle. Call before register().
+
+    See :meth:`_ProcessRegistry.set_server`.
+    """
+    _ProcessRegistry.get().set_server(
+        server_id=server_id,
+        ipc_overrides=ipc_overrides,
+        lifecycle=lifecycle,
+        owner_control=owner_control,
+    )
+
+
+def owner_control_pair():
+    """Create the private native owner control pair ``(keepalive, receiver)``.
+
+    The controller keeps the keepalive private and hands the opaque receiver to
+    exactly one target child through :func:`c_two.spawn_owned_child`. Neither value ever exposes an OS
+    descriptor, handle, endpoint name, or token.
+    """
+    from c_two._native import owner_control_pair as _owner_control_pair
+
+    return _owner_control_pair()
+
+
+def adopt_owner_stdin():
+    """Adopt the owner control receiver inherited as this process's stdin.
+
+    This is deliberately explicit and only for a trusted launcher's child that
+    was started with the receiver endpoint as its stdio. Ordinary business
+    stdin is never adopted automatically.
+    """
+    from c_two._native import NativeOwnerReceiver
+
+    return NativeOwnerReceiver.adopt_owner_stdin()
+
+
+def spawn_owned_child(receiver, program, args=None, cwd=None) -> OwnedChild:
+    """Start one child and return an opaque :class:`c_two.OwnedChild`.
+
+    ``child.id`` identifies the process; ``poll()`` observes its exit code and
+    ``wait(timeout=30)`` waits with a finite deadline, raising ``TimeoutError``
+    while leaving the handle live. ``kill()`` explicitly terminates the child.
+    ``close()`` and garbage collection release this observer; a shared native
+    reaper retains the OS process until exit without blocking Python or killing
+    the service. The controller must separately retain its owner keepalive.
+
+    The controller must call this for the intended child only. The receiver is
+    consumed by the call, so an unrelated child can never inherit the
+    capability; it never travels through argv, the environment, or a path.
+    """
+    from c_two._native import spawn_owned_child as _spawn_owned_child
+
+    return _spawn_owned_child(receiver, program, args or [], cwd)
 
 
 def set_client(
@@ -818,12 +1004,22 @@ def server_id() -> str | None:
     return _ProcessRegistry.get().get_server_id()
 
 
-def shutdown() -> None:
+def shutdown(*, timeout: float = 30.0) -> dict:
     """Full cleanup — shuts down server and pooled clients.
 
     See :meth:`_ProcessRegistry.shutdown`.
     """
-    _ProcessRegistry.get().shutdown()
+    return _ProcessRegistry.get().shutdown(timeout=timeout)
+
+
+def native_lifecycle_snapshot() -> dict | None:
+    """Thin read-only Core host lifecycle observation, or ``None``."""
+    return _ProcessRegistry.get().native_lifecycle_snapshot()
+
+
+def native_terminal_outcome() -> dict | None:
+    """Terminal native shutdown outcome, or ``None`` while not terminal."""
+    return _ProcessRegistry.get().native_terminal_outcome()
 
 
 def serve(blocking: bool = True) -> None:
@@ -849,6 +1045,43 @@ def hold_stats() -> dict:
     """
     inst = _ProcessRegistry.get()
     return dict(inst._runtime_session.hold_stats())  # noqa: SLF001
+
+
+def memory_stats() -> MemoryStats:
+    """Return read-only, scope-labelled transport memory budget statistics.
+
+    Returns a small mapping with two independent scopes:
+
+    - ``runtime_outgoing``: this process Runtime's outgoing client domain.
+      Every cached connection's request pool and reassembly pool charges this
+      one budget. ``None`` until the first connection attempt freezes the
+      domain; observing the snapshot never freezes it.
+    - ``server``: the server direction of this process Core host (response
+      pool, reassembly pool, and response prewarm). ``None`` while no host
+      exists.
+
+    Each scope maps ``limits`` to the three resolved limit keys
+    (``shm_backing_bytes``, ``file_backing_bytes``,
+    ``live_reassembly_bytes``) and ``cells`` to ``shm``/``file``/
+    ``reassembly`` cells with ``limit_bytes``, ``used_bytes``,
+    ``peak_bytes``, ``rejected_allocations`` and ``rejected_bytes``.
+
+    ``retired`` lists scope-labelled domains from earlier sessions whose
+    accounting or lease metadata is still kept alive by a real owner — an old
+    proxy's native client, an in-flight response, or outstanding ``cc.hold()``
+    data. Retired entries carry ``state="retired"``; records detach
+    individually once their last owner is gone, so repeated empty session
+    swaps never accumulate, and a late held result published through an old
+    proxy stays visible. Observing them never retains the retired Runtime,
+    cache, pools, callbacks, or payloads.
+
+    ``holds`` carries the same Rust-owned retained-buffer counters as
+    :func:`hold_stats`, composed across the live and retired lease trackers.
+    The three cells are C-Two-owned backing/reassembly accounting, not process
+    RSS: never sum or present them as RAM usage.
+    """
+    inst = _ProcessRegistry.get()
+    return dict(inst._runtime_session.memory_stats())  # noqa: SLF001
 
 
 # Auto-cleanup on process exit.

@@ -49,6 +49,7 @@ struct SlotInner {
     last_activity: u64,
     active_requests: usize,
     state: SlotState,
+    reconnect_attempt: Option<Arc<()>>,
     owner_generation: u64,
     owner_lease_epoch: u64,
     owner_lease_deadline: Option<Instant>,
@@ -62,6 +63,43 @@ enum SlotState {
     Disconnected,
     Reconnecting,
     Retired,
+}
+
+/// Restores only this connection attempt if its acquire future is dropped.
+struct ReconnectGuard<'a> {
+    slot: &'a UpstreamSlot,
+    attempt: Arc<()>,
+}
+
+impl<'a> ReconnectGuard<'a> {
+    fn new(slot: &'a UpstreamSlot, inner: &mut SlotInner) -> Self {
+        let attempt = Arc::new(());
+        inner.state = SlotState::Reconnecting;
+        inner.reconnect_attempt = Some(attempt.clone());
+        Self { slot, attempt }
+    }
+
+    fn is_current(&self, inner: &SlotInner) -> bool {
+        inner.state == SlotState::Reconnecting
+            && inner
+                .reconnect_attempt
+                .as_ref()
+                .is_some_and(|attempt| Arc::ptr_eq(attempt, &self.attempt))
+    }
+}
+
+impl Drop for ReconnectGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.slot.inner.lock();
+        if !self.is_current(&inner) {
+            return;
+        }
+        inner.reconnect_attempt = None;
+        inner.state = SlotState::Disconnected;
+        inner.last_activity = now_millis();
+        drop(inner);
+        self.slot.notify.notify_waiters();
+    }
 }
 
 #[derive(Debug)]
@@ -397,6 +435,7 @@ impl UpstreamSlot {
                 last_activity: now_millis(),
                 active_requests: 0,
                 state,
+                reconnect_attempt: None,
                 owner_generation,
                 owner_lease_epoch: 0,
                 owner_lease_deadline,
@@ -417,14 +456,11 @@ impl UpstreamSlot {
             let notified = self.notify.notified();
             let mut notified = pin!(notified);
             notified.as_mut().enable();
-            let key = {
+            let attempt = {
                 let mut inner = self.inner.lock();
                 match inner.state {
                     SlotState::Retired => return Err(AcquireError::NotFound),
-                    SlotState::OwnerOnly => {
-                        inner.state = SlotState::Reconnecting;
-                        Some(self.key.clone())
-                    }
+                    SlotState::OwnerOnly => Some(ReconnectGuard::new(&self, &mut inner)),
                     SlotState::Ready => {
                         if let Some(client) = inner.client.clone()
                             && client.is_connected()
@@ -437,25 +473,24 @@ impl UpstreamSlot {
                             });
                         }
                         inner.client = None;
-                        inner.state = SlotState::Reconnecting;
-                        Some(self.key.clone())
+                        Some(ReconnectGuard::new(&self, &mut inner))
                     }
                     SlotState::Evicted | SlotState::Disconnected => {
-                        inner.state = SlotState::Reconnecting;
-                        Some(self.key.clone())
+                        Some(ReconnectGuard::new(&self, &mut inner))
                     }
                     SlotState::Reconnecting => None,
                 }
             };
 
-            match key {
-                Some(key) => match connector(key.clone()).await {
+            match attempt {
+                Some(attempt) => match connector(self.key.clone()).await {
                     Ok(client) => {
                         let acquire = {
                             let mut inner = self.inner.lock();
-                            if inner.state == SlotState::Retired {
+                            if !attempt.is_current(&inner) {
                                 None
                             } else {
+                                inner.reconnect_attempt = None;
                                 inner.client = Some(client.clone());
                                 inner.state = SlotState::Ready;
                                 inner.active_requests += 1;
@@ -475,17 +510,18 @@ impl UpstreamSlot {
                     }
                     Err(err) => {
                         let mut inner = self.inner.lock();
-                        if inner.state == SlotState::Retired {
+                        if !attempt.is_current(&inner) {
                             drop(inner);
                             return Err(AcquireError::NotFound);
                         }
                         inner.client = None;
+                        inner.reconnect_attempt = None;
                         inner.state = SlotState::Disconnected;
                         inner.last_activity = now_millis();
                         drop(inner);
                         self.notify.notify_waiters();
                         return Err(AcquireError::Unreachable {
-                            endpoint: key,
+                            endpoint: self.key.clone(),
                             error: err,
                         });
                     }
@@ -666,6 +702,7 @@ impl UpstreamSlot {
             return;
         }
         inner.client = Some(client);
+        inner.reconnect_attempt = None;
         inner.state = SlotState::Ready;
         inner.last_activity = now_millis();
         inner.owner_generation = owner_generation;
@@ -677,6 +714,7 @@ impl UpstreamSlot {
     fn retire(&self) -> Option<Arc<IpcClient>> {
         let mut inner = self.inner.lock();
         inner.state = SlotState::Retired;
+        inner.reconnect_attempt = None;
         let client = inner.client.take();
         drop(inner);
         self.notify.notify_waiters();
@@ -753,6 +791,25 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl futures::task::ArcWake for WakeCounter {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Poll the actual acquire future to register its Notify waiter, without
+    // relying on task scheduling or sleeps to establish the cancellation race.
+    fn poll_pending<F: Future>(future: std::pin::Pin<&mut F>) -> Arc<WakeCounter> {
+        let counter = Arc::new(WakeCounter::default());
+        let waker = futures::task::waker(counter.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(future.poll(&mut context).is_pending());
+        counter
+    }
 
     fn key(address: &str) -> UpstreamEndpointKey {
         UpstreamEndpointKey::new(address, "server-grid", "server-grid-instance")
@@ -887,6 +944,283 @@ mod tests {
         assert!(lease.client().is_connected());
         drop(lease);
         assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancelled_connector_wakes_waiters_and_allows_reacquire() {
+        for initial in [
+            SlotState::OwnerOnly,
+            SlotState::Evicted,
+            SlotState::Disconnected,
+            SlotState::Ready,
+        ] {
+            let pool = ConnectionPool::new();
+            let endpoint = key("ipc://cancelled");
+            match initial {
+                SlotState::OwnerOnly => pool.insert_owner(endpoint.clone()),
+                SlotState::Evicted => {
+                    let client = Arc::new(IpcClient::new(endpoint.address()));
+                    client.force_connected(true);
+                    pool.insert(endpoint.clone(), client);
+                    pool.evict(&endpoint);
+                }
+                SlotState::Disconnected | SlotState::Ready => {
+                    pool.insert(
+                        endpoint.clone(),
+                        Arc::new(IpcClient::new(endpoint.address())),
+                    );
+                    if initial == SlotState::Disconnected {
+                        pool.lookup(&endpoint);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let owner = pool.owner_token(&endpoint).unwrap();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let finish_rx = Mutex::new(Some(finish_rx));
+            let mut connecting = Box::pin(pool.acquire_with(&endpoint, |_| {
+                let rx = finish_rx.lock().take().unwrap();
+                async move { rx.await.unwrap() }
+            }));
+            poll_pending(connecting.as_mut());
+            assert_eq!(owner.slot.inner.lock().state, SlotState::Reconnecting);
+
+            let attempts = AtomicUsize::new(0);
+            let connector = |endpoint: UpstreamEndpointKey| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let client = Arc::new(IpcClient::new(endpoint.address()));
+                client.force_connected(true);
+                std::future::ready(Ok(client))
+            };
+            let mut waiter_a = Box::pin(pool.acquire_with(&endpoint, &connector));
+            let mut waiter_b = Box::pin(pool.acquire_with(&endpoint, &connector));
+            let wake_a = poll_pending(waiter_a.as_mut());
+            let wake_b = poll_pending(waiter_b.as_mut());
+            assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+            drop(connecting);
+            assert!(finish_tx.is_closed(), "connector future must be cancelled");
+            assert!(wake_a.0.load(Ordering::SeqCst) > 0);
+            assert!(wake_b.0.load(Ordering::SeqCst) > 0);
+            let (lease_a, lease_b) = tokio::time::timeout(Duration::from_secs(1), async {
+                (waiter_a.await.unwrap(), waiter_b.await.unwrap())
+            })
+            .await
+            .expect("cancelled connector stranded acquire in Reconnecting");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(Arc::ptr_eq(&lease_a.client(), &lease_b.client()));
+            assert!(pool.matches_owner_token(&endpoint, &owner));
+            assert_eq!(owner.slot.inner.lock().active_requests, 2);
+            drop((lease_a, lease_b));
+            assert_eq!(owner.slot.inner.lock().active_requests, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn connector_success_and_error_wake_waiters_and_preserve_owner() {
+        for succeed in [true, false] {
+            let pool = ConnectionPool::new();
+            let endpoint = key("ipc://completion");
+            pool.insert_owner(endpoint.clone());
+            let owner = pool.owner_token(&endpoint).unwrap();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let finish_rx = Mutex::new(Some(finish_rx));
+            let mut connecting = Box::pin(pool.acquire_with(&endpoint, |_| {
+                let rx = finish_rx.lock().take().unwrap();
+                async move { rx.await.unwrap() }
+            }));
+            poll_pending(connecting.as_mut());
+
+            let replacement = Arc::new(IpcClient::new(endpoint.address()));
+            replacement.force_connected(true);
+            let attempts = AtomicUsize::new(0);
+            let connector = |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(replacement.clone()))
+            };
+            let mut waiter = Box::pin(pool.acquire_with(&endpoint, connector));
+            let wake = poll_pending(waiter.as_mut());
+            let connected = Arc::new(IpcClient::new(endpoint.address()));
+            connected.force_connected(true);
+            finish_tx
+                .send(if succeed {
+                    Ok(connected.clone())
+                } else {
+                    // Nonretryable: test the slot transition, without retry timers.
+                    Err(c2_ipc::IpcError::Io(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "controlled connector failure",
+                    )))
+                })
+                .unwrap_or_else(|_| panic!("connector receiver dropped"));
+            let result = connecting.await;
+            if succeed {
+                let lease = result.unwrap();
+                assert!(Arc::ptr_eq(&lease.client(), &connected));
+                drop(lease);
+                assert_eq!(owner.slot.inner.lock().state, SlotState::Ready);
+            } else {
+                assert!(matches!(result, Err(AcquireError::Unreachable { .. })));
+                assert_eq!(owner.slot.inner.lock().state, SlotState::Disconnected);
+            }
+            assert!(wake.0.load(Ordering::SeqCst) > 0);
+            assert!(pool.matches_owner_token(&endpoint, &owner));
+            let lease = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("connector completion must wake acquire")
+                .unwrap();
+            let expected = if succeed { &connected } else { &replacement };
+            assert!(Arc::ptr_eq(&lease.client(), expected));
+            assert_eq!(attempts.load(Ordering::SeqCst), usize::from(!succeed));
+            drop(lease);
+            assert_eq!(owner.slot.inner.lock().active_requests, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_attempt_cancellation_success_and_error_do_not_touch_replacement_slot() {
+        // None cancels; Some completes the old connector successfully or with an error.
+        for completion in [None, Some(true), Some(false)] {
+            let pool = ConnectionPool::new();
+            let endpoint = key("ipc://replaced");
+            pool.insert_owner(endpoint.clone());
+            let old_owner = pool.owner_token(&endpoint).unwrap();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let finish_rx = Mutex::new(Some(finish_rx));
+            let mut connecting = Box::pin(pool.acquire_with(&endpoint, |_| {
+                let rx = finish_rx.lock().take().unwrap();
+                async move { rx.await.unwrap() }
+            }));
+            poll_pending(connecting.as_mut());
+            let mut waiter = Box::pin(pool.acquire_with(&endpoint, |_| async {
+                panic!("retired slot must never reconnect")
+            }));
+            let wake = poll_pending(waiter.as_mut());
+
+            pool.remove(&endpoint);
+            assert!(wake.0.load(Ordering::SeqCst) > 0);
+            assert!(matches!(waiter.await, Err(AcquireError::NotFound)));
+            pool.insert_owner(endpoint.clone());
+            let current_owner = pool.owner_token(&endpoint).unwrap();
+            assert!(!Arc::ptr_eq(&old_owner.slot, &current_owner.slot));
+            assert!(!pool.matches_owner_token(&endpoint, &old_owner));
+            let (new_tx, new_rx) = tokio::sync::oneshot::channel();
+            let new_rx = Mutex::new(Some(new_rx));
+            let mut current = Box::pin(pool.acquire_with(&endpoint, |_| {
+                let rx = new_rx.lock().take().unwrap();
+                async move { rx.await.unwrap() }
+            }));
+            poll_pending(current.as_mut());
+
+            let stale_client = Arc::new(IpcClient::new(endpoint.address()));
+            stale_client.force_connected(true);
+            match completion {
+                None => {
+                    drop(connecting);
+                    assert!(finish_tx.is_closed());
+                }
+                Some(succeed) => {
+                    finish_tx
+                        .send(if succeed {
+                            Ok(stale_client.clone())
+                        } else {
+                            Err(c2_ipc::IpcError::Io(std::io::Error::new(
+                                ErrorKind::ConnectionReset,
+                                "retired connector failure",
+                            )))
+                        })
+                        .unwrap_or_else(|_| panic!("connector receiver dropped"));
+                    assert!(matches!(connecting.await, Err(AcquireError::NotFound)));
+                    if succeed {
+                        assert!(!stale_client.is_connected());
+                    }
+                }
+            }
+            assert_eq!(old_owner.slot.inner.lock().state, SlotState::Retired);
+            assert_eq!(
+                current_owner.slot.inner.lock().state,
+                SlotState::Reconnecting
+            );
+            assert!(pool.matches_owner_token(&endpoint, &current_owner));
+            let replacement = Arc::new(IpcClient::new(endpoint.address()));
+            replacement.force_connected(true);
+            assert!(new_tx.send(Ok(replacement.clone())).is_ok());
+            let lease = current.await.unwrap();
+            assert!(Arc::ptr_eq(&lease.client(), &replacement));
+            drop(lease);
+            assert_eq!(current_owner.slot.inner.lock().active_requests, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn superseded_attempt_does_not_rollback_ready_client_or_new_attempt() {
+        for new_attempt in [false, true] {
+            for completion in [None, Some(true), Some(false)] {
+                let pool = ConnectionPool::new();
+                let endpoint = key("ipc://superseded");
+                pool.insert_owner(endpoint.clone());
+                let old_owner = pool.owner_token(&endpoint).unwrap();
+                let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+                let finish_rx = Mutex::new(Some(finish_rx));
+                let mut connecting = Box::pin(pool.acquire_with(&endpoint, |_| {
+                    let rx = finish_rx.lock().take().unwrap();
+                    async move { rx.await.unwrap() }
+                }));
+                poll_pending(connecting.as_mut());
+                let replacement = Arc::new(IpcClient::new(endpoint.address()));
+                replacement.force_connected(true);
+                pool.reconnect(&endpoint, replacement.clone());
+                let current_owner = pool.owner_token(&endpoint).unwrap();
+                assert!(Arc::ptr_eq(&old_owner.slot, &current_owner.slot));
+                assert!(!pool.matches_owner_token(&endpoint, &old_owner));
+
+                let (new_tx, new_rx) = tokio::sync::oneshot::channel();
+                let new_rx = Mutex::new(Some(new_rx));
+                let mut current = Box::pin(pool.acquire_with(&endpoint, |_| {
+                    let rx = new_rx.lock().take().unwrap();
+                    async move { rx.await.unwrap() }
+                }));
+                if new_attempt {
+                    pool.evict(&endpoint);
+                    poll_pending(current.as_mut());
+                }
+                let stale_client = Arc::new(IpcClient::new(endpoint.address()));
+                stale_client.force_connected(true);
+                match completion {
+                    None => drop(connecting),
+                    Some(succeed) => {
+                        finish_tx
+                            .send(if succeed {
+                                Ok(stale_client.clone())
+                            } else {
+                                Err(c2_ipc::IpcError::Io(std::io::Error::new(
+                                    ErrorKind::ConnectionReset,
+                                    "superseded connector failure",
+                                )))
+                            })
+                            .unwrap_or_else(|_| panic!("connector receiver dropped"));
+                        assert!(matches!(connecting.await, Err(AcquireError::NotFound)));
+                        if succeed {
+                            assert!(!stale_client.is_connected());
+                        }
+                    }
+                }
+                let expected_state = if new_attempt {
+                    SlotState::Reconnecting
+                } else {
+                    SlotState::Ready
+                };
+                assert_eq!(current_owner.slot.inner.lock().state, expected_state);
+                assert!(pool.matches_owner_token(&endpoint, &current_owner));
+                if new_attempt {
+                    assert!(new_tx.send(Ok(replacement.clone())).is_ok());
+                }
+                let lease = current.await.unwrap();
+                assert!(Arc::ptr_eq(&lease.client(), &replacement));
+                drop(lease);
+                assert_eq!(current_owner.slot.inner.lock().active_requests, 0);
+            }
+        }
     }
 
     #[test]

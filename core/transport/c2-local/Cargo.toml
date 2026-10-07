@@ -10,12 +10,19 @@ description = "Local endpoints and asynchronous operating-system streams for C-T
 c2-config = { version = "0.1.0", path = "../../foundation/c2-config" }
 tokio = { version = "1", features = ["net", "rt", "sync", "macros", "io-util", "time"] }
 futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 socket2 = "0.6"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 c2-local-security = { version = "0.1.0", path = "../../foundation/c2-local-security" }
 sha2 = "0.10"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Wdk_Storage_FileSystem"] }

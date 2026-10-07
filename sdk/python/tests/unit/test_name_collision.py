@@ -214,6 +214,7 @@ class TestServerNameCollision:
                     f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}'
                 )
                 return {
+                    'completed': True,
                     'removed_routes': list(route_names or []),
                     'route_outcomes': [
                         {
@@ -294,6 +295,7 @@ class TestServerNameCollision:
                     f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}:{timeout_seconds}'
                 )
                 return {
+                    'completed': True,
                     'removed_routes': list(route_names or []),
                     'route_outcomes': [
                         {
@@ -366,6 +368,7 @@ class TestServerNameCollision:
             ):
                 events.append(f'native_shutdown:{list(route_names or [])}')
                 return {
+                    'completed': True,
                     'removed_routes': [],
                     'route_outcomes': [],
                     'relay_errors': [],
@@ -430,6 +433,7 @@ class TestServerNameCollision:
             ):
                 events.append(f'native_shutdown:{list(route_names or [])}')
                 return {
+                    'completed': True,
                     'removed_routes': [],
                     'route_outcomes': [],
                     'relay_errors': [],
@@ -467,6 +471,7 @@ class TestServerNameCollision:
             ):
                 events.append(f'native_shutdown:{list(route_names or [])}')
                 return {
+                    'completed': False,
                     'removed_routes': ['grid'],
                     'route_outcomes': [
                         {
@@ -645,8 +650,9 @@ class TestRegistryNameCollision:
                 assert kwargs['runtime_session'] is registry._runtime_session  # noqa: SLF001
                 raise RuntimeError('native unregister failed')
 
-            def shutdown(self) -> None:
-                pass
+            def shutdown(self, *, runtime_session, relay_anchor_address, timeout):
+                return dict(runtime_session.shutdown(route_names=['temp'],
+                    relay_anchor_address=relay_anchor_address, timeout_seconds=timeout))
 
         registry._server = FailingServer()  # noqa: SLF001
 

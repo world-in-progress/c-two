@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use c_two::generated::{
     C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess, MethodDefinition,
@@ -514,4 +515,49 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
         "expected compiler output containing {expected_stderr:?}, got:\n{stderr}"
     );
     std::fs::remove_dir_all(root).expect("temporary crate cleanup");
+}
+
+#[test]
+fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
+    let pair: fn() -> std::io::Result<(c2_core::OwnerControlKeepalive, c2_core::OwnerControlReceiver)> =
+        c_two::owner_control_pair;
+    assert_eq!(
+        std::any::TypeId::of::<c_two::ServerLifecyclePolicy>(),
+        std::any::TypeId::of::<c2_core::ServerLifecyclePolicy>(),
+    );
+    assert_eq!(
+        std::any::TypeId::of::<c_two::HostLifecycleSnapshot>(),
+        std::any::TypeId::of::<c2_core::HostLifecycleSnapshot>(),
+    );
+    let (mut keepalive, receiver) = pair().expect("native capability pair");
+    let runtime = Runtime::new(RuntimeOptions::default()).expect("runtime");
+    runtime
+        .set_lifecycle_policy(c_two::ServerLifecyclePolicy::owner_bound(Duration::ZERO).unwrap())
+        .expect("Core validates the policy");
+    runtime.attach_owner_control(receiver).expect("Core takes receiver");
+    assert!(runtime.owner_control_attached());
+    keepalive.shutdown();
+}
+
+#[test]
+fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
+    use c_two::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};
+    let address = format!("ipc://{}", unique_name("rust-sdk-native"));
+    let endpoint = direct_ipc_endpoint(&address).expect("native endpoint");
+    assert_eq!(
+        endpoint,
+        c2_config::LocalEndpoint::from_address(&address).unwrap()
+    );
+    assert_eq!(
+        endpoint.protocol(),
+        if cfg!(windows) {
+            "named-pipe"
+        } else {
+            "managed-v2"
+        }
+    );
+    assert!(!ping_direct_ipc(&address, Duration::from_millis(20)).unwrap());
+    let outcome = shutdown_direct_ipc(&address, Duration::from_millis(20)).unwrap();
+    assert!(outcome.server_stopped && !outcome.shutdown_started);
+    assert!(outcome.route_outcomes.is_empty());
 }

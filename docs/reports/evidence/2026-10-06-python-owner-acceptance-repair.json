@@ -1,0 +1,107 @@
+{
+  "source_commit": "896c0e2d773eb27215054b57b58d7705449008a4",
+  "candidate_commit": "d679786994ef76df8d8bb76eecb865adafcffa3a",
+  "fixed_fastdb_input": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "python": "3.12.10 (main, Apr  9 2025, 03:49:38) [Clang 20.1.0 ]",
+  "package": "/Users/soku/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/__init__.py",
+  "native": "/Users/soku/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so",
+  "target": "/tmp/c2-endpoint-targets/python-owner-repair",
+  "venv": "/tmp/c2-endpoint-python-owner-repair-venv",
+  "artifacts": [
+    {
+      "path": "/Users/soku/.codex/worktrees/c2-python-owner-repair/c-two/sdk/python/src/c_two/_native.cpython-312-darwin.so",
+      "sha256": "0fbce7df9a025a2b7316ac848001ee974ff06d5f76b3d97358a3b3b5d73bd474"
+    },
+    {
+      "path": "/private/tmp/c2-memory-fastdb-sdk/lib/libfastdb.dylib",
+      "sha256": "669e6a9bcc2a658dd4eafb30445bc047102016dd13323eed37fe1a8096cdb6dd"
+    }
+  ],
+  "logs": [
+    {
+      "path": "/tmp/c2-python-owner-repair-baseline-build.log",
+      "sha256": "bdd2ee8ec34ad8061f391a5dc4a1d9264ac4f26b371cc7bde4545b42fbf88e57"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-red-shutdown.log",
+      "sha256": "f21b7227fa942f09e4ab6001bc7fb8a704304d9dcb26e0311934bf0a3fb82241"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-red-policy.log",
+      "sha256": "96f0f880b6a725c4de39f1b982e699defe16591c94c64da938f81acfe44be3a2"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-red-child.log",
+      "sha256": "7565a8a94cd69ec368e4a6a6160df4f900612c014e68ad9a5ae664ef041c58da"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-red-tests.log",
+      "sha256": "be2cdaa57f7c227b7c87b1fef615700c450c7a01ea7c8440091fda71503c1b10"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-baseline-restart.log",
+      "sha256": "05cfeb4b2f23c2a0413705e36e42a2cc8974987d5d03e5f0b886b58f9348c1b2"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-build-final.log",
+      "sha256": "917554145d9a6d4195dc969789ef0c89c61d4e6113d7167ddb9428b5cf34175a"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-final-four-blockers.log",
+      "sha256": "cb5df6f0f863a0d4385cc848d0c669f133d90474420245a9af75d25ed33bf628"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-core-owner.log",
+      "sha256": "2e02972bb84c1fe56a3f30e3e274ba2574ed90202b57b2e65c13befcb86e20b2"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-green-shutdown-final.log",
+      "sha256": "0eda3c8a62c2fefedbb6f823afbfd081e28820a196dfe2dde9623925cbb0d598"
+    },
+    {
+      "path": "/tmp/c2-python-owner-repair-green-policy-final.log",
+      "sha256": "aaf15efbef5ba082b0f12d057f86e5a38992c7b34a5a28006527c2309e381d1e"
+    }
+  ],
+  "results": {
+    "native_build_exit": 0,
+    "python": {
+      "passed": 171,
+      "failed": 0,
+      "skipped": 0,
+      "seconds": 28.59,
+      "workers": 2
+    },
+    "core_owner_bound": {
+      "passed": 18,
+      "failed": 0,
+      "ignored": 0,
+      "filtered": 0,
+      "seconds": 3.05
+    },
+    "platform": "macOS arm64",
+    "unexecuted": [
+      "Windows runtime",
+      "full Python/core/CLI/SDK suites",
+      "complete portable matrices",
+      "source-mode FastDB packaging",
+      "Python 3.10/free-threading runtime"
+    ]
+  },
+  "python_test_arguments": [
+    "sdk/python/tests/unit/test_owner_acceptance_repairs.py",
+    "sdk/python/tests/integration/test_python_owned_child.py",
+    "sdk/python/tests/unit/test_runtime_session_lifecycle.py",
+    "sdk/python/tests/unit/test_runtime_session.py",
+    "sdk/python/tests/unit/test_memory_stats_facade.py",
+    "sdk/python/tests/unit/test_ipc_config.py",
+    "sdk/python/tests/integration/test_direct_ipc_control.py",
+    "sdk/python/tests/integration/test_owner_bound_lifecycle.py::test_short_shutdown_retains_inflight_borrowed_and_held_owners",
+    "sdk/python/tests/unit/test_sdk_boundary.py::test_python_native_server_bridge_does_not_expose_public_bool_unit_lifecycle_bypass",
+    "sdk/python/tests/unit/test_sdk_boundary.py::test_python_native_does_not_build_transport_runtime_directly",
+    "-n",
+    "2",
+    "-q",
+    "--timeout=30"
+  ]
+}

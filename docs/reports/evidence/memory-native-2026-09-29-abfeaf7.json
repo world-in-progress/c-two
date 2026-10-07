@@ -1,0 +1,1147 @@
+{
+  "schema": "c-two.memory-native-acceptance.v1",
+  "implementation_source": "abfeaf71deaa9ff4428d0c043ab80e3210746f47",
+  "fastdb_source": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
+  "windows_run": "https://github.com/world-in-progress/c-two/actions/runs/36552609987",
+  "linux_run": "https://github.com/world-in-progress/c-two/actions/runs/36552610119",
+  "release_candidate_run": "https://github.com/world-in-progress/c-two/actions/runs/36552609986",
+  "release_published": false,
+  "artifacts": [
+    {
+      "artifact_id": 11027186321,
+      "artifact_name": "windows-native-windows-2025-full-f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/36552609987/artifacts/11027186321",
+      "zip_sha256": "b693cd094940063ac91e490492f0918560184ca238dc7f76ecfdc81518945662",
+      "zip_bytes": 11805632,
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260922.246.2"
+      },
+      "scope": "full",
+      "run_attempt": "1",
+      "workflow_sha": "f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "gates": [
+        {
+          "id": "python310-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-package",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-rust-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-check",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-artifact",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "rust-sdk-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-native-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-wheel-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-standard-user-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-harness-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "ipc-memory-matrix",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "portable-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "typescript-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "c2-mem-node-package.log",
+          "sha256": "d5134fe58b76e2a1596a51db4ee0c197c27bc797221f183082c4c20aa3b35800",
+          "bytes": 300
+        },
+        {
+          "path": "c2-mem-node-tests.log",
+          "sha256": "fa910b125d3991a6b08a641e4829e910ac70014a1be97c98c6076fc59c919107",
+          "bytes": 7552
+        },
+        {
+          "path": "c2-mem-npm-install.log",
+          "sha256": "67ef2454e0c5ba47132e16c317b446fffecbd780890b4c4d6966cd9bd83d93ee",
+          "bytes": 3799
+        },
+        {
+          "path": "cli/c3.exe",
+          "sha256": "a3ebe2fdc078034583cef1b691b09a88ea04160be85908dec49ace24457a289e",
+          "bytes": 20819968
+        },
+        {
+          "path": "cli-artifact.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        {
+          "path": "cli-build.log",
+          "sha256": "199d388c2412dc1b8e91badbaa4b52b7c43c299789b2a4475f4f158b1da59eaa",
+          "bytes": 932
+        },
+        {
+          "path": "cli-test.log",
+          "sha256": "fbcc8e73198313975073eb9716a6b6eabdfa87136de987eb8ffc8be99a29e9d9",
+          "bytes": 3508
+        },
+        {
+          "path": "core-check.log",
+          "sha256": "5307c1f41f5787d5bec6859c063c4851556585989c6c98ec2f659762ef1b8c7c",
+          "bytes": 1362
+        },
+        {
+          "path": "core-test.log",
+          "sha256": "17a4c291c18268c8b7529f2ea4d35b32b03426ac3f3794bb924319975a636821",
+          "bytes": 100873
+        },
+        {
+          "path": "emsdk-setup.log",
+          "sha256": "0b2ff670bb95d83ece6ab505f32534c69b35a7e8273046c933a8231731474188",
+          "bytes": 907
+        },
+        {
+          "path": "fastdb-npm-install.log",
+          "sha256": "9fd942002735aa2e9e2ff946129aee1c7c55a50f5ea6e27460b7efd46864d1ba",
+          "bytes": 72
+        },
+        {
+          "path": "fastdb-rust-test.log",
+          "sha256": "e8527eed3562f366758bd8230081d461941fb3f29c73ccce2126da160fc2ee9e",
+          "bytes": 3864
+        },
+        {
+          "path": "fastdb-wheel-build.log",
+          "sha256": "b52155abb299a72698b7d86a69591a39720a3df272a58a14930bf3dd963428b8",
+          "bytes": 16517
+        },
+        {
+          "path": "installed-wheel-full-receipt.v1.json",
+          "sha256": "517d9d1f240727523d4db6edea3228b211162aeb15bf5e67173ebc554c7933af",
+          "bytes": 8351
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json",
+          "sha256": "8c3ad1103c070081b36abbe079937f4ee20f2ed5fb6432b32e41ae2f0a01d77d",
+          "bytes": 8948
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stderr.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stdout.log",
+          "sha256": "f6b0484d52fa51dcce0d634e651263b079d7360130906d85b03cb675bf7cceff",
+          "bytes": 119
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.wrapper.json",
+          "sha256": "9a18d34d717044929029d9e34ba6eb65f12dd8525fd959da50753476377d19ad",
+          "bytes": 446
+        },
+        {
+          "path": "ipc-memory-matrix/matrix.json",
+          "sha256": "80d5f4b26cc78ff7248b8094216f2b66e964f314984e2f3e10a1d0dbd0f7924f",
+          "bytes": 6644
+        },
+        {
+          "path": "ipc-memory-matrix/rows/burst4_shared_buddy_disabled.json",
+          "sha256": "272699992ba8c4d6b2a47ff4b0b4aff2d6775f3d5ea0d994a3f3dad38d672619",
+          "bytes": 61082
+        },
+        {
+          "path": "ipc-memory-matrix/rows/burst4_shared_default_buddy.json",
+          "sha256": "f193a3cbd8b88ea9814b889952eadb4e025c1f8d470e07714eb2a39deefdb12d",
+          "bytes": 61082
+        },
+        {
+          "path": "ipc-memory-matrix/rows/forced_all_backing_zero_expect_capacity_error.json",
+          "sha256": "78287c6a0b30d2a1a815a98a53c4deb86ad8ccf56021f1486ff0c04ed251dc1a",
+          "bytes": 22021
+        },
+        {
+          "path": "ipc-memory-matrix/rows/forced_zero_shm_finite_file.json",
+          "sha256": "a00f2ae9023c723bf7db764341b1b7b7e1aa80af3a1b901b17153eb1f202b591",
+          "bytes": 24107
+        },
+        {
+          "path": "ipc-memory-matrix/rows/forced_zero_shm_finite_file_buddy_disabled.json",
+          "sha256": "3fa3dc2f1c907a4bea96d6e705c2fd6159169f315646f3eb0d8e3e875bf48a3a",
+          "bytes": 24206
+        },
+        {
+          "path": "ipc-memory-matrix/rows/idle_small_rpc_buddy_disabled.json",
+          "sha256": "8b0787da82e98f37d294cd46f620730c81616e0f7b3730ded7b69899bfecd976",
+          "bytes": 23483
+        },
+        {
+          "path": "ipc-memory-matrix/rows/idle_small_rpc_default_buddy.json",
+          "sha256": "a2a06fdd12f953b9124c4be35e784f24644857301942b74ea5d6a52a0fbb6068",
+          "bytes": 23471
+        },
+        {
+          "path": "ipc-memory-matrix/rows/science_payload_pairs_buddy_disabled.json",
+          "sha256": "0e8d323df8f4056f026c47711e516d203e72625f191c3ce269665cf7a130ab0a",
+          "bytes": 16557
+        },
+        {
+          "path": "ipc-memory-matrix/rows/science_payload_pairs_default_buddy.json",
+          "sha256": "ba3bb327c002f5f344be26ad0d21857a93d811f8c7fea901c85a6594deda8e47",
+          "bytes": 16541
+        },
+        {
+          "path": "ipc-memory-matrix.log",
+          "sha256": "80d5f4b26cc78ff7248b8094216f2b66e964f314984e2f3e10a1d0dbd0f7924f",
+          "bytes": 6644
+        },
+        {
+          "path": "portable-matrix-full-receipt.v1.json",
+          "sha256": "52d6b2dca8450d406d60a4e743f97ecb1c1f3b5d6f87d248d32fdacbedf0e1d1",
+          "bytes": 19286
+        },
+        {
+          "path": "portable-tests.log",
+          "sha256": "e5c8cd9732f7e3a727f99b1a18e8e5c80eab7263b2d2ad5fccd7d33a634b6eb6",
+          "bytes": 102
+        },
+        {
+          "path": "portable-tests.xml",
+          "sha256": "0b231c7175d4aa612facf3dccb5b7d67ec04a7bf2b1329612318e076e3325e30",
+          "bytes": 4381
+        },
+        {
+          "path": "python-build.log",
+          "sha256": "20f07411f4aa60ae7b05e8f3ecd1bc86a8e01fb19cb3d905201ac212c0ecc079",
+          "bytes": 1079
+        },
+        {
+          "path": "python-native-test.log",
+          "sha256": "013645144bb3a31f2bc9ab2dfc0fc1d9c48bbe87e8c0dd73e902d16f9e5a5b97",
+          "bytes": 1457
+        },
+        {
+          "path": "python-tests.log",
+          "sha256": "f010de5933b1554babf88219adacf6be093a037a6e3ab86602ffbda0d725cd32",
+          "bytes": 1086
+        },
+        {
+          "path": "python-tests.xml",
+          "sha256": "61a19df956b7a256787d526134edb753d5ac0d535206b00981ba63b352c51a8a",
+          "bytes": 117460
+        },
+        {
+          "path": "python-wheel-build.log",
+          "sha256": "0a260c3e0bcbba138199d546686d94a765b3f43eb316e918156009e951487629",
+          "bytes": 1927
+        },
+        {
+          "path": "python310-install.log",
+          "sha256": "330a93b8d7a6d2e0a4a67998014e315b7631da2ce66d2ce7d62eccd06a969a87",
+          "bytes": 410
+        },
+        {
+          "path": "rust-sdk-test.log",
+          "sha256": "51cf94e8630b8beeaf80f0852f44b8669fb22feaad644016650e649e2c8ae67e",
+          "bytes": 2532
+        },
+        {
+          "path": "typescript-real-call-full-receipt.v1.json",
+          "sha256": "18db7540c948c00543ec28e42513e3f2b381db7ae0a11f73b69a0b511d19edd2",
+          "bytes": 12065
+        },
+        {
+          "path": "typescript-tests.log",
+          "sha256": "10c51bbbceb43666e95dc0b98de8fef38f9f3742a5659dc5d5f7c03ddd484be1",
+          "bytes": 113
+        },
+        {
+          "path": "typescript-tests.xml",
+          "sha256": "854ac88d21a63b400bcb5a13ba9090bd3714436e435da918df6083f75e223c17",
+          "bytes": 2503
+        },
+        {
+          "path": "wheels/c-two/c_two-0.6.0-cp312-cp312-win_amd64.whl",
+          "sha256": "90afcdd594600e1343277400282945241b226d4f716403899f4edc5b3b3533c7",
+          "bytes": 3815752
+        },
+        {
+          "path": "wheels/fastdb/fastdb4py-0.2.1-cp312-cp312-win_amd64.whl",
+          "sha256": "81fc9c56fcf8f035d71b47178f0d812ede18a96857f1b9492275d6fa62a2c1cb",
+          "bytes": 796545
+        },
+        {
+          "path": "windows-harness-tests.log",
+          "sha256": "434e07fb673db8e97435327978c2df1095b6b8c15406d8ae8da757e409b6c19f",
+          "bytes": 101
+        },
+        {
+          "path": "windows-harness-tests.xml",
+          "sha256": "d58313cf7607329a9f4284d62ac9fcf132446b64d5922268b5b3d13f22c514ac",
+          "bytes": 5196
+        },
+        {
+          "path": "windows-standard-user-consumer.log",
+          "sha256": "d70a27901e6d6876145caefb6eb5799e6e36972393b878a108be6a6212182aba",
+          "bytes": 38
+        },
+        {
+          "path": "windows-wheel-consumer.log",
+          "sha256": "a80b6dc1d8feeac3c7445b86107b79529af8b604e2b79cff27e97e3df5b80b35",
+          "bytes": 123
+        }
+      ],
+      "c3_sha256": "a3ebe2fdc078034583cef1b691b09a88ea04160be85908dec49ace24457a289e",
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "junit": {
+        "portable-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "25",
+            "time": "47.560",
+            "timestamp": "2026-09-29T10:16:15.203773+00:00",
+            "hostname": "runnervm99s1a"
+          }
+        ],
+        "typescript-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "14",
+            "time": "166.246",
+            "timestamp": "2026-09-29T10:17:03.557723+00:00",
+            "hostname": "runnervm99s1a"
+          }
+        ],
+        "python-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "865",
+            "time": "131.568",
+            "timestamp": "2026-09-29T10:14:02.840968+00:00",
+            "hostname": "runnervm99s1a"
+          }
+        ],
+        "windows-harness-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "34",
+            "time": "8.963",
+            "timestamp": "2026-09-29T10:13:43.971594+00:00",
+            "hostname": "runnervm99s1a"
+          }
+        ]
+      },
+      "memory_matrix": {
+        "rows": 9,
+        "native_sha256": "8f11c33283452e370498f013e6d18f7e85ecfbaa189200f6c76e4952f3c422fe",
+        "workers_exited": true,
+        "cleanup_verified": true
+      },
+      "wheel_consumers": {
+        "normal": {
+          "status": "passed",
+          "administrator": true,
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "borrowed_inputs_invalidated": 4,
+          "transports": [
+            {
+              "transport": "direct",
+              "status": "passed",
+              "observed_mode": "ipc",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            },
+            {
+              "transport": "relay",
+              "status": "passed",
+              "observed_mode": "http",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            }
+          ]
+        },
+        "standard_user": {
+          "status": "passed",
+          "administrator": false,
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "borrowed_inputs_invalidated": 4,
+          "transports": [
+            {
+              "transport": "direct",
+              "status": "passed",
+              "observed_mode": "ipc",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            },
+            {
+              "transport": "relay",
+              "status": "passed",
+              "observed_mode": "http",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            }
+          ]
+        }
+      },
+      "standard_user_cleanup": {
+        "reaped_pids": [],
+        "remaining_pids": [],
+        "processes_exited": true,
+        "workspace_removed": true,
+        "account_removed": true
+      }
+    },
+    {
+      "artifact_id": 11026062165,
+      "artifact_name": "windows-native-windows-2022-full-f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/36552609987/artifacts/11026062165",
+      "zip_sha256": "3c3dd6e303749db7b77799591c341c310a6bcbbef86c9454057d1637a58e77fc",
+      "zip_bytes": 11814508,
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20260920.314.1"
+      },
+      "scope": "full",
+      "run_attempt": "1",
+      "workflow_sha": "f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "gates": [
+        {
+          "id": "python310-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-npm-install",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "c2-mem-node-package",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-rust-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-check",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "core-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "cli-artifact",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "rust-sdk-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-native-test",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "fastdb-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-wheel-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-wheel-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-standard-user-consumer",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-build",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "windows-harness-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "ipc-memory-matrix",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "python-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "portable-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        },
+        {
+          "id": "typescript-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "c2-mem-node-package.log",
+          "sha256": "d5134fe58b76e2a1596a51db4ee0c197c27bc797221f183082c4c20aa3b35800",
+          "bytes": 300
+        },
+        {
+          "path": "c2-mem-node-tests.log",
+          "sha256": "2c2eb8a7ce4ab33fcdb66fa28ea3d573fb7aa3ad0c8fa97c6bfbda5c88b641d8",
+          "bytes": 7550
+        },
+        {
+          "path": "c2-mem-npm-install.log",
+          "sha256": "6d1e637bfbdb581cb1ae3161bdf70b563e516da1002c362b7b88355c8100c7c3",
+          "bytes": 3805
+        },
+        {
+          "path": "cli/c3.exe",
+          "sha256": "5ab46b7919abe64331ec2a871e77b2e07b9e83b8f64191e7cf2df0abcd6db8f7",
+          "bytes": 20825600
+        },
+        {
+          "path": "cli-artifact.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        {
+          "path": "cli-build.log",
+          "sha256": "a28b549d4096e664db5df7624f52f6b6f70ce417dc27eceaa233345cf65984ca",
+          "bytes": 932
+        },
+        {
+          "path": "cli-test.log",
+          "sha256": "50e754d18f0f2971de4c357abdec7a3cb0eac39abc5f8545c014d59d5bb31605",
+          "bytes": 3508
+        },
+        {
+          "path": "core-check.log",
+          "sha256": "e557e9117095e43f842e5678f19a83aa212eb5bd9f1c9adb302597eb9c104a57",
+          "bytes": 1362
+        },
+        {
+          "path": "core-test.log",
+          "sha256": "cc6f4fa3b0307ca728689ac5f9af076a5d6362d8c9dc805ccfe21adad6a0d46c",
+          "bytes": 100873
+        },
+        {
+          "path": "emsdk-setup.log",
+          "sha256": "9d869a48d2a0c71791e209ae7d76bf82643e9a19f3b2e1a60e57b2a36d9c398b",
+          "bytes": 907
+        },
+        {
+          "path": "fastdb-npm-install.log",
+          "sha256": "9fd942002735aa2e9e2ff946129aee1c7c55a50f5ea6e27460b7efd46864d1ba",
+          "bytes": 72
+        },
+        {
+          "path": "fastdb-rust-test.log",
+          "sha256": "2e2e820139bba54248ab5a043d62f379e659464131dc0b97ab6315dd099f3ad8",
+          "bytes": 3864
+        },
+        {
+          "path": "fastdb-wheel-build.log",
+          "sha256": "7f4358b54935af4eed9c0d1a1beea71b8f9504894f6a96265e645638b3a7a2a4",
+          "bytes": 16588
+        },
+        {
+          "path": "installed-wheel-full-receipt.v1.json",
+          "sha256": "b1a4e9c18054af651fb03c61fb878a7205b330612f1df6f3d5a1f65eacffe3b4",
+          "bytes": 8351
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json",
+          "sha256": "11cd4015570d7f565c5304a27af572e864cdc593bd5d457ce1a2d87eebb6dcec",
+          "bytes": 8937
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stderr.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.stdout.log",
+          "sha256": "7ca1834170cae7412cf60a1c2210740019b853ddbc2a7ac3a97c3f6f16e2ca55",
+          "bytes": 119
+        },
+        {
+          "path": "installed-wheel-standard-user-full-receipt.v1.json.wrapper.json",
+          "sha256": "5258b3d873e6182e8d00495a23d23c9ecf4ca8edaa32372c95461cf4e0affdda",
+          "bytes": 447
+        },
+        {
+          "path": "ipc-memory-matrix/matrix.json",
+          "sha256": "c110288136d6dc351aeecb9cc59abb9e474b0364038df89b274b042f5670b9cb",
+          "bytes": 6644
+        },
+        {
+          "path": "ipc-memory-matrix/rows/burst4_shared_buddy_disabled.json",
+          "sha256": "ba0fadbede464e01f5b7a468f4de7b3c852e541295cb91453b2da2568c44ee70",
+          "bytes": 61076
+        },
+        {
+          "path": "ipc-memory-matrix/rows/burst4_shared_default_buddy.json",
+          "sha256": "7ab1ecf116e713531383e5d336e0ab3f4aec2763f15e5ddec03d9f5952d3b70e",
+          "bytes": 61078
+        },
+        {
+          "path": "ipc-memory-matrix/rows/forced_all_backing_zero_expect_capacity_error.json",
+          "sha256": "6ca9c77229d51b4577ea3b231aef3445fb209e082a25df738d94bf5e75ad7049",
+          "bytes": 22020
+        },
+        {
+          "path": "ipc-memory-matrix/rows/forced_zero_shm_finite_file.json",
+          "sha256": "37cfd55b4698bcb9edea15dbb0e227fc5e414bf51e665dc6242983bd9e7dceb6",
+          "bytes": 24106
+        },
+        {
+          "path": "ipc-memory-matrix/rows/forced_zero_shm_finite_file_buddy_disabled.json",
+          "sha256": "0f8c17216d291cf6f0cc1db1f12c9b9280439a9025f99a93ae61a12f318e3d0b",
+          "bytes": 24205
+        },
+        {
+          "path": "ipc-memory-matrix/rows/idle_small_rpc_buddy_disabled.json",
+          "sha256": "7bdec4e4b03a9ac3cea9738d927275bc77d151bbaa94980b5d857cddceb1904a",
+          "bytes": 23482
+        },
+        {
+          "path": "ipc-memory-matrix/rows/idle_small_rpc_default_buddy.json",
+          "sha256": "57586fff8b96ca3e21898f63d69fed46f59b26acf6fe962b2ffe1ac6cad33814",
+          "bytes": 23467
+        },
+        {
+          "path": "ipc-memory-matrix/rows/science_payload_pairs_buddy_disabled.json",
+          "sha256": "383a3459be7d5258c27e312979bc9746137bab04d32fa4a30ea0ff7a2c746620",
+          "bytes": 16553
+        },
+        {
+          "path": "ipc-memory-matrix/rows/science_payload_pairs_default_buddy.json",
+          "sha256": "dfc45e728cb00ef82d0b481f4c7250f4a0cbd42c10fab6fdcbcf51e5088f0541",
+          "bytes": 16539
+        },
+        {
+          "path": "ipc-memory-matrix.log",
+          "sha256": "c110288136d6dc351aeecb9cc59abb9e474b0364038df89b274b042f5670b9cb",
+          "bytes": 6644
+        },
+        {
+          "path": "portable-matrix-full-receipt.v1.json",
+          "sha256": "82bc15e64a48fad01dcce28501f42cbb116926c844ba1dc23f1b50f5b6034573",
+          "bytes": 19286
+        },
+        {
+          "path": "portable-tests.log",
+          "sha256": "d4686560f198546cbfbff769ac87034cd71c3fe7e364d4ef85815864e5340f9e",
+          "bytes": 102
+        },
+        {
+          "path": "portable-tests.xml",
+          "sha256": "6ae7d7b800406c51a568e5922288040c3bedb7b8e74b2218175e089d5156a3c2",
+          "bytes": 4381
+        },
+        {
+          "path": "python-build.log",
+          "sha256": "09823134aa55d1394a01d7e463b369c12a71598263fcc887763179832035b32d",
+          "bytes": 1079
+        },
+        {
+          "path": "python-native-test.log",
+          "sha256": "50c33514ccfcfd274905609a6e63b1f5d073569e3fa43ec811692ae0bb6c56cc",
+          "bytes": 1457
+        },
+        {
+          "path": "python-tests.log",
+          "sha256": "83850039ed01970ca9b085460ec47a0aabfae58cd1e146be6c8d39baffc24a10",
+          "bytes": 1086
+        },
+        {
+          "path": "python-tests.xml",
+          "sha256": "eb1826856cbd87797aaddae31a0cf2f22161a8892695ea92801a6d04b5e33a13",
+          "bytes": 117460
+        },
+        {
+          "path": "python-wheel-build.log",
+          "sha256": "eb89261757b4e0df0ce04f10d623d1158fe721e11d104ef97a1c7f2ae17b3e91",
+          "bytes": 1927
+        },
+        {
+          "path": "python310-install.log",
+          "sha256": "b866e71ea546923dcceb77b4e6391395b149787966fe43f0ac1036a07c573059",
+          "bytes": 410
+        },
+        {
+          "path": "rust-sdk-test.log",
+          "sha256": "30554c2b3fbf21234ef49a3c2f0fbf3970f2cbcb3f33be0ec601146aad93d77b",
+          "bytes": 2532
+        },
+        {
+          "path": "typescript-real-call-full-receipt.v1.json",
+          "sha256": "584c45fda0f9645094d7c85d8eb814a304c9a4f3fec09ee1c90ed1631074c2ad",
+          "bytes": 12065
+        },
+        {
+          "path": "typescript-tests.log",
+          "sha256": "0fd78cd2716f151f1e976ec74c7bebc2bcc3c517b6711c83fbd48fc56e9832fd",
+          "bytes": 113
+        },
+        {
+          "path": "typescript-tests.xml",
+          "sha256": "02a455730c1c7d654afe51799f486b4e8dbec4fc121b8831b53f7fd6658eb0f9",
+          "bytes": 2503
+        },
+        {
+          "path": "wheels/c-two/c_two-0.6.0-cp312-cp312-win_amd64.whl",
+          "sha256": "25fdf71a2ac7c58bff2ba584b661aa3f462a74e0f6b087a347cfda57d7ed92c8",
+          "bytes": 3819102
+        },
+        {
+          "path": "wheels/fastdb/fastdb4py-0.2.1-cp312-cp312-win_amd64.whl",
+          "sha256": "fcdc1ea1f67b29065c2520e577f24721ffe0ead4a0754454fad92935fc0cb740",
+          "bytes": 797848
+        },
+        {
+          "path": "windows-harness-tests.log",
+          "sha256": "8374ad2974cf88c71afe26d601b137e42a44f00fcb793017d16a7e94e8851c83",
+          "bytes": 101
+        },
+        {
+          "path": "windows-harness-tests.xml",
+          "sha256": "48ceeb4800d60851e7d6820dd607052de28e5e548345ceddce60846c2213ceca",
+          "bytes": 5196
+        },
+        {
+          "path": "windows-standard-user-consumer.log",
+          "sha256": "d70a27901e6d6876145caefb6eb5799e6e36972393b878a108be6a6212182aba",
+          "bytes": 38
+        },
+        {
+          "path": "windows-wheel-consumer.log",
+          "sha256": "a80b6dc1d8feeac3c7445b86107b79529af8b604e2b79cff27e97e3df5b80b35",
+          "bytes": 123
+        }
+      ],
+      "c3_sha256": "5ab46b7919abe64331ec2a871e77b2e07b9e83b8f64191e7cf2df0abcd6db8f7",
+      "portable_rows": 18,
+      "typescript_rows": 12,
+      "junit": {
+        "portable-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "25",
+            "time": "26.843",
+            "timestamp": "2026-09-29T10:12:48.061319+00:00",
+            "hostname": "runnervmocx8p"
+          }
+        ],
+        "typescript-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "14",
+            "time": "123.880",
+            "timestamp": "2026-09-29T10:13:15.570521+00:00",
+            "hostname": "runnervmocx8p"
+          }
+        ],
+        "python-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "865",
+            "time": "127.754",
+            "timestamp": "2026-09-29T10:10:39.444800+00:00",
+            "hostname": "runnervmocx8p"
+          }
+        ],
+        "windows-harness-tests.xml": [
+          {
+            "name": "pytest",
+            "errors": "0",
+            "failures": "0",
+            "skipped": "0",
+            "tests": "34",
+            "time": "7.513",
+            "timestamp": "2026-09-29T10:10:23.731663+00:00",
+            "hostname": "runnervmocx8p"
+          }
+        ]
+      },
+      "memory_matrix": {
+        "rows": 9,
+        "native_sha256": "f727f3174313d47e9b41907bdc5b6ef2a602918366f37cdce01299bd7dc68ade",
+        "workers_exited": true,
+        "cleanup_verified": true
+      },
+      "wheel_consumers": {
+        "normal": {
+          "status": "passed",
+          "administrator": true,
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "borrowed_inputs_invalidated": 4,
+          "transports": [
+            {
+              "transport": "direct",
+              "status": "passed",
+              "observed_mode": "ipc",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            },
+            {
+              "transport": "relay",
+              "status": "passed",
+              "observed_mode": "http",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            }
+          ]
+        },
+        "standard_user": {
+          "status": "passed",
+          "administrator": false,
+          "cleanup": {
+            "host_orderly_shutdown": true,
+            "errors": [],
+            "relay_stop": "terminated",
+            "host_stop": "already_exited",
+            "processes_exited": true,
+            "temporary_directory_removed": true
+          },
+          "borrowed_inputs_invalidated": 4,
+          "transports": [
+            {
+              "transport": "direct",
+              "status": "passed",
+              "observed_mode": "ipc",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            },
+            {
+              "transport": "relay",
+              "status": "passed",
+              "observed_mode": "http",
+              "held_view_invalidated": true,
+              "payload_bytes": 1048576
+            }
+          ]
+        }
+      },
+      "standard_user_cleanup": {
+        "reaped_pids": [],
+        "remaining_pids": [],
+        "processes_exited": true,
+        "workspace_removed": true,
+        "account_removed": true
+      }
+    },
+    {
+      "artifact_id": 11025157830,
+      "artifact_name": "windows-native-windows-2025-local-platform-f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/36552609987/artifacts/11025157830",
+      "zip_sha256": "7fe175531650101022b1142faf0cae7bb3b48c26bde5d527baf005fdc2c8308f",
+      "zip_bytes": 14693,
+      "runner": {
+        "requested_label": "windows-2025",
+        "os": "Windows-2025Server-10.0.26100-SP0",
+        "machine": "AMD64",
+        "image": "win25-vs2026",
+        "image_version": "20260922.246.2"
+      },
+      "scope": "local-platform",
+      "run_attempt": "1",
+      "workflow_sha": "f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "gates": [
+        {
+          "id": "local-platform-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "local-platform-tests.log",
+          "sha256": "fbcbf5ce13040c62ab7bfc3ba376d435410c073d1cd958e9dbd6396ba962036d",
+          "bytes": 57040
+        }
+      ],
+      "tests_passed": 707,
+      "close_regressions": {
+        "close_shared_aborts_blocked_receiver_within_deadline": true,
+        "close_shared_is_bounded_and_honest_when_writer_slot_is_held": true,
+        "two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable": true
+      }
+    },
+    {
+      "artifact_id": 11024513707,
+      "artifact_name": "windows-native-windows-2022-local-platform-f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "url": "https://github.com/world-in-progress/c-two/actions/runs/36552609987/artifacts/11024513707",
+      "zip_sha256": "24ec59545c343f2f916a3b62a1f73efe2d5d34642a837e131b8e08a35235dcf4",
+      "zip_bytes": 14688,
+      "runner": {
+        "requested_label": "windows-2022",
+        "os": "Windows-2022Server-10.0.20348-SP0",
+        "machine": "AMD64",
+        "image": "win22",
+        "image_version": "20260920.314.1"
+      },
+      "scope": "local-platform",
+      "run_attempt": "1",
+      "workflow_sha": "f168a56fed895248cdbbdb2f42a8e8ec8ea2cc8b",
+      "gates": [
+        {
+          "id": "local-platform-tests",
+          "status": "passed",
+          "exit_code": 0,
+          "process_exited": true
+        }
+      ],
+      "files": [
+        {
+          "path": "local-platform-tests.log",
+          "sha256": "7850b18972879347c84cf167aa2e0f2db0ee6c24791a8104660a714d3a77fc3d",
+          "bytes": 57040
+        }
+      ],
+      "tests_passed": 707,
+      "close_regressions": {
+        "close_shared_aborts_blocked_receiver_within_deadline": true,
+        "close_shared_is_bounded_and_honest_when_writer_slot_is_held": true,
+        "two_concurrent_closes_of_one_blocked_receiver_serialize_and_stay_retryable": true
+      }
+    }
+  ],
+  "verifier": {
+    "result": "passed",
+    "failures": 0,
+    "script_sha256": {
+      "check.py": "89b2b944a6e2bed1bae5b95ad0a84f0e76b2fe6d51649e516454e4770799913f",
+      "verify.py": "6b7c85c2f09e8791eac9ebf860e29780afe8d6320556b4370bf6cce2f22d43e3",
+      "download.py": "bfecaa1e1abeee694315a0e45a5f2f16f3f390a118b817e3f40cf78b0a414f04"
+    },
+    "format_handling": "Accepts Cargo singular test and CRLF wheel metadata without modifying evidence; no skipped JUnit tests present."
+  }
+}

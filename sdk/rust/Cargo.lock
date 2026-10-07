@@ -106,6 +106,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "c-two"
 version = "0.1.0"
 dependencies = [
+ "c2-config",
  "c2-contract",
  "c2-core",
  "c2-error",
@@ -121,6 +122,7 @@ dependencies = [
  "c2-local-security",
  "dotenvy",
  "gethostname",
+ "libc",
  "sha2 0.10.9",
  "uuid",
 ]
@@ -144,6 +146,7 @@ dependencies = [
  "c2-error",
  "c2-http",
  "c2-ipc",
+ "c2-local",
  "c2-mem",
  "c2-server",
  "parking_lot",
@@ -170,6 +173,7 @@ dependencies = [
  "c2-contract",
  "c2-error",
  "c2-ipc",
+ "c2-mem",
  "c2-wire",
  "futures",
  "hex",
@@ -209,9 +213,12 @@ dependencies = [
  "c2-local-security",
  "futures-util",
  "libc",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "socket2",
  "tokio",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 

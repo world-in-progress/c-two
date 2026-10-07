@@ -1,0 +1,47 @@
+# Memory budget typed IPC config projection — implementation report
+
+Task: implement only the typed IPC config projection for the three approved finite memory limits on top of base `72b23e4`. Source contract: [`docs/reports/memory-budget-contract.md`](memory-budget-contract.md) (three finite byte limits). This slice is config and SDK projection only; transport allocation wiring, client cache/GC, statistics, versions/releases, and peer work are explicitly out of scope.
+
+## What was added
+
+Canonical defaults remain owned by `c2_config::MemoryBudgetLimits` (8 GiB SHM backing, 16 GiB file backing, 8 GiB live reassembly; zero rejects positive reservations and is never unlimited). No second defaults table exists in any SDK layer.
+
+| Key (override + resolved) | Env variable | Default | Notes |
+| --- | --- | --- | --- |
+| `shm_backing_budget_bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | `u64`; zero and full range valid |
+| `file_backing_budget_bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | `u64`; zero and full range valid |
+| `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | `u64`; zero and full range valid |
+
+- `core/foundation/c2-config/src/ipc.rs`: added the three `u64` fields to `BaseIpcConfig`; `Default for BaseIpcConfig` now reads its budget values from `MemoryBudgetLimits::default()`; added the pure projection `BaseIpcConfig::memory_budget_limits() -> MemoryBudgetLimits` (field-copy only) so transport can build `c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits())` without config owning the reservation primitive; added the three keys to `BASE_IPC_OVERRIDE_KEYS` and `SERVER_IPC_OVERRIDE_KEYS` and the explicit `CLIENT_IPC_OVERRIDE_KEYS` list (all three roles accept them); `validate()` intentionally performs no range check beyond the `u64` type — zero and `u64::MAX` are valid and no cross-field or pressure/RSS validation was invented.
+- `core/foundation/c2-config/src/resolver.rs`: added `shm_backing_budget_bytes` / `file_backing_budget_bytes` / `live_reassembly_budget_bytes` (`Option<u64>`) to `BaseIpcConfigOverrides`, and the same flat fields to `ServerIpcConfigOverrides` and `ClientIpcConfigOverrides`; wired the three `C2_IPC_*_BUDGET_BYTES` variables into `apply_base_env` and all override application paths (`apply_base_overrides`, `apply_flat_base_overrides_to_server`, `apply_flat_base_overrides_to_client`). Precedence is the existing chain: explicit override > process env / `.env` > Rust default from `MemoryBudgetLimits`. Negative and overflowing env strings fail in the existing `parse_optional_u64` with the variable named; typed `Option<u64>` overrides cannot represent negatives.
+- `sdk/python/native/src/config_ffi.rs`: `parse_server_ipc_overrides_dict` and `client_overrides` now extract the three keys from the Python override mapping (unknown-key rejection therefore rejects them on neither role — they are accepted); `server_ipc_overrides_to_dict` / `client_ipc_overrides_to_dict` round-trip explicitly set values (base-then-flat, flat wins, matching every existing field); `base_ipc_to_dict` projects the resolved values into the `resolve_server_ipc_config` / `resolve_client_ipc_config` result dictionaries, which is what `Server._config` and `RuntimeSession.client_ipc_config` expose.
+- `sdk/python/src/c_two/config/ipc.py`: extended the `BaseIPCOverrides` `TypedDict` with the three `int` keys (inherited by `ServerIPCOverrides` / `ClientIPCOverrides`). No Python-side validators, key tables, or defaults were added — clean cut, single Rust authority.
+- `sdk/python/tests/unit/test_ipc_config.py`: added the behavioral tests listed below and registered the three env variables in the autouse isolation fixture.
+
+Integration note: the policy slice adds prewarm/min-retained/client-decay fields. The Host preserved all fields when combining the patches and added the budget keys to the now-explicit client allowlist; the Rust key-catalog tests caught that omission. Explicit values override valid environment values; malformed environment values still error before overrides, matching the existing resolver.
+
+## Original artifact tested scope
+
+All commands ran on macOS (arm64) with the isolated target `/tmp/c2-memory-budget-config-build`.
+
+1. `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/c2-memory-budget-config-build cargo test --manifest-path core/Cargo.toml -p c2-config` — 80 passed, 0 failed, 0 ignored. New budget tests: `base_defaults_come_from_memory_budget_limits`, `server_and_client_defaults_project_memory_budget_limits`, `memory_budget_limits_projection_is_pure_field_copy`, `zero_budget_limits_are_valid_finite_configuration`, `full_range_budget_limits_are_valid`, `budget_override_keys_are_role_visible`, `resolver_budget_defaults_come_from_memory_budget_limits`, `budget_limits_resolve_from_env_for_both_roles`, `budget_limits_explicit_overrides_beat_env`, `budget_limits_accept_zero_and_full_u64_range`, `budget_limits_env_rejects_negative_and_overflow`. These cover Rust defaults, zero, full-`u64` boundaries, env resolution, explicit-over-env precedence, and the typed-struct override path.
+2. Native compile check: `PYO3_PYTHON=/tmp/c2-memory-venv/bin/python FASTDB_PAYLOAD_LINK_MODE=system FASTDB_PAYLOAD_SYSTEM_LIB_DIR=/private/tmp/c2-memory-fastdb-sdk/lib DYLD_LIBRARY_PATH=/private/tmp/c2-memory-fastdb-sdk/lib CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/c2-memory-budget-config-build cargo check --manifest-path sdk/python/native/Cargo.toml` — finished clean. This transitively compile-checks `c2-ipc`, `c2-server`, and `c2-core` against the widened `BaseIpcConfig` (all existing struct literals there use `..Default::default()` functional update syntax, so no out-of-scope file needed changes and no scope amendment was required).
+3. PyO3 `u64` extraction boundary verified empirically against the base build in the isolated venv (`/tmp/c2-memory-venv`): a negative Python int raises `OverflowError` ("can't convert negative int to unsigned") and `2**64` raises `OverflowError` ("int too big to convert"); the new Python tests assert exactly this error type.
+4. `python -m py_compile` on the edited `ipc.py` and `test_ipc_config.py`.
+
+## Original artifact unexecuted scope
+
+1. The new Python behavioral tests in `test_ipc_config.py` were **not executed**. Per instruction the Host venv was not rebuilt; the Host must run them against the integrated extension build: `test_resolved_ipc_config_exposes_canonical_memory_budget_defaults`, `test_ipc_overrides_roundtrip_memory_budget_bytes`, `test_memory_budget_zero_override_is_retained_not_unlimited`, `test_memory_budget_full_u64_range_override_is_retained`, `test_memory_budget_env_resolves_and_explicit_overrides_win`, `test_memory_budget_negative_and_overflow_overrides_rejected_by_native`, `test_memory_budget_invalid_env_value_rejected_by_native`, `test_client_session_projects_memory_budget_overrides`, `test_low_level_server_projects_memory_budget_env`, plus the extended `test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields`. They share the file's existing autouse fixture and follow its established native-resolver / `Server` / `cc.set_client` patterns; their env assertions were validated at the Rust resolver level and their error types were verified empirically, but the tests themselves have not run.
+2. Not run here (out of this slice's required commands, unchanged risk): the full `sdk/python/tests/` suite, `cargo test --workspace`, `c2-ipc` / `c2-server` / `c2-core` test *execution* (compile-checked only), the Python 3.10 syntax gate, and any Windows run. Existing-key behavior was retained; combined test results are recorded separately below.
+3. Documentation files outside the write scope were not touched: `.env.example` and the AGENTS.md environment-variable table do not yet list `C2_IPC_SHM_BACKING_BUDGET_BYTES`, `C2_IPC_FILE_BACKING_BUDGET_BYTES`, `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES`; they are documented in the table above for whoever owns those files.
+4. Explicitly not implemented (per bounded scope): transport allocation wiring against `memory_budget_limits()`, client cache/GC changes, snapshot/statistics projection, pressure thresholds or RSS validation (none exist by design), and any relay/HTTP-side budget surface.
+
+## Log artifacts
+
+Build and test scratch lives only under `/tmp`: `/tmp/c2-memory-budget-config-build` (isolated cargo target), `/tmp/c2-memory-venv` and `/tmp/c2-memory-fastdb-sdk` (pre-existing isolated check environment, read-only for this task). Nothing was written outside the authorized write scope.
+
+## Host integrated verification
+
+The Host combined the config artifact with accepted policy/cache/backing source `cb9c0e5`. Independent review and Rust tests caught the new explicit client key catalog omitting the three fields; the Host added them without removing client decay or prewarm settings. Combined `c2-config` tests passed 94/94. After rebuilding the native extension from the integrated tree, `test_ipc_config.py` and `test_runtime_session.py` passed 94/94 (including shutdown warning propagation). Logs: `/tmp/c2-memory-budget-config-integrated-tests.log`, `/tmp/c2-memory-budget-config-native-rebuild.log`, `/tmp/c2-memory-config-runtime-python-tests.log`.
+
+This accepts configuration parsing/projection only. Transport owners must still use `memory_budget_limits()` to enforce user-selected domain limits; that wiring is the next implementation slice. No Python counter or default authority was added.

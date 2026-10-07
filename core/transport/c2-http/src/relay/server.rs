@@ -150,7 +150,11 @@ fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
 
 async fn connect_register_attestation_client(address: &str) -> Result<IpcClient, c2_ipc::IpcError> {
     for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
-        let mut client = IpcClient::with_config(address, ClientIpcConfig::default());
+        // Attestation clients keep their private, lazy default memory context
+        // outside the data-plane budget. Both paths use the same canonical
+        // platform native endpoint.
+        let config = ClientIpcConfig::default();
+        let mut client = IpcClient::with_config(address, config);
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err)
@@ -813,7 +817,7 @@ mod tests {
             .find(".prepare_candidate_registration(")
             .expect("command registration must prepare replacement eligibility");
         let connect = body
-            .find("connect_register_attestation_client(&address).await")
+            .find("connect_register_attestation_client(")
             .expect("command registration must connect candidate IPC");
         let read = body
             .find("read_ipc_route_contract")
@@ -981,6 +985,51 @@ mod tests {
         assert!(!should_retry_register_attestation_connect(
             &c2_ipc::IpcError::ContractMismatch("wrong contract".into())
         ));
+    }
+
+    /// Attestation and the data plane must name the same OS endpoint.
+    ///
+    /// The production attestation helper connects to the same native endpoint
+    /// the relay data plane uses and completes its identity handshake.
+    #[tokio::test]
+    async fn register_attestation_client_uses_the_native_endpoint() {
+        let suffix = NEXT_IPC_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        let address = format!("ipc://relay-attest-native-{suffix}");
+        let server_id = "relay-attest-server";
+        let server_config = c2_config::ServerIpcConfig::default();
+        let server = Arc::new(
+            c2_server::Server::new_with_identity(
+                &address,
+                server_config,
+                c2_server::ServerIdentity {
+                    server_id: server_id.to_string(),
+                    server_instance_id: format!("{server_id}-instance"),
+                },
+            )
+            .unwrap(),
+        );
+        let server_task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            })
+        };
+        server
+            .wait_until_ready(std::time::Duration::from_secs(5))
+            .await
+            .expect("configured server ready");
+
+        // The managed client the relay actually builds connects.
+        let client = super::connect_register_attestation_client(&address)
+            .await
+            .expect("configured attestation client connects");
+        assert_eq!(client.server_id(), Some(server_id));
+        super::close_client(client);
+
+        let _ = server
+            .shutdown_and_wait(std::time::Duration::from_secs(5))
+            .await;
+        let _ = server_task.await;
     }
 
     #[test]

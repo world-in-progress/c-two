@@ -84,6 +84,15 @@ def _register_body(name: str, server_id: str) -> dict[str, object]:
     }
 
 
+def _registration_scope(base_url: str, name: str) -> dict[str, object]:
+    # Capture the full native identity from the registering relay, not a peer
+    # projection (remote entries deliberately omit local server identity).
+    route = _http_get_json(_resolve_url(base_url, name))[0]
+    return {key: route[key] for key in (
+        'name', 'server_id', 'server_instance_id', 'route_uid', 'route_revision',
+    )}
+
+
 def _http_get_json(url: str):
     with urllib.request.urlopen(url, timeout=5) as resp:
         return json.loads(resp.read())
@@ -176,7 +185,7 @@ class TestSingleRelay:
         # Unregister.
         req = _http_post(
             f"{base}/_unregister",
-            {"name": "grid", "server_id": "test-grid"},
+            _registration_scope(base, "grid"),
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
@@ -275,7 +284,7 @@ class TestTwoRelayMesh:
         # Unregister on A.
         req = _http_post(
             f"{url_a}/_unregister",
-            {"name": "net", "server_id": "net-a"},
+            _registration_scope(url_a, "net"),
         )
         urllib.request.urlopen(req, timeout=5)
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use c2_config::RelayConfig;
-use c2_ipc::{ClientIpcConfig, IpcClient, RouteBinding};
+use c2_ipc::{IpcClient, RouteBinding};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
@@ -31,6 +31,19 @@ pub struct RelayState {
     upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+    /// One shared memory context for every data-plane upstream `IpcClient`
+    /// this relay owns. Each connection's request and reassembly pools charge
+    /// this budget, so the upstream pool cannot double the relay's finite
+    /// limits by opening more connections. Short-lived registration/owner
+    /// probes keep their own explicit private contexts; this context is the
+    /// relay process's own, never a process-global cache.
+    ///
+    /// Config scope: `config.upstream_ipc` is the complete resolved policy
+    /// frozen at startup. First connections and reconnects clone that policy
+    /// and this same budget; acquisition never reloads the environment.
+    /// Control-plane attestation/watch clients use private lazy default
+    /// contexts and do not charge this data-plane budget.
+    upstream_memory_budget: c2_mem::MemoryBudget,
 }
 
 fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
@@ -119,6 +132,8 @@ impl RelayState {
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     ) -> Self {
         let owner_lease_duration = owner_lease_duration(&config);
+        let upstream_memory_budget =
+            c2_mem::MemoryBudget::from_limits(&config.upstream_ipc.memory_budget_limits());
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
@@ -126,7 +141,17 @@ impl RelayState {
             upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
+            upstream_memory_budget,
         }
+    }
+
+    /// Read-only snapshot of the relay's shared upstream memory context.
+    ///
+    /// Observing this never connects, maps, or resets accounting. Test-only
+    /// because the relay has no public stats surface yet.
+    #[cfg(test)]
+    pub fn upstream_memory_snapshot(&self) -> c2_mem::BudgetSnapshot {
+        self.upstream_memory_budget.snapshot()
     }
 
     pub fn disseminator(&self) -> &Arc<dyn crate::relay::disseminator::Disseminator> {
@@ -306,12 +331,19 @@ impl RelayState {
         };
         let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
+        // Every data-plane connection (including reconnects) uses the frozen
+        // resolved policy and the relay's one shared upstream memory context.
+        // `with_shared_budget` validates the pair before connection I/O.
+        let upstream_ipc = self.config.upstream_ipc.clone();
+        let upstream_memory_budget = self.upstream_memory_budget.clone();
 
         let lease = match self
             .conn_pool
             .acquire_with(&endpoint_key, move |endpoint| {
                 let expected = expected_for_connect.clone();
                 let route_name = route_name.clone();
+                let upstream_ipc = upstream_ipc.clone();
+                let upstream_memory_budget = upstream_memory_budget.clone();
                 async move {
                     if expected.ipc_address.as_deref() != Some(endpoint.address()) {
                         return Err(c2_ipc::IpcError::Protocol(format!(
@@ -331,8 +363,11 @@ impl RelayState {
                             expected.ipc_address
                         )));
                     }
-                    let mut client =
-                        IpcClient::with_config(endpoint.address(), ClientIpcConfig::default());
+                    let mut client = IpcClient::with_shared_budget(
+                        endpoint.address(),
+                        upstream_ipc,
+                        upstream_memory_budget,
+                    );
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -635,6 +670,15 @@ impl RelayState {
         self.clear_upstream_control_watch_unavailable(&key);
     }
 
+    /// Called by route authority while it holds the route-table write lock and
+    /// has proved that no remaining route uses this captured endpoint.
+    pub(crate) fn remove_connection_for_withdraw(
+        &self,
+        key: &UpstreamEndpointKey,
+    ) -> Option<Arc<IpcClient>> {
+        self.conn_pool.remove(key)
+    }
+
     pub(crate) fn remove_connection_if_endpoint_unused(
         &self,
         key: &UpstreamEndpointKey,
@@ -778,6 +822,7 @@ impl RelayState {
 mod tests {
     use super::*;
     use crate::relay::authority::{OwnerReplacement, RegisterPreparation};
+    use c2_config::ClientIpcConfig;
 
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
@@ -802,6 +847,289 @@ mod tests {
         abi_hash: TEST_ABI_HASH,
         signature_hash: TEST_SIGNATURE_HASH,
     };
+
+    #[test]
+    fn relay_upstream_memory_context_starts_idle_with_canonical_limits() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let snapshot = state.upstream_memory_snapshot();
+        let limits = ClientIpcConfig::default().memory_budget_limits();
+        assert_eq!(snapshot.shm.limit_bytes, limits.shm_backing_budget_bytes);
+        assert_eq!(snapshot.file.limit_bytes, limits.file_backing_budget_bytes);
+        assert_eq!(
+            snapshot.reassembly.limit_bytes,
+            limits.live_reassembly_budget_bytes
+        );
+        assert_eq!(snapshot.shm.used_bytes, 0);
+        assert_eq!(snapshot.file.used_bytes, 0);
+        assert_eq!(snapshot.reassembly.used_bytes, 0);
+        // Observation is read-only and stable.
+        assert_eq!(state.upstream_memory_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn relay_upstream_ipc_invalid_policy_is_rejected_before_bind() {
+        let mut config = RelayConfig {
+            bind: "invalid-bind".into(),
+            ..RelayConfig::default()
+        };
+        config.upstream_ipc.base.pool_enabled = false;
+        config.upstream_ipc.base.pool_prewarm_segments = 1;
+        let err = match crate::relay::RelayServer::start(config) {
+            Err(err) => err,
+            Ok(mut relay) => {
+                let _ = relay.stop();
+                panic!("invalid upstream policy must reject relay startup");
+            }
+        };
+        assert!(err.contains("upstream_ipc"), "{err}");
+        assert!(err.contains("pool_prewarm_segments"), "{err}");
+        assert!(!err.contains("Invalid bind address"), "{err}");
+    }
+
+    struct RequestTransportProbe;
+
+    impl c2_server::CrmCallback for RequestTransportProbe {
+        fn invoke(
+            &self,
+            _route_name: &str,
+            _method_idx: u16,
+            request: c2_server::RequestData,
+            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
+            let transport = match &request {
+                c2_server::RequestData::Shm {
+                    is_dedicated: true, ..
+                } => "dedicated",
+                c2_server::RequestData::Shm {
+                    is_dedicated: false,
+                    ..
+                } => "buddy",
+                c2_server::RequestData::Handle(_) => "chunked",
+                c2_server::RequestData::Inline(_) => "inline",
+            };
+            let mut lease = c2_server::RequestLease::new(request);
+            assert_eq!(lease.copy_bytes().unwrap(), [7; 32]);
+            lease
+                .release()
+                .expect("probe must release its actual request owner");
+            Ok(c2_server::ResponseMeta::Inline(
+                transport.as_bytes().to_vec(),
+            ))
+        }
+    }
+
+    // Assert policy at the live server boundary and charges on the relay's
+    // context, rather than adding an IPC config getter solely for tests.
+    async fn exercise_resolved_upstream_ipc(buddy: bool, prewarm: u32, zero_budget: bool) {
+        use c2_config::{ConfigResolver, ConfigSources, RuntimeConfigOverrides};
+        use c2_server::{
+            ConcurrencyMode, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
+        };
+
+        let mut overrides = RuntimeConfigOverrides::default();
+        overrides.client_ipc.pool_enabled = Some(buddy);
+        overrides.client_ipc.pool_prewarm_segments = Some(prewarm);
+        overrides.client_ipc.pool_segment_size = Some(65536);
+        overrides.client_ipc.max_pool_segments = Some(2);
+        overrides.client_ipc.chunk_size = Some(16);
+        overrides.client_ipc.shm_backing_budget_bytes =
+            Some(if zero_budget { 0 } else { 1_048_576 });
+        overrides.client_ipc.file_backing_budget_bytes = Some(if zero_budget { 0 } else { 32768 });
+        overrides.client_ipc.live_reassembly_budget_bytes =
+            Some(if zero_budget { 0 } else { 16384 });
+        // A 32-byte request must use the configured SHM/fallback path, whereas
+        // the default 4096-byte threshold would send it inline.
+        overrides.shm_threshold = Some(1);
+        let config = ConfigResolver::resolve_relay_server(overrides, ConfigSources::empty())
+            .unwrap()
+            .relay;
+        let state = RelayState::new(Arc::new(config), null_disseminator());
+        let address = format!(
+            "ipc://relay_policy_{}_{}_{}",
+            std::process::id(),
+            u8::from(buddy),
+            u8::from(zero_budget)
+        );
+        let server = Arc::new(
+            Server::new_with_identity(
+                &address,
+                ServerIpcConfig::default(),
+                c2_server::ServerIdentity {
+                    server_id: "policy-server".into(),
+                    server_instance_id: "policy-instance".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let route = server
+            .build_route(
+                RouteBuildSpec {
+                    name: "grid".into(),
+                    crm_ns: TEST_CRM_NS.into(),
+                    crm_name: TEST_CRM_NAME.into(),
+                    crm_ver: TEST_CRM_VER.into(),
+                    abi_hash: TEST_ABI_HASH.into(),
+                    signature_hash: TEST_SIGNATURE_HASH.into(),
+                    method_names: vec!["probe".into()],
+                    access_map: HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::ReadParallel,
+                    limits: SchedulerLimits::default(),
+                },
+                Arc::new(RequestTransportProbe),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(route).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+        let run_server = server.clone();
+        let task = tokio::spawn(async move { run_server.run().await });
+        server
+            .wait_until_responsive(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // Registration attestation is a private lazy default client. It must
+        // remain usable even when the data-plane budget is zero.
+        let mut probe = IpcClient::new(&address);
+        probe.connect().await.unwrap();
+        let contract = probe.route_contract("grid").unwrap();
+        let attestation = probe
+            .attest_route_for_registration(&contract)
+            .await
+            .unwrap();
+        let entry = match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "policy-server".into(),
+            "policy-instance".into(),
+            address.clone(),
+            TEST_CRM_NS.into(),
+            TEST_CRM_NAME.into(),
+            TEST_CRM_VER.into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            attestation.max_payload_size(),
+            attestation.route_uid().to_string(),
+            attestation.route_revision(),
+            None,
+        ) {
+            RegisterCommitResult::Registered { entry } => entry,
+            _ => panic!("live route registration failed"),
+        };
+        probe.close().await;
+        assert_eq!(state.upstream_memory_snapshot().shm.used_bytes, 0);
+
+        // A live charge on this exact context must survive connection creation
+        // and reconnect; creating another budget would lose this accounting.
+        let _charge = if zero_budget {
+            None
+        } else {
+            Some(
+                state
+                    .upstream_memory_budget
+                    .reserve(c2_mem::BudgetKind::File, 1)
+                    .unwrap(),
+            )
+        };
+        let mut previous = None;
+        for _ in 0..2 {
+            let (lease, _, binding) = match state.acquire_upstream_for_route(&entry).await {
+                Ok(acquired) => acquired,
+                Err(_) => panic!("resolved IPC policy must acquire a real client"),
+            };
+            if let Some(old) = previous.take() {
+                assert!(
+                    !Arc::ptr_eq(&old, &lease.client()),
+                    "eviction must reacquire a fresh client"
+                );
+            }
+            let snapshot = state.upstream_memory_snapshot();
+            if prewarm > 0 {
+                assert!(
+                    snapshot.shm.used_bytes > 0,
+                    "real client must prewarm the shared context"
+                );
+            }
+            assert_eq!(snapshot.file.used_bytes, u64::from(!zero_budget));
+            let response = lease
+                .client()
+                .call_bound(&binding, "probe", &[7; 32])
+                .await
+                .unwrap();
+            let expected = if zero_budget {
+                "chunked"
+            } else if buddy {
+                "buddy"
+            } else {
+                "dedicated"
+            };
+            match response {
+                c2_ipc::ResponseData::Inline(bytes) => assert_eq!(bytes, expected.as_bytes()),
+                _ => panic!("probe must return inline transport evidence"),
+            }
+            let snapshot = state.upstream_memory_snapshot();
+            assert_eq!(
+                snapshot.shm.limit_bytes,
+                if zero_budget { 0 } else { 1_048_576 }
+            );
+            assert_eq!(
+                snapshot.file.limit_bytes,
+                if zero_budget { 0 } else { 32768 }
+            );
+            assert_eq!(
+                snapshot.reassembly.limit_bytes,
+                if zero_budget { 0 } else { 16384 }
+            );
+            if zero_budget {
+                assert!(
+                    snapshot.shm.rejected_allocations > 0,
+                    "request must attempt the configured finite context"
+                );
+            } else {
+                assert!(
+                    snapshot.shm.peak_bytes > 0,
+                    "live client must charge the relay budget"
+                );
+            }
+            previous = Some(lease.client().clone());
+            drop(lease);
+            state.evict_connection("grid").unwrap().close_shared().await;
+        }
+        server
+            .shutdown_and_wait(Duration::from_secs(2))
+            .await
+            .unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_upstream_ipc_acquired_client_uses_prewarm_and_shared_budget() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            exercise_resolved_upstream_ipc(true, 1, false),
+        )
+        .await
+        .expect("live IPC regression must finish within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn relay_upstream_ipc_acquired_client_disables_buddy_on_reconnect() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            exercise_resolved_upstream_ipc(false, 0, false),
+        )
+        .await
+        .expect("live IPC regression must finish within ten seconds");
+    }
+
+    #[tokio::test]
+    async fn relay_upstream_ipc_acquired_client_obeys_zero_budget() {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            exercise_resolved_upstream_ipc(false, 0, true),
+        )
+        .await
+        .expect("live IPC regression must finish within ten seconds");
+    }
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {

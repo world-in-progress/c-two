@@ -9,9 +9,23 @@ version:       0.1.0
 publish:       false
 ```
 
-This local-candidate package is not a registry release. It reuses
+This source-only package has no crates.io release. It reuses
 `c2-contract` for release identity and `c2-core` for route, transport, retry,
 host, and lifetime behavior. It does not expose a second runtime state machine.
+
+This guide uses the shared runtime behavior of Python 0.7.0 / c3 0.3.0;
+this SDK retains its independent 0.1.0 version. See [release notes](../../docs/releases/0.7.0.md) for availability, upgrades and validation progress.
+Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain
+transactions and local endpoint maintenance. SDKs use the one OS endpoint
+derived by `LocalEndpoint::from_address`; there is no backend selector.
+See [lifecycle integration](../../docs/local-endpoint-lifecycle.md) and the
+[owned-child example](examples/owned_child.rs). Upgrade local clients, hosts and
+relays together across the old Unix endpoint namespace boundary.
+
+[IPC memory policy](../../docs/memory-policy.md) is also shared Core behavior:
+lazy buddy allocation, idle decay, finite direction-scoped backing/reassembly
+budgets and checked transport fallback. Endpoint closure does not release
+retained payload owners or their budgets.
 
 Portable payloads keep their owner-qualified name:
 
@@ -40,5 +54,4 @@ cargo run --manifest-path sdk/rust/Cargo.toml --example host
 ```
 
 Both examples create an in-process host and perform a real route-bound IPC
-call. They use the generated seam directly only because Task 6 supplies the
-actual generated client and typed service modules.
+call. Their generated client and typed service modules use the SDK generated seam.

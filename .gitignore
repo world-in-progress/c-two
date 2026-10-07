@@ -83,7 +83,8 @@ docs/_build/
 
 # PyBuilder
 .pybuilder/
-target/
+target
+node_modules/
 # The standalone Rust SDK lockfile is local-candidate evidence and is tracked.
 !sdk/rust/Cargo.lock
 

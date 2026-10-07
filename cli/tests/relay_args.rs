@@ -12,7 +12,13 @@ fn relay_help_exposes_mesh_and_idle_options() {
         .stdout(predicate::str::contains("--seeds"))
         .stdout(predicate::str::contains("--relay-id"))
         .stdout(predicate::str::contains("--advertise-url"))
-        .stdout(predicate::str::contains("--upstream"));
+        .stdout(predicate::str::contains("--upstream"))
+        .stdout(predicate::str::contains("--ipc-pool-enabled"))
+        .stdout(predicate::str::contains("--ipc-shm-backing-budget-bytes"))
+        .stdout(predicate::str::contains("--ipc-file-backing-budget-bytes"))
+        .stdout(predicate::str::contains(
+            "--ipc-live-reassembly-budget-bytes",
+        ));
 }
 
 #[test]
@@ -204,4 +210,140 @@ fn relay_cli_flag_overrides_process_env() {
         .assert()
         .success()
         .stdout(predicate::str::contains("bind=127.0.0.1:9494"));
+}
+
+// Each command owns its environment; no process-global mutation races parallel tests.
+fn isolated_relay_command() -> Command {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    for (key, _) in std::env::vars() {
+        if key.starts_with("C2_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env("C2_ENV_FILE", "");
+    cmd
+}
+
+#[test]
+fn relay_ipc_dry_run_reports_canonical_defaults() {
+    isolated_relay_command()
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ipc_pool_enabled=true"))
+        .stdout(predicate::str::contains("ipc_pool_prewarm_segments=0"))
+        .stdout(predicate::str::contains(
+            "ipc_shm_backing_budget_bytes=8589934592",
+        ))
+        .stdout(predicate::str::contains(
+            "ipc_file_backing_budget_bytes=17179869184",
+        ))
+        .stdout(predicate::str::contains(
+            "ipc_live_reassembly_budget_bytes=8589934592",
+        ));
+}
+
+#[test]
+fn relay_ipc_flags_override_env_and_accept_zero_budgets() {
+    isolated_relay_command()
+        .env("C2_IPC_POOL_ENABLED", "true")
+        .env("C2_IPC_SHM_BACKING_BUDGET_BYTES", "100")
+        .env("C2_IPC_FILE_BACKING_BUDGET_BYTES", "200")
+        .env("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "300")
+        .args([
+            "relay",
+            "--ipc-pool-enabled",
+            "false",
+            "--ipc-shm-backing-budget-bytes",
+            "0",
+            "--ipc-file-backing-budget-bytes",
+            "0",
+            "--ipc-live-reassembly-budget-bytes",
+            "0",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ipc_pool_enabled=false"))
+        .stdout(predicate::str::contains("ipc_shm_backing_budget_bytes=0"))
+        .stdout(predicate::str::contains("ipc_file_backing_budget_bytes=0"))
+        .stdout(predicate::str::contains(
+            "ipc_live_reassembly_budget_bytes=0",
+        ));
+}
+
+#[test]
+fn relay_ipc_env_overrides_dotenv_and_reports_prewarm() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("relay.env");
+    std::fs::write(&path, "C2_IPC_POOL_ENABLED=false\nC2_IPC_POOL_PREWARM_SEGMENTS=0\nC2_IPC_SHM_BACKING_BUDGET_BYTES=100\nC2_IPC_FILE_BACKING_BUDGET_BYTES=200\nC2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES=300\n").unwrap();
+    isolated_relay_command()
+        .env("C2_ENV_FILE", path)
+        .env("C2_IPC_POOL_ENABLED", "true")
+        .env("C2_IPC_POOL_PREWARM_SEGMENTS", "1")
+        .env("C2_IPC_SHM_BACKING_BUDGET_BYTES", "400")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ipc_pool_enabled=true"))
+        .stdout(predicate::str::contains("ipc_pool_prewarm_segments=1"))
+        .stdout(predicate::str::contains("ipc_shm_backing_budget_bytes=400"))
+        .stdout(predicate::str::contains(
+            "ipc_file_backing_budget_bytes=200",
+        ))
+        .stdout(predicate::str::contains(
+            "ipc_live_reassembly_budget_bytes=300",
+        ));
+}
+
+#[test]
+fn relay_ipc_rejects_disabled_pool_with_prewarm_before_listening() {
+    // Deliberately invalid bind distinguishes config rejection from listener errors.
+    isolated_relay_command()
+        .env("C2_IPC_POOL_PREWARM_SEGMENTS", "1")
+        .args([
+            "relay",
+            "--bind",
+            "invalid-bind",
+            "--ipc-pool-enabled",
+            "false",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("pool_prewarm_segments"))
+        .stderr(predicate::str::contains("failed to start relay").not());
+}
+
+#[test]
+fn relay_ipc_rejects_malformed_env_before_listening() {
+    for (key, value) in [
+        ("C2_IPC_POOL_ENABLED", "invalid"),
+        ("C2_IPC_SHM_BACKING_BUDGET_BYTES", "-1"),
+        ("C2_IPC_FILE_BACKING_BUDGET_BYTES", "18446744073709551616"),
+        ("C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES", "invalid"),
+    ] {
+        isolated_relay_command()
+            .env(key, value)
+            .args(["relay", "--bind", "invalid-bind"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(key))
+            .stderr(predicate::str::contains("failed to start relay").not());
+    }
+}
+
+#[test]
+fn relay_ipc_rejects_malformed_cli_values() {
+    for (flag, value) in [
+        ("--ipc-pool-enabled", "invalid"),
+        ("--ipc-shm-backing-budget-bytes", "-1"),
+        ("--ipc-file-backing-budget-bytes", "18446744073709551616"),
+        ("--ipc-live-reassembly-budget-bytes", "invalid"),
+    ] {
+        isolated_relay_command()
+            .args(["relay", &format!("{flag}={value}"), "--dry-run"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unexpected argument").not());
+    }
 }

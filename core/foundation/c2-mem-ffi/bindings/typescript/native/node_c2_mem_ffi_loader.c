@@ -777,6 +777,7 @@ static napi_value response_pool_release(napi_env env, napi_callback_info info) {
 }
 
 static napi_value local_endpoint(napi_env env, napi_callback_info info) {
+    /* The native platform owns automatic local endpoint derivation. */
     size_t argc = 1;
     napi_value args[1];
     C2MemFfiNodeSymbols *symbols = NULL;
