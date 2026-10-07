@@ -2,9 +2,9 @@
 
 状态更新：2026-10-07；产品排序沿用 7 月设计优先级。
 
-这是 C-Two 0.x 的当前维护路线图，以 Python 0.7.0 / c3 0.3.0 为产品基线。FastDB 固定 0.2.1。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。版本可用性与发行门禁见[发布准备页](releases/0.7.0.md)。
+这是 C-Two 0.x 的当前维护路线图，以 Python 0.7.0 / c3 0.3.0 为产品基线。FastDB 固定 0.2.1。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。版本可用性与发行门禁见[发布说明](releases/0.7.0.md)。
 
-当前端点、生命周期与内存源码证据见[统一验收](reports/canonical-local-endpoint-validation.md)，用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。这是开发源码验证，不替代尚待执行的 30 wheel + sdist 与 5 CLI target 正式候选矩阵。
+当前端点、生命周期与内存源码证据见[统一验收](reports/canonical-local-endpoint-validation.md)，用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。这是开发源码验证；30 wheel + sdist 与 5 CLI target 正式候选矩阵保留各自绑定源码的发行收据。
 
 Portable-payload 架构与历史本地候选参考为：
 
@@ -34,7 +34,7 @@ Portable-payload 架构与历史本地候选参考为：
 | Artifact composition | Rust `c2-codegen` 委托 nested specification、保留 structured FastDB error、校验 identity/hash、确定性组合 C-Two 与 FastDB artifacts，并在不存在的 destination 原子发布完整 regular-file tree。 |
 | Language projection | 用户面 Rust SDK 为 `c-two` / `c_two`，与 Python 复用 `c2-core` runtime；generated Rust/Python artifact 已 compile/import 并完成双向调用。生成的 TypeScript 已执行严格 12 行 Node direct/relay 互操作；浏览器 runtime 仍未闭环。 |
 | Runtime payload proof | Record、object-graph 与 no-payload method 已通过 Rust client → Python resource、Python client → Rust resource、Rust client → Rust resource。覆盖 scalar/`str`/`wstr`/bytes/list/null、sharing/cycle、materialize、structured mismatch error 与 checked invalidation。 |
-| 本地端点与生命周期 | 唯一 OS 派生、默认 Persistent、显式 OwnerBound 与精确/scoped 原生维护已实现并通过 hosted 验证；发布进度见准备页。 |
+| 本地端点与生命周期 | 唯一 OS 派生、默认 Persistent、显式 OwnerBound 与精确/scoped 原生维护已实现并通过 hosted 验证；发行门禁与证据见发布说明。 |
 | IPC 内存策略 | lazy buddy、idle decay 与三个有限方向预算已实现；HTTP 缓冲治理、更广的取消/队列遥测仍未闭环。 |
 | 真实 backing 边界 | 已证明的 Rust/Python receive adapter 是 copy-backed。`cc.hold()` 与 borrowed-input policy 负责 owner/lease invalidation，不代表已直接构造到最终 response shared memory。 |
 | Python-only prototype | 没有 portable binding 的普通 Python method 仍可在本地使用 pickle；portable descriptor export/codegen 会诊断并拒绝它们。 |
@@ -47,7 +47,7 @@ Portable-payload 架构与历史本地候选参考为：
 
 | 顺序 | Workstream | 为何在这里 | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Immutable FastDB package distribution | FastDB 0.2.1 已发布；协调的 Python 0.7.0 / c3 0.3.0 发行门禁及官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
+| 1 | Immutable FastDB package distribution | FastDB 0.2.1 已发布；Python 0.7.0 / c3 0.3.0 使用同一源码的协调发行门禁；官方 C-Two Rust/TypeScript 分发仍未闭环。 | 经授权的 FastDB Rust/Python/TypeScript artifacts 可按 immutable identity 获取；C-Two 固定它们并通过 clean-environment package、codegen、runtime 与 interoperability gates。 |
 | 2 | Contract compatibility | Exact release matching 是安全底线；semver/range 规则必须建立在稳定 release content 上。 | Rust-owned 规则拒绝 ambiguity 与 ABI-incompatible match，并在各 SDK 投影同一行为。 |
 | 3 | Call metadata 与 admission hooks | 上层需要 transport-consistent identity/policy mechanism，但 policy 不属于 C-Two。 | Thread-local、IPC 与 relay call 携带有界 metadata；hook 可准入/拒绝；下游系统仍是 policy authority。 |
 | 4 | Dry-run mechanism | Impact analysis 依赖同一个显式 metadata/admission boundary。 | Dry-run 明确评估内容、禁止的副作用与 unsupported method failure。 |

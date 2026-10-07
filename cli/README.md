@@ -3,7 +3,7 @@
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
 This guide describes **c3 0.3.0**, paired with Python C-Two **0.7.0**. See
-[release preparation](../docs/releases/0.7.0.md) for version availability, upgrades
+[release notes](../docs/releases/0.7.0.md) for version availability, upgrades
 and validation progress.
 
 ## Scope
@@ -232,7 +232,7 @@ python tools/dev/generate_banner.py
 
 ## Release
 
-The [c3 0.3.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) uses the following binary target convention. Availability and candidate gates are tracked in [release preparation](../docs/releases/0.7.0.md):
+The [c3 0.3.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) uses the following binary target convention. Availability and candidate gates are tracked in [release notes](../docs/releases/0.7.0.md):
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`

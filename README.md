@@ -33,14 +33,14 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 ## Version and runtime
 
-This guide describes Python C-Two **0.7.0** / c3 **0.3.0**. See [release preparation](docs/releases/0.7.0.md) for version availability, upgrades and validation progress.
+This guide describes Python C-Two **0.7.0** / c3 **0.3.0**. See [release notes](docs/releases/0.7.0.md) for version availability, upgrades and validation progress.
 
 | Area | Capability and boundary |
 | --- | --- |
 | Python | Typed CRM, same-process calls, portable FastDB payloads and native IPC. |
 | c3 | Standalone relay, contract tooling and scoped endpoint maintenance; Unix and Windows x64 installation entries are below. |
 | FastDB dependency | [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) is published; Python and Rust dependencies are pinned to 0.2.1, with native source builds pinned to `4f99f86a662b0e950a0dd29800c25a1c9fca4def`. |
-| Source validation | [Canonical validation](docs/reports/canonical-local-endpoint-validation.md) records Linux and Windows Server 2022/2025 x64 CPython 3.12 source gates plus macOS component evidence and its rerun limits. Its exact source pair is C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`; this does not prove all 0.7 release packages/ABIs. Windows 11 desktop, ARM64 and services remain unvalidated. |
+| Source validation | [Canonical validation](docs/reports/canonical-local-endpoint-validation.md) records Linux and Windows Server 2022/2025 x64 CPython 3.12 source gates plus macOS component evidence and its rerun limits. Its exact source pair is C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`; this does not prove all 0.7 release packages/ABIs. Windows 11 desktop, Windows ARM64 and services remain unvalidated. |
 | Rust / TypeScript | Rust SDK, Core and TypeScript package versions remain 0.1.0; no C-Two crates.io or npm release. Rust SDK has `publish = false`; generated Node interoperability is proven, browser runtime remains open. |
 | Benchmarks | No reviewed throughput benchmark exists for the portable `Payload` API. Historical numbers from removed integrations are not valid claims for the current architecture. |
 
@@ -62,7 +62,7 @@ In an activated environment, select the version explicitly; `fastdb4py==0.2.1` i
 uv pip install 'c-two==0.7.0'
 ```
 
-Use the same command in Windows PowerShell. See [release preparation](docs/releases/0.7.0.md) for package availability and the [Windows guide](docs/windows-native-usage.md) for platform instructions.
+Use the same command in Windows PowerShell. See [release notes](docs/releases/0.7.0.md) for package availability and the [Windows guide](docs/windows-native-usage.md) for platform instructions.
 
 ### Development checkout
 
@@ -107,7 +107,7 @@ environment so the test command does not rebuild the extension.
 
 ### c3 CLI: Linux / macOS
 
-Python 0.7.0 pairs with c3 0.3.0. Availability of the [release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) is tracked in [release preparation](docs/releases/0.7.0.md). Pass the version explicitly; the installer verifies the checksum:
+Python 0.7.0 pairs with c3 0.3.0. Availability of the [release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) is tracked in [release notes](docs/releases/0.7.0.md). Pass the version explicitly; the installer verifies the checksum:
 
 ```bash
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
@@ -363,7 +363,7 @@ c3 contract codegen rust geometry.contract.json --out-dir generated-rust   # als
 | Repository guide for agents and maintainers | [AGENTS.md](AGENTS.md) |
 | Roadmap | [docs/roadmap.md](docs/roadmap.md) · [中文](docs/roadmap.zh-CN.md) |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) |
-| 0.7.0 / c3 0.3.0 preparation and upgrade | [docs/releases/0.7.0.md](docs/releases/0.7.0.md) |
+| 0.7.0 / c3 0.3.0 release and upgrade | [docs/releases/0.7.0.md](docs/releases/0.7.0.md) |
 | Local endpoint lifecycle | [docs/local-endpoint-lifecycle.md](docs/local-endpoint-lifecycle.md) |
 | IPC memory policy | [docs/memory-policy.md](docs/memory-policy.md) |
 | Windows build and usage | [docs/windows-native-usage.md](docs/windows-native-usage.md) |

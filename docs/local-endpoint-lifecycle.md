@@ -1,6 +1,6 @@
 # 本地端点生命周期与运行器接入
 
-本文以 Python 0.7.0 / c3 0.3.0 为使用基线。版本可用性、升级与验证进度见[发布准备页](releases/0.7.0.md)。
+本文以 Python 0.7.0 / c3 0.3.0 为使用基线。版本可用性、升级与验证进度见[发布说明](releases/0.7.0.md)。
 
 本地端点只由 Rust c2-config::LocalEndpoint::from_address 按平台唯一派生。Unix 自动使用 `/tmp/c2-<uidhex>/v2.2/<sha>.sock`，包含当前用户私有托管目录、nonce gate/marker、监听租约结束前对原 gate inode 的 pin 和可退休端点租约；Windows 自动使用当前登录 SID 的 Named Pipe 及独立非继承内核监听租约。SDK、relay 和 c3 没有协议选择开关，调用方只传逻辑 ipc:// 地址。凭据中的 managed-v2 / named-pipe 仅为格式元数据，不能用于选择后端。旧 Unix 地址映射、永久每地址锁与绑定/回收分支，以及 `endpoint_protocol`、`C2_IPC_ENDPOINT_PROTOCOL`、`with_protocol` 选择器均已移除。
 
@@ -14,6 +14,6 @@ cc.shutdown(timeout=...) 返回原生结构化完成结果；直连 IPC admin sh
 
 需要续扫时使用 cc.sweep_endpoints(addresses=[本次运行的逻辑地址], max_entries=64, max_ms=10) 的 context manager 和 next_batch()；只在原生报告 round_complete 时记为本轮完成，中断或命名空间变化单独处理。c3 endpoint inspect/reap/sweep 调用同一原生机制，sweep 可重复传 --address。运行器不拼 OS 路径，不直接 unlink。
 
-对象替换、未知历史端点、损坏记录与部分初始化均保守报告 unverified，不能凭年龄、PID 或连接失败删除。从 0.6 升级时，同一通信组的 client、resource server 与 c3 必须同步替换；旧进程端点不会迁移，0.6/0.7 本地路径不能默认互通。升级不删除旧 `/tmp/c_two_ipc` 历史数据，其清理需要独立范围和授权。Windows 端点回收报告内核管理或 not-applicable。初始登记任意位置崩溃后的自动恢复不在保证范围内；Windows 11 桌面等未验证环境见[发布准备页](releases/0.7.0.md)。
+对象替换、未知历史端点、损坏记录与部分初始化均保守报告 unverified，不能凭年龄、PID 或连接失败删除。从 0.6 升级时，同一通信组的 client、resource server 与 c3 必须同步替换；旧进程端点不会迁移，0.6/0.7 本地路径不能默认互通。升级不删除旧 `/tmp/c_two_ipc` 历史数据，其清理需要独立范围和授权。Windows 端点回收报告内核管理或 not-applicable。初始登记任意位置崩溃后的自动恢复不在保证范围内；Windows 11 桌面等未验证环境见[发布说明](releases/0.7.0.md)。
 
 Rust example: [owned_child](../sdk/rust/examples/owned_child.rs). Current execution status: [canonical endpoint validation](reports/canonical-local-endpoint-validation.md). Prior optional-mechanism evidence remains [historical](reports/local-endpoint-final-validation.md).

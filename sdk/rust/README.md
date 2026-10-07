@@ -14,7 +14,7 @@ This source-only package has no crates.io release. It reuses
 host, and lifetime behavior. It does not expose a second runtime state machine.
 
 This guide uses the shared runtime behavior of Python 0.7.0 / c3 0.3.0;
-this SDK retains its independent 0.1.0 version. See [release preparation](../../docs/releases/0.7.0.md) for availability, upgrades and validation progress.
+this SDK retains its independent 0.1.0 version. See [release notes](../../docs/releases/0.7.0.md) for availability, upgrades and validation progress.
 Rust `c2-core` owns default `Persistent`, explicit `OwnerBound`, shutdown drain
 transactions and local endpoint maintenance. SDKs use the one OS endpoint
 derived by `LocalEndpoint::from_address`; there is no backend selector.

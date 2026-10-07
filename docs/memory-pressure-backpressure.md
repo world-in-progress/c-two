@@ -1,6 +1,6 @@
 # IPC Memory Pressure And Backpressure
 
-This guide describes Python 0.7.0 / c3 0.3.0. See [release preparation](releases/0.7.0.md) for version availability, upgrades and validation progress, and [memory policy](memory-policy.md) for configuration and retained-owner accounting.
+This guide describes Python 0.7.0 / c3 0.3.0. See [release notes](releases/0.7.0.md) for version availability, upgrades and validation progress, and [memory policy](memory-policy.md) for configuration and retained-owner accounting.
 
 ## Current Model
 

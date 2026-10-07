@@ -1,6 +1,6 @@
 # C-Two 传输内存策略用户指南
 
-本文说明 Python 0.7.0 / c3 0.3.0 的 IPC 内存策略。版本可用性、升级与验证进度见[发布准备页](releases/0.7.0.md)。配置默认与校验以 Rust resolver 为唯一权威，Python 仅提供类型化覆盖门面；实现背景见[内存优化计划](plans/2026-09-26-memory-policy.md)。
+本文说明 Python 0.7.0 / c3 0.3.0 的 IPC 内存策略。版本可用性、升级与验证进度见[发布说明](releases/0.7.0.md)。配置默认与校验以 Rust resolver 为唯一权威，Python 仅提供类型化覆盖门面；实现背景见[内存优化计划](plans/2026-09-26-memory-policy.md)。
 
 ## 1. 三个有限预算单元
 

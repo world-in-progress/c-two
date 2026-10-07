@@ -3,7 +3,7 @@
 The native Windows backend uses byte-mode Named Pipes for `ipc://` control traffic and named file mappings for shared payload memory. It runs within one logon session under that session's SID. Ordinary SDK code continues to use logical `ipc://` addresses; do not construct pipe or mapping names in an SDK. HTTP relay still provides the network path.
 
 This guide describes Python C-Two **0.7.0** / c3 **0.3.0** on Windows x64.
-See [release preparation](releases/0.7.0.md) for package and asset availability,
+See [release notes](releases/0.7.0.md) for package and asset availability,
 coordinated upgrades and validation progress. FastDB is pinned to 0.2.1.
 
 ## Install Python and c3
@@ -80,4 +80,4 @@ The [canonical report](reports/canonical-local-endpoint-validation.md) records W
 
 The full hosted gate additionally prepares Node 22, Ninja, Git Bash and Emscripten 5.0.2 for generated TypeScript and native Node tests. Run the same workflow for complete evidence rather than treating a local Python import as equivalent coverage.
 
-Non-administrator token execution is verified on both hosted runners. Windows 11 desktop, Windows services, ARM64, the complete 0.7 Python ABI candidate matrix and a real Windows/Linux relay link remain separate coverage targets. Their status is recorded in [the implementation report](windows-native-implementation.md); a Windows Server x64 result does not prove those environments.
+Non-administrator token execution is verified on both hosted runners. Windows 11 desktop, Windows services, Windows ARM64 and a real Windows/Linux relay link remain separate coverage targets. The coordinated Python ABI candidate matrix is described in the release notes. Their status is recorded in [the implementation report](windows-native-implementation.md); a Windows Server x64 result does not prove those environments.

@@ -33,14 +33,14 @@ C-Two 是面向分布式科学计算的 resource-oriented RPC runtime。它不�
 
 ## 版本与能力
 
-本文以 Python C-Two **0.7.0** / c3 **0.3.0** 为使用基线。版本可用性、升级与验证进度见[发布准备页](docs/releases/0.7.0.md)。
+本文以 Python C-Two **0.7.0** / c3 **0.3.0** 为使用基线。版本可用性、升级与验证进度见[发布说明](docs/releases/0.7.0.md)。
 
 | 方面 | 能力与边界 |
 | --- | --- |
 | Python | typed CRM、同进程调用、portable FastDB 载荷与原生 IPC。 |
 | c3 | 独立 relay、契约工具与 scoped 端点维护；Unix 与 Windows x64 安装入口见下文。 |
 | FastDB 依赖 | [FastDB 0.2.1](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1) 已发布；Python 与 Rust 依赖固定 0.2.1，原生源码构建固定 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`。 |
-| 源码验证 | [统一验收](docs/reports/canonical-local-endpoint-validation.md)记录 Linux、Windows Server 2022/2025 x64 CPython 3.12 源码门禁，以及 macOS 组件证据与重跑边界。确切源码组合为 C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，不证明全部 0.7 正式包/ABI；Windows 11 桌面、ARM64 与服务仍未验证。 |
+| 源码验证 | [统一验收](docs/reports/canonical-local-endpoint-validation.md)记录 Linux、Windows Server 2022/2025 x64 CPython 3.12 源码门禁，以及 macOS 组件证据与重跑边界。确切源码组合为 C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` / FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，不证明全部 0.7 正式包/ABI；Windows 11 桌面、Windows ARM64 与服务仍未验证。 |
 | Rust / TypeScript | Rust SDK、Core 与 TypeScript 包仍为 0.1.0，无 C-Two crates.io 或 npm 发布。Rust SDK 的 `publish = false`；已证明生成的 Node 互操作，浏览器 runtime 仍未闭环。 |
 | 基准测试 | portable `Payload` API 尚无经过评审的吞吐基准。来自已移除集成的历史数字不能作为当前架构的性能声明。 |
 
@@ -62,7 +62,7 @@ IPC buddy 池默认惰性分配，空闲时可衰减到零映射；每个 runtim
 uv pip install 'c-two==0.7.0'
 ```
 
-Windows PowerShell 使用相同命令。包可用性见[发布准备页](docs/releases/0.7.0.md)，Windows 操作见[Windows 指南](docs/windows-native-usage.md)。
+Windows PowerShell 使用相同命令。包可用性见[发布说明](docs/releases/0.7.0.md)，Windows 操作见[Windows 指南](docs/windows-native-usage.md)。
 
 ### 开发环境（源码 checkout）
 
@@ -107,7 +107,7 @@ uv python install 3.10
 
 ### c3 CLI：Linux / macOS
 
-Python 0.7.0 配套 c3 0.3.0；[发布入口](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0)的当前可用性见[准备页](docs/releases/0.7.0.md)。显式传版本，安装器会校验 checksum：
+Python 0.7.0 配套 c3 0.3.0；[发布入口](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0)的当前可用性见[发布说明](docs/releases/0.7.0.md)。显式传版本，安装器会校验 checksum：
 
 ```bash
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
@@ -362,7 +362,7 @@ c3 contract codegen rust geometry.contract.json --out-dir generated-rust   # 亦
 | 面向 agent 与维护者的仓库指南 | [AGENTS.md](AGENTS.md) |
 | 路线图 | [docs/roadmap.md](docs/roadmap.md) · [中文](docs/roadmap.zh-CN.md) |
 | 变更日志 | [CHANGELOG.md](CHANGELOG.md) |
-| 0.7.0 / c3 0.3.0 准备与升级 | [docs/releases/0.7.0.md](docs/releases/0.7.0.md) |
+| 0.7.0 / c3 0.3.0 发布与升级 | [docs/releases/0.7.0.md](docs/releases/0.7.0.md) |
 | 本地端点生命周期 | [docs/local-endpoint-lifecycle.md](docs/local-endpoint-lifecycle.md) |
 | IPC 内存策略 | [docs/memory-policy.md](docs/memory-policy.md) |
 | Windows 构建与使用 | [docs/windows-native-usage.md](docs/windows-native-usage.md) |

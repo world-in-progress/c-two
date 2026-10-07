@@ -2,9 +2,9 @@
 
 ## Current status (2026-10-07)
 
-Python c-two 0.6.0 and c3 0.2.0 are published with Windows x64 distribution;
-FastDB 0.2.1 is the current official dependency. Python 0.7.0 / c3 0.3.0 remain
-unpublished targets with manifests unchanged. The current
+Python c-two 0.7.0 and c3 0.3.0 are the coordinated runtime baseline,
+with FastDB 0.2.1 as the official dependency. The release notes describe the
+formal package gates and source manifest. The retained development
 [canonical validation](reports/canonical-local-endpoint-validation.md) binds
 C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` and FastDB
 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`:
@@ -18,8 +18,8 @@ Windows uses one current-logon SID Named Pipe backend with an independent
 non-inheritable listener kernel lease. Rust owns endpoint derivation,
 Persistent/OwnerBound lifecycle, drain and maintenance; credential protocol
 values are format metadata. See [usage](windows-native-usage.md),
-[lifecycle](local-endpoint-lifecycle.md) and [0.7 preparation](releases/0.7.0.md).
-The full target release matrix and extra environments remain separate work.
+[lifecycle](local-endpoint-lifecycle.md) and [0.7 release notes](releases/0.7.0.md).
+Formal release-package validation is separate from this development evidence.
 
 ## Historical implementation record
 
@@ -80,4 +80,4 @@ This contract must be proven by a test retaining an old peer mapping while the p
 
 ## Outstanding environment coverage
 
-Windows Server 2022/2025 x64 hosted execution and non-administrator consumers are verified. Windows 11 desktop, Windows services, ARM64, the full 0.7 native Windows Python ABI matrix and a real Windows/Linux two-machine relay remain separate, unexecuted targets. Native wheel execution here uses CPython 3.12; minimum-supported Python 3.10 coverage is a syntax check. No result is inferred for these other environments from the hosted pass.
+Windows Server 2022/2025 x64 hosted execution and non-administrator consumers are verified. Windows 11 desktop, Windows services, Windows ARM64 and a real Windows/Linux two-machine relay remain separate, unexecuted targets. Development wheel execution here uses CPython 3.12; minimum-supported Python 3.10 coverage here is a syntax check. The coordinated 0.7 package matrix executes its own Python ABI gates, recorded with the release manifest. No result is inferred for these other environments from the hosted pass.

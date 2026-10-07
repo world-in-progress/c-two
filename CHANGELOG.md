@@ -4,10 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — target Python 0.7.0 / c3 0.3.0
+## [0.7.0] — companion c3 0.3.0
 
-These versions are in preparation. Version metadata is set to 0.7.0 / 0.3.0;
-publication remains pending. See [preparation and upgrade notes](docs/releases/0.7.0.md).
+This entry describes Python `c-two` 0.7.0 and its companion CLI `c3` 0.3.0.
+See the [release and upgrade notes](docs/releases/0.7.0.md) for installation,
+migration requirements and the release evidence.
 
 ### Added
 
@@ -34,7 +35,8 @@ publication remains pending. See [preparation and upgrade notes](docs/releases/0
 - [The source validation](docs/reports/canonical-local-endpoint-validation.md)
   records Linux and Windows Server 2022/2025 gates, portable matrices and
   installed-wheel consumers. These are development artifacts, not published
-  0.7 packages. The complete target release matrices remain pending.
+  0.7 packages. The formal release retains its own source-bound candidate
+  manifest and promotion evidence with the [c3 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0).
 
 ## [0.6.0] — 2026-09-25
 
@@ -49,7 +51,7 @@ remains source-only; this entry does not imply a C-Two crates.io or npm release.
 
 The following record describes the earlier local candidate and its exact input
 commits. Its publication statements concern that candidate, not the later 0.6.0
-release or the current 0.7 preparation.
+release or the 0.7 release.
 
 ### Added
 
