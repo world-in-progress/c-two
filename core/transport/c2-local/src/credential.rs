@@ -7,9 +7,10 @@
 //! value in memory only. It never touches the filesystem, never creates a
 //! lock, and never claims that the described endpoint exists.
 //!
-//! The logical [`LocalEndpoint`] is always rebuilt from the recorded address
-//! and protocol through the `c2-config` derivation, so the OS path in a file
-//! is never accepted as authority. A record that cannot be parsed strictly is
+//! The logical [`LocalEndpoint`] is rebuilt from the recorded address through
+//! the platform's sole `c2-config` derivation. Recorded protocol metadata must
+//! match that backend; an OS path in a file is never accepted as authority.
+//! A record that cannot be parsed strictly is
 //! rejected rather than upgraded: an unknown record never becomes a UUID
 //! incarnation credential.
 

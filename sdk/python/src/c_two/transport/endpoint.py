@@ -117,8 +117,9 @@ def inspect_endpoint(address: str) -> dict[str, Any]:
 def reap_endpoint(address: str, credential: EndpointCredential) -> dict[str, Any]:
     """Reap the exact endpoint object named by ``credential``.
 
-    The protocol used to derive the endpoint comes from the credential, not
-    from the process default. A credential describing another endpoint is
+    Rust derives the endpoint from its address using the current OS backend.
+    Credential format metadata must match that backend and cannot select it.
+    A credential describing another endpoint is
     reported as ``'stale-target'`` and is never probed against this endpoint's
     namespace. A decoded credential never removes a newer native incarnation:
     the native identity check compares the recorded incarnation and reports

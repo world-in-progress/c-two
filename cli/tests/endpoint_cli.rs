@@ -317,11 +317,8 @@ fn reap_rejects_a_non_utf8_credential_file() {
         .stderr(predicate::str::contains("not valid UTF-8"));
 }
 
-/// The default protocol is the configured process policy, not a build-time
-/// constant, and an explicit `--protocol` always wins over it.
-
-/// `reap` derives the address with the protocol the credential records, so a
-/// managed credential is not misread as stale under a legacy process policy.
+/// `reap` validates the credential against the sole native endpoint derived
+/// from its logical address; format metadata cannot select another backend.
 #[test]
 fn reap_uses_the_native_credential_endpoint() {
     #[cfg(unix)]

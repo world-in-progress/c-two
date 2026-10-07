@@ -3,14 +3,14 @@
 //! This module is a thin projection, not a second implementation. Every
 //! decision that matters is made in Rust:
 //!
-//! * the OS endpoint is derived from the logical address and protocol by
+//! * the OS endpoint is derived from the logical address and current platform by
 //!   `c2-config::LocalEndpoint`, never by probing a path in Python;
 //! * credentials are parsed and encoded by the one Rust codec
 //!   (`EndpointCredential::from_json` / `to_json`), so Python never owns a
 //!   field table, never assembles a `LocalEndpoint`, and never patches a
 //!   credential;
-//! * `reap` uses the protocol the credential itself records and the native
-//!   identity check decides the outcome; the logical address is only compared
+//! * `reap` validates the credential against that native backend and the
+//!   identity check decides the outcome; the logical address is compared
 //!   so a credential for another endpoint is a `stale-target` instead of a
 //!   silent cross-endpoint probe;
 //! * at most one maintenance sweep exists per process, and the lease is taken
