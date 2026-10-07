@@ -6,8 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased] — target Python 0.7.0 / c3 0.3.0
 
-These versions are in preparation; package manifests and published packages have
-not changed. See [preparation and upgrade notes](docs/releases/0.7.0.md).
+These versions are in preparation. Version metadata is set to 0.7.0 / 0.3.0;
+publication remains pending. See [preparation and upgrade notes](docs/releases/0.7.0.md).
 
 ### Added
 
