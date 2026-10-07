@@ -4,19 +4,47 @@ C-Two exposes stateful Python resources through typed CRM contracts over
 same-process calls, local IPC, or an external HTTP relay. This package projects
 the shared Rust runtime into Python.
 
-This source branch prepares Python 0.6.0 and c3 0.2.0; neither candidate has been
-published yet. FastDB 0.2.1 is published and is the exact package dependency.
-See the [project introduction and quickstart](https://github.com/Dsssyc/c-two/blob/dev-feature/README.md)
-and its [Chinese edition](https://github.com/Dsssyc/c-two/blob/dev-feature/README.zh-CN.md).
+[Python c-two 0.6.0](https://pypi.org/project/c-two/0.6.0/) and
+[c3 0.2.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.2.0)
+are published, including Windows x64 wheels and CLI binaries. Install the
+published Python runtime with `uv pip install c-two` in an activated environment.
+FastDB 0.2.1 is the exact published package dependency.
+See the [project introduction and quickstart](https://github.com/world-in-progress/c-two/blob/main/README.md)
+and its [Chinese edition](https://github.com/world-in-progress/c-two/blob/main/README.zh-CN.md).
 
-Local IPC uses Unix domain sockets or Windows Named Pipes. The earlier Windows
-source pair passed Windows Server 2022/2025 x64 tests; the updated release
-candidate still requires its own CI results. Windows 11 desktop, ARM64, and
-Windows services are not covered by that evidence.
+Current development targets Python 0.7.0 and c3 0.3.0; neither target is
+published, and manifests still identify 0.6.0 / 0.2.0. Release/documentation work on local
+`socu/local-endpoint-lifecycle` has not been pushed or merged into canonical `main`.
+The fork source-validation branch `socu/local-endpoint-validation` provides the
+tested mechanisms; use it or a matching development artifact pair. The 0.7
+preparation and upgrade draft is `docs/releases/0.7.0.md` in the documentation checkout.
+
+Local IPC uses Unix domain sockets or Windows Named Pipes. Current source
+passed Linux and Windows Server 2022/2025 x64 hosted gates at the source pair in
+the [Linux](https://github.com/Dsssyc/c-two/actions/runs/37559074669) and
+[Windows](https://github.com/Dsssyc/c-two/actions/runs/37559074657) runs:
+C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` and FastDB
+`4f99f86a662b0e950a0dd29800c25a1c9fca4def`. The local summary is
+`docs/reports/canonical-local-endpoint-validation.md`.
+These development wheels still carry version 0.6.0; they do not prove the 0.7
+release matrix. Windows 11 desktop, ARM64 and services remain unvalidated.
+
+The 0.7 source removes endpoint backend selectors and changes the Unix local
+namespace; upgrade clients, resource servers and c3 together. Rust owns default
+`Persistent` and explicit `OwnerBound` lifecycle, shutdown completion and scoped
+endpoint maintenance. Follow the lifecycle guide, `docs/local-endpoint-lifecycle.md` in the documentation checkout.
+IPC uses lazy buddy pools and finite backing/reassembly budgets; disabling
+buddy does not disable dedicated SHM. The relay is a separate process with its
+own upstream policy. See the memory guide, `docs/memory-policy.md`.
 
 ## Development
 
-Run development commands from the repository root.
+Select the current development branch, then run commands from the repository root:
+
+```bash
+git clone --branch socu/local-endpoint-validation https://github.com/Dsssyc/c-two.git
+cd c-two
+```
 
 Prerequisites:
 
@@ -28,7 +56,7 @@ Prerequisites:
 - for full interoperability tests: the FastDB `v0.2.1` source checkout at `../fastdb`
 
 Python resolves `fastdb4py==0.2.1` from PyPI. The Python native extension and
-c3 use the official FastDB 0.2.1 source revision for their source-mode static
+c3 pin FastDB source `4f99f86a662b0e950a0dd29800c25a1c9fca4def` for their source-mode static
 builds. Core and Rust SDK tests use the published Rust bindings with the matching
 [FastDB Core SDK](https://github.com/world-in-progress/fastdb/releases/tag/v0.2.1)
 in system link mode. Golden specs and TypeScript interoperability fixtures still
@@ -51,7 +79,7 @@ Relay-dependent tests and examples require the standalone `c3` binary. From a
 source checkout, build and link it before running relay flows:
 
 ```bash
-python tools/dev/c3_tool.py --build --link
+FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link
 ```
 
 The Python SDK does not embed or start a relay server. Start the standalone
@@ -68,8 +96,8 @@ treated as `1`). Ambiguous data-plane failures are not replayed.
 
 After the source-mode build, configure the absolute Core SDK library directory
 for Rust consumers spawned by interoperability tests. Follow the
-[development setup](https://github.com/Dsssyc/c-two/blob/dev-feature/README.md#development-checkout)
-and [Windows guide](https://github.com/Dsssyc/c-two/blob/dev-feature/docs/windows-native-usage.md)
+development setup in the repository README and
+`docs/windows-native-usage.md`
 for platform-specific loader paths and test prerequisites. Keep the existing
 extension build while running the Python tests:
 
@@ -83,7 +111,7 @@ Run Rust core checks when validating shared native runtime changes:
 cargo test --manifest-path core/Cargo.toml --workspace
 ```
 
-For CLI build, link, and test commands, see [the CLI guide](https://github.com/Dsssyc/c-two/blob/dev-feature/cli/README.md).
+For CLI build, link, and test commands, see the CLI guide, `cli/README.md`.
 
 ## Examples
 
@@ -97,7 +125,7 @@ uv run python examples/python/local.py
 Relay examples also need a running standalone relay, for example:
 
 ```bash
-python tools/dev/c3_tool.py --build --link
+FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link
 c3 relay --bind 127.0.0.1:8080
 ```
 

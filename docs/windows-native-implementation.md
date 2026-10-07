@@ -1,5 +1,31 @@
 # Windows native implementation
 
+## Current status (2026-10-07)
+
+Python c-two 0.6.0 and c3 0.2.0 are published with Windows x64 distribution;
+FastDB 0.2.1 is the current official dependency. Python 0.7.0 / c3 0.3.0 remain
+unpublished targets with manifests unchanged. The current
+[canonical validation](reports/canonical-local-endpoint-validation.md) binds
+C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` and FastDB
+`4f99f86a662b0e950a0dd29800c25a1c9fca4def`:
+[Windows run 37559074657](https://github.com/Dsssyc/c-two/actions/runs/37559074657)
+passes four jobs, 23/23 full gates per OS, strict 18 Rust/Python and 12 TypeScript
+rows, ordinary/non-administrator wheel consumption and account/process/temp
+cleanup. Those wheels still identify as 0.6.0; this is source-development
+acceptance, not 0.7 formal package evidence.
+
+Windows uses one current-logon SID Named Pipe backend with an independent
+non-inheritable listener kernel lease. Rust owns endpoint derivation,
+Persistent/OwnerBound lifecycle, drain and maintenance; credential protocol
+values are format metadata. See [usage](windows-native-usage.md),
+[lifecycle](local-endpoint-lifecycle.md) and [0.7 preparation](releases/0.7.0.md).
+The full target release matrix and extra environments remain separate work.
+
+## Historical implementation record
+
+The sequence and evidence log below preserve the earlier source/run status.
+Their pending statements are historical and are not current publication claims.
+
 Status: the development implementation and hosted Windows x64 acceptance completed on 2026-09-25. [Final validation](reports/windows-native-final-validation.md) records four successful jobs on Windows Server 2022/2025, strict cross-language receipts, installed-wheel consumers under runner and non-administrator accounts, and downloaded artifact hashes. The tested source is C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` on `socu/windows-native-ipc`, paired with FastDB `6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4` from [FastDB PR #37](https://github.com/world-in-progress/fastdb/pull/37). Later documentation commits are not artifact source commits. This is development-build acceptance; formal publication and the additional environments below remain separate work.
 
 The target architecture and evidence boundaries are recorded in [the analysis](reports/2026-09-24-windows-native-ipc-analysis.zh-CN.md). Work resumed on 2026-09-24 after FastDB 0.2.0 publication and the OIDC migration. The first baseline used the official release source `ceebed2edbef580ba0a42dcd28dadf9628894523`; the validated MSVC repair is an unreleased source input, not a replacement for that immutable release.
@@ -54,4 +80,4 @@ This contract must be proven by a test retaining an old peer mapping while the p
 
 ## Outstanding environment coverage
 
-Windows Server 2022/2025 x64 hosted execution and non-administrator consumers are verified. Windows 11 desktop, Windows services, ARM64, native Windows Python 3.10/free-threaded 3.14 wheels and a real Windows/Linux two-machine relay remain separate, unexecuted targets. Native wheel execution here uses CPython 3.12; minimum-supported Python 3.10 coverage is a syntax check. No result is inferred for these other environments from the hosted pass.
+Windows Server 2022/2025 x64 hosted execution and non-administrator consumers are verified. Windows 11 desktop, Windows services, ARM64, the full 0.7 native Windows Python ABI matrix and a real Windows/Linux two-machine relay remain separate, unexecuted targets. Native wheel execution here uses CPython 3.12; minimum-supported Python 3.10 coverage is a syntax check. No result is inferred for these other environments from the hosted pass.

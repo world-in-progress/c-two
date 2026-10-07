@@ -1,8 +1,19 @@
 # C-Two Current Roadmap
 
-Last reviewed and ordered: 2026-07-24.
+Status refreshed: 2026-10-07; product ordering retains the July design priorities.
 
-This is the maintained roadmap for C-Two's 0.x line. Current portable-payload authority is:
+This is the maintained roadmap for C-Two's 0.x line.
+Published Python c-two 0.6.0 and c3 0.2.0 now include Windows x64 distribution;
+FastDB 0.2.1 is published. Python 0.7.0 / c3 0.3.0 are unpublished targets,
+with manifests unchanged. Rust SDK/Core/TypeScript stay 0.1.0 and are not
+published on crates.io/npm. See [release preparation](releases/0.7.0.md).
+
+Current endpoint/lifecycle and memory source evidence is the
+[canonical validation](reports/canonical-local-endpoint-validation.md), with
+usage in [lifecycle integration](local-endpoint-lifecycle.md) and
+[memory policy](memory-policy.md). It proves development source, not the
+remaining 30-wheel/sdist and five-CLI-target release matrices.
+Portable-payload architecture and historical local-candidate references are:
 
 1. [`2026-07-24 portable-payload contract composition design`](./superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md)
 2. [`2026-07-24 Rust SDK and local-candidate design`](./superpowers/specs/2026-07-24-rust-sdk-portable-payload-local-release-candidate-design.md)
@@ -36,10 +47,12 @@ Documents under `docs/plans/`, `docs/reviews/`, and older `docs/superpowers/` da
 | Generated TypeScript proof | The candidate receipt contains exactly 12/12 passing Node rows across direct IPC, explicit relay, relay-aware verified local IPC, and relay-aware HTTP with real `c3`, Rust/Python hosts, package tarballs, route/path observations, lifetime negatives, and non-replay checks. |
 | Bounded admission and strict gates | Versioned `ContractLimits` bounds outer contract input before unbounded work. Core and Python native pass strict Clippy without blanket suppression, followed by complete language and repository gates. |
 | Local package closure | One canonical 42-artifact manifest binds FastDB and C-Two implementation commits. Version-only Rust, no-index CPython 3.10/current, and tarball-only Node consumers pass outside sibling/source checkouts. |
+| Local endpoint and lifecycle | One OS-derived endpoint, default Persistent, explicit OwnerBound and exact/scoped native maintenance are implemented and hosted-validated; 0.7 publication is pending. |
+| IPC memory policy | Lazy buddy allocation, idle decay and three finite direction-scoped budgets are implemented; HTTP buffer governance and broader cancellation/queue telemetry remain open. |
 | Honest backing boundary | The proven Rust and Python receive adapters are copy-backed. `cc.hold()` and borrowed-input policy enforce owner/lease invalidation; they do not prove direct construction in final response shared memory. |
 | Python-only prototype path | Ordinary Python methods without an explicit portable binding may still use pickle locally. Portable descriptor export/codegen rejects them with diagnostics. |
 
-The local candidate consumes FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487` from C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02`. FastDB package metadata remains 0.1.22/0.0.3 and C-Two candidate metadata remains 0.1.0/0.5.1 without publication. Source commit plus SHA-256 identifies these local bytes; no version, push, tag, hosted pass, publication, or release is implied by this roadmap.
+The historical July local candidate consumed FastDB implementation commit `7eb74734926bd8fe911229eee9744a6dd8172487` from C-Two implementation commit `bf6f5c950959bcd2723cf3c7bfe772c9ee91dc02`. Its metadata was FastDB 0.1.22/0.0.3 and C-Two 0.1.0/0.5.1 without publication. Those exact bytes and receipts remain historical; current dependencies pin published FastDB 0.2.1, native source `4f99f86a662b0e950a0dd29800c25a1c9fca4def`.
 
 ## Ordered Product Work
 
@@ -47,7 +60,7 @@ Start at the first incomplete item whose prerequisites and authorization are ava
 
 | Order | Workstream | Why it comes here | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Official immutable FastDB and C-Two package distribution | Local archive-only consumers are complete, but the exact artifacts are not published or hosted. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
+| 1 | Official immutable FastDB and C-Two package distribution | FastDB 0.2.1 and Python 0.6.0 / c3 0.2.0 are published; 0.7 / 0.3 candidates and official C-Two Rust/TypeScript distribution remain open. | Authorized FastDB and C-Two Rust/Python/TypeScript/CLI artifacts are immutable and fetchable; production manifests pin them and repeat clean-environment package, codegen, runtime, and interoperability gates without local registries or sibling paths. |
 | 2 | Contract compatibility | Exact release matching is the safety floor; semver/range rules need stable official release content first. | Rust-owned rules reject ambiguity and ABI-incompatible matches and project identical behavior across SDKs. |
 | 3 | Call metadata and admission hooks | Upper layers need a transport-consistent mechanism for identity and policy decisions, but C-Two must not own policy. | Thread-local, IPC, and relay calls carry bounded metadata; hooks can accept/reject calls; downstream systems remain the policy authority. |
 | 4 | Dry-run mechanism | Impact analysis depends on the same explicit metadata/admission boundary. | Dry-run semantics state what is evaluated, which side effects are forbidden, and how unsupported methods fail. |

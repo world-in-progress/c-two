@@ -1,6 +1,6 @@
 # C-Two 传输内存策略用户指南
 
-本文说明当前开发分支的 IPC 内存策略。实现与验收进度见 [内存优化计划](plans/2026-09-26-memory-policy.md)，发布包是否包含这些变更应以对应版本记录为准。
+本文说明正在准备的 Python 0.7.0 / c3 0.3.0 源码 IPC 内存策略；目标尚未发布，正式 Python 0.6.0 / c3 0.2.0 不包含这些新策略。见[版本与升级说明](releases/0.7.0.md)。配置默认与校验以 Rust resolver 为唯一权威，Python 仅提供类型化覆盖门面；实现背景见[内存优化计划](plans/2026-09-26-memory-policy.md)。
 
 ## 1. 三个有限预算单元
 
@@ -30,7 +30,7 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 
 发送端（客户端请求）保留以下回退顺序：
 
-1. 负载不大于 `shm_threshold`（默认 4096 字节）或没有请求池时，走 inline 帧。
+1. 未选择请求池 SHM 且负载不大于 `chunk_size` 时走 inline 帧；更大的负载走分块。是否选择 SHM 还取决于 `shm_threshold`（默认 4096 字节）和线格式上限。
 2. 负载大于 `shm_threshold` 且不超过 buddy 线格式上限时，走 SHM 指针传输：数据写入本进程请求池，线上携带 15 字节 `BuddyPayload` 位置与 generation 元数据，接收端按前缀/索引/代惰性打开。
 3. SHM 不可用（预算拒绝、压力拒绝或超线格式上限）时，回退到检查过的分块传输（`chunk_size` 默认 128 KiB，受 `max_total_chunks`/`max_reassembly_bytes` 约束）；小负载回退 inline。不引入第三种传输栈。
 
@@ -122,4 +122,5 @@ c3 relay --bind 127.0.0.1:8080 \
 - `sdk/python/src/c_two/config/ipc.py`、`settings.py` — 类型化覆盖模式与进程策略；`sdk/python/src/c_two/mem/__init__.py`、`transport/registry.py` — `memory_stats`/`hold_stats` 门面。
 - `sdk/python/src/c_two/crm/transferable.py` — `HeldResult` 释放顺序；`.env.example` — `C2_IPC_POOL_ENABLED`/`PREWARM`/`MIN_RETAINED` 键。
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
-- [最终验收](reports/memory-native-final-validation.md) — 固定源码、Windows/Linux 门禁、候选包与产物哈希证据。
+- [内存阶段验收](reports/memory-native-final-validation.md) — 该阶段固定源码与开发产物证据，保留其历史状态。
+- [当前统一验收](reports/canonical-local-endpoint-validation.md) — 后续唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希；不证明 0.7 正式包发布矩阵。
