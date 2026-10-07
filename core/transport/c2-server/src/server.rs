@@ -181,6 +181,14 @@ pub struct ServerRouteCloseOutcome {
     pub closed_reason: String,
 }
 
+/// Terminal server work and its once-consumed route-close journal.
+/// A cleanup failure can coexist with successfully drained routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerShutdownCompletion {
+    pub route_outcomes: Vec<ServerRouteCloseOutcome>,
+    pub runtime_error: Option<String>,
+}
+
 /// Read-only snapshot of the server direction's shared memory budget.
 ///
 /// The three cells are C-Two-owned accounting scopes — owner-created SHM
@@ -1187,6 +1195,28 @@ impl Server {
             return Err(ServerError::Config(message));
         }
         Ok(self.take_shutdown_route_outcomes())
+    }
+
+    /// Observe terminal work before consuming the native close journal.
+    /// Runtime owners use this to retain actual drain outcomes alongside a
+    /// listener-cleanup error. It never exposes an unfenced journal drain.
+    pub async fn observe_shutdown_completion_unbounded(
+        &self,
+    ) -> Result<ServerShutdownCompletion, ServerError> {
+        self.wait_until_terminal().await?;
+        let runtime_error = match self.lifecycle_state() {
+            ServerLifecycleState::Initialized | ServerLifecycleState::Stopped => None,
+            ServerLifecycleState::Failed(message) => Some(message),
+            state => {
+                return Err(ServerError::Config(format!(
+                    "server restarted during shutdown completion observation: {state:?}"
+                )));
+            }
+        };
+        Ok(ServerShutdownCompletion {
+            route_outcomes: self.take_shutdown_route_outcomes(),
+            runtime_error,
+        })
     }
 
     /// Mark runtime-backed server work as stopped after its runtime is gone.
