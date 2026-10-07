@@ -1252,18 +1252,21 @@ impl Runtime {
         if let Some(server) = server {
             let recorded_direct_shutdown_outcomes = if matches!(
                 server.lifecycle_state(),
-                ServerLifecycleState::Stopping | ServerLifecycleState::Stopped
+                ServerLifecycleState::Stopping
+                    | ServerLifecycleState::Stopped
+                    | ServerLifecycleState::Failed(_)
             ) {
                 match Self::server_runtime() {
-                    Ok(rt) => {
-                        match rt.block_on(server.observe_external_shutdown_outcomes_unbounded()) {
-                            Ok(outcomes) => outcomes,
-                            Err(err) => {
-                                outcome.runtime_barrier_error = Some(err.to_string());
-                                Vec::new()
-                            }
+                    Ok(rt) => match rt.block_on(server.observe_shutdown_completion_unbounded()) {
+                        Ok(completion) => {
+                            outcome.runtime_barrier_error = completion.runtime_error;
+                            completion.route_outcomes
                         }
-                    }
+                        Err(err) => {
+                            outcome.runtime_barrier_error = Some(err.to_string());
+                            Vec::new()
+                        }
+                    },
                     Err(err) => {
                         outcome.runtime_barrier_error = Some(err.to_string());
                         Vec::new()
@@ -1315,9 +1318,15 @@ impl Runtime {
             }
             if can_signal_shutdown && server_was_started {
                 match Self::server_runtime() {
-                    Ok(rt) => match rt.block_on(server.shutdown_and_wait_unbounded()) {
-                        Ok(close_outcomes) => {
-                            for close in close_outcomes {
+                    Ok(rt) => match rt.block_on(async {
+                        server.request_shutdown_signal_with_reason("shutdown");
+                        server.observe_shutdown_completion_unbounded().await
+                    }) {
+                        Ok(completion) => {
+                            if let Some(error) = completion.runtime_error {
+                                outcome.runtime_barrier_error = Some(error);
+                            }
+                            for close in completion.route_outcomes {
                                 if !outcome.removed_routes.contains(&close.route_name) {
                                     outcome.removed_routes.push(close.route_name.clone());
                                     outcome
@@ -2597,6 +2606,140 @@ mod tests {
         );
 
         runner.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_preserves_failed_external_cleanup_error_and_route_journal() {
+        use std::os::unix::fs::FileExt;
+
+        let route_name = unique_route_name("direct-shutdown-cleanup-fail");
+        let session = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..RuntimeOptions::default()
+        })
+        .expect("session");
+        let server = test_server("direct-shutdown-cleanup-fail-server");
+        let route = dummy_route(&server, &route_name);
+        let handle = route.route_handle();
+        session
+            .register_route(&server, route, dummy_route_spec(&route_name), None, false)
+            .expect("route should register");
+        let runner = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || {
+                let rt = Runtime::server_runtime().expect("runtime");
+                rt.block_on(server.run())
+            })
+        };
+        let rt = Runtime::server_runtime().expect("runtime");
+        rt.block_on(server.wait_until_ready(Duration::from_secs(2)))
+            .expect("server ready");
+        let credential = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match c2_local::inspect_endpoint(server.local_endpoint()) {
+                        c2_local::EndpointInspection::Present(credential) => return credential,
+                        c2_local::EndpointInspection::IoError(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        other => panic!("cannot capture test endpoint identity: {other:?}"),
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("test endpoint identity acquisition must finish")
+        });
+        let lease_path =
+            std::path::Path::new(server.local_endpoint().os_name()).with_extension("lease");
+        let record = std::fs::read(&lease_path).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .unwrap();
+        // Keep the real shutdown draining until after its IPC acknowledgement,
+        // so endpoint connection validation still sees the intact lease record.
+        let active = handle.blocking_acquire(0).expect("active route guard");
+        let ack = c2_ipc::shutdown(server.ipc_address(), Duration::from_secs(2))
+            .expect("direct shutdown must be acknowledged");
+        assert!(ack.acknowledged && ack.shutdown_started);
+        assert!(ack.route_outcomes.is_empty(), "ack is initiation only");
+        // Damage only this test's pinned lease record, then let actual active
+        // work drain before listener retirement detects the failure.
+        lease.write_all_at(b"invalid", 0).unwrap();
+        drop(active);
+        let stopped = rt.block_on(server.wait_until_stopped(Duration::from_secs(2)));
+        // Restore before assertions, then reclaim only the captured endpoint
+        // identity after the native run loop has released its listener lease.
+        lease.write_all_at(&record, 0).unwrap();
+        stopped.expect("external shutdown must reach a terminal fence");
+        let run_result = runner.join().expect("server thread must join");
+        drop(lease);
+        let reaped = c2_local::reap_endpoint(server.local_endpoint(), &credential);
+        assert!(
+            matches!(reaped, c2_local::EndpointReapResult::Reaped),
+            "{reaped:?}"
+        );
+        assert!(
+            run_result
+                .unwrap_err()
+                .to_string()
+                .contains("InvalidRecord")
+        );
+        assert!(matches!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+        assert!(!server.is_running());
+        assert!(handle.snapshot().closed);
+        assert!(!rt.block_on(server.contains_route(&route_name)));
+
+        let outcome = session.shutdown(
+            Some(&server),
+            vec![route_name.clone()],
+            None,
+            false,
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(
+            outcome
+                .runtime_barrier_error
+                .as_deref()
+                .is_some_and(|error| error.contains("InvalidRecord")),
+            "failed listener cleanup must remain observable: {outcome:?}",
+        );
+        assert!(
+            !outcome.server_was_started,
+            "Failed is not a running server"
+        );
+        assert!(outcome.ipc_clients_drained);
+        assert!(outcome.route_close_error.is_none());
+        assert_eq!(outcome.removed_routes, vec![route_name.clone()]);
+        assert_eq!(outcome.route_outcomes.len(), 1);
+        let close = &outcome.route_outcomes[0];
+        assert_eq!(close.route_name, route_name);
+        assert_eq!(close.closed_reason, "direct_ipc_shutdown");
+        assert!(close.local_removed && close.active_drained);
+        assert!(close.close_error.is_none());
+        assert!(matches!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+        rt.block_on(server.wait_until_terminal()).unwrap();
+
+        let repeated = session.shutdown(
+            Some(&server),
+            vec![route_name],
+            None,
+            false,
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(repeated.removed_routes.is_empty());
+        assert!(repeated.route_outcomes.is_empty());
+        assert_eq!(session.shutdown_observation(&server), Some(outcome));
     }
 
     // ── Read-only memory-budget snapshots ────────────────────────────────
