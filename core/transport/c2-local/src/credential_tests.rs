@@ -88,7 +88,7 @@ async fn managed_credential_round_trips_without_a_path() {
     let (listener, credential) = managed();
     let json = credential.to_json().unwrap();
     assert!(!json.contains("/tmp"), "document must not carry an OS path");
-    assert!(credential.incarnation().is_some());
+    assert_ne!(credential.incarnation(), [0; 16]);
 
     let round_tripped = decoded(&json).unwrap();
     assert_eq!(round_tripped, credential);
@@ -498,16 +498,15 @@ fn unix_rejects_a_windows_platform_document() {
     );
 }
 
-/// Windows refuses managed-v2 during canonical endpoint derivation, before
-/// interpreting Unix incarnation or identity fields. It must never downgrade
-/// that explicit protocol into a collectable legacy pipe credential.
+/// Windows derives a Named Pipe, then rejects incompatible credential format
+/// metadata before interpreting Unix incarnation or identity fields.
 #[cfg(windows)]
 #[test]
 fn windows_rejects_managed_v2_documents() {
     let with_incarnation = r#"{"schemaVersion":2,"address":"ipc://codec-managedunsupported","protocol":"managed-v2","platform":"windows","incarnation":"00112233445566778899aabbccddeeff"}"#;
-    let error = decoded(with_incarnation).expect_err("Windows cannot derive a managed endpoint");
+    let error = decoded(with_incarnation).expect_err("Windows rejects Unix credential metadata");
     assert_eq!(error.kind(), EndpointCredentialErrorKind::InvalidValue);
-    assert_eq!(error.field(), Some("address"));
+    assert_eq!(error.field(), Some("protocol"));
     // A Unix identity field is not a Windows pipe property either.
     let with_identity = r#"{"schemaVersion":1,"address":"ipc://codec-managedunsupported","protocol":"named-pipe","platform":"windows","device":1,"inode":2}"#;
     assert_rejected(with_identity, &[EndpointCredentialErrorKind::InvalidValue]);

@@ -2083,6 +2083,15 @@ async fn native_unknown_socket_and_unsafe_permissions_are_preserved() {
         inspect_managed_at(&endpoint, root),
         EndpointInspection::Unverified(EndpointUnverifiedReason::MissingOwnership)
     ));
+    let credential = EndpointCredential::unix_managed(endpoint.clone(), identity, [7; 16]);
+    let lease = lease_path_at(root, &endpoint);
+    assert!(!lease.exists());
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, root),
+        EndpointReapResult::Unverified(EndpointUnverifiedReason::MissingOwnership)
+    ));
+    assert_eq!(identity_of(&path), identity);
+    assert!(!lease.exists(), "unknown socket reap must not create a lease");
     assert_eq!(
         bind_managed_at(&endpoint, root).err().unwrap().kind(),
         io::ErrorKind::AddrInUse

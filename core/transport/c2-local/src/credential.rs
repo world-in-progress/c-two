@@ -184,23 +184,23 @@ impl EndpointCredential {
             protocol: endpoint.protocol(),
             platform: platform_name(),
             #[cfg(unix)]
-            incarnation: self.incarnation().map(encode_incarnation),
+            incarnation: Some(encode_incarnation(self.incarnation())),
             #[cfg(not(unix))]
             incarnation: None,
             #[cfg(unix)]
-            device: self.identity().map(|identity| identity.device),
+            device: Some(self.identity().device),
             #[cfg(not(unix))]
             device: None,
             #[cfg(unix)]
-            inode: self.identity().map(|identity| identity.inode),
+            inode: Some(self.identity().inode),
             #[cfg(not(unix))]
             inode: None,
             #[cfg(unix)]
-            changedSecs: self.identity().map(|identity| identity.changed_secs),
+            changedSecs: Some(self.identity().changed_secs),
             #[cfg(not(unix))]
             changedSecs: None,
             #[cfg(unix)]
-            changedNanos: self.identity().map(|identity| identity.changed_nanos),
+            changedNanos: Some(self.identity().changed_nanos),
             #[cfg(not(unix))]
             changedNanos: None,
         };

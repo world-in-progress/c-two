@@ -43,7 +43,7 @@ pub struct EndpointCredential {
     #[cfg(unix)]
     identity: UnixSocketIdentity,
     #[cfg(unix)]
-    incarnation: Option<[u8; 16]>,
+    incarnation: [u8; 16],
 }
 
 impl EndpointCredential {
@@ -53,7 +53,7 @@ impl EndpointCredential {
 
     /// The listener incarnation; this is metadata, not a capability.
     #[cfg(unix)]
-    pub fn incarnation(&self) -> Option<[u8; 16]> {
+    pub fn incarnation(&self) -> [u8; 16] {
         self.incarnation
     }
 
@@ -66,13 +66,13 @@ impl EndpointCredential {
         Self {
             endpoint,
             identity,
-            incarnation: Some(incarnation),
+            incarnation,
         }
     }
 
     #[cfg(unix)]
-    pub(crate) fn identity(&self) -> Option<UnixSocketIdentity> {
-        Some(self.identity)
+    pub(crate) fn identity(&self) -> UnixSocketIdentity {
+        self.identity
     }
 
     #[cfg(windows)]

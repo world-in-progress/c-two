@@ -1447,10 +1447,8 @@ pub(crate) fn reap_managed_at(
     if credential.endpoint() != endpoint {
         return EndpointReapResult::StaleTarget;
     }
-    let (Some(identity), Some(incarnation)) = (credential.identity(), credential.incarnation())
-    else {
-        return EndpointReapResult::StaleTarget;
-    };
+    let identity = credential.identity();
+    let incarnation = credential.incarnation();
     let namespace = match ManagedNamespace::open_root(root, false, false) {
         Ok(namespace) => namespace,
         Err(error) => return namespace_reap_error(error),
