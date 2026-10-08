@@ -5749,7 +5749,60 @@ mod tests {
             still_charged.reassembly.used_bytes,
             charged.reassembly.used_bytes
         );
-        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        // Joining the callback holder is the release barrier for its pool
+        // read lock. This fixture starts no maintenance task, so no GC tick
+        // is needed (or available) to finish the connection's cleanup.
+        assert!(registry.pool().try_write().is_some());
+        assert!(client.maintenance.lock().is_none());
+        assert!(client.pending.lock().is_empty());
+
+        // Receiver termination and an available pool still do not make an
+        // expired caller observation a confirmed drain. Retain the exact
+        // assembly and both charges for the next observation of this close.
+        assert!(!client.close_shared_bounded(Duration::ZERO).await);
+        assert!(client.close_incomplete.load(Ordering::Acquire));
+        assert_eq!(registry.active_count(), 1);
+        let expired = budget.snapshot();
+        assert_eq!(expired.file.used_bytes, charged.file.used_bytes);
+        assert_eq!(expired.reassembly.used_bytes, charged.reassembly.used_bytes);
+
+        // Each 50 ms call observes the same retryable close transaction.
+        // Mapping destruction and scheduling can exhaust one observation
+        // even after the callback released its lock; they are not hard
+        // real-time operations. Require actual confirmation within one fixed
+        // total budget rather than promising success on the second call.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let snapshot = budget.snapshot();
+            assert!(
+                !remaining.is_zero(),
+                "close did not finish after callback release: active={}, file={}, reassembly={}",
+                registry.active_count(),
+                snapshot.file.used_bytes,
+                snapshot.reassembly.used_bytes
+            );
+            let observation_started = Instant::now();
+            if client
+                .close_shared_bounded(remaining.min(Duration::from_millis(50)))
+                .await
+            {
+                break;
+            }
+            assert!(client.close_incomplete.load(Ordering::Acquire));
+            let snapshot = budget.snapshot();
+            eprintln!(
+                "file cleanup retry incomplete: elapsed={:?}, active={}, file={}, reassembly={}",
+                observation_started.elapsed(),
+                registry.active_count(),
+                snapshot.file.used_bytes,
+                snapshot.reassembly.used_bytes
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        assert!(!client.close_incomplete.load(Ordering::Acquire));
+        assert!(client.request_pool().is_none());
         assert_eq!(registry.active_count(), 0);
         assert_eq!(budget.snapshot().file.used_bytes, 8192);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
