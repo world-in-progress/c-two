@@ -163,6 +163,12 @@ def test_cli_release_body_links_provenance_without_desktop_claims():
 
 def test_readmes_document_the_c3_installer_asset():
     root = _repo_root()
+    version = tomllib.loads((root / "cli" / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+    releases = "https://github.com/world-in-progress/c-two/releases"
+    installers = (
+        f"{releases}/latest/download/c3-installer.sh",
+        f"{releases}/download/c3-v{version}/c3-installer.sh",
+    )
 
     for path in [
         root / "README.md",
@@ -171,7 +177,9 @@ def test_readmes_document_the_c3_installer_asset():
         root / "cli" / "README.md",
     ]:
         text = path.read_text(encoding="utf-8")
-        assert "releases/latest/download/c3-installer.sh" in text
+        assert any(url in text for url in installers), path
+        if path != root / "examples" / "README.md":
+            assert f"--version {version}" in text, path
 
 
 def test_ci_runs_cli_rust_tests():

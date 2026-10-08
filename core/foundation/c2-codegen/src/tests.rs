@@ -72,7 +72,9 @@ fn consume_generated(execute: bool) {
         ),
     ).unwrap();
     std::fs::copy(
-        repository.join("sdk/rust/Cargo.lock"),
+        // CI fetches the Core workspace lock before these offline consumers.
+        // Seed the same dependency versions instead of the SDK's separate lock.
+        repository.join("core/Cargo.lock"),
         temp.path().join("Cargo.lock"),
     )
     .unwrap();
