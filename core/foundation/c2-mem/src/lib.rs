@@ -16,6 +16,7 @@ pub mod handle;
 pub mod lease;
 pub mod pool;
 mod pressure;
+pub mod retention;
 pub mod segment;
 pub mod spill;
 
@@ -34,5 +35,8 @@ pub use lease::{
     StorageLeaseStats,
 };
 pub use pool::{FreeResult, MemPool};
+pub use retention::{
+    RetentionBudget, RetentionError, RetentionPermit, RetentionRejectReason, RetentionSnapshot,
+};
 pub use segment::ShmRegion;
 pub use spill::{available_physical_memory, create_file_spill};
