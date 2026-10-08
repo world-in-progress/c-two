@@ -4,6 +4,8 @@
 //! normalization, and cross-language orchestration. It transports opaque bytes
 //! and does not depend on payload-owner implementations such as FastDB.
 
+// Internal execution seam; Client/Runtime wiring is a separate concern.
+mod call_execution;
 mod call_scope;
 mod client;
 mod control;

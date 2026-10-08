@@ -45,7 +45,7 @@ pub struct RetentionSnapshot {
     pub peak_operations: u64,
     /// High-water mark of `used_retained_bytes`; persists across releases.
     pub peak_retained_bytes: u64,
-    /// Number of rejected `reserve` attempts across all reasons; may
+    /// Number of rejected reservation or positive growth attempts; may
     /// saturate.
     pub rejected_reservations: u64,
     /// Whether [`RetentionBudget::close`] stopped new admissions. Live
@@ -328,6 +328,47 @@ impl RetentionPermit {
     /// The retained byte count this permit charges.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Grow this same permit's byte charge, atomically or not at all. Never
+    /// takes another operation slot and never shrinks or touches payloads.
+    /// Zero is a no-op, including after close and at `u64::MAX`. Positive
+    /// growth after close, above the byte limit, or overflowing either byte
+    /// count is rejected with the original charge intact. Exclusive access
+    /// to the permit and the domain's short metadata lock serialize growth
+    /// with accounting; other permits may grow concurrently.
+    pub fn try_grow(&mut self, additional_bytes: u64) -> Result<(), RetentionError> {
+        if additional_bytes == 0 {
+            return Ok(());
+        }
+        let mut inner = lock_inner(&self.state.inner);
+        let totals = self
+            .bytes
+            .checked_add(additional_bytes)
+            .zip(inner.used_retained_bytes.checked_add(additional_bytes));
+        let reason = if inner.closed {
+            Some(RetentionRejectReason::Closed)
+        } else if totals.is_none_or(|(_, total)| total > inner.max_retained_bytes) {
+            Some(RetentionRejectReason::RetainedBytesExhausted)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            inner.rejected_reservations = inner.rejected_reservations.saturating_add(1);
+            return Err(RetentionError {
+                reason,
+                requested_bytes: additional_bytes,
+                used_operations: inner.used_operations,
+                used_retained_bytes: inner.used_retained_bytes,
+                max_operations: inner.max_operations,
+                max_retained_bytes: inner.max_retained_bytes,
+            });
+        }
+        let (permit_bytes, total) = totals.expect("checked positive growth");
+        self.bytes = permit_bytes;
+        inner.used_retained_bytes = total;
+        inner.peak_retained_bytes = inner.peak_retained_bytes.max(total);
+        Ok(())
     }
 }
 
@@ -696,6 +737,124 @@ mod tests {
         assert_eq!(snap.used_retained_bytes, 25);
         assert_eq!(snap.peak_retained_bytes, 35);
         drop(retained);
+        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn retention_growth_is_one_slot_all_or_none_and_drop_refunds_total() {
+        let budget = RetentionBudget::new(1, 10);
+        let mut permit = budget.reserve(0).unwrap();
+        permit.try_grow(4).unwrap();
+        permit.try_grow(6).unwrap();
+        let before = budget.snapshot();
+        assert_eq!(before.used_operations, 1);
+        assert_eq!(before.used_retained_bytes, 10);
+        assert_eq!(
+            permit.try_grow(1).unwrap_err().reason,
+            RetentionRejectReason::RetainedBytesExhausted
+        );
+        assert_eq!(permit.bytes(), 10);
+        let after = budget.snapshot();
+        assert_eq!(after.used_operations, before.used_operations);
+        assert_eq!(after.used_retained_bytes, before.used_retained_bytes);
+        assert_eq!(after.peak_retained_bytes, before.peak_retained_bytes);
+        assert_eq!(
+            after.rejected_reservations,
+            before.rejected_reservations + 1
+        );
+        drop(permit);
+        assert_eq!(budget.snapshot().used_operations, 0);
+        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+    }
+
+    #[test]
+    fn retention_growth_zero_close_and_max_have_explicit_behavior() {
+        let budget = RetentionBudget::new(1, u64::MAX);
+        let mut permit = budget.reserve(0).unwrap();
+        permit.try_grow(u64::MAX).unwrap();
+        permit.try_grow(0).unwrap();
+        assert_eq!(
+            permit.try_grow(1).unwrap_err().reason,
+            RetentionRejectReason::RetainedBytesExhausted
+        );
+        assert_eq!(permit.bytes(), u64::MAX);
+        budget.close();
+        let before = budget.snapshot();
+        permit.try_grow(0).unwrap();
+        assert_eq!(budget.snapshot(), before);
+        assert_eq!(
+            permit.try_grow(1).unwrap_err().reason,
+            RetentionRejectReason::Closed
+        );
+        assert_eq!(permit.bytes(), u64::MAX);
+        drop(permit);
+        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+    }
+
+    #[test]
+    fn retention_growth_domain_sum_overflow_leaves_both_permits_intact() {
+        let budget = RetentionBudget::new(2, u64::MAX);
+        let a = budget.reserve(u64::MAX - 2).unwrap();
+        let mut b = budget.reserve(1).unwrap();
+        assert_eq!(
+            b.try_grow(2).unwrap_err().reason,
+            RetentionRejectReason::RetainedBytesExhausted
+        );
+        assert_eq!(b.bytes(), 1);
+        assert_eq!(budget.snapshot().used_retained_bytes, u64::MAX - 1);
+        b.try_grow(1).unwrap();
+        assert_eq!(budget.snapshot().used_retained_bytes, u64::MAX);
+        drop(a);
+        assert_eq!(budget.snapshot().used_retained_bytes, 2);
+        drop(b);
+        assert_eq!(budget.snapshot().used_operations, 0);
+    }
+
+    #[test]
+    fn retention_growth_zero_byte_domain_rejects_positive_growth() {
+        let budget = RetentionBudget::new(1, 0);
+        let mut permit = budget.reserve(0).unwrap();
+        permit.try_grow(0).unwrap();
+        assert!(permit.try_grow(1).is_err());
+        assert_eq!(permit.bytes(), 0);
+        drop(permit);
+        assert_eq!(budget.snapshot().used_operations, 0);
+    }
+
+    #[test]
+    fn retention_growth_concurrent_permits_share_one_atomic_byte_limit() {
+        let budget = RetentionBudget::new(8, 20);
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let mut permit = budget.reserve(0).unwrap();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let result = permit.try_grow(5);
+                    (permit, result)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            4
+        );
+        let snap = budget.snapshot();
+        assert_eq!(snap.used_operations, 8);
+        assert_eq!(snap.used_retained_bytes, 20);
+        assert_eq!(snap.peak_retained_bytes, 20);
+        assert_eq!(snap.rejected_reservations, 4);
+        drop(outcomes);
+        assert_eq!(budget.snapshot().used_operations, 0);
         assert_eq!(budget.snapshot().used_retained_bytes, 0);
     }
 }
