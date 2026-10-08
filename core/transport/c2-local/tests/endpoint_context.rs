@@ -36,6 +36,62 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+#[tokio::test]
+async fn custom_root_container_missing_is_not_created_by_bind() {
+    // The application's outer fixture exists, but its selected root does not.
+    // Keep the complete derived socket name within macOS sun_path capacity.
+    let outer = tempfile::Builder::new()
+        .prefix("c-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = outer.path().join("r");
+    let endpoint = context(&root).endpoint(ADDRESS).unwrap();
+    let version = Path::new(endpoint.os_name()).parent().unwrap();
+    let uid = version.parent().unwrap();
+    assert!(!root.exists());
+
+    let result = LocalListener::bind(&endpoint);
+    assert!(result.is_err(), "bind requires an application-created root");
+    // A later socket-bind EPERM is not a policy success: directory creation
+    // before that error would already violate the root ownership boundary.
+    assert!(
+        !root.exists(),
+        "bind must not create the missing root container"
+    );
+    assert!(!uid.exists());
+    assert!(!version.exists());
+    assert!(!Path::new(endpoint.os_name()).exists());
+    assert_eq!(std::fs::read_dir(outer.path()).unwrap().count(), 0);
+    assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::ENOENT));
+}
+
+#[tokio::test]
+async fn custom_root_container_file_is_rejected_without_changes() {
+    let outer = tempfile::Builder::new()
+        .prefix("c-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = outer.path().join("r");
+    let bytes = b"application-owned root file";
+    std::fs::write(&root, bytes).unwrap();
+    let endpoint = context(&root).endpoint(ADDRESS).unwrap();
+    let version = Path::new(endpoint.os_name()).parent().unwrap();
+    let uid = version.parent().unwrap();
+
+    let result = LocalListener::bind(&endpoint);
+    assert!(
+        result.is_err(),
+        "a root file cannot contain an endpoint namespace"
+    );
+    assert!(std::fs::symlink_metadata(&root).unwrap().is_file());
+    assert_eq!(std::fs::read(&root).unwrap(), bytes);
+    assert!(!uid.exists());
+    assert!(!version.exists());
+    assert!(!Path::new(endpoint.os_name()).exists());
+    assert_eq!(std::fs::read_dir(outer.path()).unwrap().count(), 1);
+    assert_eq!(result.err().unwrap().raw_os_error(), Some(libc::ENOTDIR));
+}
+
 fn retry_inspect(endpoint: &LocalEndpoint) -> EndpointCredential {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {

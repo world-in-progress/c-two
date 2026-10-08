@@ -212,17 +212,20 @@ pub(crate) fn fstat(fd: libc::c_int) -> io::Result<libc::stat> {
     }
 }
 
-/// Creates a missing managed namespace with an explicit 0700 mode.
+/// Creates only the requested private leaf directory with an explicit 0700 mode.
 ///
 /// `fs::create_dir_all` applies the process umask to 0777, so a permissive
 /// 002/000 umask would create a group- or world-writable directory that this
 /// same module then refuses to open. The explicit mode keeps a new namespace
 /// private without ever relaxing a pre-existing directory: an existing unsafe
 /// directory remains an explicit error instead of being silently chmod-ed.
+/// The caller creates the UID directory before the version directory. Never
+/// create their ancestors: the application must pre-create its root container,
+/// and a missing or non-directory root must fail at this mkdir operation.
 fn create_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
+    builder.recursive(false).mode(0o700);
     match builder.create(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
