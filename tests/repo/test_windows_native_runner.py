@@ -107,6 +107,8 @@ def test_full_scope_gate_inventory_preserves_receipt_order():
     local_args = local[0][1]
     assert "--lib" not in local_args  # owner_control is an integration target
     assert "c2-core" in local_args
+    assert "c2-http" in local_args
+    assert "c2-http/relay" in local_args
 
 
 def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():
