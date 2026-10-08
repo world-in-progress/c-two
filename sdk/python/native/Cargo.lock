@@ -100,6 +100,7 @@ dependencies = [
  "c2-local",
  "c2-mem",
  "c2-server",
+ "futures-util",
  "parking_lot",
  "serde_json",
  "tokio",

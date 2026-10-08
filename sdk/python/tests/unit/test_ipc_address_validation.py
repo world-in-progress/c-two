@@ -45,25 +45,37 @@ def test_client_util_accepts_plain_ipc_region():
 
 
 def test_client_util_uses_native_endpoint_name(monkeypatch):
-    calls = []
-
-    def fake_socket_path(address: str) -> str:
-        calls.append(address)
-        return '/tmp/native.sock'
-
     import c_two._native as native
+    from c_two.transport.registry import _ProcessRegistry
 
-    monkeypatch.setattr(native, 'ipc_endpoint_name', fake_socket_path)
+    calls = []
+    captured = native.resolve_local_endpoint_context()
 
-    assert util._endpoint_name_from_address('ipc://unit-server') == '/tmp/native.sock'
-    assert calls == ['ipc://unit-server']
+    class SessionSpy:
+        def local_endpoint_context(self) -> native.LocalEndpointContext:
+            calls.append('local_endpoint_context')
+            return captured
+
+    def unexpected_process_resolution(*_args, **_kwargs):
+        pytest.fail('util must use the current Runtime context')
+
+    registry = _ProcessRegistry.get()
+    with monkeypatch.context() as patch:
+        patch.setattr(registry, '_runtime_session', SessionSpy())
+        patch.setattr(native, 'ipc_endpoint_name', unexpected_process_resolution)
+        patch.setattr(native, 'resolve_local_endpoint_context', unexpected_process_resolution)
+
+        assert util._endpoint_name_from_address('ipc://unit-server') == captured.endpoint_name(
+            'ipc://unit-server',
+        )
+        assert calls == ['local_endpoint_context']
 
 
 def test_client_util_keeps_the_historical_call_shapes():
-    """The optional protocol arguments must not break existing callers.
+    """Optional context selection preserves the positional address/timeout.
 
-    Both probes address a fresh UUID region, so the historical one-argument and
-    two-argument shapes stay exercisable without ever touching a live server.
+    Both probes address a fresh UUID region, so the two-argument shapes remain
+    exercisable without ever touching a live server.
     """
     assert util.ping(_absent_address(), 0.01) is False
     assert util.shutdown(_absent_address(), 0.01) == {

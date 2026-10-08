@@ -50,6 +50,7 @@ pub use c2_local::{
     EndpointReapResult, EndpointSweep, EndpointSweepScope, EndpointUnverifiedReason, LocalEndpoint,
     SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
 };
+pub use call_execution::{CallExecutionObservation, CallExecutionObserver};
 pub use memory::{
     MemoryCellStats, MemoryScopeStats, RetiredMemoryObservation, RetiredScopeReport,
     RetirementHandoff, RuntimeMemoryStats, scope,

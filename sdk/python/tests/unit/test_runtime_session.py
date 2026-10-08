@@ -856,6 +856,7 @@ def test_registry_restores_native_error_bytes_before_wrapping() -> None:
     assert restored.details == {'route': 'grid'}
 
 def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> None:
+    from c_two._native import LocalEndpointContext, resolve_local_endpoint_context
     from c_two.transport.registry import _ProcessRegistry
 
     class FakeRetiredObservation:
@@ -864,9 +865,33 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
     retired_observations: list[FakeRetiredObservation] = []
 
     class FakeSession:
-        def __init__(self, outcome: dict | None = None, **_kwargs) -> None:
+        def __init__(
+            self,
+            outcome: dict | None = None,
+            *,
+            max_outstanding_calls: int | None = None,
+            retained_input_budget_bytes: int | None = None,
+            **_kwargs,
+        ) -> None:
             self._outcome = outcome if outcome is not None else {'relay_errors': []}
             self.adopted_observations: list[object] = []
+            self._context = resolve_local_endpoint_context()
+            self._limits = {
+                key: value for key, value in (
+                    ('max_outstanding_calls', max_outstanding_calls),
+                    ('retained_input_budget_bytes', retained_input_budget_bytes),
+                ) if value is not None
+            }
+
+        @property
+        def call_execution_limits_overrides(self) -> dict[str, int]:
+            return dict(self._limits)
+
+        def local_endpoint_context(self) -> LocalEndpointContext:
+            return self._context
+
+        def set_local_endpoint(self, *, context: LocalEndpointContext) -> None:
+            self._context = context
 
         def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
             assert timeout_seconds == 30.0
@@ -907,7 +932,15 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
         assert pending_runtime._runtime_session is runtime_session
         # Absent keys stay silent: apparent full cleanup is only reported
         # when the native outcome actually reports a failure.
-        hostless_registry({'relay_errors': []}).shutdown()
+        clean = hostless_registry({'relay_errors': []})
+        clean_session = clean._runtime_session
+        clean.shutdown()
+        assert clean._runtime_session is not clean_session
+        assert (
+            clean._runtime_session.local_endpoint_context()
+            is clean_session.local_endpoint_context()
+        )
+        assert clean._runtime_session.adopted_observations == retired_observations
 
     messages = [record.getMessage() for record in caplog.records]
     ipc_warnings = [

@@ -3,8 +3,8 @@
 //! This module is a thin projection, not a second implementation. Every
 //! decision that matters is made in Rust:
 //!
-//! * the OS endpoint is derived from the logical address and current platform by
-//!   `c2-config::LocalEndpoint`, never by probing a path in Python;
+//! * the OS endpoint is derived from one captured `LocalEndpointContext`, never
+//!   by probing a path in Python or re-reading process configuration per batch;
 //! * credentials are parsed and encoded by the one Rust codec
 //!   (`EndpointCredential::from_json` / `to_json`), so Python never owns a
 //!   field table, never assembles a `LocalEndpoint`, and never patches a
@@ -30,11 +30,97 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyDict, PyInt};
 
-use c2_config::LocalEndpoint;
+use c2_config::{
+    ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointNamespace,
+    LocalEndpointOptions,
+};
 use c2_core::{
     EndpointCredential, EndpointInspection, EndpointReapResult, EndpointSweep,
     EndpointUnverifiedReason, SweepBatch, SweepBudget, inspect_endpoint, reap_endpoint,
 };
+
+/// Immutable Core context. Python cannot assemble its platform identity or
+/// namespace, and every name is derived by the same native authority.
+#[pyclass(name = "LocalEndpointContext", module = "c_two._native", frozen)]
+pub(crate) struct PyLocalEndpointContext {
+    pub(crate) inner: LocalEndpointContext,
+}
+
+#[pymethods]
+impl PyLocalEndpointContext {
+    #[getter]
+    fn root(&self) -> Option<String> {
+        self.inner
+            .unix_root()
+            .map(|root| root.to_string_lossy().into_owned())
+    }
+
+    #[getter]
+    fn platform(&self) -> &'static str {
+        match self.inner.platform_kind() {
+            LocalEndpointNamespace::UnixFilesystem => "unix",
+            LocalEndpointNamespace::WindowsNamedPipe => "windows",
+        }
+    }
+
+    #[getter]
+    fn namespace_id(&self) -> &str {
+        self.inner.namespace_id()
+    }
+
+    #[getter]
+    fn layout(&self) -> &'static str {
+        self.inner.layout()
+    }
+
+    fn endpoint_name(&self, address: &str) -> PyResult<String> {
+        self.inner
+            .endpoint(address)
+            .map(|endpoint| endpoint.os_name().to_string_lossy().into_owned())
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LocalEndpointContext(platform={:?}, namespace_id={:?})",
+            self.platform(),
+            self.inner.namespace_id(),
+        )
+    }
+}
+
+/// Resolve once, or use an already captured context. The resolver owns root
+/// validation and code > environment > .env > platform-default precedence.
+pub(crate) fn resolve_context(
+    root: Option<String>,
+    context: Option<&PyLocalEndpointContext>,
+) -> PyResult<LocalEndpointContext> {
+    if let Some(context) = context {
+        if root.is_some() {
+            return Err(PyValueError::new_err(
+                "root and context are mutually exclusive",
+            ));
+        }
+        return Ok(context.inner.clone());
+    }
+    ConfigResolver::resolve_local_endpoint(
+        LocalEndpointOptions {
+            unix_root: root.map(Into::into),
+        },
+        ConfigSources::from_process(),
+    )
+    .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+#[pyfunction]
+#[pyo3(signature = (*, root=None))]
+fn resolve_local_endpoint_context(root: Option<String>) -> PyResult<PyLocalEndpointContext> {
+    resolve_context(root, None).map(|inner| PyLocalEndpointContext { inner })
+}
 
 /// Hard ceiling for one sweep batch's entry budget. A batch is a scheduling
 /// slice, never a whole-namespace collection. The default budget itself comes
@@ -195,9 +281,10 @@ impl PyEndpointCredential {
 impl PyEndpointCredential {
     /// Parses a strict JSON credential document.
     ///
-    /// Decoding is a pure parse: it re-derives the OS endpoint from the
-    /// recorded address and protocol, rejects unknown fields and unsupported
-    /// schema versions, and enforces the documented size limit. A successful
+    /// Decoding is a pure parse: the sole c2-local codec derives the endpoint
+    /// in its recorded context (schema 2 retains the historical default root),
+    /// rejects unknown fields and unsupported schema versions, and enforces
+    /// the documented size limit. A successful
     /// decode proves nothing about liveness; only `reap_endpoint` decides.
     #[staticmethod]
     fn from_json(json: &str) -> PyResult<Self> {
@@ -220,6 +307,13 @@ impl PyEndpointCredential {
     #[getter]
     fn address(&self) -> &str {
         self.inner.endpoint().address()
+    }
+
+    #[getter]
+    fn context(&self) -> PyLocalEndpointContext {
+        PyLocalEndpointContext {
+            inner: self.inner.endpoint().context().clone(),
+        }
     }
 
     /// Native backend credential metadata.
@@ -247,9 +341,16 @@ impl PyEndpointCredential {
 /// Inspects one logical local endpoint without creating ownership metadata.
 ///
 #[pyfunction]
-#[pyo3(signature = (address))]
-fn inspect_endpoint_endpoint<'py>(py: Python<'py>, address: &str) -> PyResult<Bound<'py, PyDict>> {
-    let endpoint = endpoint_for(address)?;
+#[pyo3(signature = (address, *, root=None, context=None))]
+fn inspect_endpoint_endpoint<'py>(
+    py: Python<'py>,
+    address: &str,
+    root: Option<String>,
+    context: Option<&PyLocalEndpointContext>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let endpoint = resolve_context(root, context)?
+        .endpoint(address)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
     // The inspection may touch the filesystem; it runs without the GIL.
     let inspection = py.detach(|| inspect_endpoint(&endpoint));
     match inspection {
@@ -289,10 +390,13 @@ fn inspect_endpoint_endpoint<'py>(py: Python<'py>, address: &str) -> PyResult<Bo
 ///
 /// Reap the native endpoint only after validating the credential address.
 #[pyfunction]
+#[pyo3(signature = (address, credential, *, root=None, context=None))]
 fn reap_endpoint_credential<'py>(
     py: Python<'py>,
     address: &str,
     credential: &PyEndpointCredential,
+    root: Option<String>,
+    context: Option<&PyLocalEndpointContext>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let recorded = credential.inner.endpoint();
     let dict = result_dict(py, "stale-target")?;
@@ -300,11 +404,17 @@ fn reap_endpoint_credential<'py>(
         dict.set_item("reason", Some("credential-address-mismatch".to_string()))?;
         return Ok(dict);
     }
-    // Re-derive through the same authority: a decoded credential never supplies
-    // a path, only its logical address and native backend metadata.
-    let endpoint = LocalEndpoint::from_address(recorded.address())
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    let result = py.detach(|| reap_endpoint(&endpoint, &credential.inner));
+    // The credential codec already captured and validated this endpoint.
+    // Never reinterpret schema 2 /tmp or schema 3 roots using current env.
+    // An explicit selection is a pure identity check before any state access.
+    if root.is_some() || context.is_some() {
+        let selected = resolve_context(root, context)?;
+        if &selected != recorded.context() {
+            dict.set_item("reason", Some("credential-context-mismatch"))?;
+            return Ok(dict);
+        }
+    }
+    let result = py.detach(|| reap_endpoint(recorded, &credential.inner));
     reap_dict(py, &result)
 }
 
@@ -321,6 +431,7 @@ pub(crate) struct PyEndpointSweep {
     inner: Option<EndpointSweep>,
     lease: Option<SweepLease>,
     default_budget: SweepBudget,
+    context: LocalEndpointContext,
     batches: u64,
     closed: bool,
 }
@@ -331,6 +442,8 @@ impl PyEndpointSweep {
         addresses: Option<Vec<String>>,
         max_entries: Option<Bound<'py, PyAny>>,
         max_ms: Option<Bound<'py, PyAny>>,
+        root: Option<String>,
+        context: Option<&PyLocalEndpointContext>,
     ) -> PyResult<Self> {
         // Both explicit dimensions are validated here, before the process
         // lease is taken or the native iterator is opened: a rejected budget
@@ -341,9 +454,11 @@ impl PyEndpointSweep {
             optional_budget_dimension(max_entries.as_ref(), "max_entries", MAX_SWEEP_ENTRIES)?,
             optional_budget_dimension(max_ms.as_ref(), "max_ms", MAX_SWEEP_MS)?,
         );
-        // The namespace is derived from `LocalEndpoint` authority using a
-        // reserved probe address; it is never a hardcoded directory.
-        let probe = LocalEndpoint::from_address("ipc://c2-endpoint-sweep")
+        // Capture exactly one context for the entire iterator, including all
+        // scoped addresses and later batches. Nothing re-reads env mid-round.
+        let context = resolve_context(root, context)?;
+        let probe = context
+            .endpoint("ipc://c2-endpoint-sweep")
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let scope = addresses
             .as_ref()
@@ -371,6 +486,7 @@ impl PyEndpointSweep {
             inner: Some(inner),
             lease: Some(lease),
             default_budget,
+            context,
             batches: 0,
             closed: false,
         })
@@ -469,14 +585,16 @@ fn batch_dict<'py>(
 impl PyEndpointSweep {
     /// Opens the native namespace with optional address scope and bounded budgets.
     #[new]
-    #[pyo3(signature = (*, addresses=None, max_entries=None, max_ms=None))]
+    #[pyo3(signature = (*, addresses=None, max_entries=None, max_ms=None, root=None, context=None))]
     fn new<'py>(
         py: Python<'py>,
         addresses: Option<Vec<String>>,
         max_entries: Option<Bound<'py, PyAny>>,
         max_ms: Option<Bound<'py, PyAny>>,
+        root: Option<String>,
+        context: Option<&PyLocalEndpointContext>,
     ) -> PyResult<Self> {
-        Self::open(py, addresses, max_entries, max_ms)
+        Self::open(py, addresses, max_entries, max_ms, root, context)
     }
 
     /// Advances the native iterator by one bounded batch.
@@ -514,10 +632,16 @@ impl PyEndpointSweep {
 
     #[getter]
     fn protocol(&self) -> &str {
-        if cfg!(windows) {
-            "named-pipe"
-        } else {
-            "managed-v2"
+        match self.context.platform_kind() {
+            LocalEndpointNamespace::WindowsNamedPipe => "named-pipe",
+            LocalEndpointNamespace::UnixFilesystem => "managed-v2",
+        }
+    }
+
+    #[getter]
+    fn context(&self) -> PyLocalEndpointContext {
+        PyLocalEndpointContext {
+            inner: self.context.clone(),
         }
     }
 
@@ -577,13 +701,11 @@ impl Drop for PyEndpointSweep {
 }
 
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyLocalEndpointContext>()?;
     module.add_class::<PyEndpointCredential>()?;
     module.add_class::<PyEndpointSweep>()?;
     module.add_function(wrap_pyfunction!(inspect_endpoint_endpoint, module)?)?;
     module.add_function(wrap_pyfunction!(reap_endpoint_credential, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve_local_endpoint_context, module)?)?;
     Ok(())
-}
-
-fn endpoint_for(address: &str) -> PyResult<LocalEndpoint> {
-    LocalEndpoint::from_address(address).map_err(|e| PyValueError::new_err(e.to_string()))
 }

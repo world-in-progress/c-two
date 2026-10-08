@@ -26,6 +26,15 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 set_attr(value, "message", message);
                 let detail_dict = PyDict::new(py);
                 for (key, item) in details {
+                    if key == "transport_phase" {
+                        set_attr(value, "transport_phase", &item);
+                    }
+                    if key == "fallback_eligible" {
+                        set_attr(value, "fallback_eligible", item == "true");
+                    }
+                    if key == "route_withdrawal" {
+                        set_attr(value, "route_withdrawal", item == "true");
+                    }
                     let _ = detail_dict.set_item(key, item);
                 }
                 set_attr(value, "details", detail_dict);
@@ -75,8 +84,14 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
         LifecycleError::InvalidServerId(_) => {
             set_attr(value, "lifecycle_kind", "invalid_server_id");
         }
+        LifecycleError::ConfigFrozen => {
+            set_attr(value, "lifecycle_kind", "config_frozen");
+        }
         LifecycleError::ClientConfigFrozen => {
             set_attr(value, "lifecycle_kind", "client_config_frozen");
+        }
+        LifecycleError::ConfigFrozen => {
+            set_attr(value, "lifecycle_kind", "config_frozen");
         }
         LifecycleError::DuplicateRoute(route) => {
             set_attr(value, "lifecycle_kind", "duplicate_route");

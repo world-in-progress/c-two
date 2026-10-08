@@ -34,6 +34,8 @@ PORTABLE = (
     f"{SDK}/integration/test_portable_payload_matrix.py",
 )
 TYPESCRIPT = f"{SDK}/integration/test_typescript_real_calls.py"
+# The SDK pyproject is pytest's root, so nodeids start with tests/.
+WINDOWS_ENDPOINT_TEST = "tests/unit/test_endpoint_context.py::test_windows_root_override_is_explicitly_unsupported_and_preserves_default"
 FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
 PLUGIN = "tools.dev.test_python"
 
@@ -207,8 +209,16 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
     calls = Counter(row["nodeid"] for row in reports if row["when"] == "call")
     if any(count != 1 for count in calls.values()):
         raise RunnerError("同一nodeid被执行多次")
-    problems = [row for row in reports if row["outcome"] != "passed"]
-    if problems or set(calls) != set(expected) or evidence["exit_status"] != 0:
+    platform_skips = {
+        row["nodeid"] for row in reports
+        if sys.platform != "win32" and row["nodeid"] == WINDOWS_ENDPOINT_TEST
+        and row["when"] == "setup" and row["outcome"] == "skipped"
+        and row.get("skip_reason") == "Skipped: Windows named-pipe platform contract"
+    }
+    problems = [row for row in reports if row["outcome"] != "passed" and not (
+        row["nodeid"] in platform_skips and row["when"] == "setup" and row["outcome"] == "skipped"
+    )]
+    if problems or set(calls) != set(expected) - platform_skips or evidence["exit_status"] != 0:
         raise RunnerError(f"实际测试有失败/skip/未执行call：{problems}")
     if not (directory / "junit.xml").is_file():
         raise RunnerError("JUnit缺失")
@@ -468,7 +478,10 @@ def pytest_collection_finish(session: Any) -> None:
 
 
 def pytest_runtest_logreport(report: Any) -> None:
-    _REPORTS.append({"nodeid": report.nodeid, "when": report.when, "outcome": report.outcome})
+    row = {"nodeid": report.nodeid, "when": report.when, "outcome": report.outcome}
+    if report.skipped and isinstance(report.longrepr, tuple):
+        row["skip_reason"] = str(report.longrepr[2])
+    _REPORTS.append(row)
 
 
 def pytest_sessionfinish(session: Any, exitstatus: Any) -> None:

@@ -1,38 +1,48 @@
 //! Call-scoped writable buffer exposed to Python payload write plans.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use pyo3::exceptions::{PyAttributeError, PyBufferError, PyValueError};
+use parking_lot::Mutex;
+use pyo3::exceptions::{PyAttributeError, PyBufferError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-#[pyclass(name = "WritablePayloadSink")]
+#[pyclass(name = "WritablePayloadSink", frozen)]
 pub(crate) struct PyWritablePayloadSink {
-    ptr: *mut u8,
-    len: usize,
-    active: AtomicBool,
+    inner: Mutex<SinkState>,
 }
 
-// The sink is a call-scoped buffer-protocol facade over memory owned by the
-// native request/response writer. Dropping or inspecting the Python object on
-// another thread is safe because Rust never dereferences `ptr` outside
-// `__getbuffer__`; active buffer acquisition is fenced by `active`, and
-// existing exported buffers remain the caller's unsafe responsibility until the
-// write callback returns.
-unsafe impl Send for PyWritablePayloadSink {}
-unsafe impl Sync for PyWritablePayloadSink {}
+struct SinkState {
+    bytes: Option<Vec<u8>>,
+    active: bool,
+    exports: usize,
+}
 
 impl PyWritablePayloadSink {
-    fn new(ptr: *mut u8, len: usize) -> Self {
+    fn new(len: usize) -> Self {
         Self {
-            ptr,
-            len,
-            active: AtomicBool::new(true),
+            inner: Mutex::new(SinkState {
+                bytes: Some(vec![0; len]),
+                active: true,
+                exports: 0,
+            }),
         }
     }
 
     fn close_inner(&self) {
-        self.active.store(false, Ordering::SeqCst);
+        self.inner.lock().active = false;
+    }
+
+    fn take_bytes(&self) -> PyResult<Vec<u8>> {
+        let mut state = self.inner.lock();
+        state.active = false;
+        if state.exports != 0 {
+            return Err(PyBufferError::new_err(
+                "prepared payload writer retained an exported destination buffer",
+            ));
+        }
+        state
+            .bytes
+            .take()
+            .ok_or_else(|| PyBufferError::new_err("writable payload sink is closed"))
     }
 }
 
@@ -43,7 +53,7 @@ impl PyWritablePayloadSink {
     }
 
     fn __len__(&self) -> usize {
-        self.len
+        self.inner.lock().bytes.as_ref().map_or(0, Vec::len)
     }
 
     unsafe fn __getbuffer__(
@@ -52,18 +62,22 @@ impl PyWritablePayloadSink {
         flags: std::os::raw::c_int,
     ) -> PyResult<()> {
         let this = slf.borrow();
-        if !this.active.load(Ordering::SeqCst) {
+        let mut state = this.inner.lock();
+        if !state.active {
             return Err(PyBufferError::new_err("writable payload sink is closed"));
         }
-        if this.ptr.is_null() {
-            return Err(PyBufferError::new_err(
-                "writable payload sink has no buffer",
-            ));
-        }
+        let bytes = state
+            .bytes
+            .as_mut()
+            .ok_or_else(|| PyBufferError::new_err("writable payload sink is closed"))?;
+        // The Vec never moves/reallocates while exported. Each export owns a
+        // Python reference to the sink, so escaped views pin the Vec even after
+        // callback failure or timeout. Transfer requires zero exports under the
+        // same lock that fences new acquisition. No unsafe Send wrapper exists.
         unsafe {
-            (*view).buf = this.ptr as *mut std::os::raw::c_void;
+            (*view).buf = bytes.as_mut_ptr().cast();
             (*view).obj = ffi::Py_NewRef(slf.as_ptr());
-            (*view).len = this.len as isize;
+            (*view).len = bytes.len() as isize;
             (*view).readonly = 0;
             (*view).itemsize = 1;
             (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
@@ -73,26 +87,24 @@ impl PyWritablePayloadSink {
             };
             (*view).ndim = 1;
             (*view).shape = if flags & ffi::PyBUF_ND != 0 {
-                &mut (*view).len as *mut isize
+                &mut (*view).len
             } else {
                 std::ptr::null_mut()
             };
             (*view).strides = if flags & ffi::PyBUF_STRIDES != 0 {
-                &mut (*view).itemsize as *mut isize
+                &mut (*view).itemsize
             } else {
                 std::ptr::null_mut()
             };
             (*view).suboffsets = std::ptr::null_mut();
             (*view).internal = std::ptr::null_mut();
         }
+        state.exports += 1;
         Ok(())
     }
 
-    unsafe fn __releasebuffer__(
-        _slf: &Bound<'_, Self>,
-        _view: *mut ffi::Py_buffer,
-    ) -> PyResult<()> {
-        Ok(())
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
+        self.inner.lock().exports -= 1;
     }
 }
 
@@ -115,19 +127,15 @@ pub(crate) fn prepared_plan_nbytes(plan: &Bound<'_, PyAny>) -> PyResult<Option<u
     }
 }
 
-pub(crate) fn write_python_payload_plan(
+pub(crate) fn materialize_python_payload_plan(
     py: Python<'_>,
     plan: &Bound<'_, PyAny>,
-    destination: &mut [u8],
-) -> PyResult<()> {
-    let sink = Py::new(
-        py,
-        PyWritablePayloadSink::new(destination.as_mut_ptr(), destination.len()),
-    )?;
-    let sink_bound = sink.bind(py);
-    let result = plan.call_method1("write_into", (sink_bound,));
-    sink_bound.borrow().close_inner();
-    result.map(|_| ()).map_err(|err| {
-        PyValueError::new_err(format!("prepared payload write failed: {}", err.value(py)))
-    })
+    nbytes: usize,
+) -> PyResult<Vec<u8>> {
+    let sink = Py::new(py, PyWritablePayloadSink::new(nbytes))?;
+    let result = plan.call_method1("write_into", (sink.bind(py),));
+    sink.bind(py).borrow().close_inner();
+    result?;
+    let bytes = sink.bind(py).borrow().take_bytes()?;
+    Ok(bytes)
 }

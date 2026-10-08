@@ -44,6 +44,89 @@ use tokio::runtime::{Builder, Handle, Runtime};
 
 use crate::{CallScope, CallScopeError, CallState, Error, LifecycleError, TransportPhase};
 
+/// Pure metadata observation of one Runtime's finite-call domain.
+///
+/// Capturing or reading this handle never resolves configuration or creates
+/// an executor. It can outlive the Runtime and retains only accounting state,
+/// never a session, transport, payload, service or permission to execute calls.
+/// Different Runtime instances have independent domains and limits.
+#[derive(Clone, Debug)]
+pub struct CallExecutionObserver {
+    state: Arc<Mutex<ObservationState>>,
+}
+
+#[derive(Debug, Default)]
+struct ObservationState {
+    budget: Option<RetentionBudget>,
+    closed: bool,
+}
+
+/// One consistent metadata observation. An uninitialized open domain remains
+/// live: the first business call may still establish its accounting budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallExecutionObservation {
+    pub initialized: bool,
+    pub closed: bool,
+    pub counters: Option<crate::CallExecutionSnapshot>,
+}
+
+impl CallExecutionObserver {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ObservationState::default())),
+        }
+    }
+
+    /// Read counters only; never reads process environment or .env and never
+    /// changes configuration, admission or owner lifetimes.
+    pub fn snapshot(&self) -> CallExecutionObservation {
+        let state = self.state.lock();
+        CallExecutionObservation {
+            initialized: state.budget.is_some(),
+            closed: state.closed,
+            counters: state.budget.as_ref().map(RetentionBudget::snapshot),
+        }
+    }
+
+    /// Retired metadata may be discarded only after closure and real release
+    /// of every operation and input byte. Open, uninitialized domains are live.
+    pub fn is_live(&self) -> bool {
+        let observation = self.snapshot();
+        !observation.closed
+            || observation.counters.is_some_and(|counters| {
+                counters.used_operations != 0 || counters.used_retained_bytes != 0
+            })
+    }
+
+    pub fn same_domain(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    // RuntimeState's lock serializes publication with configuration/closure.
+    // The nested metadata lock makes a captured-before-freeze observer see
+    // either the complete new budget or the prior uninitialized state.
+    pub(crate) fn publish(&self, context: &CallExecutionContext) {
+        let mut state = self.state.lock();
+        debug_assert!(state.budget.is_none());
+        if state.closed {
+            context.close();
+        }
+        state.budget = Some(context.budget.clone());
+    }
+
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock();
+        if let Some(budget) = &state.budget {
+            budget.close();
+        }
+        state.closed = true;
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state.lock().closed
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CallExecutionContext {
     budget: RetentionBudget,

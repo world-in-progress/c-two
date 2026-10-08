@@ -2,9 +2,8 @@
 
 `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
-This guide describes **c3 0.3.0**, paired with Python C-Two **0.7.0**. See
-[release notes](../docs/releases/0.7.0.md) for version availability, upgrades
-and validation progress.
+This guide covers **c3 0.3.1 / C-Two 0.7.1**. Configuration and upgrade details
+are in the [version guide](../docs/releases/0.7.1.md).
 
 ## Scope
 
@@ -107,6 +106,7 @@ Useful options:
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
+| `--ipc-root` | `C2_IPC_ROOT` | `/tmp` (Unix) | Absolute container root for the relay's private Unix endpoint directories; the deployment must create the container beforehand. Not applicable on Windows, where upstream IPC uses current-logon-SID Named Pipes. |
 | `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
@@ -170,6 +170,16 @@ c3 endpoint reap ipc://this-run-server --credential endpoint-credential.json
 c3 endpoint sweep --address ipc://this-run-server --max-entries 64 --max-ms 10 --max-batches 64
 ```
 
+Inspect, reap and sweep accept `--ipc-root` (or `C2_IPC_ROOT`) to address
+endpoints under a non-default Unix root. The root container must already
+exist; the CLI captures the endpoint context with the inspection and reap
+operates strictly on that captured context, so a credential from one root
+never touches an object under another. Custom-root routes discovered through
+a relay answer over HTTP when the relay's local namespace does not match;
+the namespace hint is a routing-domain signal, not an authentication
+credential. On Windows these commands keep their current-logon-SID Named
+Pipe behavior and `--ipc-root` is rejected as not applicable.
+
 Inspect reports observation, not process liveness. Reap refuses stale or
 unverified objects. Keep sweep addresses scoped to the current run; report
 completion only when CLI JSON `sweep.roundComplete` is true, not merely when the batch limit
@@ -232,7 +242,9 @@ python tools/dev/generate_banner.py
 
 ## Release
 
-The [c3 0.3.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.0) uses the following binary target convention. Availability and candidate gates are tracked in [release notes](../docs/releases/0.7.0.md):
+The coordinated [c3 0.3.1 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.1)
+uses the following binary target convention. Installation and checksum
+verification are in the [Windows guide](../docs/windows-native-usage.md):
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
@@ -247,14 +259,14 @@ The matching release's `rc-manifest.json` identifies the artifact source.
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.1
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to
 `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.0 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.1 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64
@@ -263,7 +275,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.0 -Target x86_64-pc-windows-msvc
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.1 -Target x86_64-pc-windows-msvc
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```

@@ -289,12 +289,9 @@ fn inline_response_lease(bytes: &[u8]) -> ResponseLease {
 
 fn breakable_handle_response(bytes: &[u8]) -> (HeldResponse, Arc<RwLock<MemPool>>) {
     let pool = Arc::new(RwLock::new(replacement_pool("handle")));
-    let mut handle = c2_wire::chunk::ReassemblyBacking::admit(
-        Arc::clone(&pool),
-        1,
-        bytes.len().max(1),
-    )
-    .expect("handle admission");
+    let mut handle =
+        c2_wire::chunk::ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len().max(1))
+            .expect("handle admission");
     handle.write_at(0, bytes).expect("handle write");
     let lease = ResponseLease::new(
         ResponseData::Handle(handle),

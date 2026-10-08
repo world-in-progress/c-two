@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -124,8 +124,9 @@ pub struct RelayAwareHttpClient {
     config: RelayAwareClientConfig,
     current: Mutex<Option<String>>,
     anchor_allows_local_ipc: bool,
-    local_endpoint_context: LocalEndpointContext,
-    default_namespace_id: String,
+    local_endpoint_context: Option<LocalEndpointContext>,
+    default_local_endpoint_context: OnceLock<Option<LocalEndpointContext>>,
+    http_only: bool,
 }
 
 impl RelayAwareHttpClient {
@@ -147,14 +148,12 @@ impl RelayAwareHttpClient {
     ) -> Result<Self, HttpError> {
         c2_contract::validate_expected_route_contract(&expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
-        // Legacy APIs mean the platform default, regardless of C2_IPC_ROOT.
-        // Core projects a custom frozen Runtime context through the builder below.
-        let local_endpoint_context = LocalEndpointContext::default_for_platform()
-            .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
-        let default_namespace_id = local_endpoint_context.namespace_id().to_owned();
+        // HTTP construction must not require a local logon SID or resolve an IPC
+        // root. Legacy local selection derives the platform default lazily.
         Ok(Self {
-            local_endpoint_context,
-            default_namespace_id,
+            local_endpoint_context: None,
+            default_local_endpoint_context: OnceLock::new(),
+            http_only: false,
             anchor_allows_local_ipc: relay_anchor_allows_local_ipc(control.base_url()),
             control,
             pool: HttpClientPool::instance(),
@@ -165,19 +164,51 @@ impl RelayAwareHttpClient {
         })
     }
 
-    /// Freeze the context whose endpoints the caller can open. Namespace agreement
+    /// Project the context whose endpoints the caller can open. Namespace agreement
     /// only proposes an IPC candidate; the caller still validates handshake identity
     /// and the complete expected route contract before using it.
     pub fn with_local_endpoint_context(mut self, context: &LocalEndpointContext) -> Self {
-        self.local_endpoint_context = context.clone();
+        self.local_endpoint_context = Some(context.clone());
         *self.current.get_mut() = None;
         self
     }
 
+    /// Disable local candidate selection without constructing a placeholder
+    /// endpoint context. Remote-only callers need no local platform capability.
+    pub fn with_http_only(mut self) -> Self {
+        self.http_only = true;
+        *self.current.get_mut() = None;
+        self
+    }
+
+    pub fn allows_local_ipc(&self) -> bool {
+        self.anchor_allows_local_ipc && !self.http_only
+    }
+
+    /// The exact context used to compare local candidates. This observation is
+    /// pure; it never binds/connects or freezes a Runtime's configuration.
+    pub fn local_ipc_context(&self) -> Option<&LocalEndpointContext> {
+        if !self.allows_local_ipc() {
+            return None;
+        }
+        self.local_endpoint_context.as_ref().or_else(|| {
+            self.default_local_endpoint_context
+                .get_or_init(|| LocalEndpointContext::default_for_platform().ok())
+                .as_ref()
+        })
+    }
+
     fn namespace_allows_local_ipc(&self, namespace: Option<&str>) -> bool {
+        let Some(context) = self.local_ipc_context() else {
+            return false;
+        };
         match namespace {
-            Some(namespace) => namespace == self.local_endpoint_context.namespace_id(),
-            None => self.local_endpoint_context.namespace_id() == self.default_namespace_id,
+            Some(namespace) => namespace == context.namespace_id(),
+            None => self
+                .default_local_endpoint_context
+                .get_or_init(|| LocalEndpointContext::default_for_platform().ok())
+                .as_ref()
+                .is_some_and(|default| context == default),
         }
     }
 
@@ -321,7 +352,11 @@ impl RelayAwareHttpClient {
 
         for attempt in 0..attempts {
             let routes = match self
-                .resolve_routes_async(attempt > 0 || fallback_denied_when_only_excluded, control)
+                .resolve_routes_async(
+                    attempt > 0 || fallback_denied_when_only_excluded,
+                    prefer_local_ipc,
+                    control,
+                )
                 .await
             {
                 Ok(routes) if !routes.routes.is_empty() => routes,
@@ -339,8 +374,8 @@ impl RelayAwareHttpClient {
                     return Err(err);
                 }
             };
-            let namespace_allows_local_ipc =
-                self.namespace_allows_local_ipc(routes.local_endpoint_namespace.as_deref());
+            let namespace_allows_local_ipc = prefer_local_ipc
+                && self.namespace_allows_local_ipc(routes.local_endpoint_namespace.as_deref());
             let had_routes_before_local_exclusion = !routes.routes.is_empty();
             let routes =
                 filter_failed_local_ipc_candidates(routes.routes, excluded_local_ipc_candidates);
@@ -441,7 +476,7 @@ impl RelayAwareHttpClient {
         let mut previous_dispatch = None;
 
         for attempt in 0..attempts {
-            let routes = match self.resolve_routes_async(attempt > 0, control).await {
+            let routes = match self.resolve_routes_async(attempt > 0, false, control).await {
                 Ok(routes) if !routes.routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
@@ -520,6 +555,7 @@ impl RelayAwareHttpClient {
     async fn resolve_routes_async(
         &self,
         force_refresh: bool,
+        prefer_local_ipc: bool,
         control: Option<&HttpCallControl>,
     ) -> Result<RelayResolvedRoutes, HttpError> {
         check_active(control)?;
@@ -527,8 +563,7 @@ impl RelayAwareHttpClient {
             self.control.invalidate(self.route_name());
         }
         let routes = self
-            .control
-            .resolve_matching_with_context_async(&self.expected, &self.local_endpoint_context)
+            .resolve_with_endpoint_context_async(prefer_local_ipc)
             .await;
         check_active(control)?;
         let routes = routes?;
@@ -539,8 +574,7 @@ impl RelayAwareHttpClient {
             check_active(control)?;
             self.control.invalidate(self.route_name());
             let refreshed = self
-                .control
-                .resolve_matching_with_context_async(&self.expected, &self.local_endpoint_context)
+                .resolve_with_endpoint_context_async(prefer_local_ipc)
                 .await;
             check_active(control)?;
             let refreshed = refreshed?;
@@ -569,6 +603,33 @@ impl RelayAwareHttpClient {
             routes: filtered,
             local_endpoint_namespace,
         })
+    }
+
+    async fn resolve_with_endpoint_context_async(
+        &self,
+        prefer_local_ipc: bool,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
+        // A supplied Runtime snapshot may be advertised on HTTP-only paths too;
+        // only local selection may lazily request the platform default/SID.
+        let context = self.local_endpoint_context.as_ref().or_else(|| {
+            if prefer_local_ipc {
+                self.local_ipc_context()
+            } else {
+                None
+            }
+        });
+        match context {
+            Some(context) => {
+                self.control
+                    .resolve_matching_with_context_async(&self.expected, context)
+                    .await
+            }
+            None => {
+                self.control
+                    .resolve_matching_with_namespace_async(&self.expected)
+                    .await
+            }
+        }
     }
 
     fn acquire_route_client(
@@ -1237,6 +1298,42 @@ mod tests {
 
         registry_handle.abort();
         live_handle.abort();
+    }
+
+    #[test]
+    fn http_policy_never_requires_a_local_scope() {
+        for anchor in ["http://127.0.0.1:9", "https://relay.example"] {
+            let client = RelayAwareHttpClient::new(
+                anchor,
+                expected_contract(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap();
+            assert!(client.default_local_endpoint_context.get().is_none());
+            let client = client.with_http_only();
+            assert!(!client.allows_local_ipc());
+            assert!(client.local_ipc_context().is_none());
+            assert!(!client.namespace_allows_local_ipc(None));
+            assert!(client.default_local_endpoint_context.get().is_none());
+        }
+    }
+
+    #[test]
+    fn unavailable_local_scope_proposes_http_without_a_fake_context() {
+        let client = RelayAwareHttpClient::new(
+            "http://127.0.0.1:9",
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap();
+        // Synthetic result of a failed platform/SID lookup, without OS or env
+        // mutation. There is no replacement SID/context and no local I/O.
+        client.default_local_endpoint_context.set(None).unwrap();
+        assert!(client.local_ipc_context().is_none());
+        assert!(!client.namespace_allows_local_ipc(None));
+        assert!(!client.namespace_allows_local_ipc(Some(&"f".repeat(64))));
     }
 
     #[test]

@@ -173,6 +173,26 @@ class _ProcessRegistry:
     # Public API
     # ------------------------------------------------------------------
 
+    def set_local_endpoint(self, *, root: str | None = None) -> None:
+        """Forward the code root to Core's endpoint resolver."""
+        if root is not None and not isinstance(root, str):
+            raise TypeError('root must be a str or None')
+        with self._lock:
+            self._runtime_session.set_local_endpoint(root=root)
+
+    def set_call_execution_limits(
+        self,
+        *,
+        max_outstanding_calls: int | None = None,
+        retained_input_budget_bytes: int | None = None,
+    ) -> None:
+        """Set native finite call limits before their first business call."""
+        with self._lock:
+            self._runtime_session.set_call_execution_limits(
+                max_outstanding_calls=max_outstanding_calls,
+                retained_input_budget_bytes=retained_input_budget_bytes,
+            )
+
     def set_relay_anchor(self, address: str) -> None:
         """Set the relay anchor address for name resolution.
 
@@ -239,7 +259,10 @@ class _ProcessRegistry:
         """
         runtime_session = self._runtime_session
         retired_observation = runtime_session.retire_memory_observation()
-        kwargs = _runtime_session_kwargs_from_settings()
+        kwargs = {
+            **_runtime_session_kwargs_from_settings(),
+            **runtime_session.call_execution_limits_overrides,
+        }
         if preserve_server_identity:
             kwargs = {
                 'server_id': (
@@ -251,6 +274,9 @@ class _ProcessRegistry:
                 **kwargs,
             }
         new_session = runtime_session.__class__(**kwargs)
+        # Native context authority pins the replacement to the captured domain,
+        # including a frozen env/.env choice. Python stores no root or paths.
+        new_session.set_local_endpoint(context=runtime_session.local_endpoint_context())
         new_session.adopt_retired_memory_observation(retired_observation)
         if preserve_server_identity:
             new_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
@@ -263,10 +289,10 @@ class _ProcessRegistry:
         """Drive a replaced session's bounded client-only close barrier.
 
         This releases the old session's outgoing IPC cache and runtime
-        barrier. The retirement observation needs no separate lifecycle step:
-        it observes through weak handles, so its records detach exactly when
-        the last real owner of the old session's accounting or lease metadata
-        — an old proxy, an in-flight response, an outstanding hold — is gone.
+        barrier. Memory retirement observes through weak handles. Finite-call
+        retirement holds only Core counter metadata, including initialization
+        and close publication. It never retains a Runtime or refunds unfinished
+        input ownership as part of this close.
         """
         try:
             old_session.shutdown(
@@ -855,6 +881,18 @@ class _ProcessRegistry:
 # Module-level API (delegates to singleton)
 # ------------------------------------------------------------------
 
+def set_local_endpoint(*, root: str | None = None) -> None:
+    """Configure local IPC through Core. Call before the first local attempt.
+
+    Code root overrides environment/.env/defaults. Queries do not create
+    directories or freeze the selection; the first bind/connect attempt does,
+    including a failed attempt. Repeating the same frozen context is a no-op.
+    The Unix root container must already exist; Windows rejects root overrides.
+    Completed shutdown preserves the native selection in the fresh session.
+    """
+    _ProcessRegistry.get().set_local_endpoint(root=root)
+
+
 def set_transport_policy(
     *,
     shm_threshold: int | None | object = _UNSET,
@@ -1045,6 +1083,38 @@ def hold_stats() -> dict:
     """
     inst = _ProcessRegistry.get()
     return dict(inst._runtime_session.hold_stats())  # noqa: SLF001
+
+
+def set_call_execution_limits(
+    *,
+    max_outstanding_calls: int | None = None,
+    retained_input_budget_bytes: int | None = None,
+) -> None:
+    """Set Core finite call admission limits before the first business call.
+
+    Each ``None`` inherits native environment and default policy. Zero rejects
+    that dimension. Connections and snapshot observations do not freeze it;
+    the first business call does. Limits are per Runtime/domain and shared by
+    its call views.
+    """
+    _ProcessRegistry.get().set_call_execution_limits(
+        max_outstanding_calls=max_outstanding_calls,
+        retained_input_budget_bytes=retained_input_budget_bytes,
+    )
+
+
+def call_execution_snapshot() -> dict:
+    """Observe Core finite input charges without freezing admission policy.
+
+    Includes unfinished continuations after caller expiry. ``retired`` reports
+    earlier sessions separately while native operations still own charges;
+    shutdown closes admission and never refunds unfinished input ownership.
+    Each Runtime has its own admission domain; these rows do not imply a
+    shared process-wide limit across replacement sessions. Counters measure
+    retained input, not process memory usage.
+    """
+    inst = _ProcessRegistry.get()
+    return dict(inst._runtime_session.call_execution_snapshot())  # noqa: SLF001
 
 
 def memory_stats() -> MemoryStats:

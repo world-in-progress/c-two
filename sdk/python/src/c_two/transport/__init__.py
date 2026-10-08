@@ -11,6 +11,9 @@ __all__ = [
     'CRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
+    'with_call_options',
+    'set_call_execution_limits',
+    'call_execution_snapshot',
     'set_transport_policy', 'set_server', 'set_client',
     'set_relay_anchor',
     'register', 'connect', 'close',
@@ -18,6 +21,9 @@ __all__ = [
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    'with_call_options': ('.client.proxy', 'with_call_options'),
+    'set_call_execution_limits': ('.registry', 'set_call_execution_limits'),
+    'call_execution_snapshot': ('.registry', 'call_execution_snapshot'),
     'CRMProxy':         ('.client.proxy',        'CRMProxy'),
     'Server':          ('.server.native',       'NativeServerBridge'),
     'CRMSlot':           ('.server.native',       'CRMSlot'),

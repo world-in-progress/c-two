@@ -617,6 +617,9 @@ impl Runtime {
                 settings.remote_payload_chunk_size,
             )
             .map_err(normalize_resolution_error)?;
+        let resolved = self
+            .reconcile_relay_connection(resolved)
+            .map_err(normalize_resolution_error)?;
         match resolved {
             RelayResolvedConnection::Http {
                 client,
@@ -631,55 +634,55 @@ impl Runtime {
                 },
                 ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
             ),
-            RelayResolvedConnection::Ipc { client, candidate } => {
-                match self.acquire_relay_ipc(&candidate, &expected) {
-                    Ok(connection) => {
-                        let observed_route = observed_ipc_route(&connection);
-                        self.finish_client(
-                            expected,
-                            ObservedPath::RelayAwareLocalIpc,
-                            observed_route,
-                            ClientInner::Ipc(connection),
-                        )
-                    }
-                    Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
-                    Err(_) => {
-                        let resolved = Runtime::resolve_relay_connection_after_local_ipc_failures(
-                            client,
-                            std::slice::from_ref(&candidate),
-                        )
+            RelayResolvedConnection::Ipc {
+                client, candidate, ..
+            } => match self.acquire_relay_ipc(&candidate, &expected) {
+                Ok(connection) => {
+                    let observed_route = observed_ipc_route(&connection);
+                    self.finish_client(
+                        expected,
+                        ObservedPath::RelayAwareLocalIpc,
+                        observed_route,
+                        ClientInner::Ipc(connection),
+                    )
+                }
+                Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
+                Err(_) => {
+                    let resolved = Runtime::resolve_relay_connection_after_local_ipc_failures(
+                        client,
+                        std::slice::from_ref(&candidate),
+                    )
+                    .map_err(normalize_resolution_error)?;
+                    let resolved = self
+                        .reconcile_relay_connection(resolved)
                         .map_err(normalize_resolution_error)?;
-                        match resolved {
-                            RelayResolvedConnection::Http {
-                                client,
+                    match resolved {
+                        RelayResolvedConnection::Http {
+                            client,
+                            route_uid,
+                            route_revision,
+                        } => self.finish_client(
+                            expected,
+                            ObservedPath::RelayAwareRelay,
+                            ObservedRoute {
                                 route_uid,
                                 route_revision,
-                            } => self.finish_client(
+                            },
+                            ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
+                        ),
+                        RelayResolvedConnection::Ipc { candidate, .. } => {
+                            let connection = self.acquire_relay_ipc(&candidate, &expected)?;
+                            let observed_route = observed_ipc_route(&connection);
+                            self.finish_client(
                                 expected,
-                                ObservedPath::RelayAwareRelay,
-                                ObservedRoute {
-                                    route_uid,
-                                    route_revision,
-                                },
-                                ClientInner::Http(
-                                    client,
-                                    relay_default(settings.call_timeout_secs)?,
-                                ),
-                            ),
-                            RelayResolvedConnection::Ipc { candidate, .. } => {
-                                let connection = self.acquire_relay_ipc(&candidate, &expected)?;
-                                let observed_route = observed_ipc_route(&connection);
-                                self.finish_client(
-                                    expected,
-                                    ObservedPath::RelayAwareLocalIpc,
-                                    observed_route,
-                                    ClientInner::Ipc(connection),
-                                )
-                            }
+                                ObservedPath::RelayAwareLocalIpc,
+                                observed_route,
+                                ClientInner::Ipc(connection),
+                            )
                         }
                     }
                 }
-            }
+            },
         }
     }
 }

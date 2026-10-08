@@ -468,10 +468,7 @@ mod tests {
     fn init_peer_shm_clamps_zero_segment() {
         let conn = Connection::new(4);
         conn.init_peer_shm("/cc3b_zero".into(), vec![("z0".into(), 0)]);
-        assert_eq!(
-            conn.buddy_segment_size(),
-            MIN_BUDDY_SEGMENT_SIZE,
-        );
+        assert_eq!(conn.buddy_segment_size(), MIN_BUDDY_SEGMENT_SIZE,);
     }
 
     #[test]
@@ -479,10 +476,7 @@ mod tests {
         // 8191 is 1 below MIN_BUDDY_SEGMENT_SIZE (8192) — must clamp.
         let conn = Connection::new(5);
         conn.init_peer_shm("/cc3b_8191".into(), vec![("s0".into(), 8191)]);
-        assert_eq!(
-            conn.buddy_segment_size(),
-            MIN_BUDDY_SEGMENT_SIZE,
-        );
+        assert_eq!(conn.buddy_segment_size(), MIN_BUDDY_SEGMENT_SIZE,);
     }
 
     #[test]

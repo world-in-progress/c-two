@@ -4,43 +4,63 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-fn timeout_duration(timeout_seconds: f64) -> PyResult<Duration> {
-    if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
-        return Err(PyValueError::new_err(
-            "timeout must be a non-negative finite number",
-        ));
-    }
-    Ok(Duration::from_secs_f64(timeout_seconds))
+use crate::endpoint_ffi::{PyLocalEndpointContext, resolve_context};
+
+pub(crate) fn timeout_duration(timeout_seconds: f64) -> PyResult<Duration> {
+    crate::runtime_session_ffi::checked_shutdown_timeout(timeout_seconds)
+        .map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
-#[pyo3(signature = (address))]
-fn ipc_endpoint_name(address: &str) -> PyResult<String> {
-    let endpoint = c2_core::direct_ipc_endpoint(address);
+#[pyo3(signature = (address, *, root=None, context=None))]
+fn ipc_endpoint_name(
+    address: &str,
+    root: Option<String>,
+    context: Option<&PyLocalEndpointContext>,
+) -> PyResult<String> {
+    let context = resolve_context(root, context)?;
+    let endpoint = c2_core::direct_ipc_endpoint_with_context(address, &context);
     endpoint
         .map(|endpoint| endpoint.os_name().to_string_lossy().into_owned())
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[pyfunction]
-#[pyo3(signature = (address, timeout_seconds=0.5))]
-fn ipc_ping(py: Python<'_>, address: &str, timeout_seconds: f64) -> PyResult<bool> {
+#[pyo3(signature = (address, timeout_seconds=0.5, *, root=None, context=None))]
+fn ipc_ping(
+    py: Python<'_>,
+    address: &str,
+    timeout_seconds: f64,
+    root: Option<String>,
+    context: Option<&PyLocalEndpointContext>,
+) -> PyResult<bool> {
     let timeout = timeout_duration(timeout_seconds)?;
-    py.detach(|| c2_core::ping_direct_ipc(address, timeout))
+    let context = resolve_context(root, context)?;
+    py.detach(|| c2_core::ping_direct_ipc_with_context(address, &context, timeout))
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[pyfunction]
-#[pyo3(signature = (address, timeout_seconds=0.5))]
+#[pyo3(signature = (address, timeout_seconds=0.5, *, root=None, context=None))]
 fn ipc_shutdown<'py>(
     py: Python<'py>,
     address: &str,
     timeout_seconds: f64,
+    root: Option<String>,
+    context: Option<&PyLocalEndpointContext>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let timeout = timeout_duration(timeout_seconds)?;
+    let context = resolve_context(root, context)?;
     let outcome = py
-        .detach(|| c2_core::shutdown_direct_ipc(address, timeout))
+        .detach(|| c2_core::shutdown_direct_ipc_with_context(address, &context, timeout))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    shutdown_ack_dict(py, outcome)
+}
+
+pub(crate) fn shutdown_ack_dict<'py>(
+    py: Python<'py>,
+    outcome: c2_core::DirectIpcShutdownOutcome,
+) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
     result.set_item("acknowledged", outcome.acknowledged)?;
     result.set_item("shutdown_started", outcome.shutdown_started)?;

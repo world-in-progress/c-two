@@ -109,11 +109,20 @@ def _text_bridge():
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry():
-    """Ensure a clean registry for every test."""
-    _ProcessRegistry.reset()
-    yield
-    _ProcessRegistry.reset()
+def _clean_registry(monkeypatch):
+    """Keep the singleton and code relay override local to each test.
+
+    Tests that need a relay set it explicitly. Scoped restoration still runs
+    if native teardown raises, so a failed test cannot export its code override
+    to the next file on the same worker.
+    """
+    with monkeypatch.context() as patch:
+        patch.setattr(settings, 'relay_anchor_address', None)
+        _ProcessRegistry.reset()
+        try:
+            yield
+        finally:
+            _ProcessRegistry.reset()
 
 
 # ------------------------------------------------------------------

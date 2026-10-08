@@ -14,10 +14,11 @@ use c2_contract::{
     PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
 use c2_core::{
-    Connect, Host, HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSnapshot, HostOptions,
-    MethodDefinition, RegisterOutcome, Registration, RelayCleanupError, RetiredMemoryObservation,
-    RouteCloseOutcome, Runtime, RuntimeOptions, ServerLifecyclePolicy, ServiceConcurrencyMode,
-    ServiceDefinition, ShutdownOutcome, UnregisterOutcome,
+    CallExecutionObserver, Connect, Host, HostClientHeldLeases, HostLifecyclePhase,
+    HostLifecycleSnapshot, HostOptions, MethodDefinition, RegisterOutcome, Registration,
+    RelayCleanupError, RetiredMemoryObservation, RouteCloseOutcome, Runtime, RuntimeOptions,
+    ServerLifecyclePolicy, ServiceConcurrencyMode, ServiceDefinition, ShutdownOutcome,
+    UnregisterOutcome,
 };
 use c2_mem::{BufferLeaseStats, BufferLeaseTracker};
 
@@ -27,6 +28,7 @@ use crate::config_ffi::{
 };
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
 use crate::core_ffi::{PyCoreClient, PyCoreService};
+use crate::endpoint_ffi::PyLocalEndpointContext;
 use crate::lease_ffi::{PyBufferLeaseTracker, lease_stats_dict};
 use crate::owner_ffi::PyNativeOwnerReceiver;
 use crate::route_concurrency_ffi::PyRouteConcurrency;
@@ -89,14 +91,20 @@ pub struct PyRuntimeSession {
     /// session's Runtime, cache, pools, callbacks, or payloads. Records whose
     /// last owner is gone are pruned individually on the next observation.
     retired: Mutex<Vec<Arc<RetiredMemoryObservation>>>,
+    /// Opaque Core observers retain only publication and counter metadata,
+    /// never retired runtimes, transports, services or payload ownership.
+    retired_call_execution: Mutex<Vec<CallExecutionObserver>>,
 }
 
 /// Read-only observation bundle passed from a shutting-down session to its
 /// replacement.
 ///
 /// The Python registry moves one of these between sessions; it carries no
-/// mutable transport authority and exposes no Python surface at all. The
-/// pending bundle is the one created by the latest retirement event; carried
+/// mutable transport authority and exposes no Python surface at all.
+/// Memory observations use weak handles. Call execution observers retain
+/// only Core-owned counter metadata, including a publication cell for domains
+/// not yet initialized at capture. Neither observer retains runtime authority.
+/// The pending bundle is the one created by the latest retirement event; carried
 /// bundles belong to earlier retirements. Capture is retry-safe: a failed
 /// replacement attempt drops its un-adopted bundle without consuming the old
 /// session's records, and a later retry re-captures everything the session
@@ -104,6 +112,7 @@ pub struct PyRuntimeSession {
 #[pyclass(name = "RetiredMemoryObservation", frozen)]
 pub struct PyRetiredMemoryObservation {
     inner: c2_core::RetirementHandoff,
+    call_execution: Vec<CallExecutionObserver>,
 }
 
 impl PyRuntimeSession {
@@ -161,6 +170,7 @@ impl PyRuntimeSession {
     /// session captured twice can never double-count. Capturing never
     /// connects, maps memory, freezes config, or instantiates a host.
     fn retire_bundles(&self) -> PyRetiredMemoryObservation {
+        self.prune_retired_call_execution();
         let pending = Arc::new(RetiredMemoryObservation::new());
         if let Some(observer) = self.inner.outgoing_memory_observer() {
             pending.push_scope(c2_core::scope::RUNTIME_OUTGOING, observer);
@@ -171,6 +181,14 @@ impl PyRuntimeSession {
         pending.push_tracker(Arc::clone(&self.lease_tracker));
         PyRetiredMemoryObservation {
             inner: c2_core::RetirementHandoff::new(pending, self.retired.lock().clone()),
+            call_execution: {
+                let mut observers = self.retired_call_execution.lock().clone();
+                let observer = self.inner.call_execution_observer();
+                if observer.is_live() {
+                    observers.push(observer);
+                }
+                observers
+            },
         }
     }
 
@@ -182,9 +200,16 @@ impl PyRuntimeSession {
     /// producer (an old proxy, an in-flight response) may still publish — and
     /// an emptied bundle goes away.
     fn live_retired_observations(&self) -> Vec<Arc<RetiredMemoryObservation>> {
+        self.prune_retired_call_execution();
         let mut retired = self.retired.lock();
         RetiredMemoryObservation::retain_live_bundles(&mut retired);
         retired.clone()
+    }
+
+    fn prune_retired_call_execution(&self) {
+        self.retired_call_execution
+            .lock()
+            .retain(CallExecutionObserver::is_live);
     }
 
     /// Retained-lease counters across the live tracker and every retired one.
@@ -210,7 +235,7 @@ impl PyRuntimeSession {
 #[pymethods]
 impl PyRuntimeSession {
     #[new]
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true))]
+    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, retained_input_budget_bytes=None))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         server_id: Option<String>,
@@ -219,6 +244,8 @@ impl PyRuntimeSession {
         shm_threshold: Option<u64>,
         remote_payload_chunk_size: Option<u64>,
         use_process_relay_anchor: bool,
+        max_outstanding_calls: Option<u64>,
+        retained_input_budget_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let server_ipc_overrides = server_ipc_overrides
             .map(|value| parse_server_ipc_overrides(Some(value)))
@@ -236,6 +263,15 @@ impl PyRuntimeSession {
             use_process_relay_anchor,
         })
         .map_err(runtime_configuration_error_to_py)?;
+        let call_execution_overrides = c2_config::CallExecutionLimitsOverrides {
+            max_outstanding_calls,
+            retained_input_budget_bytes,
+        };
+        if max_outstanding_calls.is_some() || retained_input_budget_bytes.is_some() {
+            inner
+                .set_call_execution_limits(call_execution_overrides.clone())
+                .map_err(lifecycle_error_to_py)?;
+        }
         Ok(Self {
             inner: Arc::new(inner),
             lease_tracker: Arc::new(BufferLeaseTracker::default()),
@@ -243,6 +279,7 @@ impl PyRuntimeSession {
             registrations: Mutex::new(HashMap::new()),
             server_bridge: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
+            retired_call_execution: Mutex::new(Vec::new()),
         })
     }
 
@@ -250,8 +287,161 @@ impl PyRuntimeSession {
         PyBufferLeaseTracker::from_arc(Arc::clone(&self.lease_tracker))
     }
 
+    /// Configure Core's local domain; no Python/native copy of root authority.
+    /// An opaque captured context can pin a replacement without process discovery.
+    #[pyo3(signature = (*, root=None, context=None))]
+    fn set_local_endpoint(
+        &self,
+        root: Option<String>,
+        context: Option<&PyLocalEndpointContext>,
+    ) -> PyResult<()> {
+        if let Some(context) = context {
+            if root.is_some() {
+                return Err(PyValueError::new_err(
+                    "root and context are mutually exclusive",
+                ));
+            }
+            let options = c2_config::LocalEndpointOptions {
+                unix_root: context.inner.unix_root().map(Into::into),
+            };
+            let sources = c2_config::ConfigSources::empty();
+            // A captured choice must still describe this platform scope.
+            // Refuse a UID/logon-scope change rather than silently rebasing it.
+            let resolved =
+                c2_config::ConfigResolver::resolve_local_endpoint(options.clone(), sources.clone())
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            if resolved != context.inner {
+                return Err(PyValueError::new_err(
+                    "captured local endpoint context does not match the current platform scope",
+                ));
+            }
+            self.inner.set_local_endpoint_with_sources(options, sources)
+        } else {
+            self.inner
+                .set_local_endpoint(c2_config::LocalEndpointOptions {
+                    unix_root: root.map(Into::into),
+                })
+        }
+        .map_err(runtime_configuration_error_to_py)
+    }
+
+    /// Pure native observation; deriving names never freezes local I/O policy.
+    fn local_endpoint_context(&self) -> PyResult<PyLocalEndpointContext> {
+        self.inner
+            .local_endpoint_context()
+            .map(|inner| PyLocalEndpointContext { inner })
+            .map_err(runtime_configuration_error_to_py)
+    }
+
+    fn local_endpoint(&self, address: &str) -> PyResult<String> {
+        self.inner
+            .local_endpoint(address)
+            .map(|endpoint| endpoint.os_name().to_string_lossy().into_owned())
+            .map_err(runtime_configuration_error_to_py)
+    }
+
+    #[getter]
+    fn local_endpoint_frozen(&self) -> bool {
+        self.inner.local_endpoint_frozen()
+    }
+
+    #[pyo3(signature = (address, timeout_seconds=0.5))]
+    fn ping_direct_ipc(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        timeout_seconds: f64,
+    ) -> PyResult<bool> {
+        let timeout = crate::control_ffi::timeout_duration(timeout_seconds)?;
+        py.detach(|| self.inner.ping_direct_ipc(address, timeout))
+            .map_err(runtime_configuration_error_to_py)
+    }
+
+    #[pyo3(signature = (address, timeout_seconds=0.5))]
+    fn shutdown_direct_ipc<'py>(
+        &self,
+        py: Python<'py>,
+        address: &str,
+        timeout_seconds: f64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let timeout = crate::control_ffi::timeout_duration(timeout_seconds)?;
+        let outcome = py
+            .detach(|| self.inner.shutdown_direct_ipc(address, timeout))
+            .map_err(runtime_configuration_error_to_py)?;
+        crate::control_ffi::shutdown_ack_dict(py, outcome)
+    }
+
     fn hold_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         lease_stats_dict(py, &self.merged_lease_stats())
+    }
+
+    #[pyo3(signature = (*, max_outstanding_calls=None, retained_input_budget_bytes=None))]
+    fn set_call_execution_limits(
+        &self,
+        max_outstanding_calls: Option<u64>,
+        retained_input_budget_bytes: Option<u64>,
+    ) -> PyResult<()> {
+        let overrides = c2_config::CallExecutionLimitsOverrides {
+            max_outstanding_calls,
+            retained_input_budget_bytes,
+        };
+        self.inner
+            .set_call_execution_limits(overrides)
+            .map_err(lifecycle_error_to_py)
+    }
+
+    #[getter]
+    fn call_execution_limits_overrides<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let overrides = self.inner.call_execution_limits_overrides();
+        let dict = PyDict::new(py);
+        dict.set_item("max_outstanding_calls", overrides.max_outstanding_calls)?;
+        dict.set_item(
+            "retained_input_budget_bytes",
+            overrides.retained_input_budget_bytes,
+        )?;
+        Ok(dict)
+    }
+
+    /// Actual Core-owned finite input charges, including unfinished native
+    /// continuations after a Python caller times out or a session is replaced.
+    fn call_execution_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let snapshot = self
+            .inner
+            .call_execution_snapshot()
+            .map_err(lifecycle_error_to_py)?;
+        let dict = call_execution_snapshot_dict(py, &snapshot)?;
+        let mut retired = self.retired_call_execution.lock();
+        let mut reports = Vec::new();
+        // Initialization and close publication come from the same Core
+        // authority. An uninitialized open domain stays observable; a closed
+        // domain is retired only after actual owners release all charges.
+        retired.retain(CallExecutionObserver::is_live);
+        for observer in retired.iter() {
+            let observation = observer.snapshot();
+            let report = match observation.counters {
+                Some(snapshot) => call_execution_snapshot_dict(py, &snapshot)?,
+                None => {
+                    let report = PyDict::new(py);
+                    report.set_item("max_operations", py.None())?;
+                    report.set_item("max_retained_bytes", py.None())?;
+                    report.set_item("used_operations", 0)?;
+                    report.set_item("used_retained_bytes", 0)?;
+                    report.set_item("peak_operations", 0)?;
+                    report.set_item("peak_retained_bytes", 0)?;
+                    report.set_item("rejected_reservations", 0)?;
+                    report.set_item("closed", observation.closed)?;
+                    report
+                }
+            };
+            report.set_item("initialized", observation.initialized)?;
+            report.set_item("state", "retired")?;
+            reports.push(report);
+        }
+        dict.set_item("retired", PyList::new(py, reports)?)?;
+        Ok(dict)
     }
 
     /// Read-only, scope-labelled memory-budget snapshot.
@@ -313,8 +503,10 @@ impl PyRuntimeSession {
     /// hands the result to its replacement, so charges retained by held data
     /// and retired budget domains stay observable after `cc.shutdown()`. The
     /// pending bundle holds only weak views of budget accounting and lease
-    /// metadata; it never retains a Runtime, client cache, pool, connection,
-    /// callback, or payload. Earlier adopted bundles are carried forward
+    /// metadata. Call-execution observers keep only Core publication/counter
+    /// metadata, even when captured before first finite-domain initialization.
+    /// They retain no Runtime, transport, service or payload registry, and
+    /// expose no independent accounting authority. Earlier bundles are carried forward
     /// unchanged, and this session keeps its own records until the handoff
     /// succeeds, so a failed replacement never loses them.
     fn retire_memory_observation(&self) -> PyRetiredMemoryObservation {
@@ -331,6 +523,17 @@ impl PyRuntimeSession {
     fn adopt_retired_memory_observation(&self, observation: &PyRetiredMemoryObservation) {
         let mut retired = self.retired.lock();
         observation.inner.adopt_into(&mut retired);
+        let mut execution = self.retired_call_execution.lock();
+        execution.retain(CallExecutionObserver::is_live);
+        for observer in &observation.call_execution {
+            if observer.is_live()
+                && !execution
+                    .iter()
+                    .any(|existing| existing.same_domain(observer))
+            {
+                execution.push(observer.clone());
+            }
+        }
     }
 
     fn sweep_hold_leases<'py>(
@@ -1073,6 +1276,22 @@ fn route_close_outcome_to_dict<'py>(
 /// are C-Two-owned accounting scopes, not process RSS.
 const MEMORY_ACCOUNTING_NOTE: &str =
     "C-Two-owned IPC backing and live reassembly charges; not process RSS";
+
+fn call_execution_snapshot_dict<'py>(
+    py: Python<'py>,
+    snapshot: &c2_core::CallExecutionSnapshot,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("max_operations", snapshot.max_operations)?;
+    dict.set_item("max_retained_bytes", snapshot.max_retained_bytes)?;
+    dict.set_item("used_operations", snapshot.used_operations)?;
+    dict.set_item("used_retained_bytes", snapshot.used_retained_bytes)?;
+    dict.set_item("peak_operations", snapshot.peak_operations)?;
+    dict.set_item("peak_retained_bytes", snapshot.peak_retained_bytes)?;
+    dict.set_item("rejected_reservations", snapshot.rejected_reservations)?;
+    dict.set_item("closed", snapshot.closed)?;
+    Ok(dict)
+}
 
 fn memory_cell_dict<'py>(
     py: Python<'py>,
