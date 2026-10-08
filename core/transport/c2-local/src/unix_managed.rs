@@ -26,7 +26,7 @@ use crate::unix_common::{
 };
 use crate::{
     EndpointCredential, EndpointInspection, EndpointReapResult, EndpointUnverifiedReason,
-    LocalEndpoint, SweepBatch, SweepBudget,
+    LocalEndpoint, LocalEndpointContext, SweepBatch, SweepBudget,
 };
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, ReadDir};
@@ -321,7 +321,7 @@ fn record_matches_endpoint(record: &OwnerRecord, endpoint: &LocalEndpoint) -> bo
     if record.address != endpoint.address() {
         return false;
     }
-    let Ok(derived) = LocalEndpoint::from_address(&record.address) else {
+    let Ok(derived) = endpoint.context().endpoint(&record.address) else {
         return false;
     };
     derived.os_name() == endpoint.os_name()
@@ -1170,6 +1170,12 @@ pub(crate) fn bind_managed_at(
     endpoint: &LocalEndpoint,
     root: &Path,
 ) -> io::Result<ManagedListener> {
+    if Path::new(endpoint.os_name()).parent() != Some(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "endpoint context does not match namespace",
+        ));
+    }
     let namespace = open_root_bounded(root, true).map_err(namespace_bind_error)?;
     let gate_pin = namespace.gate.try_clone()?;
     let names = managed_names(endpoint)?;
@@ -1444,7 +1450,7 @@ pub(crate) fn reap_managed_at(
     credential: &EndpointCredential,
     root: &Path,
 ) -> EndpointReapResult {
-    if credential.endpoint() != endpoint {
+    if credential.endpoint() != endpoint || Path::new(endpoint.os_name()).parent() != Some(root) {
         return EndpointReapResult::StaleTarget;
     }
     let identity = credential.identity();
@@ -1459,11 +1465,42 @@ pub(crate) fn reap_managed_at(
 /// Reaps one slot found by a sweep. The slot record itself is the proof. The
 /// gate is only tried, never waited for, so a foreign holder cannot block the
 /// round.
-pub(crate) fn reap_slot(root: &Path, stem: &OsStr) -> EndpointReapResult {
+#[cfg(test)]
+pub(crate) fn reap_slot(context: &LocalEndpointContext, stem: &OsStr) -> EndpointReapResult {
+    reap_slot_with_directory(context, stem, None)
+}
+
+fn reap_slot_with_directory(
+    context: &LocalEndpointContext,
+    stem: &OsStr,
+    expected_directory: Option<&EndpointDirectory>,
+) -> EndpointReapResult {
+    let anchor = match context.endpoint("ipc://c2-endpoint-sweep") {
+        Ok(endpoint) => endpoint,
+        Err(error) => return EndpointReapResult::IoError(error),
+    };
+    let root = Path::new(anchor.os_name())
+        .parent()
+        .expect("derived Unix endpoint has a parent");
     let namespace = match ManagedNamespace::open_root(root, false, false) {
         Ok(namespace) => namespace,
         Err(error) => return namespace_reap_error(error),
     };
+    // A sweep must stay attached to the directory it opened. If replacement
+    // happens between its batch check and this gate open, do not adopt even a
+    // complete record in the replacement namespace.
+    if let Some(expected) = expected_directory {
+        let same_directory = fstat(expected.fd()).and_then(|expected_stat| {
+            fstat(namespace.directory.fd()).map(|current| same_file(&expected_stat, &current))
+        });
+        match same_directory {
+            Ok(true) if expected.path_still_names_open_directory() => {}
+            Ok(_) => {
+                return EndpointReapResult::Unverified(EndpointUnverifiedReason::UnsafeDirectory);
+            }
+            Err(error) => return EndpointReapResult::IoError(error),
+        }
+    }
     let record = match read_lease_record(&namespace, stem) {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -1482,7 +1519,7 @@ pub(crate) fn reap_slot(root: &Path, stem: &OsStr) -> EndpointReapResult {
         Err(reason) => return EndpointReapResult::Unverified(reason),
     };
     let address = record.address.clone();
-    let Ok(endpoint) = LocalEndpoint::from_address(&address) else {
+    let Ok(endpoint) = context.endpoint(&address) else {
         return EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidRecord);
     };
     let Ok(stem_expected) = endpoint_stem(&endpoint) else {
@@ -1515,6 +1552,9 @@ pub(crate) fn inspect_managed(endpoint: &LocalEndpoint) -> EndpointInspection {
 /// reaper it only tries the gate, so a busy coordinator becomes an observable
 /// `WouldBlock` inspection instead of an unbounded wait.
 pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> EndpointInspection {
+    if Path::new(endpoint.os_name()).parent() != Some(root) {
+        return EndpointInspection::Unverified(EndpointUnverifiedReason::RecordMismatch);
+    }
     let namespace = match ManagedNamespace::open_root(root, false, false) {
         Ok(namespace) => namespace,
         Err(error) => return namespace_inspection_error(error),
@@ -1587,7 +1627,7 @@ pub(crate) fn inspect_managed_at(endpoint: &LocalEndpoint, root: &Path) -> Endpo
 /// Bounded, explicitly driven maintenance over the managed-v2 namespace. The
 /// gate is acquired per candidate and never held across the traversal.
 pub(crate) struct ManagedSweep {
-    root: PathBuf,
+    context: LocalEndpointContext,
     directory: EndpointDirectory,
     entries: Option<ReadDir>,
     finished: bool,
@@ -1607,19 +1647,22 @@ impl ManagedSweep {
                 )
             })?
             .to_owned();
-        Self::open_root(&root)
-    }
-
-    /// Test-only entry point for an isolated managed namespace root.
-    #[cfg(test)]
-    pub(crate) fn open_at(root: &Path) -> io::Result<Self> {
-        Self::open_root(root)
+        Self::open_root(&root, endpoint.context())
     }
 
     pub(crate) fn for_scope(
         endpoint: &LocalEndpoint,
         targets: &[LocalEndpoint],
     ) -> io::Result<Self> {
+        if targets
+            .iter()
+            .any(|target| target.context() != endpoint.context())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "endpoint sweep target is outside its context",
+            ));
+        }
         let selected = Self::target_names(targets)?;
         let mut sweep = Self::for_endpoint(endpoint)?;
         sweep.selected = Some(selected);
@@ -1636,15 +1679,7 @@ impl ManagedSweep {
         Ok(selected)
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_scoped_at(root: &Path, targets: &[LocalEndpoint]) -> io::Result<Self> {
-        let selected = Self::target_names(targets)?;
-        let mut sweep = Self::open_root(root)?;
-        sweep.selected = Some(selected);
-        Ok(sweep)
-    }
-
-    fn open_root(root: &Path) -> io::Result<Self> {
+    fn open_root(root: &Path, context: &LocalEndpointContext) -> io::Result<Self> {
         let lease = SweepLease::acquire()?;
         let directory = EndpointDirectory::open(root, false)?;
         if !directory.strict_private() {
@@ -1661,7 +1696,7 @@ impl ManagedSweep {
             ));
         }
         Ok(Self {
-            root: root.to_owned(),
+            context: context.clone(),
             directory,
             entries: Some(entries),
             finished: false,
@@ -1747,18 +1782,38 @@ impl ManagedSweep {
         if let Some(stem) = bytes.strip_suffix(SOCKET_SUFFIX.as_bytes()) {
             batch.endpoints_examined += 1;
             let stem = OsStr::from_bytes(stem);
-            self.count(batch, reap_slot(&self.root, stem), false);
+            self.count(
+                batch,
+                reap_slot_with_directory(&self.context, stem, Some(&self.directory)),
+                false,
+            );
         } else if let Some(stem) = bytes.strip_suffix(LEASE_SUFFIX.as_bytes()) {
             // A socket slot is handled through its `.sock` entry, which retires
             // both objects. Only a socket-less slot is a lease-only candidate.
             let mut socket = stem.to_vec();
             socket.extend_from_slice(SOCKET_SUFFIX.as_bytes());
-            if self.root.join(OsString::from_vec(socket)).exists() {
-                return;
+            let socket = match CString::new(socket) {
+                Ok(socket) => socket,
+                Err(_) => {
+                    batch.unverified += 1;
+                    return;
+                }
+            };
+            match self.directory.stat(&socket) {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    self.count(batch, EndpointReapResult::IoError(error), false);
+                    return;
+                }
             }
             batch.endpoints_examined += 1;
             let stem = OsStr::from_bytes(stem);
-            self.count(batch, reap_slot(&self.root, stem), true);
+            self.count(
+                batch,
+                reap_slot_with_directory(&self.context, stem, Some(&self.directory)),
+                true,
+            );
         }
     }
 

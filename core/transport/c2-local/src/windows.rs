@@ -168,10 +168,6 @@ pub(crate) fn reap_endpoint(
 pub(crate) struct EndpointSweep;
 
 impl EndpointSweep {
-    pub(crate) fn open() -> io::Result<Self> {
-        Ok(Self)
-    }
-
     pub(crate) fn for_endpoint(_endpoint: &LocalEndpoint) -> io::Result<Self> {
         Ok(Self)
     }
