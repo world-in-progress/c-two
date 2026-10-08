@@ -4,6 +4,7 @@
 //! normalization, and cross-language orchestration. It transports opaque bytes
 //! and does not depend on payload-owner implementations such as FastDB.
 
+mod call_scope;
 mod client;
 mod control;
 pub mod error;
@@ -15,6 +16,7 @@ mod outcome;
 mod owner_bound;
 mod session;
 
+pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{Client, Connect, EncodedClient, ObservedPath, ObservedRoute, PathCounters};
 pub use control::{
     DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint, ping_direct_ipc,
