@@ -133,6 +133,10 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
 
 async fn route_is_semantically_gone(client: &IpcClient, route: &RouteEntry) -> bool {
     let expected = expected_contract_for_route(route);
+    // Ordinary IPC connections do not subscribe to route updates, so cached
+    // validation can retain a removed route indefinitely. Query the owner for
+    // the complete contract on this existing observer cycle; transport errors
+    // still do not authorize withdrawal.
     matches!(
         client.acquire_route(&expected).await,
         Err(c2_ipc::IpcError::RouteNotFound(_))
