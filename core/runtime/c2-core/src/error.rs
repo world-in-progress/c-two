@@ -43,7 +43,7 @@ impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidServerId(message) => formatter.write_str(message),
-            Self::ConfigFrozen => formatter.write_str("local endpoint configuration is frozen"),
+            Self::ConfigFrozen => formatter.write_str("runtime configuration is frozen"),
             Self::ClientConfigFrozen => formatter.write_str("client IPC configuration is frozen"),
             Self::DuplicateRoute(name) => write!(formatter, "route already registered: {name}"),
             Self::MissingRoute(name) => write!(formatter, "route not registered: {name}"),
@@ -626,6 +626,7 @@ mod native_boundary_tests {
     fn local_call_rejection_keeps_semantic_code_and_no_fallback_details() {
         for code in [
             ErrorCode::CallDeadlineExceeded,
+            ErrorCode::UnsupportedCallMode,
             ErrorCode::CallCapacityExceeded,
         ] {
             let source = C2Error::new(code, "local call stopped").with_details(BTreeMap::from([

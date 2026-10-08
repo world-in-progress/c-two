@@ -20,6 +20,7 @@ use c2_http::client::{
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
+use crate::call_execution::CallExecutionContext;
 use crate::outcome::RuntimeRouteSpec;
 use crate::{
     LifecycleError, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome,
@@ -142,6 +143,11 @@ struct RuntimeState {
     client_ipc_overrides: Option<ClientIpcConfigOverrides>,
     shm_threshold: Option<u64>,
     remote_payload_chunk_size: Option<u64>,
+    call_execution_overrides: c2_config::CallExecutionLimitsOverrides,
+    call_execution_sources: Option<c2_config::ConfigSources>,
+    call_execution_revision: u64,
+    call_execution: Option<CallExecutionContext>,
+    call_execution_closed: bool,
     client_config_frozen: bool,
     client_config_revision: u64,
     local_endpoint_options: c2_config::LocalEndpointOptions,
@@ -228,6 +234,11 @@ impl Runtime {
                 client_ipc_overrides: options.client_ipc_overrides,
                 shm_threshold: options.shm_threshold,
                 remote_payload_chunk_size: options.remote_payload_chunk_size,
+                call_execution_overrides: Default::default(),
+                call_execution_sources: None,
+                call_execution_revision: 0,
+                call_execution: None,
+                call_execution_closed: false,
                 client_config_frozen: false,
                 client_config_revision: 0,
                 local_endpoint_options: Default::default(),
@@ -253,6 +264,100 @@ impl Runtime {
                 forced_relay_config_error: None,
             })),
         })
+    }
+
+    /// Configure the independent finite-call domain before its first business
+    /// call. Connect does not freeze this policy. Clones and every Client share
+    /// the one domain; teardown never replaces it or launders live charges.
+    pub fn set_call_execution_limits(
+        &self,
+        overrides: c2_config::CallExecutionLimitsOverrides,
+    ) -> Result<(), LifecycleError> {
+        self.configure_call_execution_limits(overrides, None)
+    }
+
+    /// Deterministic resolver inputs replace process discovery for this domain.
+    pub fn set_call_execution_limits_with_sources(
+        &self,
+        overrides: c2_config::CallExecutionLimitsOverrides,
+        sources: c2_config::ConfigSources,
+    ) -> Result<(), LifecycleError> {
+        self.configure_call_execution_limits(overrides, Some(sources))
+    }
+
+    fn configure_call_execution_limits(
+        &self,
+        overrides: c2_config::CallExecutionLimitsOverrides,
+        sources: Option<c2_config::ConfigSources>,
+    ) -> Result<(), LifecycleError> {
+        let limits = resolve_call_execution_limits(overrides.clone(), sources.clone())?;
+        let mut state = self.state.lock();
+        if let Some(context) = &state.call_execution {
+            let snapshot = context.snapshot();
+            return if snapshot.max_operations == limits.max_outstanding_calls
+                && snapshot.max_retained_bytes == limits.retained_input_budget_bytes
+            {
+                Ok(()) // Idempotent configuration, never replace this domain.
+            } else {
+                Err(LifecycleError::ConfigFrozen)
+            };
+        }
+        if state.call_execution_closed {
+            return Err(LifecycleError::ConfigFrozen);
+        }
+        state.call_execution_overrides = overrides;
+        state.call_execution_sources = sources;
+        state.call_execution_revision += 1;
+        Ok(())
+    }
+
+    /// Consistent read-only input retention counters. Before first call this
+    /// resolves policy without freezing or constructing an executor. It counts
+    /// actual finite owners, including continuations after caller timeout;
+    /// response-storage observations stay in outgoing_memory_observer().
+    pub fn call_execution_snapshot(&self) -> Result<crate::CallExecutionSnapshot, LifecycleError> {
+        Ok(self.resolve_call_execution_context(false)?.snapshot())
+    }
+
+    pub(crate) fn call_execution_context(&self) -> Result<CallExecutionContext, LifecycleError> {
+        self.resolve_call_execution_context(true)
+    }
+
+    fn resolve_call_execution_context(
+        &self,
+        freeze: bool,
+    ) -> Result<CallExecutionContext, LifecycleError> {
+        loop {
+            let (overrides, sources, revision) = {
+                let state = self.state.lock();
+                if let Some(context) = &state.call_execution {
+                    return Ok(context.clone());
+                }
+                (
+                    state.call_execution_overrides.clone(),
+                    state.call_execution_sources.clone(),
+                    state.call_execution_revision,
+                )
+            };
+            // Environment/.env I/O outside runtime metadata, just as for the
+            // existing configuration domains. A racing setter wins by revision.
+            let resolved = resolve_call_execution_limits(overrides, sources);
+            let mut state = self.state.lock();
+            if let Some(context) = &state.call_execution {
+                return Ok(context.clone());
+            }
+            if state.call_execution_revision != revision {
+                continue;
+            }
+            let context = CallExecutionContext::new(&resolved?);
+            if state.call_execution_closed {
+                context.close();
+            }
+            if freeze {
+                state.call_execution = Some(context.clone());
+            }
+            return Ok(context);
+        }
     }
 
     /// Configure local endpoints without binding, connecting, or freezing memory policy.
@@ -1202,6 +1307,15 @@ impl Runtime {
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
     ) -> ShutdownOutcome {
+        // Close only finite admission; retain this domain and all actual
+        // owners. Unlimited never consults it. No cancellation or early refund.
+        {
+            let mut state = self.state.lock();
+            state.call_execution_closed = true;
+            if let Some(context) = &state.call_execution {
+                context.close();
+            }
+        }
         let deadline = Instant::now() + shutdown_timeout;
         let scopes = server
             .map(|server| self.capture_registration_scopes(server, &route_names))
@@ -1731,6 +1845,17 @@ fn canonical_relay_anchor_address(address: &str) -> String {
     address.trim().trim_end_matches('/').to_string()
 }
 
+fn resolve_call_execution_limits(
+    overrides: c2_config::CallExecutionLimitsOverrides,
+    sources: Option<c2_config::ConfigSources>,
+) -> Result<c2_config::CallExecutionLimits, LifecycleError> {
+    c2_config::ConfigResolver::resolve_call_execution_limits(
+        overrides,
+        sources.unwrap_or_else(c2_config::ConfigSources::from_process),
+    )
+    .map_err(|error| LifecycleError::Configuration(error.to_string()))
+}
+
 fn resolve_local_endpoint(
     options: c2_config::LocalEndpointOptions,
     sources: Option<c2_config::ConfigSources>,
@@ -1776,6 +1901,157 @@ mod tests {
         AccessLevel, BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta,
         RouteBuildSpec, SchedulerLimits,
     };
+
+    #[test]
+    fn call_execution_snapshot_resolves_sources_without_freezing() {
+        use c2_config::{CallExecutionLimitsOverrides, ConfigSources, EnvMap};
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        runtime
+            .set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides::default(),
+                ConfigSources {
+                    env_file: c2_config::EnvFilePolicy::Disabled,
+                    process_env: EnvMap::from([
+                        ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
+                        ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "17".into()),
+                    ]),
+                },
+            )
+            .unwrap();
+        let snapshot = runtime.call_execution_snapshot().unwrap();
+        assert_eq!(
+            (snapshot.max_operations, snapshot.max_retained_bytes),
+            (3, 17)
+        );
+        assert_eq!(
+            (snapshot.used_operations, snapshot.used_retained_bytes),
+            (0, 0)
+        );
+        // Observation did not freeze: a later typed override wins.
+        runtime
+            .set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(1),
+                    retained_input_budget_bytes: Some(32),
+                },
+                ConfigSources::empty(),
+            )
+            .unwrap();
+        assert_eq!(runtime.call_execution_snapshot().unwrap().max_operations, 1);
+    }
+
+    #[test]
+    fn call_execution_clones_freeze_one_domain_without_laundering_live_permits() {
+        use c2_config::{CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources};
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        let overrides = CallExecutionLimitsOverrides {
+            max_outstanding_calls: Some(1),
+            retained_input_budget_bytes: Some(32),
+        };
+        runtime
+            .set_call_execution_limits_with_sources(overrides.clone(), ConfigSources::empty())
+            .unwrap();
+        let clone = runtime.clone();
+        let context = runtime.call_execution_context().unwrap();
+        let mut call = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                None,
+            )
+            .unwrap();
+        call.charge_input(32).unwrap();
+        assert_eq!(
+            clone.call_execution_snapshot().unwrap().used_retained_bytes,
+            32
+        );
+        clone
+            .set_call_execution_limits_with_sources(overrides, ConfigSources::empty())
+            .unwrap();
+        assert_eq!(clone.call_execution_snapshot().unwrap().used_operations, 1);
+        assert_eq!(
+            clone.set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(2),
+                    retained_input_budget_bytes: Some(64)
+                },
+                ConfigSources::empty(),
+            ),
+            Err(LifecycleError::ConfigFrozen)
+        );
+        assert!(
+            clone
+                .call_execution_context()
+                .unwrap()
+                .prepare(
+                    CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                    None
+                )
+                .is_err()
+        );
+        drop(call);
+        assert_eq!(clone.call_execution_snapshot().unwrap().used_operations, 0);
+    }
+
+    #[test]
+    fn call_execution_shutdown_closes_admission_and_keeps_actual_charge() {
+        use c2_config::{CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources};
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        runtime
+            .set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(1),
+                    retained_input_budget_bytes: Some(32),
+                },
+                ConfigSources::empty(),
+            )
+            .unwrap();
+        let context = runtime.call_execution_context().unwrap();
+        let mut call = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                None,
+            )
+            .unwrap();
+        call.charge_input(32).unwrap();
+        runtime.shutdown(None, Vec::new(), None, false, None, Duration::from_secs(1));
+        let snapshot = runtime.call_execution_snapshot().unwrap();
+        assert!(snapshot.closed);
+        assert_eq!(
+            (snapshot.used_operations, snapshot.used_retained_bytes),
+            (1, 32)
+        );
+        assert!(
+            context
+                .prepare(
+                    CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                    None
+                )
+                .is_err()
+        );
+        // Explicit Unlimited stays uncharged even in the closed finite domain.
+        let unlimited = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::Unlimited),
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap();
+        drop(unlimited);
+        assert_eq!(
+            runtime
+                .call_execution_snapshot()
+                .unwrap()
+                .used_retained_bytes,
+            32
+        );
+        drop(call);
+        assert_eq!(
+            runtime
+                .call_execution_snapshot()
+                .unwrap()
+                .used_retained_bytes,
+            0
+        );
+    }
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

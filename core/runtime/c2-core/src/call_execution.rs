@@ -1,4 +1,4 @@
-//! Crate-private owned-call execution, ready for Runtime/Client integration.
+//! Crate-private owned-call execution for the Runtime/Client boundary.
 //!
 //! Prepare BEFORE SDK serialization; precharge known payload nbytes there.
 //! Execute corrects the charge BEFORE materialization, then gives a transport
@@ -25,17 +25,17 @@
 //! gap. Timeout settles only the scope/waiter. Task and input owners live on;
 //! arbitrary cleanup runs outside the lock, late responses on the native task.
 
-// This private seam intentionally has no production caller until the next
-// integration concern. Do not export it as an application executor API.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
-use c2_config::{CallExecutionLimits, CallOptions};
+use c2_config::CallExecutionLimits;
+#[cfg(test)]
+use c2_config::CallOptions;
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{RetentionBudget, RetentionError, RetentionPermit, RetentionSnapshot};
 use futures_util::FutureExt;
@@ -57,12 +57,18 @@ impl CallExecutionContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         &self,
         options: CallOptions,
         path_default: Option<Duration>,
     ) -> Result<PreparingCall, Error> {
-        let scope = CallScope::new(options, path_default).map_err(scope_error)?;
+        self.prepare_scope(CallScope::new(options, path_default).map_err(scope_error)?)
+    }
+
+    /// The Client establishes its scope at entry, before first-domain config
+    /// resolution/metadata waits. Admission checks that original D afterwards.
+    pub(crate) fn prepare_scope(&self, scope: CallScope) -> Result<PreparingCall, Error> {
         scope.check_pre_dispatch().map_err(scope_error)?;
         // Finite continuation slot first, zero bytes: SDK serialization must
         // not precede this. No deadline means synchronous caller ownership;
@@ -97,6 +103,7 @@ pub(crate) struct PreparingCall {
 }
 
 impl PreparingCall {
+    #[cfg(test)]
     pub(crate) fn scope(&self) -> &CallScope {
         &self.scope
     }
@@ -482,11 +489,26 @@ fn settle_failure(scope: &CallScope, error: Error) -> Error {
     }
 }
 
-fn scope_error(error: CallScopeError) -> Error {
+pub(crate) fn scope_error(error: CallScopeError) -> Error {
     match error {
         CallScopeError::DeadlineExceeded { phase } => deadline_error(phase),
         CallScopeError::DeadlineNotRepresentable { .. } => configuration(error.to_string()),
         _ => configuration(format!("invalid call execution scope: {error}")),
+    }
+}
+
+/// Transport callbacks require the canonical semantic authority, never an
+/// untyped guard rejection that could trigger route fallback or withdrawal.
+pub(crate) fn guard_error(error: CallScopeError) -> C2Error {
+    match scope_error(error) {
+        Error::Semantic(error) => error,
+        other => C2Error::new(ErrorCode::ClientCallingResource, other.to_string()).with_details(
+            BTreeMap::from([
+                ("fallback_eligible".into(), "false".into()),
+                ("route_withdrawal".into(), "false".into()),
+                ("stage".into(), "call_execution_guard".into()),
+            ]),
+        ),
     }
 }
 

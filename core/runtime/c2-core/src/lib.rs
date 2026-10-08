@@ -4,7 +4,6 @@
 //! normalization, and cross-language orchestration. It transports opaque bytes
 //! and does not depend on payload-owner implementations such as FastDB.
 
-// Internal execution seam; Client/Runtime wiring is a separate concern.
 mod call_execution;
 mod call_scope;
 mod client;
@@ -19,7 +18,10 @@ mod owner_bound;
 mod session;
 
 pub use call_scope::{CallScope, CallScopeError, CallState};
-pub use client::{Client, Connect, EncodedClient, ObservedPath, ObservedRoute, PathCounters};
+pub use client::{
+    Client, Connect, EncodedCall, EncodedClient, HeldResponse, ObservedPath, ObservedRoute,
+    PathCounters, PreparedCall,
+};
 pub use control::{
     DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
     direct_ipc_endpoint_with_context, ping_direct_ipc, ping_direct_ipc_with_context,
@@ -39,7 +41,6 @@ pub use host::{
 pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
 };
-pub use lifetime::HeldResponse;
 // The native local-endpoint lifecycle surface is owned by `c2-local`. Core
 // re-exports it so SDKs and the CLI share one implementation instead of
 // writing their own paths, parsers, or management loops.
@@ -62,8 +63,11 @@ pub use session::{Runtime, RuntimeIdentity, RuntimeOptions};
 
 // SDK facades use the canonical Core owner capability types.
 pub use c2_config::{
-    ConfigSources, EnvFilePolicy, EnvMap, LocalEndpointContext, LocalEndpointNamespace,
-    LocalEndpointOptions, MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy,
-    validate_owner_missing_grace,
+    CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources,
+    EnvFilePolicy, EnvMap, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
+    MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace,
 };
 pub use c2_local::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};
+
+/// Read-only counters for the Runtime finite-call input retention domain.
+pub use c2_mem::RetentionSnapshot as CallExecutionSnapshot;
