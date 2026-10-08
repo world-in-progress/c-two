@@ -1,12 +1,13 @@
 //! HTTP client for CRM calls through a relay server.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_LENGTH;
 use thiserror::Error;
 
+use super::{HttpCallControl, HttpCallPhase};
 use c2_contract::ExpectedRouteContract;
 
 /// Characters allowed unencoded in URL path segments — matches Python's
@@ -49,6 +50,11 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 /// Errors returned by [`HttpClient`] operations.
 #[derive(Debug, Error)]
 pub enum HttpError {
+    /// The logical call owner rejected a local guard. Preserve code and details
+    /// for the caller's canonical conversion; this is never a transport failure.
+    #[error("HTTP local call rejected: {0}")]
+    LocalCallRejected(#[source] c2_error::C2Error),
+
     /// Invalid local request configuration.
     #[error("HTTP invalid request: {0}")]
     InvalidInput(String),
@@ -73,8 +79,41 @@ pub enum HttpError {
 /// Uses `reqwest::Client` internally with connection pooling.
 pub struct HttpClient {
     client: reqwest::Client,
+    probe_client: reqwest::Client,
     base_url: String,
     remote_payload_chunk_size: u64,
+}
+
+/// Shared owner of a controlled call's read-only input.
+///
+/// The owner must expose the same immutable byte slice throughout its lifetime.
+/// Callers can keep retention permits alongside their bytes in this owner:
+/// request bodies and their slices retain the complete owner, even after an
+/// attempt future returns. This transport neither interprets nor releases a
+/// caller's permit separately from the input. `Vec<u8>` is also a valid owner.
+pub type HttpInputOwner = Arc<dyn AsRef<[u8]> + Send + Sync + 'static>;
+
+pub(crate) enum HttpCallInput<'a> {
+    Borrowed(&'a [u8]),
+    Owned(HttpInputOwner),
+}
+
+impl HttpCallInput<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.len(),
+            Self::Owned(data) => data.as_ref().as_ref().len(),
+        }
+    }
+
+    fn body(&self, chunk_size: u64) -> Result<reqwest::Body, HttpError> {
+        match self {
+            Self::Borrowed(data) => crate::payload::reqwest_body_from_payload(data, chunk_size),
+            Self::Owned(data) => {
+                crate::payload::reqwest_body_from_owned_payload(Arc::clone(data), chunk_size)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +147,40 @@ impl HttpClient {
         use_proxy: bool,
         remote_payload_chunk_size: u64,
     ) -> Result<Self, HttpError> {
+        Self::new_with_policy(
+            base_url,
+            timeout_secs,
+            max_connections,
+            use_proxy,
+            remote_payload_chunk_size,
+            false,
+        )
+    }
+
+    pub(crate) fn new_controlled(
+        base_url: &str,
+        max_connections: usize,
+        use_proxy: bool,
+        remote_payload_chunk_size: u64,
+    ) -> Result<Self, HttpError> {
+        Self::new_with_policy(
+            base_url,
+            0.0,
+            max_connections,
+            use_proxy,
+            remote_payload_chunk_size,
+            true,
+        )
+    }
+
+    fn new_with_policy(
+        base_url: &str,
+        timeout_secs: f64,
+        max_connections: usize,
+        use_proxy: bool,
+        remote_payload_chunk_size: u64,
+        controlled: bool,
+    ) -> Result<Self, HttpError> {
         if !timeout_secs.is_finite() || timeout_secs < 0.0 {
             return Err(HttpError::Transport(
                 "HTTP call timeout must be finite and >= 0".to_string(),
@@ -119,11 +192,29 @@ impl HttpClient {
         if timeout_secs > 0.0 {
             builder = builder.timeout(Duration::from_secs_f64(timeout_secs));
         }
+        if controlled {
+            // Core owns the logical deadline. No upload/total timeout or hidden
+            // POST replay may bypass the per-call dispatch guard.
+            builder = builder
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::none());
+        }
         let client = builder
             .build()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
+        // Probes are control-plane operations with an independent safety timeout.
+        // Waiting for them never resets the owner's original absolute deadline.
+        let probe_client = if controlled {
+            crate::relay_client_builder_with_proxy(use_proxy)
+                .timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|e| HttpError::Transport(e.to_string()))?
+        } else {
+            client.clone()
+        };
         Ok(Self {
             client,
+            probe_client,
             base_url: base_url.trim_end_matches('/').to_owned(),
             remote_payload_chunk_size,
         })
@@ -134,7 +225,9 @@ impl HttpClient {
         expected: &ExpectedRouteContract,
         route_token: &HttpRouteToken,
         method_name: &str,
-        data: &[u8],
+        data: &HttpCallInput<'_>,
+        control: Option<&HttpCallControl>,
+        previous_dispatch: Option<HttpCallPhase>,
     ) -> Result<Vec<u8>, HttpError> {
         let url = format!(
             "{}/{}/{}",
@@ -147,14 +240,20 @@ impl HttpClient {
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             .header(CONTENT_LENGTH, data.len().to_string())
-            .body(crate::payload::reqwest_body_from_payload(
-                data,
-                self.remote_payload_chunk_size,
-            )?);
+            .body(data.body(self.remote_payload_chunk_size)?);
         let request = add_expected_contract_headers(request, expected);
         let request = add_route_token_headers(request, route_token);
-        let resp = request
-            .send()
+        let request = request
+            .build()
+            .map_err(|e| HttpError::InvalidInput(e.to_string()))?;
+        // The body and headers are fully prepared before the actual send gate.
+        super::call_control::check_active(control)?;
+        if let Some(control) = control {
+            control.check_dispatch(previous_dispatch)?;
+        }
+        let resp = self
+            .client
+            .execute(request)
             .await
             .map_err(|e| HttpError::Transport(e.to_string()))?;
 
@@ -208,7 +307,7 @@ impl HttpClient {
             self.base_url,
             encode_segment(&expected.route_name)
         );
-        let request = add_expected_contract_headers(self.client.get(&url), expected);
+        let request = add_expected_contract_headers(self.probe_client.get(&url), expected);
         let request = add_route_token_headers(request, route_token);
         let resp = request
             .send()
@@ -260,6 +359,72 @@ fn add_route_token_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepared_owned_body_guard_returns_intact_local_error_before_network() {
+        let client = HttpClient::new_controlled("http://127.0.0.1:9", 100, false, 3).unwrap();
+        let expected = ExpectedRouteContract {
+            route_name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: "a".repeat(64),
+            signature_hash: "b".repeat(64),
+        };
+        let token = HttpRouteToken {
+            route_uid: "route-grid".into(),
+            route_revision: 1,
+        };
+        let owner = Arc::new(vec![1, 2, 3, 4, 5, 6, 7]);
+        let weak = Arc::downgrade(&owner);
+        let observe_body = weak.clone();
+        let rejection =
+            c2_error::C2Error::new(c2_error::ErrorCode::ClientCallingResource, "expired")
+                .with_details(std::collections::BTreeMap::from([(
+                    "scope".into(),
+                    "original".into(),
+                )]));
+        let rejected = rejection.clone();
+        let control = HttpCallControl::new(
+            || Ok(()),
+            move |phase| {
+                assert_eq!(phase, None);
+                assert_eq!(
+                    observe_body.strong_count(),
+                    2,
+                    "prepared body shares the original input"
+                );
+                Err(rejected.clone())
+            },
+        );
+        let input = HttpCallInput::Owned(owner);
+        let error = client
+            .call_with_route_token_async(&expected, &token, "step", &input, Some(&control), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HttpError::LocalCallRejected(error) if error == rejection));
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "rejected request releases its body owner"
+        );
+        drop(input);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn controlled_data_client_has_no_total_timeout_while_probe_remains_bounded() {
+        let controlled =
+            HttpClient::new_controlled("http://localhost:9988", 100, false, 1024).unwrap();
+        let legacy =
+            HttpClient::new_with_transport_policy("http://localhost:9988", 300.0, 100, false, 1024)
+                .unwrap();
+        // reqwest's Client Debug projects its actual configured TotalTimeout
+        // (reqwest 0.12.28 RequestConfig::fmt_as_field), not a local policy copy.
+        assert!(!format!("{:?}", controlled.client).contains("TotalTimeout"));
+        assert!(format!("{:?}", controlled.probe_client).contains("TotalTimeout"));
+        assert!(format!("{:?}", legacy.client).contains("TotalTimeout"));
+    }
 
     #[test]
     fn zero_timeout_is_accepted_to_disable_total_call_timeout() {

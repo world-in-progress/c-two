@@ -8,7 +8,12 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::json;
 
-use super::{HttpClient, HttpClientPool, HttpError, RelayControlClient, RelayRouteInfo};
+use super::call_control::check_active;
+use super::http_client::HttpCallInput;
+use super::{
+    HttpCallControl, HttpClient, HttpClientPool, HttpError, HttpInputOwner, RelayControlClient,
+    RelayRouteInfo,
+};
 use c2_contract::ExpectedRouteContract;
 
 /// Whether an HTTP call failure is proven to precede CRM dispatch.
@@ -178,6 +183,36 @@ impl RelayAwareHttpClient {
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
     }
 
+    /// Call with the owner's original scope guards and one shared, read-only
+    /// input owner, including any caller-owned retention permit. Bodies retain
+    /// that complete owner until their last slice is dropped; an attempt's
+    /// completion alone does not release it. The data client has no reqwest
+    /// total/upload timeout; inherited defaults, explicit deadlines and Unlimited
+    /// belong to the caller's scope. No in-flight send is cancelled by this transport.
+    pub async fn call_controlled_async(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        control: &HttpCallControl,
+    ) -> Result<Vec<u8>, HttpCallError> {
+        self.call_inner_async(method_name, HttpCallInput::Owned(data), Some(control))
+            .await
+            .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    /// Synchronous facade for [`Self::call_controlled_async`]. An owned caller
+    /// must drive this operation to completion after business dispatch.
+    pub fn call_controlled(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        control: &HttpCallControl,
+    ) -> Result<Vec<u8>, HttpCallError> {
+        super::http_client::runtime()
+            .handle()
+            .block_on(self.call_controlled_async(method_name, data, control))
+    }
+
     pub fn connect(&self) -> Result<(), HttpError> {
         super::http_client::runtime()
             .handle()
@@ -220,11 +255,22 @@ impl RelayAwareHttpClient {
         self.select_target_async(false).await
     }
 
+    /// Resolve/probe under the same logical call's active check. Control-plane
+    /// safety timeouts remain independent and never restart its deadline.
+    /// Neither resolve nor probe invokes the business dispatch guard.
+    pub async fn resolve_http_target_controlled_async(
+        &self,
+        control: &HttpCallControl,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(false, &[], false, Some(control))
+            .await
+    }
+
     pub async fn resolve_target_after_local_ipc_failures_async(
         &self,
         failed_candidates: &[RelayLocalIpcCandidate],
     ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(true, failed_candidates, true)
+        self.select_target_with_local_exclusions_async(true, failed_candidates, true, None)
             .await
     }
 
@@ -232,7 +278,7 @@ impl RelayAwareHttpClient {
         &self,
         prefer_local_ipc: bool,
     ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(prefer_local_ipc, &[], false)
+        self.select_target_with_local_exclusions_async(prefer_local_ipc, &[], false, None)
             .await
     }
 
@@ -241,6 +287,7 @@ impl RelayAwareHttpClient {
         prefer_local_ipc: bool,
         excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
         fallback_denied_when_only_excluded: bool,
+        control: Option<&HttpCallControl>,
     ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
@@ -248,7 +295,7 @@ impl RelayAwareHttpClient {
 
         for attempt in 0..attempts {
             let routes = match self
-                .resolve_routes_async(attempt > 0 || fallback_denied_when_only_excluded)
+                .resolve_routes_async(attempt > 0 || fallback_denied_when_only_excluded, control)
                 .await
             {
                 Ok(routes) if !routes.is_empty() => routes,
@@ -296,28 +343,22 @@ impl RelayAwareHttpClient {
 
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self.pool.acquire_with_options(
-                    &relay_url,
-                    self.use_proxy,
-                    self.config.call_timeout_secs,
-                    self.config.remote_payload_chunk_size,
-                ) {
-                    Ok(client) => RelayPoolGuard {
-                        pool: self.pool,
-                        relay_url: relay_url.clone(),
-                        client,
-                    },
+                let client = match self.acquire_route_client(&relay_url, control) {
+                    Ok(client) => client,
+                    Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
                     Err(err) => {
                         last_error = Some(err);
                         continue;
                     }
                 };
 
-                match client
+                check_active(control)?;
+                let probe = client
                     .client
                     .probe_route_with_token_async(&self.expected, &route.route_token())
-                    .await
-                {
+                    .await;
+                check_active(control)?;
+                match probe {
                     Ok(()) => {
                         *self.current.lock() = Some(relay_url.clone());
                         return Ok(RelayResolvedTarget::Http {
@@ -338,7 +379,11 @@ impl RelayAwareHttpClient {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if attempt + 1 < attempts {
+                check_active(control)?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                check_active(control)?;
+            }
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -351,12 +396,23 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, HttpError> {
+        self.call_inner_async(method_name, HttpCallInput::Borrowed(data), None)
+            .await
+    }
+
+    async fn call_inner_async(
+        &self,
+        method_name: &str,
+        data: HttpCallInput<'_>,
+        control: Option<&HttpCallControl>,
+    ) -> Result<Vec<u8>, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
         let mut excluded_routes = HashSet::new();
+        let mut previous_dispatch = None;
 
         for attempt in 0..attempts {
-            let routes = match self.resolve_routes_async(attempt > 0).await {
+            let routes = match self.resolve_routes_async(attempt > 0, control).await {
                 Ok(routes) if !routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
@@ -381,17 +437,9 @@ impl RelayAwareHttpClient {
             }
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self.pool.acquire_with_options(
-                    &relay_url,
-                    self.use_proxy,
-                    self.config.call_timeout_secs,
-                    self.config.remote_payload_chunk_size,
-                ) {
-                    Ok(client) => RelayPoolGuard {
-                        pool: self.pool,
-                        relay_url: relay_url.clone(),
-                        client,
-                    },
+                let client = match self.acquire_route_client(&relay_url, control) {
+                    Ok(client) => client,
+                    Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
                     Err(err) => {
                         last_error = Some(err);
                         continue;
@@ -404,7 +452,9 @@ impl RelayAwareHttpClient {
                         &self.expected,
                         &route.route_token(),
                         method_name,
-                        data,
+                        &data,
+                        control,
+                        previous_dispatch,
                     )
                     .await
                 {
@@ -414,6 +464,8 @@ impl RelayAwareHttpClient {
                     }
                     Err(HttpError::CrmError(err)) => return Err(HttpError::CrmError(err)),
                     Err(err) if route_is_stale(&err) => {
+                        check_active(control)?;
+                        previous_dispatch = Some(HttpCallPhase::PreDispatch);
                         self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
                         excluded_routes.insert(relay_url);
@@ -424,7 +476,11 @@ impl RelayAwareHttpClient {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if attempt + 1 < attempts {
+                check_active(control)?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                check_active(control)?;
+            }
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -435,16 +491,23 @@ impl RelayAwareHttpClient {
     async fn resolve_routes_async(
         &self,
         force_refresh: bool,
+        control: Option<&HttpCallControl>,
     ) -> Result<Vec<RelayRouteInfo>, HttpError> {
+        check_active(control)?;
         if force_refresh {
             self.control.invalidate(self.route_name());
         }
-        let routes = self.control.resolve_matching_async(&self.expected).await?;
+        let routes = self.control.resolve_matching_async(&self.expected).await;
+        check_active(control)?;
+        let routes = routes?;
         let raw_routes_non_empty = !routes.is_empty();
         let filtered = filter_routes_by_expected_contract(routes, &self.expected);
         if !force_refresh && raw_routes_non_empty && filtered.is_empty() {
+            check_active(control)?;
             self.control.invalidate(self.route_name());
-            let refreshed = self.control.resolve_matching_async(&self.expected).await?;
+            let refreshed = self.control.resolve_matching_async(&self.expected).await;
+            check_active(control)?;
+            let refreshed = refreshed?;
             let refreshed_routes_non_empty = !refreshed.is_empty();
             let refreshed_filtered = filter_routes_by_expected_contract(refreshed, &self.expected);
             if refreshed_routes_non_empty && refreshed_filtered.is_empty() {
@@ -462,6 +525,37 @@ impl RelayAwareHttpClient {
             ));
         }
         Ok(filtered)
+    }
+
+    fn acquire_route_client(
+        &self,
+        relay_url: &str,
+        control: Option<&HttpCallControl>,
+    ) -> Result<RelayPoolGuard, HttpError> {
+        check_active(control)?;
+        let client = if control.is_some() {
+            self.pool.acquire_controlled(
+                relay_url,
+                self.use_proxy,
+                self.config.remote_payload_chunk_size,
+            )
+        } else {
+            self.pool.acquire_with_options(
+                relay_url,
+                self.use_proxy,
+                self.config.call_timeout_secs,
+                self.config.remote_payload_chunk_size,
+            )
+        }
+        .map(|client| RelayPoolGuard {
+            pool: self.pool,
+            relay_url: relay_url.to_string(),
+            client,
+            controlled: control.is_some(),
+        });
+        // The mutex/build wait is complete; rejection also drops the acquired lease.
+        check_active(control)?;
+        client
     }
 
     fn order_routes(
@@ -495,11 +589,12 @@ struct RelayPoolGuard {
     pool: &'static HttpClientPool,
     relay_url: String,
     client: Arc<HttpClient>,
+    controlled: bool,
 }
 
 impl Drop for RelayPoolGuard {
     fn drop(&mut self) {
-        self.pool.release(&self.relay_url);
+        self.pool.release_view(&self.relay_url, self.controlled);
     }
 }
 
@@ -511,35 +606,19 @@ fn route_is_stale(err: &HttpError) -> bool {
         HttpError::ServerError(409, body) => {
             relay_error_code_is(body, c2_error::ErrorCode::RouteStale)
         }
-        HttpError::ServerError(502, body) => canonical_semantic_error(body).is_some_and(|error| {
-            error.code == c2_error::ErrorCode::ResourceUnavailable
-                && error.details.get("dispatch_phase").map(String::as_str) == Some("pre_dispatch")
-        }),
+        // ResourceUnavailable + pre_dispatch also covers local request capacity
+        // rejection. It proves no business dispatch, but not a stale route, so
+        // it must not trigger withdrawal or authorize another business POST.
         _ => false,
     }
 }
 
 fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
     match error {
-        HttpError::InvalidInput(_) => HttpCallPhase::PreDispatch,
-        HttpError::ServerError(_, body)
-            if canonical_semantic_error(body).is_some_and(|error| {
-                error.code != c2_error::ErrorCode::ResourceUnavailable
-                    || error.details.get("dispatch_phase").map(String::as_str)
-                        == Some("pre_dispatch")
-            }) =>
-        {
-            HttpCallPhase::PreDispatch
-        }
-        HttpError::CrmError(_) | HttpError::Transport(_) | HttpError::ServerError(_, _) => {
-            HttpCallPhase::DispatchUncertain
-        }
+        HttpError::InvalidInput(_) | HttpError::LocalCallRejected(_) => HttpCallPhase::PreDispatch,
+        error if route_is_stale(error) => HttpCallPhase::PreDispatch,
+        _ => HttpCallPhase::DispatchUncertain,
     }
-}
-
-fn canonical_semantic_error(body: &str) -> Option<c2_error::C2Error> {
-    let envelope = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body).ok()?;
-    c2_error::C2Error::from_envelope(envelope).ok()
 }
 
 fn relay_error_code_is(body: &str, expected: c2_error::ErrorCode) -> bool {
@@ -795,15 +874,39 @@ mod tests {
         })
     }
 
-    async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
-        let mut error = canonical_error_json(
-            702,
-            "ResourceUnavailable",
-            "relay upstream unavailable",
-            &route,
+    #[test]
+    fn retry_proof_requires_stale_route_authority_and_never_capacity_or_crm_failure() {
+        let stale = HttpError::ServerError(
+            409,
+            canonical_error_json(704, "RouteStale", "stale token", "grid").to_string(),
         );
-        error["details"]["dispatch_phase"] = json!("pre_dispatch");
-        (StatusCode::BAD_GATEWAY, Json(error)).into_response()
+        assert!(route_is_stale(&stale));
+        assert_eq!(http_call_error_phase(&stale), HttpCallPhase::PreDispatch);
+
+        let mut capacity = canonical_error_json(702, "ResourceUnavailable", "capacity", "grid");
+        capacity["details"]["dispatch_phase"] = json!("pre_dispatch");
+        for error in [
+            HttpError::ServerError(502, capacity.to_string()),
+            HttpError::ServerError(429, capacity.to_string()),
+            HttpError::ServerError(404, "ResourceNotFound in an untrusted body".into()),
+            HttpError::CrmError(
+                canonical_error_json(704, "RouteStale", "user error", "grid")
+                    .to_string()
+                    .into_bytes(),
+            ),
+            HttpError::Transport("connection lost after POST".into()),
+        ] {
+            assert!(!route_is_stale(&error));
+            assert_eq!(
+                http_call_error_phase(&error),
+                HttpCallPhase::DispatchUncertain
+            );
+        }
+    }
+
+    async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
+        let error = canonical_error_json(704, "RouteStale", "relay route token is stale", &route);
+        (StatusCode::CONFLICT, Json(error)).into_response()
     }
 
     async fn generic_bad_gateway() -> Response {
