@@ -12,8 +12,9 @@ use super::call_control::check_active;
 use super::http_client::HttpCallInput;
 use super::{
     HttpCallControl, HttpClient, HttpClientPool, HttpError, HttpInputOwner, RelayControlClient,
-    RelayRouteInfo,
+    RelayResolvedRoutes, RelayRouteInfo,
 };
+use c2_config::LocalEndpointContext;
 use c2_contract::ExpectedRouteContract;
 
 /// Whether an HTTP call failure is proven to precede CRM dispatch.
@@ -123,6 +124,8 @@ pub struct RelayAwareHttpClient {
     config: RelayAwareClientConfig,
     current: Mutex<Option<String>>,
     anchor_allows_local_ipc: bool,
+    local_endpoint_context: LocalEndpointContext,
+    default_namespace_id: String,
 }
 
 impl RelayAwareHttpClient {
@@ -144,7 +147,14 @@ impl RelayAwareHttpClient {
     ) -> Result<Self, HttpError> {
         c2_contract::validate_expected_route_contract(&expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
+        // Legacy APIs mean the platform default, regardless of C2_IPC_ROOT.
+        // Core projects a custom frozen Runtime context through the builder below.
+        let local_endpoint_context = LocalEndpointContext::default_for_platform()
+            .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
+        let default_namespace_id = local_endpoint_context.namespace_id().to_owned();
         Ok(Self {
+            local_endpoint_context,
+            default_namespace_id,
             anchor_allows_local_ipc: relay_anchor_allows_local_ipc(control.base_url()),
             control,
             pool: HttpClientPool::instance(),
@@ -153,6 +163,22 @@ impl RelayAwareHttpClient {
             config,
             current: Mutex::new(None),
         })
+    }
+
+    /// Freeze the context whose endpoints the caller can open. Namespace agreement
+    /// only proposes an IPC candidate; the caller still validates handshake identity
+    /// and the complete expected route contract before using it.
+    pub fn with_local_endpoint_context(mut self, context: &LocalEndpointContext) -> Self {
+        self.local_endpoint_context = context.clone();
+        *self.current.get_mut() = None;
+        self
+    }
+
+    fn namespace_allows_local_ipc(&self, namespace: Option<&str>) -> bool {
+        match namespace {
+            Some(namespace) => namespace == self.local_endpoint_context.namespace_id(),
+            None => self.local_endpoint_context.namespace_id() == self.default_namespace_id,
+        }
     }
 
     pub fn route_name(&self) -> &str {
@@ -298,7 +324,7 @@ impl RelayAwareHttpClient {
                 .resolve_routes_async(attempt > 0 || fallback_denied_when_only_excluded, control)
                 .await
             {
-                Ok(routes) if !routes.is_empty() => routes,
+                Ok(routes) if !routes.routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
@@ -313,8 +339,11 @@ impl RelayAwareHttpClient {
                     return Err(err);
                 }
             };
-            let had_routes_before_local_exclusion = !routes.is_empty();
-            let routes = filter_failed_local_ipc_candidates(routes, excluded_local_ipc_candidates);
+            let namespace_allows_local_ipc =
+                self.namespace_allows_local_ipc(routes.local_endpoint_namespace.as_deref());
+            let had_routes_before_local_exclusion = !routes.routes.is_empty();
+            let routes =
+                filter_failed_local_ipc_candidates(routes.routes, excluded_local_ipc_candidates);
             if routes.is_empty()
                 && fallback_denied_when_only_excluded
                 && had_routes_before_local_exclusion
@@ -327,7 +356,7 @@ impl RelayAwareHttpClient {
 
             if let Some(candidate) = select_local_ipc_candidate(
                 prefer_local_ipc,
-                self.anchor_allows_local_ipc,
+                self.anchor_allows_local_ipc && namespace_allows_local_ipc,
                 &routes,
                 &self.expected,
             ) {
@@ -413,7 +442,7 @@ impl RelayAwareHttpClient {
 
         for attempt in 0..attempts {
             let routes = match self.resolve_routes_async(attempt > 0, control).await {
-                Ok(routes) if !routes.is_empty() => routes,
+                Ok(routes) if !routes.routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
@@ -429,7 +458,7 @@ impl RelayAwareHttpClient {
                 }
             };
 
-            let ordered = self.order_routes(routes, &excluded_routes);
+            let ordered = self.order_routes(routes.routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
                     HttpError::ServerError(404, resource_not_found_body(self.route_name()))
@@ -492,31 +521,43 @@ impl RelayAwareHttpClient {
         &self,
         force_refresh: bool,
         control: Option<&HttpCallControl>,
-    ) -> Result<Vec<RelayRouteInfo>, HttpError> {
+    ) -> Result<RelayResolvedRoutes, HttpError> {
         check_active(control)?;
         if force_refresh {
             self.control.invalidate(self.route_name());
         }
-        let routes = self.control.resolve_matching_async(&self.expected).await;
+        let routes = self
+            .control
+            .resolve_matching_with_context_async(&self.expected, &self.local_endpoint_context)
+            .await;
         check_active(control)?;
         let routes = routes?;
-        let raw_routes_non_empty = !routes.is_empty();
-        let filtered = filter_routes_by_expected_contract(routes, &self.expected);
+        let raw_routes_non_empty = !routes.routes.is_empty();
+        let local_endpoint_namespace = routes.local_endpoint_namespace;
+        let filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
         if !force_refresh && raw_routes_non_empty && filtered.is_empty() {
             check_active(control)?;
             self.control.invalidate(self.route_name());
-            let refreshed = self.control.resolve_matching_async(&self.expected).await;
+            let refreshed = self
+                .control
+                .resolve_matching_with_context_async(&self.expected, &self.local_endpoint_context)
+                .await;
             check_active(control)?;
             let refreshed = refreshed?;
-            let refreshed_routes_non_empty = !refreshed.is_empty();
-            let refreshed_filtered = filter_routes_by_expected_contract(refreshed, &self.expected);
+            let refreshed_routes_non_empty = !refreshed.routes.is_empty();
+            let local_endpoint_namespace = refreshed.local_endpoint_namespace;
+            let refreshed_filtered =
+                filter_routes_by_expected_contract(refreshed.routes, &self.expected);
             if refreshed_routes_non_empty && refreshed_filtered.is_empty() {
                 return Err(HttpError::ServerError(
                     409,
                     crm_contract_mismatch_body(self.route_name()),
                 ));
             }
-            return Ok(refreshed_filtered);
+            return Ok(RelayResolvedRoutes {
+                routes: refreshed_filtered,
+                local_endpoint_namespace,
+            });
         }
         if force_refresh && raw_routes_non_empty && filtered.is_empty() {
             return Err(HttpError::ServerError(
@@ -524,7 +565,10 @@ impl RelayAwareHttpClient {
                 crm_contract_mismatch_body(self.route_name()),
             ));
         }
-        Ok(filtered)
+        Ok(RelayResolvedRoutes {
+            routes: filtered,
+            local_endpoint_namespace,
+        })
     }
 
     fn acquire_route_client(
@@ -1193,6 +1237,137 @@ mod tests {
 
         registry_handle.abort();
         live_handle.abort();
+    }
+
+    #[test]
+    fn immutable_namespace_expectation_preserves_platform_default_legacy_mapping() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let client = RelayAwareHttpClient::new(
+            "http://127.0.0.1:9",
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap();
+        assert!(client.namespace_allows_local_ipc(None));
+        assert!(client.namespace_allows_local_ipc(Some(context.namespace_id())));
+        assert!(!client.namespace_allows_local_ipc(Some(&"f".repeat(64))));
+        #[cfg(unix)]
+        {
+            let custom =
+                LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-ns-test"))
+                    .unwrap();
+            let client = client.with_local_endpoint_context(&custom);
+            assert!(!client.namespace_allows_local_ipc(None));
+            assert!(!client.namespace_allows_local_ipc(Some(context.namespace_id())));
+            assert!(client.namespace_allows_local_ipc(Some(custom.namespace_id())));
+        }
+    }
+
+    async fn assert_namespace_selection(
+        context: &LocalEndpointContext,
+        response_namespace: Option<String>,
+        expect_ipc: bool,
+    ) {
+        use super::super::LOCAL_ENDPOINT_NAMESPACE_HEADER;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe_count = probes.clone();
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route(
+                    "/_probe/{route}",
+                    get(move || {
+                        let probe_count = probe_count.clone();
+                        async move {
+                            probe_count.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
+        let expected_namespace = context.namespace_id().to_owned();
+        let resolved_url = live_url.clone();
+        let (registry_url, registry_handle) = spawn_app(Router::new().route(
+            "/_resolve/{name}",
+            get(move |headers: HeaderMap| {
+                let expected_namespace = expected_namespace.clone();
+                let response_namespace = response_namespace.clone();
+                let resolved_url = resolved_url.clone();
+                async move {
+                    assert_eq!(
+                        headers.get(LOCAL_ENDPOINT_NAMESPACE_HEADER).unwrap(),
+                        expected_namespace.as_str()
+                    );
+                    let mut response = Json(vec![RelayRouteInfo {
+                        ipc_address: Some("ipc://local-grid".into()),
+                        server_id: Some("local-grid".into()),
+                        server_instance_id: Some("inst-local-grid".into()),
+                        ..route_info("grid".into(), resolved_url)
+                    }])
+                    .into_response();
+                    if let Some(namespace) = response_namespace {
+                        response
+                            .headers_mut()
+                            .insert(LOCAL_ENDPOINT_NAMESPACE_HEADER, namespace.parse().unwrap());
+                    }
+                    response
+                }
+            }),
+        ))
+        .await;
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap()
+        .with_local_endpoint_context(context);
+        let target = client.resolve_target_async().await.unwrap();
+        assert_eq!(
+            matches!(target, RelayResolvedTarget::Ipc { .. }),
+            expect_ipc
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), usize::from(!expect_ipc));
+        // Mismatch and missing custom metadata preserve the same HTTP route and token.
+        if !expect_ipc {
+            assert_eq!(target.as_url(), live_url);
+            assert_eq!(
+                client.call_async("step", b"namespace").await.unwrap(),
+                b"ok:namespace"
+            );
+        }
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
+    // Kept cross-platform: Windows default SID metadata and legacy compatibility
+    // use the same public negotiation, including explicit mismatch -> HTTP.
+    #[tokio::test]
+    async fn default_namespace_new_and_old_relay_compatibility() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        assert_namespace_selection(&context, Some(context.namespace_id().to_owned()), true).await;
+        assert_namespace_selection(&context, None, true).await;
+        let mismatch = if context.namespace_id() == "a".repeat(64) {
+            "b"
+        } else {
+            "a"
+        }
+        .repeat(64);
+        assert_namespace_selection(&context, Some(mismatch), false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_namespace_requires_matching_metadata_and_keeps_http_route() {
+        let context =
+            LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-ns-test")).unwrap();
+        assert_namespace_selection(&context, Some(context.namespace_id().to_owned()), true).await;
+        assert_namespace_selection(&context, None, false).await;
+        let other = LocalEndpointContext::default_for_platform().unwrap();
+        assert_namespace_selection(&context, Some(other.namespace_id().to_owned()), false).await;
     }
 
     #[tokio::test]

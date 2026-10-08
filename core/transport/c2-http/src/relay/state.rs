@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use c2_config::RelayConfig;
+use c2_config::{
+    ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions, RelayConfig,
+};
 use c2_ipc::{IpcClient, RouteBinding};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
@@ -30,6 +32,8 @@ pub struct RelayState {
     upstream_controls: RwLock<HashMap<UpstreamOwnerKey, UpstreamControlTask>>,
     upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
+    endpoint_context: LocalEndpointContext,
+    default_endpoint_namespace: bool,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     /// One shared memory context for every data-plane upstream `IpcClient`
     /// this relay owns. Each connection's request and reassembly pools charge
@@ -41,8 +45,8 @@ pub struct RelayState {
     /// Config scope: `config.upstream_ipc` is the complete resolved policy
     /// frozen at startup. First connections and reconnects clone that policy
     /// and this same budget; acquisition never reloads the environment.
-    /// Control-plane attestation/watch clients use private lazy default
-    /// contexts and do not charge this data-plane budget.
+    /// Control-plane attestation/watch clients use private lazy memory
+    /// contexts with the same frozen endpoint namespace and do not charge this data-plane budget.
     upstream_memory_budget: c2_mem::MemoryBudget,
 }
 
@@ -127,10 +131,27 @@ async fn verify_route_after_watch_unavailable(
 }
 
 impl RelayState {
+    #[allow(dead_code)]
     pub fn new(
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     ) -> Self {
+        let context = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources::from_process(),
+        )
+        .expect("invalid relay local endpoint configuration");
+        Self::new_with_context(config, disseminator, context)
+    }
+
+    /// Freeze one endpoint namespace for every upstream connection and watcher.
+    pub fn new_with_context(
+        config: Arc<RelayConfig>,
+        disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+        endpoint_context: LocalEndpointContext,
+    ) -> Self {
+        let default_endpoint_namespace = LocalEndpointContext::default_for_platform()
+            .is_ok_and(|default| default == endpoint_context);
         let owner_lease_duration = owner_lease_duration(&config);
         let upstream_memory_budget =
             c2_mem::MemoryBudget::from_limits(&config.upstream_ipc.memory_budget_limits());
@@ -141,6 +162,8 @@ impl RelayState {
             upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
+            endpoint_context,
+            default_endpoint_namespace,
             upstream_memory_budget,
         }
     }
@@ -161,6 +184,14 @@ impl RelayState {
     pub fn config(&self) -> &RelayConfig {
         &self.config
     }
+    pub fn endpoint_context(&self) -> &LocalEndpointContext {
+        &self.endpoint_context
+    }
+
+    pub(crate) fn is_default_endpoint_namespace(&self) -> bool {
+        self.default_endpoint_namespace
+    }
+
     pub fn relay_id(&self) -> &str {
         &self.config.relay_id
     }
@@ -333,9 +364,10 @@ impl RelayState {
         let expected_for_connect = expected.clone();
         // Every data-plane connection (including reconnects) uses the frozen
         // resolved policy and the relay's one shared upstream memory context.
-        // `with_shared_budget` validates the pair before connection I/O.
+        // `with_endpoint_and_shared_budget` validates the pair before connection I/O.
         let upstream_ipc = self.config.upstream_ipc.clone();
         let upstream_memory_budget = self.upstream_memory_budget.clone();
+        let endpoint_context = self.endpoint_context.clone();
 
         let lease = match self
             .conn_pool
@@ -344,6 +376,7 @@ impl RelayState {
                 let route_name = route_name.clone();
                 let upstream_ipc = upstream_ipc.clone();
                 let upstream_memory_budget = upstream_memory_budget.clone();
+                let endpoint_context = endpoint_context.clone();
                 async move {
                     if expected.ipc_address.as_deref() != Some(endpoint.address()) {
                         return Err(c2_ipc::IpcError::Protocol(format!(
@@ -363,8 +396,8 @@ impl RelayState {
                             expected.ipc_address
                         )));
                     }
-                    let mut client = IpcClient::with_shared_budget(
-                        endpoint.address(),
+                    let mut client = IpcClient::with_endpoint_and_shared_budget(
+                        endpoint_context.endpoint(endpoint.address()).map_err(c2_ipc::IpcError::Io)?,
                         upstream_ipc,
                         upstream_memory_budget,
                     );

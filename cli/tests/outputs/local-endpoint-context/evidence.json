@@ -1,0 +1,454 @@
+{
+  "status": "NOT_READY_waitingHost_retest",
+  "date": "2026-10-08",
+  "originalInputCommit": "6ada99f7ac116f63beab14789a04d04b51355a0c",
+  "continuationInputCommit": "5fa6d1d641f1f6aa872d6af7783fd17397191a74",
+  "cumulativeCodeDiffSha256": "051dd5cade9b57f2ccece81b264e70ed654fb9d515883d8d8c6739b34cf73be5",
+  "cumulativeChangedCodePaths": [
+    "cli/src/endpoint.rs",
+    "cli/src/relay.rs",
+    "cli/tests/endpoint_cli.rs",
+    "cli/tests/relay_args.rs",
+    "core/transport/c2-http/src/client/control.rs",
+    "core/transport/c2-http/src/client/mod.rs",
+    "core/transport/c2-http/src/client/relay_aware.rs",
+    "core/transport/c2-http/src/relay/authority.rs",
+    "core/transport/c2-http/src/relay/route_table.rs",
+    "core/transport/c2-http/src/relay/router.rs",
+    "core/transport/c2-http/src/relay/server.rs",
+    "core/transport/c2-http/src/relay/state.rs",
+    "core/transport/c2-http/src/relay/test_support.rs",
+    "core/transport/c2-http/src/relay/types.rs",
+    "core/transport/c2-http/src/relay/upstream_control.rs"
+  ],
+  "codeFileSha256": {
+    "cli/src/endpoint.rs": "c76d0dd49602cca7d541f3763fb17a281c944ac75c9688c1fb6fbda29cdff94a",
+    "cli/src/relay.rs": "ac1c6ff55daa06ef5a124d62099a9026c7a2df538eaca3c63a4a21bdc6c27477",
+    "cli/tests/endpoint_cli.rs": "7c714c876f7294ec95ad29467578e1b90958cad3cd4061fe9ac01d410cfd1b89",
+    "cli/tests/relay_args.rs": "fe8ea604592759504e0820fddb49da02682dbf1257108071650cc1bdf8674505",
+    "core/transport/c2-http/src/client/control.rs": "07c3cb38335a06180ba2331f2ed7c27c715db9f5aea0211b303492a8c914c88a",
+    "core/transport/c2-http/src/client/mod.rs": "daa47eeec68d18d48be9ed636bb39caa0d625c4a23a7c71ec51522d6db281c2e",
+    "core/transport/c2-http/src/client/relay_aware.rs": "8d5a49999c70c58feacc9ed37298d99d12664df29a51f7050605c8a00a5cf543",
+    "core/transport/c2-http/src/relay/authority.rs": "79523e1d42df5adb012d623c6a568a719ee2730f19e11a67440c57f9ba94be5c",
+    "core/transport/c2-http/src/relay/route_table.rs": "a17b254a24dab2709507c7494e38ff5da1b6ea04931204296cb271cf82696d38",
+    "core/transport/c2-http/src/relay/router.rs": "3a68197f9564e84a65277b5c3ef48d8b41cd31ed1ada29a16875bd61ed994768",
+    "core/transport/c2-http/src/relay/server.rs": "dea40ca2fff4dd21970e0dd90a413a877b27d3a07e2c8956d582a854a16fdb59",
+    "core/transport/c2-http/src/relay/state.rs": "bbd31445ecc438a5b98357beca9c9a222f2c662c0639cb0d36ed1db7dac14151",
+    "core/transport/c2-http/src/relay/test_support.rs": "f4b9b5d6614cd30d7494090d1bfeec0fa057bf35e1be9c522c3459e4028d2317",
+    "core/transport/c2-http/src/relay/types.rs": "fc3091b187278bf520ee35dc29e518d81035687658a2e531e4b53e71d0ffe3cd",
+    "core/transport/c2-http/src/relay/upstream_control.rs": "0cfc45ae4f07e7b3ea92b6871cfc0d59e8914b63dfd21c8fc2a598329e6953eb"
+  },
+  "productionContextAudit": {
+    "scannedProductionPaths": [
+      "cli/src/endpoint.rs",
+      "cli/src/relay.rs",
+      "core/transport/c2-http/src/client/control.rs",
+      "core/transport/c2-http/src/client/mod.rs",
+      "core/transport/c2-http/src/client/relay_aware.rs",
+      "core/transport/c2-http/src/relay/authority.rs",
+      "core/transport/c2-http/src/relay/conn_pool.rs",
+      "core/transport/c2-http/src/relay/route_table.rs",
+      "core/transport/c2-http/src/relay/router.rs",
+      "core/transport/c2-http/src/relay/server.rs",
+      "core/transport/c2-http/src/relay/state.rs",
+      "core/transport/c2-http/src/relay/types.rs",
+      "core/transport/c2-http/src/relay/upstream_control.rs"
+    ],
+    "forbiddenConstructorHits": [],
+    "platformDefaultIdentityUses": [
+      {
+        "path": "core/transport/c2-http/src/client/relay_aware.rs",
+        "line": 152,
+        "text": "let local_endpoint_context = LocalEndpointContext::default_for_platform()"
+      },
+      {
+        "path": "core/transport/c2-http/src/relay/state.rs",
+        "line": 153,
+        "text": "let default_endpoint_namespace = LocalEndpointContext::default_for_platform()"
+      }
+    ],
+    "defaultIdentityExplanation": "Only immutable legacy client default identity and Relay default-namespace compatibility comparisons; no endpoint open/connect bypass. Context is resolved once at startup; upstream factories derive endpoints from the frozen RelayState context. Route-table address sanity calls canonical logical validation only."
+  },
+  "apiAndHandoff": "LocalEndpointContext Relay/CLI implementation checkpoint (2026-10-08)\nFrozen input: 6ada99f7ac116f63beab14789a04d04b51355a0c\nScope: only authorized CLI and c2-http client/relay files; no Core Runtime/session/client, SDK, FFI, docs or versions changed. No commit/push/PR/publication.\n\nPrecise Rust API for the subsequent Core projection:\n  c2_http::relay::server::RelayServer::start_with_context(config: c2_config::RelayConfig, context: c2_config::LocalEndpointContext) -> Result<RelayServer, String>\n  RelayServer::start(config) captures ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), ConfigSources::from_process()) once, delegates to start_with_context.\n  c2_http::client::RelayControlClient::with_local_endpoint_context(self, context: &c2_config::LocalEndpointContext) -> Self\n    Apply to the resource registration control client before register/prepare_register. Emits only namespace hash, never root path. Legacy constructors send no namespace (default-root registration compatible); custom registration requires typed context.\n  c2_http::client::RelayAwareHttpClient::with_local_endpoint_context(self, context: &c2_config::LocalEndpointContext) -> Self\n    Apply before sharing the discovery client. Legacy constructors use the pure platform default, never C2_IPC_ROOT. Builder freezes a cloned context. No-header old Relay accepts IPC only for platform default; explicit mismatch or custom missing metadata uses HTTP without withdrawing routes. IPC candidates still require caller-side handshake same identity and full contract validation.\n  RelayControlClient::resolve_matching_with_context_async(&self, expected: &c2_contract::ExpectedRouteContract, context: &c2_config::LocalEndpointContext) -> Result<c2_http::client::RelayResolvedRoutes, c2_http::client::HttpError>\n  RelayControlClient::resolve_matching_with_namespace_async(&self, expected: &ExpectedRouteContract) -> Result<RelayResolvedRoutes, HttpError>\n  RelayResolvedRoutes { pub routes: Vec<RelayRouteInfo>, pub local_endpoint_namespace: Option<String> }\n    Existing RelayRouteInfo/RelayRegistration/RelayConfig literal fields unchanged. Response cache keys include expected contract + request namespace. Invalid metadata rejected; conflicting header/JSON metadata strips IPC hints while keeping HTTP routes.\n  c2_http::client::LOCAL_ENDPOINT_NAMESPACE_HEADER = \"x-c2-local-namespace\" (HTTP case-insensitive).\n    Optional request/response header, native v1 64 lowercase hex identity; repeated/invalid registration or resolve header rejected. Resolve JSON remains array, flattened additive local_endpoint_namespace field. Probe carries frozen namespace response header. Namespace is a hint, not authorization; native SID/credential/handshake checks remain mandatory.\n\nCLI:\n  c3 relay --ipc-root ROOT\n  c3 endpoint inspect ADDRESS --ipc-root ROOT\n  c3 endpoint reap ADDRESS --credential FILE [--ipc-root ROOT]\n  c3 endpoint sweep [--ipc-root ROOT] [--address ADDRESS ...]\n  code/CLI > process C2_IPC_ROOT > .env > platform default (Rust resolver).\n  Reap without explicit flag follows credential context regardless of env/.env (schema 2 means historical /tmp); explicit context mismatch is pure rejection before target IO.\n  Windows explicit root is not applicable, defaults use existing SID pipe namespace; inspect kernel-managed and sweep notApplicable are preserved.\n\nCOMPLETED HOST-AUTHORIZED SCOPE REPAIR (continuation 2026-10-08):\n  authority.rs validate_ipc_address now derives through self.state.endpoint_context().endpoint(address) and preserves InvalidAddress mapping.\n  authority.rs probe_captured_owner now derives captured owner's endpoint through the same frozen context, then uses IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()). Derivation/connection failure preserves Dead observation; all server/instance identity, complete route contract and current owner-token checks remain unchanged.\n  route_table.rs valid_ipc_address is now only ipc:// prefix + c2_config::validate_ipc_region_id, with no platform SID/default endpoint/filesystem resolver.\n  Added three narrow pure tests: default logical-address preservation (cross-platform), captured root sun_path capacity (Unix), canonical logical address sanity (cross-platform).\n  Captured root capacity regression: temporary pre-fix default derivation fails (exit101), restored final implementation passes (exit0). Final source restored and then all final checks rerun.\n  Existing real captured-owner replacement regression compiled for Host execution. No network test or CLI cache-write attempt repeated in this continuation.\n  Scoped production audit found zero default endpoint/client derivation bypasses; platform-default identity comparisons remain solely for negotiated legacy compatibility.\n\nREQUIRED HOST VALIDATION:\n  cargo test --manifest-path core/Cargo.toml -p c2-http --features relay\n    Run with normal parallel tests on socket-enabled macOS/Linux and Windows; preserve existing timeout/hooks/owned-body/nonreplay/errorclassification/route-removal tests.\n  cargo test --manifest-path cli/Cargo.toml\n    Full CLI suite, including endpoint_cli and relay_args.\n    Build in an authorized environment where patched FastDB CMake source generation is writable. Current sandbox forbids cargo git cache Clipper header writes before CLI compilation.\n  Explicit Unix real regression names (relay::router::tests::):\n    two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace\n    custom_namespace_captured_owner_probe_refuses_replacing_live_owner\n    The captured-owner regression now targets the repaired final implementation; its real execution awaits Host validation.\n  Client real old/new metadata tests (client::relay_aware::tests::):\n    default_namespace_new_and_old_relay_compatibility\n    custom_namespace_requires_matching_metadata_and_keeps_http_route\n  Cross-platform default tests remain runnable on Windows (no blanket Unix-only skip). Unix root tests alone are platform gated.\n\nEvidence limits:\n  Network attempt: TCP bind returns EPERM/Operation not permitted, including unchanged existing tests (32 pass /31 fail at initial client checkpoint); no sandbox bypass attempted.\n  Authored real regressions are compiled only locally; no passing real socket or Windows execution claimed.\n  Log files are ignored local outputs; no package/build artifacts added to Git.\n\nFINAL LOCAL EVIDENCE (continuation):\n  c2-http relay --no-run: all 355 Rust tests compiled.\n  Authority pure suite 5/5; route-table pure suite 62/62; namespace pure filter 9/9; control pure filter 8/8 (last two overlap).\n  Client-only cargo check, scoped rustfmt --check, git diff --check, production constructor audit, and scope check pass.\n  Cumulative code paths and file SHA-256 values, commands and actual outputs are retained in evidence.json so the snapshot retains evidence even when *.log local files are excluded.\n  Status: waitingHost. No complete/accepted/full runtime validation assertion.\n\nHOST NOT_READY FIXTURE CONTINUATION (2026-10-08):\n  Host actual full results: HTTP 354 pass / 1 fail; endpoint CLI 17 pass / 3 fail. Previous checkpoint remains unaccepted. Log SHA-256 and selected failure outputs are retained in hostValidationReceived.\n  Two-root watch test now uses explicit native unregister_route while live; requires A withdrawal, B unchanged identity/UID/revision, then B withdrawal. Production generic disconnect policy remains unchanged.\n  Missing-root test uses removed short TempDir path itself; new CLI pure test verifies endpoint and sweep-anchor capacity without creating root. Unix real CLI fixtures use independent short precreated roots and captured native contexts, sibling selected/unselected share one domain. Shared default setup and inspection retries removed. Unknown, budget, scope and reachability assertions remain. Historical schema2 captured /tmp exact reap and public Windows default branches remain.\n  Fresh final-source local checks: c2-http no-run compiles all 355 tests; authority 5/5, route table 62/62, namespace 9/9, control 8/8 pass (overlap). Client-only check, rustfmt, diff and scope audit pass. checks retains actual fresh outputs; priorCheckpointChecks is historical only. CLI compile/pure capacity test has not run locally because Host forbids repeating confirmed Cargo cache blocker.\n  Precise APIs and protocol remain unchanged as recorded above. Waiting Host same-source Unix/Windows HTTP and CLI full retest with normal parallelism; no acceptance or real fixture passing claim.\n",
+  "checks": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "--no-run"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-relay-final-test-compilation.log",
+      "exitCode": 0,
+      "outputSha256": "c4af8fe86a9f454c916fcd98acde082ecae65d36bee8380c15776686d8f07a64",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --no-run\n   Compiling c2-http v0.1.0 (/Users/soku/.local/share/hey-my-buddy/state/workspaces/ws-a9a24fa595c38a5f4e56b1d256546315/checkout/core/transport/c2-http)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.16s\n  Executable unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nExit code: 0\n"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "relay::authority::tests::"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-authority-pure-tests.log",
+      "exitCode": 0,
+      "outputSha256": "2c1e33f2c447693a5747ea51dee479e064adb2e08ed3ed766040a643448c3f3a",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay::authority::tests::\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 5 tests\ntest relay::authority::tests::preliminary_registration_paths_do_not_attach_replacement_evidence ... ok\ntest relay::authority::tests::replacement_proof_types_do_not_expose_fields ... ok\ntest relay::authority::tests::endpoint_validation_preserves_platform_default_logical_addresses ... ok\ntest relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it ... ok\ntest relay::authority::tests::authority_rejects_invalid_relay_id_before_peer_route_mutation ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 350 filtered out; finished in 0.00s\n\n\nExit code: 0\n"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "relay::route_table::tests::"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-route-table-pure-tests.log",
+      "exitCode": 0,
+      "outputSha256": "49ec70ff303182273b003143d069261f452fc834e3d5815b9d10e805d021960f",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay::route_table::tests::\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 62 tests\ntest relay::route_table::tests::ipc_address_sanity_is_canonical_logical_validation_on_every_platform ... ok\ntest relay::route_table::tests::apply_tombstone_rejects_path_like_relay_id_without_mutation ... ok\ntest relay::route_table::tests::apply_tombstone_rejects_invalid_identity_fields_without_mutation ... ok\ntest relay::route_table::tests::local_unregister_uses_monotonic_timestamp ... ok\ntest relay::route_table::tests::local_register_after_restart_outranks_old_tombstone ... ok\ntest relay::route_table::tests::apply_tombstone_rejects_non_finite_timestamp ... ok\ntest relay::route_table::tests::catalog_revision_advances_for_route_events_and_gc_compacts_removed_revision ... ok\ntest relay::route_table::tests::merge_snapshot_accepts_routes_after_peer_status_recovers ... ok\ntest relay::route_table::tests::merge_snapshot_applies_tombstone_before_old_route ... ok\ntest relay::route_table::tests::full_snapshot_and_merge ... ok\ntest relay::route_table::tests::merge_snapshot_does_not_clear_existing_peer_routes_when_snapshot_lacks_owner_peer ... ok\ntest relay::route_table::tests::merge_snapshot_does_not_import_routes_for_dead_peer ... ok\ntest relay::route_table::tests::merge_snapshot_does_not_resurrect_locally_dead_peer_routes ... ok\ntest relay::route_table::tests::full_sync_tombstone_wire_does_not_expose_private_server_id ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_empty_relay_ids_without_mutating_existing_routes ... ok\ntest relay::route_table::tests::merge_snapshot_keeps_url_for_new_peer ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_invalid_peer_url_without_partial_mutation ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_routes_with_wire_invalid_names ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_invalid_crm_tag_without_partial_mutation ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_invalid_peer_without_partial_mutation ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_tombstones_with_wire_invalid_names ... ok\ntest relay::route_table::tests::merge_snapshot_newer_route_removes_older_tombstone ... ok\ntest relay::route_table::tests::merge_snapshot_strips_owner_private_fields_from_peer_routes ... ok\ntest relay::route_table::tests::monotonic_timestamp_clamps_backwards_steps ... ok\ntest relay::route_table::tests::new_table_is_empty ... ok\ntest relay::route_table::tests::merge_snapshot_updates_known_peer_url ... ok\ntest relay::route_table::tests::newer_route_replaces_tombstone ... ok\ntest relay::route_table::tests::old_tombstone_cannot_delete_newer_route ... ok\ntest relay::route_table::tests::peer_leave_removal_advances_catalog_and_emits_remove_events ... ok\ntest relay::route_table::tests::peer_tombstone_gc_compacts_local_revision_not_owner_removed_revision ... ok\ntest relay::route_table::tests::record_peer_join_rejects_invalid_relay_id_without_peer_mutation ... ok\ntest relay::route_table::tests::newer_peer_tombstone_preserves_private_local_owner_id ... ok\ntest relay::route_table::tests::register_and_resolve_local ... ok\ntest relay::route_table::tests::register_route_rejects_invalid_relay_id_without_mutation ... ok\ntest relay::route_table::tests::register_route_rejects_invalid_identity_fields_without_mutation ... ok\ntest relay::route_table::tests::relay_watch_retains_removed_event_until_tombstone_compaction ... ok\ntest relay::route_table::tests::register_route_rejects_non_finite_timestamp ... ok\ntest relay::route_table::tests::remove_routes_by_relay ... ok\ntest relay::route_table::tests::resolve_ignores_routes_owned_by_dead_peer ... ok\ntest relay::route_table::tests::resolve_includes_routes_owned_by_recovered_peer ... ok\ntest relay::route_table::tests::resolve_local_before_peer ... ok\ntest relay::route_table::tests::resolve_missing_name_returns_empty ... ok\ntest relay::route_table::tests::resolve_matching_filters_by_full_crm_tag ... ok\ntest relay::route_table::tests::resolve_peers_sorted_deterministically ... ok\ntest relay::route_table::tests::route_digest_has_fixed_active_and_tombstone_golden_vectors ... ok\ntest relay::route_table::tests::route_digest_changes_on_relay_url_update ... ok\ntest relay::route_table::tests::relay_watch_history_overflow_compacts_without_dropping_routes ... ok\ntest relay::route_table::tests::route_name_validator_rejects_control_characters ... ok\ntest relay::route_table::tests::route_digest_includes_crm_name ... ok\ntest relay::route_table::tests::to_route_info_keeps_ipc_identity_for_local ... ok\ntest relay::route_table::tests::to_route_info_strips_ipc_address_for_peer ... ok\ntest relay::route_table::tests::route_digest_stable_when_only_ipc_only_identity_changes ... ok\ntest relay::route_table::tests::tombstone_blocks_stale_route_announce ... ok\ntest relay::route_table::tests::tombstone_gc_removes_expired_negative_state ... ok\ntest relay::route_table::tests::unregister_route_rejects_non_finite_tombstone_without_removing_route ... ok\ntest relay::route_table::tests::unregister_local_route_records_private_owner_tombstone ... ok\ntest relay::route_table::tests::unregister_route_with_tombstone_removes_active_route ... ok\ntest relay::route_table::tests::upsert_semantics ... ok\ntest relay::route_table::tests::unregister_local_route_rejects_invalid_tombstone_without_removing_route ... ok\ntest relay::route_table::tests::valid_relay_url_rejects_non_base_urls ... ok\ntest relay::route_table::tests::route_digest_is_sha256_hex_and_binds_route_key_and_fingerprints ... ok\ntest relay::route_table::tests::name_only_resolve_helpers_are_test_only ... ok\n\ntest result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 293 filtered out; finished in 0.01s\n\n\nExit code: 0\n"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "namespace",
+        "--",
+        "--skip",
+        "default_namespace_new_and_old_relay_compatibility",
+        "--skip",
+        "custom_namespace_requires_matching_metadata_and_keeps_http_route",
+        "--skip",
+        "two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace",
+        "--skip",
+        "custom_namespace_captured_owner_probe_refuses_replacing_live_owner",
+        "--skip",
+        "typed_registration_context_sends_only_namespace_and_legacy_sends_none"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-namespace-pure-tests.log",
+      "exitCode": 0,
+      "outputSha256": "4f4f8b2a4d44e7e331b2941688611082218e3508d12b54b3a97bdf60a1f5f914",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay namespace -- --skip default_namespace_new_and_old_relay_compatibility --skip custom_namespace_requires_matching_metadata_and_keeps_http_route --skip two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace --skip custom_namespace_captured_owner_probe_refuses_replacing_live_owner --skip typed_registration_context_sends_only_namespace_and_legacy_sends_none\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 9 tests\ntest client::control::tests::additive_json_namespace_keeps_legacy_records_and_conflicts_keep_http ... ok\ntest client::control::tests::namespace_metadata_validation_is_strict ... ok\ntest client::control::tests::namespace_response_cache_is_scoped_and_keeps_metadata ... ok\ntest client::relay_aware::tests::immutable_namespace_expectation_preserves_platform_default_legacy_mapping ... ok\ntest relay::router::tests::probe_namespace_metadata_is_frozen_even_when_route_is_absent ... ok\ntest relay::router::tests::custom_register_requires_namespace_before_any_owner_probe ... ok\ntest relay::router::tests::default_relay_namespace_keeps_legacy_loopback_resolution ... ok\ntest relay::router::tests::register_namespace_rejects_before_parsing_or_owner_preparation ... ok\ntest relay::router::tests::custom_relay_suppresses_ipc_for_legacy_and_other_namespace_clients ... ok\n\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.01s\n\n\nExit code: 0\n"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "client::control::tests::",
+        "--",
+        "--skip",
+        "typed_registration_context_sends_only_namespace_and_legacy_sends_none",
+        "--skip",
+        "resolve_maps_404_status_from_real_relay_router"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-control-pure-tests.log",
+      "exitCode": 0,
+      "outputSha256": "40a77be91942ae612f8b0a5e1e2b385f379d06911291fca2dee1ebe94095b5a3",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay client::control::tests:: -- --skip typed_registration_context_sends_only_namespace_and_legacy_sends_none --skip resolve_maps_404_status_from_real_relay_router\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 8 tests\ntest client::control::tests::additive_json_namespace_keeps_legacy_records_and_conflicts_keep_http ... ok\ntest client::control::tests::canonicalizes_base_url ... ok\ntest client::control::tests::namespace_metadata_validation_is_strict ... ok\ntest client::control::tests::namespace_response_cache_is_scoped_and_keeps_metadata ... ok\ntest client::control::tests::route_cache_key_distinguishes_contract_hashes ... ok\ntest client::control::tests::relay_control_client_does_not_expose_name_only_resolve ... ok\ntest client::control::tests::route_cache_can_be_invalidated ... ok\ntest client::control::tests::resolve_matching_rejects_malformed_expected_contract_before_request ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 347 filtered out; finished in 0.00s\n\n\nExit code: 0\n"
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-client-only-check.log",
+      "exitCode": 0,
+      "outputSha256": "c63fdeccb523bcc0379cab7e5563e74e96944a6aa03510e8fd270b9b649ee538",
+      "actualOutput": "Command: cargo check --manifest-path core/Cargo.toml -p c2-http\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s\n\nExit code: 0\n"
+    },
+    {
+      "command": [
+        "rustfmt",
+        "--check",
+        "--edition",
+        "2024",
+        "--config",
+        "skip_children=true",
+        "cli/src/endpoint.rs",
+        "cli/src/relay.rs",
+        "cli/tests/endpoint_cli.rs",
+        "cli/tests/relay_args.rs",
+        "core/transport/c2-http/src/client/control.rs",
+        "core/transport/c2-http/src/client/mod.rs",
+        "core/transport/c2-http/src/client/relay_aware.rs",
+        "core/transport/c2-http/src/relay/authority.rs",
+        "core/transport/c2-http/src/relay/route_table.rs",
+        "core/transport/c2-http/src/relay/router.rs",
+        "core/transport/c2-http/src/relay/server.rs",
+        "core/transport/c2-http/src/relay/state.rs",
+        "core/transport/c2-http/src/relay/test_support.rs",
+        "core/transport/c2-http/src/relay/types.rs",
+        "core/transport/c2-http/src/relay/upstream_control.rs"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-format-check.log",
+      "exitCode": 0,
+      "outputSha256": "599c23e2fd9b9cf4cc7dba8edbed6eaac190709b93f6e1402914de3182e2d21c",
+      "actualOutput": "Command: rustfmt --check --edition 2024 --config skip_children=true cli/src/endpoint.rs cli/src/relay.rs cli/tests/endpoint_cli.rs cli/tests/relay_args.rs core/transport/c2-http/src/client/control.rs core/transport/c2-http/src/client/mod.rs core/transport/c2-http/src/client/relay_aware.rs core/transport/c2-http/src/relay/authority.rs core/transport/c2-http/src/relay/route_table.rs core/transport/c2-http/src/relay/router.rs core/transport/c2-http/src/relay/server.rs core/transport/c2-http/src/relay/state.rs core/transport/c2-http/src/relay/test_support.rs core/transport/c2-http/src/relay/types.rs core/transport/c2-http/src/relay/upstream_control.rs\n\nExit code: 0\n"
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "output": "cli/tests/outputs/local-endpoint-context/fixture-diff-check.log",
+      "exitCode": 0,
+      "outputSha256": "4645399315316733e126e11349b72d1bc2d3707764fa84d7a11d101432d174c3",
+      "actualOutput": "Command: git diff --check\n\nExit code: 0\n"
+    },
+    {
+      "exitCode": 0,
+      "actualOutput": "15 authorized cumulative Rust source files; continuation code delta is endpoint_cli.rs fixtures and router.rs test-only hunk. No default LocalEndpoint::from_address/IpcClient::new production bypass.\n",
+      "verification": "Inline python3 assertions checking cumulative source paths, test-only continuation delta and production constructor audit"
+    }
+  ],
+  "remainingHostWork": [
+    "Run cargo test --manifest-path core/Cargo.toml -p c2-http --features relay with normal parallel tests on socket-enabled Unix and Windows.",
+    "Run cargo test --manifest-path cli/Cargo.toml on authorized Unix/Windows FastDB build environment; include CLI pure capacity test, preserved Unknown/watch assertions and Windows default SID coverage.",
+    "Save source-matched full output and verdict in host-unix-full-receipt.json / host-windows-full-receipt.json; return exact failures if any. NOT_READY until agreed gates pass."
+  ],
+  "priorCheckpointChecks": [
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/relay-final-test-compilation.log",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "--no-run"
+      ],
+      "exitCode": 0,
+      "outputSha256": "70104209a851f4e71ef4c036402abb4a98b1b678640fd680f15656ea205619c2",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --no-run\n   Compiling c2-http v0.1.0 (/Users/soku/.local/share/hey-my-buddy/state/workspaces/ws-a9a24fa595c38a5f4e56b1d256546315/checkout/core/transport/c2-http)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.37s\n  Executable unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/authority-pure-tests.log",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "relay::authority::tests::"
+      ],
+      "exitCode": 0,
+      "outputSha256": "49f857ba1e5462afd6ddccab13b2d807697fd45fe0cb980bb24b807da29cedc9",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay::authority::tests::\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 5 tests\ntest relay::authority::tests::preliminary_registration_paths_do_not_attach_replacement_evidence ... ok\ntest relay::authority::tests::replacement_proof_types_do_not_expose_fields ... ok\ntest relay::authority::tests::endpoint_validation_preserves_platform_default_logical_addresses ... ok\ntest relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it ... ok\ntest relay::authority::tests::authority_rejects_invalid_relay_id_before_peer_route_mutation ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 350 filtered out; finished in 0.01s\n\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/route-table-pure-tests.log",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "relay::route_table::tests::"
+      ],
+      "exitCode": 0,
+      "outputSha256": "9aa14a7adb180cba0f24396b4d67a6148a767302101b0db836d5c680be100dfc",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay::route_table::tests::\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 62 tests\ntest relay::route_table::tests::ipc_address_sanity_is_canonical_logical_validation_on_every_platform ... ok\ntest relay::route_table::tests::merge_snapshot_accepts_routes_after_peer_status_recovers ... ok\ntest relay::route_table::tests::merge_snapshot_does_not_clear_existing_peer_routes_when_snapshot_lacks_owner_peer ... ok\ntest relay::route_table::tests::apply_tombstone_rejects_invalid_identity_fields_without_mutation ... ok\ntest relay::route_table::tests::apply_tombstone_rejects_path_like_relay_id_without_mutation ... ok\ntest relay::route_table::tests::merge_snapshot_applies_tombstone_before_old_route ... ok\ntest relay::route_table::tests::apply_tombstone_rejects_non_finite_timestamp ... ok\ntest relay::route_table::tests::merge_snapshot_does_not_import_routes_for_dead_peer ... ok\ntest relay::route_table::tests::merge_snapshot_does_not_resurrect_locally_dead_peer_routes ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_empty_relay_ids_without_mutating_existing_routes ... ok\ntest relay::route_table::tests::merge_snapshot_keeps_url_for_new_peer ... ok\ntest relay::route_table::tests::merge_snapshot_newer_route_removes_older_tombstone ... ok\ntest relay::route_table::tests::local_register_after_restart_outranks_old_tombstone ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_invalid_crm_tag_without_partial_mutation ... ok\ntest relay::route_table::tests::local_unregister_uses_monotonic_timestamp ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_invalid_peer_url_without_partial_mutation ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_invalid_peer_without_partial_mutation ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_routes_with_wire_invalid_names ... ok\ntest relay::route_table::tests::merge_snapshot_rejects_tombstones_with_wire_invalid_names ... ok\ntest relay::route_table::tests::full_snapshot_and_merge ... ok\ntest relay::route_table::tests::merge_snapshot_updates_known_peer_url ... ok\ntest relay::route_table::tests::merge_snapshot_strips_owner_private_fields_from_peer_routes ... ok\ntest relay::route_table::tests::new_table_is_empty ... ok\ntest relay::route_table::tests::monotonic_timestamp_clamps_backwards_steps ... ok\ntest relay::route_table::tests::newer_peer_tombstone_preserves_private_local_owner_id ... ok\ntest relay::route_table::tests::newer_route_replaces_tombstone ... ok\ntest relay::route_table::tests::old_tombstone_cannot_delete_newer_route ... ok\ntest relay::route_table::tests::peer_leave_removal_advances_catalog_and_emits_remove_events ... ok\ntest relay::route_table::tests::record_peer_join_rejects_invalid_relay_id_without_peer_mutation ... ok\ntest relay::route_table::tests::catalog_revision_advances_for_route_events_and_gc_compacts_removed_revision ... ok\ntest relay::route_table::tests::peer_tombstone_gc_compacts_local_revision_not_owner_removed_revision ... ok\ntest relay::route_table::tests::register_route_rejects_invalid_relay_id_without_mutation ... ok\ntest relay::route_table::tests::register_route_rejects_non_finite_timestamp ... ok\ntest relay::route_table::tests::register_route_rejects_invalid_identity_fields_without_mutation ... ok\ntest relay::route_table::tests::relay_watch_retains_removed_event_until_tombstone_compaction ... ok\ntest relay::route_table::tests::register_and_resolve_local ... ok\ntest relay::route_table::tests::resolve_ignores_routes_owned_by_dead_peer ... ok\ntest relay::route_table::tests::relay_watch_history_overflow_compacts_without_dropping_routes ... ok\ntest relay::route_table::tests::remove_routes_by_relay ... ok\ntest relay::route_table::tests::resolve_includes_routes_owned_by_recovered_peer ... ok\ntest relay::route_table::tests::resolve_local_before_peer ... ok\ntest relay::route_table::tests::resolve_missing_name_returns_empty ... ok\ntest relay::route_table::tests::route_name_validator_rejects_control_characters ... ok\ntest relay::route_table::tests::resolve_matching_filters_by_full_crm_tag ... ok\ntest relay::route_table::tests::to_route_info_keeps_ipc_identity_for_local ... ok\ntest relay::route_table::tests::to_route_info_strips_ipc_address_for_peer ... ok\ntest relay::route_table::tests::resolve_peers_sorted_deterministically ... ok\ntest relay::route_table::tests::route_digest_includes_crm_name ... ok\ntest relay::route_table::tests::route_digest_changes_on_relay_url_update ... ok\ntest relay::route_table::tests::route_digest_has_fixed_active_and_tombstone_golden_vectors ... ok\ntest relay::route_table::tests::route_digest_stable_when_only_ipc_only_identity_changes ... ok\ntest relay::route_table::tests::tombstone_blocks_stale_route_announce ... ok\ntest relay::route_table::tests::tombstone_gc_removes_expired_negative_state ... ok\ntest relay::route_table::tests::route_digest_is_sha256_hex_and_binds_route_key_and_fingerprints ... ok\ntest relay::route_table::tests::unregister_local_route_records_private_owner_tombstone ... ok\ntest relay::route_table::tests::unregister_local_route_rejects_invalid_tombstone_without_removing_route ... ok\ntest relay::route_table::tests::unregister_route_rejects_non_finite_tombstone_without_removing_route ... ok\ntest relay::route_table::tests::unregister_route_with_tombstone_removes_active_route ... ok\ntest relay::route_table::tests::upsert_semantics ... ok\ntest relay::route_table::tests::valid_relay_url_rejects_non_base_urls ... ok\ntest relay::route_table::tests::full_sync_tombstone_wire_does_not_expose_private_server_id ... ok\ntest relay::route_table::tests::name_only_resolve_helpers_are_test_only ... ok\n\ntest result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 293 filtered out; finished in 0.01s\n\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/namespace-pure-tests.log",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "namespace",
+        "--",
+        "--skip",
+        "default_namespace_new_and_old_relay_compatibility",
+        "--skip",
+        "custom_namespace_requires_matching_metadata_and_keeps_http_route",
+        "--skip",
+        "two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace",
+        "--skip",
+        "custom_namespace_captured_owner_probe_refuses_replacing_live_owner",
+        "--skip",
+        "typed_registration_context_sends_only_namespace_and_legacy_sends_none"
+      ],
+      "exitCode": 0,
+      "outputSha256": "7b9a1ca8425c17041405ba574bc4d7fcb97de72342c6b227f9b14a5a650478f8",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay namespace -- --skip default_namespace_new_and_old_relay_compatibility --skip custom_namespace_requires_matching_metadata_and_keeps_http_route --skip two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace --skip custom_namespace_captured_owner_probe_refuses_replacing_live_owner --skip typed_registration_context_sends_only_namespace_and_legacy_sends_none\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 9 tests\ntest client::control::tests::namespace_metadata_validation_is_strict ... ok\ntest client::control::tests::additive_json_namespace_keeps_legacy_records_and_conflicts_keep_http ... ok\ntest relay::router::tests::probe_namespace_metadata_is_frozen_even_when_route_is_absent ... ok\ntest relay::router::tests::custom_register_requires_namespace_before_any_owner_probe ... ok\ntest relay::router::tests::default_relay_namespace_keeps_legacy_loopback_resolution ... ok\ntest client::control::tests::namespace_response_cache_is_scoped_and_keeps_metadata ... ok\ntest relay::router::tests::register_namespace_rejects_before_parsing_or_owner_preparation ... ok\ntest client::relay_aware::tests::immutable_namespace_expectation_preserves_platform_default_legacy_mapping ... ok\ntest relay::router::tests::custom_relay_suppresses_ipc_for_legacy_and_other_namespace_clients ... ok\n\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 346 filtered out; finished in 0.01s\n\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/control-pure-tests.log",
+      "command": [
+        "cargo",
+        "test",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http",
+        "--features",
+        "relay",
+        "client::control::tests::",
+        "--",
+        "--skip",
+        "typed_registration_context_sends_only_namespace_and_legacy_sends_none",
+        "--skip",
+        "resolve_maps_404_status_from_real_relay_router"
+      ],
+      "exitCode": 0,
+      "outputSha256": "ff3555fd834ad1bc84f22b41b56f284a45b24232bee598d5cb042f018d50f09c",
+      "actualOutput": "Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay client::control::tests:: -- --skip typed_registration_context_sends_only_namespace_and_legacy_sends_none --skip resolve_maps_404_status_from_real_relay_router\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 8 tests\ntest client::control::tests::namespace_metadata_validation_is_strict ... ok\ntest client::control::tests::canonicalizes_base_url ... ok\ntest client::control::tests::route_cache_key_distinguishes_contract_hashes ... ok\ntest client::control::tests::relay_control_client_does_not_expose_name_only_resolve ... ok\ntest client::control::tests::additive_json_namespace_keeps_legacy_records_and_conflicts_keep_http ... ok\ntest client::control::tests::route_cache_can_be_invalidated ... ok\ntest client::control::tests::namespace_response_cache_is_scoped_and_keeps_metadata ... ok\ntest client::control::tests::resolve_matching_rejects_malformed_expected_contract_before_request ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 347 filtered out; finished in 0.00s\n\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/client-only-check.log",
+      "command": [
+        "cargo",
+        "check",
+        "--manifest-path",
+        "core/Cargo.toml",
+        "-p",
+        "c2-http"
+      ],
+      "exitCode": 0,
+      "outputSha256": "0aa8a57a63cbfe9cfa3b2652490f7a61f4c25a5d1bb60fcc4eef2906ab2e19b5",
+      "actualOutput": "Command: cargo check --manifest-path core/Cargo.toml -p c2-http\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/format-check.log",
+      "command": [
+        "rustfmt",
+        "--check",
+        "--edition",
+        "2024",
+        "--config",
+        "skip_children=true",
+        "cli/src/endpoint.rs",
+        "cli/src/relay.rs",
+        "cli/tests/endpoint_cli.rs",
+        "cli/tests/relay_args.rs",
+        "core/transport/c2-http/src/client/control.rs",
+        "core/transport/c2-http/src/client/mod.rs",
+        "core/transport/c2-http/src/client/relay_aware.rs",
+        "core/transport/c2-http/src/relay/authority.rs",
+        "core/transport/c2-http/src/relay/route_table.rs",
+        "core/transport/c2-http/src/relay/router.rs",
+        "core/transport/c2-http/src/relay/server.rs",
+        "core/transport/c2-http/src/relay/state.rs",
+        "core/transport/c2-http/src/relay/test_support.rs",
+        "core/transport/c2-http/src/relay/types.rs",
+        "core/transport/c2-http/src/relay/upstream_control.rs"
+      ],
+      "exitCode": 0,
+      "outputSha256": "599c23e2fd9b9cf4cc7dba8edbed6eaac190709b93f6e1402914de3182e2d21c",
+      "actualOutput": "Command: rustfmt --check --edition 2024 --config skip_children=true cli/src/endpoint.rs cli/src/relay.rs cli/tests/endpoint_cli.rs cli/tests/relay_args.rs core/transport/c2-http/src/client/control.rs core/transport/c2-http/src/client/mod.rs core/transport/c2-http/src/client/relay_aware.rs core/transport/c2-http/src/relay/authority.rs core/transport/c2-http/src/relay/route_table.rs core/transport/c2-http/src/relay/router.rs core/transport/c2-http/src/relay/server.rs core/transport/c2-http/src/relay/state.rs core/transport/c2-http/src/relay/test_support.rs core/transport/c2-http/src/relay/types.rs core/transport/c2-http/src/relay/upstream_control.rs\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/diff-check.log",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exitCode": 0,
+      "outputSha256": "4645399315316733e126e11349b72d1bc2d3707764fa84d7a11d101432d174c3",
+      "actualOutput": "Command: git diff --check\n\nExit code: 0\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/captured-root-capacity-red.log",
+      "exitCode": 101,
+      "outputSha256": "e033243eb1f3c524a90c80b5c632ee651ed2252cf69ae5b83eeec0dd8428df47",
+      "actualOutput": "Temporary pre-fix default derivation for regression check. Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it -- --exact\n   Compiling c2-http v0.1.0 (/Users/soku/.local/share/hey-my-buddy/state/workspaces/ws-a9a24fa595c38a5f4e56b1d256546315/checkout/core/transport/c2-http)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.21s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 1 test\ntest relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it ... FAILED\n\nfailures:\n\n---- relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it stdout ----\n\nthread 'relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it' (9860909) panicked at transport/c2-http/src/relay/authority.rs:1158:9:\nassertion failed: matches!(RouteAuthority::new(&state).validate_ipc_address(\"ipc://worker\"),\n    Err(ControlError::InvalidAddress { reason }) if\n    reason.contains(\"sun_path\"))\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 354 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p c2-http --lib`\n\nExit code: 101\n"
+    },
+    {
+      "output": "cli/tests/outputs/local-endpoint-context/captured-root-capacity-green.log",
+      "exitCode": 0,
+      "outputSha256": "52884bc10606d3e372be5782510a7a91ca44fd5f6360b6332acd511cee42d33f",
+      "actualOutput": "Restored final frozen-context derivation. Command: cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it -- --exact\n   Compiling c2-http v0.1.0 (/Users/soku/.local/share/hey-my-buddy/state/workspaces/ws-a9a24fa595c38a5f4e56b1d256546315/checkout/core/transport/c2-http)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.28s\n     Running unittests src/lib.rs (core/target/debug/deps/c2_http-e782d54768ee2642)\n\nrunning 1 test\ntest relay::authority::tests::endpoint_validation_uses_captured_root_capacity_without_opening_it ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 354 filtered out; finished in 0.00s\n\n\nExit code: 0\n"
+    }
+  ],
+  "hostValidationReceived": {
+    "accepted": false,
+    "disposition": "NOT_READY",
+    "sourceCheckpoint": "5fa6d1d641f1f6aa872d6af7783fd17397191a74",
+    "http": {
+      "passed": 354,
+      "failed": 1
+    },
+    "endpointCli": {
+      "passed": 17,
+      "failed": 3
+    },
+    "logs": [
+      {
+        "path": "/tmp/c2-071-implementation/relay-endpoint-host-http-full.log",
+        "sha256": "9dbc70247efabdbe641cd4450be3668eddcad252b8db42419ae53c7143b78c7a",
+        "bytes": 34263,
+        "failureExcerpts": "test relay::router::tests::probe_reconnect_rejects_same_route_name_with_different_server_instance_id ... ok\ntest relay::router::tests::two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace ... FAILED\n\nfailures:\n\n---- relay::router::tests::two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace stdout ----\n[relay] Register request: name=grid server_id=same-owner server_instance_id=same-instance address=ipc://same-owner prepare_only=false\n[relay] Register committed: name=grid server_id=same-owner server_instance_id=same-instance address=ipc://same-owner crm=test.echo/Echo/0.1.0\n\n---- relay::router::tests::two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace stdout ----\n[relay] Register request: name=grid server_id=same-owner server_instance_id=same-instance address=ipc://same-owner prepare_only=false\n[relay] Register committed: name=grid server_id=same-owner server_instance_id=same-instance address=ipc://same-owner crm=test.echo/Echo/0.1.0\n[relay] Register request: name=grid server_id=same-owner server_instance_id=same-instance address=ipc://same-owner prepare_only=false\n[relay] Register committed: name=grid server_id=same-owner server_instance_id=same-instance address=ipc://same-owner crm=test.echo/Echo/0.1.0\n[relay] Upstream control watch disconnected: server_id=same-owner server_instance_id=same-instance address=ipc://same-owner\n[relay] Upstream control watch connect failed: server_id=same-owner server_instance_id=same-instance address=ipc://same-owner error=IPC I/O error: No such file or directory (os error 2)\n\nthread 'relay::router::tests::two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace' (10192574) panicked at transport/c2-http/src/relay/router.rs:2425:9:\ntimed out waiting for local route \"grid\" to be removed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    relay::router::tests::two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace\nfailures:\n    relay::router::tests::two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace\n\ntest result: FAILED. 354 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.54s\n\nerror: test failed, to rerun pass `-p c2-http --lib`"
+      },
+      {
+        "path": "/tmp/c2-071-implementation/relay-endpoint-host-cli-full.log",
+        "sha256": "4bd72420944207db8ea871e2bc5c38f8f410292dccce2e665f35b6796c64dc34",
+        "bytes": 14779,
+        "failureExcerpts": "test help_exposes_the_three_bounded_subcommands ... ok\ntest missing_custom_root_is_never_created_by_inspection_or_sweep ... FAILED\ntest inspect_reports_absent_without_inventing_an_endpoint ... FAILED\ntest inspect_rejects_a_non_local_or_path_like_address ... ok\ntest reap_rejects_a_credential_that_fails_the_strict_codec ... ok\ntest endpoint_help_exposes_root_on_each_command ... ok\ntest reap_rejects_a_non_utf8_credential_file ... ok\ntest reap_reports_a_credential_address_mismatch_as_stale ... ok\ntest missing_custom_root_is_never_created_by_inspection_or_sweep ... FAILED\ntest inspect_reports_absent_without_inventing_an_endpoint ... FAILED\ntest inspect_rejects_a_non_local_or_path_like_address ... ok\ntest reap_rejects_a_credential_that_fails_the_strict_codec ... ok\ntest endpoint_help_exposes_root_on_each_command ... ok\ntest reap_rejects_a_non_utf8_credential_file ... ok\ntest reap_reports_a_credential_address_mismatch_as_stale ... ok\ntest reap_rejects_an_oversized_credential_file ... ok\ntest historical_schema2_reap_is_not_reinterpreted_by_env ... ok\ntest sweep_accepts_repeated_logical_targets_without_touching_unselected_entries ... FAILED\ntest reap_uses_the_native_credential_endpoint ... ok\ntest sweep_reports_an_honest_status_field ... ok\ntest reap_captured_context_ignores_env_and_rejects_explicit_other_root ... ok\ntest sweep_rejects_zero_and_unbounded_budgets ... ok\ntest sweep_rejects_invalid_and_oversized_address_scopes ... ok\ntest root_maintenance_keeps_uid_scope_and_rejects_replaced_gate_nonce ... ok\n\n---- missing_custom_root_is_never_created_by_inspection_or_sweep stdout ----\n\nthread 'missing_custom_root_is_never_created_by_inspection_or_sweep' (10196918) panicked at /Users/soku/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5:\nUnexpected failure.\ncode=1\nstderr=```\"Error: invalid local endpoint: Unix socket endpoint exceeds sun_path capacity\\n\"```\ncommand=`env -u C2_IPC_ROOT C2_ENV_FILE=\"\" \"/Users/soku/.codex/worktrees/c2-0-7-1-design/c-two/cli/target/debug/c3\" \"endpoint\" \"inspect\" \"ipc://c3-cli-missing-31944-2\" \"--ipc-root\" \"/tmp/c3r-tSHxoR/missing\"`\n\nthread 'missing_custom_root_is_never_created_by_inspection_or_sweep' (10196918) panicked at /Users/soku/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5:\nUnexpected failure.\ncode=1\nstderr=```\"Error: invalid local endpoint: Unix socket endpoint exceeds sun_path capacity\\n\"```\ncommand=`env -u C2_IPC_ROOT C2_ENV_FILE=\"\" \"/Users/soku/.codex/worktrees/c2-0-7-1-design/c-two/cli/target/debug/c3\" \"endpoint\" \"inspect\" \"ipc://c3-cli-missing-31944-2\" \"--ipc-root\" \"/tmp/c3r-tSHxoR/missing\"`\ncode=1\nstdout=\"\"\n\n---- inspect_reports_absent_without_inventing_an_endpoint stdout ----\n\nthread 'inspect_reports_absent_without_inventing_an_endpoint' (10196916) panicked at /Users/soku/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5:\nUnexpected failure.\ncode=1\nstderr=```\"\"```\ncommand=`env -u C2_IPC_ROOT C2_ENV_FILE=\"\" \"/Users/soku/.codex/worktrees/c2-0-7-1-design/c-two/cli/target/debug/c3\" \"endpoint\" \"inspect\" \"ipc://c3-cli-absent-31944-1\"`\n\nthread 'inspect_reports_absent_without_inventing_an_endpoint' (10196916) panicked at /Users/soku/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5:\nUnexpected failure.\ncode=1\nstderr=```\"\"```\ncommand=`env -u C2_IPC_ROOT C2_ENV_FILE=\"\" \"/Users/soku/.codex/worktrees/c2-0-7-1-design/c-two/cli/target/debug/c3\" \"endpoint\" \"inspect\" \"ipc://c3-cli-absent-31944-1\"`\ncode=1\nstdout=\"{\\\"reason\\\":\\\"operation would block\\\",\\\"status\\\":\\\"io-error\\\"}\\n\"\ncode=1\nstdout=\"{\\\"reason\\\":\\\"operation would block\\\",\\\"status\\\":\\\"io-error\\\"}\\n\"\nstderr=\"\"\n\n\n---- sweep_accepts_repeated_logical_targets_without_touching_unselected_entries stdout ----\n\nthread 'sweep_accepts_repeated_logical_targets_without_touching_unselected_entries' (10196997) panicked at /Users/soku/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5:\n\n---- sweep_accepts_repeated_logical_targets_without_touching_unselected_entries stdout ----\n\nthread 'sweep_accepts_repeated_logical_targets_without_touching_unselected_entries' (10196997) panicked at /Users/soku/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5:\nUnexpected stdout, failed var.contains(\"unverified\":1)\n├── var: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n└── var as str: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n\n\nthread 'sweep_accepts_repeated_logical_targets_without_touching_unselected_entries' (10196997) panicked at /Users/soku/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5:\nUnexpected stdout, failed var.contains(\"unverified\":1)\n├── var: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n└── var as str: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n\ncommand=`env -u C2_IPC_ROOT C2_ENV_FILE=\"\" \"/Users/soku/.codex/worktrees/c2-0-7-1-design/c-two/cli/target/debug/c3\" \"endpoint\" \"sweep\" \"--address\" \"ipc://c3-cli-selected-31944-9\" \"--address\" \"ipc://c3-cli-second-31944-13\" \"--max-entries\" \"4096\" \"--max-ms\" \"1000\" \"--max-batches\" \"4096\"`\ncode=0\nUnexpected stdout, failed var.contains(\"unverified\":1)\n├── var: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n└── var as str: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n\ncommand=`env -u C2_IPC_ROOT C2_ENV_FILE=\"\" \"/Users/soku/.codex/worktrees/c2-0-7-1-design/c-two/cli/target/debug/c3\" \"endpoint\" \"sweep\" \"--address\" \"ipc://c3-cli-selected-31944-9\" \"--address\" \"ipc://c3-cli-second-31944-13\" \"--max-entries\" \"4096\" \"--max-ms\" \"1000\" \"--max-batches\" \"4096\"`\ncode=0\nstdout=\"{\\\"reason\\\":null,\\\"status\\\":\\\"complete\\\",\\\"sweep\\\":{\\\"alreadyAbsent\\\":0,\\\"batches\\\":1,\\\"busy\\\":1,\\\"elapsedMs\\\":1,\\\"endpointsExamined\\\":1,\\\"entriesVisited\\\":778,\\\"ioErrors\\\":0,\\\"leasesRetired\\\":0,\\\"namespaceChanged\\\":false,\\\"notApplicable\\\":0,\\\"reaped\\\":0,\\\"roundComplete\\\":true,\\\"roundInterrupted\\\":false,\\\"staleTarget\\\":0,\\\"unverified\\\":0}}\\n\"\nstderr=\"\"\n├── var: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n└── var as str: {\"reason\":null,\"status\":\"complete\",\"sweep\":{\"alreadyAbsent\":0,\"batches\":1,\"busy\":1,\"elapsedMs\":1,\"endpointsExamined\":1,\"entriesVisited\":778,\"ioErrors\":0,\"leasesRetired\":0,\"namespaceChanged\":false,\"notApplicable\":0,\"reaped\":0,\"roundComplete\":true,\"roundInterrupted\":false,\"staleTarget\":0,\"unverified\":0}}\n\ncommand=`env -u C2_IPC_ROOT C2_ENV_FILE=\"\" \"/Users/soku/.codex/worktrees/c2-0-7-1-design/c-two/cli/target/debug/c3\" \"endpoint\" \"sweep\" \"--address\" \"ipc://c3-cli-selected-31944-9\" \"--address\" \"ipc://c3-cli-second-31944-13\" \"--max-entries\" \"4096\" \"--max-ms\" \"1000\" \"--max-batches\" \"4096\"`\ncode=0\nstdout=\"{\\\"reason\\\":null,\\\"status\\\":\\\"complete\\\",\\\"sweep\\\":{\\\"alreadyAbsent\\\":0,\\\"batches\\\":1,\\\"busy\\\":1,\\\"elapsedMs\\\":1,\\\"endpointsExamined\\\":1,\\\"entriesVisited\\\":778,\\\"ioErrors\\\":0,\\\"leasesRetired\\\":0,\\\"namespaceChanged\\\":false,\\\"notApplicable\\\":0,\\\"reaped\\\":0,\\\"roundComplete\\\":true,\\\"roundInterrupted\\\":false,\\\"staleTarget\\\":0,\\\"unverified\\\":0}}\\n\"\nstderr=\"\"\n\ncode=0\nstdout=\"{\\\"reason\\\":null,\\\"status\\\":\\\"complete\\\",\\\"sweep\\\":{\\\"alreadyAbsent\\\":0,\\\"batches\\\":1,\\\"busy\\\":1,\\\"elapsedMs\\\":1,\\\"endpointsExamined\\\":1,\\\"entriesVisited\\\":778,\\\"ioErrors\\\":0,\\\"leasesRetired\\\":0,\\\"namespaceChanged\\\":false,\\\"notApplicable\\\":0,\\\"reaped\\\":0,\\\"roundComplete\\\":true,\\\"roundInterrupted\\\":false,\\\"staleTarget\\\":0,\\\"unverified\\\":0}}\\n\"\nstderr=\"\"\n\n\n\nfailures:\n    inspect_reports_absent_without_inventing_an_endpoint\nfailures:\n    inspect_reports_absent_without_inventing_an_endpoint\n    missing_custom_root_is_never_created_by_inspection_or_sweep\n    sweep_accepts_repeated_logical_targets_without_touching_unselected_entries\n\ntest result: FAILED. 17 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\nerror: test failed, to rerun pass `--test endpoint_cli`\n    inspect_reports_absent_without_inventing_an_endpoint\n    missing_custom_root_is_never_created_by_inspection_or_sweep\n    sweep_accepts_repeated_logical_targets_without_touching_unselected_entries\n\ntest result: FAILED. 17 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\nerror: test failed, to rerun pass `--test endpoint_cli`\n    missing_custom_root_is_never_created_by_inspection_or_sweep\n    sweep_accepts_repeated_logical_targets_without_touching_unselected_entries\n\ntest result: FAILED. 17 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\nerror: test failed, to rerun pass `--test endpoint_cli`"
+      }
+    ]
+  },
+  "fixtureRepair": {
+    "productionBehaviorChanged": false,
+    "testOnlyPaths": [
+      "cli/tests/endpoint_cli.rs",
+      "core/transport/c2-http/src/relay/router.rs"
+    ],
+    "rootCause": [
+      "Generic server disconnect intentionally does not authorize route withdrawal. Native unregister_route emits ExplicitUnregister Closed/Removed while the connection is live.",
+      "Nested missing-root fixture exceeded macOS sockaddr_un capacity before inspection; use direct removed short TempDir path.",
+      "Shared default namespace (778 entries) lets foreign coordinator gate contention return Busy before raw-socket ownership verification, masking expected Unknown."
+    ],
+    "changes": [
+      "Require A withdrawal after explicit native unregister; require B UID/revision/instance unchanged; unregister B and require B withdrawal; then shut down servers. Production generic-loss policy unchanged.",
+      "Independent short pre-created native contexts and explicit --ipc-root for Unix CLI fixtures; selected/unselected share one fixture domain. Remove global default initialization and inspection retries.",
+      "Keep examined=1, unverified=1, reaped=0, reachability, scope/batch budget assertions. Missing container stays absent. Historical schema2 captured /tmp exact reap and Windows public default branches remain."
+    ],
+    "validationLimits": "CLI compile and real sockets were not attempted under Host-confirmed EPERM/read-only CargoCache constraints. CLI pure capacity test awaits Host compile/run."
+  }
+}

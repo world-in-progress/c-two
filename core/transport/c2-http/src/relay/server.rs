@@ -23,7 +23,9 @@ use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
 use crate::relay::url::peer_endpoint_url;
-use c2_config::RelayConfig;
+use c2_config::{
+    ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions, RelayConfig,
+};
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
 const REGISTER_ATTESTATION_CONNECT_ATTEMPTS: usize = 3;
@@ -148,13 +150,15 @@ fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
     )
 }
 
-async fn connect_register_attestation_client(address: &str) -> Result<IpcClient, c2_ipc::IpcError> {
+async fn connect_register_attestation_client(
+    address: &str,
+    context: &LocalEndpointContext,
+) -> Result<IpcClient, c2_ipc::IpcError> {
     for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
-        // Attestation clients keep their private, lazy default memory context
-        // outside the data-plane budget. Both paths use the same canonical
-        // platform native endpoint.
+        // Attestation uses private memory accounting and the frozen relay endpoint namespace.
         let config = ClientIpcConfig::default();
-        let mut client = IpcClient::with_config(address, config);
+        let endpoint = context.endpoint(address).map_err(c2_ipc::IpcError::Io)?;
+        let mut client = IpcClient::with_endpoint(endpoint, config);
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err)
@@ -181,6 +185,19 @@ pub struct RelayServer {
 impl RelayServer {
     /// Start the relay server on a background thread.
     pub fn start(config: RelayConfig) -> Result<Self, String> {
+        let context = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources::from_process(),
+        )
+        .map_err(|error| format!("Invalid relay local endpoint configuration: {error}"))?;
+        Self::start_with_context(config, context)
+    }
+
+    /// Start with the caller's immutable native endpoint context.
+    pub fn start_with_context(
+        config: RelayConfig,
+        context: LocalEndpointContext,
+    ) -> Result<Self, String> {
         config
             .validate()
             .map_err(|e| format!("Invalid relay config: {e}"))?;
@@ -201,7 +218,11 @@ impl RelayServer {
         let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
             crate::relay::disseminator::FullBroadcast::with_proxy_policy(config.use_proxy),
         );
-        let state = Arc::new(RelayState::new(config.clone(), disseminator));
+        let state = Arc::new(RelayState::new_with_context(
+            config.clone(),
+            disseminator,
+            context,
+        ));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -500,7 +521,12 @@ impl RelayServer {
                         }
                     };
                     let result = {
-                        match connect_register_attestation_client(&address).await {
+                        match connect_register_attestation_client(
+                            &address,
+                            state.endpoint_context(),
+                        )
+                        .await
+                        {
                             Ok(client) => {
                                 let server_identity_matches =
                                     client.server_id() == Some(server_id.as_str());
@@ -1020,9 +1046,12 @@ mod tests {
             .expect("configured server ready");
 
         // The managed client the relay actually builds connects.
-        let client = super::connect_register_attestation_client(&address)
-            .await
-            .expect("configured attestation client connects");
+        let client = super::connect_register_attestation_client(
+            &address,
+            &c2_config::LocalEndpointContext::default_for_platform().unwrap(),
+        )
+        .await
+        .expect("configured attestation client connects");
         assert_eq!(client.server_id(), Some(server_id));
         super::close_client(client);
 

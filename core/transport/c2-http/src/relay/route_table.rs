@@ -1016,7 +1016,11 @@ fn valid_server_instance_id(value: &str) -> bool {
 }
 
 fn valid_ipc_address(address: &str) -> bool {
-    c2_ipc::local_endpoint_from_ipc_address(address).is_ok()
+    // Route-table sanity is logical only. Native scope and capacity belong to
+    // the authority's frozen context, never a platform-default derivation.
+    address
+        .strip_prefix("ipc://")
+        .is_some_and(|id| c2_config::validate_ipc_region_id(id).is_ok())
 }
 
 pub(crate) fn valid_relay_url(url: &str) -> bool {
@@ -1056,6 +1060,29 @@ fn current_epoch_millis() -> u64 {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn ipc_address_sanity_is_canonical_logical_validation_on_every_platform() {
+        for id in ["worker", "worker-1", "worker_1", "worker space", "工人"] {
+            assert!(valid_ipc_address(&format!("ipc://{id}")), "{id}");
+        }
+        for address in [
+            "worker",
+            "http://worker",
+            "ipc://",
+            "ipc://.",
+            "ipc://..",
+            "ipc:///worker",
+            "ipc://worker/path",
+            "ipc://worker\\path",
+            "ipc:// leading",
+            "ipc://trailing ",
+            "ipc://worker\n",
+            "ipc://worker\0",
+        ] {
+            assert!(!valid_ipc_address(address), "{address:?}");
+        }
+    }
 
     #[test]
     fn name_only_resolve_helpers_are_test_only() {

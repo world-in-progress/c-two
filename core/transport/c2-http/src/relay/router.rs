@@ -18,6 +18,7 @@ use axum::{
 };
 use futures::StreamExt;
 
+use crate::client::{LOCAL_ENDPOINT_NAMESPACE_HEADER, validate_local_endpoint_namespace};
 use crate::relay::authority::{
     ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
     RegistrationWithdrawal, RouteAuthority, attest_ipc_pending_route_contract,
@@ -28,7 +29,7 @@ use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
 use crate::relay::route_table::valid_route_name;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
-use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
+use crate::relay::types::{ResolvedRouteInfo, RouteEntry, UpstreamEndpointKey};
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -533,11 +534,43 @@ fn register_contract_claim_from_body(
     }
 }
 
-async fn connect_ipc_for_register(address: &str) -> Result<IpcClient, String> {
+fn local_namespace_from_headers(headers: &HeaderMap) -> Result<Option<&str>, Response> {
+    let mut values = headers.get_all(LOCAL_ENDPOINT_NAMESPACE_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    let namespace = value.to_str().ok();
+    if values.next().is_some()
+        || namespace.is_none_or(|value| validate_local_endpoint_namespace(value).is_err())
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid local endpoint namespace").into_response());
+    }
+    Ok(namespace)
+}
+
+fn with_local_namespace_response(state: &RelayState, mut response: Response) -> Response {
+    response.headers_mut().insert(
+        LOCAL_ENDPOINT_NAMESPACE_HEADER,
+        state
+            .endpoint_context()
+            .namespace_id()
+            .parse()
+            .expect("native namespace is valid ASCII"),
+    );
+    response
+}
+
+async fn connect_ipc_for_register(
+    address: &str,
+    context: &c2_config::LocalEndpointContext,
+) -> Result<IpcClient, String> {
     let started = Instant::now();
     let timeout = Duration::from_millis(500);
     loop {
-        let mut client = IpcClient::with_config(address, ClientIpcConfig::default());
+        let endpoint = context
+            .endpoint(address)
+            .map_err(|error| error.to_string())?;
+        let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err) => {
@@ -684,8 +717,35 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
     State(state): State<Arc<RelayState>>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // Namespace is a domain hint, never an authorization credential. Reject
+    // mismatches before owner preparation or any local endpoint is probed.
+    match local_namespace_from_headers(&headers) {
+        Ok(Some(namespace)) if namespace != state.endpoint_context().namespace_id() => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "LocalEndpointNamespaceMismatch",
+                    "message": "resource and relay local endpoint namespaces differ",
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) if !state.is_default_endpoint_namespace() => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "LocalEndpointNamespaceRequired",
+                    "message": "custom relay endpoint context requires the resource namespace",
+                })),
+            )
+                .into_response();
+        }
+        Err(response) => return response,
+        _ => {}
+    }
     let name = match body.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"name\"").into_response(),
@@ -781,7 +841,7 @@ async fn handle_register(
 
     // Connect IPC client and attest the registered route contract.
     let (client, contract) = {
-        let mut c = match connect_ipc_for_register(&address).await {
+        let mut c = match connect_ipc_for_register(&address, state.endpoint_context()).await {
             Ok(client) => client,
             Err(e) => {
                 eprintln!(
@@ -1321,6 +1381,7 @@ async fn handle_resolve(
     Query(query): Query<ResolveQuery>,
     State(state): State<Arc<RelayState>>,
     OptionalConnectInfo(remote_addr): OptionalConnectInfo,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     if !valid_route_name(&name) {
         return (
@@ -1332,7 +1393,16 @@ async fn handle_resolve(
         )
             .into_response();
     }
-    let expose_ipc_address = remote_addr.is_some_and(|addr| addr.ip().is_loopback());
+    let namespace = match local_namespace_from_headers(&headers) {
+        Ok(namespace) => namespace,
+        Err(response) => return response,
+    };
+    let compatible_namespace = match namespace {
+        Some(namespace) => namespace == state.endpoint_context().namespace_id(),
+        None => state.is_default_endpoint_namespace(),
+    };
+    let expose_ipc_address =
+        remote_addr.is_some_and(|addr| addr.ip().is_loopback()) && compatible_namespace;
     let expected_crm = match (
         &query.crm_ns,
         &query.crm_name,
@@ -1383,7 +1453,14 @@ async fn handle_resolve(
             route.server_instance_id = None;
         }
     }
-    Json(routes).into_response()
+    let routes = routes
+        .into_iter()
+        .map(|route| ResolvedRouteInfo {
+            route,
+            local_endpoint_namespace: state.endpoint_context().namespace_id().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    with_local_namespace_response(&state, Json(routes).into_response())
 }
 
 /// `GET /_peers` — list known peer relays.
@@ -1439,6 +1516,15 @@ async fn read_unknown_length_body(
 async fn handle_probe(
     Path(route_name): Path<String>,
     State(state): State<Arc<RelayState>>,
+    headers: HeaderMap,
+) -> Response {
+    let response = handle_probe_in_context(route_name, state.clone(), headers).await;
+    with_local_namespace_response(&state, response)
+}
+
+async fn handle_probe_in_context(
+    route_name: String,
+    state: Arc<RelayState>,
     headers: HeaderMap,
 ) -> Response {
     let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
@@ -2439,9 +2525,28 @@ mod tests {
         route_name: &str,
         marker: &'static [u8],
     ) -> Arc<Server> {
+        start_marker_server_in_context(
+            &c2_config::LocalEndpointContext::default_for_platform().unwrap(),
+            address,
+            server_id,
+            server_instance_id,
+            route_name,
+            marker,
+        )
+        .await
+    }
+
+    async fn start_marker_server_in_context(
+        context: &c2_config::LocalEndpointContext,
+        address: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        route_name: &str,
+        marker: &'static [u8],
+    ) -> Arc<Server> {
         let server = Arc::new(
-            Server::new_with_identity(
-                address,
+            Server::new_with_identity_and_endpoint(
+                context.endpoint(address).unwrap(),
                 ServerIpcConfig::default(),
                 ServerIdentity {
                     server_id: server_id.to_string(),
@@ -2478,6 +2583,483 @@ mod tests {
             .await
             .unwrap();
         server
+    }
+
+    fn namespace_test_state(context: c2_config::LocalEndpointContext) -> Arc<RelayState> {
+        Arc::new(RelayState::new_with_context(
+            Arc::new(c2_config::RelayConfig::default()),
+            Arc::new(crate::relay::test_support::NoopDisseminator),
+            context,
+        ))
+    }
+
+    fn install_namespace_test_route(state: &Arc<RelayState>) {
+        assert!(matches!(
+            test_commit_registration!(
+                state,
+                "grid".into(),
+                "same-owner".into(),
+                "same-instance".into(),
+                "ipc://same-owner".into(),
+                TEST_CRM_NS.into(),
+                TEST_CRM_NAME.into(),
+                TEST_CRM_VER.into(),
+                TEST_ABI_HASH.into(),
+                TEST_SIGNATURE_HASH.into(),
+                1024,
+                "grid-uid".into(),
+                1,
+                None,
+            ),
+            RegisterCommitResult::Registered { .. }
+        ));
+    }
+
+    async fn namespace_resolve_response(
+        state: Arc<RelayState>,
+        namespace: Option<&str>,
+    ) -> Response {
+        let mut request = Request::builder().uri(format!(
+            "/_resolve/grid?crm_ns={TEST_CRM_NS}&crm_name={TEST_CRM_NAME}&crm_ver={TEST_CRM_VER}&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
+        ));
+        if let Some(namespace) = namespace {
+            request = request.header(LOCAL_ENDPOINT_NAMESPACE_HEADER, namespace);
+        }
+        let mut request = request.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))));
+        build_router(state).oneshot(request).await.unwrap()
+    }
+
+    // This runs on Windows too: the default namespace is the current logon SID,
+    // not a made-up Unix root or an environment-selected pipe backend.
+    #[tokio::test]
+    async fn default_relay_namespace_keeps_legacy_loopback_resolution() {
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let state = namespace_test_state(context.clone());
+        install_namespace_test_route(&state);
+        let response = namespace_resolve_response(state.clone(), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[LOCAL_ENDPOINT_NAMESPACE_HEADER],
+            context.namespace_id()
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body[0]["ipc_address"], "ipc://same-owner");
+        assert_eq!(body[0]["local_endpoint_namespace"], context.namespace_id());
+        let mismatch = "f".repeat(64);
+        let response = namespace_resolve_response(state.clone(), Some(&mismatch)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(body[0]["ipc_address"].is_null());
+        assert_eq!(body[0]["name"], "grid");
+        assert!(state.local_route("grid").is_some());
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                context.platform_kind(),
+                c2_config::LocalEndpointNamespace::WindowsNamedPipe
+            );
+            assert!(context.unix_root().is_none());
+            assert!(
+                context
+                    .endpoint("ipc://same-owner")
+                    .unwrap()
+                    .os_name()
+                    .to_string_lossy()
+                    .starts_with(r"\\.\pipe\c_two-")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_relay_suppresses_ipc_for_legacy_and_other_namespace_clients() {
+        let root = crate::relay::test_support::EndpointTestRoot::new();
+        let context = root.context();
+        let state = namespace_test_state(context.clone());
+        install_namespace_test_route(&state);
+        for namespace in [
+            None,
+            Some("f".repeat(64)),
+            Some(context.namespace_id().to_owned()),
+        ] {
+            let response = namespace_resolve_response(state.clone(), namespace.as_deref()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                !body[0]["ipc_address"].is_null(),
+                namespace.as_deref() == Some(context.namespace_id())
+            );
+            assert_eq!(body[0]["name"], "grid");
+            assert_eq!(body[0]["route_uid"], "grid-uid");
+        }
+    }
+
+    #[tokio::test]
+    async fn register_namespace_rejects_before_parsing_or_owner_preparation() {
+        let state =
+            namespace_test_state(c2_config::LocalEndpointContext::default_for_platform().unwrap());
+        install_namespace_test_route(&state);
+        for (namespace, status) in [
+            ("f".repeat(64), StatusCode::CONFLICT),
+            ("bad".into(), StatusCode::BAD_REQUEST),
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_register")
+                        .header("content-type", "application/json")
+                        .header(LOCAL_ENDPOINT_NAMESPACE_HEADER, namespace)
+                        // Missing identity/address would fail parsing if the domain gate ran late.
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(state.local_route("grid").unwrap().route_uid, "grid-uid");
+        }
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_register")
+                    .header("content-type", "application/json")
+                    .header(
+                        LOCAL_ENDPOINT_NAMESPACE_HEADER,
+                        state.endpoint_context().namespace_id(),
+                    )
+                    .header(
+                        LOCAL_ENDPOINT_NAMESPACE_HEADER,
+                        state.endpoint_context().namespace_id(),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.local_route("grid").unwrap().route_uid, "grid-uid");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_register_requires_namespace_before_any_owner_probe() {
+        let root = crate::relay::test_support::EndpointTestRoot::new();
+        let state = namespace_test_state(root.context());
+        install_namespace_test_route(&state);
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_register")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(state.local_route("grid").unwrap().route_uid, "grid-uid");
+        // Both missing and mismatched namespace checks precede route owner
+        // preparation, which can itself open a captured owner's IPC endpoint.
+        let source = source_between(
+            include_str!("router.rs"),
+            "async fn handle_register",
+            "fn close_arc_client",
+        )
+        .unwrap();
+        assert!(
+            source.find("local_namespace_from_headers").unwrap()
+                < source.find(".prepare_register(").unwrap()
+        );
+        assert!(
+            source.find("local_namespace_from_headers").unwrap()
+                < source.find("connect_ipc_for_register(").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_namespace_metadata_is_frozen_even_when_route_is_absent() {
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let state = namespace_test_state(context.clone());
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/_probe/grid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[LOCAL_ENDPOINT_NAMESPACE_HEADER],
+            context.namespace_id()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_namespace_captured_owner_probe_refuses_replacing_live_owner() {
+        let root = crate::relay::test_support::EndpointTestRoot::new();
+        let context = root.context();
+        let address = "ipc://custom-captured-owner";
+        let server = start_marker_server_in_context(
+            &context,
+            address,
+            "custom-owner",
+            "custom-instance",
+            "grid",
+            b"old",
+        )
+        .await;
+        let state = namespace_test_state(context.clone());
+        let response = build_router(state.clone()).oneshot(Request::builder()
+            .method("POST").uri("/_register").header("content-type", "application/json")
+            .header(LOCAL_ENDPOINT_NAMESPACE_HEADER, context.namespace_id())
+            .body(Body::from(serde_json::json!({
+                "name": "grid", "server_id": "custom-owner", "server_instance_id": "custom-instance",
+                "address": address, "max_payload_size": ServerIpcConfig::default().max_payload_size,
+            }).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        state.evict_connection("grid");
+        let preparation = RouteAuthority::new(&state)
+            .prepare_register(
+                "grid",
+                "replacement-owner",
+                "replacement-instance",
+                "ipc://replacement-owner",
+            )
+            .await;
+        let preserved = matches!(preparation, Ok(RegisterPreparation::DuplicateAlive { existing_address }) if existing_address == address);
+        shutdown_live_server(&server).await;
+        assert!(
+            preserved,
+            "captured owner probe must check the live custom-root owner rather than treating an absent default-root endpoint as dead"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_roots_same_owner_keep_attestation_pool_watch_and_http_in_frozen_namespace() {
+        use crate::client::{
+            RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient, RelayRegistration,
+            RelayResolvedTarget,
+        };
+        let roots = [
+            crate::relay::test_support::EndpointTestRoot::new(),
+            crate::relay::test_support::EndpointTestRoot::new(),
+        ];
+        let contexts = [roots[0].context(), roots[1].context()];
+        let address = "ipc://same-owner";
+        let servers = [
+            start_marker_server_in_context(
+                &contexts[0],
+                address,
+                "same-owner",
+                "same-instance",
+                "grid",
+                b"root-a",
+            )
+            .await,
+            start_marker_server_in_context(
+                &contexts[1],
+                address,
+                "same-owner",
+                "same-instance",
+                "grid",
+                b"root-b",
+            )
+            .await,
+        ];
+        let expected = c2_contract::ExpectedRouteContract {
+            route_name: "grid".into(),
+            crm_ns: "test.echo".into(),
+            crm_name: "Echo".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: TEST_ABI_HASH.into(),
+            signature_hash: TEST_SIGNATURE_HASH.into(),
+        };
+        let mut relay_tasks = Vec::new();
+        let mut relay_states = Vec::new();
+        let mut urls = Vec::new();
+        for (index, context) in contexts.iter().enumerate() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let state = Arc::new(RelayState::new_with_context(
+                Arc::new(c2_config::RelayConfig {
+                    relay_id: format!("relay-{index}"),
+                    advertise_url: url.clone(),
+                    ..c2_config::RelayConfig::default()
+                }),
+                Arc::new(crate::relay::test_support::NoopDisseminator),
+                context.clone(),
+            ));
+            let app = build_router(state.clone());
+            relay_tasks.push(tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            }));
+            let control = RelayControlClient::new(&url, false)
+                .unwrap()
+                .with_local_endpoint_context(context);
+            let registration_expected = expected.clone();
+            tokio::task::spawn_blocking(move || {
+                control.register(RelayRegistration {
+                    expected: &registration_expected,
+                    server_id: "same-owner",
+                    server_instance_id: "same-instance",
+                    address,
+                    max_payload_size: ServerIpcConfig::default().max_payload_size,
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            relay_states.push(state);
+            urls.push(url);
+        }
+        for index in 0..2 {
+            let client = RelayAwareHttpClient::new(
+                &urls[index],
+                expected.clone(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap()
+            .with_local_endpoint_context(&contexts[index]);
+            let RelayResolvedTarget::Ipc { candidate } =
+                client.resolve_target_async().await.unwrap()
+            else {
+                panic!("matching namespace must propose direct IPC")
+            };
+            let mut ipc = IpcClient::with_endpoint(
+                contexts[index].endpoint(&candidate.address).unwrap(),
+                ClientIpcConfig::default(),
+            );
+            ipc.connect().await.unwrap();
+            assert_eq!(ipc.server_id(), Some(candidate.server_id.as_str()));
+            assert_eq!(
+                ipc.server_instance_id(),
+                Some(candidate.server_instance_id.as_str())
+            );
+            let binding = ipc
+                .acquire_route_token(&expected, &candidate.route_uid, candidate.route_revision)
+                .await
+                .unwrap();
+            let response = ipc.call_bound(&binding, "ping", b"").await.unwrap();
+            assert_eq!(
+                response
+                    .into_bytes_with_pool(ipc.server_pool_arc())
+                    .unwrap(),
+                if index == 0 {
+                    b"root-a".to_vec()
+                } else {
+                    b"root-b".to_vec()
+                }
+            );
+            ipc.close().await;
+            let wrong_client = RelayAwareHttpClient::new(
+                &urls[index],
+                expected.clone(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap()
+            .with_local_endpoint_context(&contexts[1 - index]);
+            assert!(matches!(
+                wrong_client.resolve_target_async().await.unwrap(),
+                RelayResolvedTarget::Http { .. }
+            ));
+            assert_eq!(
+                wrong_client.call_async("ping", b"").await.unwrap(),
+                if index == 0 {
+                    b"root-a".to_vec()
+                } else {
+                    b"root-b".to_vec()
+                }
+            );
+            // Custom relay + legacy default client keeps the HTTP route.
+            let legacy = RelayAwareHttpClient::new(
+                &urls[index],
+                expected.clone(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                legacy.resolve_target_async().await.unwrap(),
+                RelayResolvedTarget::Http { .. }
+            ));
+            let route_before = relay_states[index].local_route("grid").unwrap();
+            let wrong_registration = RelayControlClient::new(&urls[index], false)
+                .unwrap()
+                .with_local_endpoint_context(&contexts[1 - index]);
+            let registration_expected = expected.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                wrong_registration.register(RelayRegistration {
+                    expected: &registration_expected,
+                    server_id: "same-owner",
+                    server_instance_id: "same-instance",
+                    address,
+                    max_payload_size: ServerIpcConfig::default().max_payload_size,
+                })
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                result,
+                Err(crate::client::HttpError::ServerError(409, _))
+            ));
+            assert_eq!(
+                relay_states[index].local_route("grid").unwrap().route_uid,
+                route_before.route_uid
+            );
+            // Force the data plane to reconnect in its captured namespace.
+            relay_states[index].evict_connection("grid");
+            assert_eq!(
+                wrong_client.call_async("ping", b"").await.unwrap(),
+                if index == 0 {
+                    b"root-a".to_vec()
+                } else {
+                    b"root-b".to_vec()
+                }
+            );
+        }
+        // Native unregister publishes a semantic route removal while the
+        // connection is live. Generic server disconnect alone is not evidence
+        // authorizing withdrawal, so it must not be this fixture's trigger.
+        let root_b_before = relay_states[1].local_route("grid").unwrap();
+        assert!(servers[0].unregister_route("grid").await);
+        wait_for_local_route_removed(&relay_states[0], "grid").await;
+        let root_b_after = relay_states[1].local_route("grid").unwrap();
+        assert_eq!(root_b_after.route_uid, root_b_before.route_uid);
+        assert_eq!(root_b_after.route_revision, root_b_before.route_revision);
+        assert_eq!(
+            root_b_after.server_instance_id,
+            root_b_before.server_instance_id
+        );
+        assert!(servers[1].unregister_route("grid").await);
+        wait_for_local_route_removed(&relay_states[1], "grid").await;
+        assert!(relay_states[0].local_route("grid").is_none());
+        shutdown_live_server(&servers[0]).await;
+        shutdown_live_server(&servers[1]).await;
+        for task in relay_tasks {
+            task.abort();
+        }
     }
 
     fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {

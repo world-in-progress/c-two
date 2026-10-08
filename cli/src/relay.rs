@@ -1,16 +1,20 @@
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use c2_config::{
-    ClientIpcConfigOverrides, ConfigResolver, ConfigSources, RelayConfigOverrides,
-    RuntimeConfigOverrides,
+    ClientIpcConfigOverrides, ConfigResolver, ConfigSources, LocalEndpointOptions,
+    RelayConfigOverrides, RuntimeConfigOverrides,
 };
 use c2_http::relay::RelayServer;
 use clap::Args;
 
 #[derive(Debug, Args)]
 pub struct RelayArgs {
+    /// Pre-created Unix IPC root (not applicable to Windows Named Pipes).
+    #[arg(long)]
+    pub ipc_root: Option<PathBuf>,
     /// HTTP listen address.
     #[arg(long, short = 'b')]
     pub bind: Option<String>,
@@ -102,12 +106,21 @@ pub fn run(args: RelayArgs) -> Result<()> {
         },
         ..Default::default()
     };
-    let resolved = ConfigResolver::resolve_relay_server(overrides, ConfigSources::from_process())
-        .map_err(|e| anyhow!("{e}"))?;
+    let sources = ConfigSources::from_process();
+    let context = ConfigResolver::resolve_local_endpoint(
+        LocalEndpointOptions {
+            unix_root: args.ipc_root.clone(),
+        },
+        sources.clone(),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+    let resolved =
+        ConfigResolver::resolve_relay_server(overrides, sources).map_err(|e| anyhow!("{e}"))?;
     let config = resolved.relay;
     let display_bind = config.bind.clone();
 
     if args.dry_run {
+        println!("local_namespace={}", context.namespace_id());
         println!("bind={}", config.bind);
         println!("relay_id={}", config.relay_id);
         println!("advertise_url={}", config.effective_advertise_url());
@@ -150,8 +163,8 @@ pub fn run(args: RelayArgs) -> Result<()> {
         )
         .init();
 
-    let mut relay =
-        RelayServer::start(config).map_err(|e| anyhow!("failed to start relay: {e}"))?;
+    let mut relay = RelayServer::start_with_context(config, context)
+        .map_err(|e| anyhow!("failed to start relay: {e}"))?;
     for (name, server_id, address) in args.upstreams {
         relay
             .register_upstream(&name, &server_id, &address)

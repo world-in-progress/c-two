@@ -10,7 +10,12 @@ mod pool;
 mod relay_aware;
 
 pub use call_control::HttpCallControl;
-pub use control::{RelayControlClient, RelayRegistration, RelayRegistrationScope, RelayRouteInfo};
+#[cfg(feature = "relay")]
+pub(crate) use control::validate_local_endpoint_namespace;
+pub use control::{
+    LOCAL_ENDPOINT_NAMESPACE_HEADER, RelayControlClient, RelayRegistration, RelayRegistrationScope,
+    RelayResolvedRoutes, RelayRouteInfo,
+};
 pub use http_client::{HttpClient, HttpError, HttpInputOwner};
 pub use pool::HttpClientPool;
 pub use relay_aware::{

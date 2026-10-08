@@ -6,7 +6,24 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
 use super::http_client::{HttpError, HttpRouteToken, runtime};
+use c2_config::LocalEndpointContext;
 use c2_contract::ExpectedRouteContract;
+
+/// Optional discovery hint; it grants no permission to open an endpoint.
+pub const LOCAL_ENDPOINT_NAMESPACE_HEADER: &str = "x-c2-local-namespace";
+
+pub(crate) fn validate_local_endpoint_namespace(value: &str) -> Result<(), HttpError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(HttpError::InvalidInput(
+            "invalid local endpoint namespace (expected v1 lowercase SHA-256 identity)".into(),
+        ));
+    }
+    Ok(())
+}
 
 const CONTROL_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -26,6 +43,7 @@ fn encode_segment(s: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ResolveCacheKey {
     expected: ExpectedRouteContract,
+    local_endpoint_namespace: Option<String>,
 }
 
 impl ResolveCacheKey {
@@ -37,6 +55,7 @@ impl ResolveCacheKey {
 fn resolve_cache_key(expected: &ExpectedRouteContract) -> ResolveCacheKey {
     ResolveCacheKey {
         expected: expected.clone(),
+        local_endpoint_namespace: None,
     }
 }
 
@@ -142,9 +161,69 @@ impl RelayRouteInfo {
     }
 }
 
+#[derive(Deserialize)]
+struct ResolvedRouteWithNamespace {
+    #[serde(flatten)]
+    route: RelayRouteInfo,
+    #[serde(default)]
+    local_endpoint_namespace: Option<String>,
+}
+
+fn resolved_routes_with_namespace(
+    records: Vec<ResolvedRouteWithNamespace>,
+    header_namespace: Option<String>,
+) -> Result<RelayResolvedRoutes, HttpError> {
+    // Header and additive JSON metadata describe the same relay domain. A
+    // disagreement removes only IPC hints; the HTTP route remains usable.
+    let has_header = header_namespace.is_some();
+    let mut namespace = header_namespace;
+    let mut disagreement = false;
+    let mut missing_ipc_metadata = false;
+    for record in &records {
+        if let Some(value) = &record.local_endpoint_namespace {
+            validate_local_endpoint_namespace(value)
+                .map_err(|error| HttpError::Transport(error.to_string()))?;
+            match &namespace {
+                Some(namespace) if namespace != value => disagreement = true,
+                None => namespace = Some(value.clone()),
+                _ => {}
+            }
+        } else if record.route.ipc_address.is_some() {
+            missing_ipc_metadata = true;
+        }
+    }
+    // With no response header, partial JSON metadata must not reinterpret
+    // unlabelled legacy IPC records as custom-root endpoints.
+    let suppress_ipc = disagreement || (!has_header && namespace.is_some() && missing_ipc_metadata);
+    let routes = records
+        .into_iter()
+        .map(|record| {
+            let mut route = record.route;
+            if suppress_ipc {
+                route.ipc_address = None;
+                route.server_id = None;
+                route.server_instance_id = None;
+            }
+            route
+        })
+        .collect();
+    Ok(RelayResolvedRoutes {
+        routes,
+        local_endpoint_namespace: namespace,
+    })
+}
+
+/// Discovery metadata kept separately so existing `RelayRouteInfo` literals remain valid.
+#[derive(Debug, Clone)]
+pub struct RelayResolvedRoutes {
+    pub routes: Vec<RelayRouteInfo>,
+    pub local_endpoint_namespace: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct CacheEntry {
     routes: Vec<RelayRouteInfo>,
+    local_endpoint_namespace: Option<String>,
     inserted_at: Instant,
 }
 
@@ -172,6 +251,7 @@ pub struct RelayControlClient {
     base_url: String,
     config: RelayControlClientConfig,
     cache: Mutex<HashMap<ResolveCacheKey, CacheEntry>>,
+    local_endpoint_context: Option<LocalEndpointContext>,
 }
 
 impl RelayControlClient {
@@ -193,7 +273,17 @@ impl RelayControlClient {
             base_url: canonical_base_url(base_url),
             config,
             cache: Mutex::new(HashMap::new()),
+            local_endpoint_context: None,
         })
+    }
+
+    /// Freeze the resource owner's native context for registration and discovery.
+    /// Custom-root owners must explicitly project their context before registering.
+    /// Legacy constructors emit no header and retain default-namespace behavior.
+    pub fn with_local_endpoint_context(mut self, context: &LocalEndpointContext) -> Self {
+        self.local_endpoint_context = Some(context.clone());
+        self.cache.get_mut().clear();
+        self
     }
 
     pub fn register(&self, registration: RelayRegistration<'_>) -> Result<(), HttpError> {
@@ -247,17 +337,41 @@ impl RelayControlClient {
         &self,
         expected: &ExpectedRouteContract,
     ) -> Result<Vec<RelayRouteInfo>, HttpError> {
-        self.resolve_with_query_async(expected).await
+        Ok(self
+            .resolve_matching_with_namespace_async(expected)
+            .await?
+            .routes)
+    }
+
+    /// Resolve with optional response namespace without changing the legacy route surface.
+    pub async fn resolve_matching_with_namespace_async(
+        &self,
+        expected: &ExpectedRouteContract,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
+        self.resolve_with_query_async(expected, self.local_endpoint_context.as_ref())
+            .await
+    }
+
+    /// Project an already frozen Runtime context; never resolve process configuration here.
+    pub async fn resolve_matching_with_context_async(
+        &self,
+        expected: &ExpectedRouteContract,
+        context: &LocalEndpointContext,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
+        self.resolve_with_query_async(expected, Some(context)).await
     }
 
     async fn resolve_with_query_async(
         &self,
         expected: &ExpectedRouteContract,
-    ) -> Result<Vec<RelayRouteInfo>, HttpError> {
+        context: Option<&LocalEndpointContext>,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
-        let cache_key = resolve_cache_key(expected);
-        if let Some(routes) = self.cached(&cache_key) {
+        let mut cache_key = resolve_cache_key(expected);
+        cache_key.local_endpoint_namespace =
+            context.map(|context| context.namespace_id().to_owned());
+        if let Some(routes) = self.cached_with_namespace(&cache_key) {
             return Ok(routes);
         }
 
@@ -270,16 +384,44 @@ impl RelayControlClient {
             encode_segment(&expected.abi_hash),
             encode_segment(&expected.signature_hash),
         );
-        let resp = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
+        let request = self.client.get(format!("{}{}", self.base_url, path));
+        let request = match context {
+            Some(context) => {
+                request.header(LOCAL_ENDPOINT_NAMESPACE_HEADER, context.namespace_id())
+            }
+            None => request,
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         let status = resp.status().as_u16();
-        let routes = match status {
+        if resp
+            .headers()
+            .get_all(LOCAL_ENDPOINT_NAMESPACE_HEADER)
+            .iter()
+            .count()
+            > 1
+        {
+            return Err(HttpError::Transport(
+                "repeated local endpoint namespace header".into(),
+            ));
+        }
+        let local_endpoint_namespace = resp
+            .headers()
+            .get(LOCAL_ENDPOINT_NAMESPACE_HEADER)
+            .map(|value| {
+                let value = value.to_str().map_err(|_| {
+                    HttpError::Transport("invalid local endpoint namespace header".into())
+                })?;
+                validate_local_endpoint_namespace(value)
+                    .map_err(|error| HttpError::Transport(error.to_string()))?;
+                Ok::<_, HttpError>(value.to_owned())
+            })
+            .transpose()?;
+        let records = match status {
             200 => resp
-                .json::<Vec<RelayRouteInfo>>()
+                .json::<Vec<ResolvedRouteWithNamespace>>()
                 .await
                 .map_err(|e| HttpError::Transport(e.to_string()))?,
             404 => {
@@ -291,18 +433,20 @@ impl RelayControlClient {
                 return Err(HttpError::ServerError(code, text));
             }
         };
-        for route in &routes {
+        let resolved = resolved_routes_with_namespace(records, local_endpoint_namespace)?;
+        for route in &resolved.routes {
             validate_resolved_route(route)?;
         }
 
         self.cache.lock().insert(
             cache_key,
             CacheEntry {
-                routes: routes.clone(),
+                routes: resolved.routes.clone(),
+                local_endpoint_namespace: resolved.local_endpoint_namespace.clone(),
                 inserted_at: Instant::now(),
             },
         );
-        Ok(routes)
+        Ok(resolved)
     }
 
     pub fn clear_cache(&self) {
@@ -357,10 +501,17 @@ impl RelayControlClient {
     where
         T: Serialize + ?Sized,
     {
-        let resp = self
+        let request = self
             .client
             .post(format!("{}{}", self.base_url, path))
-            .json(payload)
+            .json(payload);
+        let request = match &self.local_endpoint_context {
+            Some(context) => {
+                request.header(LOCAL_ENDPOINT_NAMESPACE_HEADER, context.namespace_id())
+            }
+            None => request,
+        };
+        let resp = request
             .send()
             .await
             .map_err(|e| HttpError::Transport(e.to_string()))?;
@@ -372,14 +523,23 @@ impl RelayControlClient {
         Err(HttpError::ServerError(status, text))
     }
 
+    #[cfg(test)]
     fn cached(&self, key: &ResolveCacheKey) -> Option<Vec<RelayRouteInfo>> {
+        self.cached_with_namespace(key)
+            .map(|resolved| resolved.routes)
+    }
+
+    fn cached_with_namespace(&self, key: &ResolveCacheKey) -> Option<RelayResolvedRoutes> {
         let mut cache = self.cache.lock();
         let entry = cache.get(key)?;
         if entry.inserted_at.elapsed() >= self.config.cache_ttl {
             cache.remove(key);
             return None;
         }
-        Some(entry.routes.clone())
+        Some(RelayResolvedRoutes {
+            routes: entry.routes.clone(),
+            local_endpoint_namespace: entry.local_endpoint_namespace.clone(),
+        })
     }
 }
 
@@ -409,6 +569,75 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .to_string(),
         }
+    }
+
+    #[test]
+    fn namespace_metadata_validation_is_strict() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        validate_local_endpoint_namespace(context.namespace_id()).unwrap();
+        for invalid in [
+            "",
+            "root=/tmp",
+            "v2:abc",
+            &"A".repeat(64),
+            &"a".repeat(63),
+            &"a".repeat(65),
+        ] {
+            assert!(
+                validate_local_endpoint_namespace(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn typed_registration_context_sends_only_namespace_and_legacy_sends_none() {
+        use axum::{
+            Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use std::sync::Arc;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        async fn capture(
+            State(seen): State<Arc<Mutex<Vec<Option<String>>>>>,
+            headers: HeaderMap,
+        ) -> StatusCode {
+            seen.lock().push(
+                headers
+                    .get(LOCAL_ENDPOINT_NAMESPACE_HEADER)
+                    .map(|value| value.to_str().unwrap().to_owned()),
+            );
+            StatusCode::OK
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/_register", post(capture))
+            .with_state(seen.clone());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let legacy = RelayControlClient::new(&url, false).unwrap();
+        legacy
+            .post_json_once("/_register", &serde_json::json!({}), &[200])
+            .await
+            .unwrap();
+        let typed = RelayControlClient::new(&url, false)
+            .unwrap()
+            .with_local_endpoint_context(&context);
+        typed
+            .post_json_once("/_register", &serde_json::json!({}), &[200])
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock(),
+            vec![None, Some(context.namespace_id().to_owned())]
+        );
+        handle.abort();
     }
 
     #[test]
@@ -476,6 +705,66 @@ mod tests {
     }
 
     #[test]
+    fn namespace_response_cache_is_scoped_and_keeps_metadata() {
+        let client = RelayControlClient::new("http://relay.test", false).unwrap();
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let legacy = resolve_cache_key(&expected_contract());
+        let mut typed = legacy.clone();
+        typed.local_endpoint_namespace = Some(context.namespace_id().into());
+        client.cache.lock().insert(
+            typed.clone(),
+            CacheEntry {
+                routes: vec![],
+                local_endpoint_namespace: Some(context.namespace_id().into()),
+                inserted_at: Instant::now(),
+            },
+        );
+        assert!(client.cached_with_namespace(&legacy).is_none());
+        assert_eq!(
+            client
+                .cached_with_namespace(&typed)
+                .unwrap()
+                .local_endpoint_namespace
+                .as_deref(),
+            Some(context.namespace_id())
+        );
+        client.invalidate("grid");
+        assert!(client.cached_with_namespace(&typed).is_none());
+    }
+
+    #[test]
+    fn additive_json_namespace_keeps_legacy_records_and_conflicts_keep_http() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let base = serde_json::json!({
+            "name": "grid", "relay_url": "http://relay.test", "route_uid": "grid-route-uid-0001", "route_revision": 1,
+            "ipc_address": "ipc://grid", "server_id": "grid", "server_instance_id": "grid-instance",
+            "crm_ns": "test.ns", "crm_name": "Grid", "crm_ver": "0.1.0", "abi_hash": expected_contract().abi_hash,
+            "signature_hash": expected_contract().signature_hash, "max_payload_size": 1024
+        });
+        let records =
+            serde_json::from_value::<Vec<ResolvedRouteWithNamespace>>(serde_json::json!([base]))
+                .unwrap();
+        let legacy = resolved_routes_with_namespace(records, None).unwrap();
+        assert!(legacy.local_endpoint_namespace.is_none());
+        assert!(legacy.routes[0].ipc_address.is_some());
+        let mut typed = base.clone();
+        typed["local_endpoint_namespace"] = serde_json::json!(context.namespace_id());
+        let records = serde_json::from_value(serde_json::json!([typed])).unwrap();
+        let metadata_only = resolved_routes_with_namespace(records, None).unwrap();
+        assert_eq!(
+            metadata_only.local_endpoint_namespace.as_deref(),
+            Some(context.namespace_id())
+        );
+        assert!(metadata_only.routes[0].ipc_address.is_some());
+        typed["local_endpoint_namespace"] = serde_json::json!("a".repeat(64));
+        let records = serde_json::from_value(serde_json::json!([typed])).unwrap();
+        let conflict = resolved_routes_with_namespace(records, Some("b".repeat(64))).unwrap();
+        assert!(conflict.routes[0].ipc_address.is_none());
+        assert_eq!(conflict.routes[0].relay_url, "http://relay.test");
+        assert_eq!(conflict.routes[0].route_uid, "grid-route-uid-0001");
+    }
+
+    #[test]
     fn route_cache_can_be_invalidated() {
         let client = RelayControlClient::new("http://relay.test", false).unwrap();
         let expected = expected_contract();
@@ -499,6 +788,7 @@ mod tests {
                         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
                     max_payload_size: 1024,
                 }],
+                local_endpoint_namespace: None,
                 inserted_at: Instant::now(),
             },
         );

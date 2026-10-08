@@ -105,6 +105,14 @@ pub struct RouteTombstone {
     pub observed_at: Instant,
 }
 
+/// Additive HTTP metadata wrapper keeps existing `RouteInfo` literals stable.
+#[derive(Debug, Serialize)]
+pub(crate) struct ResolvedRouteInfo {
+    #[serde(flatten)]
+    pub route: RouteInfo,
+    pub local_endpoint_namespace: String,
+}
+
 /// Resolution result returned to clients via /_resolve.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteInfo {

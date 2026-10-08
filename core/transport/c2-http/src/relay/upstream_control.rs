@@ -52,7 +52,18 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
             return;
         }
 
-        let mut client = IpcClient::new(key.address());
+        let endpoint = match state.endpoint_context().endpoint(key.address()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                state.mark_upstream_control_watch_unavailable(
+                    &key,
+                    format!("control watch endpoint invalid: {error}"),
+                );
+                tokio::time::sleep(CONTROL_RETRY_DELAY).await;
+                continue;
+            }
+        };
+        let mut client = IpcClient::with_endpoint(endpoint, c2_config::ClientIpcConfig::default());
         match client.connect().await {
             Ok(()) => {}
             Err(err) => {
@@ -97,7 +108,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
             }
 
             for route in state.local_routes_for_owner(&key) {
-                if route_is_semantically_gone(&client, &route) {
+                if route_is_semantically_gone(&client, &route).await {
                     remove_route(&state, &route, "route_catalog_update").await;
                 }
             }
@@ -120,10 +131,10 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
     }
 }
 
-fn route_is_semantically_gone(client: &IpcClient, route: &RouteEntry) -> bool {
+async fn route_is_semantically_gone(client: &IpcClient, route: &RouteEntry) -> bool {
     let expected = expected_contract_for_route(route);
     matches!(
-        client.validate_route_contract(&expected),
+        client.acquire_route(&expected).await,
         Err(c2_ipc::IpcError::RouteNotFound(_))
             | Err(c2_ipc::IpcError::RouteRemoved { .. })
             | Err(c2_ipc::IpcError::RouteClosed { .. })
