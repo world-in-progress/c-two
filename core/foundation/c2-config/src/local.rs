@@ -344,7 +344,10 @@ impl LocalEndpoint {
         context.endpoint(address)
     }
 
-    fn in_context(context: &LocalEndpointContext, address: &str) -> io::Result<Self> {
+    /// Validate only the logical address, without resolving or deriving an
+    /// endpoint. Admin probes use this to distinguish malformed targets from
+    /// failures of a valid target's configured platform namespace.
+    pub fn validate_address(address: &str) -> io::Result<&str> {
         let server_id = address.strip_prefix("ipc://").ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -353,6 +356,11 @@ impl LocalEndpoint {
         })?;
         crate::validate_ipc_region_id(server_id)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Ok(server_id)
+    }
+
+    fn in_context(context: &LocalEndpointContext, address: &str) -> io::Result<Self> {
+        let server_id = Self::validate_address(address)?;
         let os_name = context.platform.derive_os_name(server_id)?;
         Ok(Self {
             address: address.to_owned(),

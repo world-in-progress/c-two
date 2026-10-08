@@ -30,6 +30,8 @@ def ping(
 
     Defaults to the current Runtime, including its code override and frozen
     context. Independent supervisors may supply a Unix root or captured context.
+    Core returns False for malformed targets; configuration and timeout errors
+    propagate to the caller.
     """
     from c_two._native import ipc_ping
 
@@ -38,14 +40,9 @@ def ping(
         _selected_context(root, context)
         if root is not None or context is not None else None
     )
-    try:
-        if selected is not None:
-            return bool(ipc_ping(server_address, float(timeout), context=selected))
-        return bool(_session().ping_direct_ipc(server_address, float(timeout)))
-    except ValueError as exc:
-        if 'timeout' in str(exc):
-            raise
-        return False
+    if selected is not None:
+        return bool(ipc_ping(server_address, float(timeout), context=selected))
+    return bool(_session().ping_direct_ipc(server_address, float(timeout)))
 
 
 def shutdown(
@@ -61,6 +58,8 @@ def shutdown(
     context. Independent supervisors may supply a Unix root or captured context.
     The acknowledgement proves initiation; observe the owner-side native
     shutdown barrier before running hooks or considering work drained.
+    Core returns an unconfirmed result for malformed targets; configuration and
+    timeout errors propagate to the caller.
     """
     from c_two._native import ipc_shutdown
 
@@ -69,16 +68,6 @@ def shutdown(
         _selected_context(root, context)
         if root is not None or context is not None else None
     )
-    try:
-        if selected is not None:
-            return dict(ipc_shutdown(server_address, float(timeout), context=selected))
-        return dict(_session().shutdown_direct_ipc(server_address, float(timeout)))
-    except ValueError as exc:
-        if 'timeout' in str(exc):
-            raise
-        return {
-            'acknowledged': False,
-            'shutdown_started': False,
-            'server_stopped': False,
-            'route_outcomes': [],
-        }
+    if selected is not None:
+        return dict(ipc_shutdown(server_address, float(timeout), context=selected))
+    return dict(_session().shutdown_direct_ipc(server_address, float(timeout)))

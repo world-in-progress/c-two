@@ -51,6 +51,183 @@ def _unused_root() -> str:
     return f'/tmp/q-{uuid.uuid4().hex[:8]}'
 
 
+@pytest.mark.parametrize('probe', ['ping', 'shutdown'])
+@pytest.mark.parametrize('source', ['environment', 'dotenv'])
+@pytest.mark.parametrize('root', ['relative', ''])
+def test_admin_probes_surface_invalid_root_configuration(
+    tmp_path: Path, probe: str, source: str, root: str,
+) -> None:
+    updates = {'C2_IPC_ROOT': root}
+    if source == 'dotenv':
+        dotenv = tmp_path / 'invalid-root.env'
+        dotenv.write_text(f'C2_IPC_ROOT={root}\n', encoding='utf-8')
+        updates = {'C2_ENV_FILE': str(dotenv)}
+    _run_isolated(f'''
+        import uuid
+        from c_two.transport.client import util
+        from c_two.transport.registry import _ProcessRegistry
+        operation = getattr(util, {probe!r})
+        try:
+            operation('ipc://invalid-config-' + uuid.uuid4().hex, 0.01)
+        except ValueError as error:
+            assert 'root' in str(error).lower(), error
+        else:
+            raise AssertionError('configuration error reported as an offline endpoint')
+        assert not _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+        # Even a malformed target must not hide invalid process configuration.
+        try:
+            operation('tcp://not-ipc', 0.01)
+        except ValueError as error:
+            assert 'root' in str(error).lower(), error
+        else:
+            raise AssertionError('invalid target hid invalid process configuration')
+    ''', **updates)
+
+
+@UNIX_ONLY
+@pytest.mark.parametrize('probe', ['ping', 'shutdown'])
+def test_admin_probes_surface_explicit_endpoint_name_capacity(probe: str) -> None:
+    _run_isolated(f'''
+        from c_two.transport.client import util
+        try:
+            getattr(util, {probe!r})('ipc://name-capacity', 0.01, root='/tmp/' + 'x' * 200)
+        except ValueError as error:
+            assert any(word in str(error).lower() for word in ('path', 'endpoint', 'socket')), error
+        else:
+            raise AssertionError('name capacity error reported as an offline endpoint')
+    ''')
+
+
+@UNIX_ONLY
+@pytest.mark.parametrize('probe', ['ping', 'shutdown'])
+@pytest.mark.parametrize('selection', ['context', 'runtime', 'environment', 'dotenv'])
+def test_admin_probes_surface_endpoint_name_capacity_in_all_contexts(
+    tmp_path: Path, probe: str, selection: str,
+) -> None:
+    root = '/tmp/' + 'x' * 200
+    updates = {}
+    if selection == 'environment':
+        updates = {'C2_IPC_ROOT': root}
+    elif selection == 'dotenv':
+        dotenv = tmp_path / 'capacity.env'
+        dotenv.write_text(f'C2_IPC_ROOT={root}\n', encoding='utf-8')
+        updates = {'C2_ENV_FILE': str(dotenv)}
+    _run_isolated(f'''
+        import c_two as cc
+        from c_two import _native
+        from c_two.transport.client import util
+        from c_two.transport.registry import _ProcessRegistry
+        kwargs = {{}}
+        if {selection!r} == 'context':
+            kwargs['context'] = cc.local_endpoint_context(root={root!r})
+        elif {selection!r} == 'runtime':
+            cc.set_local_endpoint(root={root!r})
+        operation = getattr(util, {probe!r})
+        try:
+            operation('ipc://name-capacity', 0.01, **kwargs)
+        except ValueError as error:
+            assert 'sun_path' in str(error), error
+        else:
+            raise AssertionError('name capacity error reported as an offline endpoint')
+        session = _ProcessRegistry.get()._runtime_session
+        assert session.local_endpoint_frozen == ({selection!r} != 'context')
+        assert not session.client_config_frozen
+    ''', **updates)
+
+
+@pytest.mark.parametrize('probe', ['ping', 'shutdown'])
+def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(probe: str) -> None:
+    _run_isolated(f'''
+        from functools import partial
+        import c_two as cc
+        from c_two import _native
+        from c_two.transport.client import util
+        from c_two.transport.registry import _ProcessRegistry
+        session = _native.RuntimeSession(use_process_relay_anchor=False)
+        context = session.local_endpoint_context()
+        expected = False if {probe!r} == 'ping' else {{
+            'acknowledged': False, 'shutdown_started': False,
+            'server_stopped': False, 'route_outcomes': [],
+        }}
+        for address in (
+            'tcp://not-ipc', 'ipc://', 'ipc://../escape', 'ipc://bad/name',
+            'ipc://bad\\\\name', 'ipc://.', 'ipc://..', 'ipc:// leading',
+            'ipc://trailing ', 'ipc://bad\\nname',
+        ):
+            operations = [
+                partial(getattr(util, {probe!r}), address),
+                partial(getattr(util, {probe!r}), address, context=context),
+                partial(getattr(_native, 'ipc_' + {probe!r}), address),
+                partial(getattr(_native, 'ipc_' + {probe!r}), address, context=context),
+                partial(getattr(session, {probe!r} + '_direct_ipc'), address),
+            ]
+            if context.root is not None:
+                operations.append(partial(getattr(util, {probe!r}), address, root=context.root))
+            for operation in operations:
+                assert operation(0.01) == expected, address
+                for timeout in (-1.0, float('nan'), float('inf'), 1e300):
+                    try:
+                        operation(timeout)
+                    except ValueError as error:
+                        assert 'timeout' in str(error), error
+                    else:
+                        raise AssertionError('invalid target hid an invalid timeout')
+        assert session.local_endpoint_frozen
+        assert not session.client_config_frozen
+        assert _ProcessRegistry.get()._runtime_session.local_endpoint_frozen
+    ''')
+
+
+@UNIX_ONLY
+@pytest.mark.parametrize('probe', ['ping', 'shutdown'])
+def test_admin_runtime_configuration_precedence_and_freeze(probe: str) -> None:
+    root = _unused_root()
+    _run_isolated(f'''
+        import os
+        import uuid
+        import c_two as cc
+        from c_two.transport.client import util
+        from c_two.transport.registry import _ProcessRegistry
+        cc.set_local_endpoint(root={root!r})
+        session = _ProcessRegistry.get()._runtime_session
+        assert not session.local_endpoint_frozen
+        address = 'ipc://admin-freeze-' + uuid.uuid4().hex
+        expected = False if {probe!r} == 'ping' else {{
+            'acknowledged': True, 'shutdown_started': False,
+            'server_stopped': True, 'route_outcomes': [],
+        }}
+        assert getattr(util, {probe!r})(address, 0.01) == expected
+        assert session.local_endpoint_frozen
+        assert not session.client_config_frozen
+        os.environ['C2_IPC_ROOT'] = ''
+        assert getattr(util, {probe!r})(address, 0.01) == expected
+        assert session.local_endpoint_context().root == {root!r}
+    ''', C2_IPC_ROOT='relative')
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason='Windows named-pipe platform contract')
+@pytest.mark.parametrize('probe', ['ping', 'shutdown'])
+@pytest.mark.parametrize('source', ['environment', 'dotenv'])
+def test_admin_probes_surface_windows_root_not_applicable(
+    tmp_path: Path, probe: str, source: str,
+) -> None:
+    root = r'C:\tmp'
+    updates = {'C2_IPC_ROOT': root}
+    if source == 'dotenv':
+        dotenv = tmp_path / 'windows-root.env'
+        dotenv.write_text(f'C2_IPC_ROOT={root}\n', encoding='utf-8')
+        updates = {'C2_ENV_FILE': str(dotenv)}
+    _run_isolated(f'''
+        from c_two.transport.client import util
+        try:
+            getattr(util, {probe!r})('ipc://windows-root', 0.01)
+        except ValueError as error:
+            assert 'not applicable' in str(error), error
+        else:
+            raise AssertionError('Windows root error reported as an offline endpoint')
+    ''', **updates)
+
+
 def test_common_default_is_opaque_native_and_query_does_not_freeze() -> None:
     _run_isolated('''
         import sys

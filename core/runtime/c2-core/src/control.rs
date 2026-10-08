@@ -55,6 +55,11 @@ pub fn ping_direct_ipc_with_context(
     context: &LocalEndpointContext,
     timeout: Duration,
 ) -> Result<bool, LifecycleError> {
+    // A malformed probe target has no reachable server. Configuration and
+    // native-name derivation failures for valid targets must remain errors.
+    if LocalEndpoint::validate_address(address).is_err() {
+        return Ok(false);
+    }
     c2_ipc::ping_with_context(address, context, timeout)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
@@ -73,6 +78,14 @@ pub fn shutdown_direct_ipc_with_context(
     context: &LocalEndpointContext,
     timeout: Duration,
 ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
+    if LocalEndpoint::validate_address(address).is_err() {
+        return Ok(DirectIpcShutdownOutcome {
+            acknowledged: false,
+            shutdown_started: false,
+            server_stopped: false,
+            route_outcomes: Vec::new(),
+        });
+    }
     c2_ipc::shutdown_with_context(address, context, timeout)
         .map(DirectIpcShutdownOutcome::from)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
@@ -138,5 +151,60 @@ mod tests {
             !ping_direct_ipc(&address, Duration::from_millis(10))
                 .expect("absent server is not an error")
         );
+    }
+
+    #[test]
+    fn malformed_probe_targets_are_negative_results() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        for address in [
+            "tcp://not-ipc",
+            "ipc://",
+            "ipc://../escape",
+            "ipc://bad/name",
+            "ipc://bad\\name",
+            "ipc://.",
+            "ipc://..",
+            "ipc:// leading",
+            "ipc://trailing ",
+            "ipc://bad\nname",
+        ] {
+            assert!(!ping_direct_ipc_with_context(address, &context, Duration::ZERO).unwrap());
+            let outcome =
+                shutdown_direct_ipc_with_context(address, &context, Duration::ZERO).unwrap();
+            assert!(!outcome.acknowledged);
+            assert!(!outcome.shutdown_started);
+            assert!(!outcome.server_stopped);
+            assert!(outcome.route_outcomes.is_empty());
+            assert!(direct_ipc_endpoint_with_context(address, &context).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_native_name_capacity_is_a_configuration_error() {
+        let root = format!("/tmp/{}", "x".repeat(200));
+        let context = LocalEndpointContext::with_unix_root(std::path::Path::new(&root)).unwrap();
+        let runtime = Runtime::new(crate::RuntimeOptions::default()).unwrap();
+        runtime
+            .set_local_endpoint_with_sources(
+                LocalEndpointOptions {
+                    unix_root: Some(root.into()),
+                },
+                ConfigSources::empty(),
+            )
+            .unwrap();
+        for result in [
+            ping_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO).map(|_| ()),
+            shutdown_direct_ipc_with_context("ipc://capacity", &context, Duration::ZERO)
+                .map(|_| ()),
+            runtime
+                .ping_direct_ipc("ipc://capacity", Duration::ZERO)
+                .map(|_| ()),
+            runtime
+                .shutdown_direct_ipc("ipc://capacity", Duration::ZERO)
+                .map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(LifecycleError::Configuration(_))));
+        }
     }
 }
