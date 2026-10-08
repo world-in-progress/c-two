@@ -1757,6 +1757,9 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
     use c2_error::{C2Error, ErrorCode};
 
     match error {
+        c2_ipc::IpcError::LocalCallRejected(error) => {
+            semantic_error_response(StatusCode::SERVICE_UNAVAILABLE, error.clone())
+        }
         c2_ipc::IpcError::RouteNotFound(route) => semantic_error_response(
             StatusCode::NOT_FOUND,
             C2Error::new(
@@ -1930,6 +1933,7 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::Shm(_) => "shm",
         c2_ipc::IpcError::Chunk(_) => "chunk",
         c2_ipc::IpcError::CrmError(_) => "crm-error",
+        c2_ipc::IpcError::LocalCallRejected(_) => "local-call-rejected",
         c2_ipc::IpcError::Closed => "closed",
         c2_ipc::IpcError::Pool(_) => "pool",
     }

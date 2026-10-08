@@ -671,6 +671,15 @@ impl Drop for HostInner {
 }
 
 impl Host {
+    /// Exact native endpoint retained for bind, readiness, and credentials.
+    pub fn local_endpoint(&self) -> &c2_config::LocalEndpoint {
+        self.inner.server.local_endpoint()
+    }
+
+    pub fn local_endpoint_context(&self) -> &c2_config::LocalEndpointContext {
+        self.local_endpoint().context()
+    }
+
     /// Read-only memory statistics for this host and its Runtime.
     ///
     /// Composes the Runtime's outgoing client domain with the Core host's
@@ -837,8 +846,10 @@ impl Runtime {
             None => false,
         };
         let server = Arc::new(
-            Server::new_with_identity(
-                &identity.ipc_address,
+            Server::new_with_identity_and_endpoint(
+                self.freeze_local_endpoint_context()?
+                    .endpoint(&identity.ipc_address)
+                    .map_err(|error| LifecycleError::Configuration(error.to_string()))?,
                 config.clone(),
                 ServerIdentity {
                     server_id: identity.server_id,

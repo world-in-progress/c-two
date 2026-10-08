@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock};
 use c2_mem::MemPool;
 
 use crate::client::{
-    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestBlock, RequestTransportKind,
-    RouteBinding, ServerPoolState, choose_request_transport,
+    ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RequestBlock,
+    RequestTransportKind, RouteBinding, ServerPoolState, choose_request_transport,
 };
 use crate::response::{ResponseData, ResponseLease};
 
@@ -72,7 +72,8 @@ impl std::error::Error for IpcCallError {
 
 pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
     match error {
-        IpcError::Config(_)
+        IpcError::LocalCallRejected(_)
+        | IpcError::Config(_)
         | IpcError::Handshake(_)
         | IpcError::Protocol(_)
         | IpcError::IdentityMismatch { .. }
@@ -233,7 +234,7 @@ impl SyncClient {
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
         self.rt
-            .block_on(self.inner.call_bound(binding, method_name, data))
+            .block_on(self.call_bound_async(binding, method_name, data))
     }
 
     /// Synchronous CRM call with an explicit dispatch-safety phase on failure.
@@ -243,8 +244,58 @@ impl SyncClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<ResponseData, IpcCallError> {
-        self.call_bound(binding, method_name, data)
-            .map_err(|source| IpcCallError::new(call_error_phase(&source), source))
+        self.rt
+            .block_on(self.call_bound_async_phased(binding, method_name, data))
+    }
+
+    /// Await the actual IPC future on the caller's runtime. The receive task
+    /// remains on the connection's shared runtime; no blocking bridge or
+    /// nested `block_on` is used here.
+    pub async fn call_bound_async(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, IpcError> {
+        self.inner.call_bound(binding, method_name, data).await
+    }
+
+    pub async fn call_bound_async_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, IpcCallError> {
+        self.inner
+            .call_bound_phased(binding, method_name, data)
+            .await
+    }
+
+    /// Await a route-bound call with owner-supplied first-byte authority.
+    /// The owner must retain this future after granting dispatch, even if its
+    /// caller stops waiting, until send/reply ownership is settled.
+    pub async fn call_bound_controlled_async(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, IpcError> {
+        self.inner
+            .call_bound_controlled(binding, method_name, data, control)
+            .await
+    }
+
+    pub async fn call_bound_controlled_async_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, IpcCallError> {
+        self.inner
+            .call_bound_controlled_phased(binding, method_name, data, control)
+            .await
     }
 
     /// Whether the client has a SHM pool and data exceeds the threshold.

@@ -15,6 +15,7 @@ use crate::RegisterFailureOutcome;
 pub enum LifecycleError {
     InvalidServerId(String),
     ClientConfigFrozen,
+    ConfigFrozen,
     DuplicateRoute(String),
     MissingRoute(String),
     RelayDuplicateRoute(String),
@@ -42,6 +43,7 @@ impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidServerId(message) => formatter.write_str(message),
+            Self::ConfigFrozen => formatter.write_str("local endpoint configuration is frozen"),
             Self::ClientConfigFrozen => formatter.write_str("client IPC configuration is frozen"),
             Self::DuplicateRoute(name) => write!(formatter, "route already registered: {name}"),
             Self::MissingRoute(name) => write!(formatter, "route not registered: {name}"),
@@ -227,6 +229,7 @@ impl From<LifecycleError> for Error {
 /// Normalize an IPC error without flattening its transport source.
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
+        IpcError::LocalCallRejected(error) => Error::Semantic(error),
         IpcError::Chunk(ChunkError::Capacity(message)) => {
             let semantic = C2Error::new(ErrorCode::ResourceUnavailable, message.clone())
                 .with_details(BTreeMap::from([
@@ -620,7 +623,7 @@ mod native_boundary_tests {
         }
     }
     #[test]
-    fn local_http_call_rejection_keeps_semantic_code_and_no_fallback_details() {
+    fn local_call_rejection_keeps_semantic_code_and_no_fallback_details() {
         for code in [
             ErrorCode::CallDeadlineExceeded,
             ErrorCode::CallCapacityExceeded,
@@ -638,6 +641,13 @@ mod native_boundary_tests {
             ) {
                 Error::Semantic(actual) => assert_eq!(actual, source),
                 other => panic!("local rejection became a transport failure: {other:?}"),
+            }
+            match normalize_ipc_error(
+                IpcError::LocalCallRejected(source.clone()),
+                TransportPhase::PreDispatch,
+            ) {
+                Error::Semantic(actual) => assert_eq!(actual, source),
+                other => panic!("local IPC rejection became a transport failure: {other:?}"),
             }
         }
     }

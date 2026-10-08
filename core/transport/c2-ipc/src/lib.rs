@@ -25,7 +25,8 @@ mod tests;
 
 pub use c2_wire::shutdown_control::{DirectShutdownAck, ShutdownControlRouteOutcome};
 pub use client::{
-    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestBlock, RouteBinding, ServerPoolState,
+    ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RequestBlock, RouteBinding,
+    ServerPoolState,
 };
 pub use control::{
     local_endpoint_from_ipc_address, ping, ping_with_context, ping_with_endpoint, shutdown,

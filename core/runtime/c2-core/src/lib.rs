@@ -21,8 +21,9 @@ mod session;
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{Client, Connect, EncodedClient, ObservedPath, ObservedRoute, PathCounters};
 pub use control::{
-    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint, ping_direct_ipc,
-    shutdown_direct_ipc,
+    DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
+    direct_ipc_endpoint_with_context, ping_direct_ipc, ping_direct_ipc_with_context,
+    shutdown_direct_ipc, shutdown_direct_ipc_with_context,
 };
 pub use error::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, TransportError,
@@ -60,5 +61,9 @@ pub use owner_bound::{HostClientHeldLeases, HostLifecyclePhase, HostLifecycleSna
 pub use session::{Runtime, RuntimeIdentity, RuntimeOptions};
 
 // SDK facades use the canonical Core owner capability types.
-pub use c2_config::{MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace};
+pub use c2_config::{
+    ConfigSources, EnvFilePolicy, EnvMap, LocalEndpointContext, LocalEndpointNamespace,
+    LocalEndpointOptions, MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy,
+    validate_owner_missing_grace,
+};
 pub use c2_local::{OwnerControlKeepalive, OwnerControlReceiver, owner_control_pair};

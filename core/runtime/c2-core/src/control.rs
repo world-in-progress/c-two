@@ -1,7 +1,9 @@
-use c2_config::LocalEndpoint;
+use c2_config::{
+    ConfigResolver, ConfigSources, LocalEndpoint, LocalEndpointContext, LocalEndpointOptions,
+};
 use std::time::Duration;
 
-use crate::LifecycleError;
+use crate::{LifecycleError, Runtime};
 
 /// Per-route fact returned by a direct IPC shutdown acknowledgement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,25 +22,81 @@ pub struct DirectIpcShutdownOutcome {
     pub route_outcomes: Vec<DirectIpcShutdownRouteOutcome>,
 }
 
-/// Derive the platform native endpoint for a validated IPC address.
+/// Capture process configuration once for an independent admin operation.
+fn process_context() -> Result<LocalEndpointContext, LifecycleError> {
+    ConfigResolver::resolve_local_endpoint(
+        LocalEndpointOptions::default(),
+        ConfigSources::from_process(),
+    )
+    .map_err(|error| LifecycleError::Configuration(error.to_string()))
+}
+
+/// Derive an endpoint from current process configuration without local I/O.
 pub fn direct_ipc_endpoint(address: &str) -> Result<LocalEndpoint, LifecycleError> {
-    c2_ipc::local_endpoint_from_ipc_address(address)
+    direct_ipc_endpoint_with_context(address, &process_context()?)
+}
+
+pub fn direct_ipc_endpoint_with_context(
+    address: &str,
+    context: &LocalEndpointContext,
+) -> Result<LocalEndpoint, LifecycleError> {
+    context
+        .endpoint(address)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
-/// Probe a direct IPC server without involving relay discovery.
+/// Probe using one process configuration snapshot for all retries.
 pub fn ping_direct_ipc(address: &str, timeout: Duration) -> Result<bool, LifecycleError> {
-    c2_ipc::ping(address, timeout).map_err(|error| LifecycleError::Configuration(error.to_string()))
+    ping_direct_ipc_with_context(address, &process_context()?, timeout)
+}
+
+pub fn ping_direct_ipc_with_context(
+    address: &str,
+    context: &LocalEndpointContext,
+    timeout: Duration,
+) -> Result<bool, LifecycleError> {
+    c2_ipc::ping_with_context(address, context, timeout)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
 /// Initiate direct IPC shutdown without waiting for the owner-side drain.
+/// All retries retain a single process configuration snapshot.
 pub fn shutdown_direct_ipc(
     address: &str,
     timeout: Duration,
 ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
-    c2_ipc::shutdown(address, timeout)
+    shutdown_direct_ipc_with_context(address, &process_context()?, timeout)
+}
+
+pub fn shutdown_direct_ipc_with_context(
+    address: &str,
+    context: &LocalEndpointContext,
+    timeout: Duration,
+) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
+    c2_ipc::shutdown_with_context(address, context, timeout)
         .map(DirectIpcShutdownOutcome::from)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
+}
+
+impl Runtime {
+    /// Probe inside this Runtime's frozen local domain. Does not freeze memory policy.
+    pub fn ping_direct_ipc(
+        &self,
+        address: &str,
+        timeout: Duration,
+    ) -> Result<bool, LifecycleError> {
+        ping_direct_ipc_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
+    }
+
+    /// Initiate admin shutdown inside this Runtime's frozen local domain.
+    /// The acknowledgement is initiation only; Host shutdown observes completion.
+    pub fn shutdown_direct_ipc(
+        &self,
+        address: &str,
+        timeout: Duration,
+    ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
+        shutdown_direct_ipc_with_context(address, &self.freeze_local_endpoint_context()?, timeout)
+    }
 }
 
 impl From<c2_ipc::DirectShutdownAck> for DirectIpcShutdownOutcome {

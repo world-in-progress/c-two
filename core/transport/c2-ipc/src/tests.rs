@@ -911,6 +911,651 @@ mod lazy_policy_roundtrip_tests {
             .unwrap()
     }
 
+    // Fake callback state is a transport seam, not a Core deadline model.
+    // These tests use the same LocalStream/Server path on Unix and Windows.
+    #[derive(Clone, Copy)]
+    enum ControlledTransport {
+        Inline,
+        Buddy,
+        Dedicated,
+        Chunked,
+    }
+
+    fn controlled_config(kind: ControlledTransport) -> (BaseIpcConfig, u64, &'static str) {
+        let mut base = small_base(64 * 1024, 2);
+        match kind {
+            ControlledTransport::Inline => (base, u64::MAX, "inline"),
+            ControlledTransport::Buddy => (base, 1024, "shm_buddy"),
+            ControlledTransport::Dedicated => {
+                base.pool_enabled = false;
+                (base, 1024, "shm_dedicated")
+            }
+            ControlledTransport::Chunked => {
+                base.pool_enabled = false;
+                base.chunk_size = 1024;
+                (base, u64::MAX, "chunked_handle")
+            }
+        }
+    }
+
+    fn rejected_scope() -> c2_error::C2Error {
+        c2_error::C2Error::new(
+            c2_error::ErrorCode::CallDeadlineExceeded,
+            "fake scope expired",
+        )
+        .with_details(std::collections::BTreeMap::from([
+            ("call_id".into(), "fake-call-17".into()),
+            ("stage".into(), "before_dispatch".into()),
+        ]))
+    }
+
+    async fn check_controlled_rejection(kind: ControlledTransport, payload: Vec<u8>, label: &str) {
+        use crate::{IpcCallControl, TransportPhase};
+        use std::sync::atomic::AtomicBool;
+
+        // The dedicated case uses the existing bounded-capacity fault seam:
+        // one available publication slot proves every rejected guard returns
+        // its unpublished permit. Other cases still run with production policy.
+        let dedicated = matches!(kind, ControlledTransport::Dedicated);
+        let _exclusive =
+            dedicated.then(crate::client::dedicated_retire_test_control::exclusive_lock);
+        let _retire_guard =
+            (!dedicated).then(crate::client::dedicated_retire_test_control::production_guard);
+        let (base, threshold, expected_kind) = controlled_config(kind);
+        let (callback, seen) = echo_callback();
+        let server = start_echo_server(label, server_config(base.clone(), 1024), callback).await;
+        let mut client =
+            IpcClient::with_config(server.ipc_address(), client_config(base, threshold));
+        client.connect().await.unwrap();
+        let binding = client
+            .acquire_route(&expected_contract(label))
+            .await
+            .unwrap();
+        let _capacity = if dedicated {
+            let baseline = retire_permit_baseline().await;
+            Some(crate::client::dedicated_retire_test_control::capacity_override(baseline + 1))
+        } else {
+            None
+        };
+        let pool = client.request_pool().expect("lazy request pool");
+        let budget = pool.lock().budget().cloned().unwrap();
+        // Cache a buddy backing before measuring: rejecting a call releases
+        // its allocation, while the existing idle backing stays pool-owned.
+        if matches!(kind, ControlledTransport::Buddy) {
+            pool.lock().ensure_buddy_segments(1).unwrap();
+        }
+        let backing_before = budget.snapshot().shm.used_bytes;
+        let buddy_generation = pool.lock().segment_generation(0);
+        let assert_unpublished_accounting = || {
+            let pool = pool.lock();
+            let stats = pool.stats();
+            assert_eq!(stats.alloc_count, 0);
+            assert_eq!(stats.dedicated_active_count, 0);
+            // MemPool keeps a freed dedicated owner mapping charged until
+            // read_done/crash GC. A local rejection has no peer reader and
+            // must preserve that existing release authority.
+            assert_eq!(
+                stats.dedicated_mapped_bytes,
+                stats.dedicated_pending_free_bytes
+            );
+            assert_eq!(
+                budget.snapshot().shm.used_bytes,
+                backing_before + stats.dedicated_pending_free_bytes
+            );
+            assert_eq!(pool.segment_generation(0), buddy_generation);
+        };
+        let active = Arc::new(AtomicBool::new(false));
+        let guard_calls = Arc::new(AtomicU64::new(0));
+        let writer_slot = client.writer_slot_for_test();
+        let control = IpcCallControl::new({
+            let active = Arc::clone(&active);
+            let guard_calls = Arc::clone(&guard_calls);
+            let writer_slot = Arc::clone(&writer_slot);
+            move || {
+                assert!(
+                    writer_slot.try_lock().is_err(),
+                    "first-byte authority requires the writer lock"
+                );
+                guard_calls.fetch_add(1, Ordering::SeqCst);
+                if active.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(rejected_scope())
+                }
+            }
+        });
+
+        // Initially expired: a first-byte rejection must not become SHM
+        // fallback, stream abort, business dispatch, or an unclaimed request.
+        let error = client
+            .call_bound_controlled_phased(&binding, "echo", &payload, &control)
+            .await
+            .unwrap_err();
+        assert_eq!(error.phase(), TransportPhase::PreDispatch);
+        assert!(
+            matches!(error.into_source(), IpcError::LocalCallRejected(error) if error == rejected_scope())
+        );
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client.pending_len_for_test(), 0);
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+        assert_eq!(pool.lock().stats().dedicated_active_count, 0);
+        assert_unpublished_accounting();
+        assert!(seen.lock().is_empty());
+        assert!(client.is_connected());
+
+        // Expiry while QUEUED is not dispatch. Poll once with the writer held
+        // so preparation/pending registration finish at a deterministic seam.
+        active.store(true, Ordering::SeqCst);
+        let writer = writer_slot.lock().await;
+        let abort = writer.as_ref().unwrap().abort_handle();
+        let mut queued =
+            Box::pin(client.call_bound_controlled_phased(&binding, "echo", &payload, &control));
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client.pending_len_for_test(), 1);
+        let owns_allocation = matches!(
+            kind,
+            ControlledTransport::Buddy | ControlledTransport::Dedicated
+        );
+        assert_eq!(pool.lock().stats().alloc_count, u32::from(owns_allocation));
+        active.store(false, Ordering::SeqCst);
+        drop(writer);
+        let error = timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.phase(), TransportPhase::PreDispatch);
+        assert!(
+            matches!(error.into_source(), IpcError::LocalCallRejected(error) if error == rejected_scope())
+        );
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.pending_len_for_test(), 0);
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+        assert_eq!(pool.lock().stats().dedicated_active_count, 0);
+        assert_unpublished_accounting();
+        assert!(
+            !abort.is_aborted(),
+            "local rejection cannot abort a shared connection"
+        );
+
+        let preparation_calls = Arc::new(AtomicU64::new(0));
+        let preparation_rejection =
+            IpcCallControl::new(|| panic!("preparation rejected before dispatch"))
+                .with_before_prepare({
+                    let preparation_calls = Arc::clone(&preparation_calls);
+                    let pool = Arc::clone(&pool);
+                    move || {
+                        let attempt = preparation_calls.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            return Ok(());
+                        }
+                        assert_eq!(pool.lock().stats().alloc_count, u32::from(owns_allocation));
+                        Err(rejected_scope())
+                    }
+                });
+        let error = client
+            .call_bound_controlled_phased(&binding, "echo", &payload, &preparation_rejection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.phase(), TransportPhase::PreDispatch);
+        assert!(
+            matches!(error.into_source(), IpcError::LocalCallRejected(error) if error == rejected_scope())
+        );
+        assert_eq!(preparation_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.pending_len_for_test(), 0);
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+        assert_unpublished_accounting();
+        assert!(!abort.is_aborted());
+
+        // The same route binding and stream still carry an unguarded call,
+        // followed by a fresh permitted call on exactly the intended path.
+        let response = client.call_bound(&binding, "echo", b"ok").await.unwrap();
+        assert_eq!(response_bytes(&client, response), b"ok");
+        active.store(true, Ordering::SeqCst);
+        let response = client
+            .call_bound_controlled(&binding, "echo", &payload, &control)
+            .await
+            .unwrap();
+        assert_eq!(response_bytes(&client, response), payload);
+        assert_eq!(*seen.lock(), vec!["inline", expected_kind]);
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(client.pending_len_for_test(), 0);
+        wait_until(5, || pool.lock().stats().alloc_count == 0).await;
+        assert_unpublished_accounting();
+        assert_eq!(
+            crate::client::dedicated_retire_test_control::retention_jobs_for_pool(&pool),
+            0
+        );
+        assert!(crate::ping(server.ipc_address(), Duration::from_secs(5)).unwrap());
+        client.close_shared().await;
+        drop(preparation_rejection);
+        drop(pool);
+        assert_eq!(
+            budget.snapshot().shm.used_bytes,
+            0,
+            "owner destruction refunds all remaining cached/pending-free backings"
+        );
+        stop_server(&server).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_zero_rejection_and_writer_expiry_keep_connection() {
+        check_controlled_rejection(ControlledTransport::Inline, vec![], "control_zero").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_inline_rejection_and_writer_expiry_keep_connection() {
+        check_controlled_rejection(ControlledTransport::Inline, vec![3; 2048], "control_inline")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_buddy_rejection_and_writer_expiry_release_unpublished_allocation() {
+        check_controlled_rejection(ControlledTransport::Buddy, vec![3; 8192], "control_buddy")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_dedicated_rejection_and_writer_expiry_release_unpublished_allocation() {
+        check_controlled_rejection(
+            ControlledTransport::Dedicated,
+            vec![3; 8192],
+            "control_dedicated",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_chunk_rejection_and_writer_expiry_keep_connection() {
+        check_controlled_rejection(ControlledTransport::Chunked, vec![3; 4096], "control_chunk")
+            .await;
+    }
+
+    struct FirstDelayedEcho {
+        seen: Arc<Mutex<Vec<&'static str>>>,
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl CrmCallback for FirstDelayedEcho {
+        fn invoke(
+            &self,
+            _route: &str,
+            _method: u16,
+            request: RequestData,
+            _pool: Arc<RwLock<MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            let first = {
+                let mut seen = self.seen.lock();
+                seen.push(request_kind(&request));
+                seen.len() == 1
+            };
+            if first {
+                self.started.lock().take().unwrap().send(()).unwrap();
+                self.release
+                    .lock()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+            let bytes = RequestLease::new(request)
+                .into_owned_bytes()
+                .map_err(CrmError::InternalError)?;
+            if first {
+                self.finished.lock().take().unwrap().send(()).unwrap();
+            }
+            Ok(ResponseMeta::Inline(bytes))
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn first_delayed_echo() -> (
+        Arc<FirstDelayedEcho>,
+        Arc<Mutex<Vec<&'static str>>>,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(FirstDelayedEcho {
+                seen: Arc::clone(&seen),
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+                finished: Mutex::new(Some(finished_tx)),
+            }),
+            seen,
+            started_rx,
+            release_tx,
+            finished_rx,
+        )
+    }
+
+    async fn check_controlled_continuation(
+        kind: ControlledTransport,
+        prefix_bytes: usize,
+        label: &str,
+    ) {
+        use crate::IpcCallControl;
+        use std::sync::atomic::AtomicBool;
+
+        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
+        let (base, threshold, expected_kind) = controlled_config(kind);
+        // Delay the first reply, while other correlated calls complete.
+        let (callback, seen, started, release_reply, finished) = first_delayed_echo();
+        let server = start_echo_server(
+            label,
+            cancellation_server_config(base.clone(), 1024, 2),
+            callback,
+        )
+        .await;
+        let mut client =
+            IpcClient::with_config(server.ipc_address(), client_config(base, threshold));
+        client.connect().await.unwrap();
+        let binding = client
+            .acquire_route(&expected_contract(label))
+            .await
+            .unwrap();
+        let pool = client.request_pool().unwrap();
+        let budget = pool.lock().budget().cloned().unwrap();
+        let before = budget.snapshot().shm.used_bytes;
+        let client = Arc::new(client);
+        let active = Arc::new(AtomicBool::new(true));
+        let guard_calls = Arc::new(AtomicU64::new(0));
+        let preparation_calls = Arc::new(AtomicU64::new(0));
+        let control = IpcCallControl::new({
+            let active = Arc::clone(&active);
+            let guard_calls = Arc::clone(&guard_calls);
+            move || {
+                guard_calls.fetch_add(1, Ordering::SeqCst);
+                if active.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(rejected_scope())
+                }
+            }
+        })
+        .with_before_prepare({
+            let active = Arc::clone(&active);
+            let preparation_calls = Arc::clone(&preparation_calls);
+            move || {
+                preparation_calls.fetch_add(1, Ordering::SeqCst);
+                if active.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(rejected_scope())
+                }
+            }
+        });
+        let (prefix_tx, prefix_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        client.set_frame_write_seam_for_test(Some(FrameWriteSeam {
+            prefix_bytes,
+            prefix_written: prefix_tx,
+            release: resume_rx,
+        }));
+        let abort = client
+            .writer_slot_for_test()
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let payload = vec![7; 8192];
+        // This task stands in for Core's owned execution. The observer may
+        // expire, but never aborts/drops this IPC future or its input owner.
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                client
+                    .call_bound_controlled(&binding, "echo", &payload, &control)
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), prefix_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(preparation_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            seen.lock().is_empty(),
+            "only a prefix or first chunk was published"
+        );
+        active.store(false, Ordering::SeqCst);
+        assert!(!task.is_finished());
+        assert!(!abort.is_aborted());
+        resume_tx.send(()).unwrap();
+        timeout(Duration::from_secs(5), started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(preparation_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*seen.lock(), vec![expected_kind]);
+        // An independent call can use the connection while the expired
+        // observer's owned execution is still awaiting its late reply.
+        let response = timeout(
+            Duration::from_secs(5),
+            client.call_bound(&binding, "echo", b"parallel"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response_bytes(&client, response), b"parallel");
+        assert!(!task.is_finished());
+        release_reply.send(()).unwrap();
+        timeout(Duration::from_secs(5), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.pending_len_for_test(), 0);
+        let mut lease = ResponseLease::new(response, Arc::clone(client.server_pool_arc()));
+        assert_eq!(lease.copy_bytes().unwrap(), payload);
+        lease.release().unwrap();
+        lease.release().unwrap();
+        drop(lease);
+        // The reply is leased and dropped once; repeated release and Drop
+        // must not double-free either the reply or the consumed request.
+        wait_until(5, || pool.lock().stats().alloc_count == 0).await;
+        wait_until(5, || {
+            server.response_pool_arc().read().stats().alloc_count == 0
+        })
+        .await;
+        if matches!(kind, ControlledTransport::Dedicated) {
+            wait_until(5, || budget.snapshot().shm.used_bytes == before).await;
+        }
+        assert!(
+            !abort.is_aborted(),
+            "expiry must not trigger transport write/drop abort"
+        );
+        assert!(client.is_connected());
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        let response = client.call_bound(&binding, "echo", b"after").await.unwrap();
+        assert_eq!(response_bytes(&client, response), b"after");
+        client.close_shared().await;
+        stop_server(&server).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_inline_partial_header_continues_after_scope_expiry() {
+        check_controlled_continuation(ControlledTransport::Inline, 12, "control_header").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_inline_partial_body_continues_after_scope_expiry() {
+        check_controlled_continuation(ControlledTransport::Inline, 1024, "control_body").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_buddy_partial_frame_continues_after_scope_expiry() {
+        check_controlled_continuation(ControlledTransport::Buddy, 12, "control_buddy_partial")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_dedicated_partial_frame_continues_after_scope_expiry() {
+        check_controlled_continuation(
+            ControlledTransport::Dedicated,
+            12,
+            "control_dedicated_partial",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_chunks_continue_after_first_chunk_and_scope_expiry() {
+        check_controlled_continuation(ControlledTransport::Chunked, usize::MAX, "control_chunks")
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_async_sync_client_delegates_without_nested_block_on() {
+        use crate::{IpcCallControl, SyncClient, TransportPhase};
+        let (callback, seen) = echo_callback();
+        let base = small_base(64 * 1024, 2);
+        let server = start_echo_server(
+            "control_sync_async",
+            server_config(base.clone(), 1024),
+            callback,
+        )
+        .await;
+        // Only connection acquisition is blocking. The call below is awaited
+        // directly from a distinct current-thread runtime.
+        let address = server.ipc_address().to_string();
+        let (client, binding) = tokio::task::spawn_blocking(move || {
+            let client = SyncClient::connect(&address, None, client_config(base, 1024)).unwrap();
+            let binding = client
+                .acquire_route(&expected_contract("control_sync_async"))
+                .unwrap();
+            (client, binding)
+        })
+        .await
+        .unwrap();
+        let task = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let rejected = IpcCallControl::new(|| Err(rejected_scope()));
+                let error = client.call_bound_controlled_async_phased(&binding, "echo", b"rejected", &rejected)
+                    .await.unwrap_err();
+                assert_eq!(error.phase(), TransportPhase::PreDispatch);
+                assert!(matches!(error.into_source(), IpcError::LocalCallRejected(error) if error == rejected_scope()));
+                let allowed = IpcCallControl::new(|| Ok(()));
+                let response = client.call_bound_controlled_async(&binding, "echo", b"async", &allowed).await.unwrap();
+                assert_eq!(client.lease_response(response).into_owned_bytes().unwrap(), b"async");
+                let response = client.call_bound_async(&binding, "echo", b"plain").await.unwrap();
+                assert_eq!(client.lease_response(response).into_owned_bytes().unwrap(), b"plain");
+                let response = client.call_bound_async_phased(&binding, "echo", b"phased").await.unwrap();
+                assert_eq!(client.lease_response(response).into_owned_bytes().unwrap(), b"phased");
+            });
+            let response = client.call_bound(&binding, "echo", b"sync").unwrap();
+            assert_eq!(
+                client.lease_response(response).into_owned_bytes().unwrap(),
+                b"sync"
+            );
+            assert!(client.close_shared(Duration::from_secs(5)));
+        });
+        tokio::task::spawn_blocking(move || task.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(seen.lock().len(), 4);
+        stop_server(&server).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_call_preserves_explicit_close_gate_and_uncertainty() {
+        use crate::{IpcCallControl, TransportPhase};
+        let (callback, seen) = echo_callback();
+        let base = small_base(64 * 1024, 2);
+        let server =
+            start_echo_server("control_close", server_config(base.clone(), 1024), callback).await;
+        let mut client =
+            IpcClient::with_config(server.ipc_address(), client_config(base, u64::MAX));
+        client.connect().await.unwrap();
+        let binding = client
+            .acquire_route(&expected_contract("control_close"))
+            .await
+            .unwrap();
+        let client = Arc::new(client);
+        let guard_calls = Arc::new(AtomicU64::new(0));
+        let control = IpcCallControl::new({
+            let guard_calls = Arc::clone(&guard_calls);
+            move || {
+                guard_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let (prefix_tx, prefix_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        client.set_frame_write_seam_for_test(Some(FrameWriteSeam {
+            prefix_bytes: 12,
+            prefix_written: prefix_tx,
+            release: resume_rx,
+        }));
+        let abort = client
+            .writer_slot_for_test()
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let task = {
+            let client = Arc::clone(&client);
+            let binding = binding.clone();
+            let control = control.clone();
+            tokio::spawn(async move {
+                client
+                    .call_bound_controlled_phased(&binding, "echo", &[7; 2048], &control)
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), prefix_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // Unlike per-call expiry, an explicit close still aborts a stuck
+        // writer under its bounded barrier. Keep polling the owned future.
+        assert!(!client.close_shared_bounded(Duration::from_millis(50)).await);
+        assert!(abort.is_aborted());
+        resume_tx.send(()).unwrap();
+        let error = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.phase(), TransportPhase::DispatchUncertain);
+        assert!(matches!(
+            error.into_source(),
+            IpcError::Io(_) | IpcError::Closed
+        ));
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        assert!(client.close_shared_bounded(Duration::from_secs(5)).await);
+        assert_eq!(client.pending_len_for_test(), 0);
+        // A close that wins first never invokes dispatch authority.
+        let error = client
+            .call_bound_controlled_phased(&binding, "echo", b"closed", &control)
+            .await
+            .unwrap_err();
+        assert_eq!(error.phase(), TransportPhase::DispatchUncertain);
+        assert!(matches!(error.into_source(), IpcError::Closed));
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+        assert!(seen.lock().is_empty());
+        stop_server(&server).await;
+    }
+
     // ── Lazy startup: no buddy mappings without explicit prewarm ─────────
 
     #[tokio::test]
