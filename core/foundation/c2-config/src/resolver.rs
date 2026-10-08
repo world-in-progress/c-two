@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::{
-    BaseIpcConfig, ClientIpcConfig, LocalEndpointContext, LocalEndpointOptions, RelayConfig,
-    ServerIpcConfig,
+    BaseIpcConfig, CallExecutionLimits, ClientIpcConfig, LocalEndpointContext,
+    LocalEndpointOptions, RelayConfig, ServerIpcConfig,
 };
 
 pub type EnvMap = BTreeMap<String, String>;
@@ -162,6 +162,18 @@ pub struct RelayConfigOverrides {
     pub seeds: Option<Vec<String>>,
     pub idle_timeout_secs: Option<u64>,
     pub anti_entropy_interval_secs: Option<f64>,
+}
+
+/// Typed code-level overrides for [`CallExecutionLimits`] resolution.
+///
+/// Each dimension is independent: `None` falls through to the process
+/// environment, then the `.env` file, then the canonical default, while
+/// `Some(value)` is a finite `u64` admission limit used verbatim — `Some(0)`
+/// closes that dimension and never means unset.
+#[derive(Debug, Clone, Default)]
+pub struct CallExecutionLimitsOverrides {
+    pub max_outstanding_calls: Option<u64>,
+    pub retained_input_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -347,6 +359,38 @@ impl ConfigResolver {
     ) -> Result<u64, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
         resolve_shm_threshold(&catalog, override_value)
+    }
+
+    /// Resolve the bounded deadline transaction admission limits from typed
+    /// overrides and configuration sources: explicit code > process env >
+    /// `.env` > the canonical [`CallExecutionLimits`] default. Both
+    /// dimensions are finite `u64` admission limits — an explicit or
+    /// environmental `0` rejects every positive request in that dimension
+    /// and never means unlimited or unset. A present-but-empty or
+    /// whitespace-only environment value is rejected instead of silently
+    /// falling back to the default, and every other invalid value names its
+    /// variable in the error.
+    pub fn resolve_call_execution_limits(
+        overrides: CallExecutionLimitsOverrides,
+        sources: ConfigSources,
+    ) -> Result<CallExecutionLimits, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+
+        let max_outstanding_calls = match overrides.max_outstanding_calls {
+            Some(value) => value,
+            None => call_execution_limit_from_env(&catalog, "C2_CALL_MAX_OUTSTANDING")?
+                .unwrap_or(crate::DEFAULT_MAX_OUTSTANDING_CALLS),
+        };
+        let retained_input_budget_bytes = match overrides.retained_input_budget_bytes {
+            Some(value) => value,
+            None => call_execution_limit_from_env(&catalog, "C2_CALL_RETAINED_INPUT_BUDGET_BYTES")?
+                .unwrap_or(crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES),
+        };
+
+        Ok(CallExecutionLimits {
+            max_outstanding_calls,
+            retained_input_budget_bytes,
+        })
     }
 
     /// Resolve the immutable local endpoint context from typed options and
@@ -830,6 +874,31 @@ fn resolve_shm_threshold(
         return Err(ConfigError::new("shm_threshold must be > 0"));
     }
     Ok(shm_threshold)
+}
+
+/// Present-but-raw finite-`u64` lookup for one call execution limit.
+///
+/// An absent key is `None`; a present value must carry non-empty unsigned
+/// integer text. An empty or whitespace-only value is rejected instead of
+/// silently becoming the default, and negative, non-numeric, or overflowing
+/// text fails with the variable named. `0` is a present finite value, never
+/// unset.
+fn call_execution_limit_from_env(
+    catalog: &EnvCatalog,
+    key: &str,
+) -> Result<Option<u64>, ConfigError> {
+    let raw = match catalog.raw_optional_string(key) {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(ConfigError::new(format!("{key} cannot be empty")));
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|e| ConfigError::new(format!("{key} must be an unsigned integer: {e}")))
 }
 
 fn apply_flat_base_overrides_to_server(
@@ -1800,6 +1869,273 @@ mod tests {
                 "error should name {key}: {err}"
             );
         }
+    }
+
+    // ── Call execution limits ────────────────────────────────────────────
+
+    #[test]
+    fn call_execution_limits_resolve_canonical_defaults() {
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect("defaults should resolve");
+
+        assert_eq!(limits, CallExecutionLimits::default());
+        assert_eq!(limits.max_outstanding_calls, 1024);
+        assert_eq!(limits.retained_input_budget_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn call_execution_limits_resolve_from_env_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let env_file = tempdir.path().join(".env");
+        fs::write(
+            &env_file,
+            [
+                "C2_CALL_MAX_OUTSTANDING=64",
+                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+            ]
+            .join("\n"),
+        )
+        .expect("write env file");
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file),
+                process_env: env(&[]),
+            },
+        )
+        .expect("env-file limits should resolve");
+
+        assert_eq!(limits.max_outstanding_calls, 64);
+        assert_eq!(limits.retained_input_budget_bytes, 1_073_741_824);
+    }
+
+    #[test]
+    fn call_execution_limits_process_env_overrides_env_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let env_file = tempdir.path().join(".env");
+        fs::write(
+            &env_file,
+            [
+                "C2_CALL_MAX_OUTSTANDING=64",
+                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+            ]
+            .join("\n"),
+        )
+        .expect("write env file");
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file),
+                process_env: env(&[
+                    ("C2_CALL_MAX_OUTSTANDING", "128"),
+                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "2147483648"),
+                ]),
+            },
+        )
+        .expect("process env should win over the env file");
+
+        assert_eq!(limits.max_outstanding_calls, 128);
+        assert_eq!(limits.retained_input_budget_bytes, 2_147_483_648);
+    }
+
+    #[test]
+    fn call_execution_limits_explicit_overrides_beat_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_CALL_MAX_OUTSTANDING", "64"),
+                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "1073741824"),
+            ]),
+        };
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(7),
+                retained_input_budget_bytes: Some(4096),
+            },
+            sources,
+        )
+        .expect("explicit limits should beat env");
+
+        assert_eq!(limits.max_outstanding_calls, 7);
+        assert_eq!(limits.retained_input_budget_bytes, 4096);
+    }
+
+    #[test]
+    fn call_execution_limits_explicit_overrides_ignore_invalid_env() {
+        // A present explicit value means the environment for that dimension
+        // is never consulted, so invalid text there cannot fail resolution.
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(7),
+                retained_input_budget_bytes: Some(4096),
+            },
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[
+                    ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
+                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+                ]),
+            },
+        )
+        .expect("explicit limits should bypass env parsing entirely");
+
+        assert_eq!(limits.max_outstanding_calls, 7);
+        assert_eq!(limits.retained_input_budget_bytes, 4096);
+    }
+
+    #[test]
+    fn call_execution_limits_zero_is_finite_per_dimension() {
+        // An explicit zero closes only its own dimension; the other one
+        // still falls through to the canonical default.
+        let zeroed_max = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(0),
+                retained_input_budget_bytes: None,
+            },
+            ConfigSources::empty(),
+        )
+        .expect("explicit zero outstanding calls should resolve");
+        assert_eq!(zeroed_max.max_outstanding_calls, 0);
+        assert_eq!(
+            zeroed_max.retained_input_budget_bytes,
+            crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES
+        );
+
+        // An environmental zero is a present value in exactly the same way:
+        // it must never fall through to the default via truthiness.
+        let zero_env = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "0")]),
+            },
+        )
+        .expect("zero retained budget should resolve as finite and rejecting");
+        assert_eq!(
+            zero_env.max_outstanding_calls,
+            crate::DEFAULT_MAX_OUTSTANDING_CALLS
+        );
+        assert_eq!(zero_env.retained_input_budget_bytes, 0);
+    }
+
+    #[test]
+    fn call_execution_limits_accept_full_u64_range() {
+        let from_env = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[
+                    ("C2_CALL_MAX_OUTSTANDING", "18446744073709551615"),
+                    (
+                        "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                        "18446744073709551615",
+                    ),
+                ]),
+            },
+        )
+        .expect("u64::MAX is a legal finite limit");
+        assert_eq!(from_env.max_outstanding_calls, u64::MAX);
+        assert_eq!(from_env.retained_input_budget_bytes, u64::MAX);
+
+        let from_override = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(u64::MAX),
+                retained_input_budget_bytes: Some(u64::MAX),
+            },
+            ConfigSources::empty(),
+        )
+        .expect("u64::MAX overrides are legal");
+        assert_eq!(from_override.max_outstanding_calls, u64::MAX);
+        assert_eq!(from_override.retained_input_budget_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn call_execution_limits_env_rejects_invalid_values() {
+        for (key, value) in [
+            ("C2_CALL_MAX_OUTSTANDING", "-1"),
+            ("C2_CALL_MAX_OUTSTANDING", ""),
+            ("C2_CALL_MAX_OUTSTANDING", "   "),
+            ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
+            ("C2_CALL_MAX_OUTSTANDING", "18446744073709551616"),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", ""),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "   "),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "not-a-number"),
+            (
+                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                "18446744073709551616",
+            ),
+        ] {
+            let sources = ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[(key, value)]),
+            };
+
+            let err = ConfigResolver::resolve_call_execution_limits(
+                CallExecutionLimitsOverrides::default(),
+                sources,
+            )
+            .expect_err(&format!("invalid value {value:?} for {key} should fail"));
+
+            assert!(
+                err.to_string().contains(key),
+                "error should name {key} for {value:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_execution_limits_ignore_other_scopes_invalid_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_CALL_MAX_OUTSTANDING", "32"),
+                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "65536"),
+                ("C2_IPC_MAX_FRAME_SIZE", "not-a-number"),
+                ("C2_IPC_POOL_SEGMENT_SIZE", "-1"),
+                ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
+                ("C2_SHM_THRESHOLD", ""),
+                ("C2_IPC_ROOT", "   "),
+            ]),
+        };
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            sources,
+        )
+        .expect("call limit resolution must not parse other scopes");
+
+        assert_eq!(limits.max_outstanding_calls, 32);
+        assert_eq!(limits.retained_input_budget_bytes, 65_536);
+    }
+
+    #[test]
+    fn other_scope_resolutions_ignore_call_limit_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
+                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+            ]),
+        };
+
+        let threshold = ConfigResolver::resolve_shm_threshold(None, sources.clone())
+            .expect("shm threshold resolution must not parse call limit env");
+        assert_eq!(threshold, 4096);
+
+        let attempts = ConfigResolver::resolve_relay_route_max_attempts(sources.clone())
+            .expect("relay route attempts resolution must not parse call limit env");
+        assert_eq!(attempts, 3);
+
+        let runtime = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
+            .expect("runtime resolution must not parse call limit env");
+        assert_eq!(runtime.shm_threshold, 4096);
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub use remote::{
     validate_remote_payload_chunk_size,
 };
 pub use resolver::{
-    BaseIpcConfigOverrides, ClientIpcConfigOverrides, ConfigResolver, ConfigSources, EnvFilePolicy,
-    EnvMap, RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedRelayConfig,
-    ResolvedRuntimeConfig, RuntimeConfigOverrides, ServerIpcConfigOverrides,
+    BaseIpcConfigOverrides, CallExecutionLimitsOverrides, ClientIpcConfigOverrides, ConfigResolver,
+    ConfigSources, EnvFilePolicy, EnvMap, RelayConfigOverrides, ResolvedRelayClientConfig,
+    ResolvedRelayConfig, ResolvedRuntimeConfig, RuntimeConfigOverrides, ServerIpcConfigOverrides,
 };

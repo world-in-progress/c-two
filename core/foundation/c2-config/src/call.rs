@@ -12,8 +12,9 @@
 //!
 //! This module is pure policy data and checked conversion. It reads no
 //! environment (the `C2_CALL_MAX_OUTSTANDING` and
-//! `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` overrides are wired by a later
-//! integration), starts no runtime, and resolves no transport default: the
+//! `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` overrides are wired by
+//! [`crate::ConfigResolver::resolve_call_execution_limits`], not by these
+//! types), starts no runtime, and resolves no transport default: the
 //! HTTP default policy and the `Inherit` resolution both belong to the
 //! future callers that own those paths. A zero value is a finite deadline
 //! that expires immediately and must not dispatch — it is never unlimited,
