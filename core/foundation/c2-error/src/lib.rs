@@ -31,6 +31,9 @@ pub enum ErrorCode {
     RouteWatchUnavailable = 712,
     ProtocolViolation = 713,
     FallbackDenied = 714,
+    CallDeadlineExceeded = 715,
+    UnsupportedCallMode = 716,
+    CallCapacityExceeded = 717,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,6 +135,18 @@ const ERROR_CODE_REGISTRY: &[ErrorCodeEntry] = &[
         code: ErrorCode::FallbackDenied,
         name: "FallbackDenied",
     },
+    ErrorCodeEntry {
+        code: ErrorCode::CallDeadlineExceeded,
+        name: "CallDeadlineExceeded",
+    },
+    ErrorCodeEntry {
+        code: ErrorCode::UnsupportedCallMode,
+        name: "UnsupportedCallMode",
+    },
+    ErrorCodeEntry {
+        code: ErrorCode::CallCapacityExceeded,
+        name: "CallCapacityExceeded",
+    },
 ];
 
 impl ErrorCode {
@@ -182,6 +197,9 @@ impl TryFrom<u16> for ErrorCode {
             712 => Ok(ErrorCode::RouteWatchUnavailable),
             713 => Ok(ErrorCode::ProtocolViolation),
             714 => Ok(ErrorCode::FallbackDenied),
+            715 => Ok(ErrorCode::CallDeadlineExceeded),
+            716 => Ok(ErrorCode::UnsupportedCallMode),
+            717 => Ok(ErrorCode::CallCapacityExceeded),
             _ => Err(()),
         }
     }
@@ -371,6 +389,9 @@ mod tests {
         assert_eq!(u16::from(ErrorCode::RouteWatchUnavailable), 712);
         assert_eq!(u16::from(ErrorCode::ProtocolViolation), 713);
         assert_eq!(u16::from(ErrorCode::FallbackDenied), 714);
+        assert_eq!(u16::from(ErrorCode::CallDeadlineExceeded), 715);
+        assert_eq!(u16::from(ErrorCode::UnsupportedCallMode), 716);
+        assert_eq!(u16::from(ErrorCode::CallCapacityExceeded), 717);
     }
 
     #[test]
@@ -412,9 +433,28 @@ mod tests {
                 ("RouteWatchUnavailable", 712),
                 ("ProtocolViolation", 713),
                 ("FallbackDenied", 714),
+                ("CallDeadlineExceeded", 715),
+                ("UnsupportedCallMode", 716),
+                ("CallCapacityExceeded", 717),
             ],
         );
         assert_eq!(ErrorCode::WriteConflict.name(), "WriteConflict");
+    }
+
+    #[test]
+    fn error_code_registry_has_unique_codes_names_and_full_variant_coverage() {
+        let registry = ErrorCode::registry();
+        assert_eq!(registry.len(), 26);
+
+        let mut codes: Vec<u16> = registry.iter().map(|entry| u16::from(entry.code)).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), registry.len());
+
+        let mut names: Vec<&str> = registry.iter().map(|entry| entry.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), registry.len());
     }
 
     #[test]
@@ -539,5 +579,45 @@ mod tests {
             err.to_string(),
             "invalid C2 error wire name for code 703: expected ResourceAlreadyRegistered, got ResourceNotFound"
         );
+    }
+
+    #[test]
+    fn wire_round_trips_new_call_error_codes() {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "transport_phase".to_string(),
+            "dispatch_uncertain".to_string(),
+        );
+        let err = C2Error::new(
+            ErrorCode::CallDeadlineExceeded,
+            "deadline elapsed before a definitive outcome",
+        )
+        .with_details(details);
+        let decoded = C2Error::from_wire_bytes(&err.to_wire_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.code, ErrorCode::CallDeadlineExceeded);
+        assert_eq!(
+            decoded.message,
+            "deadline elapsed before a definitive outcome"
+        );
+        assert_eq!(
+            decoded.details.get("transport_phase").map(String::as_str),
+            Some("dispatch_uncertain")
+        );
+
+        for (code, expected) in [
+            (ErrorCode::UnsupportedCallMode, 716_u16),
+            (ErrorCode::CallCapacityExceeded, 717),
+        ] {
+            let plain = C2Error::new(code, "bounded call budget exhausted");
+            let decoded = C2Error::from_wire_bytes(&plain.to_wire_bytes())
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded.code, code);
+            assert_eq!(u16::from(decoded.code), expected);
+            assert_eq!(decoded.message, "bounded call budget exhausted");
+            assert!(decoded.details.is_empty());
+        }
     }
 }

@@ -28,6 +28,9 @@ _NATIVE_TO_PY_ERROR_NAMES = {
     "RouteWatchUnavailable": "ERROR_ROUTE_WATCH_UNAVAILABLE",
     "ProtocolViolation": "ERROR_PROTOCOL_VIOLATION",
     "FallbackDenied": "ERROR_FALLBACK_DENIED",
+    "CallDeadlineExceeded": "ERROR_CALL_DEADLINE_EXCEEDED",
+    "UnsupportedCallMode": "ERROR_UNSUPPORTED_CALL_MODE",
+    "CallCapacityExceeded": "ERROR_CALL_CAPACITY_EXCEEDED",
 }
 
 
@@ -271,6 +274,52 @@ class FallbackDenied(CCError):
     def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
         super().__init__(code=ERROR_Code.ERROR_FALLBACK_DENIED, message=message or 'Fallback denied', details=details)
 
+class CallDeadlineExceeded(CCError):
+    """Raised when a bounded call deadline elapsed without a definitive outcome.
+
+    The peer Core reports the observed ``transport_phase`` detail, either
+    ``pre_dispatch`` or ``dispatch_uncertain``. This class only projects the
+    received detail; it never infers a phase from the message text and never
+    rewrites received details.
+    """
+    ERROR_CODE = 715
+
+    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
+        super().__init__(
+            code=ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED,
+            message=message or 'Call deadline exceeded',
+            details=details,
+        )
+
+    @property
+    def transport_phase(self) -> str | None:
+        """Read-only view of ``details['transport_phase']``; ``None`` when absent."""
+        return self.details.get('transport_phase')
+
+class UnsupportedCallMode(CCError):
+    """Raised when a call mode cannot honor the requested semantics, such as a
+    finite deadline that does not support same-process synchronous dispatch."""
+    ERROR_CODE = 716
+
+    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
+        super().__init__(
+            code=ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE,
+            message=message or 'Unsupported call mode',
+            details=details,
+        )
+
+class CallCapacityExceeded(CCError):
+    """Raised when a bounded continuation budget is exhausted, such as
+    continuation slots or byte capacity."""
+    ERROR_CODE = 717
+
+    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
+        super().__init__(
+            code=ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED,
+            message=message or 'Call capacity exceeded',
+            details=details,
+        )
+
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER:    ResourceInputFromBuffer,
@@ -294,4 +343,7 @@ _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE:          RouteWatchUnavailable,
     ERROR_Code.ERROR_PROTOCOL_VIOLATION:               ProtocolViolation,
     ERROR_Code.ERROR_FALLBACK_DENIED:                  FallbackDenied,
+    ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED:           CallDeadlineExceeded,
+    ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE:            UnsupportedCallMode,
+    ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED:           CallCapacityExceeded,
 }
