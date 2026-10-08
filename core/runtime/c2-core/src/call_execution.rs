@@ -527,6 +527,13 @@ mod tests {
 
     const FINITE: Duration = Duration::from_millis(500);
     const TEST_WAIT: Duration = Duration::from_secs(5);
+    // Fault-injection fixtures verify panic conversion, refund-once, and
+    // no-strand semantics, never expiry: a loaded CI scheduler may legally
+    // consume a short budget between prepare and the injected fault, and the
+    // deadline must win then. Their budget therefore stays finite but large
+    // enough that only the injected fault decides the outcome. Expiry and
+    // budget-boundary tests keep FINITE or their own explicit deadlines.
+    const INJECTION_BUDGET: Duration = Duration::from_secs(10);
 
     fn context(slots: u64, bytes: u64) -> CallExecutionContext {
         CallExecutionContext::new(&CallExecutionLimits {
@@ -538,6 +545,15 @@ mod tests {
     fn prepare(context: &CallExecutionContext) -> PreparingCall {
         context
             .prepare(CallOptions::with_timeout(CallTimeout::After(FINITE)), None)
+            .unwrap()
+    }
+
+    fn prepare_injection(context: &CallExecutionContext) -> PreparingCall {
+        context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(INJECTION_BUDGET)),
+                None,
+            )
             .unwrap()
     }
 
@@ -1181,7 +1197,7 @@ mod tests {
     fn panic_in_materializer_constructor_poll_and_future_drop_wakes_and_refunds() {
         for boundary in 0..4 {
             let context = context(1, 1);
-            let preparing = prepare(&context);
+            let preparing = prepare_injection(&context);
             let scope = preparing.scope().clone();
             let (drop_tx, drop_rx) = mpsc::channel();
             let call = preparing
@@ -1235,7 +1251,7 @@ mod tests {
     #[test]
     fn executor_start_failure_and_unpolled_task_drop_do_not_strand_slots() {
         let context = context(1, 1);
-        let error = prepare(&context)
+        let error = prepare_injection(&context)
             .execute_on::<(), _, _, _>(
                 1,
                 || panic!("materialized without executor"),
@@ -1249,7 +1265,7 @@ mod tests {
             Error::Lifecycle(LifecycleError::Configuration(_))
         ));
         assert_eq!(context.snapshot().used_operations, 0);
-        let preparing = prepare(&context);
+        let preparing = prepare_injection(&context);
         let scope = preparing.scope().clone();
         let error = preparing
             .execute_on::<(), _, _, _>(
@@ -1271,7 +1287,7 @@ mod tests {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let handle = runtime.handle().clone();
         runtime.shutdown_background();
-        let call = prepare(&context)
+        let call = prepare_injection(&context)
             .execute_on::<(), _, _, _>(
                 1,
                 || panic!("materialized on stopped runtime"),
