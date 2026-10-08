@@ -1076,16 +1076,31 @@ mod tests {
     }
 
     #[test]
-    fn server_pool_segment_must_not_exceed_payload_limit() {
+    fn server_pool_segment_capacity_is_independent_of_payload_limit() {
+        // Pool segment capacity and the per-message limit are independent
+        // dimensions (0.7.1 design section 3): the default 256 MiB segment
+        // resolves beside a 32 MiB message cap with the buddy pool enabled
+        // and disabled. Oversized individual payloads stay a dispatch-level
+        // check, not a resolver validation rule.
         let mut overrides = RuntimeConfigOverrides::default();
-        overrides.server_ipc.pool_segment_size = Some(2 * 1024 * 1024);
-        overrides.server_ipc.max_payload_size = Some(1024 * 1024);
+        overrides.server_ipc.max_payload_size = Some(32 * 1024 * 1024);
 
-        let err = ConfigResolver::resolve(overrides, ConfigSources::empty())
-            .expect_err("oversized pool segment should fail");
+        let resolved = ConfigResolver::resolve(overrides, ConfigSources::empty())
+            .expect("large pool segment with a smaller message cap should resolve");
+        assert_eq!(resolved.server_ipc.pool_segment_size, 256 * 1024 * 1024);
+        assert_eq!(resolved.server_ipc.max_pool_memory, 1024 * 1024 * 1024);
+        assert_eq!(resolved.server_ipc.max_payload_size, 32 * 1024 * 1024);
+        assert!(resolved.server_ipc.pool_enabled);
 
-        assert!(err.to_string().contains("pool_segment_size"));
-        assert!(err.to_string().contains("max_payload_size"));
+        let mut overrides = RuntimeConfigOverrides::default();
+        overrides.server_ipc.max_payload_size = Some(32 * 1024 * 1024);
+        overrides.server_ipc.pool_enabled = Some(false);
+
+        let resolved = ConfigResolver::resolve(overrides, ConfigSources::empty())
+            .expect("buddy-off resolution must also allow segment > message cap");
+        assert!(!resolved.server_ipc.pool_enabled);
+        assert_eq!(resolved.server_ipc.pool_segment_size, 256 * 1024 * 1024);
+        assert_eq!(resolved.server_ipc.max_payload_size, 32 * 1024 * 1024);
     }
 
     #[test]

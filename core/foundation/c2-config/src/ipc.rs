@@ -500,12 +500,11 @@ impl ServerIpcConfig {
                 self.max_execution_workers, MAX_EXECUTION_WORKERS
             ));
         }
-        if self.base.pool_segment_size > self.max_payload_size {
-            return Err(format!(
-                "pool_segment_size ({}) must not exceed max_payload_size ({})",
-                self.base.pool_segment_size, self.max_payload_size,
-            ));
-        }
+        // Pool segment capacity and the per-message `max_payload_size` limit
+        // are independent dimensions (0.7.1 design section 3): one segment
+        // backs many smaller messages, so segment capacity may exceed the
+        // message cap. Oversized individual payloads are still rejected at
+        // dispatch by the actual payload checks.
         if self.shm_threshold > self.max_frame_size {
             return Err(format!(
                 "shm_threshold ({}) must not exceed max_frame_size ({})",
@@ -740,15 +739,24 @@ mod tests {
     }
 
     #[test]
-    fn reject_pool_segment_larger_than_payload_size() {
-        let mut cfg = ServerIpcConfig::default();
-        cfg.base.pool_segment_size = 2 * 1024 * 1024;
-        cfg.base.max_pool_memory =
-            cfg.base.pool_segment_size * u64::from(cfg.base.max_pool_segments);
-        cfg.max_payload_size = 1024 * 1024;
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("pool_segment_size"));
-        assert!(err.contains("max_payload_size"));
+    fn accept_pool_segment_larger_than_payload_size() {
+        // Pool segment capacity and the per-message limit are independent
+        // dimensions: one segment backs many smaller messages. The default
+        // 256 MiB segment must be accepted beside a 32 MiB message cap with
+        // the buddy pool enabled and disabled, and the fully default
+        // configuration stays valid.
+        let mut cfg = ServerIpcConfig {
+            max_payload_size: 32 * 1024 * 1024,
+            ..ServerIpcConfig::default()
+        };
+        assert_eq!(cfg.pool_segment_size, 256 * 1024 * 1024);
+        assert!(cfg.pool_enabled);
+        assert!(cfg.validate().is_ok());
+
+        cfg.base.pool_enabled = false;
+        assert!(cfg.validate().is_ok());
+
+        assert!(ServerIpcConfig::default().validate().is_ok());
     }
 
     #[test]
