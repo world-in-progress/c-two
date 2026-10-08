@@ -2056,7 +2056,7 @@ impl IpcClient {
     }
 
     fn from_parts(
-        address: &str,
+        endpoint: Result<LocalEndpoint, String>,
         pool: Option<Arc<StdMutex<MemPool>>>,
         config: ClientIpcConfig,
         pool_injected: bool,
@@ -2064,12 +2064,7 @@ impl IpcClient {
         memory_budget: Option<c2_mem::MemoryBudget>,
         chunk_registry: Option<Arc<ChunkRegistry>>,
     ) -> Self {
-        // The resolved config owns the endpoint protocol: construction,
-        // reconnect, and every fallback reuse this one derivation instead of
-        // probing old and new endpoint namespaces.
-        let endpoint = crate::control::local_endpoint_from_ipc_address(address)
-            .map_err(|error| error.to_string());
-
+        // Construction freezes the native endpoint; reconnect never derives it again.
         Self {
             endpoint,
             abort: Arc::new(StdMutex::new(None)),
@@ -2214,7 +2209,7 @@ impl IpcClient {
         let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
         let registry = Self::build_chunk_registry(&config, &budget);
         Self::from_parts(
-            address,
+            Self::default_endpoint(address),
             None,
             config,
             false,
@@ -2252,10 +2247,34 @@ impl IpcClient {
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
     ) -> Self {
+        Self::with_budget_endpoint(Self::default_endpoint(address), config, budget)
+    }
+
+    /// Create a client with a frozen endpoint and a config-owned memory budget.
+    /// The caller resolves the context; this transport never reads environment roots.
+    pub fn with_endpoint(endpoint: LocalEndpoint, config: ClientIpcConfig) -> Self {
+        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        Self::with_endpoint_and_shared_budget(endpoint, config, budget)
+    }
+
+    /// Use the given endpoint and the owning domain's shared memory budget.
+    pub fn with_endpoint_and_shared_budget(
+        endpoint: LocalEndpoint,
+        config: ClientIpcConfig,
+        budget: c2_mem::MemoryBudget,
+    ) -> Self {
+        Self::with_budget_endpoint(Ok(endpoint), config, budget)
+    }
+
+    fn with_budget_endpoint(
+        endpoint: Result<LocalEndpoint, String>,
+        config: ClientIpcConfig,
+        budget: c2_mem::MemoryBudget,
+    ) -> Self {
         let pool = Self::own_pool_from_config(&config, &budget);
         let registry = Self::build_chunk_registry(&config, &budget);
         Self::from_parts(
-            address,
+            endpoint,
             Some(pool),
             config,
             false,
@@ -2287,11 +2306,29 @@ impl IpcClient {
     /// allocations are never mutated or destroyed by the transport;
     /// maintenance only calls the pool's public GC API.
     pub fn with_pool(address: &str, pool: Arc<StdMutex<MemPool>>, config: ClientIpcConfig) -> Self {
+        Self::with_pool_endpoint(Self::default_endpoint(address), pool, config)
+    }
+
+    /// Use a frozen endpoint with an externally owned pool. The same injected-pool
+    /// policy and budget checks as [`Self::with_pool`] apply before connection I/O.
+    pub fn with_endpoint_and_pool(
+        endpoint: LocalEndpoint,
+        pool: Arc<StdMutex<MemPool>>,
+        config: ClientIpcConfig,
+    ) -> Self {
+        Self::with_pool_endpoint(Ok(endpoint), pool, config)
+    }
+
+    fn with_pool_endpoint(
+        endpoint: Result<LocalEndpoint, String>,
+        pool: Arc<StdMutex<MemPool>>,
+        config: ClientIpcConfig,
+    ) -> Self {
         let budget = pool.lock().budget().cloned();
         let registry = budget
             .as_ref()
             .map(|budget| Self::build_chunk_registry(&config, budget));
-        Self::from_parts(address, Some(pool), config, true, false, budget, registry)
+        Self::from_parts(endpoint, Some(pool), config, true, false, budget, registry)
     }
 
     /// Create a client around a transport-internal pool built from `config`
@@ -2301,14 +2338,14 @@ impl IpcClient {
     /// owning cache's shared domain context; the pool was already created with
     /// it and the client's reassembly pool charges the same context.
     pub(crate) fn with_transport_pool(
-        address: &str,
+        endpoint: LocalEndpoint,
         pool: Arc<StdMutex<MemPool>>,
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
     ) -> Self {
         let registry = Self::build_chunk_registry(&config, &budget);
         Self::from_parts(
-            address,
+            Ok(endpoint),
             Some(pool),
             config,
             false,
@@ -2316,6 +2353,17 @@ impl IpcClient {
             Some(budget),
             Some(registry),
         )
+    }
+
+    fn default_endpoint(address: &str) -> Result<LocalEndpoint, String> {
+        crate::control::local_endpoint_from_ipc_address(address).map_err(|error| error.to_string())
+    }
+
+    /// The endpoint frozen at construction, retained across close and reconnect.
+    pub fn local_endpoint(&self) -> Result<&LocalEndpoint, IpcError> {
+        self.endpoint
+            .as_ref()
+            .map_err(|error| IpcError::Config(error.clone()))
     }
 
     /// Connect and perform handshake.

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 use crate::client::IpcError;
+use c2_config::LocalEndpointContext;
 use c2_local::{LocalEndpoint, LocalStream};
 use c2_wire::flags::{FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{self, HEADER_SIZE};
@@ -12,16 +13,18 @@ use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_ack, encode_s
 
 /// Derive the automatic platform native endpoint for a logical IPC address.
 pub fn local_endpoint_from_ipc_address(address: &str) -> Result<LocalEndpoint, IpcError> {
-    LocalEndpoint::from_address(address).map_err(|error| {
-        if matches!(
-            error.kind(),
-            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
-        ) {
-            IpcError::Config(error.to_string())
-        } else {
-            IpcError::Io(error)
-        }
-    })
+    LocalEndpoint::from_address(address).map_err(endpoint_error)
+}
+
+pub(crate) fn endpoint_error(error: io::Error) -> IpcError {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    ) {
+        IpcError::Config(error.to_string())
+    } else {
+        IpcError::Io(error)
+    }
 }
 
 enum Exchange {
@@ -170,9 +173,23 @@ mod test_seam {
 
 /// Ping the platform native endpoint for this logical address.
 pub fn ping(address: &str, timeout: Duration) -> Result<bool, IpcError> {
-    let endpoint = local_endpoint_from_ipc_address(address)?;
+    ping_with_endpoint(&local_endpoint_from_ipc_address(address)?, timeout)
+}
+
+/// Ping in a caller-resolved context; derive only once for the whole operation.
+pub fn ping_with_context(
+    address: &str,
+    context: &LocalEndpointContext,
+    timeout: Duration,
+) -> Result<bool, IpcError> {
+    ping_with_endpoint(&context.endpoint(address).map_err(endpoint_error)?, timeout)
+}
+
+/// Ping the exact endpoint, retaining one snapshot through all retries.
+pub fn ping_with_endpoint(endpoint: &LocalEndpoint, timeout: Duration) -> Result<bool, IpcError> {
+    let endpoint = endpoint.clone();
     #[cfg(test)]
-    let address = address.to_owned();
+    let address = endpoint.address().to_owned();
     blocking(async move {
         let started = Instant::now();
         while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
@@ -242,7 +259,25 @@ fn already_stopped() -> DirectShutdownAck {
 /// carries route outcomes — so absence is answered here instead of being
 /// confused with a probe that reached the wrong namespace.
 pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectShutdownAck, IpcError> {
-    let endpoint = local_endpoint_from_ipc_address(address)?;
+    shutdown_with_endpoint(&local_endpoint_from_ipc_address(address)?, timeout)
+}
+
+/// Initiate shutdown in a caller-resolved context, with one endpoint snapshot.
+pub fn shutdown_with_context(
+    address: &str,
+    context: &LocalEndpointContext,
+    timeout: Duration,
+) -> Result<DirectShutdownAck, IpcError> {
+    shutdown_with_endpoint(&context.endpoint(address).map_err(endpoint_error)?, timeout)
+}
+
+/// Initiate shutdown of exactly this endpoint. The acknowledgement still proves
+/// initiation only; completion is observed through the server's native barrier.
+pub fn shutdown_with_endpoint(
+    endpoint: &LocalEndpoint,
+    timeout: Duration,
+) -> Result<DirectShutdownAck, IpcError> {
+    let endpoint = endpoint.clone();
     blocking(async move {
         let started = Instant::now();
         let request = encode_shutdown_initiate();

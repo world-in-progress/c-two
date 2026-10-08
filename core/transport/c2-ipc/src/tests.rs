@@ -5868,3 +5868,331 @@ mod chunk_reply_admission_tests {
         driven._handle.abort();
     }
 }
+
+/// Endpoint APIs are platform-neutral and never resolve environment overrides.
+#[cfg(test)]
+mod endpoint_context_tests {
+    use crate::{ClientIpcConfig, ClientPool, IpcClient};
+    use c2_config::{LocalEndpointContext, LocalEndpointNamespace};
+    use c2_server::{Server, ServerIpcConfig};
+    use std::time::Duration;
+
+    #[test]
+    fn platform_default_and_explicit_constructors_keep_the_same_snapshot() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context.endpoint("ipc://context_api").unwrap();
+        let client = IpcClient::new(endpoint.address());
+        let configured = IpcClient::with_config(endpoint.address(), ClientIpcConfig::default());
+        let explicit = IpcClient::with_endpoint(endpoint.clone(), ClientIpcConfig::default());
+        assert_eq!(client.local_endpoint().unwrap(), &endpoint);
+        assert_eq!(configured.local_endpoint().unwrap(), &endpoint);
+        assert_eq!(explicit.local_endpoint().unwrap(), &endpoint);
+        let server =
+            Server::new_with_endpoint(endpoint.clone(), ServerIpcConfig::default()).unwrap();
+        let default_server = Server::new(endpoint.address(), ServerIpcConfig::default()).unwrap();
+        let identified = Server::new_with_identity_and_endpoint(
+            endpoint.clone(),
+            ServerIpcConfig::default(),
+            server.identity().clone(),
+        )
+        .unwrap();
+        assert_eq!(server.local_endpoint(), &endpoint);
+        assert_eq!(default_server.local_endpoint(), &endpoint);
+        assert_eq!(identified.local_endpoint(), &endpoint);
+        assert_eq!(identified.identity(), server.identity());
+        let pool = ClientPool::with_endpoint_context(Duration::ZERO, context.clone());
+        let default_pool = ClientPool::new(Duration::ZERO);
+        assert_eq!(pool.endpoint_context().unwrap(), &context);
+        assert_eq!(default_pool.endpoint_context().unwrap(), &context);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                context.platform_kind(),
+                LocalEndpointNamespace::WindowsNamedPipe
+            );
+            assert!(context.unix_root().is_none());
+            assert!(context.windows_logon_scope_id().is_some());
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            context.platform_kind(),
+            LocalEndpointNamespace::UnixFilesystem
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_context_is_frozen_across_client_close_and_empty_cache_epochs() {
+        let a = LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/ctxa")).unwrap();
+        let b = LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/ctxb")).unwrap();
+        let endpoint = a.endpoint("ipc://same").unwrap();
+        assert_ne!(endpoint, b.endpoint(endpoint.address()).unwrap());
+        let config = ClientIpcConfig::default();
+        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        let mut client =
+            IpcClient::with_endpoint_and_shared_budget(endpoint.clone(), config, budget);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(client.close());
+        assert_eq!(client.local_endpoint().unwrap(), &endpoint);
+        let server =
+            Server::new_with_endpoint(endpoint.clone(), ServerIpcConfig::default()).unwrap();
+        assert_eq!(server.local_endpoint(), &endpoint);
+        let pool = ClientPool::with_endpoint_context(Duration::ZERO, a.clone());
+        for _ in 0..2 {
+            let report = pool.close_all(Duration::from_secs(1));
+            assert!(report.error.is_none(), "{report:?}");
+            assert!(report.unconfirmed.is_empty(), "{report:?}");
+            assert_eq!(pool.endpoint_context().unwrap(), &a);
+        }
+        assert!(matches!(
+            pool.acquire("http://invalid", None),
+            Err(crate::IpcError::Config(_))
+        ));
+        assert_eq!(
+            pool.endpoint_context().unwrap().namespace_id(),
+            a.namespace_id()
+        );
+        assert_ne!(
+            pool.endpoint_context().unwrap().namespace_id(),
+            b.namespace_id()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod endpoint_context_transport_tests {
+    use crate::{
+        ClientIpcConfig, ClientPool, SyncClient, ping_with_context, ping_with_endpoint,
+        shutdown_with_context, shutdown_with_endpoint,
+    };
+    use c2_config::LocalEndpointContext;
+    use c2_server::{
+        ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
+        SchedulerLimits, Server, ServerIpcConfig,
+    };
+    use std::collections::HashMap;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(5);
+    const ADDRESS: &str = "ipc://same_context_route";
+
+    // Short UUID-derived names keep the complete socket below macOS sun_path.
+    // Only containers successfully created by this fixture are ever removed.
+    struct Root(PathBuf);
+    impl Root {
+        fn new() -> Self {
+            loop {
+                let identity = Server::new("ipc://root_uuid", ServerIpcConfig::default()).unwrap();
+                let path = PathBuf::from(format!("/tmp/c{}", &identity.server_instance_id()[..8]));
+                match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create custom-root container: {error}"),
+                }
+            }
+        }
+        fn context(&self) -> LocalEndpointContext {
+            LocalEndpointContext::with_unix_root(&self.0).unwrap()
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove only fixture-owned container");
+        }
+    }
+
+    struct Tag(u8);
+    impl CrmCallback for Tag {
+        fn invoke(
+            &self,
+            _: &str,
+            _: u16,
+            _: RequestData,
+            _: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            Ok(ResponseMeta::Inline(vec![self.0]))
+        }
+    }
+
+    fn contract() -> c2_contract::ExpectedRouteContract {
+        c2_contract::ExpectedRouteContract {
+            route_name: "grid".into(),
+            crm_ns: "test.context".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
+        }
+    }
+
+    async fn register(server: &Server, tag: u8) {
+        let expected = contract();
+        let built = server
+            .build_route(
+                RouteBuildSpec {
+                    name: expected.route_name,
+                    crm_ns: expected.crm_ns,
+                    crm_name: expected.crm_name,
+                    crm_ver: expected.crm_ver,
+                    abi_hash: expected.abi_hash,
+                    signature_hash: expected.signature_hash,
+                    method_names: vec!["tag".into()],
+                    access_map: HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::ReadParallel,
+                    limits: SchedulerLimits::default(),
+                },
+                Arc::new(Tag(tag)),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(built).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+    }
+
+    fn check_tag(client: &SyncClient, expected: u8) {
+        let binding = client.acquire_route(&contract()).unwrap();
+        let response = client.call_bound(&binding, "tag", &[]).unwrap();
+        assert_eq!(
+            client.lease_response(response).into_owned_bytes().unwrap(),
+            vec![expected]
+        );
+    }
+
+    #[test]
+    fn same_address_custom_roots_isolate_clients_cache_epochs_and_admin_control() {
+        let root_a = Root::new();
+        let root_b = Root::new();
+        let a = root_a.context();
+        let b = root_b.context();
+        let endpoint_a = a.endpoint(ADDRESS).unwrap();
+        let endpoint_b = b.endpoint(ADDRESS).unwrap();
+        assert_ne!(endpoint_a.os_name(), endpoint_b.os_name());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let server_a = Arc::new(
+            Server::new_with_endpoint(endpoint_a.clone(), ServerIpcConfig::default()).unwrap(),
+        );
+        let server_b = Arc::new(
+            Server::new_with_identity_and_endpoint(
+                endpoint_b.clone(),
+                ServerIpcConfig::default(),
+                c2_server::ServerIdentity {
+                    server_id: "root_b".into(),
+                    server_instance_id: "root_b_instance".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let (run_a, run_b) = rt.block_on(async {
+            register(&server_a, b'A').await;
+            register(&server_b, b'B').await;
+            let start = |server: Arc<Server>| {
+                server.begin_start_attempt().unwrap();
+                tokio::spawn(async move { server.run().await })
+            };
+            let runs = (start(server_a.clone()), start(server_b.clone()));
+            // Native watch events prove bind readiness without polling or sleeps.
+            server_a.wait_until_ready(WAIT).await.unwrap();
+            server_b.wait_until_ready(WAIT).await.unwrap();
+            runs
+        });
+        let mut direct_a =
+            SyncClient::connect_with_endpoint(endpoint_a.clone(), None, ClientIpcConfig::default())
+                .unwrap();
+        let mut direct_b =
+            SyncClient::connect_with_endpoint(endpoint_b.clone(), None, ClientIpcConfig::default())
+                .unwrap();
+        assert_eq!(direct_a.server_identity(), Some(server_a.identity()));
+        assert_eq!(direct_b.server_identity(), Some(server_b.identity()));
+        check_tag(&direct_a, b'A');
+        check_tag(&direct_b, b'B');
+        assert!(ping_with_context(ADDRESS, &a, WAIT).unwrap());
+        assert!(ping_with_endpoint(&endpoint_b, WAIT).unwrap());
+
+        let pool_a = ClientPool::with_endpoint_context(Duration::from_secs(30), a.clone());
+        let pool_b = ClientPool::with_endpoint_context(Duration::from_secs(30), b.clone());
+        let cached_a = pool_a.acquire(ADDRESS, None).unwrap();
+        let cached_b = pool_b.acquire(ADDRESS, None).unwrap();
+        let hit_a = pool_a.acquire(ADDRESS, None).unwrap();
+        assert!(Arc::ptr_eq(&cached_a, &hit_a));
+        assert_eq!(pool_a.refcount(ADDRESS), 2);
+        assert_eq!(pool_b.refcount(ADDRESS), 1);
+        assert!(!Arc::ptr_eq(&cached_a, &cached_b));
+        check_tag(&cached_a, b'A');
+        check_tag(&cached_b, b'B');
+        pool_a.release(ADDRESS);
+        assert_eq!(pool_a.refcount(ADDRESS), 1);
+        let report = pool_a.close_all(WAIT);
+        assert_eq!(report.detached, 1);
+        assert!(report.error.is_none(), "{report:?}");
+        assert!(report.unconfirmed.is_empty(), "{report:?}");
+        assert!(!cached_a.is_connected());
+        check_tag(&cached_b, b'B');
+        assert_eq!(pool_b.refcount(ADDRESS), 1);
+        assert_eq!(pool_a.endpoint_context().unwrap(), &a);
+        let reopened_a = pool_a.acquire(ADDRESS, None).unwrap();
+        assert!(!Arc::ptr_eq(&cached_a, &reopened_a));
+        assert_eq!(reopened_a.local_endpoint(), &endpoint_a);
+        assert_eq!(reopened_a.server_identity(), Some(server_a.identity()));
+        check_tag(&reopened_a, b'A');
+        check_tag(&cached_b, b'B');
+
+        direct_a.close();
+        direct_b.close();
+        let report = pool_a.close_all(WAIT);
+        assert!(
+            report.error.is_none() && report.unconfirmed.is_empty(),
+            "{report:?}"
+        );
+        let ack_a = shutdown_with_context(ADDRESS, &a, WAIT).unwrap();
+        assert!(ack_a.acknowledged && ack_a.shutdown_started);
+        rt.block_on(async {
+            server_a.wait_until_stopped(WAIT).await.unwrap();
+            run_a.await.unwrap().unwrap();
+        });
+        assert_eq!(server_a.local_endpoint(), &endpoint_a);
+        assert!(ping_with_endpoint(&endpoint_b, WAIT).unwrap());
+        check_tag(&cached_b, b'B');
+        let absent_a = shutdown_with_endpoint(&endpoint_a, WAIT).unwrap();
+        assert!(absent_a.acknowledged && absent_a.server_stopped);
+        // Fence restart before readiness waiters, using the same Server endpoint.
+        server_a.begin_start_attempt().unwrap();
+        let restarted_a = rt.block_on(async {
+            let server = server_a.clone();
+            let runner = tokio::spawn(async move { server.run().await });
+            server_a.wait_until_ready(WAIT).await.unwrap();
+            runner
+        });
+        let mut restarted_client =
+            SyncClient::connect_with_endpoint(endpoint_a.clone(), None, ClientIpcConfig::default())
+                .unwrap();
+        assert_eq!(
+            restarted_client.server_identity(),
+            Some(server_a.identity())
+        );
+        assert_eq!(restarted_client.local_endpoint(), &endpoint_a);
+        restarted_client.close();
+        check_tag(&cached_b, b'B');
+        let ack_a = shutdown_with_endpoint(&endpoint_a, WAIT).unwrap();
+        assert!(ack_a.acknowledged && ack_a.shutdown_started);
+        rt.block_on(async {
+            server_a.wait_until_stopped(WAIT).await.unwrap();
+            restarted_a.await.unwrap().unwrap();
+        });
+        let report = pool_b.close_all(WAIT);
+        assert!(
+            report.error.is_none() && report.unconfirmed.is_empty(),
+            "{report:?}"
+        );
+        let ack_b = shutdown_with_endpoint(&endpoint_b, WAIT).unwrap();
+        assert!(ack_b.acknowledged && ack_b.shutdown_started);
+        rt.block_on(async {
+            server_b.wait_until_stopped(WAIT).await.unwrap();
+            run_b.await.unwrap().unwrap();
+        });
+        assert_eq!(server_b.local_endpoint(), &endpoint_b);
+    }
+}

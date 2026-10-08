@@ -141,16 +141,38 @@ impl SyncClient {
         pool: Option<Arc<Mutex<MemPool>>>,
         config: ClientIpcConfig,
     ) -> Result<Self, IpcError> {
+        Self::connect_with_endpoint(
+            crate::control::local_endpoint_from_ipc_address(address)?,
+            pool,
+            config,
+        )
+    }
+
+    /// Connect using the caller's already-derived, immutable platform endpoint.
+    pub fn connect_with_endpoint(
+        endpoint: c2_config::LocalEndpoint,
+        pool: Option<Arc<Mutex<MemPool>>>,
+        config: ClientIpcConfig,
+    ) -> Result<Self, IpcError> {
         let rt = get_or_create_runtime();
-        let mut client = match pool {
-            Some(p) => IpcClient::with_pool(address, p, config),
-            None => IpcClient::with_config(address, config),
-        };
+        let mut client = Self::client_for_endpoint(endpoint, pool, config);
         rt.block_on(client.connect())?;
         Ok(Self {
             inner: client,
             rt: rt.handle().clone(),
         })
+    }
+
+    /// Share construction with pure policy tests without performing connection I/O.
+    fn client_for_endpoint(
+        endpoint: c2_config::LocalEndpoint,
+        pool: Option<Arc<Mutex<MemPool>>>,
+        config: ClientIpcConfig,
+    ) -> IpcClient {
+        match pool {
+            Some(pool) => IpcClient::with_endpoint_and_pool(endpoint, pool, config),
+            None => IpcClient::with_endpoint(endpoint, config),
+        }
     }
 
     /// Test-only connect that arms a probe before the receive task is spawned.
@@ -182,18 +204,25 @@ impl SyncClient {
     /// context: the pool already charges it and the client's reassembly pool
     /// charges the same context.
     pub(crate) fn connect_transport_pool(
-        address: &str,
+        endpoint: c2_config::LocalEndpoint,
         pool: Arc<Mutex<MemPool>>,
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
     ) -> Result<Self, IpcError> {
         let rt = get_or_create_runtime();
-        let mut client = IpcClient::with_transport_pool(address, pool, config, budget);
+        let mut client = IpcClient::with_transport_pool(endpoint, pool, config, budget);
         rt.block_on(client.connect())?;
         Ok(Self {
             inner: client,
             rt: rt.handle().clone(),
         })
+    }
+
+    /// The native endpoint retained by this connection.
+    pub fn local_endpoint(&self) -> &c2_config::LocalEndpoint {
+        self.inner
+            .local_endpoint()
+            .expect("connected client has a valid endpoint")
     }
 
     /// Synchronous CRM call through an immutable route binding.
@@ -597,21 +626,130 @@ pub(crate) mod tests {
         );
     }
 
+    fn factory_test_config() -> ClientIpcConfig {
+        ClientIpcConfig {
+            base: c2_config::BaseIpcConfig {
+                pool_enabled: false,
+                pool_segment_size: 2 * 1024 * 1024,
+                max_pool_segments: 2,
+                max_pool_memory: 4 * 1024 * 1024,
+                pool_prewarm_segments: 0,
+                pool_min_retained_segments: 1,
+                reassembly_segment_size: 1024 * 1024,
+                reassembly_max_segments: 3,
+                max_total_chunks: 37,
+                chunk_gc_interval_secs: 0.75,
+                chunk_threshold_ratio: 0.625,
+                chunk_assembler_timeout_secs: 4.25,
+                max_reassembly_bytes: 7 * 1024 * 1024,
+                chunk_size: 8192,
+                shm_backing_budget_bytes: 11 * 1024 * 1024,
+                file_backing_budget_bytes: 13 * 1024 * 1024,
+                live_reassembly_budget_bytes: 3 * 1024 * 1024,
+            },
+            shm_threshold: 257,
+            pool_decay_seconds: 2.5,
+        }
+    }
+
+    fn factory_test_endpoint() -> c2_config::LocalEndpoint {
+        #[cfg(unix)]
+        let context =
+            c2_config::LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/sf"))
+                .unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        context.endpoint("ipc://sync_factory").unwrap()
+    }
+
     #[test]
     fn sync_client_connect_without_external_pool_preserves_config() {
-        let source = include_str!("sync_client.rs");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("sync_client.rs must contain a production section");
-        assert!(
-            !production.contains("None => IpcClient::new(address)"),
-            "SyncClient::connect must not discard ClientIpcConfig when no external pool is supplied"
-        );
-        assert!(
-            production.contains("None => IpcClient::with_config(address, config)"),
-            "SyncClient::connect must preserve ClientIpcConfig in the no-external-pool branch"
-        );
+        let endpoint = factory_test_endpoint();
+        for buddy_enabled in [false, true] {
+            let mut config = factory_test_config();
+            config.base.pool_enabled = buddy_enabled;
+            config.base.pool_prewarm_segments = u32::from(buddy_enabled);
+            config.validate().unwrap();
+            let client = SyncClient {
+                inner: SyncClient::client_for_endpoint(endpoint.clone(), None, config.clone()),
+                rt: get_or_create_runtime().handle().clone(),
+            };
+            assert_eq!(client.inner.config(), &config);
+            assert_eq!(client.local_endpoint(), &endpoint);
+            let pool = client
+                .inner
+                .request_pool()
+                .expect("config-owned request pool");
+            assert_eq!(pool.lock().config().buddy_enabled, buddy_enabled);
+            assert_eq!(
+                pool.lock().config().segment_size,
+                config.pool_segment_size as usize
+            );
+            assert_eq!(
+                pool.lock().config().max_segments,
+                config.max_pool_segments as usize
+            );
+            assert_eq!(pool.lock().config().min_retained_segments, 1);
+            assert_eq!(
+                pool.lock().config().buddy_idle_decay_secs,
+                config.pool_decay_seconds
+            );
+            let threshold = config.shm_threshold as usize;
+            assert!(!client.should_use_shm(threshold - 1));
+            assert!(!client.should_use_shm(threshold));
+            // Disabling buddy retains a request pool for dedicated SHM;
+            // the same threshold still governs selection of that pool.
+            assert!(client.should_use_shm(threshold + 1));
+        }
+    }
+
+    #[test]
+    fn sync_client_factory_with_external_pool_preserves_snapshot_and_policy_gate() {
+        let endpoint = factory_test_endpoint();
+        let config = factory_test_config();
+        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+            config.base.primary_pool_config(&config.pool_tuning()),
+            "sync-factory-injected".into(),
+            c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
+        )));
+        let client =
+            SyncClient::client_for_endpoint(endpoint.clone(), Some(pool.clone()), config.clone());
+        assert_eq!(client.config(), &config);
+        assert_eq!(client.local_endpoint().unwrap(), &endpoint);
+        assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &pool));
+        assert!(!pool.lock().config().buddy_enabled);
+
+        // Both injected-pool rejections occur before OS connection or allocation.
+        for (buddy_enabled, prewarm, expected_error) in [
+            (true, 0, "injected pool has buddy enabled"),
+            (false, 1, "cannot be applied to an injected pool"),
+        ] {
+            let mut config = factory_test_config();
+            config.base.pool_enabled = prewarm > 0;
+            config.base.pool_prewarm_segments = prewarm;
+            config.validate().unwrap();
+            let mut pool_config = config.base.primary_pool_config(&config.pool_tuning());
+            pool_config.buddy_enabled = buddy_enabled;
+            let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
+                pool_config,
+                "sync-factory-rejected".into(),
+                c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits()),
+            )));
+            let mut client = SyncClient::client_for_endpoint(
+                endpoint.clone(),
+                Some(pool.clone()),
+                config.clone(),
+            );
+            assert_eq!(client.config(), &config);
+            assert_eq!(client.local_endpoint().unwrap(), &endpoint);
+            assert!(Arc::ptr_eq(&client.request_pool().unwrap(), &pool));
+            let error = get_or_create_runtime()
+                .block_on(client.connect())
+                .unwrap_err();
+            assert!(matches!(error, IpcError::Pool(message) if message.contains(expected_error)));
+            assert_eq!(pool.lock().config().buddy_enabled, buddy_enabled);
+            assert_eq!(pool.lock().stats().alloc_count, 0);
+        }
     }
 
     #[test]
