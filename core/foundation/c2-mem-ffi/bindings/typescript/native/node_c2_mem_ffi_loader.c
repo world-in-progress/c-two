@@ -99,12 +99,24 @@ typedef C2MemFfiStatus (*response_pool_release_fn)(C2MemFfiResponsePool *, C2Mem
 typedef uint32_t (*abi_version_fn)(void);
 typedef C2MemFfiStatus (*local_endpoint_len_fn)(const char *, size_t *);
 typedef C2MemFfiStatus (*local_endpoint_copy_fn)(const char *, char *, size_t, size_t *);
+typedef C2MemFfiStatus (*endpoint_context_capture_fn)(const char *, C2MemFfiLocalEndpointContext **);
+typedef void (*endpoint_context_free_fn)(C2MemFfiLocalEndpointContext *);
+typedef C2MemFfiStatus (*endpoint_context_name_len_fn)(const C2MemFfiLocalEndpointContext *, const char *, size_t *);
+typedef C2MemFfiStatus (*endpoint_context_name_copy_fn)(const C2MemFfiLocalEndpointContext *, const char *, char *, size_t, size_t *);
+typedef C2MemFfiStatus (*endpoint_context_namespace_id_len_fn)(const C2MemFfiLocalEndpointContext *, size_t *);
+typedef C2MemFfiStatus (*endpoint_context_namespace_id_copy_fn)(const C2MemFfiLocalEndpointContext *, char *, size_t, size_t *);
 
 typedef struct C2MemFfiNodeSymbols {
     void *library;
     abi_version_fn abi_version;
     local_endpoint_len_fn local_endpoint_len;
     local_endpoint_copy_fn local_endpoint_copy;
+    endpoint_context_capture_fn endpoint_context_capture;
+    endpoint_context_free_fn endpoint_context_free;
+    endpoint_context_name_len_fn endpoint_context_name_len;
+    endpoint_context_name_copy_fn endpoint_context_name_copy;
+    endpoint_context_namespace_id_len_fn endpoint_context_namespace_id_len;
+    endpoint_context_namespace_id_copy_fn endpoint_context_namespace_id_copy;
     request_pool_new_fn request_pool_new;
     request_pool_destroy_fn request_pool_destroy;
     request_pool_prefix_len_fn request_pool_prefix_len;
@@ -133,6 +145,16 @@ typedef struct C2MemFfiNodePoolHandle {
     C2MemFfiNodePoolKind kind;
     void *ptr;
 } C2MemFfiNodePoolHandle;
+
+typedef struct C2MemFfiNodeEndpointContext {
+    C2MemFfiNodeSymbols *symbols;
+    C2MemFfiLocalEndpointContext *ptr;
+} C2MemFfiNodeEndpointContext;
+
+/* Only wrapped objects created by this addon can carry a context owner. */
+static const napi_type_tag endpoint_context_tag = {
+    UINT64_C(0x0f29c11fb943496e), UINT64_C(0xa3535c87f53e14bf)
+};
 
 static napi_value throw_error(napi_env env, const char *message) {
     napi_throw_error(env, NULL, message);
@@ -776,8 +798,62 @@ static napi_value response_pool_release(napi_env env, napi_callback_info info) {
     return make_status_result(env, status, NULL);
 }
 
+static bool endpoint_context_supported(const C2MemFfiNodeSymbols *symbols) {
+    return symbols->endpoint_context_capture != NULL &&
+        symbols->endpoint_context_free != NULL &&
+        symbols->endpoint_context_name_len != NULL &&
+        symbols->endpoint_context_name_copy != NULL &&
+        symbols->endpoint_context_namespace_id_len != NULL &&
+        symbols->endpoint_context_namespace_id_copy != NULL;
+}
+
+/* A null address selects the namespace id query on the same captured context. */
+static napi_value endpoint_string_result(
+    napi_env env,
+    C2MemFfiNodeSymbols *symbols,
+    const C2MemFfiLocalEndpointContext *context,
+    const char *address) {
+    size_t length = 0;
+    C2MemFfiStatus status;
+    if (context == NULL) {
+        status = symbols->local_endpoint_len(address, &length);
+    } else if (address != NULL) {
+        status = symbols->endpoint_context_name_len(context, address, &length);
+    } else {
+        status = symbols->endpoint_context_namespace_id_len(context, &length);
+    }
+    if (status != C2_MEM_FFI_STATUS_OK) {
+        return make_status_result(env, status, NULL);
+    }
+    if (length == SIZE_MAX) {
+        return throw_error(env, "IPC endpoint name is too large.");
+    }
+    char *buffer = (char *)malloc(length + 1);
+    if (buffer == NULL) {
+        return throw_error(env, "Out of memory.");
+    }
+    size_t written = 0;
+    if (context == NULL) {
+        status = symbols->local_endpoint_copy(address, buffer, length + 1, &written);
+    } else if (address != NULL) {
+        status = symbols->endpoint_context_name_copy(context, address, buffer, length + 1, &written);
+    } else {
+        status = symbols->endpoint_context_namespace_id_copy(context, buffer, length + 1, &written);
+    }
+    napi_value value = NULL;
+    if (status == C2_MEM_FFI_STATUS_OK && (written > length || buffer[written] != '\0')) {
+        free(buffer);
+        return throw_error(env, "Invalid native IPC endpoint string result.");
+    }
+    if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_string_utf8(env, buffer, written, &value))) {
+        free(buffer);
+        return NULL;
+    }
+    free(buffer);
+    return make_status_result(env, status, value);
+}
+
 static napi_value local_endpoint(napi_env env, napi_callback_info info) {
-    /* The native platform owns automatic local endpoint derivation. */
     size_t argc = 1;
     napi_value args[1];
     C2MemFfiNodeSymbols *symbols = NULL;
@@ -788,31 +864,140 @@ static napi_value local_endpoint(napi_env env, napi_callback_info info) {
     if (address == NULL) {
         return NULL;
     }
-    size_t length = 0;
-    C2MemFfiStatus status = symbols->local_endpoint_len(address, &length);
-    if (status != C2_MEM_FFI_STATUS_OK) {
-        free(address);
-        return make_status_result(env, status, NULL);
+    C2MemFfiLocalEndpointContext *context = NULL;
+    if (endpoint_context_supported(symbols)) {
+        C2MemFfiStatus status = symbols->endpoint_context_capture(NULL, &context);
+        if (status != C2_MEM_FFI_STATUS_OK || context == NULL) {
+            free(address);
+            if (context != NULL) symbols->endpoint_context_free(context);
+            if (status == C2_MEM_FFI_STATUS_OK) {
+                return throw_error(env, "Native IPC endpoint capture returned no context.");
+            }
+            return make_status_result(env, status, NULL);
+        }
     }
-    if (length == SIZE_MAX) {
-        free(address);
-        return throw_error(env, "IPC endpoint name is too large.");
-    }
-    char *buffer = (char *)malloc(length + 1);
-    if (buffer == NULL) {
-        free(address);
-        return throw_error(env, "Out of memory.");
-    }
-    size_t written = 0;
-    status = symbols->local_endpoint_copy(address, buffer, length + 1, &written);
+    napi_value result = endpoint_string_result(env, symbols, context, address);
+    if (context != NULL) symbols->endpoint_context_free(context);
     free(address);
-    napi_value value = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_string_utf8(env, buffer, written, &value))) {
-        free(buffer);
+    return result;
+}
+
+static void endpoint_context_finalize(napi_env env, void *data, void *hint) {
+    (void)env;
+    (void)hint;
+    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)data;
+    if (context->ptr != NULL) {
+        context->symbols->endpoint_context_free(context->ptr);
+        context->ptr = NULL;
+    }
+    free(context);
+}
+
+static C2MemFfiNodeEndpointContext *endpoint_context_receiver(
+    napi_env env, napi_value receiver, bool require_open) {
+    bool tagged = false;
+    void *raw = NULL;
+    if (!check_napi(napi_check_object_type_tag(env, receiver, &endpoint_context_tag, &tagged)) ||
+        !tagged || !check_napi(napi_unwrap(env, receiver, &raw)) || raw == NULL) {
+        throw_type_error(env, "Expected a c2-mem-ffi native endpoint context receiver.");
         return NULL;
     }
-    free(buffer);
-    return make_status_result(env, status, value);
+    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)raw;
+    if (require_open && context->ptr == NULL) {
+        throw_type_error(env, "c2-mem-ffi native endpoint context is closed.");
+        return NULL;
+    }
+    return context;
+}
+
+static napi_value endpoint_context_name(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1], receiver;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc < 1) {
+        return throw_type_error(env, "endpointName expects an ipc:// address.");
+    }
+    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
+    if (context == NULL) return NULL;
+    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
+    if (address == NULL) return NULL;
+    napi_value result = endpoint_string_result(env, context->symbols, context->ptr, address);
+    free(address);
+    return result;
+}
+
+static napi_value endpoint_context_namespace_id(napi_env env, napi_callback_info info) {
+    napi_value receiver;
+    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL))) return NULL;
+    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
+    if (context == NULL) return NULL;
+    return endpoint_string_result(env, context->symbols, context->ptr, NULL);
+}
+
+static napi_value endpoint_context_close(napi_env env, napi_callback_info info) {
+    napi_value receiver;
+    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL))) return NULL;
+    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, false);
+    if (context == NULL) return NULL;
+    if (context->ptr != NULL) {
+        context->symbols->endpoint_context_free(context->ptr);
+        context->ptr = NULL;
+    }
+    napi_value result;
+    if (!check_napi(napi_get_undefined(env, &result))) return NULL;
+    return result;
+}
+
+static napi_value endpoint_context_capture(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1];
+    C2MemFfiNodeSymbols *symbols = NULL;
+    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols))) return NULL;
+    char *root = NULL;
+    if (argc > 0) {
+        napi_valuetype type;
+        if (!check_napi(napi_typeof(env, args[0], &type))) return NULL;
+        if (type != napi_null && type != napi_undefined) {
+            root = read_string_arg(env, args[0], "IPC root must be a string or null.");
+            if (root == NULL) return NULL;
+        }
+    }
+    C2MemFfiLocalEndpointContext *ptr = NULL;
+    C2MemFfiStatus status = symbols->endpoint_context_capture(root, &ptr);
+    free(root);
+    if (status != C2_MEM_FFI_STATUS_OK || ptr == NULL) {
+        if (ptr != NULL) symbols->endpoint_context_free(ptr);
+        if (status == C2_MEM_FFI_STATUS_OK) {
+            return throw_error(env, "Native IPC endpoint capture returned no context.");
+        }
+        return make_status_result(env, status, NULL);
+    }
+    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)calloc(1, sizeof(*context));
+    if (context == NULL) {
+        symbols->endpoint_context_free(ptr);
+        return throw_error(env, "Out of memory.");
+    }
+    context->symbols = symbols;
+    context->ptr = ptr;
+    napi_value object;
+    napi_property_descriptor methods[] = {
+        { "endpointName", NULL, endpoint_context_name, NULL, NULL, NULL, napi_default, NULL },
+        { "namespaceId", NULL, endpoint_context_namespace_id, NULL, NULL, NULL, napi_default, NULL },
+        { "close", NULL, endpoint_context_close, NULL, NULL, NULL, napi_default, NULL },
+    };
+    if (!check_napi(napi_create_object(env, &object)) ||
+        !check_napi(napi_define_properties(env, object, sizeof(methods) / sizeof(methods[0]), methods)) ||
+        !check_napi(napi_type_tag_object(env, object, &endpoint_context_tag)) ||
+        !check_napi(napi_wrap(env, object, context, endpoint_context_finalize, NULL, NULL))) {
+        endpoint_context_finalize(env, context, NULL);
+        return NULL;
+    }
+    napi_value result = make_status_result(env, status, object);
+    if (result == NULL) {
+        /* The wrapped object still owns its small shell; close native ownership now. */
+        symbols->endpoint_context_free(context->ptr);
+        context->ptr = NULL;
+    }
+    return result;
 }
 
 static bool load_symbol(napi_env env, void *library, const char *name, void **out) {
@@ -837,6 +1022,17 @@ static bool load_symbol(napi_env env, void *library, const char *name, void **ou
 #endif
     *out = symbol;
     return true;
+}
+
+/* Context symbols were appended to ABI 3; older ABI 3 libraries remain valid. */
+static void *optional_symbol(void *library, const char *name) {
+#ifdef _WIN32
+    return (void *)GetProcAddress((HMODULE)library, name);
+#else
+    dlerror();
+    void *symbol = dlsym(library, name);
+    return dlerror() == NULL ? symbol : NULL;
+#endif
 }
 
 static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
@@ -866,6 +1062,18 @@ static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
     LOAD_REQUIRED(response_pool_read, "c2_mem_ffi_response_pool_read");
     LOAD_REQUIRED(response_pool_release, "c2_mem_ffi_response_pool_release");
 #undef LOAD_REQUIRED
+    symbols->endpoint_context_capture = (endpoint_context_capture_fn)optional_symbol(
+        symbols->library, "c2_mem_ffi_local_endpoint_context_capture");
+    symbols->endpoint_context_free = (endpoint_context_free_fn)optional_symbol(
+        symbols->library, "c2_mem_ffi_local_endpoint_context_free");
+    symbols->endpoint_context_name_len = (endpoint_context_name_len_fn)optional_symbol(
+        symbols->library, "c2_mem_ffi_local_endpoint_context_name_len");
+    symbols->endpoint_context_name_copy = (endpoint_context_name_copy_fn)optional_symbol(
+        symbols->library, "c2_mem_ffi_local_endpoint_context_name_copy");
+    symbols->endpoint_context_namespace_id_len = (endpoint_context_namespace_id_len_fn)optional_symbol(
+        symbols->library, "c2_mem_ffi_local_endpoint_context_namespace_id_len");
+    symbols->endpoint_context_namespace_id_copy = (endpoint_context_namespace_id_copy_fn)optional_symbol(
+        symbols->library, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
     return true;
 }
 
@@ -937,6 +1145,12 @@ static napi_value load(napi_env env, napi_callback_info info) {
         !set_function(env, object, "c2_mem_ffi_response_pool_destroy", response_pool_destroy, symbols) ||
         !set_function(env, object, "c2_mem_ffi_response_pool_read", response_pool_read, symbols) ||
         !set_function(env, object, "c2_mem_ffi_response_pool_release", response_pool_release, symbols)) {
+        close_library(library);
+        free(symbols);
+        return NULL;
+    }
+    if (endpoint_context_supported(symbols) &&
+        !set_function(env, object, "c2_mem_ffi_local_endpoint_context_capture", endpoint_context_capture, symbols)) {
         close_library(library);
         free(symbols);
         return NULL;
