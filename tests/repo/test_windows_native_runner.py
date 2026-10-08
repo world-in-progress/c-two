@@ -101,9 +101,12 @@ def test_full_scope_gate_inventory_preserves_receipt_order():
     assert dependencies["windows-harness-tests"] == ["python-build"]
     assert set(dependencies[runner.IPC_MEMORY_GATE]) == {"python-build", "windows-harness-tests"}
     assert index["python-build"] < index["windows-harness-tests"] < index[runner.IPC_MEMORY_GATE]
-    # Local-platform selection stays a single native-library gate without the matrix.
+    # Local-platform covers native integration/Core state without SDK matrices.
     local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE)
     assert [name for name, _, _ in local] == ["local-platform-tests"]
+    local_args = local[0][1]
+    assert "--lib" not in local_args  # owner_control is an integration target
+    assert "c2-core" in local_args
 
 
 def test_ipc_memory_matrix_gate_runs_full_required_stats_bounded_matrix():
