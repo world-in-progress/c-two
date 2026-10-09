@@ -4,12 +4,12 @@ C-Two exposes stateful Python resources through typed CRM contracts over
 same-process calls, local IPC, or an external HTTP relay. This package projects
 the shared Rust runtime into Python.
 
-This guide describes Python C-Two **0.7.0** with c3 **0.3.0**. See
-[version availability, upgrades and validation progress](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.7.0.md).
+This guide describes Python C-Two **0.7.1** with c3 **0.3.1**. See
+[configuration and upgrade guide](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.7.1.md).
 In an activated environment (including Windows PowerShell):
 
 ```bash
-uv pip install 'c-two==0.7.0'
+uv pip install 'c-two==0.7.1'
 ```
 
 FastDB is pinned to `fastdb4py==0.2.1`. See the

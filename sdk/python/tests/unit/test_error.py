@@ -9,6 +9,7 @@ from c_two.error import (
     ResourceAlreadyRegistered, RouteStale, WriteConflict,
     ResourceClosed, ResourceRemoved, ContractMismatch, IdentityMismatch,
     RouteCatalogCompacted, RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
+    CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded,
 )
 
 
@@ -34,9 +35,12 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE == 712
         assert ERROR_Code.ERROR_PROTOCOL_VIOLATION == 713
         assert ERROR_Code.ERROR_FALLBACK_DENIED == 714
+        assert ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED == 715
+        assert ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE == 716
+        assert ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED == 717
 
-    def test_has_exactly_23_members(self):
-        assert len(ERROR_Code) == 23
+    def test_has_exactly_26_members(self):
+        assert len(ERROR_Code) == 26
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -186,6 +190,12 @@ ROUTE_CATALOG_SUBCLASS_PARAMS = [
     (FallbackDenied, ERROR_Code.ERROR_FALLBACK_DENIED),
 ]
 
+CALL_ERROR_SUBCLASS_PARAMS = [
+    (CallDeadlineExceeded, ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED),
+    (UnsupportedCallMode, ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE),
+    (CallCapacityExceeded, ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED),
+]
+
 
 class TestErrorSubclasses:
     @pytest.mark.parametrize("cls,expected_code,desc_fragment", SUBCLASS_PARAMS)
@@ -224,6 +234,120 @@ class TestRouteCatalogErrorSubclasses:
         assert err.details == {'route': 'grid'}
 
 
+class TestCallErrorSubclasses:
+    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
+    def test_correct_error_code_message_and_details(self, cls, expected_code):
+        err = cls('bounded call failed', details={'route': 'grid'})
+        assert err.code == expected_code
+        assert err.message == 'bounded call failed'
+        assert err.details == {'route': 'grid'}
+
+    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
+    def test_default_message(self, cls, expected_code):
+        err = cls()
+        assert err.code == expected_code
+        assert isinstance(err.message, str)
+        assert err.message != ''
+
+    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
+    def test_is_cc_error(self, cls, expected_code):
+        err = cls()
+        assert isinstance(err, CCError)
+        assert isinstance(err, CCBaseError)
+        assert isinstance(err, Exception)
+
+
+class TestCallDeadlineExceededTransportPhase:
+    def test_phase_property_reads_pre_dispatch_detail(self):
+        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
+        assert err.transport_phase == 'pre_dispatch'
+
+    def test_phase_property_reads_dispatch_uncertain_detail(self):
+        err = CallDeadlineExceeded('late', details={'transport_phase': 'dispatch_uncertain'})
+        assert err.transport_phase == 'dispatch_uncertain'
+
+    def test_phase_property_is_none_without_detail(self):
+        err = CallDeadlineExceeded('late')
+        assert err.transport_phase is None
+
+    def test_phase_property_is_read_only(self):
+        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
+        with pytest.raises(AttributeError):
+            err.transport_phase = 'dispatch_uncertain'
+        assert err.transport_phase == 'pre_dispatch'
+
+    def test_phase_property_does_not_rewrite_received_details(self):
+        details = {'transport_phase': 'dispatch_uncertain', 'route': 'grid'}
+        err = CallDeadlineExceeded('late', details=details)
+        assert err.transport_phase == 'dispatch_uncertain'
+        assert err.details == {'transport_phase': 'dispatch_uncertain', 'route': 'grid'}
+
+    def test_phase_not_stored_as_instance_attribute_copy(self):
+        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
+        assert 'transport_phase' not in vars(err)
+
+    def test_wire_carries_phase_only_once_as_detail(self):
+        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
+        wire = CCError.serialize(err)
+        assert wire.count(b'transport_phase') == 1
+        restored = CCError.deserialize(memoryview(wire))
+        assert isinstance(restored, CallDeadlineExceeded)
+        assert restored.transport_phase == 'pre_dispatch'
+        assert restored.details == {'transport_phase': 'pre_dispatch'}
+
+    def test_wire_omits_phase_when_detail_absent(self):
+        err = CallDeadlineExceeded('late')
+        wire = CCError.serialize(err)
+        assert b'transport_phase' not in wire
+        restored = CCError.deserialize(memoryview(wire))
+        assert isinstance(restored, CallDeadlineExceeded)
+        assert restored.transport_phase is None
+
+
+class TestNewCallErrorCodec:
+    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
+    def test_canonical_native_codec_round_trip(self, cls, expected_code):
+        original = cls('budget exhausted', details={'route': 'grid', 'stage': 'call_deadline'})
+        data = CCError.serialize(original)
+        restored = CCError.deserialize(memoryview(data))
+        assert isinstance(restored, cls)
+        assert restored.code == expected_code
+        assert restored.message == 'budget exhausted'
+        assert restored.details == {'route': 'grid', 'stage': 'call_deadline'}
+
+    def test_deadline_error_round_trip_keeps_phase_and_details(self):
+        original = CallDeadlineExceeded(
+            'deadline elapsed before a definitive outcome',
+            details={'transport_phase': 'dispatch_uncertain', 'fallback_eligible': 'false'},
+        )
+        wire = CCError.serialize(original)
+        assert wire.startswith(b'C2E1{"version":1,"code":715,"name":"CallDeadlineExceeded"')
+        restored = CCError.deserialize(memoryview(wire))
+        assert isinstance(restored, CallDeadlineExceeded)
+        assert restored.message == 'deadline elapsed before a definitive outcome'
+        assert restored.details == {
+            'transport_phase': 'dispatch_uncertain',
+            'fallback_eligible': 'false',
+        }
+        assert restored.transport_phase == 'dispatch_uncertain'
+
+    def test_unsupported_call_mode_round_trip(self):
+        original = UnsupportedCallMode('finite deadline does not support same-process sync')
+        restored = CCError.deserialize(memoryview(CCError.serialize(original)))
+        assert isinstance(restored, UnsupportedCallMode)
+        assert restored.code == ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE
+        assert restored.message == 'finite deadline does not support same-process sync'
+        assert restored.details == {}
+
+    def test_call_capacity_exceeded_round_trip(self):
+        original = CallCapacityExceeded('continuation byte capacity exhausted')
+        restored = CCError.deserialize(memoryview(CCError.serialize(original)))
+        assert isinstance(restored, CallCapacityExceeded)
+        assert restored.code == ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED
+        assert restored.message == 'continuation byte capacity exhausted'
+        assert restored.details == {}
+
+
 ALL_SUBCLASSES = [
     error.ResourceDeserializeInput,
     error.ResourceInputFromBuffer,
@@ -242,6 +366,9 @@ ALL_SUBCLASSES = [
     error.RouteWatchUnavailable,
     error.ProtocolViolation,
     error.FallbackDenied,
+    error.CallDeadlineExceeded,
+    error.UnsupportedCallMode,
+    error.CallCapacityExceeded,
 ]
 
 
@@ -349,12 +476,28 @@ class TestNativeErrorRegistryParity:
             "ERROR_ROUTE_WATCH_UNAVAILABLE": ("RouteWatchUnavailable", 712),
             "ERROR_PROTOCOL_VIOLATION": ("ProtocolViolation", 713),
             "ERROR_FALLBACK_DENIED": ("FallbackDenied", 714),
+            "ERROR_CALL_DEADLINE_EXCEEDED": ("CallDeadlineExceeded", 715),
+            "ERROR_UNSUPPORTED_CALL_MODE": ("UnsupportedCallMode", 716),
+            "ERROR_CALL_CAPACITY_EXCEEDED": ("CallCapacityExceeded", 717),
         }
 
         assert set(ERROR_Code.__members__) == set(expected)
         for py_name, (native_name, value) in expected.items():
             assert native[native_name] == value
             assert ERROR_Code[py_name].value == value
+
+    def test_native_registry_entries_are_unique_and_exact(self):
+        from c_two import _native
+
+        native = _native.error_registry()
+        assert len(native) == 26
+        names = list(native.keys())
+        values = list(native.values())
+        assert len(set(names)) == len(names)
+        assert len(set(values)) == len(values)
+        assert native["CallDeadlineExceeded"] == 715
+        assert native["UnsupportedCallMode"] == 716
+        assert native["CallCapacityExceeded"] == 717
 
     def test_serialize_uses_native_wire_encoder(self, monkeypatch):
         calls = []

@@ -110,6 +110,9 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
         def __getattr__(self, name):
             return getattr(self.native_session, name)
 
+        def inherit_local_endpoint_selection(self, previous):
+            self.native_session.inherit_local_endpoint_selection(previous.native_session)
+
         def adopt_retired_memory_observation(self, observation):
             if self.fail_adoption:
                 raise RuntimeError('injected failed adoption')
@@ -153,8 +156,14 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
         assert outcome['completed']
         assert resource.hooks == 1
     finally:
+        # Undo failure injection before cleanup, even if an assertion failed.
+        # The boundary wrapper must not escape into another test's registry.
+        monkeypatch.setattr(registry_module, '_runtime_session_kwargs_from_settings', original_kwargs)
+        AdoptionBoundary.fail_adoption = False
+        if isinstance(registry._runtime_session, AdoptionBoundary):
+            registry._runtime_session = registry._runtime_session.native_session
         keepalive.shutdown()
-        cc.shutdown(timeout=5)
+        assert cc.shutdown(timeout=5)['completed']
         settings.shm_threshold = previous_threshold
 
 

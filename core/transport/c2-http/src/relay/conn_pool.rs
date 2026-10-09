@@ -499,7 +499,19 @@ impl UpstreamSlot {
                             }
                         };
                         if acquire.is_none() {
-                            client.close_shared().await;
+                            // A rejected candidate must start closing even when an
+                            // external Arc survives. Only this candidate is fenced;
+                            // the replacement slot/client is untouched. Production
+                            // connectors published it into the bounded Relay owner
+                            // domain before returning it here. An unconfirmed close
+                            // leaves that owner intact and is_connected=false makes
+                            // its existing observer retry until confirmed cleanup.
+                            let cleanup_confirmed =
+                                client.close_shared_bounded(Duration::from_millis(50)).await;
+                            tracing::debug!(
+                                cleanup_confirmed,
+                                "closing rejected upstream candidate"
+                            );
                             return Err(AcquireError::NotFound);
                         }
                         self.notify.notify_waiters();

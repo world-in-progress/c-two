@@ -7,11 +7,11 @@
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use c2_config::MemoryBudgetLimits;
+use c2_config::{LocalEndpoint, LocalEndpointContext, MemoryBudgetLimits};
 use c2_mem::{MemPool, PoolConfig};
 
 /// Label counter for client pools. MemPool adds its incarnation and owns
@@ -240,7 +240,7 @@ fn is_transient_connect_error(error: &IpcError) -> bool {
 }
 
 fn connect_with_transient_retry(
-    address: &str,
+    endpoint: &LocalEndpoint,
     cfg: &ClientIpcConfig,
     budget: &c2_mem::MemoryBudget,
 ) -> Result<SyncClient, IpcError> {
@@ -264,7 +264,12 @@ fn connect_with_transient_retry(
                 .map_err(|e| IpcError::Io(std::io::Error::other(e)))?;
         }
 
-        match SyncClient::connect_transport_pool(address, pool, cfg.clone(), budget.clone()) {
+        match SyncClient::connect_transport_pool(
+            endpoint.clone(),
+            pool,
+            cfg.clone(),
+            budget.clone(),
+        ) {
             Ok(client) => return Ok(client),
             Err(error)
                 if attempt + 1 < CONNECT_TRANSIENT_RETRY_ATTEMPTS
@@ -377,6 +382,9 @@ pub struct ClientCacheCloseReport {
 /// losers, discards, drains) are always closed explicitly through the bounded
 /// shared-ownership close instead of relying on `Drop`.
 pub struct ClientPool {
+    // One immutable namespace per cache. Address keys are scoped by this owner;
+    // draining changes only the epoch, never the endpoint or memory domain.
+    endpoint_context: Result<LocalEndpointContext, String>,
     state: Mutex<CacheState>,
     grace_period: Duration,
     default_config: Mutex<Option<ClientIpcConfig>>,
@@ -411,9 +419,7 @@ fn close_retired_ticket(
     let client = {
         let txn_state = txn.0.lock();
         match txn_state.retired.get(&ticket) {
-            Some(record) if record.state == RetiredState::Closing => {
-                Arc::clone(&record.client)
-            }
+            Some(record) if record.state == RetiredState::Closing => Arc::clone(&record.client),
             // Already removed by a confirming retry elsewhere, or never
             // registered: nothing to close, nothing to report.
             _ => return Ok(()),
@@ -457,7 +463,25 @@ fn run_retired_closes(txn: &(Mutex<CloseTxnState>, Condvar), tickets: &[u64]) {
 impl ClientPool {
     /// Create a new pool with the given grace period.
     pub fn new(grace_period: Duration) -> Self {
+        Self::from_endpoint_context(
+            grace_period,
+            LocalEndpointContext::default_for_platform().map_err(|error| error.to_string()),
+        )
+    }
+
+    /// Create one cache domain from a resolved, immutable endpoint context.
+    /// Unix custom-root containers must exist before acquire. Windows callers
+    /// supply the platform's Named Pipe context, with no Unix path projection.
+    pub fn with_endpoint_context(grace_period: Duration, context: LocalEndpointContext) -> Self {
+        Self::from_endpoint_context(grace_period, Ok(context))
+    }
+
+    fn from_endpoint_context(
+        grace_period: Duration,
+        context: Result<LocalEndpointContext, String>,
+    ) -> Self {
         Self {
+            endpoint_context: context,
             state: Mutex::new(CacheState {
                 entries: HashMap::new(),
                 epoch: 0,
@@ -476,6 +500,13 @@ impl ClientPool {
                 Condvar::new(),
             )),
         }
+    }
+
+    /// The namespace shared by every entry and every epoch of this cache.
+    pub fn endpoint_context(&self) -> Result<&LocalEndpointContext, IpcError> {
+        self.endpoint_context
+            .as_ref()
+            .map_err(|error| IpcError::Config(error.clone()))
     }
 
     /// Set the default IPC config for newly created clients.
@@ -667,7 +698,12 @@ impl ClientPool {
             return Err(error);
         }
 
-        let client = Arc::new(connect_with_transient_retry(address, &cfg, &budget)?);
+        // Derive once before retries; every attempt uses this same snapshot.
+        let endpoint = self
+            .endpoint_context()?
+            .endpoint(address)
+            .map_err(crate::control::endpoint_error)?;
+        let client = Arc::new(connect_with_transient_retry(&endpoint, &cfg, &budget)?);
 
         let mut state = self.state.lock();
         if state.closing_generation.is_some() || state.epoch != epoch {
@@ -914,8 +950,7 @@ impl ClientPool {
                             .values()
                             .any(|record| record.state == RetiredState::Closing))
                 {
-                    report.error =
-                        Some(Self::drain_wait_error(txn.active_generation.is_some()));
+                    report.error = Some(Self::drain_wait_error(txn.active_generation.is_some()));
                     return report;
                 }
             }
@@ -1019,7 +1054,10 @@ impl ClientPool {
             debug_assert_eq!(txn.active_generation, Some(generation));
             txn.active_generation = None;
             for record in txn.retired.values() {
-                let already_reported = report.unconfirmed.iter().any(|address| *address == record.address);
+                let already_reported = report
+                    .unconfirmed
+                    .iter()
+                    .any(|address| *address == record.address);
                 if !already_reported {
                     report.unconfirmed.push(record.address.clone());
                 }
@@ -1537,7 +1575,8 @@ mod tests {
             crm_ns: "test.pool".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .to_string(),
             max_payload_size: 1024 * 1024 * 1024,
@@ -1932,7 +1971,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let reopen_address = unique_ipc_address("pool_epoch_reopen");
-            let server = Arc::new(Server::new(&reopen_address, ServerIpcConfig::default()).unwrap());
+            let server =
+                Arc::new(Server::new(&reopen_address, ServerIpcConfig::default()).unwrap());
             let runner = {
                 let server = Arc::clone(&server);
                 tokio::spawn(async move { server.run().await })
@@ -2017,11 +2057,10 @@ mod tests {
             // operations run off this runtime's workers.)
             let probe_pool = Arc::clone(&pool);
             let probe_address = address.clone();
-            let probe_result = tokio::task::spawn_blocking(move || {
-                probe_pool.acquire(&probe_address, None)
-            })
-            .await
-            .expect("acquire probe task");
+            let probe_result =
+                tokio::task::spawn_blocking(move || probe_pool.acquire(&probe_address, None))
+                    .await
+                    .expect("acquire probe task");
             match probe_result {
                 Err(IpcError::Pool(message)) => assert!(
                     message.contains("closing"),
@@ -2056,8 +2095,7 @@ mod tests {
             // Release the writer: the first drain confirms and reopens the
             // cache under a new epoch.
             drop(release_tx);
-            let (first_report, first_elapsed) =
-                drain_thread.join().expect("first drain thread");
+            let (first_report, first_elapsed) = drain_thread.join().expect("first drain thread");
             assert_eq!(first_report.detached, 1, "{first_report:?}");
             assert!(first_report.unconfirmed.is_empty(), "{first_report:?}");
             assert!(first_report.error.is_none(), "{first_report:?}");
@@ -2071,19 +2109,17 @@ mod tests {
             // Restart semantics: a fresh acquire under the new epoch works.
             let reopen_pool = Arc::clone(&pool);
             let reopen_address = address.clone();
-            let reopened = tokio::task::spawn_blocking(move || {
-                reopen_pool.acquire(&reopen_address, None)
-            })
-            .await
-            .expect("reopen acquire task")
-            .expect("acquire after drain");
+            let reopened =
+                tokio::task::spawn_blocking(move || reopen_pool.acquire(&reopen_address, None))
+                    .await
+                    .expect("reopen acquire task")
+                    .expect("acquire after drain");
             assert!(reopened.is_connected());
             let final_pool = Arc::clone(&pool);
-            let final_report = tokio::task::spawn_blocking(move || {
-                final_pool.close_all(Duration::from_secs(2))
-            })
-            .await
-            .expect("final drain task");
+            let final_report =
+                tokio::task::spawn_blocking(move || final_pool.close_all(Duration::from_secs(2)))
+                    .await
+                    .expect("final drain task");
             assert!(final_report.error.is_none(), "{final_report:?}");
             assert!(final_report.unconfirmed.is_empty(), "{final_report:?}");
 
@@ -2198,7 +2234,10 @@ mod tests {
             .send(())
             .expect("release the receiver cancellation gate");
         let retry = client.close_shared(Duration::from_secs(2));
-        assert!(retry, "a later close must confirm after the serialized barriers");
+        assert!(
+            retry,
+            "a later close must confirm after the serialized barriers"
+        );
         assert!(!client.is_connected());
 
         let _ = release_tx.send(());
@@ -2243,8 +2282,9 @@ mod tests {
             let discard_pool = Arc::clone(&pool);
             let discard_address = address.clone();
             let discard_client = Arc::clone(&client);
-            let discard_thread =
-                thread::spawn(move || discard_pool.discard_if_same(&discard_address, &discard_client));
+            let discard_thread = thread::spawn(move || {
+                discard_pool.discard_if_same(&discard_address, &discard_client)
+            });
             assert!(
                 pool.wait_until_detached_close_in_flight_for_test(Duration::from_secs(5)),
                 "discard must register its pending close before any close I/O"
@@ -2275,11 +2315,10 @@ mod tests {
                 "discard must complete once the writer slot frees"
             );
             let clean_pool = Arc::clone(&pool);
-            let clean = tokio::task::spawn_blocking(move || {
-                clean_pool.close_all(Duration::from_secs(2))
-            })
-            .await
-            .expect("clean drain task");
+            let clean =
+                tokio::task::spawn_blocking(move || clean_pool.close_all(Duration::from_secs(2)))
+                    .await
+                    .expect("clean drain task");
             assert_eq!(clean.detached, 0, "{clean:?}");
             assert!(clean.error.is_none(), "{clean:?}");
             assert!(clean.unconfirmed.is_empty(), "{clean:?}");
@@ -2348,11 +2387,10 @@ mod tests {
             // unconfirmed record and confirms its close.
             drop(release_tx);
             let second_pool = Arc::clone(&pool);
-            let second = tokio::task::spawn_blocking(move || {
-                second_pool.close_all(Duration::from_secs(2))
-            })
-            .await
-            .expect("second drain task");
+            let second =
+                tokio::task::spawn_blocking(move || second_pool.close_all(Duration::from_secs(2)))
+                    .await
+                    .expect("second drain task");
             assert_eq!(second.detached, 0, "{second:?}");
             assert!(second.error.is_none(), "{second:?}");
             assert!(

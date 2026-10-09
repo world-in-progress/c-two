@@ -179,6 +179,7 @@ def _build_transfer_wrapper(
 
     def com_to_crm(*args, _c2_buffer=None):
         stage = "call_crm"
+        prepared = None
         output_hook = "deserialize"
         input_serializer = (
             input.serialize
@@ -213,7 +214,25 @@ def _build_transfer_wrapper(
                     return HeldResult(result)
                 return result
 
+            # Both bound calls and CRM.method(instance, ...) enter here. Reserve
+            # before running Python serializer hooks; native preparation owns D.
+            prepare_call = getattr(client, "prepare_call", None)
+            if callable(prepare_call):
+                prepared = prepare_call(method_name)
+
             stage = "serialize_input"
+            if (
+                prepared is not None
+                and input is not None
+                and input.kind is PayloadPlanKind.FASTDB
+                and request is not None
+                and len(request) == 1
+            ):
+                from fastdb4py.payload import Payload
+                if isinstance(request[0], Payload):
+                    # Metadata may reject an invalid owner and belongs to the
+                    # same input-error boundary as the serializer itself.
+                    prepared.charge_input(request[0].execution_report().used_bytes)
             serialized_args = (
                 input_serializer(*request)
                 if request is not None and input_serializer is not None
@@ -221,7 +240,8 @@ def _build_transfer_wrapper(
             )
 
             stage = "call_crm"
-            response = client.call(method_name, serialized_args)
+            call_client = client if prepared is None else prepared
+            response = call_client.call(method_name, serialized_args)
 
             stage = "deserialize_output"
             if output_decoder is None:
@@ -335,6 +355,9 @@ def _build_transfer_wrapper(
             if output_hook == "scoped_owner":
                 raise error.ClientOutputFromBuffer(str(exc), details=details) from exc
             raise error.ClientDeserializeOutput(str(exc), details=details) from exc
+        finally:
+            if prepared is not None:
+                prepared.close()
 
     def crm_to_com(
         *args,

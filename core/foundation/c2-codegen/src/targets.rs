@@ -70,6 +70,9 @@ pub fn expected_route(
     Ok(contract_release()?.expected_route(route_name)?)
 }
 
+/// Typed calls consume the sealed c_two::generated::EncodedClient authority
+/// through Core preparation, before caller-side serialization.
+#[derive(Clone)]
 pub struct ContractClient {
     client: c_two::Client,
 }
@@ -90,6 +93,15 @@ impl ContractClient {
             .into());
         }
         Ok(Self { client })
+    }
+
+    /// Immutable policy view over the same route and connection acquisition.
+    pub fn with_call_options(&self, options: c_two::CallOptions) -> Self {
+        Self { client: self.client.with_call_options(options) }
+    }
+
+    pub fn call_options(&self) -> c_two::CallOptions {
+        self.client.call_options()
     }
 
     pub fn expected_route(&self) -> &c_two::ExpectedRouteContract {
@@ -293,14 +305,22 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
     } else {
         format!("encode_{symbol}_input()")
     };
+    let preparation = if method.input_sha256.is_some() {
+        "        c_two::generated::charge_payload_input(&mut call, payload)?;\n"
+    } else {
+        ""
+    };
+    let binding = if method.input_sha256.is_some() {
+        "mut call"
+    } else {
+        "call"
+    };
     output.push_str(&format!(
         "\n    pub fn {symbol}(&self{parameter}) -> Result<{return_type}, c_two::Error> {{\n\
+         \x20       let {binding} = self.client.begin_call({})?;\n\
+         {preparation}\
          \x20       let request = {request};\n\
-         \x20       let response = c_two::generated::EncodedClient::call_owned(\n\
-         \x20           &self.client,\n\
-         \x20           {},\n\
-         \x20           &request,\n\
-         \x20       )?;\n\
+         \x20       let response = call.encode_vec(request)?.call_owned()?;\n\
          \x20       decode_{symbol}_output(&response)\n\
          \x20   }}\n",
         quoted(method.name),
@@ -310,12 +330,10 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
             "\n    pub fn hold_{symbol}(\n\
              \x20       &self{parameter},\n\
              \x20   ) -> Result<c_two::Held<fastdb::Payload>, c_two::Error> {{\n\
+             \x20       let {binding} = self.client.begin_call({})?;\n\
+             {preparation}\
              \x20       let request = {request};\n\
-             \x20       let response = c_two::generated::EncodedClient::call_held(\n\
-             \x20           &self.client,\n\
-             \x20           {},\n\
-             \x20           &request,\n\
-             \x20       )?;\n\
+             \x20       let response = call.encode_vec(request)?.call_held()?;\n\
              \x20       decode_{symbol}_output_held(response)\n\
              \x20   }}\n",
             quoted(method.name),
@@ -1059,3 +1077,7 @@ fn method_symbol(index: usize, name: &str) -> String {
     }
     symbol
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

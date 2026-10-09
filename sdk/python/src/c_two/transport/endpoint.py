@@ -16,7 +16,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from c_two._native import LocalEndpointContext
+
 __all__ = [
+    'LocalEndpointContext',
+    'local_endpoint_context',
     'EndpointCredential',
     'EndpointSweep',
     'inspect_endpoint',
@@ -33,6 +37,44 @@ def _native() -> Any:
     from c_two import _native
 
     return _native
+
+
+def _selection(
+    root: str | None,
+    context: LocalEndpointContext | None,
+) -> None:
+    """Check argument shapes only; native code validates the selection."""
+    if root is not None and not isinstance(root, str):
+        raise TypeError('root must be a str or None')
+    if context is not None and not isinstance(context, LocalEndpointContext):
+        raise TypeError('context must be a LocalEndpointContext or None')
+    if root is not None and context is not None:
+        raise TypeError('root and context are mutually exclusive')
+
+
+def _selected_context(
+    root: str | None,
+    context: LocalEndpointContext | None,
+) -> LocalEndpointContext:
+    _selection(root, context)
+    if context is not None:
+        return context
+    if root is not None:
+        return _native().resolve_local_endpoint_context(root=root)
+    from .registry import _ProcessRegistry
+
+    return _ProcessRegistry.get()._runtime_session.local_endpoint_context()  # noqa: SLF001
+
+
+def local_endpoint_context(*, root: str | None = None) -> LocalEndpointContext:
+    """Capture the current Runtime's immutable native endpoint context.
+
+    This query creates no endpoint metadata and does not freeze the Runtime.
+    An explicit ``root`` resolves an independent supervisor context through
+    Core, without changing the current Runtime. Unix root containers must be
+    pre-created before bind/connect; Windows rejects root overrides.
+    """
+    return _selected_context(root, None)
 
 
 class EndpointCredential:
@@ -73,6 +115,11 @@ class EndpointCredential:
         return self._native.address
 
     @property
+    def context(self) -> LocalEndpointContext:
+        """The endpoint context captured by the sole native credential codec."""
+        return self._native.context
+
+    @property
     def protocol(self) -> str:
         """The endpoint protocol this credential records (metadata)."""
         return self._native.protocol
@@ -86,11 +133,18 @@ class EndpointCredential:
         return f'EndpointCredential(address={self.address!r}, protocol={self.protocol!r})'
 
 
-def inspect_endpoint(address: str) -> dict[str, Any]:
+def inspect_endpoint(
+    address: str,
+    *,
+    root: str | None = None,
+    context: LocalEndpointContext | None = None,
+) -> dict[str, Any]:
     """Inspect one logical local endpoint without creating ownership metadata.
 
     Args:
         address: Logical IPC address, for example ``'ipc://my_server'``.
+        root: Independent Unix root selection for a supervisor.
+        context: Captured native context. Defaults to the current Runtime.
 
     Returns:
         A result dictionary with ``status``, ``credential``, ``reason``,
@@ -108,17 +162,24 @@ def inspect_endpoint(address: str) -> dict[str, Any]:
     if not isinstance(address, str):
         raise TypeError('address must be a str')
     result = dict(
-        _native().inspect_endpoint_endpoint(address)
+        _native().inspect_endpoint_endpoint(address, context=_selected_context(root, context))
     )
     _wrap_credential(result)
     return result
 
 
-def reap_endpoint(address: str, credential: EndpointCredential) -> dict[str, Any]:
+def reap_endpoint(
+    address: str,
+    credential: EndpointCredential,
+    *,
+    root: str | None = None,
+    context: LocalEndpointContext | None = None,
+) -> dict[str, Any]:
     """Reap the exact endpoint object named by ``credential``.
 
-    Rust derives the endpoint from its address using the current OS backend.
-    Credential format metadata must match that backend and cannot select it.
+    Rust uses the endpoint captured by the strict credential codec, including
+    its historical root. Current environment or Runtime selection cannot
+    reinterpret it. An explicit root/context must match before state access.
     A credential describing another endpoint is
     reported as ``'stale-target'`` and is never probed against this endpoint's
     namespace. A decoded credential never removes a newer native incarnation:
@@ -140,8 +201,11 @@ def reap_endpoint(address: str, credential: EndpointCredential) -> dict[str, Any
         raise TypeError('address must be a str')
     if not isinstance(credential, EndpointCredential):
         raise TypeError('credential must be an EndpointCredential')
+    _selection(root, context)
     return dict(
-        _native().reap_endpoint_credential(address, credential._native)  # noqa: SLF001
+        _native().reap_endpoint_credential(  # noqa: SLF001
+            address, credential._native, root=root, context=context,
+        )
     )
 
 
@@ -169,6 +233,11 @@ class EndpointSweep:
     def protocol(self) -> str:
         """The protocol namespace this sweep covers."""
         return self._native.protocol
+
+    @property
+    def context(self) -> LocalEndpointContext:
+        """The native context captured when this sweep was opened."""
+        return self._native.context
 
     @property
     def closed(self) -> bool:
@@ -232,10 +301,13 @@ def sweep_endpoints(
     addresses: list[str] | None = None,
     max_entries: int | None = None,
     max_ms: int | None = None,
+    root: str | None = None,
+    context: LocalEndpointContext | None = None,
 ) -> EndpointSweep:
     """Open one bounded maintenance sweep over the platform native namespace.
 
-    The returned sweep must be closed.
+    The returned sweep must be closed. One context is captured for the entire
+    round; batches do not re-read environment or Runtime selection.
 
     Args:
         addresses: Optional logical IPC addresses to select. ``None`` covers
@@ -247,6 +319,8 @@ def sweep_endpoints(
         max_ms: Optional wall-clock budget override in milliseconds. ``None``
             keeps the native default. Explicit values are validated by the
             native gate before the process lease or iterator exists.
+        root: Independent Unix root selection for a supervisor.
+        context: Captured native context. Defaults to the current Runtime.
 
     Raises:
         RuntimeError: another sweep is already active in this process.
@@ -258,7 +332,10 @@ def sweep_endpoints(
     # the default budget and validates every explicit dimension before it
     # takes the process lease or opens the iterator.
     return EndpointSweep(
-        native.PyEndpointSweep(addresses=addresses, max_entries=max_entries, max_ms=max_ms)
+        native.PyEndpointSweep(
+            addresses=addresses, max_entries=max_entries, max_ms=max_ms,
+            context=_selected_context(root, context),
+        )
     )
 
 

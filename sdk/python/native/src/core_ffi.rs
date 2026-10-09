@@ -9,15 +9,15 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use c2_core::{
-    Client, EncodedClient, EncodedService, HeldResponse, LifecycleError, ObservedPath,
-    ObservedRoute,
+    CallOptions, CallTimeout, Client, EncodedService, HeldResponse, LifecycleError, ObservedPath,
+    ObservedRoute, PreparedCall,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::BufferLeaseGuard;
 
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
 use crate::lease_ffi::PyBufferLeaseTracker;
-use crate::writable_sink::{prepared_plan_nbytes, write_python_payload_plan};
+use crate::writable_sink::{materialize_python_payload_plan, prepared_plan_nbytes};
 
 #[pyclass(name = "CoreClient", frozen, skip_from_py_object)]
 pub(crate) struct PyCoreClient {
@@ -40,40 +40,177 @@ impl PyCoreClient {
         }
     }
 
-    fn call_bytes<'py>(
-        &self,
-        py: Python<'py>,
-        method_name: &str,
-        request: Vec<u8>,
-    ) -> PyResult<Py<PyAny>> {
-        let result = py.detach(|| {
-            let client = self.inner.lock();
-            let client = client
-                .as_ref()
-                .ok_or_else(|| LifecycleError::Server("Core client is closed".to_string()))?;
-            client
-                .call_held(method_name, &request)
-                .map_err(CoreCallFailure::Core)
-        });
-        let held = match result {
-            Ok(held) => held,
-            Err(CoreCallFailure::Core(error)) => return Err(core_error_to_py(error)),
-            Err(CoreCallFailure::Lifecycle(error)) => {
-                return Err(lifecycle_error_to_py(error));
-            }
-        };
-        Ok(Py::new(py, PyCoreResponse::new(held))?.into_any())
+    // Keep this view lock out of preparation, config, materialization and I/O.
+    fn client(&self) -> PyResult<Client> {
+        self.inner.lock().clone().ok_or_else(|| {
+            lifecycle_error_to_py(LifecycleError::Server("Core client is closed".into()))
+        })
     }
 }
 
-enum CoreCallFailure {
-    Core(c2_core::Error),
-    Lifecycle(LifecycleError),
+#[pyclass(name = "NativeCallOptions", frozen, skip_from_py_object)]
+struct PyNativeCallOptions {
+    options: CallOptions,
 }
 
-impl From<LifecycleError> for CoreCallFailure {
-    fn from(error: LifecycleError) -> Self {
-        Self::Lifecycle(error)
+fn inherit_timeout() -> Py<PyAny> {
+    Python::attach(|py| py.Ellipsis())
+}
+
+fn call_options(py: Python<'_>, timeout: &Py<PyAny>) -> PyResult<CallOptions> {
+    let timeout = timeout.bind(py);
+    let timeout = if timeout.is(&py.Ellipsis()) {
+        CallTimeout::Inherit
+    } else if timeout.is_none() {
+        CallTimeout::Unlimited
+    } else {
+        CallTimeout::try_after_seconds(timeout.extract::<f64>()?)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?
+    };
+    // Validate the monotonic clock range through Core as well as Duration.
+    let options = CallOptions::with_timeout(timeout);
+    c2_core::CallScope::new(options, None)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(options)
+}
+
+#[pymethods]
+impl PyNativeCallOptions {
+    #[new]
+    #[pyo3(signature = (*, timeout=inherit_timeout()))]
+    fn new(py: Python<'_>, timeout: Py<PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            options: call_options(py, &timeout)?,
+        })
+    }
+
+    fn validate_thread(&self) -> PyResult<()> {
+        if self.options.effective_timeout(None).is_some() {
+            return Err(core_error_to_py(c2_core::Error::Semantic(
+                C2Error::new(
+                    ErrorCode::UnsupportedCallMode,
+                    "finite call timeout is unsupported for synchronous thread-local calls",
+                )
+                .with_details(BTreeMap::from([
+                    ("transport_phase".into(), "pre_dispatch".into()),
+                    ("fallback_eligible".into(), "false".into()),
+                    ("route_withdrawal".into(), "false".into()),
+                ])),
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One native scope and finite slot, reserved before caller-side serialization.
+/// Taking the Option makes every execution attempt single use, including errors.
+#[pyclass(name = "NativePreparedCall", frozen, skip_from_py_object)]
+struct PyNativePreparedCall {
+    inner: Mutex<Option<PreparedCall>>,
+}
+
+impl PyNativePreparedCall {
+    fn take(&self) -> PyResult<PreparedCall> {
+        self.inner.lock().take().ok_or_else(|| {
+            PyValueError::new_err("prepared call has already been consumed or closed")
+        })
+    }
+
+    fn finish(py: Python<'_>, encoded: c2_core::EncodedCall) -> PyResult<PyCoreResponse> {
+        py.detach(move || encoded.call_held())
+            .map(PyCoreResponse::new)
+            .map_err(core_error_to_py)
+    }
+}
+
+#[pymethods]
+impl PyNativePreparedCall {
+    fn charge_input(&self, nbytes: u64) -> PyResult<()> {
+        let mut inner = self.inner.lock();
+        inner
+            .as_mut()
+            .ok_or_else(|| {
+                PyValueError::new_err("prepared call has already been consumed or closed")
+            })?
+            .charge_input(nbytes)
+            .map_err(core_error_to_py)
+    }
+
+    fn call(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
+        let mut prepared = self.take()?;
+        if let Ok(bytes) = data.cast_exact::<PyBytes>() {
+            let nbytes = bytes.as_bytes().len();
+            // Exact built-in bytes have no user finalizer; their storage is immutable; the strong Py owner is Send and pins its
+            // storage until the Core-owned factory finishes. The owner is
+            // accessed under the GIL, the native copy detaches, and no Python
+            // callback runs on the Core execution worker.
+            let owner = bytes.clone().unbind();
+            let encoded = prepared
+                .encode(nbytes, move || {
+                    Ok(Python::attach(|py| {
+                        let bytes = owner.bind(py).as_bytes();
+                        // Immutable bytes remain pinned by owner while the native
+                        // copy releases the GIL. The expired waiter can reacquire
+                        // Python independently of a still-running native copy.
+                        py.detach(|| bytes.to_vec())
+                    }))
+                })
+                .map_err(core_error_to_py)?;
+            return Self::finish(py, encoded);
+        }
+        // A read-only memoryview can still alias mutable backing. Snapshot all
+        // non-bytes buffers on the caller under the GIL after native charging;
+        // no raw borrowed pointer or mutable exporter crosses the handoff.
+        let buffer = PyBuffer::<u8>::get(data)?;
+        prepared
+            .charge_input(buffer.len_bytes() as u64)
+            .map_err(core_error_to_py)?;
+        let request = snapshot_python_buffer(py, &buffer)?;
+        let encoded = prepared.encode_vec(request).map_err(core_error_to_py)?;
+        Self::finish(py, encoded)
+    }
+
+    fn call_prepared(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
+        let mut prepared = self.take()?;
+        if let Some(nbytes) = prepared_plan_nbytes(plan)? {
+            prepared
+                .charge_input(nbytes as u64)
+                .map_err(core_error_to_py)?;
+            // write_into is user code and stays on this caller/GIL thread.
+            // Its destination owns its memory, even if a view escapes.
+            let request = materialize_python_payload_plan(py, plan, nbytes)?;
+            return Self::finish(py, prepared.encode_vec(request).map_err(core_error_to_py)?);
+        }
+        if let Ok(bytes) = plan.cast_exact::<PyBytes>() {
+            let owner = bytes.clone().unbind();
+            let encoded = prepared
+                .encode(bytes.as_bytes().len(), move || {
+                    Ok(Python::attach(|py| {
+                        let bytes = owner.bind(py).as_bytes();
+                        // Immutable bytes remain pinned by owner while the native
+                        // copy releases the GIL. The expired waiter can reacquire
+                        // Python independently of a still-running native copy.
+                        py.detach(|| bytes.to_vec())
+                    }))
+                })
+                .map_err(core_error_to_py)?;
+            return Self::finish(py, encoded);
+        }
+        let continuation = Self {
+            inner: Mutex::new(Some(prepared)),
+        };
+        if PyBuffer::<u8>::get(plan).is_ok() {
+            return continuation.call(py, plan);
+        }
+        // Unknown-size Python serialization remains on the caller. The same
+        // preparation is charged against its original D before native copying.
+        let materialized = plan.call_method0("to_bytes")?;
+        continuation.call(py, &materialized)
+    }
+
+    fn close(&self) {
+        let closed = self.inner.lock().take();
+        drop(closed);
     }
 }
 
@@ -112,22 +249,45 @@ impl PyCoreClient {
         self.observed_route.route_revision
     }
 
-    fn call<'py>(&self, py: Python<'py>, method_name: &str, data: &[u8]) -> PyResult<Py<PyAny>> {
-        self.call_bytes(py, method_name, data.to_vec())
+    #[pyo3(signature = (*, timeout=inherit_timeout()))]
+    fn with_call_options(&self, py: Python<'_>, timeout: Py<PyAny>) -> PyResult<Self> {
+        let client = self.client()?;
+        Ok(Self::new(
+            client.with_call_options(call_options(py, &timeout)?),
+        ))
     }
 
-    fn call_prepared<'py>(
+    fn begin_call(&self, py: Python<'_>, method_name: &str) -> PyResult<PyNativePreparedCall> {
+        let client = self.client()?;
+        let prepared = py
+            .detach(move || client.begin_call(method_name))
+            .map_err(core_error_to_py)?;
+        Ok(PyNativePreparedCall {
+            inner: Mutex::new(Some(prepared)),
+        })
+    }
+
+    fn call(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         method_name: &str,
-        plan: &Bound<'py, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        let request = materialize_python_bytes(py, plan)?;
-        self.call_bytes(py, method_name, request)
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<PyCoreResponse> {
+        self.begin_call(py, method_name)?.call(py, data)
+    }
+
+    fn call_prepared(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+        plan: &Bound<'_, PyAny>,
+    ) -> PyResult<PyCoreResponse> {
+        self.begin_call(py, method_name)?.call_prepared(py, plan)
     }
 
     fn close(&self) {
-        self.inner.lock().take();
+        let closed = self.inner.lock().take();
+        drop(closed);
     }
 
     #[getter]
@@ -447,11 +607,17 @@ impl EncodedService for PyCoreService {
     }
 }
 
+// Caller/GIL snapshot for mutable exporters, read-only aliases and bytes
+// subclasses. Only the returned native Vec crosses execution handoff.
+fn snapshot_python_buffer(py: Python<'_>, buffer: &PyBuffer<u8>) -> PyResult<Vec<u8>> {
+    let mut bytes = vec![0_u8; buffer.len_bytes()];
+    buffer.copy_to_slice(py, &mut bytes)?;
+    Ok(bytes)
+}
+
 fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(buffer) = PyBuffer::<u8>::get(value) {
-        let mut bytes = vec![0_u8; buffer.len_bytes()];
-        buffer.copy_to_slice(py, &mut bytes)?;
-        return Ok(bytes);
+        return snapshot_python_buffer(py, &buffer);
     }
     if let Ok(to_bytes) = value.getattr("to_bytes")
         && to_bytes.is_callable()
@@ -460,9 +626,7 @@ fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResul
         return materialize_python_bytes(py, &materialized);
     }
     if let Some(nbytes) = prepared_plan_nbytes(value)? {
-        let mut bytes = vec![0_u8; nbytes];
-        write_python_payload_plan(py, value, &mut bytes)?;
-        return Ok(bytes);
+        return materialize_python_payload_plan(py, value, nbytes);
     }
     Err(PyValueError::new_err(
         "Core service/client payload must expose the buffer protocol, to_bytes(), or write_into()",
@@ -583,8 +747,148 @@ fn core_capability_receipt<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>>
 
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCoreClient>()?;
+    module.add_class::<PyNativeCallOptions>()?;
+    module.add_class::<PyNativePreparedCall>()?;
     module.add_class::<PyCoreResponse>()?;
     module.add_class::<PyCoreRequestBuffer>()?;
     module.add_function(wrap_pyfunction!(core_capability_receipt, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use pyo3::types::PyModule;
+    use std::ffi::CString;
+
+    fn module<'py>(py: Python<'py>, source: &str) -> Bound<'py, PyModule> {
+        PyModule::from_code(
+            py,
+            &CString::new(source).unwrap(),
+            c"payload_test.py",
+            c"payload_test",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mutable_and_readonly_alias_snapshots_own_stable_bytes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = module(
+                py,
+                "backing = bytearray(b'original')\nalias = memoryview(backing).toreadonly()\n",
+            );
+            for name in ["backing", "alias"] {
+                let source = module.getattr(name).unwrap();
+                let buffer = PyBuffer::<u8>::get(&source).unwrap();
+                let snapshot = snapshot_python_buffer(py, &buffer).unwrap();
+                drop(buffer);
+                module
+                    .getattr("backing")
+                    .unwrap()
+                    .set_item(0, b'X')
+                    .unwrap();
+                assert_eq!(snapshot, b"original");
+                module
+                    .getattr("backing")
+                    .unwrap()
+                    .set_item(0, b'o')
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn bytes_subclass_is_snapshotted_and_finalized_on_caller() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = module(
+                py,
+                r#"
+import threading
+caller = threading.get_ident()
+events = []
+class CustomBytes(bytes):
+    def __del__(self):
+        events.append(threading.get_ident())
+source = CustomBytes(b'snapshot')
+"#,
+            );
+            let source = module.getattr("source").unwrap();
+            assert!(source.cast_exact::<PyBytes>().is_err());
+            let buffer = PyBuffer::<u8>::get(&source).unwrap();
+            let snapshot = snapshot_python_buffer(py, &buffer).unwrap();
+            drop(buffer);
+            module.delattr("source").unwrap();
+            drop(source);
+            assert_eq!(snapshot, b"snapshot");
+            let caller: u64 = module.getattr("caller").unwrap().extract().unwrap();
+            let events: Vec<u64> = module.getattr("events").unwrap().extract().unwrap();
+            assert_eq!(events, vec![caller]);
+        });
+    }
+
+    #[test]
+    fn response_writer_transfers_its_only_vec_and_escaped_failure_stays_safe() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = module(
+                py,
+                r#"
+import ctypes
+class Plan:
+    nbytes = 32
+    def write_into(self, sink):
+        self.address = ctypes.addressof(ctypes.c_char.from_buffer(sink))
+        with memoryview(sink) as view:
+            view[:] = b'a' * self.nbytes
+plan = Plan()
+class EscapingPlan:
+    nbytes = 32
+    def __init__(self, fail):
+        self.fail = fail
+    def write_into(self, sink):
+        self.view = memoryview(sink)
+        self.view[:] = b'b' * self.nbytes
+        if self.fail:
+            raise ValueError('writer failed')
+"#,
+            );
+            let plan = module.getattr("plan").unwrap();
+            let bytes = materialize_python_bytes(py, &plan).unwrap();
+            let address: usize = plan.getattr("address").unwrap().extract().unwrap();
+            assert_eq!(address, bytes.as_ptr() as usize);
+            assert_eq!(bytes, vec![b'a'; 32]);
+            for fail in [false, true] {
+                let plan = module
+                    .getattr("EscapingPlan")
+                    .unwrap()
+                    .call1((fail,))
+                    .unwrap();
+                let error = materialize_python_bytes(py, &plan).unwrap_err();
+                if fail {
+                    assert!(error.is_instance_of::<PyValueError>(py));
+                } else {
+                    assert!(error.is_instance_of::<PyBufferError>(py));
+                }
+                // A Python exception traceback can also retain callback
+                // locals. Release it before proving export-only ownership.
+                drop(error);
+                let view = plan.getattr("view").unwrap();
+                // Drop the plan/sink callback owners before using the escaped
+                // view: its buffer export alone keeps the native Vec alive.
+                drop(plan);
+                assert_eq!(
+                    view.call_method0("tobytes")
+                        .unwrap()
+                        .extract::<Vec<u8>>()
+                        .unwrap(),
+                    vec![b'b'; 32]
+                );
+                view.set_item(0, b'c').unwrap();
+                view.call_method0("release").unwrap();
+            }
+        });
+    }
 }

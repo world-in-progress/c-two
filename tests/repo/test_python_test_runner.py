@@ -103,6 +103,39 @@ def test_collection_skip_stops_before_execution(tmp_path: Path, monkeypatch: pyt
     assert [s['id'] for s in evidence['steps']] == ['collect-full']
 
 
+@pytest.mark.parametrize('platform,nodeid,phase,reason,accepted', [
+    *((platform, nodeid, 'setup', 'Skipped: Windows named-pipe platform contract', True)
+      for platform in ('darwin', 'linux') for nodeid in sorted(runner.WINDOWS_ENDPOINT_TESTS)),
+    ('win32', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: Windows named-pipe platform contract', False),
+    ('darwin', runner.WINDOWS_ENDPOINT_TEST, 'call', 'Skipped: Windows named-pipe platform contract', False),
+    ('darwin', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: missing native', False),
+    ('darwin', 'unexpected::test_skip', 'setup', 'Skipped: Windows named-pipe platform contract', False),
+    ('darwin', 'tests/unit/test_endpoint_context.py::test_admin_probes_surface_windows_root_not_applicable[other-ping]',
+     'setup', 'Skipped: Windows named-pipe platform contract', False),
+])
+def test_only_declared_windows_setup_skip_is_not_applicable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    platform: str, nodeid: str, phase: str, reason: str, accepted: bool,
+) -> None:
+    monkeypatch.setattr(runner.sys, 'platform', platform)
+    (tmp_path / 'collected-master.json').write_text(json.dumps({
+        'nodeids': [nodeid], 'collection_problems': [],
+    }))
+    (tmp_path / 'reports.json').write_text(json.dumps({
+        'exit_status': 0,
+        'reports': [
+            {'nodeid': nodeid, 'when': phase, 'outcome': 'skipped', 'skip_reason': reason},
+            {'nodeid': nodeid, 'when': 'teardown', 'outcome': 'passed'},
+        ],
+    }))
+    (tmp_path / 'junit.xml').write_text('<testsuite/>')
+    if accepted:
+        runner.validate_execution(tmp_path, [nodeid], 1)
+    else:
+        with pytest.raises(runner.RunnerError):
+            runner.validate_execution(tmp_path, [nodeid], 1)
+
+
 def test_actual_collected_omission_stops_before_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, options, environment, info = synthetic_suite(tmp_path, monkeypatch)
     original = runner.group_arguments

@@ -68,7 +68,7 @@ class CRMProxy:
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
         '_closed', '_close_lock', '_on_terminate',
-        '_scheduler', '_lease_tracker',
+        '_scheduler', '_lease_tracker', '_call_options',
     )
 
     # ------------------------------------------------------------------
@@ -111,6 +111,7 @@ class CRMProxy:
         proxy._on_terminate = on_terminate
         proxy._scheduler = scheduler
         proxy._lease_tracker = lease_tracker
+        proxy._call_options = None
         return proxy
 
     @classmethod
@@ -139,6 +140,7 @@ class CRMProxy:
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
         proxy._lease_tracker = lease_tracker
+        proxy._call_options = None
         return proxy
 
     @classmethod
@@ -165,6 +167,7 @@ class CRMProxy:
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
         proxy._lease_tracker = lease_tracker
+        proxy._call_options = None
         return proxy
 
     # ------------------------------------------------------------------
@@ -215,6 +218,37 @@ class CRMProxy:
         """Native retained-buffer lease tracker for this process session."""
         return self._lease_tracker
 
+    def with_call_options(self, *, timeout=...) -> CRMProxy:
+        """Create an independent connection view with Core-owned call options."""
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
+        from ..._native import NativeCallOptions
+
+        view = object.__new__(type(self))
+        for name in self.__slots__:
+            setattr(view, name, getattr(self, name))
+        view._close_lock = threading.Lock()
+        view._closed = False
+        if self._mode == 'thread':
+            view._call_options = NativeCallOptions(timeout=timeout)
+            view._on_terminate = None
+        else:
+            view._client = _native_call(self._client.with_call_options, timeout=timeout)
+            view._on_terminate = view._client.close
+        return view
+
+    def begin_call(self, method_name: str):
+        """Reserve the Core operation before Python input serialization."""
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
+        return _native_call(self._client.begin_call, method_name)
+
+    def prepare_call(self, method_name: str):
+        """Project one reserved native call into the transfer interface."""
+        return _PreparedClient(self.begin_call(method_name))
+
     def call(self, method_name: str, data: bytes | bytearray | memoryview | None = None) -> bytes:
         """Send a serialized CRM call (IPC or HTTP mode).
 
@@ -225,16 +259,7 @@ class CRMProxy:
             if self._closed:
                 raise RuntimeError('Proxy is closed')
         if self._mode in ('ipc', 'http'):
-            try:
-                return self._client.call(method_name, data or b'')
-            except Exception as exc:
-                error_bytes = getattr(exc, 'error_bytes', None)
-                if error_bytes is not None:
-                    from ...error import CCError
-                    cc_err = CCError.deserialize(memoryview(error_bytes))
-                    if cc_err is not None:
-                        raise cc_err from exc
-                raise
+            return _native_call(self._client.call, method_name, data if data is not None else b'')
         raise NotImplementedError(
             'call() not available in thread-local mode; use call_direct()',
         )
@@ -244,19 +269,10 @@ class CRMProxy:
         with self._close_lock:
             if self._closed:
                 raise RuntimeError('Proxy is closed')
-        if self._mode == 'ipc':
+        if self._mode in ('ipc', 'http'):
             call_prepared = getattr(self._client, 'call_prepared', None)
             if callable(call_prepared):
-                try:
-                    return call_prepared(method_name, plan)
-                except Exception as exc:
-                    error_bytes = getattr(exc, 'error_bytes', None)
-                    if error_bytes is not None:
-                        from ...error import CCError
-                        cc_err = CCError.deserialize(memoryview(error_bytes))
-                        if cc_err is not None:
-                            raise cc_err from exc
-                    raise
+                return _native_call(call_prepared, method_name, plan)
         if self._mode in ('ipc', 'http'):
             to_bytes = getattr(plan, 'to_bytes', None)
             if not callable(to_bytes):
@@ -281,6 +297,8 @@ class CRMProxy:
             raise NotImplementedError(
                 'call_direct() only available in thread-local mode',
             )
+        from ..._native import NativeCallOptions
+        _native_call((self._call_options or NativeCallOptions()).validate_thread)
         method = getattr(self._crm, method_name, None)
         if method is None:
             raise AttributeError(
@@ -324,3 +342,53 @@ class CRMProxy:
             self._closed = True
         if self._on_terminate is not None:
             self._on_terminate()
+
+
+def _native_call(operation, *args, **kwargs):
+    """Keep canonical Core errors and their transport-phase observation."""
+    try:
+        return operation(*args, **kwargs)
+    except Exception as exc:
+        error_bytes = getattr(exc, 'error_bytes', None)
+        if error_bytes is not None:
+            from ...error import CCError
+            cc_error = CCError.deserialize(memoryview(error_bytes))
+            if cc_error is not None:
+                phase = getattr(exc, 'transport_phase', None)
+                if phase is not None:
+                    cc_error.details['transport_phase'] = phase
+                raise cc_error from exc
+        raise
+
+
+class _PreparedClient:
+    """One caller-thread serialization followed by the reserved Core call."""
+
+    __slots__ = ('_prepared',)
+
+    def __init__(self, prepared):
+        self._prepared = prepared
+
+    def call(self, method_name, data=None):
+        return _native_call(self._prepared.call, data if data is not None else b'')
+
+    def charge_input(self, nbytes):
+        return _native_call(self._prepared.charge_input, nbytes)
+
+    def close(self):
+        self._prepared.close()
+
+
+def with_call_options(proxy, *, timeout=...):
+    """Return a CRM connection view with a timeout in seconds.
+
+    Omission inherits the current path policy; ``None`` selects unlimited.
+    Business method keyword arguments, including ``timeout``, remain unchanged.
+    """
+    client = getattr(proxy, 'client', None)
+    if not isinstance(client, CRMProxy):
+        raise TypeError('cc.with_call_options() requires a connected CRM instance')
+    view = object.__new__(type(proxy))
+    view.__dict__.update(proxy.__dict__)
+    view.client = client.with_call_options(timeout=timeout)
+    return view

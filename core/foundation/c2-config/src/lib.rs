@@ -3,6 +3,7 @@
 //! This crate is the single source of truth for all configuration structs
 //! used across the C-Two transport layer (IPC, relay, memory pool).
 
+mod call;
 mod identity;
 mod ipc;
 mod lifecycle;
@@ -13,16 +14,20 @@ mod relay;
 mod remote;
 mod resolver;
 
-pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id};
-pub use lifecycle::{
-    MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace,
+pub use call::{
+    CallExecutionLimits, CallOptions, CallTimeout, CallTimeoutError, DEFAULT_MAX_OUTSTANDING_CALLS,
+    DEFAULT_RETAINED_INPUT_BUDGET_BYTES,
 };
+pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id};
 pub use ipc::{
     BASE_IPC_OVERRIDE_KEYS, BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig,
     FORBIDDEN_IPC_OVERRIDE_KEYS, MAX_EXECUTION_WORKERS, MAX_IPC_POOL_SEGMENTS, PoolRoleTuning,
     SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
 };
-pub use local::{LocalEndpoint, LocalEndpointNamespace};
+pub use lifecycle::{MAX_OWNER_MISSING_GRACE, ServerLifecyclePolicy, validate_owner_missing_grace};
+pub use local::{
+    LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
+};
 pub use memory::MemoryBudgetLimits;
 pub use pool::{PoolConfig, default_spill_dir};
 pub use relay::RelayConfig;
@@ -31,7 +36,7 @@ pub use remote::{
     validate_remote_payload_chunk_size,
 };
 pub use resolver::{
-    BaseIpcConfigOverrides, ClientIpcConfigOverrides, ConfigResolver, ConfigSources, EnvFilePolicy,
-    EnvMap, RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedRelayConfig,
-    ResolvedRuntimeConfig, RuntimeConfigOverrides, ServerIpcConfigOverrides,
+    BaseIpcConfigOverrides, CallExecutionLimitsOverrides, ClientIpcConfigOverrides, ConfigResolver,
+    ConfigSources, EnvFilePolicy, EnvMap, RelayConfigOverrides, ResolvedRelayClientConfig,
+    ResolvedRelayConfig, ResolvedRuntimeConfig, RuntimeConfigOverrides, ServerIpcConfigOverrides,
 };

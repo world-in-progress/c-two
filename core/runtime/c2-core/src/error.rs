@@ -15,6 +15,7 @@ use crate::RegisterFailureOutcome;
 pub enum LifecycleError {
     InvalidServerId(String),
     ClientConfigFrozen,
+    ConfigFrozen,
     DuplicateRoute(String),
     MissingRoute(String),
     RelayDuplicateRoute(String),
@@ -42,6 +43,7 @@ impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidServerId(message) => formatter.write_str(message),
+            Self::ConfigFrozen => formatter.write_str("runtime configuration is frozen"),
             Self::ClientConfigFrozen => formatter.write_str("client IPC configuration is frozen"),
             Self::DuplicateRoute(name) => write!(formatter, "route already registered: {name}"),
             Self::MissingRoute(name) => write!(formatter, "route not registered: {name}"),
@@ -227,6 +229,7 @@ impl From<LifecycleError> for Error {
 /// Normalize an IPC error without flattening its transport source.
 pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
     match error {
+        IpcError::LocalCallRejected(error) => Error::Semantic(error),
         IpcError::Chunk(ChunkError::Capacity(message)) => {
             let semantic = C2Error::new(ErrorCode::ResourceUnavailable, message.clone())
                 .with_details(BTreeMap::from([
@@ -373,6 +376,7 @@ fn semantic_route_error<const N: usize>(
 /// Normalize an HTTP error without flattening its transport source.
 pub fn normalize_http_error(error: HttpError, phase: TransportPhase) -> Error {
     match error {
+        HttpError::LocalCallRejected(error) => Error::Semantic(error),
         HttpError::CrmError(bytes) => normalize_ipc_semantic_bytes(&bytes),
         HttpError::ServerError(_, body) => normalize_http_semantic_body(&body),
         transport => Error::Transport(TransportError::new(phase, TransportKind::Http, transport)),
@@ -616,6 +620,36 @@ mod native_boundary_tests {
             assert!(transport.semantic_error().is_none());
             assert!(!transport.is_fallback_eligible());
             assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
+        }
+    }
+    #[test]
+    fn local_call_rejection_keeps_semantic_code_and_no_fallback_details() {
+        for code in [
+            ErrorCode::CallDeadlineExceeded,
+            ErrorCode::UnsupportedCallMode,
+            ErrorCode::CallCapacityExceeded,
+        ] {
+            let source = C2Error::new(code, "local call stopped").with_details(BTreeMap::from([
+                (
+                    "transport_phase".to_string(),
+                    "dispatch_uncertain".to_string(),
+                ),
+                ("fallback_eligible".to_string(), "false".to_string()),
+            ]));
+            match normalize_http_error(
+                HttpError::LocalCallRejected(source.clone()),
+                TransportPhase::PreDispatch,
+            ) {
+                Error::Semantic(actual) => assert_eq!(actual, source),
+                other => panic!("local rejection became a transport failure: {other:?}"),
+            }
+            match normalize_ipc_error(
+                IpcError::LocalCallRejected(source.clone()),
+                TransportPhase::PreDispatch,
+            ) {
+                Error::Semantic(actual) => assert_eq!(actual, source),
+                other => panic!("local IPC rejection became a transport failure: {other:?}"),
+            }
         }
     }
 }

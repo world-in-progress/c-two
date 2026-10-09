@@ -11,6 +11,7 @@
 //! `Unverified` are never written as success.
 
 use anyhow::{Result, anyhow, bail};
+use c2_config::{ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions};
 use c2_core::{
     ENDPOINT_CREDENTIAL_MAX_BYTES, EndpointCredential, EndpointInspection, EndpointReapResult,
     EndpointSweep, EndpointUnverifiedReason, LocalEndpoint, SweepBatch, SweepBudget,
@@ -49,6 +50,9 @@ pub enum EndpointCommand {
 pub struct InspectArgs {
     /// Logical IPC address, for example ipc://my_server.
     pub address: String,
+    /// Pre-created Unix IPC root (not applicable to Windows Named Pipes).
+    #[arg(long)]
+    pub ipc_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -58,10 +62,16 @@ pub struct ReapArgs {
     /// Credential JSON file produced by `inspect`.
     #[arg(long)]
     pub credential: PathBuf,
+    /// Require the credential to belong to this Unix IPC root.
+    #[arg(long)]
+    pub ipc_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct SweepArgs {
+    /// Pre-created Unix IPC root (not applicable to Windows Named Pipes).
+    #[arg(long)]
+    pub ipc_root: Option<PathBuf>,
     /// Restrict maintenance to this logical IPC address. Repeat for multiple
     /// targets; omission explicitly selects the full native namespace.
     #[arg(long = "address", value_name = "IPC_ADDRESS")]
@@ -86,7 +96,8 @@ pub fn run(args: EndpointArgs) -> Result<ExitCode> {
 }
 
 fn inspect(args: InspectArgs) -> Result<ExitCode> {
-    let endpoint = endpoint_for(&args.address)?;
+    let context = resolve_context(args.ipc_root)?;
+    let endpoint = endpoint_for(&context, &args.address)?;
     let report = match inspect_endpoint(&endpoint) {
         EndpointInspection::Absent => Report::status("absent"),
         EndpointInspection::Present(credential) => {
@@ -116,8 +127,19 @@ fn inspect(args: InspectArgs) -> Result<ExitCode> {
 
 fn reap(args: ReapArgs) -> Result<ExitCode> {
     let credential = read_credential(&args.credential)?;
-    // The strict credential and this operation use the same native derivation.
-    let endpoint = endpoint_for(&args.address)?;
+    // Reap follows the credential's captured context, including historical
+    // schema-2 /tmp credentials. Environment and .env cannot retarget it.
+    // An explicit override only checks the context, before native endpoint IO.
+    if let Some(root) = args.ipc_root {
+        let context = resolve_context(Some(root))?;
+        if credential.endpoint().context() != &context {
+            Report::status("stale-target")
+                .with_reason(Some("credential-context-mismatch".to_string()))
+                .emit()?;
+            return Ok(ExitCode::from(1));
+        }
+    }
+    let endpoint = endpoint_for(credential.endpoint().context(), &args.address)?;
     // The credential must describe this exact endpoint; a mismatch is caught
     // natively as StaleTarget, but reject it early with a clear reason too.
     if credential.endpoint() != &endpoint {
@@ -147,7 +169,8 @@ fn sweep(args: SweepArgs) -> Result<ExitCode> {
         bail!("--max-batches must be between 1 and {MAX_BATCHES}");
     }
 
-    let endpoint = LocalEndpoint::from_address("ipc://c3-endpoint-sweep")?;
+    let context = resolve_context(args.ipc_root)?;
+    let endpoint = context.endpoint("ipc://c3-endpoint-sweep")?;
     // Native scope construction validates every logical address and the 4096
     // target limit before opening any iterator or taking a sweep lease.
     let mut sweep = if args.addresses.is_empty() {
@@ -423,6 +446,16 @@ impl Report {
     }
 }
 
-fn endpoint_for(address: &str) -> Result<LocalEndpoint> {
-    LocalEndpoint::from_address(address).map_err(|error| anyhow!("invalid local endpoint: {error}"))
+fn resolve_context(unix_root: Option<PathBuf>) -> Result<LocalEndpointContext> {
+    ConfigResolver::resolve_local_endpoint(
+        LocalEndpointOptions { unix_root },
+        ConfigSources::from_process(),
+    )
+    .map_err(|error| anyhow!("{error}"))
+}
+
+fn endpoint_for(context: &LocalEndpointContext, address: &str) -> Result<LocalEndpoint> {
+    context
+        .endpoint(address)
+        .map_err(|error| anyhow!("invalid local endpoint: {error}"))
 }

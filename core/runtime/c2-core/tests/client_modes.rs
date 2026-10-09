@@ -93,7 +93,9 @@ fn runtime_options(server_id: String, relay_url: Option<String>) -> RuntimeOptio
 // this lock. Keep it until runtime/server teardown has finished; guarding
 // only the writer still lets parallel clients observe its invalid value.
 fn relay_env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn with_invalid_relay_proxy_env(test: impl FnOnce()) {
@@ -1071,13 +1073,17 @@ fn hostless_shutdown_closes_own_clients_and_isolates_sibling_runtimes_and_held_l
     // Runtime construction and client-config resolution read the process
     // environment, so this test joins the file-wide env isolation guard.
     let _environment = relay_env_lock();
-    let server_runtime = Runtime::new(runtime_options(unique_name("iso-server"), None))
-        .expect("server runtime");
+    let server_runtime =
+        Runtime::new(runtime_options(unique_name("iso-server"), None)).expect("server runtime");
     let host = server_runtime.host(HostOptions::default()).expect("host");
     let route_name = unique_name("iso-echo");
-    let mut registration = host.register(definition(&route_name)).expect("registration");
+    let mut registration = host
+        .register(definition(&route_name))
+        .expect("registration");
     let address = server_runtime.server_address().expect("server address");
-    let expected = release().expected_route(&route_name).expect("expected route");
+    let expected = release()
+        .expected_route(&route_name)
+        .expect("expected route");
 
     let runtime_a =
         Runtime::new(runtime_options(unique_name("iso-client-a"), None)).expect("runtime a");
@@ -1148,8 +1154,7 @@ fn hostless_shutdown_closes_own_clients_and_isolates_sibling_runtimes_and_held_l
         "B's client must be closed by its own hostless shutdown"
     );
     assert_eq!(held.bytes(), big.as_slice());
-    held
-        .invalidate_then_release(|| Ok(()))
+    held.invalidate_then_release(|| Ok(()))
         .expect("held lease must release cleanly after its connection closed");
 
     drop(client_a);
@@ -1213,9 +1218,12 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
     let connect_runtime = runtime.clone();
     let connect_address = address.clone();
     let connect_thread = std::thread::spawn(move || {
-        connect_runtime.connect(expected, Connect::DirectIpc {
-            address: connect_address,
-        })
+        connect_runtime.connect(
+            expected,
+            Connect::DirectIpc {
+                address: connect_address,
+            },
+        )
     });
 
     // The peer observed the handshake request bytes, which strictly happens

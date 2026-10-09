@@ -30,9 +30,7 @@ pub enum ServerLifecyclePolicy {
     /// capability. When the controller closes, new business admission stops
     /// immediately and, after at most `owner_missing_grace`, the existing
     /// native drain/shutdown transaction runs.
-    OwnerBound {
-        owner_missing_grace: Duration,
-    },
+    OwnerBound { owner_missing_grace: Duration },
 }
 
 impl Default for ServerLifecyclePolicy {
@@ -118,18 +116,14 @@ mod tests {
     #[test]
     fn owner_bound_accepts_only_finite_bounded_grace() {
         assert!(ServerLifecyclePolicy::owner_bound(Duration::ZERO).is_ok());
-        assert!(
-            ServerLifecyclePolicy::owner_bound(Duration::from_millis(3_000))
-                .is_ok()
-        );
+        assert!(ServerLifecyclePolicy::owner_bound(Duration::from_millis(3_000)).is_ok());
         let too_large = MAX_OWNER_MISSING_GRACE + Duration::from_millis(1);
         let error =
             ServerLifecyclePolicy::owner_bound(too_large).expect_err("grace must be bounded");
         assert!(error.contains("exceeds the maximum"));
-        let policy =
-            ServerLifecyclePolicy::OwnerBound {
-                owner_missing_grace: too_large,
-            };
+        let policy = ServerLifecyclePolicy::OwnerBound {
+            owner_missing_grace: too_large,
+        };
         assert!(policy.validate().is_err());
     }
 }

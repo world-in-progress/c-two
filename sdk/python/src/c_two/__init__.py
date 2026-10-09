@@ -27,15 +27,22 @@ from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import hold, transfer, Held, HeldResult
 from .mem import MemoryCellStats, MemoryLimits, MemoryScopeStats, MemoryStats
 from .transport.endpoint import (
+    LocalEndpointContext,
+    local_endpoint_context,
     EndpointCredential,
     EndpointSweep,
     inspect_endpoint,
     reap_endpoint,
     sweep_endpoints,
 )
+from .transport.client.proxy import with_call_options
 from .transport.input_lifetime import InputLifetime
 from .transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 from .transport.registry import (
+    set_local_endpoint,
+
+    set_call_execution_limits,
+    call_execution_snapshot,
     set_transport_policy,
     set_server,
     set_client,
@@ -91,6 +98,8 @@ __all__ = [
     'MemoryScopeStats',
     'MemoryStats',
     'EndpointCredential',
+    'LocalEndpointContext',
+    'local_endpoint_context',
     'EndpointSweep',
     'inspect_endpoint',
     'reap_endpoint',
@@ -98,7 +107,11 @@ __all__ = [
     'InputLifetime',
     'ConcurrencyConfig',
     'ConcurrencyMode',
+    'with_call_options',
+    'set_call_execution_limits',
+    'call_execution_snapshot',
     'set_transport_policy',
+    'set_local_endpoint',
     'set_server',
     'set_client',
     'set_relay_anchor',

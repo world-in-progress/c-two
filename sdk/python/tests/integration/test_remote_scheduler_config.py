@@ -19,14 +19,19 @@ def _clean_env_and_registry(monkeypatch):
     previous_override_shm_threshold = settings._shm_threshold  # noqa: SLF001
     settings.relay_anchor_address = None
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
-    yield
     try:
-        cc.shutdown()
-    except Exception:
-        pass
-    _ProcessRegistry._instance = None  # noqa: SLF001
-    settings._relay_anchor_address = previous_override_relay  # noqa: SLF001
-    settings._shm_threshold = previous_override_shm_threshold  # noqa: SLF001
+        # These scheduler tests own a Persistent host, never a prior test's
+        # OwnerBound capability or frozen server configuration.
+        assert cc.shutdown()['completed']
+        cc.set_server(lifecycle=cc.LifecycleConfig.persistent())
+        yield
+    finally:
+        try:
+            assert cc.shutdown()['completed']
+            _ProcessRegistry.reset()
+        finally:
+            settings._relay_anchor_address = previous_override_relay  # noqa: SLF001
+            settings._shm_threshold = previous_override_shm_threshold  # noqa: SLF001
 
 
 def _direct_client(crm_type: type, name: str):

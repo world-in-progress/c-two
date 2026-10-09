@@ -47,8 +47,14 @@ macro_rules! test_commit_registration {
 
 pub(crate) mod authority;
 pub(crate) mod background;
+pub(crate) mod client_lifecycle;
+#[cfg(test)]
+mod client_lifecycle_tests;
 pub(crate) mod conn_pool;
 pub(crate) mod disseminator;
+pub(crate) mod forwarding;
+#[cfg(test)]
+mod forwarding_tests;
 pub(crate) mod gossip;
 #[cfg(test)]
 mod memory_tests;
@@ -65,4 +71,4 @@ pub(crate) mod upstream_control;
 pub(crate) mod url;
 
 pub use c2_config::RelayConfig;
-pub use server::{RelayControlError, RelayServer};
+pub use server::{RelayControlError, RelayServer, RelayServerOptions};

@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Async IPC client for C-Two relay"
 
+# Explicitly opt in only from downstream development/test dependencies.
+[features]
+test-support = []
+
 [dependencies]
 c2-config = { version = "0.1.0", path = "../../foundation/c2-config" }
 c2-contract = { version = "0.1.0", path = "../../foundation/c2-contract" }

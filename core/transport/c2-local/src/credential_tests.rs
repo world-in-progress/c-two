@@ -113,7 +113,7 @@ async fn rejects_unknown_fields_unknown_schema_and_oversize() {
     );
     assert_rejected(
         &mutate(&json, |object| {
-            object.insert("schemaVersion".into(), 3.into());
+            object.insert("schemaVersion".into(), 4.into());
         }),
         &[EndpointCredentialErrorKind::UnsupportedSchemaVersion],
     );
@@ -444,6 +444,234 @@ fn rejects_an_unknown_protocol_on_every_platform() {
         host_platform()
     );
     assert_rejected(&document, &[EndpointCredentialErrorKind::InvalidValue]);
+}
+
+// These values are descriptions for codec tests, deliberately constructed
+// without a bind. Only the native maintenance checks can authorize a reap.
+#[cfg(unix)]
+fn described_credential(context: &LocalEndpointContext) -> EndpointCredential {
+    EndpointCredential::unix_managed(
+        context.endpoint("ipc://codec-context").unwrap(),
+        UnixSocketIdentity {
+            device: 11,
+            inode: 22,
+            changed_secs: 33,
+            changed_nanos: 44,
+        },
+        [0x5a; 16],
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn context_codec_default_remains_v2_and_custom_root_round_trips_v3() {
+    let default = described_credential(&LocalEndpointContext::default_for_platform().unwrap());
+    let json = default.to_json().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["schemaVersion"], 2);
+    assert!(value.get("unixRoot").is_none());
+    assert!(value.get("namespaceId").is_none());
+    assert_eq!(decoded(&json).unwrap(), default);
+
+    // Nonexistent roots are valid descriptions. Decode must not create them.
+    let root = format!(
+        "/tmp/c2c-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    );
+    assert!(!std::path::Path::new(&root).exists());
+    let context = LocalEndpointContext::with_unix_root(std::path::Path::new(&root)).unwrap();
+    let custom = described_credential(&context);
+    let json = custom.to_json().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["schemaVersion"], 3);
+    assert_eq!(value["unixRoot"], root);
+    assert_eq!(value["namespaceId"], context.namespace_id());
+    assert_eq!(value["protocol"], "managed-v2");
+    assert_eq!(decoded(&json).unwrap(), custom);
+    assert!(!std::path::Path::new(&root).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn context_codec_v3_strictly_binds_root_and_namespace() {
+    let context =
+        LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-codec")).unwrap();
+    let json = described_credential(&context).to_json().unwrap();
+    for field in ["unixRoot", "namespaceId", "device", "inode", "incarnation"] {
+        assert!(
+            decoded(&mutate(&json, |object| {
+                object.remove(field);
+            }))
+            .is_err()
+        );
+        assert!(
+            decoded(&mutate(&json, |object| {
+                object.insert(field.into(), serde_json::Value::Null);
+            }))
+            .is_err()
+        );
+    }
+    for root in ["relative", "", "/tmp/../elsewhere", "/tmp/a\0b", "/tmp"] {
+        assert_eq!(
+            decoded(&mutate(&json, |object| {
+                object.insert("unixRoot".into(), root.into());
+            }))
+            .unwrap_err()
+            .field(),
+            Some("unixRoot"),
+        );
+    }
+    assert_eq!(
+        decoded(&mutate(&json, |object| {
+            object.insert("unixRoot".into(), "/tmp/c2-other".into());
+        }))
+        .unwrap_err()
+        .field(),
+        Some("namespaceId"),
+    );
+    assert_eq!(
+        decoded(&mutate(&json, |object| {
+            object.insert("namespaceId".into(), "forged".into());
+        }))
+        .unwrap_err()
+        .field(),
+        Some("namespaceId"),
+    );
+    // Root normalization is lexical and belongs to c2-config. No canonicalize
+    // or filesystem alias rewriting participates in this comparison.
+    let normalized = decoded(&mutate(&json, |object| {
+        object.insert("unixRoot".into(), "/tmp//c2-codec/".into());
+    }))
+    .unwrap();
+    assert_eq!(normalized.endpoint().context(), &context);
+    assert!(
+        decoded(&mutate(&json, |object| {
+            object.insert("socketPath".into(), "/tmp/arbitrary".into());
+        }))
+        .is_err()
+    );
+    assert!(
+        decoded(&mutate(&json, |object| {
+            object.insert("schemaVersion".into(), 4.into());
+        }))
+        .is_err()
+    );
+    assert!(
+        decoded(&mutate(&json, |object| {
+            object.insert("platform".into(), "windows".into());
+        }))
+        .is_err()
+    );
+    // Serde must reject duplicate fields as well as unknown fields.
+    let duplicate = json.replacen('{', "{\"unixRoot\":\"/tmp/c2-other\",", 1);
+    assert_rejected(&duplicate, &[EndpointCredentialErrorKind::MalformedJson]);
+}
+
+#[cfg(unix)]
+#[test]
+fn context_codec_v2_cannot_carry_custom_context_fields_even_as_null() {
+    let context = LocalEndpointContext::default_for_platform().unwrap();
+    let json = described_credential(&context).to_json().unwrap();
+    for field in ["unixRoot", "namespaceId"] {
+        for value in [serde_json::Value::Null, "/tmp/c2-other".into()] {
+            assert_eq!(
+                decoded(&mutate(&json, |object| {
+                    object.insert(field.into(), value);
+                }))
+                .unwrap_err()
+                .field(),
+                Some(field),
+            );
+        }
+    }
+    assert!(
+        decoded(&mutate(&json, |object| {
+            object.insert("schemaVersion".into(), 3.into());
+        }))
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn context_scope_derives_every_target_from_the_captured_context() {
+    let context =
+        LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-scope")).unwrap();
+    let endpoint = context.endpoint("ipc://scope-anchor").unwrap();
+    let addresses = vec!["ipc://scope-a".to_owned(), "ipc://scope-b".to_owned()];
+    let scope = EndpointSweepScope::from_addresses(&endpoint, &addresses).unwrap();
+    assert_eq!(scope.endpoint, endpoint);
+    for (target, address) in scope.targets.iter().zip(addresses.iter()) {
+        assert_eq!(target, &context.endpoint(address).unwrap());
+        assert_eq!(target.context(), &context);
+    }
+    assert!(
+        EndpointSweepScope::from_addresses(&endpoint, &[])
+            .unwrap()
+            .targets
+            .is_empty()
+    );
+    assert!(EndpointSweepScope::from_addresses(&endpoint, &["ipc://../outside".into()]).is_err());
+    assert!(
+        EndpointSweepScope::from_addresses(
+            &endpoint,
+            &vec![addresses[0].clone(); EndpointSweepScope::MAX_ADDRESSES + 1]
+        )
+        .is_err()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn context_codec_system_alias_keeps_its_lexical_identity() {
+    let alias = LocalEndpointContext::with_unix_root(std::path::Path::new("/private/tmp")).unwrap();
+    let default = LocalEndpointContext::default_for_platform().unwrap();
+    assert_ne!(alias, default);
+    let credential = described_credential(&alias);
+    let value: serde_json::Value = serde_json::from_str(&credential.to_json().unwrap()).unwrap();
+    assert_eq!(value["schemaVersion"], 3);
+    assert_eq!(value["unixRoot"], "/private/tmp");
+    assert_eq!(decoded(&value.to_string()).unwrap(), credential);
+    assert!(
+        default
+            .endpoint("ipc://codec-context")
+            .unwrap()
+            .os_name()
+            .to_str()
+            .unwrap()
+            .starts_with("/tmp/")
+    );
+}
+
+#[test]
+fn context_codec_rejects_unix_fields_in_windows_documents() {
+    // These cases run on both platforms. Unix rejects the platform; Windows
+    // must reject the otherwise known fields even when their value is null.
+    for schema in [1, 3] {
+        for fields in [
+            r#""unixRoot":"/tmp/c2-codec""#,
+            r#""namespaceId":"forged""#,
+            r#""unixRoot":null"#,
+            r#""namespaceId":null"#,
+        ] {
+            let json = format!(
+                r#"{{"schemaVersion":{schema},"address":"ipc://codec-context","protocol":"named-pipe","platform":"windows",{fields}}}"#
+            );
+            assert!(decoded(&json).is_err());
+        }
+    }
+    for field in [
+        "incarnation",
+        "device",
+        "inode",
+        "changedSecs",
+        "changedNanos",
+    ] {
+        let json = format!(
+            r#"{{"schemaVersion":1,"address":"ipc://codec-context","protocol":"named-pipe","platform":"windows","{field}":null}}"#
+        );
+        assert!(decoded(&json).is_err());
+    }
 }
 
 // --- Windows kernel-managed credentials --------------------------------------

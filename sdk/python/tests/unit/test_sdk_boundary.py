@@ -3,6 +3,40 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
+
+import pytest
+
+
+def _rust_function(source: str, name: str) -> str:
+    """Limit guards to one function, ignoring comment/string brace contents."""
+    masked = re.sub(
+        r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/',
+        lambda match: ' ' * len(match.group()),
+        source,
+        flags=re.DOTALL,
+    )
+    declaration = re.search(rf'\bfn\s+{re.escape(name)}\b', masked)
+    assert declaration is not None, f'Rust function {name!r} is missing'
+    start = declaration.start()
+    opening = masked.index('{', declaration.end())
+    depth = 1
+    for index in range(opening + 1, len(masked)):
+        depth += (masked[index] == '{') - (masked[index] == '}')
+        if depth == 0:
+            return source[start:index + 1]
+    raise AssertionError(f'Rust function {name!r} has no closing brace')
+
+
+def _rust_compact(source: str) -> str:
+    """Normalize formatting for token guards, without matching comments."""
+    code = re.sub(
+        r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/',
+        lambda match: match.group() if match.group().startswith('"') else '',
+        source,
+        flags=re.DOTALL,
+    )
+    return re.sub(r'\s+', '', code)
 
 
 def test_registry_does_not_own_relay_control_plane_mechanisms():
@@ -305,6 +339,122 @@ def test_registry_does_not_own_generic_relay_or_route_authority():
     assert "self._runtime_session.connect_explicit_relay_http" in source
 
 
+def test_runtime_endpoint_and_accepted_budget_authority_are_native():
+    root = Path(__file__).resolve().parents[4]
+    registry = root / 'sdk/python/src/c_two/transport/registry.py'
+    tree = ast.parse(registry.read_text(encoding='utf-8'))
+    state_fields = {
+        node.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
+    }
+    assert not {
+        field for field in state_fields
+        if any(part in field for part in (
+            'endpoint', 'execution_limits', 'execution_context',
+            'outstanding_calls', 'retained_input_budget',
+        ))
+    }
+    calls = {
+        _attribute_name(node.func) for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert 'self._runtime_session.set_local_endpoint' in calls
+    assert 'self._runtime_session.set_call_execution_limits' in calls
+    assert 'new_session.inherit_local_endpoint_selection' in calls
+    swap = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == '_swap_runtime_session'
+    )
+    inheritance = [
+        node for node in ast.walk(swap)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and _attribute_name(node.func) == 'new_session.inherit_local_endpoint_selection'
+    ]
+    assert len(inheritance) == 1
+    assert len(inheritance[0].args) == 1
+    assert isinstance(inheritance[0].args[0], ast.Name)
+    assert inheritance[0].args[0].id == 'runtime_session'
+    # Swapping inherits Core's lazy/accepted selection without resolving a
+    # context, re-reading configuration, or deriving OS paths in Python.
+    swap_calls = {
+        ast.unparse(node.func) for node in ast.walk(swap)
+        if isinstance(node, ast.Call)
+    }
+    assert not any(
+        part in call for call in swap_calls
+        for part in ('local_endpoint_context', 'resolve_local_endpoint',
+                     'set_local_endpoint', 'getenv', 'environ', 'Path',
+                     'getuid', 'getsid', 'expanduser', 'tempfile', 'socket')
+    )
+    assert not any(
+        isinstance(node, ast.Attribute)
+        and (node.attr == 'environ' or 'local_endpoint' in node.attr)
+        and node.attr != 'inherit_local_endpoint_selection'
+        for node in ast.walk(swap)
+    )
+    assert any(
+        isinstance(node, ast.Attribute)
+        and node.attr == 'call_execution_limits_overrides'
+        and isinstance(node.value, ast.Name)
+        and node.value.id == 'runtime_session'
+        and isinstance(node.ctx, ast.Load)
+        for node in ast.walk(tree)
+    )
+
+    native = (root / 'sdk/python/native/src/runtime_session_ffi.rs').read_text(encoding='utf-8')
+    getter = _rust_compact(_rust_function(native, 'call_execution_limits_overrides'))
+    assert 'letoverrides=self.inner.call_execution_limits_overrides();' in getter
+    context = _rust_compact(_rust_function(native, 'local_endpoint_context'))
+    assert 'self.inner.local_endpoint_context()' in context
+    inheritance_native = _rust_compact(_rust_function(native, 'inherit_local_endpoint_selection'))
+    assert 'previous:&Self' in inheritance_native
+    assert 'self.inner.inherit_local_endpoint_selection(&previous.inner)' in inheritance_native
+    struct = re.search(
+        r'\bpub\s+struct\s+PyRuntimeSession\s*\{(.*?)\n\s*\}', native, flags=re.DOTALL,
+    )
+    assert struct is not None
+    fields = set(re.findall(r'^\s*(\w+)\s*:', struct.group(1), flags=re.MULTILINE))
+    assert not {field for field in fields if 'endpoint' in field or 'overrides' in field}
+
+
+def test_endpoint_admin_facade_only_projects_native_context_and_actions():
+    path = Path(__file__).resolve().parents[2] / 'src/c_two/transport/endpoint.py'
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    imported = {
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    }
+    assert not imported.intersection({'os', 'pathlib', 'socket', 'json', 'tempfile'})
+    assert any(
+        isinstance(node, ast.ImportFrom) and node.module == 'c_two._native'
+        and any(alias.name == 'LocalEndpointContext' for alias in node.names)
+        for node in tree.body
+    )
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    selection = functions['_selected_context']
+    assert any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == 'local_endpoint_context'
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == '_runtime_session'
+        for node in ast.walk(selection)
+    )
+    for name, native_operation in (
+        ('inspect_endpoint', 'inspect_endpoint_endpoint'),
+        ('reap_endpoint', 'reap_endpoint_credential'),
+        ('sweep_endpoints', 'PyEndpointSweep'),
+    ):
+        assert any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == native_operation
+            and any(keyword.arg == 'context' for keyword in node.keywords)
+            for node in ast.walk(functions[name])
+        ), name
+
+
 def test_explicit_ipc_connect_branch_bypasses_relay_facade():
     source_path = (
         Path(__file__).resolve().parents[2]
@@ -439,7 +589,7 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     default_offenders = [
         needle
         for needle in forbidden_defaults
-        if needle in runtime_session
+        if needle in _rust_compact(runtime_session)
     ]
     assert default_offenders == []
 
@@ -448,10 +598,32 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     assert "Connect::DirectIpc" in runtime_session
     assert "Connect::ExplicitRelay" in runtime_session
     assert "Connect::RelayAware" in runtime_session
-    assert ".call_held(method_name, &request)" in core_ffi
-    old_call_signature = "fn call<'py>(\n        &self,\n        py: Python<'py>,\n        route_name: &str,"
-    assert old_call_signature not in core_ffi
-    assert old_call_signature not in runtime_session
+    # Native clients are already contract-bound. Preparation reserves exactly
+    # one Core scope; consuming it passes encoded bytes without another route.
+    client_impl = re.search(r'#\[pymethods\]\s*impl\s+PyCoreClient\s*\{', core_ffi)
+    assert client_impl is not None
+    client_source = core_ffi[client_impl.start():]
+    begin = _rust_compact(_rust_function(client_source, 'begin_call'))
+    call = _rust_compact(_rust_function(client_source, 'call'))
+    finish = _rust_compact(_rust_function(core_ffi, 'finish'))
+    take = _rust_compact(_rust_function(core_ffi, 'take'))
+    clone = _rust_compact(_rust_function(core_ffi, 'client'))
+    assert 'letclient=self.client()?;' in begin
+    assert 'detach(move||client.begin_call(method_name))' in begin
+    assert 'self.begin_call(py,method_name)?.call(py,data)' in call
+    assert 'encoded:c2_core::EncodedCall' in finish
+    assert 'detach(move||encoded.call_held())' in finish
+    assert 'self.inner.lock().take()' in take
+    assert 'self.inner.lock().clone()' in clone
+    assert '.lock()' not in begin + call + finish
+    for name in ('call', 'call_prepared'):
+        prepared_call = _rust_compact(_rust_function(core_ffi, name))
+        assert 'letmutprepared=self.take()?;' in prepared_call
+        assert 'begin_call(' not in prepared_call
+    for source in (core_ffi, runtime_session):
+        assert re.search(
+            r'\bfn\s+call(?:<[^>]*>)?\s*\([^)]*\broute_name\s*:', source,
+        ) is None
 
 
 def test_python_crm_call_surfaces_do_not_accept_route_key_arguments():
@@ -500,13 +672,39 @@ def test_python_crm_call_surfaces_do_not_accept_route_key_arguments():
     assert offenders == []
 
 
-def test_crm_proxy_does_not_pass_route_name_into_native_call():
+@pytest.mark.parametrize('mode', ['ipc', 'http'])
+def test_crm_proxy_does_not_pass_route_name_into_native_call(mode):
     import inspect
+    import textwrap
     from c_two.transport.client.proxy import CRMProxy
 
-    source = inspect.getsource(CRMProxy.call)
-    assert "self._name" not in source
-    assert "self._client.call(method_name, data or b'')" in source
+    tree = ast.parse(textwrap.dedent(inspect.getsource(CRMProxy.call)))
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == '_name'
+        for node in ast.walk(tree)
+    )
+
+    class RouteBoundClientSpy:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method_name, data):
+            self.calls.append((method_name, data))
+            return b'response'
+
+    client = RouteBoundClientSpy()
+    proxy = getattr(CRMProxy, mode)(client, 'already-bound-route')
+    try:
+        for payload in (None, b'request', bytearray(), memoryview(b'request')):
+            assert proxy.call('method', payload) == b'response'
+            method, forwarded = client.calls[-1]
+            assert method == 'method'
+            if payload is None:
+                assert forwarded == b''
+            else:
+                assert forwarded is payload
+    finally:
+        proxy.terminate()
 
 
 def test_python_server_dispatcher_does_not_own_response_allocation():
@@ -530,9 +728,7 @@ def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
     root = Path(__file__).resolve().parents[4]
     core_ffi = root / "sdk" / "python" / "native" / "src" / "core_ffi.rs"
     source = core_ffi.read_text(encoding="utf-8")
-    start = source.index("fn materialize_python_bytes")
-    end = source.index("fn python_error_to_c2", start)
-    parser_source = source[start:end]
+    parser_source = _rust_function(source, 'materialize_python_bytes')
 
     forbidden = [
         "PyTuple",
@@ -544,7 +740,24 @@ def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
     ]
     offenders = [needle for needle in forbidden if needle in parser_source]
     assert offenders == []
-    assert "write_python_payload_plan" in parser_source
+    assert 'materialize_python_payload_plan(py,value,nbytes)' in _rust_compact(parser_source)
+
+    sink_source = (core_ffi.parent / 'writable_sink.rs').read_text(encoding='utf-8')
+    sink = _rust_compact(sink_source)
+    assert 'bytes:Option<Vec<u8>>' in sink
+    export = _rust_compact(_rust_function(sink_source, '__getbuffer__'))
+    transfer = _rust_compact(_rust_function(sink_source, 'take_bytes'))
+    assert 'letmutstate=this.inner.lock();' in export
+    assert 'if!state.active' in export
+    assert '(*view).buf=bytes.as_mut_ptr().cast();' in export
+    assert '(*view).obj=ffi::Py_NewRef(slf.as_ptr());' in export
+    assert 'state.exports+=1;' in export
+    assert 'letmutstate=self.inner.lock();' in transfer
+    assert 'state.active=false;' in transfer
+    assert transfer.index('ifstate.exports!=0') < transfer.index('.bytes.take()')
+    assert 'Err(PyBufferError::new_err(' in transfer
+    release = _rust_compact(_rust_function(sink_source, '__releasebuffer__'))
+    assert 'self.inner.lock().exports-=1;' in release
 
 
 def test_prepared_payload_detection_requires_write_into_before_nbytes():
@@ -552,13 +765,14 @@ def test_prepared_payload_detection_requires_write_into_before_nbytes():
     sink_source = (
         root / "sdk" / "python" / "native" / "src" / "writable_sink.rs"
     ).read_text(encoding="utf-8")
-    start = sink_source.index("pub(crate) fn prepared_plan_nbytes")
-    end = sink_source.index("pub(crate) fn write_python_payload_plan", start)
-    helper_source = sink_source[start:end]
+    helper_source = _rust_compact(_rust_function(sink_source, 'prepared_plan_nbytes'))
 
     assert 'plan.getattr("write_into")' in helper_source
     assert "value.is_callable()" in helper_source
     assert helper_source.index('plan.getattr("write_into")') < helper_source.index('plan.getattr("nbytes")')
+    assert helper_source.index('plan.getattr("write_into")') < helper_source.index('plan.getattr("byte_length")')
+    assert 'Ok(_)=>returnOk(None)' in helper_source
+    assert 'Err(err)if!err.is_instance_of::<PyAttributeError>(plan.py())=>returnErr(err)' in helper_source
 
 
 def test_python_ipc_config_facade_does_not_validate_override_keys():
@@ -691,10 +905,13 @@ def test_route_authority_reports_invalid_ipc_address_as_validation_error():
     authority_source = authority.read_text(encoding="utf-8")
     state_source = state.read_text(encoding="utf-8")
 
-    assert "InvalidAddress { reason: String }" in authority_source
-    assert "c2_ipc::local_endpoint_from_ipc_address(" in authority_source
-    assert ".map_err(|err| ControlError::InvalidAddress {" in authority_source
-    assert "ControlError::InvalidAddress { reason }" in state_source
+    assert 'InvalidAddress{reason:String}' in _rust_compact(authority_source)
+    validation = _rust_compact(_rust_function(authority_source, 'validate_ipc_address'))
+    assert 'self.state.endpoint_context().endpoint(address)' in validation
+    assert '.map_err(|err|ControlError::InvalidAddress{reason:err.to_string(),' in validation
+    assert 'ConfigSources::from_process' not in validation
+    assert 'local_endpoint_from_ipc_address' not in validation
+    assert 'ControlError::InvalidAddress{reason}' in _rust_compact(state_source)
 
 
 def test_python_crm_metadata_is_not_parsed_from_slash_tag():
@@ -709,15 +926,38 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
     route_table = root / "core" / "transport" / "c2-http" / "src" / "relay" / "route_table.rs"
     source = route_table.read_text(encoding="utf-8")
 
-    assert "fn valid_tombstone" in source
-    assert "self.valid_tombstone(&tombstone)" in source
-    assert "fn valid_server_instance_id" in source
-    assert "fn valid_relay_url" in source
-    assert "valid_relay_url(&entry.relay_url)" in source
-    assert "valid_relay_url(&url)" in source
-    assert "let removed = self.routes.get(&key).cloned();" in source
-    assert "if !self.apply_tombstone(tombstone)" in source
-    assert "c2_ipc::local_endpoint_from_ipc_address" in source
+    compact = _rust_compact(source)
+    _rust_function(source, 'valid_tombstone')
+    _rust_function(source, 'valid_server_instance_id')
+    _rust_function(source, 'valid_relay_url')
+    assert 'self.valid_tombstone(&tombstone)' in compact
+    assert 'valid_relay_url(&entry.relay_url)' in compact
+    assert 'valid_relay_url(&url)' in compact
+    assert 'letremoved=self.routes.get(&key).cloned();' in compact
+    assert 'if!self.apply_tombstone(tombstone)' in compact
+    # A guard elsewhere in this module cannot excuse an unchecked mutation.
+    for name in (
+        'unregister_route_with_tombstone',
+        'unregister_local_route_with_tombstone',
+        'unregister_local_route_if_matches',
+    ):
+        mutation = _rust_compact(_rust_function(source, name))
+        assert mutation.index('if!self.valid_tombstone(&tombstone)') < mutation.index(
+            'letremoved=self.routes.get(&key).cloned();',
+        )
+        assert 'if!self.apply_tombstone(tombstone)' in mutation
+    apply = _rust_compact(_rust_function(source, 'apply_tombstone'))
+    assert apply.index('if!self.valid_tombstone(&tombstone)') < apply.index(
+        'self.advance_catalog_revision()',
+    ) < apply.index('self.routes.remove(&key)')
+    address = _rust_compact(_rust_function(source, 'valid_ipc_address'))
+    assert 'address.strip_prefix("ipc://")' in address
+    assert '.is_some_and(|id|c2_config::validate_ipc_region_id(id).is_ok())' in address
+    assert 'local_endpoint_from_ipc_address' not in address
+    assert 'ConfigSources::from_process' not in address
+    identity = _rust_compact(_rust_function(source, 'valid_server_id'))
+    assert 'c2_config::validate_server_id(server_id).is_ok()' in identity
+    assert 'server_id.len()<=MAX_WIRE_TEXT_BYTES' in identity
     assert 'starts_with("ipc://")' not in source
     assert "valid_nonempty_identity" not in source
 

@@ -1,16 +1,20 @@
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use c2_config::{
-    ClientIpcConfigOverrides, ConfigResolver, ConfigSources, RelayConfigOverrides,
-    RuntimeConfigOverrides,
+    CallExecutionLimitsOverrides, ClientIpcConfigOverrides, ConfigResolver, ConfigSources,
+    LocalEndpointOptions, RelayConfigOverrides, RuntimeConfigOverrides,
 };
-use c2_http::relay::RelayServer;
+use c2_http::relay::{RelayServer, RelayServerOptions};
 use clap::Args;
 
 #[derive(Debug, Args)]
 pub struct RelayArgs {
+    /// Pre-created Unix IPC root (not applicable to Windows Named Pipes).
+    #[arg(long)]
+    pub ipc_root: Option<PathBuf>,
     /// HTTP listen address.
     #[arg(long, short = 'b')]
     pub bind: Option<String>,
@@ -50,6 +54,14 @@ pub struct RelayArgs {
     /// Shared upstream IPC live reassembly budget in bytes. Zero rejects positive charges.
     #[arg(long)]
     pub ipc_live_reassembly_budget_bytes: Option<u64>,
+
+    /// Maximum outstanding native forwarding transactions. Zero rejects all calls.
+    #[arg(long)]
+    pub call_max_outstanding: Option<u64>,
+
+    /// Retained forwarding input budget in bytes. Zero rejects positive input.
+    #[arg(long)]
+    pub call_retained_input_budget_bytes: Option<u64>,
 
     /// Validate and print relay configuration without starting the server.
     #[arg(long, hide = true)]
@@ -102,12 +114,37 @@ pub fn run(args: RelayArgs) -> Result<()> {
         },
         ..Default::default()
     };
-    let resolved = ConfigResolver::resolve_relay_server(overrides, ConfigSources::from_process())
-        .map_err(|e| anyhow!("{e}"))?;
+    let options = RelayServerOptions {
+        call_execution: CallExecutionLimitsOverrides {
+            max_outstanding_calls: args.call_max_outstanding,
+            retained_input_budget_bytes: args.call_retained_input_budget_bytes,
+        },
+    };
+    let sources = ConfigSources::from_process();
+    let context = ConfigResolver::resolve_local_endpoint(
+        LocalEndpointOptions {
+            unix_root: args.ipc_root.clone(),
+        },
+        sources.clone(),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+    let resolved =
+        ConfigResolver::resolve_relay_server(overrides, sources).map_err(|e| anyhow!("{e}"))?;
     let config = resolved.relay;
     let display_bind = config.bind.clone();
 
     if args.dry_run {
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            options.call_execution.clone(),
+            ConfigSources::from_process(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        println!("call_max_outstanding={}", limits.max_outstanding_calls);
+        println!(
+            "call_retained_input_budget_bytes={}",
+            limits.retained_input_budget_bytes
+        );
+        println!("local_namespace={}", context.namespace_id());
         println!("bind={}", config.bind);
         println!("relay_id={}", config.relay_id);
         println!("advertise_url={}", config.effective_advertise_url());
@@ -150,8 +187,8 @@ pub fn run(args: RelayArgs) -> Result<()> {
         )
         .init();
 
-    let mut relay =
-        RelayServer::start(config).map_err(|e| anyhow!("failed to start relay: {e}"))?;
+    let mut relay = RelayServer::start_with_context_and_options(config, context, options)
+        .map_err(|e| anyhow!("failed to start relay: {e}"))?;
     for (name, server_id, address) in args.upstreams {
         relay
             .register_upstream(&name, &server_id, &address)

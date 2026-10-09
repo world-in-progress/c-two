@@ -210,3 +210,34 @@ pub(crate) async fn shutdown_live_server(server: &Arc<Server>) {
         .shutdown_and_wait(std::time::Duration::from_secs(2))
         .await;
 }
+
+/// A short, pre-created container owned by one parallel test. Never sweep
+/// historical endpoints or use a process-global root override.
+#[cfg(unix)]
+pub(crate) struct EndpointTestRoot(std::path::PathBuf);
+
+#[cfg(unix)]
+impl EndpointTestRoot {
+    pub(crate) fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/rn{:x}{:x}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    pub(crate) fn context(&self) -> c2_config::LocalEndpointContext {
+        c2_config::LocalEndpointContext::with_unix_root(&self.0).unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EndpointTestRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}

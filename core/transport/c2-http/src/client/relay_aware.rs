@@ -2,13 +2,19 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde_json::json;
 
-use super::{HttpClient, HttpClientPool, HttpError, RelayControlClient, RelayRouteInfo};
+use super::call_control::check_active;
+use super::http_client::HttpCallInput;
+use super::{
+    HttpCallControl, HttpClient, HttpClientPool, HttpError, HttpInputOwner, RelayControlClient,
+    RelayResolvedRoutes, RelayRouteInfo,
+};
+use c2_config::LocalEndpointContext;
 use c2_contract::ExpectedRouteContract;
 
 /// Whether an HTTP call failure is proven to precede CRM dispatch.
@@ -118,6 +124,9 @@ pub struct RelayAwareHttpClient {
     config: RelayAwareClientConfig,
     current: Mutex<Option<String>>,
     anchor_allows_local_ipc: bool,
+    local_endpoint_context: Option<LocalEndpointContext>,
+    default_local_endpoint_context: OnceLock<Option<LocalEndpointContext>>,
+    http_only: bool,
 }
 
 impl RelayAwareHttpClient {
@@ -139,7 +148,12 @@ impl RelayAwareHttpClient {
     ) -> Result<Self, HttpError> {
         c2_contract::validate_expected_route_contract(&expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
+        // HTTP construction must not require a local logon SID or resolve an IPC
+        // root. Legacy local selection derives the platform default lazily.
         Ok(Self {
+            local_endpoint_context: None,
+            default_local_endpoint_context: OnceLock::new(),
+            http_only: false,
             anchor_allows_local_ipc: relay_anchor_allows_local_ipc(control.base_url()),
             control,
             pool: HttpClientPool::instance(),
@@ -148,6 +162,54 @@ impl RelayAwareHttpClient {
             config,
             current: Mutex::new(None),
         })
+    }
+
+    /// Project the context whose endpoints the caller can open. Namespace agreement
+    /// only proposes an IPC candidate; the caller still validates handshake identity
+    /// and the complete expected route contract before using it.
+    pub fn with_local_endpoint_context(mut self, context: &LocalEndpointContext) -> Self {
+        self.local_endpoint_context = Some(context.clone());
+        *self.current.get_mut() = None;
+        self
+    }
+
+    /// Disable local candidate selection without constructing a placeholder
+    /// endpoint context. Remote-only callers need no local platform capability.
+    pub fn with_http_only(mut self) -> Self {
+        self.http_only = true;
+        *self.current.get_mut() = None;
+        self
+    }
+
+    pub fn allows_local_ipc(&self) -> bool {
+        self.anchor_allows_local_ipc && !self.http_only
+    }
+
+    /// The exact context used to compare local candidates. This observation is
+    /// pure; it never binds/connects or freezes a Runtime's configuration.
+    pub fn local_ipc_context(&self) -> Option<&LocalEndpointContext> {
+        if !self.allows_local_ipc() {
+            return None;
+        }
+        self.local_endpoint_context.as_ref().or_else(|| {
+            self.default_local_endpoint_context
+                .get_or_init(|| LocalEndpointContext::default_for_platform().ok())
+                .as_ref()
+        })
+    }
+
+    fn namespace_allows_local_ipc(&self, namespace: Option<&str>) -> bool {
+        let Some(context) = self.local_ipc_context() else {
+            return false;
+        };
+        match namespace {
+            Some(namespace) => namespace == context.namespace_id(),
+            None => self
+                .default_local_endpoint_context
+                .get_or_init(|| LocalEndpointContext::default_for_platform().ok())
+                .as_ref()
+                .is_some_and(|default| context == default),
+        }
     }
 
     pub fn route_name(&self) -> &str {
@@ -176,6 +238,36 @@ impl RelayAwareHttpClient {
         self.call_async(method_name, data)
             .await
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    /// Call with the owner's original scope guards and one shared, read-only
+    /// input owner, including any caller-owned retention permit. Bodies retain
+    /// that complete owner until their last slice is dropped; an attempt's
+    /// completion alone does not release it. The data client has no reqwest
+    /// total/upload timeout; inherited defaults, explicit deadlines and Unlimited
+    /// belong to the caller's scope. No in-flight send is cancelled by this transport.
+    pub async fn call_controlled_async(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        control: &HttpCallControl,
+    ) -> Result<Vec<u8>, HttpCallError> {
+        self.call_inner_async(method_name, HttpCallInput::Owned(data), Some(control))
+            .await
+            .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    /// Synchronous facade for [`Self::call_controlled_async`]. An owned caller
+    /// must drive this operation to completion after business dispatch.
+    pub fn call_controlled(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        control: &HttpCallControl,
+    ) -> Result<Vec<u8>, HttpCallError> {
+        super::http_client::runtime()
+            .handle()
+            .block_on(self.call_controlled_async(method_name, data, control))
     }
 
     pub fn connect(&self) -> Result<(), HttpError> {
@@ -220,11 +312,22 @@ impl RelayAwareHttpClient {
         self.select_target_async(false).await
     }
 
+    /// Resolve/probe under the same logical call's active check. Control-plane
+    /// safety timeouts remain independent and never restart its deadline.
+    /// Neither resolve nor probe invokes the business dispatch guard.
+    pub async fn resolve_http_target_controlled_async(
+        &self,
+        control: &HttpCallControl,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(false, &[], false, Some(control))
+            .await
+    }
+
     pub async fn resolve_target_after_local_ipc_failures_async(
         &self,
         failed_candidates: &[RelayLocalIpcCandidate],
     ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(true, failed_candidates, true)
+        self.select_target_with_local_exclusions_async(true, failed_candidates, true, None)
             .await
     }
 
@@ -232,7 +335,7 @@ impl RelayAwareHttpClient {
         &self,
         prefer_local_ipc: bool,
     ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(prefer_local_ipc, &[], false)
+        self.select_target_with_local_exclusions_async(prefer_local_ipc, &[], false, None)
             .await
     }
 
@@ -241,6 +344,7 @@ impl RelayAwareHttpClient {
         prefer_local_ipc: bool,
         excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
         fallback_denied_when_only_excluded: bool,
+        control: Option<&HttpCallControl>,
     ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
@@ -248,10 +352,14 @@ impl RelayAwareHttpClient {
 
         for attempt in 0..attempts {
             let routes = match self
-                .resolve_routes_async(attempt > 0 || fallback_denied_when_only_excluded)
+                .resolve_routes_async(
+                    attempt > 0 || fallback_denied_when_only_excluded,
+                    prefer_local_ipc,
+                    control,
+                )
                 .await
             {
-                Ok(routes) if !routes.is_empty() => routes,
+                Ok(routes) if !routes.routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
@@ -266,8 +374,11 @@ impl RelayAwareHttpClient {
                     return Err(err);
                 }
             };
-            let had_routes_before_local_exclusion = !routes.is_empty();
-            let routes = filter_failed_local_ipc_candidates(routes, excluded_local_ipc_candidates);
+            let namespace_allows_local_ipc = prefer_local_ipc
+                && self.namespace_allows_local_ipc(routes.local_endpoint_namespace.as_deref());
+            let had_routes_before_local_exclusion = !routes.routes.is_empty();
+            let routes =
+                filter_failed_local_ipc_candidates(routes.routes, excluded_local_ipc_candidates);
             if routes.is_empty()
                 && fallback_denied_when_only_excluded
                 && had_routes_before_local_exclusion
@@ -280,7 +391,7 @@ impl RelayAwareHttpClient {
 
             if let Some(candidate) = select_local_ipc_candidate(
                 prefer_local_ipc,
-                self.anchor_allows_local_ipc,
+                self.anchor_allows_local_ipc && namespace_allows_local_ipc,
                 &routes,
                 &self.expected,
             ) {
@@ -296,28 +407,26 @@ impl RelayAwareHttpClient {
 
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self.pool.acquire_with_options(
-                    &relay_url,
-                    self.use_proxy,
-                    self.config.call_timeout_secs,
-                    self.config.remote_payload_chunk_size,
-                ) {
-                    Ok(client) => RelayPoolGuard {
-                        pool: self.pool,
-                        relay_url: relay_url.clone(),
-                        client,
-                    },
+                let client = match self.acquire_route_client(&relay_url, control) {
+                    Ok(client) => client,
+                    Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
                     Err(err) => {
                         last_error = Some(err);
                         continue;
                     }
                 };
 
-                match client
+                check_active(control)?;
+                let probe = client
                     .client
-                    .probe_route_with_token_async(&self.expected, &route.route_token())
-                    .await
-                {
+                    .probe_route_with_token_async(
+                        &self.expected,
+                        &route.route_token(),
+                        route.max_payload_size,
+                    )
+                    .await;
+                check_active(control)?;
+                match probe {
                     Ok(()) => {
                         *self.current.lock() = Some(relay_url.clone());
                         return Ok(RelayResolvedTarget::Http {
@@ -338,7 +447,11 @@ impl RelayAwareHttpClient {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if attempt + 1 < attempts {
+                check_active(control)?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                check_active(control)?;
+            }
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -351,13 +464,24 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, HttpError> {
+        self.call_inner_async(method_name, HttpCallInput::Borrowed(data), None)
+            .await
+    }
+
+    async fn call_inner_async(
+        &self,
+        method_name: &str,
+        data: HttpCallInput<'_>,
+        control: Option<&HttpCallControl>,
+    ) -> Result<Vec<u8>, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
         let mut excluded_routes = HashSet::new();
+        let mut previous_dispatch = None;
 
         for attempt in 0..attempts {
-            let routes = match self.resolve_routes_async(attempt > 0).await {
-                Ok(routes) if !routes.is_empty() => routes,
+            let routes = match self.resolve_routes_async(attempt > 0, false, control).await {
+                Ok(routes) if !routes.routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
@@ -373,7 +497,7 @@ impl RelayAwareHttpClient {
                 }
             };
 
-            let ordered = self.order_routes(routes, &excluded_routes);
+            let ordered = self.order_routes(routes.routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
                     HttpError::ServerError(404, resource_not_found_body(self.route_name()))
@@ -381,17 +505,9 @@ impl RelayAwareHttpClient {
             }
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self.pool.acquire_with_options(
-                    &relay_url,
-                    self.use_proxy,
-                    self.config.call_timeout_secs,
-                    self.config.remote_payload_chunk_size,
-                ) {
-                    Ok(client) => RelayPoolGuard {
-                        pool: self.pool,
-                        relay_url: relay_url.clone(),
-                        client,
-                    },
+                let client = match self.acquire_route_client(&relay_url, control) {
+                    Ok(client) => client,
+                    Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
                     Err(err) => {
                         last_error = Some(err);
                         continue;
@@ -403,8 +519,11 @@ impl RelayAwareHttpClient {
                     .call_with_route_token_async(
                         &self.expected,
                         &route.route_token(),
+                        route.max_payload_size,
                         method_name,
-                        data,
+                        &data,
+                        control,
+                        previous_dispatch,
                     )
                     .await
                 {
@@ -414,6 +533,8 @@ impl RelayAwareHttpClient {
                     }
                     Err(HttpError::CrmError(err)) => return Err(HttpError::CrmError(err)),
                     Err(err) if route_is_stale(&err) => {
+                        check_active(control)?;
+                        previous_dispatch = Some(HttpCallPhase::PreDispatch);
                         self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
                         excluded_routes.insert(relay_url);
@@ -424,7 +545,11 @@ impl RelayAwareHttpClient {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if attempt + 1 < attempts {
+                check_active(control)?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                check_active(control)?;
+            }
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -435,25 +560,43 @@ impl RelayAwareHttpClient {
     async fn resolve_routes_async(
         &self,
         force_refresh: bool,
-    ) -> Result<Vec<RelayRouteInfo>, HttpError> {
+        prefer_local_ipc: bool,
+        control: Option<&HttpCallControl>,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
+        check_active(control)?;
         if force_refresh {
             self.control.invalidate(self.route_name());
         }
-        let routes = self.control.resolve_matching_async(&self.expected).await?;
-        let raw_routes_non_empty = !routes.is_empty();
-        let filtered = filter_routes_by_expected_contract(routes, &self.expected);
+        let routes = self
+            .resolve_with_endpoint_context_async(prefer_local_ipc)
+            .await;
+        check_active(control)?;
+        let routes = routes?;
+        let raw_routes_non_empty = !routes.routes.is_empty();
+        let local_endpoint_namespace = routes.local_endpoint_namespace;
+        let filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
         if !force_refresh && raw_routes_non_empty && filtered.is_empty() {
+            check_active(control)?;
             self.control.invalidate(self.route_name());
-            let refreshed = self.control.resolve_matching_async(&self.expected).await?;
-            let refreshed_routes_non_empty = !refreshed.is_empty();
-            let refreshed_filtered = filter_routes_by_expected_contract(refreshed, &self.expected);
+            let refreshed = self
+                .resolve_with_endpoint_context_async(prefer_local_ipc)
+                .await;
+            check_active(control)?;
+            let refreshed = refreshed?;
+            let refreshed_routes_non_empty = !refreshed.routes.is_empty();
+            let local_endpoint_namespace = refreshed.local_endpoint_namespace;
+            let refreshed_filtered =
+                filter_routes_by_expected_contract(refreshed.routes, &self.expected);
             if refreshed_routes_non_empty && refreshed_filtered.is_empty() {
                 return Err(HttpError::ServerError(
                     409,
                     crm_contract_mismatch_body(self.route_name()),
                 ));
             }
-            return Ok(refreshed_filtered);
+            return Ok(RelayResolvedRoutes {
+                routes: refreshed_filtered,
+                local_endpoint_namespace,
+            });
         }
         if force_refresh && raw_routes_non_empty && filtered.is_empty() {
             return Err(HttpError::ServerError(
@@ -461,7 +604,68 @@ impl RelayAwareHttpClient {
                 crm_contract_mismatch_body(self.route_name()),
             ));
         }
-        Ok(filtered)
+        Ok(RelayResolvedRoutes {
+            routes: filtered,
+            local_endpoint_namespace,
+        })
+    }
+
+    async fn resolve_with_endpoint_context_async(
+        &self,
+        prefer_local_ipc: bool,
+    ) -> Result<RelayResolvedRoutes, HttpError> {
+        // A supplied Runtime snapshot may be advertised on HTTP-only paths too;
+        // only local selection may lazily request the platform default/SID.
+        let context = self.local_endpoint_context.as_ref().or_else(|| {
+            if prefer_local_ipc {
+                self.local_ipc_context()
+            } else {
+                None
+            }
+        });
+        match context {
+            Some(context) => {
+                self.control
+                    .resolve_matching_with_context_async(&self.expected, context)
+                    .await
+            }
+            None => {
+                self.control
+                    .resolve_matching_with_namespace_async(&self.expected)
+                    .await
+            }
+        }
+    }
+
+    fn acquire_route_client(
+        &self,
+        relay_url: &str,
+        control: Option<&HttpCallControl>,
+    ) -> Result<RelayPoolGuard, HttpError> {
+        check_active(control)?;
+        let client = if control.is_some() {
+            self.pool.acquire_controlled(
+                relay_url,
+                self.use_proxy,
+                self.config.remote_payload_chunk_size,
+            )
+        } else {
+            self.pool.acquire_with_options(
+                relay_url,
+                self.use_proxy,
+                self.config.call_timeout_secs,
+                self.config.remote_payload_chunk_size,
+            )
+        }
+        .map(|client| RelayPoolGuard {
+            pool: self.pool,
+            relay_url: relay_url.to_string(),
+            client,
+            controlled: control.is_some(),
+        });
+        // The mutex/build wait is complete; rejection also drops the acquired lease.
+        check_active(control)?;
+        client
     }
 
     fn order_routes(
@@ -495,11 +699,12 @@ struct RelayPoolGuard {
     pool: &'static HttpClientPool,
     relay_url: String,
     client: Arc<HttpClient>,
+    controlled: bool,
 }
 
 impl Drop for RelayPoolGuard {
     fn drop(&mut self) {
-        self.pool.release(&self.relay_url);
+        self.pool.release_view(&self.relay_url, self.controlled);
     }
 }
 
@@ -511,35 +716,19 @@ fn route_is_stale(err: &HttpError) -> bool {
         HttpError::ServerError(409, body) => {
             relay_error_code_is(body, c2_error::ErrorCode::RouteStale)
         }
-        HttpError::ServerError(502, body) => canonical_semantic_error(body).is_some_and(|error| {
-            error.code == c2_error::ErrorCode::ResourceUnavailable
-                && error.details.get("dispatch_phase").map(String::as_str) == Some("pre_dispatch")
-        }),
+        // ResourceUnavailable + pre_dispatch also covers local request capacity
+        // rejection. It proves no business dispatch, but not a stale route, so
+        // it must not trigger withdrawal or authorize another business POST.
         _ => false,
     }
 }
 
 fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
     match error {
-        HttpError::InvalidInput(_) => HttpCallPhase::PreDispatch,
-        HttpError::ServerError(_, body)
-            if canonical_semantic_error(body).is_some_and(|error| {
-                error.code != c2_error::ErrorCode::ResourceUnavailable
-                    || error.details.get("dispatch_phase").map(String::as_str)
-                        == Some("pre_dispatch")
-            }) =>
-        {
-            HttpCallPhase::PreDispatch
-        }
-        HttpError::CrmError(_) | HttpError::Transport(_) | HttpError::ServerError(_, _) => {
-            HttpCallPhase::DispatchUncertain
-        }
+        HttpError::InvalidInput(_) | HttpError::LocalCallRejected(_) => HttpCallPhase::PreDispatch,
+        error if route_is_stale(error) => HttpCallPhase::PreDispatch,
+        _ => HttpCallPhase::DispatchUncertain,
     }
-}
-
-fn canonical_semantic_error(body: &str) -> Option<c2_error::C2Error> {
-    let envelope = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body).ok()?;
-    c2_error::C2Error::from_envelope(envelope).ok()
 }
 
 fn relay_error_code_is(body: &str, expected: c2_error::ErrorCode) -> bool {
@@ -795,15 +984,39 @@ mod tests {
         })
     }
 
-    async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
-        let mut error = canonical_error_json(
-            702,
-            "ResourceUnavailable",
-            "relay upstream unavailable",
-            &route,
+    #[test]
+    fn retry_proof_requires_stale_route_authority_and_never_capacity_or_crm_failure() {
+        let stale = HttpError::ServerError(
+            409,
+            canonical_error_json(704, "RouteStale", "stale token", "grid").to_string(),
         );
-        error["details"]["dispatch_phase"] = json!("pre_dispatch");
-        (StatusCode::BAD_GATEWAY, Json(error)).into_response()
+        assert!(route_is_stale(&stale));
+        assert_eq!(http_call_error_phase(&stale), HttpCallPhase::PreDispatch);
+
+        let mut capacity = canonical_error_json(702, "ResourceUnavailable", "capacity", "grid");
+        capacity["details"]["dispatch_phase"] = json!("pre_dispatch");
+        for error in [
+            HttpError::ServerError(502, capacity.to_string()),
+            HttpError::ServerError(429, capacity.to_string()),
+            HttpError::ServerError(404, "ResourceNotFound in an untrusted body".into()),
+            HttpError::CrmError(
+                canonical_error_json(704, "RouteStale", "user error", "grid")
+                    .to_string()
+                    .into_bytes(),
+            ),
+            HttpError::Transport("connection lost after POST".into()),
+        ] {
+            assert!(!route_is_stale(&error));
+            assert_eq!(
+                http_call_error_phase(&error),
+                HttpCallPhase::DispatchUncertain
+            );
+        }
+    }
+
+    async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
+        let error = canonical_error_json(704, "RouteStale", "relay route token is stale", &route);
+        (StatusCode::CONFLICT, Json(error)).into_response()
     }
 
     async fn generic_bad_gateway() -> Response {
@@ -1090,6 +1303,173 @@ mod tests {
 
         registry_handle.abort();
         live_handle.abort();
+    }
+
+    #[test]
+    fn http_policy_never_requires_a_local_scope() {
+        for anchor in ["http://127.0.0.1:9", "https://relay.example"] {
+            let client = RelayAwareHttpClient::new(
+                anchor,
+                expected_contract(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap();
+            assert!(client.default_local_endpoint_context.get().is_none());
+            let client = client.with_http_only();
+            assert!(!client.allows_local_ipc());
+            assert!(client.local_ipc_context().is_none());
+            assert!(!client.namespace_allows_local_ipc(None));
+            assert!(client.default_local_endpoint_context.get().is_none());
+        }
+    }
+
+    #[test]
+    fn unavailable_local_scope_proposes_http_without_a_fake_context() {
+        let client = RelayAwareHttpClient::new(
+            "http://127.0.0.1:9",
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap();
+        // Synthetic result of a failed platform/SID lookup, without OS or env
+        // mutation. There is no replacement SID/context and no local I/O.
+        client.default_local_endpoint_context.set(None).unwrap();
+        assert!(client.local_ipc_context().is_none());
+        assert!(!client.namespace_allows_local_ipc(None));
+        assert!(!client.namespace_allows_local_ipc(Some(&"f".repeat(64))));
+    }
+
+    #[test]
+    fn immutable_namespace_expectation_preserves_platform_default_legacy_mapping() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let client = RelayAwareHttpClient::new(
+            "http://127.0.0.1:9",
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap();
+        assert!(client.namespace_allows_local_ipc(None));
+        assert!(client.namespace_allows_local_ipc(Some(context.namespace_id())));
+        assert!(!client.namespace_allows_local_ipc(Some(&"f".repeat(64))));
+        #[cfg(unix)]
+        {
+            let custom =
+                LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-ns-test"))
+                    .unwrap();
+            let client = client.with_local_endpoint_context(&custom);
+            assert!(!client.namespace_allows_local_ipc(None));
+            assert!(!client.namespace_allows_local_ipc(Some(context.namespace_id())));
+            assert!(client.namespace_allows_local_ipc(Some(custom.namespace_id())));
+        }
+    }
+
+    async fn assert_namespace_selection(
+        context: &LocalEndpointContext,
+        response_namespace: Option<String>,
+        expect_ipc: bool,
+    ) {
+        use super::super::LOCAL_ENDPOINT_NAMESPACE_HEADER;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe_count = probes.clone();
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route(
+                    "/_probe/{route}",
+                    get(move || {
+                        let probe_count = probe_count.clone();
+                        async move {
+                            probe_count.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
+        let expected_namespace = context.namespace_id().to_owned();
+        let resolved_url = live_url.clone();
+        let (registry_url, registry_handle) = spawn_app(Router::new().route(
+            "/_resolve/{name}",
+            get(move |headers: HeaderMap| {
+                let expected_namespace = expected_namespace.clone();
+                let response_namespace = response_namespace.clone();
+                let resolved_url = resolved_url.clone();
+                async move {
+                    assert_eq!(
+                        headers.get(LOCAL_ENDPOINT_NAMESPACE_HEADER).unwrap(),
+                        expected_namespace.as_str()
+                    );
+                    let mut response = Json(vec![RelayRouteInfo {
+                        ipc_address: Some("ipc://local-grid".into()),
+                        server_id: Some("local-grid".into()),
+                        server_instance_id: Some("inst-local-grid".into()),
+                        ..route_info("grid".into(), resolved_url)
+                    }])
+                    .into_response();
+                    if let Some(namespace) = response_namespace {
+                        response
+                            .headers_mut()
+                            .insert(LOCAL_ENDPOINT_NAMESPACE_HEADER, namespace.parse().unwrap());
+                    }
+                    response
+                }
+            }),
+        ))
+        .await;
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap()
+        .with_local_endpoint_context(context);
+        let target = client.resolve_target_async().await.unwrap();
+        assert_eq!(
+            matches!(target, RelayResolvedTarget::Ipc { .. }),
+            expect_ipc
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), usize::from(!expect_ipc));
+        // Mismatch and missing custom metadata preserve the same HTTP route and token.
+        if !expect_ipc {
+            assert_eq!(target.as_url(), live_url);
+            assert_eq!(
+                client.call_async("step", b"namespace").await.unwrap(),
+                b"ok:namespace"
+            );
+        }
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
+    // Kept cross-platform: Windows default SID metadata and legacy compatibility
+    // use the same public negotiation, including explicit mismatch -> HTTP.
+    #[tokio::test]
+    async fn default_namespace_new_and_old_relay_compatibility() {
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        assert_namespace_selection(&context, Some(context.namespace_id().to_owned()), true).await;
+        assert_namespace_selection(&context, None, true).await;
+        let mismatch = if context.namespace_id() == "a".repeat(64) {
+            "b"
+        } else {
+            "a"
+        }
+        .repeat(64);
+        assert_namespace_selection(&context, Some(mismatch), false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_namespace_requires_matching_metadata_and_keeps_http_route() {
+        let context =
+            LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-ns-test")).unwrap();
+        assert_namespace_selection(&context, Some(context.namespace_id().to_owned()), true).await;
+        assert_namespace_selection(&context, None, false).await;
+        let other = LocalEndpointContext::default_for_platform().unwrap();
+        assert_namespace_selection(&context, Some(other.namespace_id().to_owned()), false).await;
     }
 
     #[tokio::test]

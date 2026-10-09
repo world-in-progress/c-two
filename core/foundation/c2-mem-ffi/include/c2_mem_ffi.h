@@ -42,17 +42,68 @@ typedef struct C2MemFfiResponseBlock {
 
 typedef struct C2MemFfiRequestPool C2MemFfiRequestPool;
 typedef struct C2MemFfiResponsePool C2MemFfiResponsePool;
+typedef struct C2MemFfiLocalEndpointContext C2MemFfiLocalEndpointContext;
 
 uint32_t c2_mem_ffi_abi_version(void);
 
 /*
  * Resolve a logical ipc:// address through c2-config's native endpoint owner.
  * The backend is selected automatically by the native platform.
+ * Each call resolves process/.env configuration independently; a length/copy
+ * pair is stable only when it uses the captured-context API below.
  */
 C2MemFfiStatus c2_mem_ffi_local_endpoint_len(
     const char *address, size_t *out_len);
 C2MemFfiStatus c2_mem_ffi_local_endpoint_copy(
     const char *address, char *dst, size_t dst_len, size_t *out_written);
+
+/*
+ * Optional additive ABI-3 capability. An older ABI-3 library may lack these
+ * symbols; consumers must detect the complete context API before calling it.
+ *
+ * Capture c2-config's complete immutable endpoint context exactly once.
+ * NULL unix_root inherits process env/.env/platform default; a non-NULL UTF-8
+ * root is the explicit code override and does not read process env/.env.
+ * Unix roots are validated without
+ * creating or checking directories; the caller prepares a root before bind.
+ * Windows uses the current logon SID and rejects every non-NULL root override.
+ * This context does not change SHM names or pool layouts.
+ *
+ * On failure a valid out_context is set to NULL. The successful pointer is
+ * owned by the caller and must be freed once after all queries have ended.
+ * free(NULL) is safe; other pointers must be live results from capture.
+ * Dangling, forged, and multiply freed pointers are not valid inputs.
+ */
+C2MemFfiStatus c2_mem_ffi_local_endpoint_context_capture(
+    const char *unix_root, C2MemFfiLocalEndpointContext **out_context);
+void c2_mem_ffi_local_endpoint_context_free(
+    C2MemFfiLocalEndpointContext *context);
+
+/*
+ * Names and namespace ids come from the same captured context, independent
+ * of later env/.env changes. Length/written counts exclude the final NUL;
+ * copy needs len + 1 bytes. On failure valid out_len/out_written are set to 0
+ * and dst is unchanged. Input/output storage must not overlap. Non-NULL
+ * context pointers must stay live for the entire query.
+ */
+C2MemFfiStatus c2_mem_ffi_local_endpoint_context_name_len(
+    const C2MemFfiLocalEndpointContext *context,
+    const char *address,
+    size_t *out_len);
+C2MemFfiStatus c2_mem_ffi_local_endpoint_context_name_copy(
+    const C2MemFfiLocalEndpointContext *context,
+    const char *address,
+    char *dst,
+    size_t dst_len,
+    size_t *out_written);
+C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_len(
+    const C2MemFfiLocalEndpointContext *context,
+    size_t *out_len);
+C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_copy(
+    const C2MemFfiLocalEndpointContext *context,
+    char *dst,
+    size_t dst_len,
+    size_t *out_written);
 
 /* Creates a native buddy/dedicated request pool. max_segments must be 1..16. */
 C2MemFfiStatus c2_mem_ffi_request_pool_new(

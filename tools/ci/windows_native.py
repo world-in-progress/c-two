@@ -307,10 +307,13 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE) -> list[Gate]:
         return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], ()
 
     if scope == LOCAL_PLATFORM_SCOPE:
-        return [cargo("local-platform-tests", "core/Cargo.toml", "--lib", "--no-fail-fast",
-                      "-p", "c2-config", "-p", "c2-local-security", "-p", "c2-local",
+        # Include native integration tests (notably owner-control) and Core
+        # call-state tests at each implementation stage, without SDK matrices.
+        return [cargo("local-platform-tests", "core/Cargo.toml", "--no-fail-fast",
+                      "--features", "c2-http/relay",
+                      "-p", "c2-config", "-p", "c2-error", "-p", "c2-local-security", "-p", "c2-local",
                       "-p", "c2-mem", "-p", "c2-mem-ffi", "-p", "c2-wire",
-                      "-p", "c2-ipc", "-p", "c2-server")]
+                      "-p", "c2-ipc", "-p", "c2-server", "-p", "c2-http", "-p", "c2-core")]
     if scope != FULL_SCOPE:
         raise ValueError(f"Unknown native gate scope: {scope}")
     fastdb_typescript = "../fastdb/ts/fastdb4ts"

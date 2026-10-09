@@ -20,6 +20,7 @@ use c2_http::client::{
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
+use crate::call_execution::{CallExecutionContext, CallExecutionObserver};
 use crate::outcome::RuntimeRouteSpec;
 use crate::{
     LifecycleError, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome,
@@ -142,14 +143,27 @@ struct RuntimeState {
     client_ipc_overrides: Option<ClientIpcConfigOverrides>,
     shm_threshold: Option<u64>,
     remote_payload_chunk_size: Option<u64>,
+    call_execution_overrides: c2_config::CallExecutionLimitsOverrides,
+    call_execution_sources: Option<c2_config::ConfigSources>,
+    call_execution_revision: u64,
+    call_execution: Option<CallExecutionContext>,
+    call_execution_observer: CallExecutionObserver,
     client_config_frozen: bool,
+    client_config_revision: u64,
+    local_endpoint_options: c2_config::LocalEndpointOptions,
+    local_endpoint_sources: Option<c2_config::ConfigSources>,
+    local_endpoint_revision: u64,
+    frozen_local_endpoint: Option<c2_config::LocalEndpointContext>,
+    /// Accepted domain inherited from a used session, still configurable until I/O.
+    inherited_local_endpoint: Option<c2_config::LocalEndpointContext>,
     /// Resolved client IPC config fixed by the first valid connection
     /// attempt. Later acquires reuse it verbatim so one Runtime can never
     /// run two competing client configurations.
     frozen_client_config: Option<c2_config::ClientIpcConfig>,
-    /// Outgoing IPC client cache owned by this Runtime. Clones of the
-    /// Runtime share it; distinct Runtimes are isolated.
-    client_pool: Arc<c2_ipc::ClientPool>,
+    /// Outgoing IPC cache in one immutable endpoint domain. Created on first
+    /// acquire so HTTP-only Runtimes need no local platform scope. Clones share
+    /// it; distinct Runtimes are isolated, and drains never replace the pool.
+    client_pool: Option<Arc<c2_ipc::ClientPool>>,
     identity: Option<RuntimeIdentity>,
     relay_anchor_address_override: Option<String>,
     use_process_relay_anchor: bool,
@@ -176,6 +190,7 @@ struct RelayProjection {
     relay_anchor_address: String,
     relay_use_proxy: bool,
     control: Arc<RelayControlClient>,
+    local_endpoint_context: Option<c2_config::LocalEndpointContext>,
 }
 
 pub(crate) struct RelayClientSettings {
@@ -189,6 +204,7 @@ pub(crate) enum RelayResolvedConnection {
     Ipc {
         client: RelayAwareHttpClient,
         candidate: RelayLocalIpcCandidate,
+        context: c2_config::LocalEndpointContext,
     },
     Http {
         client: RelayAwareHttpClient,
@@ -210,6 +226,14 @@ impl RuntimeState {
     }
 }
 
+impl Drop for RuntimeState {
+    fn drop(&mut self) {
+        // Observers retain accounting metadata alone. Closing on last session
+        // owner drop does not refund surviving real input/preparation owners.
+        self.call_execution_observer.close();
+    }
+}
+
 impl Runtime {
     pub fn new(options: RuntimeOptions) -> Result<Self, LifecycleError> {
         if let Some(server_id) = options.server_id.as_deref() {
@@ -222,9 +246,20 @@ impl Runtime {
                 client_ipc_overrides: options.client_ipc_overrides,
                 shm_threshold: options.shm_threshold,
                 remote_payload_chunk_size: options.remote_payload_chunk_size,
+                call_execution_overrides: Default::default(),
+                call_execution_sources: None,
+                call_execution_revision: 0,
+                call_execution: None,
+                call_execution_observer: CallExecutionObserver::new(),
                 client_config_frozen: false,
+                client_config_revision: 0,
+                local_endpoint_options: Default::default(),
+                local_endpoint_sources: None,
+                local_endpoint_revision: 0,
+                frozen_local_endpoint: None,
+                inherited_local_endpoint: None,
                 frozen_client_config: None,
-                client_pool: Arc::new(c2_ipc::ClientPool::new(Duration::from_secs(60))),
+                client_pool: None,
                 identity: None,
                 relay_anchor_address_override: options
                     .relay_anchor_address
@@ -242,6 +277,280 @@ impl Runtime {
                 forced_relay_config_error: None,
             })),
         })
+    }
+
+    /// Configure the independent finite-call domain before its first business
+    /// call. Connect does not freeze this policy. Clones and every Client share
+    /// the one domain; teardown never replaces it or launders live charges.
+    pub fn set_call_execution_limits(
+        &self,
+        overrides: c2_config::CallExecutionLimitsOverrides,
+    ) -> Result<(), LifecycleError> {
+        self.configure_call_execution_limits(overrides, None)
+    }
+
+    /// Deterministic resolver inputs replace process discovery for this domain.
+    pub fn set_call_execution_limits_with_sources(
+        &self,
+        overrides: c2_config::CallExecutionLimitsOverrides,
+        sources: c2_config::ConfigSources,
+    ) -> Result<(), LifecycleError> {
+        self.configure_call_execution_limits(overrides, Some(sources))
+    }
+
+    fn configure_call_execution_limits(
+        &self,
+        overrides: c2_config::CallExecutionLimitsOverrides,
+        sources: Option<c2_config::ConfigSources>,
+    ) -> Result<(), LifecycleError> {
+        let limits = resolve_call_execution_limits(overrides.clone(), sources.clone())?;
+        let mut state = self.state.lock();
+        if let Some(context) = &state.call_execution {
+            let snapshot = context.snapshot();
+            return if snapshot.max_operations == limits.max_outstanding_calls
+                && snapshot.max_retained_bytes == limits.retained_input_budget_bytes
+            {
+                // Record accepted optional code inputs, even for an idempotent
+                // setter. The frozen budget and its live charges stay intact.
+                state.call_execution_overrides = overrides;
+                state.call_execution_sources = sources;
+                Ok(()) // Idempotent configuration, never replace this domain.
+            } else {
+                Err(LifecycleError::ConfigFrozen)
+            };
+        }
+        if state.call_execution_observer.is_closed() {
+            return Err(LifecycleError::ConfigFrozen);
+        }
+        state.call_execution_overrides = overrides;
+        state.call_execution_sources = sources;
+        state.call_execution_revision += 1;
+        Ok(())
+    }
+
+    /// Consistent read-only input retention counters. Before first call this
+    /// resolves policy without freezing or constructing an executor. It counts
+    /// actual finite owners, including continuations after caller timeout;
+    /// response-storage observations stay in outgoing_memory_observer().
+    pub fn call_execution_snapshot(&self) -> Result<crate::CallExecutionSnapshot, LifecycleError> {
+        Ok(self.resolve_call_execution_context(false)?.snapshot())
+    }
+
+    /// Capture pure metadata for this Runtime's independent domain, including
+    /// future first-call initialization. This neither resolves nor freezes policy.
+    pub fn call_execution_observer(&self) -> CallExecutionObserver {
+        self.state.lock().call_execution_observer.clone()
+    }
+
+    /// Last accepted optional code inputs, without resolving defaults or
+    /// environment. This is not a second copy of the effective domain limits.
+    pub fn call_execution_limits_overrides(&self) -> c2_config::CallExecutionLimitsOverrides {
+        self.state.lock().call_execution_overrides.clone()
+    }
+
+    pub(crate) fn call_execution_context(&self) -> Result<CallExecutionContext, LifecycleError> {
+        self.resolve_call_execution_context(true)
+    }
+
+    fn resolve_call_execution_context(
+        &self,
+        freeze: bool,
+    ) -> Result<CallExecutionContext, LifecycleError> {
+        loop {
+            let (overrides, sources, revision) = {
+                let state = self.state.lock();
+                if let Some(context) = &state.call_execution {
+                    return Ok(context.clone());
+                }
+                (
+                    state.call_execution_overrides.clone(),
+                    state.call_execution_sources.clone(),
+                    state.call_execution_revision,
+                )
+            };
+            // Environment/.env I/O outside runtime metadata, just as for the
+            // existing configuration domains. A racing setter wins by revision.
+            let resolved = resolve_call_execution_limits(overrides, sources);
+            let mut state = self.state.lock();
+            if let Some(context) = &state.call_execution {
+                return Ok(context.clone());
+            }
+            if state.call_execution_revision != revision {
+                continue;
+            }
+            let context = CallExecutionContext::new(&resolved?);
+            if state.call_execution_observer.is_closed() {
+                context.close();
+            }
+            if freeze {
+                state.call_execution_observer.publish(&context);
+                state.call_execution = Some(context.clone());
+            }
+            return Ok(context);
+        }
+    }
+
+    /// Configure local endpoints without binding, connecting, or freezing memory policy.
+    /// Code options override process environment, then .env, then platform defaults.
+    pub fn set_local_endpoint(
+        &self,
+        options: c2_config::LocalEndpointOptions,
+    ) -> Result<(), LifecycleError> {
+        self.set_local_endpoint_sources(options, None)
+    }
+
+    /// Configure local endpoints with explicit resolver inputs (for deterministic
+    /// embedding and isolated fixtures). These inputs replace process discovery.
+    pub fn set_local_endpoint_with_sources(
+        &self,
+        options: c2_config::LocalEndpointOptions,
+        sources: c2_config::ConfigSources,
+    ) -> Result<(), LifecycleError> {
+        self.set_local_endpoint_sources(options, Some(sources))
+    }
+
+    fn set_local_endpoint_sources(
+        &self,
+        options: c2_config::LocalEndpointOptions,
+        sources: Option<c2_config::ConfigSources>,
+    ) -> Result<(), LifecycleError> {
+        // Resolver file reads and platform scope lookup run outside Runtime metadata.
+        let context = resolve_local_endpoint(options.clone(), sources.clone())?;
+        let mut state = self.state.lock();
+        if let Some(frozen) = &state.frozen_local_endpoint {
+            return if frozen == &context {
+                Ok(())
+            } else {
+                Err(LifecycleError::ConfigFrozen)
+            };
+        }
+        state.local_endpoint_options = options;
+        state.local_endpoint_sources = sources;
+        state.inherited_local_endpoint = None;
+        state.local_endpoint_revision += 1;
+        Ok(())
+    }
+
+    /// Inherit endpoint selection without resolving sources or platform scope.
+    /// Unused policies remain lazy; a used domain survives environment changes.
+    /// The replacement remains configurable until its own first local I/O.
+    pub fn inherit_local_endpoint_selection(&self, previous: &Self) -> Result<(), LifecycleError> {
+        if Arc::ptr_eq(&self.state, &previous.state) {
+            return Ok(());
+        }
+        let (options, sources, selected) = {
+            let state = previous.state.lock();
+            (
+                state.local_endpoint_options.clone(),
+                state.local_endpoint_sources.clone(),
+                state
+                    .frozen_local_endpoint
+                    .clone()
+                    .or_else(|| state.inherited_local_endpoint.clone()),
+            )
+        };
+        // Never hold both Runtime locks, including for opposite-direction handoffs.
+        let mut state = self.state.lock();
+        if state.frozen_local_endpoint.is_some() {
+            return Err(LifecycleError::ConfigFrozen);
+        }
+        state.local_endpoint_options = options;
+        state.local_endpoint_sources = sources;
+        state.inherited_local_endpoint = selected;
+        state.local_endpoint_revision += 1;
+        Ok(())
+    }
+
+    /// Pure context observation. Before first local I/O it reflects current
+    /// resolver inputs; afterwards it returns the immutable Runtime snapshot.
+    /// Never creates directories, a ClientPool, or a client memory domain.
+    pub fn local_endpoint_context(
+        &self,
+    ) -> Result<c2_config::LocalEndpointContext, LifecycleError> {
+        self.resolve_local_endpoint_context(false)
+    }
+
+    pub fn local_endpoint(
+        &self,
+        address: &str,
+    ) -> Result<c2_config::LocalEndpoint, LifecycleError> {
+        self.local_endpoint_context()?
+            .endpoint(address)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))
+    }
+
+    pub fn local_endpoint_frozen(&self) -> bool {
+        self.state.lock().frozen_local_endpoint.is_some()
+    }
+
+    pub(crate) fn freeze_local_endpoint_context(
+        &self,
+    ) -> Result<c2_config::LocalEndpointContext, LifecycleError> {
+        self.resolve_local_endpoint_context(true)
+    }
+
+    fn resolve_local_endpoint_context(
+        &self,
+        freeze: bool,
+    ) -> Result<c2_config::LocalEndpointContext, LifecycleError> {
+        self.resolve_local_endpoint_context_guarded(freeze, None)
+            .map(|context| {
+                context.expect("unconditional context resolution cannot reject a domain")
+            })
+    }
+
+    /// Resolve and, for an imminent local acquire, publish under the same
+    /// metadata fence. A stale relay candidate cannot freeze a different domain.
+    fn resolve_local_endpoint_context_guarded(
+        &self,
+        freeze: bool,
+        captured: Option<&c2_config::LocalEndpointContext>,
+    ) -> Result<Option<c2_config::LocalEndpointContext>, LifecycleError> {
+        let accepts = |context: &c2_config::LocalEndpointContext| {
+            captured.is_none_or(|captured| captured == context)
+        };
+        loop {
+            let (options, sources, revision) = {
+                let mut state = self.state.lock();
+                if let Some(context) = &state.frozen_local_endpoint {
+                    return Ok(accepts(context).then(|| context.clone()));
+                }
+                if let Some(context) = state.inherited_local_endpoint.clone() {
+                    if !accepts(&context) {
+                        return Ok(None);
+                    }
+                    if freeze {
+                        state.frozen_local_endpoint = Some(context.clone());
+                    }
+                    return Ok(Some(context));
+                }
+                (
+                    state.local_endpoint_options.clone(),
+                    state.local_endpoint_sources.clone(),
+                    state.local_endpoint_revision,
+                )
+            };
+            let resolved = resolve_local_endpoint(options, sources);
+            let mut state = self.state.lock();
+            if let Some(context) = &state.frozen_local_endpoint {
+                return Ok(accepts(context).then(|| context.clone()));
+            }
+            // A concurrent setter wins only if it committed before the freeze.
+            // Discard even stale resolver errors and retry its newer inputs.
+            if state.local_endpoint_revision != revision {
+                continue;
+            }
+            let context = resolved?;
+            // Compare before publishing, while still holding the revision fence.
+            // HTTP fallback leaves an unused Runtime's configuration mutable.
+            if !accepts(&context) {
+                return Ok(None);
+            }
+            if freeze {
+                state.frozen_local_endpoint = Some(context.clone());
+            }
+            return Ok(Some(context));
+        }
     }
 
     pub fn ensure_server(&self) -> Result<RuntimeIdentity, LifecycleError> {
@@ -317,6 +626,7 @@ impl Runtime {
             return Err(LifecycleError::ClientConfigFrozen);
         }
         state.client_ipc_overrides = overrides;
+        state.client_config_revision += 1;
         Ok(())
     }
 
@@ -347,7 +657,7 @@ impl Runtime {
     /// Charges retained by completed or held data stay observable across a
     /// shutdown for as long as the Runtime (or any budget guard) exists.
     pub fn outgoing_memory_stats(&self) -> Option<crate::MemoryScopeStats> {
-        let pool = Arc::clone(&self.state.lock().client_pool);
+        let pool = self.state.lock().client_pool.clone()?;
         pool.memory_budget_snapshot()
             .map(|snapshot| crate::MemoryScopeStats::from_budget(snapshot.limits, snapshot.budget))
     }
@@ -360,7 +670,7 @@ impl Runtime {
     /// without retaining the cache, connections, or pools. Observing never
     /// connects, maps memory, or freezes configuration.
     pub fn outgoing_memory_observer(&self) -> Option<c2_mem::BudgetObserver> {
-        let pool = Arc::clone(&self.state.lock().client_pool);
+        let pool = self.state.lock().client_pool.clone()?;
         pool.memory_budget_observer()
     }
 
@@ -388,32 +698,68 @@ impl Runtime {
         &self,
         address: &str,
     ) -> Result<Arc<c2_ipc::SyncClient>, c2_ipc::IpcError> {
-        let (config, pool) = {
-            let mut state = self.state.lock();
-            let config = match state.frozen_client_config.clone() {
-                Some(config) => config,
-                None => {
-                    let config = resolve_client_config_locked(&state)
-                        .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
-                    state.frozen_client_config = Some(config.clone());
-                    state.client_config_frozen = true;
-                    config
+        let context = self
+            .freeze_local_endpoint_context()
+            .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+        let (config, pool) = loop {
+            let (overrides, revision) = {
+                let mut state = self.state.lock();
+                if let Some(config) = state.frozen_client_config.clone() {
+                    let pool = state
+                        .client_pool
+                        .get_or_insert_with(|| {
+                            Arc::new(c2_ipc::ClientPool::with_endpoint_context(
+                                Duration::from_secs(60),
+                                context.clone(),
+                            ))
+                        })
+                        .clone();
+                    break (config, pool);
                 }
+                (
+                    c2_config::RuntimeConfigOverrides {
+                        client_ipc: state.client_ipc_overrides.clone().unwrap_or_default(),
+                        shm_threshold: state.shm_threshold,
+                        ..Default::default()
+                    },
+                    state.client_config_revision,
+                )
             };
-            (config, Arc::clone(&state.client_pool))
+            let resolved = resolve_client_config(overrides);
+            let mut state = self.state.lock();
+            if state.client_config_revision != revision || state.frozen_client_config.is_some() {
+                continue;
+            }
+            let config = resolved.map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+            state.frozen_client_config = Some(config.clone());
+            state.client_config_frozen = true;
+            let pool = state
+                .client_pool
+                .get_or_insert_with(|| {
+                    Arc::new(c2_ipc::ClientPool::with_endpoint_context(
+                        Duration::from_secs(60),
+                        context.clone(),
+                    ))
+                })
+                .clone();
+            break (config, pool);
         };
         // Connect outside the RuntimeState lock.
         pool.acquire(address, Some(&config))
     }
 
     pub(crate) fn release_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        let pool = Arc::clone(&self.state.lock().client_pool);
-        pool.release_if_same(address, client);
+        let pool = self.state.lock().client_pool.clone();
+        if let Some(pool) = pool {
+            pool.release_if_same(address, client);
+        }
     }
 
     pub(crate) fn discard_ipc_client(&self, address: &str, client: &Arc<c2_ipc::SyncClient>) {
-        let pool = Arc::clone(&self.state.lock().client_pool);
-        pool.discard_if_same(address, client);
+        let pool = self.state.lock().client_pool.clone();
+        if let Some(pool) = pool {
+            pool.discard_if_same(address, client);
+        }
     }
 
     pub(crate) fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
@@ -749,25 +1095,28 @@ impl Runtime {
         let mut relay_registered = false;
         let mut relay_projection = None;
         if let Some(relay_anchor_address) = effective_relay_anchor_address.as_deref() {
-            let projection =
-                match self.relay_projection_for_address(relay_anchor_address, relay_use_proxy) {
-                    Ok(projection) => projection,
-                    Err(err) => {
-                        rt.block_on(server.abort_reserved_route(
-                            reservation.take().expect("reservation should exist"),
-                        ));
-                        return Err(LifecycleError::RegisterFailure(Box::new(
-                            RegisterFailureOutcome {
-                                route_name: route_name.clone(),
-                                failure_source: "relay_projection".to_string(),
-                                error_message: err.to_string(),
-                                status_code: None,
-                                rollback: Some(registration_rollback_outcome(&route_name, false)),
-                                relay_cleanup_error: None,
-                            },
-                        )));
-                    }
-                };
+            let projection = match self.relay_projection_for_address(
+                relay_anchor_address,
+                relay_use_proxy,
+                Some(server.local_endpoint().context()),
+            ) {
+                Ok(projection) => projection,
+                Err(err) => {
+                    rt.block_on(server.abort_reserved_route(
+                        reservation.take().expect("reservation should exist"),
+                    ));
+                    return Err(LifecycleError::RegisterFailure(Box::new(
+                        RegisterFailureOutcome {
+                            route_name: route_name.clone(),
+                            failure_source: "relay_projection".to_string(),
+                            error_message: err.to_string(),
+                            status_code: None,
+                            rollback: Some(registration_rollback_outcome(&route_name, false)),
+                            relay_cleanup_error: None,
+                        },
+                    )));
+                }
+            };
             let registration_token = reservation
                 .as_ref()
                 .expect("reservation should exist")
@@ -1052,6 +1401,12 @@ impl Runtime {
         relay_cleanup_config_error: Option<String>,
         shutdown_timeout: Duration,
     ) -> ShutdownOutcome {
+        // Close only finite admission; retain this domain and all actual
+        // owners. Unlimited never consults it. No cancellation or early refund.
+        {
+            let state = self.state.lock();
+            state.call_execution_observer.close();
+        }
         let deadline = Instant::now() + shutdown_timeout;
         let scopes = server
             .map(|server| self.capture_registration_scopes(server, &route_names))
@@ -1224,29 +1579,33 @@ impl Runtime {
         // drain report is only a completed claim when every detached client
         // confirmed its bounded close AND the drain was not blocked behind a
         // concurrent drain transaction or in-flight detached-close barriers.
-        let client_pool = Arc::clone(&self.state.lock().client_pool);
-        let mut client_close = client_pool.close_all(shutdown_timeout);
-        if server.is_some() {
-            // This native transaction owns outstanding client barriers as well as routes.
-            // Its callers time out independently; keep retrying actual unconfirmed work.
-            while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
-                client_close = client_pool.close_all(Duration::from_secs(1));
-            }
-        }
-        outcome.ipc_clients_drained =
-            client_close.unconfirmed.is_empty() && client_close.error.is_none();
-        if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {
-            let mut detail = client_close.error.unwrap_or_default();
-            if !client_close.unconfirmed.is_empty() {
-                if !detail.is_empty() {
-                    detail.push_str("; ");
+        let client_pool = self.state.lock().client_pool.clone();
+        if let Some(client_pool) = client_pool {
+            let mut client_close = client_pool.close_all(shutdown_timeout);
+            if server.is_some() {
+                // This native transaction owns outstanding client barriers as well as routes.
+                // Its callers time out independently; keep retrying actual unconfirmed work.
+                while !client_close.unconfirmed.is_empty() || client_close.error.is_some() {
+                    client_close = client_pool.close_all(Duration::from_secs(1));
                 }
-                detail.push_str(&format!(
-                    "unconfirmed IPC client cache closes for {:?}",
-                    client_close.unconfirmed
-                ));
             }
-            outcome.ipc_client_close_error = Some(detail);
+            outcome.ipc_clients_drained =
+                client_close.unconfirmed.is_empty() && client_close.error.is_none();
+            if client_close.error.is_some() || !client_close.unconfirmed.is_empty() {
+                let mut detail = client_close.error.unwrap_or_default();
+                if !client_close.unconfirmed.is_empty() {
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(&format!(
+                        "unconfirmed IPC client cache closes for {:?}",
+                        client_close.unconfirmed
+                    ));
+                }
+                outcome.ipc_client_close_error = Some(detail);
+            }
+        } else {
+            outcome.ipc_clients_drained = true;
         }
 
         if let Some(server) = server {
@@ -1393,8 +1752,12 @@ impl Runtime {
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
     ) -> Result<RelayResolvedConnection, LifecycleError> {
-        let projection =
-            self.relay_projection_for_address(relay_anchor_address, relay_use_proxy)?;
+        let frozen_context = self.state.lock().frozen_local_endpoint.clone();
+        let projection = self.relay_projection_for_address(
+            relay_anchor_address,
+            relay_use_proxy,
+            frozen_context.as_ref(),
+        )?;
         let client = RelayAwareHttpClient::new_with_control(
             Arc::clone(&projection.control),
             expected,
@@ -1406,9 +1769,18 @@ impl Runtime {
             },
         )
         .map_err(runtime_http_error)?;
+        let client = self.project_relay_client_context(client, true);
         match client.resolve_target().map_err(runtime_http_error)? {
             RelayResolvedTarget::Ipc { candidate } => {
-                Ok(RelayResolvedConnection::Ipc { client, candidate })
+                let context = client
+                    .local_ipc_context()
+                    .expect("selected IPC candidate has a compared context")
+                    .clone();
+                Ok(RelayResolvedConnection::Ipc {
+                    client,
+                    candidate,
+                    context,
+                })
             }
             RelayResolvedTarget::Http {
                 route_uid,
@@ -1431,7 +1803,15 @@ impl Runtime {
             .map_err(runtime_http_error)?
         {
             RelayResolvedTarget::Ipc { candidate } => {
-                Ok(RelayResolvedConnection::Ipc { client, candidate })
+                let context = client
+                    .local_ipc_context()
+                    .expect("selected IPC candidate has a compared context")
+                    .clone();
+                Ok(RelayResolvedConnection::Ipc {
+                    client,
+                    candidate,
+                    context,
+                })
             }
             RelayResolvedTarget::Http {
                 route_uid,
@@ -1465,6 +1845,9 @@ impl Runtime {
             },
         )
         .map_err(runtime_http_error)?;
+        let client = self
+            .project_relay_client_context(client, false)
+            .with_http_only();
         match client.resolve_http_target().map_err(runtime_http_error)? {
             RelayResolvedTarget::Http {
                 route_uid,
@@ -1473,6 +1856,70 @@ impl Runtime {
             } => Ok((client, route_uid, route_revision)),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
         }
+    }
+
+    fn project_relay_client_context(
+        &self,
+        client: RelayAwareHttpClient,
+        prefer_local_ipc: bool,
+    ) -> RelayAwareHttpClient {
+        let frozen = self.state.lock().frozen_local_endpoint.clone();
+        if let Some(context) = frozen {
+            return client.with_local_endpoint_context(&context);
+        }
+        if prefer_local_ipc && client.allows_local_ipc() {
+            match self.local_endpoint_context() {
+                Ok(context) => client.with_local_endpoint_context(&context),
+                // An unusable local root/scope must not break a usable HTTP route.
+                Err(_) => client.with_http_only(),
+            }
+        } else {
+            client.with_http_only()
+        }
+    }
+
+    /// Fence the captured comparison immediately before local acquire. A setter
+    /// may have changed the Runtime root while relay resolution was in flight.
+    /// Never reinterpret that candidate's logical address in a different domain.
+    pub(crate) fn reconcile_relay_connection(
+        &self,
+        resolved: RelayResolvedConnection,
+    ) -> Result<RelayResolvedConnection, LifecycleError> {
+        let RelayResolvedConnection::Ipc {
+            client,
+            candidate,
+            context,
+        } = resolved
+        else {
+            return Ok(resolved);
+        };
+        if self.freeze_relay_candidate_context(&context) {
+            return Ok(RelayResolvedConnection::Ipc {
+                client,
+                candidate,
+                context,
+            });
+        }
+        let client = client.with_http_only();
+        match client.resolve_http_target().map_err(runtime_http_error)? {
+            RelayResolvedTarget::Http {
+                route_uid,
+                route_revision,
+                ..
+            } => Ok(RelayResolvedConnection::Http {
+                client,
+                route_uid,
+                route_revision,
+            }),
+            RelayResolvedTarget::Ipc { .. } => {
+                unreachable!("HTTP-only reconciliation returned IPC")
+            }
+        }
+    }
+
+    fn freeze_relay_candidate_context(&self, captured: &c2_config::LocalEndpointContext) -> bool {
+        self.resolve_local_endpoint_context_guarded(true, Some(captured))
+            .is_ok_and(|context| context.is_some())
     }
 
     pub fn clear_relay_projection_cache(&self) {
@@ -1485,6 +1932,7 @@ impl Runtime {
         &self,
         relay_anchor_address: &str,
         relay_use_proxy: bool,
+        local_endpoint_context: Option<&c2_config::LocalEndpointContext>,
     ) -> Result<RelayProjection, LifecycleError> {
         let relay_anchor_address = canonical_relay_anchor_address(relay_anchor_address);
         {
@@ -1492,19 +1940,23 @@ impl Runtime {
             if let Some(projection) = state.relay_projection.as_ref()
                 && projection.relay_anchor_address == relay_anchor_address
                 && projection.relay_use_proxy == relay_use_proxy
+                && projection.local_endpoint_context.as_ref() == local_endpoint_context
             {
                 return Ok(projection.clone());
             }
         }
 
-        let control = Arc::new(
-            RelayControlClient::new(&relay_anchor_address, relay_use_proxy)
-                .map_err(|e| LifecycleError::Relay(e.to_string()))?,
-        );
+        let control = RelayControlClient::new(&relay_anchor_address, relay_use_proxy)
+            .map_err(|e| LifecycleError::Relay(e.to_string()))?;
+        let control = Arc::new(match local_endpoint_context {
+            Some(context) => control.with_local_endpoint_context(context),
+            None => control,
+        });
         let projection = RelayProjection {
             relay_anchor_address,
             relay_use_proxy,
             control,
+            local_endpoint_context: local_endpoint_context.cloned(),
         };
         self.state.lock().relay_projection = Some(projection.clone());
         Ok(projection)
@@ -1532,17 +1984,21 @@ impl Runtime {
     ) -> Option<RelayCleanupError> {
         let route_name = scope.name.as_str();
         let relay_anchor_address = relay_anchor_address?;
-        let projection =
-            match self.relay_projection_for_address(relay_anchor_address, relay_use_proxy) {
-                Ok(projection) => projection,
-                Err(err) => {
-                    return Some(RelayCleanupError {
-                        route_name: route_name.to_string(),
-                        status_code: None,
-                        message: err.to_string(),
-                    });
-                }
-            };
+        let frozen_context = self.state.lock().frozen_local_endpoint.clone();
+        let projection = match self.relay_projection_for_address(
+            relay_anchor_address,
+            relay_use_proxy,
+            frozen_context.as_ref(),
+        ) {
+            Ok(projection) => projection,
+            Err(err) => {
+                return Some(RelayCleanupError {
+                    route_name: route_name.to_string(),
+                    status_code: None,
+                    message: err.to_string(),
+                });
+            }
+        };
         match projection.control.unregister_registration(scope) {
             Ok(()) => None,
             Err(HttpError::ServerError(status_code, body)) => Some(RelayCleanupError {
@@ -1577,18 +2033,32 @@ fn canonical_relay_anchor_address(address: &str) -> String {
     address.trim().trim_end_matches('/').to_string()
 }
 
-/// Resolve the client IPC config from one consistent RuntimeState snapshot.
-///
-/// Called with the state lock held so the first connection attempt resolves
-/// and freezes the config atomically before any connect I/O.
-fn resolve_client_config_locked(
-    state: &RuntimeState,
+fn resolve_call_execution_limits(
+    overrides: c2_config::CallExecutionLimitsOverrides,
+    sources: Option<c2_config::ConfigSources>,
+) -> Result<c2_config::CallExecutionLimits, LifecycleError> {
+    c2_config::ConfigResolver::resolve_call_execution_limits(
+        overrides,
+        sources.unwrap_or_else(c2_config::ConfigSources::from_process),
+    )
+    .map_err(|error| LifecycleError::Configuration(error.to_string()))
+}
+
+fn resolve_local_endpoint(
+    options: c2_config::LocalEndpointOptions,
+    sources: Option<c2_config::ConfigSources>,
+) -> Result<c2_config::LocalEndpointContext, LifecycleError> {
+    c2_config::ConfigResolver::resolve_local_endpoint(
+        options,
+        sources.unwrap_or_else(c2_config::ConfigSources::from_process),
+    )
+    .map_err(|error| LifecycleError::Configuration(error.to_string()))
+}
+
+/// Resolve from a metadata snapshot, outside the Runtime lock.
+fn resolve_client_config(
+    runtime_overrides: c2_config::RuntimeConfigOverrides,
 ) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
-    let runtime_overrides = c2_config::RuntimeConfigOverrides {
-        client_ipc: state.client_ipc_overrides.clone().unwrap_or_default(),
-        shm_threshold: state.shm_threshold,
-        ..Default::default()
-    };
     c2_config::ConfigResolver::resolve_client_ipc(
         runtime_overrides.client_ipc.clone(),
         runtime_overrides,
@@ -1619,6 +2089,630 @@ mod tests {
         AccessLevel, BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta,
         RouteBuildSpec, SchedulerLimits,
     };
+
+    fn observer_runtime() -> Runtime {
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        runtime
+            .set_call_execution_limits_with_sources(
+                c2_config::CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(8),
+                    retained_input_budget_bytes: Some(256),
+                },
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        runtime
+    }
+
+    #[test]
+    fn call_execution_observer_captured_before_concurrent_initialization_sees_actual_domain() {
+        use c2_config::{CallOptions, CallTimeout};
+        let runtime = observer_runtime();
+        let observer = runtime.call_execution_observer();
+        assert!(!observer.snapshot().initialized);
+        assert!(observer.is_live());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let runtime = runtime.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let context = runtime.call_execution_context().unwrap();
+                    let mut call = context
+                        .prepare(
+                            CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                            None,
+                        )
+                        .unwrap();
+                    call.charge_input(32).unwrap();
+                    call
+                })
+            })
+            .collect::<Vec<_>>();
+        let calls = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        let observed = observer.snapshot();
+        assert!(observed.initialized);
+        assert!(!observed.closed);
+        let counters = observed.counters.unwrap();
+        assert_eq!(
+            (counters.used_operations, counters.used_retained_bytes),
+            (8, 256)
+        );
+        assert_eq!(counters, runtime.call_execution_snapshot().unwrap());
+        assert!(observer.same_domain(&runtime.clone().call_execution_observer()));
+        drop(calls);
+        assert_eq!(observer.snapshot().counters.unwrap().used_operations, 0);
+        assert!(observer.is_live());
+    }
+
+    #[test]
+    fn call_execution_observer_preserves_actual_input_after_runtime_drop_without_retaining_session()
+    {
+        use c2_config::{CallOptions, CallTimeout};
+        let runtime = observer_runtime();
+        let weak_session = Arc::downgrade(&runtime.state);
+        let observer = runtime.call_execution_observer();
+        let context = runtime.call_execution_context().unwrap();
+        let input = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                None,
+            )
+            .unwrap()
+            .execute(
+                32,
+                || Ok(vec![7; 32]),
+                |input, scope| async move {
+                    scope
+                        .try_begin_dispatch()
+                        .map_err(crate::call_execution::scope_error)?;
+                    Ok(input)
+                },
+            )
+            .unwrap()
+            .wait()
+            .unwrap();
+        drop(context);
+        drop(runtime);
+        // Last RuntimeState is gone: no service/transport/cache can be kept
+        // alive by the observer. Its budget metadata still sees the real Vec.
+        assert!(weak_session.upgrade().is_none());
+        assert_eq!(input.as_ref().as_ref(), &[7; 32]);
+        let observation = observer.snapshot();
+        assert!(observation.closed);
+        let counters = observation.counters.unwrap();
+        assert!(counters.closed);
+        assert_eq!(
+            (counters.used_operations, counters.used_retained_bytes),
+            (1, 32)
+        );
+        assert!(observer.is_live());
+        drop(input);
+        let until = Instant::now() + Duration::from_secs(10);
+        while observer.is_live() {
+            assert!(
+                Instant::now() < until,
+                "real input owner did not release its charge"
+            );
+            std::thread::yield_now();
+        }
+        let counters = observer.snapshot().counters.unwrap();
+        assert_eq!(
+            (counters.used_operations, counters.used_retained_bytes),
+            (0, 0)
+        );
+        assert!(counters.closed);
+    }
+
+    #[test]
+    fn call_execution_observer_freeze_shutdown_race_always_publishes_closed_budget() {
+        for _ in 0..32 {
+            let runtime = observer_runtime();
+            let observer = runtime.call_execution_observer();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let initializing = {
+                let runtime = runtime.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    runtime.call_execution_context().unwrap()
+                })
+            };
+            barrier.wait();
+            runtime.shutdown(None, Vec::new(), None, false, None, Duration::from_secs(1));
+            let context = initializing.join().unwrap();
+            assert!(context.snapshot().closed);
+            let observed = observer.snapshot();
+            assert!(observed.initialized && observed.closed);
+            assert!(observed.counters.unwrap().closed);
+            assert!(!observer.is_live());
+        }
+    }
+
+    #[test]
+    fn call_execution_observer_never_resolves_or_freezes_configuration() {
+        let runtime = observer_runtime();
+        // Invalid resolver data proves observer reads do not invoke resolution.
+        runtime.state.lock().call_execution_sources = Some(c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([(
+                "C2_CALL_MAX_OUTSTANDING".into(),
+                "invalid".into(),
+            )]),
+        });
+        runtime.state.lock().call_execution_overrides = Default::default();
+        let observer = runtime.call_execution_observer();
+        assert!(observer.is_live());
+        assert_eq!(observer.snapshot().counters, None);
+        assert!(runtime.call_execution_snapshot().is_err());
+        assert!(runtime.state.lock().call_execution.is_none());
+        runtime
+            .set_call_execution_limits_with_sources(
+                c2_config::CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(3),
+                    retained_input_budget_bytes: Some(64),
+                },
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        assert!(!observer.snapshot().initialized);
+    }
+
+    #[test]
+    fn call_execution_accepted_overrides_update_idempotently_without_replacing_budget() {
+        let runtime = observer_runtime();
+        let mut call = runtime
+            .call_execution_context()
+            .unwrap()
+            .prepare(
+                c2_config::CallOptions::with_timeout(c2_config::CallTimeout::After(
+                    Duration::from_secs(10),
+                )),
+                None,
+            )
+            .unwrap();
+        call.charge_input(32).unwrap();
+        let observer = runtime.call_execution_observer();
+        let sources = c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([
+                ("C2_CALL_MAX_OUTSTANDING".into(), "8".into()),
+                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "256".into()),
+            ]),
+        };
+        runtime
+            .set_call_execution_limits_with_sources(Default::default(), sources)
+            .unwrap();
+        let accepted = runtime.call_execution_limits_overrides();
+        assert_eq!(accepted.max_outstanding_calls, None);
+        assert_eq!(accepted.retained_input_budget_bytes, None);
+        assert_eq!(observer.snapshot().counters.unwrap().max_operations, 8);
+        assert_eq!(
+            observer.snapshot().counters.unwrap().used_retained_bytes,
+            32
+        );
+        assert!(
+            runtime
+                .set_call_execution_limits_with_sources(
+                    c2_config::CallExecutionLimitsOverrides {
+                        max_outstanding_calls: Some(9),
+                        retained_input_budget_bytes: None,
+                    },
+                    c2_config::ConfigSources::empty(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .call_execution_limits_overrides()
+                .max_outstanding_calls,
+            None
+        );
+    }
+
+    #[test]
+    fn endpoint_selection_inheritance_keeps_invalid_sources_lazy() {
+        let previous = Runtime::new(RuntimeOptions::default()).unwrap();
+        previous.state.lock().local_endpoint_sources = Some(c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([("C2_IPC_ROOT".into(), "relative".into())]),
+        });
+        let replacement = Runtime::new(RuntimeOptions::default()).unwrap();
+        replacement
+            .inherit_local_endpoint_selection(&previous)
+            .unwrap();
+        replacement
+            .inherit_local_endpoint_selection(&replacement.clone())
+            .unwrap();
+        assert!(!previous.local_endpoint_frozen());
+        assert!(!replacement.local_endpoint_frozen());
+        assert!(replacement.local_endpoint_context().is_err());
+        assert!(!replacement.local_endpoint_frozen());
+        assert!(replacement.outgoing_memory_stats().is_none());
+        let expected = c2_contract::ContractRelease::from_descriptor_json(include_bytes!(
+            "../../../../tests/fixtures/contracts/portable-release.contract.json"
+        ))
+        .unwrap()
+        .expected_route("route")
+        .unwrap();
+        let client = RelayAwareHttpClient::new(
+            "https://relay.example",
+            expected,
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap();
+        let client = replacement.project_relay_client_context(client, false);
+        assert!(!client.allows_local_ipc());
+        assert!(client.local_ipc_context().is_none());
+        assert!(!replacement.local_endpoint_frozen());
+        // Explicit sources stay native inputs, rather than disappearing at handoff.
+        assert_eq!(
+            replacement
+                .state
+                .lock()
+                .local_endpoint_sources
+                .as_ref()
+                .unwrap()
+                .process_env
+                .get("C2_IPC_ROOT")
+                .unwrap(),
+            "relative"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_selection_inheritance_pins_used_domain_but_allows_reconfiguration() {
+        let previous = Runtime::new(RuntimeOptions::default()).unwrap();
+        let at = |root: &str| c2_config::LocalEndpointOptions {
+            unix_root: Some(root.into()),
+        };
+        let env_at = |root: &str| c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([("C2_IPC_ROOT".into(), root.into())]),
+        };
+        previous
+            .set_local_endpoint_with_sources(Default::default(), env_at("/tmp/c2-old"))
+            .unwrap();
+        let captured = previous.freeze_local_endpoint_context().unwrap();
+        previous.state.lock().local_endpoint_sources = Some(env_at("/tmp/c2-new"));
+        let replacement = Runtime::new(RuntimeOptions::default()).unwrap();
+        replacement
+            .inherit_local_endpoint_selection(&previous)
+            .unwrap();
+        assert!(!replacement.local_endpoint_frozen());
+        assert_eq!(replacement.local_endpoint_context().unwrap(), captured);
+        // Repeated replacements must preserve the inherited selection as well.
+        let next = Runtime::new(RuntimeOptions::default()).unwrap();
+        next.inherit_local_endpoint_selection(&replacement).unwrap();
+        assert_eq!(next.freeze_local_endpoint_context().unwrap(), captured);
+        assert!(next.inherit_local_endpoint_selection(&previous).is_err());
+        assert_eq!(next.local_endpoint_context().unwrap(), captured);
+        assert!(
+            next.set_local_endpoint_with_sources(
+                at("/tmp/c2-new"),
+                c2_config::ConfigSources::empty()
+            )
+            .is_err()
+        );
+        replacement
+            .set_local_endpoint_with_sources(at("/tmp/c2-new"), c2_config::ConfigSources::empty())
+            .unwrap();
+        assert_ne!(replacement.local_endpoint_context().unwrap(), captured);
+        assert_eq!(previous.local_endpoint_context().unwrap(), captured);
+    }
+
+    #[test]
+    fn http_projection_does_not_resolve_invalid_local_configuration() {
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        // Model lazy process configuration with a real isolated resolver map;
+        // no process-wide environment mutation or local platform lookup.
+        runtime.state.lock().local_endpoint_sources = Some(c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([("C2_IPC_ROOT".into(), "relative".into())]),
+        });
+        let expected = c2_contract::ContractRelease::from_descriptor_json(include_bytes!(
+            "../../../../tests/fixtures/contracts/portable-release.contract.json"
+        ))
+        .unwrap()
+        .expected_route("route")
+        .unwrap();
+        for (anchor, prefer_local) in [
+            ("http://127.0.0.1:9", false),
+            ("https://relay.example", true),
+            ("http://127.0.0.1:9", true),
+        ] {
+            let client = RelayAwareHttpClient::new(
+                anchor,
+                expected.clone(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap();
+            let client = runtime.project_relay_client_context(client, prefer_local);
+            assert!(!client.allows_local_ipc());
+            assert!(client.local_ipc_context().is_none());
+            assert!(!runtime.local_endpoint_frozen());
+            assert!(runtime.outgoing_memory_stats().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_relay_namespace_is_checked_against_the_final_freeze() {
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        let at = |root: &str| c2_config::LocalEndpointOptions {
+            unix_root: Some(root.into()),
+        };
+        runtime
+            .set_local_endpoint_with_sources(
+                at("/tmp/c2-captured-a"),
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        let captured = runtime.local_endpoint_context().unwrap();
+        assert!(!runtime.local_endpoint_frozen());
+        runtime
+            .set_local_endpoint_with_sources(
+                at("/tmp/c2-captured-b"),
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        assert!(!runtime.freeze_relay_candidate_context(&captured));
+        assert!(!runtime.local_endpoint_frozen());
+        assert_ne!(captured, runtime.local_endpoint_context().unwrap());
+        runtime
+            .set_local_endpoint_with_sources(
+                at("/tmp/c2-captured-c"),
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        let current = runtime.local_endpoint_context().unwrap();
+        assert!(!runtime.local_endpoint_frozen());
+        // This is the private imminent-acquire fence, rather than a pure query.
+        assert!(runtime.freeze_relay_candidate_context(&current));
+        assert!(runtime.local_endpoint_frozen());
+        assert!(!runtime.freeze_relay_candidate_context(&captured));
+        assert_eq!(runtime.local_endpoint_context().unwrap(), current);
+        assert!(runtime.outgoing_memory_stats().is_none());
+        assert!(
+            runtime
+                .set_local_endpoint_with_sources(
+                    at("/tmp/c2-captured-a"),
+                    c2_config::ConfigSources::empty()
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_relay_candidate_context_does_not_publish_a_freeze() {
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        runtime
+            .set_local_endpoint_with_sources(
+                c2_config::LocalEndpointOptions::default(),
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        let captured = runtime.local_endpoint_context().unwrap();
+        runtime.state.lock().local_endpoint_sources = Some(c2_config::ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: c2_config::EnvMap::from([("C2_IPC_ROOT".into(), "relative".into())]),
+        });
+        assert!(!runtime.freeze_relay_candidate_context(&captured));
+        assert!(!runtime.local_endpoint_frozen());
+        assert!(runtime.outgoing_memory_stats().is_none());
+        runtime
+            .set_local_endpoint_with_sources(
+                c2_config::LocalEndpointOptions::default(),
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        assert_eq!(runtime.local_endpoint_context().unwrap(), captured);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_candidate_publication_and_setter_share_one_revision_fence() {
+        for _ in 0..32 {
+            let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+            runtime
+                .set_local_endpoint_with_sources(
+                    c2_config::LocalEndpointOptions {
+                        unix_root: Some("/tmp/c2-fence-a".into()),
+                    },
+                    c2_config::ConfigSources::empty(),
+                )
+                .unwrap();
+            let captured = runtime.local_endpoint_context().unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let setter = runtime.clone();
+            let setter_barrier = barrier.clone();
+            let thread = std::thread::spawn(move || {
+                setter_barrier.wait();
+                setter.set_local_endpoint_with_sources(
+                    c2_config::LocalEndpointOptions {
+                        unix_root: Some("/tmp/c2-fence-b".into()),
+                    },
+                    c2_config::ConfigSources::empty(),
+                )
+            });
+            barrier.wait();
+            let accepted = runtime.freeze_relay_candidate_context(&captured);
+            let set = thread.join().unwrap();
+            if accepted {
+                assert_eq!(set, Err(LifecycleError::ConfigFrozen));
+                assert!(runtime.local_endpoint_frozen());
+                assert_eq!(runtime.local_endpoint_context().unwrap(), captured);
+            } else {
+                assert!(set.is_ok());
+                assert!(!runtime.local_endpoint_frozen());
+                assert_ne!(runtime.local_endpoint_context().unwrap(), captured);
+            }
+            assert!(runtime.outgoing_memory_stats().is_none());
+        }
+    }
+
+    #[test]
+    fn call_execution_snapshot_resolves_sources_without_freezing() {
+        use c2_config::{CallExecutionLimitsOverrides, ConfigSources, EnvMap};
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        runtime
+            .set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides::default(),
+                ConfigSources {
+                    env_file: c2_config::EnvFilePolicy::Disabled,
+                    process_env: EnvMap::from([
+                        ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
+                        ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "17".into()),
+                    ]),
+                },
+            )
+            .unwrap();
+        let snapshot = runtime.call_execution_snapshot().unwrap();
+        assert_eq!(
+            (snapshot.max_operations, snapshot.max_retained_bytes),
+            (3, 17)
+        );
+        assert_eq!(
+            (snapshot.used_operations, snapshot.used_retained_bytes),
+            (0, 0)
+        );
+        // Observation did not freeze: a later typed override wins.
+        runtime
+            .set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(1),
+                    retained_input_budget_bytes: Some(32),
+                },
+                ConfigSources::empty(),
+            )
+            .unwrap();
+        assert_eq!(runtime.call_execution_snapshot().unwrap().max_operations, 1);
+    }
+
+    #[test]
+    fn call_execution_clones_freeze_one_domain_without_laundering_live_permits() {
+        use c2_config::{CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources};
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        let overrides = CallExecutionLimitsOverrides {
+            max_outstanding_calls: Some(1),
+            retained_input_budget_bytes: Some(32),
+        };
+        runtime
+            .set_call_execution_limits_with_sources(overrides.clone(), ConfigSources::empty())
+            .unwrap();
+        let clone = runtime.clone();
+        let context = runtime.call_execution_context().unwrap();
+        let mut call = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                None,
+            )
+            .unwrap();
+        call.charge_input(32).unwrap();
+        assert_eq!(
+            clone.call_execution_snapshot().unwrap().used_retained_bytes,
+            32
+        );
+        clone
+            .set_call_execution_limits_with_sources(overrides, ConfigSources::empty())
+            .unwrap();
+        assert_eq!(clone.call_execution_snapshot().unwrap().used_operations, 1);
+        assert_eq!(
+            clone.set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(2),
+                    retained_input_budget_bytes: Some(64)
+                },
+                ConfigSources::empty(),
+            ),
+            Err(LifecycleError::ConfigFrozen)
+        );
+        assert!(
+            clone
+                .call_execution_context()
+                .unwrap()
+                .prepare(
+                    CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                    None
+                )
+                .is_err()
+        );
+        drop(call);
+        assert_eq!(clone.call_execution_snapshot().unwrap().used_operations, 0);
+    }
+
+    #[test]
+    fn call_execution_shutdown_closes_admission_and_keeps_actual_charge() {
+        use c2_config::{CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources};
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        runtime
+            .set_call_execution_limits_with_sources(
+                CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(1),
+                    retained_input_budget_bytes: Some(32),
+                },
+                ConfigSources::empty(),
+            )
+            .unwrap();
+        let context = runtime.call_execution_context().unwrap();
+        let observer = runtime.call_execution_observer();
+        let mut call = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                None,
+            )
+            .unwrap();
+        call.charge_input(32).unwrap();
+        runtime.shutdown(None, Vec::new(), None, false, None, Duration::from_secs(1));
+        let snapshot = runtime.call_execution_snapshot().unwrap();
+        assert!(snapshot.closed);
+        assert_eq!(
+            (snapshot.used_operations, snapshot.used_retained_bytes),
+            (1, 32)
+        );
+        assert_eq!(observer.snapshot().counters, Some(snapshot));
+        assert!(observer.is_live());
+        assert!(
+            context
+                .prepare(
+                    CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
+                    None
+                )
+                .is_err()
+        );
+        // Explicit Unlimited stays uncharged even in the closed finite domain.
+        let unlimited = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::Unlimited),
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap();
+        drop(unlimited);
+        assert_eq!(
+            runtime
+                .call_execution_snapshot()
+                .unwrap()
+                .used_retained_bytes,
+            32
+        );
+        drop(call);
+        assert_eq!(
+            runtime
+                .call_execution_snapshot()
+                .unwrap()
+                .used_retained_bytes,
+            0
+        );
+        assert!(!observer.is_live());
+    }
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

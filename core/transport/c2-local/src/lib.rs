@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures_util::task::AtomicWaker;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-pub use c2_config::LocalEndpoint;
+pub use c2_config::{LocalEndpoint, LocalEndpointContext};
 
 mod credential;
 pub use credential::{
@@ -223,16 +223,9 @@ impl EndpointSweepScope {
                 "too many endpoint sweep addresses",
             ));
         }
-        let root = std::path::Path::new(endpoint.os_name()).parent();
         let mut targets = Vec::with_capacity(addresses.len());
         for address in addresses {
-            let target = LocalEndpoint::from_address(address)?;
-            if std::path::Path::new(target.os_name()).parent() != root {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "endpoint sweep target is outside its namespace",
-                ));
-            }
+            let target = endpoint.context().endpoint(address)?;
             targets.push(target);
         }
         Ok(Self {
@@ -254,7 +247,14 @@ impl EndpointSweep {
     /// Opens the default managed namespace derived from `LocalEndpoint`
     /// authority. It is not a second hardcoded directory.
     pub fn open() -> io::Result<Self> {
-        platform::EndpointSweep::open().map(Self)
+        Self::for_context(&LocalEndpointContext::default_for_platform()?)
+    }
+
+    /// Opens the namespace of a captured context without resolving environment
+    /// configuration again. Derivation is pure; native directory checks still
+    /// govern every maintenance operation.
+    pub fn for_context(context: &LocalEndpointContext) -> io::Result<Self> {
+        Self::for_endpoint(&context.endpoint("ipc://c2-endpoint-sweep")?)
     }
 
     /// Opens the managed namespace that contains `endpoint`.
@@ -577,10 +577,13 @@ pub fn reap_endpoint(
     endpoint: &LocalEndpoint,
     credential: &EndpointCredential,
 ) -> EndpointReapResult {
-    platform::reap_endpoint(endpoint, credential)
+    if credential.endpoint() != endpoint {
+        return EndpointReapResult::StaleTarget;
+    }
+    platform::reap_endpoint(credential.endpoint(), credential)
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod credential_tests;
+#[cfg(test)]
+mod tests;

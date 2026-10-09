@@ -3,7 +3,10 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{BaseIpcConfig, ClientIpcConfig, RelayConfig, ServerIpcConfig};
+use crate::{
+    BaseIpcConfig, CallExecutionLimits, ClientIpcConfig, LocalEndpointContext,
+    LocalEndpointOptions, RelayConfig, ServerIpcConfig,
+};
 
 pub type EnvMap = BTreeMap<String, String>;
 const MAX_RELAY_ROUTE_ATTEMPTS: u64 = 32;
@@ -51,6 +54,13 @@ impl EnvCatalog {
 
     fn optional_string(&self, key: &str) -> Option<String> {
         optional_string(&self.env, key)
+    }
+
+    /// Present-but-raw value lookup. Unlike `optional_string` this keeps
+    /// empty values visible so callers can reject them explicitly instead of
+    /// silently falling back to defaults.
+    fn raw_optional_string(&self, key: &str) -> Option<&str> {
+        self.env.get(key).map(String::as_str)
     }
 
     fn optional_bool(&self, key: &str) -> Option<Result<bool, ConfigError>> {
@@ -152,6 +162,18 @@ pub struct RelayConfigOverrides {
     pub seeds: Option<Vec<String>>,
     pub idle_timeout_secs: Option<u64>,
     pub anti_entropy_interval_secs: Option<f64>,
+}
+
+/// Typed code-level overrides for [`CallExecutionLimits`] resolution.
+///
+/// Each dimension is independent: `None` falls through to the process
+/// environment, then the `.env` file, then the canonical default, while
+/// `Some(value)` is a finite `u64` admission limit used verbatim — `Some(0)`
+/// closes that dimension and never means unset.
+#[derive(Debug, Clone, Default)]
+pub struct CallExecutionLimitsOverrides {
+    pub max_outstanding_calls: Option<u64>,
+    pub retained_input_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -337,6 +359,79 @@ impl ConfigResolver {
     ) -> Result<u64, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
         resolve_shm_threshold(&catalog, override_value)
+    }
+
+    /// Resolve the bounded deadline transaction admission limits from typed
+    /// overrides and configuration sources: explicit code > process env >
+    /// `.env` > the canonical [`CallExecutionLimits`] default. Both
+    /// dimensions are finite `u64` admission limits — an explicit or
+    /// environmental `0` rejects every positive request in that dimension
+    /// and never means unlimited or unset. A present-but-empty or
+    /// whitespace-only environment value is rejected instead of silently
+    /// falling back to the default, and every other invalid value names its
+    /// variable in the error.
+    pub fn resolve_call_execution_limits(
+        overrides: CallExecutionLimitsOverrides,
+        sources: ConfigSources,
+    ) -> Result<CallExecutionLimits, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+
+        let max_outstanding_calls = match overrides.max_outstanding_calls {
+            Some(value) => value,
+            None => call_execution_limit_from_env(&catalog, "C2_CALL_MAX_OUTSTANDING")?
+                .unwrap_or(crate::DEFAULT_MAX_OUTSTANDING_CALLS),
+        };
+        let retained_input_budget_bytes = match overrides.retained_input_budget_bytes {
+            Some(value) => value,
+            None => call_execution_limit_from_env(&catalog, "C2_CALL_RETAINED_INPUT_BUDGET_BYTES")?
+                .unwrap_or(crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES),
+        };
+
+        Ok(CallExecutionLimits {
+            max_outstanding_calls,
+            retained_input_budget_bytes,
+        })
+    }
+
+    /// Resolve the immutable local endpoint context from typed options and
+    /// configuration sources: explicit code > process env > `.env` > platform
+    /// default. The resolved root is validated without touching the
+    /// filesystem; the root container must be pre-created by the application.
+    /// An explicit empty, relative, `..`-bearing, NUL-bearing, or non-UTF-8
+    /// root is rejected instead of silently falling back to the default.
+    /// Environment values reach native validation verbatim — a trailing space
+    /// is a legal Unix directory name and must resolve identically to the
+    /// same code-level path, so nothing is trimmed into or out of validity.
+    pub fn resolve_local_endpoint(
+        options: LocalEndpointOptions,
+        sources: ConfigSources,
+    ) -> Result<LocalEndpointContext, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+
+        let (root, source_name) = match options.unix_root {
+            Some(root) => (root, "local endpoint root option".to_owned()),
+            None => match catalog.raw_optional_string("C2_IPC_ROOT") {
+                // Only a present-but-empty value is rejected outright;
+                // whitespace-only and leading-whitespace values keep their
+                // raw bytes and fail the native absolute-path check.
+                Some(raw) => {
+                    if raw.is_empty() {
+                        return Err(ConfigError::new("C2_IPC_ROOT cannot be empty"));
+                    }
+                    (PathBuf::from(raw), "C2_IPC_ROOT".to_owned())
+                }
+                None => {
+                    return LocalEndpointContext::default_for_platform().map_err(|error| {
+                        ConfigError::new(format!(
+                            "default local endpoint context unavailable: {error}"
+                        ))
+                    });
+                }
+            },
+        };
+
+        LocalEndpointContext::with_unix_root(&root)
+            .map_err(|error| ConfigError::new(format!("{source_name}: {error}")))
     }
 }
 
@@ -781,6 +876,31 @@ fn resolve_shm_threshold(
     Ok(shm_threshold)
 }
 
+/// Present-but-raw finite-`u64` lookup for one call execution limit.
+///
+/// An absent key is `None`; a present value must carry non-empty unsigned
+/// integer text. An empty or whitespace-only value is rejected instead of
+/// silently becoming the default, and negative, non-numeric, or overflowing
+/// text fails with the variable named. `0` is a present finite value, never
+/// unset.
+fn call_execution_limit_from_env(
+    catalog: &EnvCatalog,
+    key: &str,
+) -> Result<Option<u64>, ConfigError> {
+    let raw = match catalog.raw_optional_string(key) {
+        Some(raw) => raw,
+        None => return Ok(None),
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(ConfigError::new(format!("{key} cannot be empty")));
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|e| ConfigError::new(format!("{key} must be an unsigned integer: {e}")))
+}
+
 fn apply_flat_base_overrides_to_server(
     cfg: &mut ServerIpcConfig,
     overrides: &ServerIpcConfigOverrides,
@@ -1076,16 +1196,31 @@ mod tests {
     }
 
     #[test]
-    fn server_pool_segment_must_not_exceed_payload_limit() {
+    fn server_pool_segment_capacity_is_independent_of_payload_limit() {
+        // Pool segment capacity and the per-message limit are independent
+        // dimensions (0.7.1 design section 3): the default 256 MiB segment
+        // resolves beside a 32 MiB message cap with the buddy pool enabled
+        // and disabled. Oversized individual payloads stay a dispatch-level
+        // check, not a resolver validation rule.
         let mut overrides = RuntimeConfigOverrides::default();
-        overrides.server_ipc.pool_segment_size = Some(2 * 1024 * 1024);
-        overrides.server_ipc.max_payload_size = Some(1024 * 1024);
+        overrides.server_ipc.max_payload_size = Some(32 * 1024 * 1024);
 
-        let err = ConfigResolver::resolve(overrides, ConfigSources::empty())
-            .expect_err("oversized pool segment should fail");
+        let resolved = ConfigResolver::resolve(overrides, ConfigSources::empty())
+            .expect("large pool segment with a smaller message cap should resolve");
+        assert_eq!(resolved.server_ipc.pool_segment_size, 256 * 1024 * 1024);
+        assert_eq!(resolved.server_ipc.max_pool_memory, 1024 * 1024 * 1024);
+        assert_eq!(resolved.server_ipc.max_payload_size, 32 * 1024 * 1024);
+        assert!(resolved.server_ipc.pool_enabled);
 
-        assert!(err.to_string().contains("pool_segment_size"));
-        assert!(err.to_string().contains("max_payload_size"));
+        let mut overrides = RuntimeConfigOverrides::default();
+        overrides.server_ipc.max_payload_size = Some(32 * 1024 * 1024);
+        overrides.server_ipc.pool_enabled = Some(false);
+
+        let resolved = ConfigResolver::resolve(overrides, ConfigSources::empty())
+            .expect("buddy-off resolution must also allow segment > message cap");
+        assert!(!resolved.server_ipc.pool_enabled);
+        assert_eq!(resolved.server_ipc.pool_segment_size, 256 * 1024 * 1024);
+        assert_eq!(resolved.server_ipc.max_payload_size, 32 * 1024 * 1024);
     }
 
     #[test]
@@ -1736,6 +1871,273 @@ mod tests {
         }
     }
 
+    // ── Call execution limits ────────────────────────────────────────────
+
+    #[test]
+    fn call_execution_limits_resolve_canonical_defaults() {
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect("defaults should resolve");
+
+        assert_eq!(limits, CallExecutionLimits::default());
+        assert_eq!(limits.max_outstanding_calls, 1024);
+        assert_eq!(limits.retained_input_budget_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn call_execution_limits_resolve_from_env_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let env_file = tempdir.path().join(".env");
+        fs::write(
+            &env_file,
+            [
+                "C2_CALL_MAX_OUTSTANDING=64",
+                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+            ]
+            .join("\n"),
+        )
+        .expect("write env file");
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file),
+                process_env: env(&[]),
+            },
+        )
+        .expect("env-file limits should resolve");
+
+        assert_eq!(limits.max_outstanding_calls, 64);
+        assert_eq!(limits.retained_input_budget_bytes, 1_073_741_824);
+    }
+
+    #[test]
+    fn call_execution_limits_process_env_overrides_env_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let env_file = tempdir.path().join(".env");
+        fs::write(
+            &env_file,
+            [
+                "C2_CALL_MAX_OUTSTANDING=64",
+                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+            ]
+            .join("\n"),
+        )
+        .expect("write env file");
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file),
+                process_env: env(&[
+                    ("C2_CALL_MAX_OUTSTANDING", "128"),
+                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "2147483648"),
+                ]),
+            },
+        )
+        .expect("process env should win over the env file");
+
+        assert_eq!(limits.max_outstanding_calls, 128);
+        assert_eq!(limits.retained_input_budget_bytes, 2_147_483_648);
+    }
+
+    #[test]
+    fn call_execution_limits_explicit_overrides_beat_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_CALL_MAX_OUTSTANDING", "64"),
+                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "1073741824"),
+            ]),
+        };
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(7),
+                retained_input_budget_bytes: Some(4096),
+            },
+            sources,
+        )
+        .expect("explicit limits should beat env");
+
+        assert_eq!(limits.max_outstanding_calls, 7);
+        assert_eq!(limits.retained_input_budget_bytes, 4096);
+    }
+
+    #[test]
+    fn call_execution_limits_explicit_overrides_ignore_invalid_env() {
+        // A present explicit value means the environment for that dimension
+        // is never consulted, so invalid text there cannot fail resolution.
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(7),
+                retained_input_budget_bytes: Some(4096),
+            },
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[
+                    ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
+                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+                ]),
+            },
+        )
+        .expect("explicit limits should bypass env parsing entirely");
+
+        assert_eq!(limits.max_outstanding_calls, 7);
+        assert_eq!(limits.retained_input_budget_bytes, 4096);
+    }
+
+    #[test]
+    fn call_execution_limits_zero_is_finite_per_dimension() {
+        // An explicit zero closes only its own dimension; the other one
+        // still falls through to the canonical default.
+        let zeroed_max = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(0),
+                retained_input_budget_bytes: None,
+            },
+            ConfigSources::empty(),
+        )
+        .expect("explicit zero outstanding calls should resolve");
+        assert_eq!(zeroed_max.max_outstanding_calls, 0);
+        assert_eq!(
+            zeroed_max.retained_input_budget_bytes,
+            crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES
+        );
+
+        // An environmental zero is a present value in exactly the same way:
+        // it must never fall through to the default via truthiness.
+        let zero_env = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "0")]),
+            },
+        )
+        .expect("zero retained budget should resolve as finite and rejecting");
+        assert_eq!(
+            zero_env.max_outstanding_calls,
+            crate::DEFAULT_MAX_OUTSTANDING_CALLS
+        );
+        assert_eq!(zero_env.retained_input_budget_bytes, 0);
+    }
+
+    #[test]
+    fn call_execution_limits_accept_full_u64_range() {
+        let from_env = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[
+                    ("C2_CALL_MAX_OUTSTANDING", "18446744073709551615"),
+                    (
+                        "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                        "18446744073709551615",
+                    ),
+                ]),
+            },
+        )
+        .expect("u64::MAX is a legal finite limit");
+        assert_eq!(from_env.max_outstanding_calls, u64::MAX);
+        assert_eq!(from_env.retained_input_budget_bytes, u64::MAX);
+
+        let from_override = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(u64::MAX),
+                retained_input_budget_bytes: Some(u64::MAX),
+            },
+            ConfigSources::empty(),
+        )
+        .expect("u64::MAX overrides are legal");
+        assert_eq!(from_override.max_outstanding_calls, u64::MAX);
+        assert_eq!(from_override.retained_input_budget_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn call_execution_limits_env_rejects_invalid_values() {
+        for (key, value) in [
+            ("C2_CALL_MAX_OUTSTANDING", "-1"),
+            ("C2_CALL_MAX_OUTSTANDING", ""),
+            ("C2_CALL_MAX_OUTSTANDING", "   "),
+            ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
+            ("C2_CALL_MAX_OUTSTANDING", "18446744073709551616"),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", ""),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "   "),
+            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "not-a-number"),
+            (
+                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                "18446744073709551616",
+            ),
+        ] {
+            let sources = ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[(key, value)]),
+            };
+
+            let err = ConfigResolver::resolve_call_execution_limits(
+                CallExecutionLimitsOverrides::default(),
+                sources,
+            )
+            .expect_err(&format!("invalid value {value:?} for {key} should fail"));
+
+            assert!(
+                err.to_string().contains(key),
+                "error should name {key} for {value:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_execution_limits_ignore_other_scopes_invalid_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_CALL_MAX_OUTSTANDING", "32"),
+                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "65536"),
+                ("C2_IPC_MAX_FRAME_SIZE", "not-a-number"),
+                ("C2_IPC_POOL_SEGMENT_SIZE", "-1"),
+                ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
+                ("C2_SHM_THRESHOLD", ""),
+                ("C2_IPC_ROOT", "   "),
+            ]),
+        };
+
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            sources,
+        )
+        .expect("call limit resolution must not parse other scopes");
+
+        assert_eq!(limits.max_outstanding_calls, 32);
+        assert_eq!(limits.retained_input_budget_bytes, 65_536);
+    }
+
+    #[test]
+    fn other_scope_resolutions_ignore_call_limit_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
+                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+            ]),
+        };
+
+        let threshold = ConfigResolver::resolve_shm_threshold(None, sources.clone())
+            .expect("shm threshold resolution must not parse call limit env");
+        assert_eq!(threshold, 4096);
+
+        let attempts = ConfigResolver::resolve_relay_route_max_attempts(sources.clone())
+            .expect("relay route attempts resolution must not parse call limit env");
+        assert_eq!(attempts, 3);
+
+        let runtime = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
+            .expect("runtime resolution must not parse call limit env");
+        assert_eq!(runtime.shm_threshold, 4096);
+    }
+
     #[test]
     fn relay_upstream_ipc_rejects_invalid_configuration() {
         for (key, value) in [
@@ -1830,5 +2232,243 @@ mod tests {
         );
         assert_eq!(ipc.pool_decay_seconds, 30.0);
         assert_eq!(ipc.shm_threshold, 4096);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_endpoint_resolution_follows_code_env_file_default_precedence() {
+        use crate::{LocalEndpointContext, LocalEndpointOptions};
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let env_file = tempdir.path().join(".env");
+        fs::write(&env_file, "C2_IPC_ROOT=/tmp/c2-file-root\n").expect("write env file");
+
+        // Default: no code option, no env, no env file.
+        let default_ctx = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources::empty(),
+        )
+        .expect("default context should resolve");
+        assert_eq!(
+            default_ctx.unix_root(),
+            Some(std::path::Path::new("/tmp")),
+            "the platform default root must stay /tmp"
+        );
+        assert_eq!(
+            default_ctx,
+            ConfigResolver::resolve_local_endpoint(
+                LocalEndpointOptions::default(),
+                ConfigSources::empty()
+            )
+            .expect("default context is stable")
+        );
+
+        // .env only.
+        let from_file = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file.clone()),
+                process_env: env(&[]),
+            },
+        )
+        .expect("env-file context should resolve");
+        assert_eq!(
+            from_file.unix_root(),
+            Some(std::path::Path::new("/tmp/c2-file-root"))
+        );
+
+        // Process env beats the env file.
+        let from_env = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file.clone()),
+                process_env: env(&[("C2_IPC_ROOT", "/tmp/c2-env-root")]),
+            },
+        )
+        .expect("env context should resolve");
+        assert_eq!(
+            from_env.unix_root(),
+            Some(std::path::Path::new("/tmp/c2-env-root"))
+        );
+
+        // Explicit code beats process env.
+        let from_code = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions {
+                unix_root: Some(std::path::PathBuf::from("/tmp/c2-code-root")),
+            },
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file),
+                process_env: env(&[("C2_IPC_ROOT", "/tmp/c2-env-root")]),
+            },
+        )
+        .expect("code context should resolve");
+        assert_eq!(
+            from_code.unix_root(),
+            Some(std::path::Path::new("/tmp/c2-code-root"))
+        );
+
+        // Distinct roots keep the same logical address isolated and give it
+        // distinct namespace identities.
+        let address = "ipc://resolver-name";
+        let env_endpoint = from_env.endpoint(address).expect("env endpoint");
+        let code_endpoint = from_code.endpoint(address).expect("code endpoint");
+        assert_ne!(env_endpoint, code_endpoint);
+        assert_ne!(
+            env_endpoint.context().namespace_id(),
+            code_endpoint.context().namespace_id()
+        );
+        assert_eq!(
+            from_env.namespace_id(),
+            LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/c2-env-root"))
+                .expect("same root is one identity")
+                .namespace_id()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_endpoint_resolver_rejects_invalid_root_values() {
+        use crate::LocalEndpointOptions;
+
+        // "" is the only value rejected as explicitly empty; "   " fails the
+        // native absolute-path check instead (never trimmed into validity).
+        let empty_sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_ROOT", "")]),
+        };
+        let empty_err =
+            ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), empty_sources)
+                .expect_err("empty root should fail");
+        assert!(
+            empty_err.to_string().contains("cannot be empty"),
+            "{empty_err}"
+        );
+
+        for value in ["   ", "relative/root", "/tmp/../escape", "/tmp/a\0b"] {
+            let sources = ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_ROOT", value)]),
+            };
+            let err =
+                ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), sources)
+                    .expect_err(&format!("invalid root {value:?} should fail"));
+            assert!(
+                err.to_string().contains("C2_IPC_ROOT"),
+                "error should name C2_IPC_ROOT for {value:?}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_endpoint_env_root_is_preserved_verbatim() {
+        use crate::LocalEndpointOptions;
+
+        // A trailing space is a legal Unix directory name: the env value must
+        // resolve to exactly the same context/endpoint/namespace id as the
+        // identical code-level path, and stay distinct from the name without
+        // the trailing space.
+        let spaced = "/tmp/c2-r ";
+        let from_env = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_ROOT", spaced)]),
+            },
+        )
+        .expect("spaced env root should resolve");
+        let from_code = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions {
+                unix_root: Some(std::path::PathBuf::from(spaced)),
+            },
+            ConfigSources::empty(),
+        )
+        .expect("spaced code root should resolve");
+        assert_eq!(from_env, from_code);
+        assert_eq!(from_env.unix_root(), Some(std::path::Path::new(spaced)));
+        assert_eq!(from_env.namespace_id(), from_code.namespace_id());
+
+        let endpoint = from_env.endpoint("ipc://verbatim").expect("endpoint");
+        assert_eq!(
+            endpoint,
+            from_code.endpoint("ipc://verbatim").expect("endpoint")
+        );
+        assert!(
+            endpoint
+                .os_name()
+                .to_str()
+                .unwrap()
+                .starts_with("/tmp/c2-r /c2-"),
+            "{endpoint:?}"
+        );
+
+        let plain = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_ROOT", "/tmp/c2-r")]),
+            },
+        )
+        .expect("plain env root should resolve");
+        assert_ne!(from_env, plain);
+        assert_ne!(from_env.namespace_id(), plain.namespace_id());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_endpoint_env_root_whitespace_is_rejected_without_trimming() {
+        use crate::LocalEndpointOptions;
+
+        // Whitespace-only and leading-whitespace values keep their raw bytes
+        // and fail the native absolute-path check; they must never be
+        // trimmed into valid paths.
+        for value in [" ", "  /tmp/c2-r", "\t/tmp/c2-r"] {
+            let sources = ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_IPC_ROOT", value)]),
+            };
+            let err =
+                ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), sources)
+                    .expect_err(&format!("whitespace root {value:?} must not become valid"));
+            assert!(
+                err.to_string().contains("C2_IPC_ROOT"),
+                "error should name C2_IPC_ROOT for {value:?}: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_endpoint_env_file_quoted_spaces_are_preserved() {
+        use crate::LocalEndpointOptions;
+
+        // Quoted .env values legally carry spaces; the parser must keep them
+        // verbatim so the resolved context matches the same code-level path.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let env_file = tempdir.path().join(".env");
+        fs::write(&env_file, "C2_IPC_ROOT=\"/tmp/c2-r quoted\"\n").expect("write env file");
+
+        let from_file = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Path(env_file),
+                process_env: env(&[]),
+            },
+        )
+        .expect("quoted env-file root should resolve");
+        assert_eq!(
+            from_file.unix_root(),
+            Some(std::path::Path::new("/tmp/c2-r quoted"))
+        );
+
+        let from_code = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions {
+                unix_root: Some(std::path::PathBuf::from("/tmp/c2-r quoted")),
+            },
+            ConfigSources::empty(),
+        )
+        .expect("quoted code root should resolve");
+        assert_eq!(from_file, from_code);
+        assert_eq!(from_file.namespace_id(), from_code.namespace_id());
     }
 }

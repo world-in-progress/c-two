@@ -110,7 +110,9 @@ fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
 
 fn close_reason_to_route_state_reason(closed_reason: &str) -> RouteStateReasonWire {
     match closed_reason {
-        "shutdown" | "direct_ipc_shutdown" | OWNER_BOUND_SHUTDOWN_REASON
+        "shutdown"
+        | "direct_ipc_shutdown"
+        | OWNER_BOUND_SHUTDOWN_REASON
         | OWNER_WATCHER_ERROR_SHUTDOWN_REASON => RouteStateReasonWire::Shutdown,
         OWNER_MISSING_ADMISSION_REASON | OWNER_WATCHER_ERROR_ADMISSION_REASON => {
             RouteStateReasonWire::OwnerWatchDisconnected
@@ -361,9 +363,33 @@ impl Server {
         config: ServerIpcConfig,
         identity: ServerIdentity,
     ) -> Result<Self, ServerError> {
+        Self::new_with_identity_and_endpoint(parse_local_endpoint(address)?, config, identity)
+    }
+
+    /// Construct in the caller's resolved namespace. The endpoint is retained
+    /// for readiness probes, bind, restart, listener credentials and drop.
+    /// Unix custom-root containers must already exist before running the server.
+    pub fn new_with_endpoint(
+        endpoint: LocalEndpoint,
+        config: ServerIpcConfig,
+    ) -> Result<Self, ServerError> {
+        let identity = ServerIdentity {
+            server_id: server_id_from_ipc_address(endpoint.address())?,
+            server_instance_id: uuid::Uuid::new_v4().simple().to_string(),
+        };
+        Self::new_with_identity_and_endpoint(endpoint, config, identity)
+    }
+
+    /// Construct with an explicit identity and an already-derived endpoint.
+    /// This accepts both Unix-managed and Windows Named Pipe contexts without
+    /// projecting either through another platform's path representation.
+    pub fn new_with_identity_and_endpoint(
+        endpoint: LocalEndpoint,
+        config: ServerIpcConfig,
+        identity: ServerIdentity,
+    ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
         validate_server_identity(&identity)?;
-        parse_local_endpoint(address)?;
         // One server direction, one finite budget: the response pool, the
         // chunk-reassembly pool, and response prewarm all charge the same
         // context, so the server cannot double its configured cap by owning
@@ -385,8 +411,8 @@ impl Server {
                 memory_budget.clone(),
             )
         };
-        Self::with_reassembly_pool(
-            address,
+        Self::with_endpoint_and_reassembly_pool(
+            endpoint,
             config,
             identity,
             Arc::new(parking_lot::RwLock::new(reassembly_pool)),
@@ -399,17 +425,29 @@ impl Server {
     /// admission authority for chunked request reassembly. Production callers
     /// pass the config-derived pool through [`Server::new_with_identity`];
     /// tests use this seam to inject pools with tiny finite budgets.
+    #[cfg(test)]
     fn with_reassembly_pool(
         address: &str,
         config: ServerIpcConfig,
         identity: ServerIdentity,
         reassembly_pool: Arc<parking_lot::RwLock<MemPool>>,
     ) -> Result<Self, ServerError> {
+        Self::with_endpoint_and_reassembly_pool(
+            parse_local_endpoint(address)?,
+            config,
+            identity,
+            reassembly_pool,
+        )
+    }
+
+    fn with_endpoint_and_reassembly_pool(
+        endpoint: LocalEndpoint,
+        config: ServerIpcConfig,
+        identity: ServerIdentity,
+        reassembly_pool: Arc<parking_lot::RwLock<MemPool>>,
+    ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
         validate_server_identity(&identity)?;
-        // Bind and restart use the same canonical platform endpoint.
-        let endpoint =
-            parse_local_endpoint(address)?;
         let (shutdown_tx, _) = watch::channel(false);
         // The injected test pool and the production reassembly pool both
         // carry the server's accounting authority. Derive the response-pool
@@ -462,7 +500,7 @@ impl Server {
         Ok(Self {
             identity,
             config,
-            ipc_address: address.to_string(),
+            ipc_address: endpoint.address().to_string(),
             endpoint,
             dispatcher: RwLock::new(Dispatcher::new()),
             route_catalog: parking_lot::RwLock::new(route_catalog),
@@ -3353,9 +3391,9 @@ async fn dispatch_chunked_call(
                 // Either way this later chunk stops without a duplicate reply,
                 // but it must still release a buddy-backed frame's peer block
                 // instead of leaking the SHM allocation.
-                ChunkAdmissionOutcome::Refused | ChunkAdmissionOutcome::Aborted => Some(
-                    "chunk admission ended before this later chunk could feed",
-                ),
+                ChunkAdmissionOutcome::Refused | ChunkAdmissionOutcome::Aborted => {
+                    Some("chunk admission ended before this later chunk could feed")
+                }
                 ChunkAdmissionOutcome::Pending => {
                     debug_assert!(false, "chunk admission waiter returned while pending");
                     Some("chunk admission waiter returned while still pending")
@@ -4237,9 +4275,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::RequestLease;
     use crate::dispatcher::{CrmCallback, CrmError, CrmRoute};
     use crate::scheduler::{ConcurrencyMode, Scheduler};
-    use crate::RequestLease;
 
     // -- address parsing --
 
@@ -7587,18 +7625,24 @@ mod tests {
 
         // Read the correlated error reply frame for request 21.
         let mut header = [0u8; c2_wire::frame::HEADER_SIZE];
-        tokio::time::timeout(std::time::Duration::from_secs(5), probe.read_exact(&mut header))
-            .await
-            .expect("error reply within timeout")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe.read_exact(&mut header),
+        )
+        .await
+        .expect("error reply within timeout")
+        .unwrap();
         // total_len counts everything after the 4-byte prefix: the 12-byte
         // header (already read) plus the payload still to read.
         let (total_len, _) = c2_wire::frame::decode_total_len(&header).unwrap();
         let mut body = vec![0u8; total_len as usize - 12];
-        tokio::time::timeout(std::time::Duration::from_secs(5), probe.read_exact(&mut body))
-            .await
-            .expect("error body within timeout")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe.read_exact(&mut body),
+        )
+        .await
+        .expect("error body within timeout")
+        .unwrap();
         let mut frame_bytes = header.to_vec();
         frame_bytes.extend_from_slice(&body);
         let (hdr, payload_out) = c2_wire::frame::decode_frame(&frame_bytes).unwrap();
@@ -7745,7 +7789,13 @@ mod tests {
             let start = idx * CHUNK;
             let end = usize::min(start + CHUNK, data.len());
             client
-                .write_all(&chunked_call_frame(77, idx as u16, TOTAL as u16, &data[start..end], "grid"))
+                .write_all(&chunked_call_frame(
+                    77,
+                    idx as u16,
+                    TOTAL as u16,
+                    &data[start..end],
+                    "grid",
+                ))
                 .await
                 .expect("write chunk frame");
         }
@@ -7769,7 +7819,11 @@ mod tests {
         // Control liveness while the route gate is stalled: the receive loop
         // still answers a ping on the same connection.
         client
-            .write_all(&encode_frame(5, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .write_all(&encode_frame(
+                5,
+                FLAG_SIGNAL,
+                &c2_wire::msg_type::PING_BYTES,
+            ))
             .await
             .expect("write ping");
         let (ping_rid, ping_flags, ping_payload) = read_reply_frame(&mut client).await;
@@ -7838,8 +7892,8 @@ mod tests {
 
         let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
         assert_eq!(reply_rid, 88);
-        let (control, _) = c2_wire::control::decode_reply_control(&reply_payload, 0)
-            .expect("reply control");
+        let (control, _) =
+            c2_wire::control::decode_reply_control(&reply_payload, 0).expect("reply control");
         match control {
             ReplyControl::RouteNotFound(route) => assert_eq!(route, "missing"),
             other => panic!("expected structured route-not-found reply, got {other:?}"),
@@ -7964,12 +8018,15 @@ mod tests {
                 .await
                 .expect("write chunk frame");
         }
-        wait_until("incomplete assembly registered with route admission", || {
-            server.chunk_registry.active_count() == 1
-                && server.chunk_route_pending.lock().len() == 1
-                && server.chunk_admission_gate.len() == 0
-                && server.chunk_processing_permits.available_permits() == 3
-        })
+        wait_until(
+            "incomplete assembly registered with route admission",
+            || {
+                server.chunk_registry.active_count() == 1
+                    && server.chunk_route_pending.lock().len() == 1
+                    && server.chunk_admission_gate.len() == 0
+                    && server.chunk_processing_permits.available_permits() == 3
+            },
+        )
         .await;
         let conn_id = server.active_connection_ids()[0];
         assert!(matches!(
@@ -7982,7 +8039,11 @@ mod tests {
 
         // Control liveness while the incomplete assembly is still charged.
         client
-            .write_all(&encode_frame(6, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .write_all(&encode_frame(
+                6,
+                FLAG_SIGNAL,
+                &c2_wire::msg_type::PING_BYTES,
+            ))
             .await
             .expect("write ping");
         let (ping_rid, _flags, ping_payload) = read_reply_frame(&mut client).await;
@@ -8008,7 +8069,11 @@ mod tests {
         // Control liveness after the timeout, and the connection still serves
         // a complete request with every byte delivered once.
         client
-            .write_all(&encode_frame(7, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .write_all(&encode_frame(
+                7,
+                FLAG_SIGNAL,
+                &c2_wire::msg_type::PING_BYTES,
+            ))
             .await
             .expect("write ping");
         let (ping_rid, _flags, ping_payload) = read_reply_frame(&mut client).await;
@@ -8141,7 +8206,11 @@ mod tests {
 
         // Control liveness on the same connection after the terminal refusal.
         client
-            .write_all(&encode_frame(5, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .write_all(&encode_frame(
+                5,
+                FLAG_SIGNAL,
+                &c2_wire::msg_type::PING_BYTES,
+            ))
             .await
             .expect("write ping");
         let (ping_rid, _flags, ping_payload) = read_reply_frame(&mut client).await;
@@ -8202,11 +8271,14 @@ mod tests {
         );
 
         drop(dispatcher_guard);
-        wait_until("malformed-frame teardown released the parked admission", || {
-            server.chunk_admission_gate.len() == 0
-                && server.chunk_registry.active_count() == 0
-                && server.chunk_processing_permits.available_permits() == 3
-        })
+        wait_until(
+            "malformed-frame teardown released the parked admission",
+            || {
+                server.chunk_admission_gate.len() == 0
+                    && server.chunk_registry.active_count() == 0
+                    && server.chunk_processing_permits.available_permits() == 3
+            },
+        )
         .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -8332,12 +8404,15 @@ mod tests {
             "duplicate admission must be correlated: {message}"
         );
 
-        wait_until("duplicate refusal released the published generation", || {
-            server.chunk_registry.active_count() == 0
-                && server.chunk_route_pending.lock().is_empty()
-                && server.chunk_processing_permits.available_permits() == 3
-                && server.chunk_admission_gate.len() == 0
-        })
+        wait_until(
+            "duplicate refusal released the published generation",
+            || {
+                server.chunk_registry.active_count() == 0
+                    && server.chunk_route_pending.lock().is_empty()
+                    && server.chunk_processing_permits.available_permits() == 3
+                    && server.chunk_admission_gate.len() == 0
+            },
+        )
         .await;
         assert!(!server.chunk_registry.contains(conn_id, 82));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -8593,7 +8668,11 @@ mod tests {
 
         // Control liveness at full chunk-processing capacity.
         client
-            .write_all(&encode_frame(9, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES))
+            .write_all(&encode_frame(
+                9,
+                FLAG_SIGNAL,
+                &c2_wire::msg_type::PING_BYTES,
+            ))
             .await
             .expect("write ping");
         let (ping_rid, ping_flags, ping_payload) = read_reply_frame(&mut client).await;

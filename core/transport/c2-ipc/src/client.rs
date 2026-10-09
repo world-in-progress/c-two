@@ -16,7 +16,7 @@ use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, oneshot};
 
-use c2_error::ErrorCode;
+use c2_error::{C2Error, ErrorCode};
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
@@ -1125,9 +1125,65 @@ impl From<ChunkAdmissionError> for ChunkError {
     }
 }
 
+/// Call-site authority for preparation and the first business frame byte.
+///
+/// Callbacks must be synchronous, nonblocking, and must not panic. The owner
+/// (for example Core's call scope) supplies policy; IPC owns no deadline or
+/// cancellation watcher. If a call reaches the first-byte boundary,
+/// `try_begin_dispatch` runs once, with the writer lock held, before
+/// publishing send or request-allocation state.
+/// After permission is granted, IPC drives the entire send and response wait
+/// without consulting these callbacks again. The owner must retain/poll the
+/// future through completion; dropping it still has normal transport
+/// cancellation semantics, including aborting an incomplete frame.
+#[derive(Clone)]
+pub struct IpcCallControl {
+    before_prepare: Option<Arc<dyn Fn() -> Result<(), C2Error> + Send + Sync>>,
+    try_begin_dispatch: Arc<dyn Fn() -> Result<(), C2Error> + Send + Sync>,
+}
+
+impl IpcCallControl {
+    pub fn new(
+        try_begin_dispatch: impl Fn() -> Result<(), C2Error> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            before_prepare: None,
+            try_begin_dispatch: Arc::new(try_begin_dispatch),
+        }
+    }
+
+    /// Optional active-scope check before and after preparing an unpublished
+    /// request. It never grants dispatch permission and may run more than once
+    /// if SHM preparation falls back to another transport.
+    pub fn with_before_prepare(
+        mut self,
+        before_prepare: impl Fn() -> Result<(), C2Error> + Send + Sync + 'static,
+    ) -> Self {
+        self.before_prepare = Some(Arc::new(before_prepare));
+        self
+    }
+
+    fn check_preparation(control: Option<&Self>) -> Result<(), IpcError> {
+        if let Some(check) = control.and_then(|control| control.before_prepare.as_ref()) {
+            check().map_err(IpcError::LocalCallRejected)?;
+        }
+        Ok(())
+    }
+
+    fn begin_dispatch(control: Option<&Self>) -> Result<(), IpcError> {
+        if let Some(control) = control {
+            (control.try_begin_dispatch)().map_err(IpcError::LocalCallRejected)?;
+        }
+        Ok(())
+    }
+}
+
 /// IPC client error.
 #[derive(Debug)]
 pub enum IpcError {
+    /// Call-site policy rejected this unpublished call. Retains the canonical
+    /// code, message, and details; it is not a connection or route failure.
+    LocalCallRejected(C2Error),
     /// I/O error on the local connection.
     Io(std::io::Error),
     /// Invalid client configuration or IPC address.
@@ -1193,6 +1249,7 @@ pub enum IpcError {
 impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::LocalCallRejected(error) => write!(f, "IPC local call rejected: {error}"),
             Self::Io(e) => write!(f, "IPC I/O error: {e}"),
             Self::Config(msg) => write!(f, "IPC config error: {msg}"),
             Self::Decode(e) => write!(f, "IPC decode error: {e}"),
@@ -1720,12 +1777,12 @@ impl Drop for SendGuard {
     }
 }
 
-/// Test-only seam that splits one prealloc frame write into a real partial
+/// Test-only seam that splits one business frame write into a real partial
 /// prefix plus a parked continuation, so tests can prove that cancelling
 /// after bytes actually landed poisons the stream instead of leaving a frame
 /// prefix a later writer would append to. Production never installs it.
-#[cfg(test)]
-pub(crate) struct FrameWriteSeam {
+#[cfg(any(test, feature = "test-support"))]
+pub struct FrameWriteSeam {
     /// Bytes of the frame to write for real before parking mid-frame.
     pub prefix_bytes: usize,
     /// Completed once the prefix bytes were written to the real stream.
@@ -1738,8 +1795,8 @@ pub(crate) struct FrameWriteSeam {
 /// Park this connection immediately before its terminal pending drain and
 /// report the first real attempt. Tests can hold the pending map across that
 /// attempt without relying on timing or affecting any other connection.
-#[cfg(test)]
-pub(crate) struct PendingDrainSeam {
+#[cfg(any(test, feature = "test-support"))]
+pub struct PendingDrainSeam {
     pub entered: tokio::sync::oneshot::Sender<()>,
     pub resume: tokio::sync::oneshot::Receiver<()>,
     pub attempted: tokio::sync::oneshot::Sender<bool>,
@@ -1901,7 +1958,7 @@ pub struct IpcClient {
     partial_header_pending_for_test: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     receiver_drop_gate_for_test: StdMutex<Option<ReceiverDropGateForTest>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pending_drain_seam: StdMutex<Option<PendingDrainSeam>>,
     /// Serializes close barriers. Only one closer at a time may manipulate
     /// the writer slot and the receive-task handle, so a concurrent close
@@ -1968,7 +2025,7 @@ pub struct IpcClient {
     /// One-shot seam that splits the next prealloc frame write into a real
     /// partial prefix plus a parked continuation. Test-only: production
     /// never installs it, so real builds always write whole frames.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     frame_write_seam: StdMutex<Option<FrameWriteSeam>>,
 }
 
@@ -2056,7 +2113,7 @@ impl IpcClient {
     }
 
     fn from_parts(
-        address: &str,
+        endpoint: Result<LocalEndpoint, String>,
         pool: Option<Arc<StdMutex<MemPool>>>,
         config: ClientIpcConfig,
         pool_injected: bool,
@@ -2064,12 +2121,7 @@ impl IpcClient {
         memory_budget: Option<c2_mem::MemoryBudget>,
         chunk_registry: Option<Arc<ChunkRegistry>>,
     ) -> Self {
-        // The resolved config owns the endpoint protocol: construction,
-        // reconnect, and every fallback reuse this one derivation instead of
-        // probing old and new endpoint namespaces.
-        let endpoint = crate::control::local_endpoint_from_ipc_address(address)
-            .map_err(|error| error.to_string());
-
+        // Construction freezes the native endpoint; reconnect never derives it again.
         Self {
             endpoint,
             abort: Arc::new(StdMutex::new(None)),
@@ -2085,7 +2137,7 @@ impl IpcClient {
             partial_header_pending_for_test: StdMutex::new(None),
             #[cfg(test)]
             receiver_drop_gate_for_test: StdMutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pending_drain_seam: StdMutex::new(None),
             close_gate: tokio::sync::Mutex::new(()),
             close_incomplete: AtomicBool::new(false),
@@ -2102,7 +2154,7 @@ impl IpcClient {
             maintenance_ticks: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             prealloc_selection_hook: StdMutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             frame_write_seam: StdMutex::new(None),
         }
     }
@@ -2214,7 +2266,7 @@ impl IpcClient {
         let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
         let registry = Self::build_chunk_registry(&config, &budget);
         Self::from_parts(
-            address,
+            Self::default_endpoint(address),
             None,
             config,
             false,
@@ -2252,10 +2304,34 @@ impl IpcClient {
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
     ) -> Self {
+        Self::with_budget_endpoint(Self::default_endpoint(address), config, budget)
+    }
+
+    /// Create a client with a frozen endpoint and a config-owned memory budget.
+    /// The caller resolves the context; this transport never reads environment roots.
+    pub fn with_endpoint(endpoint: LocalEndpoint, config: ClientIpcConfig) -> Self {
+        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
+        Self::with_endpoint_and_shared_budget(endpoint, config, budget)
+    }
+
+    /// Use the given endpoint and the owning domain's shared memory budget.
+    pub fn with_endpoint_and_shared_budget(
+        endpoint: LocalEndpoint,
+        config: ClientIpcConfig,
+        budget: c2_mem::MemoryBudget,
+    ) -> Self {
+        Self::with_budget_endpoint(Ok(endpoint), config, budget)
+    }
+
+    fn with_budget_endpoint(
+        endpoint: Result<LocalEndpoint, String>,
+        config: ClientIpcConfig,
+        budget: c2_mem::MemoryBudget,
+    ) -> Self {
         let pool = Self::own_pool_from_config(&config, &budget);
         let registry = Self::build_chunk_registry(&config, &budget);
         Self::from_parts(
-            address,
+            endpoint,
             Some(pool),
             config,
             false,
@@ -2287,11 +2363,29 @@ impl IpcClient {
     /// allocations are never mutated or destroyed by the transport;
     /// maintenance only calls the pool's public GC API.
     pub fn with_pool(address: &str, pool: Arc<StdMutex<MemPool>>, config: ClientIpcConfig) -> Self {
+        Self::with_pool_endpoint(Self::default_endpoint(address), pool, config)
+    }
+
+    /// Use a frozen endpoint with an externally owned pool. The same injected-pool
+    /// policy and budget checks as [`Self::with_pool`] apply before connection I/O.
+    pub fn with_endpoint_and_pool(
+        endpoint: LocalEndpoint,
+        pool: Arc<StdMutex<MemPool>>,
+        config: ClientIpcConfig,
+    ) -> Self {
+        Self::with_pool_endpoint(Ok(endpoint), pool, config)
+    }
+
+    fn with_pool_endpoint(
+        endpoint: Result<LocalEndpoint, String>,
+        pool: Arc<StdMutex<MemPool>>,
+        config: ClientIpcConfig,
+    ) -> Self {
         let budget = pool.lock().budget().cloned();
         let registry = budget
             .as_ref()
             .map(|budget| Self::build_chunk_registry(&config, budget));
-        Self::from_parts(address, Some(pool), config, true, false, budget, registry)
+        Self::from_parts(endpoint, Some(pool), config, true, false, budget, registry)
     }
 
     /// Create a client around a transport-internal pool built from `config`
@@ -2301,14 +2395,14 @@ impl IpcClient {
     /// owning cache's shared domain context; the pool was already created with
     /// it and the client's reassembly pool charges the same context.
     pub(crate) fn with_transport_pool(
-        address: &str,
+        endpoint: LocalEndpoint,
         pool: Arc<StdMutex<MemPool>>,
         config: ClientIpcConfig,
         budget: c2_mem::MemoryBudget,
     ) -> Self {
         let registry = Self::build_chunk_registry(&config, &budget);
         Self::from_parts(
-            address,
+            Ok(endpoint),
             Some(pool),
             config,
             false,
@@ -2316,6 +2410,17 @@ impl IpcClient {
             Some(budget),
             Some(registry),
         )
+    }
+
+    fn default_endpoint(address: &str) -> Result<LocalEndpoint, String> {
+        crate::control::local_endpoint_from_ipc_address(address).map_err(|error| error.to_string())
+    }
+
+    /// The endpoint frozen at construction, retained across close and reconnect.
+    pub fn local_endpoint(&self) -> Result<&LocalEndpoint, IpcError> {
+        self.endpoint
+            .as_ref()
+            .map_err(|error| IpcError::Config(error.clone()))
     }
 
     /// Connect and perform handshake.
@@ -2591,7 +2696,7 @@ impl IpcClient {
                         .expect("connected stream has an abort handle")
                         .clone(),
                 });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let pending_drain_seam = self.pending_drain_seam.lock().take();
         let recv_handle = tokio::spawn(recv_loop_inner(
             reader,
@@ -2605,7 +2710,7 @@ impl IpcClient {
             partial_header_pending,
             #[cfg(test)]
             receiver_drop_gate,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pending_drain_seam,
         ));
         *self.recv_handle.lock() = Some(recv_handle);
@@ -2861,6 +2966,7 @@ impl IpcClient {
         identity: RouteCallIdentity,
         max_payload_size: u64,
         data: &[u8],
+        control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, IpcError> {
         let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         if data_len > max_payload_size {
@@ -2869,9 +2975,11 @@ impl IpcClient {
             )));
         }
 
+        IpcCallControl::check_preparation(control)?;
+
         match choose_request_transport(&self.config, self.has_request_pool(), data.len()) {
             RequestTransportKind::Buddy => {
-                match self.call_buddy(&identity, method_idx, data).await {
+                match self.call_buddy(&identity, method_idx, data, control).await {
                     Ok(result) => return Ok(result),
                     Err(IpcError::Shm(_)) => {
                         // Pool allocation or SHM setup failed. Fall back through the
@@ -2882,17 +2990,25 @@ impl IpcClient {
                 }
             }
             RequestTransportKind::Chunked => {
-                return self.call_chunked(&identity, method_idx, data).await;
+                return self
+                    .call_chunked(&identity, method_idx, data, control)
+                    .await;
             }
             RequestTransportKind::Inline => {
-                return self.call_inline(&identity, method_idx, data).await;
+                return self
+                    .call_inline_controlled(&identity, method_idx, data, control)
+                    .await;
             }
         }
 
         match choose_request_transport(&self.config, false, data.len()) {
-            RequestTransportKind::Chunked => self.call_chunked(&identity, method_idx, data).await,
+            RequestTransportKind::Chunked => {
+                self.call_chunked(&identity, method_idx, data, control)
+                    .await
+            }
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                self.call_inline(&identity, method_idx, data).await
+                self.call_inline_controlled(&identity, method_idx, data, control)
+                    .await
             }
         }
     }
@@ -2904,6 +3020,30 @@ impl IpcClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
+        self.call_bound_with_control(binding, method_name, data, None)
+            .await
+    }
+
+    /// Route-bound call with first-byte dispatch authority supplied by its
+    /// owner. Local rejection leaves this connection available to other calls.
+    pub async fn call_bound_controlled(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, IpcError> {
+        self.call_bound_with_control(binding, method_name, data, Some(control))
+            .await
+    }
+
+    async fn call_bound_with_control(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+        control: Option<&IpcCallControl>,
+    ) -> Result<ResponseData, IpcError> {
         let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
         self.call_resolved_target(
             binding.route_name(),
@@ -2911,6 +3051,7 @@ impl IpcClient {
             identity,
             max_payload_size,
             data,
+            control,
         )
         .await
     }
@@ -2930,6 +3071,19 @@ impl IpcClient {
                     source,
                 )
             })
+    }
+
+    /// Controlled route-bound call preserving transport dispatch phase.
+    pub async fn call_bound_controlled_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, crate::sync_client::IpcCallError> {
+        self.call_bound_controlled(binding, method_name, data, control)
+            .await
+            .map_err(classified_call_error)
     }
 
     /// Send a CRM call from a known-size body stream through a previously
@@ -3038,6 +3192,49 @@ impl IpcClient {
         }
     }
 
+    // Keep the real write boundaries (stack frame vs header/control/body)
+    // unchanged. Tests can park after a real prefix across those boundaries;
+    // production never installs the seam or builds a second frame buffer.
+    async fn write_frame_parts(
+        &self,
+        writer: &mut LocalWriteHalf,
+        parts: &[&[u8]],
+    ) -> Result<(), IpcError> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let seam = self.frame_write_seam.lock().take();
+            if let Some(seam) = seam {
+                let mut remaining = seam.prefix_bytes;
+                let mut part_idx = 0;
+                let mut offset = 0;
+                while let Some(part) = parts.get(part_idx) {
+                    offset = remaining.min(part.len());
+                    writer.write_all(&part[..offset]).await?;
+                    remaining -= offset;
+                    if offset < part.len() {
+                        break;
+                    }
+                    part_idx += 1;
+                    offset = 0;
+                }
+                let _ = seam.prefix_written.send(());
+                let _ = seam.release.await;
+                if let Some(part) = parts.get(part_idx) {
+                    writer.write_all(&part[offset..]).await?;
+                    part_idx += 1;
+                }
+                for part in &parts[part_idx..] {
+                    writer.write_all(part).await?;
+                }
+                return Ok(());
+            }
+        }
+        for part in parts {
+            writer.write_all(part).await?;
+        }
+        Ok(())
+    }
+
     /// Inline call path — sends call control + data in a single frame.
     pub(crate) async fn call_inline(
         &self,
@@ -3045,15 +3242,26 @@ impl IpcClient {
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
-        // Register pending call.
-        let (tx, rx) = oneshot::channel();
-        let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
+        self.call_inline_controlled(identity, method_idx, data, None)
+            .await
+    }
 
+    async fn call_inline_controlled(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        data: &[u8],
+        control: Option<&IpcCallControl>,
+    ) -> Result<ResponseData, IpcError> {
         // Build and send the frame.
         let ctrl_len = encoded_call_control_len(identity)?;
         let payload_len = ctrl_len + data.len();
         let total_len = (12 + payload_len) as u32;
         let frame_size = frame::HEADER_SIZE + payload_len;
+
+        IpcCallControl::check_preparation(control)?;
+        let (tx, rx) = oneshot::channel();
+        let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
 
         let mut send_guard =
             SendGuard::new(Arc::clone(&self.pending), Arc::clone(&self.abort), rid);
@@ -3063,6 +3271,7 @@ impl IpcClient {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
 
+            IpcCallControl::begin_dispatch(control)?;
             write_started.store(true, Ordering::Release);
             if frame_size <= 1024 {
                 // Stack-allocate the entire frame (zero heap, single syscall).
@@ -3078,7 +3287,8 @@ impl IpcClient {
                 )?;
                 let data_off = frame::HEADER_SIZE + ctrl_written;
                 buf[data_off..data_off + data.len()].copy_from_slice(data);
-                writer.write_all(&buf[..frame_size]).await?;
+                self.write_frame_parts(writer, &[&buf[..frame_size]])
+                    .await?;
             } else {
                 // Large payload: header+ctrl on stack, data separate write.
                 // Cancellation between these writes would strand a partial
@@ -3088,9 +3298,8 @@ impl IpcClient {
                 hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
                 hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
                 let ctrl = encode_call_control(identity, method_idx)?;
-                writer.write_all(&hdr_buf).await?;
-                writer.write_all(&ctrl).await?;
-                writer.write_all(data).await?;
+                self.write_frame_parts(writer, &[&hdr_buf, &ctrl, data])
+                    .await?;
             }
             Ok(())
         }
@@ -3121,6 +3330,7 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, IpcError> {
         if data.len() > u32::MAX as usize {
             return Err(IpcError::Config(format!(
@@ -3153,7 +3363,7 @@ impl IpcClient {
         // releases through the owning pool while it is still armed.
         block.write_at(0, data)?;
 
-        self.call_with_prealloc(identity, method_idx, &block, data.len())
+        self.call_with_prealloc_controlled(identity, method_idx, &block, data.len(), control)
             .await
     }
 
@@ -3264,6 +3474,18 @@ impl IpcClient {
         block: &RequestBlock,
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
+        self.call_with_prealloc_controlled(identity, method_idx, block, data_size, None)
+            .await
+    }
+
+    async fn call_with_prealloc_controlled(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        block: &RequestBlock,
+        data_size: usize,
+        control: Option<&IpcCallControl>,
+    ) -> Result<ResponseData, IpcError> {
         if data_size > u32::MAX as usize {
             let _ = block.release();
             return Err(IpcError::Config(format!(
@@ -3296,6 +3518,11 @@ impl IpcClient {
         let mut payload = Vec::with_capacity(payload_len);
         payload.extend_from_slice(&buddy_bytes);
         payload.extend_from_slice(&ctrl);
+
+        if let Err(error) = IpcCallControl::check_preparation(control) {
+            let _ = block.release();
+            return Err(error);
+        }
 
         // Register pending call.
         let (tx, rx) = oneshot::channel();
@@ -3340,6 +3567,15 @@ impl IpcClient {
             } else {
                 None
             };
+            // Local policy must reject before Armed → Dispatched or pending
+            // release authority is published. The writer is already held;
+            // no await can open a first-byte race after permission is granted.
+            if let Err(error) = IpcCallControl::begin_dispatch(control) {
+                if let Some(permit) = retire_permit {
+                    permit.release();
+                }
+                return Err(error);
+            }
             // Dispatch seam: linearize Armed → Dispatched. A released or
             // already-dispatched block is rejected before any byte is
             // written, so freed or reused coordinates are never sent.
@@ -3360,22 +3596,7 @@ impl IpcClient {
                 }
             }
             write_started.store(true, Ordering::Release);
-            #[cfg(test)]
-            let seam = self.frame_write_seam.lock().take();
-            #[cfg(test)]
-            if let Some(seam) = seam {
-                // Test-only partial-write seam: a real prefix lands on the
-                // real stream, then the write parks mid-frame.
-                let prefix = seam.prefix_bytes.min(frame.len());
-                writer.write_all(&frame[..prefix]).await?;
-                let _ = seam.prefix_written.send(());
-                let _ = seam.release.await;
-                writer.write_all(&frame[prefix..]).await?;
-            } else {
-                writer.write_all(&frame).await?;
-            }
-            #[cfg(not(test))]
-            writer.write_all(&frame).await?;
+            self.write_frame_parts(writer, &[&frame]).await?;
             Ok(())
         }
         .await;
@@ -3423,16 +3644,18 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, IpcError> {
         let chunk_size = self.config.chunk_size as usize;
         let total_chunks = request_chunk_count(data.len(), chunk_size)?;
 
+        // Build call control (included only in chunk 0).
+        let ctrl = encode_call_control(identity, method_idx)?;
+
+        IpcCallControl::check_preparation(control)?;
         // Register pending call ONCE — reply comes after last chunk.
         let (tx, rx) = oneshot::channel();
         let rid = register_unary_pending(&self.pending, &self.rid_counter, tx);
-
-        // Build call control (included only in chunk 0).
-        let ctrl = encode_call_control(identity, method_idx)?;
 
         let mut send_guard =
             SendGuard::new(Arc::clone(&self.pending), Arc::clone(&self.abort), rid);
@@ -3442,6 +3665,7 @@ impl IpcClient {
             let mut writer_guard = self.writer.lock().await;
             let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
 
+            IpcCallControl::begin_dispatch(control)?;
             write_started.store(true, Ordering::Release);
             // Cancellation between chunk writes would strand a partial
             // chunked message; the send guard poisons the stream in that
@@ -3470,7 +3694,7 @@ impl IpcClient {
                 payload.extend_from_slice(chunk_data);
 
                 let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
-                writer.write_all(&frame_bytes).await?;
+                self.write_frame_parts(writer, &[&frame_bytes]).await?;
             }
             Ok(())
         }
@@ -4491,16 +4715,16 @@ impl IpcClient {
         *self.receiver_drop_gate_for_test.lock() = Some(gate);
     }
 
-    /// Install the one-shot partial-write seam for the next prealloc frame.
+    /// Install the one-shot partial-write seam for the next business frame.
     ///
     /// Test-only: production never installs it.
-    #[cfg(test)]
-    pub(crate) fn set_frame_write_seam_for_test(&self, seam: Option<FrameWriteSeam>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_frame_write_seam_for_test(&self, seam: Option<FrameWriteSeam>) {
         *self.frame_write_seam.lock() = seam;
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_pending_drain_seam_for_test(&self, seam: PendingDrainSeam) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_pending_drain_seam_for_test(&self, seam: PendingDrainSeam) {
         *self.pending_drain_seam.lock() = Some(seam);
     }
 
@@ -4509,10 +4733,17 @@ impl IpcClient {
         Arc::clone(&self.pending)
     }
 
+    /// Exact request-pool owner for bounded lock-contention tests. This is
+    /// absent from default builds and never substitutes for release authority.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn request_pool_for_test(&self) -> Option<Arc<StdMutex<MemPool>>> {
+        self.request_pool()
+    }
+
     /// Number of live pending-response entries (test-only probe for
     /// per-call pending cleanup).
-    #[cfg(test)]
-    pub(crate) fn pending_len_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_len_for_test(&self) -> usize {
         self.pending.lock().len()
     }
 }
@@ -4727,7 +4958,7 @@ pub(crate) async fn recv_loop(
         None,
         #[cfg(test)]
         None,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         None,
     )
     .await;
@@ -4743,7 +4974,7 @@ async fn recv_loop_inner(
     connection: Option<ReceiveConnectionState>,
     #[cfg(test)] mut partial_header_pending: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)] receiver_drop_gate: Option<ReceiverDropGuardForTest>,
-    #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
+    #[cfg(any(test, feature = "test-support"))] pending_drain_seam: Option<PendingDrainSeam>,
 ) {
     #[cfg(test)]
     let _abort_join_delay = if receiver_drop_gate.is_none() {
@@ -4976,7 +5207,7 @@ async fn recv_loop_inner(
         &pending,
         &server_pool,
         connection.as_ref(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         pending_drain_seam,
     )
     .await;
@@ -4988,14 +5219,14 @@ async fn drain_pending_on_disconnect(
     pending: &StdMutex<PendingMap>,
     server_pool: &Arc<StdMutex<Option<ServerPoolState>>>,
     connection: Option<&ReceiveConnectionState>,
-    #[cfg(test)] pending_drain_seam: Option<PendingDrainSeam>,
+    #[cfg(any(test, feature = "test-support"))] pending_drain_seam: Option<PendingDrainSeam>,
 ) {
     // Publish transport termination before waking a waiter or waiting for
     // pending settlement. Keeping the receiver alive is cleanup, not liveness.
     if let Some(connection) = connection {
         connection.disconnect();
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let attempted = if let Some(seam) = pending_drain_seam {
         let _ = seam.entered.send(());
         let _ = seam.resume.await;
@@ -5004,7 +5235,7 @@ async fn drain_pending_on_disconnect(
         None
     };
     let drained = try_drain_pending(pending, server_pool, true, None);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(attempted) = attempted {
         let _ = attempted.send(drained);
     }
@@ -5749,7 +5980,60 @@ mod tests {
             still_charged.reassembly.used_bytes,
             charged.reassembly.used_bytes
         );
-        assert!(client.close_shared_bounded(Duration::from_millis(50)).await);
+        // Joining the callback holder is the release barrier for its pool
+        // read lock. This fixture starts no maintenance task, so no GC tick
+        // is needed (or available) to finish the connection's cleanup.
+        assert!(registry.pool().try_write().is_some());
+        assert!(client.maintenance.lock().is_none());
+        assert!(client.pending.lock().is_empty());
+
+        // Receiver termination and an available pool still do not make an
+        // expired caller observation a confirmed drain. Retain the exact
+        // assembly and both charges for the next observation of this close.
+        assert!(!client.close_shared_bounded(Duration::ZERO).await);
+        assert!(client.close_incomplete.load(Ordering::Acquire));
+        assert_eq!(registry.active_count(), 1);
+        let expired = budget.snapshot();
+        assert_eq!(expired.file.used_bytes, charged.file.used_bytes);
+        assert_eq!(expired.reassembly.used_bytes, charged.reassembly.used_bytes);
+
+        // Each 50 ms call observes the same retryable close transaction.
+        // Mapping destruction and scheduling can exhaust one observation
+        // even after the callback released its lock; they are not hard
+        // real-time operations. Require actual confirmation within one fixed
+        // total budget rather than promising success on the second call.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let snapshot = budget.snapshot();
+            assert!(
+                !remaining.is_zero(),
+                "close did not finish after callback release: active={}, file={}, reassembly={}",
+                registry.active_count(),
+                snapshot.file.used_bytes,
+                snapshot.reassembly.used_bytes
+            );
+            let observation_started = Instant::now();
+            if client
+                .close_shared_bounded(remaining.min(Duration::from_millis(50)))
+                .await
+            {
+                break;
+            }
+            assert!(client.close_incomplete.load(Ordering::Acquire));
+            let snapshot = budget.snapshot();
+            eprintln!(
+                "file cleanup retry incomplete: elapsed={:?}, active={}, file={}, reassembly={}",
+                observation_started.elapsed(),
+                registry.active_count(),
+                snapshot.file.used_bytes,
+                snapshot.reassembly.used_bytes
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        assert!(!client.close_incomplete.load(Ordering::Acquire));
+        assert!(client.request_pool().is_none());
         assert_eq!(registry.active_count(), 0);
         assert_eq!(budget.snapshot().file.used_bytes, 8192);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 8192);
@@ -7266,6 +7550,80 @@ mod tests {
             .expect("cached test route should bind");
         let pool = client.request_pool().expect("transport-owned request pool");
         (client, binding, pool)
+    }
+
+    #[tokio::test]
+    async fn controlled_prepare_rejection_is_pure_and_preserves_canonical_error() {
+        let (client, binding, pool) = cancellation_client("controlled_pure_prepare");
+        let expected = C2Error::new(ErrorCode::CallDeadlineExceeded, "fake deadline").with_details(
+            std::collections::BTreeMap::from([("call_id".into(), "pure-17".into())]),
+        );
+        for reject_at in [1, 2] {
+            let checks = Arc::new(AtomicU32::new(0));
+            let control =
+                IpcCallControl::new(|| panic!("no dispatch permission before preparation"))
+                    .with_before_prepare({
+                        let checks = Arc::clone(&checks);
+                        let expected = expected.clone();
+                        move || {
+                            if checks.fetch_add(1, Ordering::SeqCst) + 1 == reject_at {
+                                Err(expected.clone())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    });
+            // Empty inline preparation needs neither OS backing nor a writer.
+            let error = client
+                .call_bound_controlled_phased(&binding, "ping", &[], &control)
+                .await
+                .unwrap_err();
+            assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
+            assert!(
+                matches!(error.into_source(), IpcError::LocalCallRejected(error) if error == expected)
+            );
+            assert_eq!(checks.load(Ordering::SeqCst), reject_at);
+            assert_eq!(client.pending_len_for_test(), 0);
+            assert_eq!(pool.lock().stats().alloc_count, 0);
+            assert_eq!(pool.lock().segment_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_method_contract_and_payload_limits_precede_preparation() {
+        let (client, binding, pool) = cancellation_client("controlled_pure_limits");
+        let control = IpcCallControl::new(|| panic!("invalid request must never dispatch"))
+            .with_before_prepare(|| panic!("invalid request must never prepare"));
+        let error = client
+            .call_bound_controlled_phased(&binding, "missing", &[], &control)
+            .await
+            .unwrap_err();
+        assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
+        assert!(matches!(
+            error.into_source(),
+            IpcError::MethodNotFound { .. }
+        ));
+        let error = client
+            .call_bound_controlled_phased(&binding, "ping", &[1; 1025], &control)
+            .await
+            .unwrap_err();
+        assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
+        assert!(matches!(error.into_source(), IpcError::Config(_)));
+        let mut wrong_contract = c2_contract::ExpectedRouteContract {
+            route_name: binding.route_name().into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: binding.table.abi_hash.clone(),
+            signature_hash: binding.table.signature_hash.clone(),
+        };
+        wrong_contract.crm_ver = "0.2.0".into();
+        assert!(matches!(
+            client.bind_cached_route(&wrong_contract),
+            Err(IpcError::ContractMismatch(_))
+        ));
+        assert_eq!(client.pending_len_for_test(), 0);
+        assert_eq!(pool.lock().segment_count(), 0);
     }
 
     #[tokio::test]

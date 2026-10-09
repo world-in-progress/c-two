@@ -1,6 +1,6 @@
 # C-Two 传输内存策略用户指南
 
-本文说明 Python 0.7.0 / c3 0.3.0 的 IPC 内存策略。版本可用性、升级与验证进度见[发布说明](releases/0.7.0.md)。配置默认与校验以 Rust resolver 为唯一权威，Python 仅提供类型化覆盖门面；实现背景见[内存优化计划](plans/2026-09-26-memory-policy.md)。
+本文说明 Python 0.7.1 / c3 0.3.1 的 IPC 内存策略；该版本是尚未发布的候选，可用性与验证进度见[发布说明](releases/0.7.1.md)。配置默认与校验以 Rust resolver 为唯一权威，Python 仅提供类型化覆盖门面；实现背景见[内存优化计划](plans/2026-09-26-memory-policy.md)。
 
 ## 1. 三个有限预算单元
 
@@ -14,7 +14,7 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 
 零值语义：`0` 表示该单元拒绝一切正数预留，它不是"无限制"。全部 `u64` 范围都是合法配置。
 
-预算边界：只覆盖 C-Two 自有的 IPC 数据后备与在途组装，不约束 Python/FastDB 堆、HTTP 缓冲、接收端代开的对端映射，也不等于进程 RSS。既有的单消息限制（`max_payload_size`、`max_reassembly_bytes`、`max_total_chunks`、`max_pool_segments` 等）继续独立生效，预算不替代它们。
+预算边界：只覆盖 C-Two 自有的 IPC 数据后备与在途组装，不约束 Python/FastDB 堆、HTTP 缓冲、接收端代开的对端映射，也不等于进程 RSS。既有的单消息限制（`max_payload_size`、`max_reassembly_bytes`、`max_total_chunks`、`max_pool_segments` 等）继续独立生效，预算不替代它们。0.7.1 起另有独立的调用延续预算（`C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES`）：它只约束有限期限调用为保留请求输入而取得的准入名额与字节预留，不属于这三个 IPC 预算单元，也不约束无限调用。
 
 预算方向：服务端方向（响应池、组装池、响应预热）共享一个预算；Runtime 出站客户端域内所有缓存连接的请求池与组装池共享另一个预算。两个方向相互独立，独立的 Runtime 互不共享。创建 backing 前先原子预留预算：预留失败不会产生任何映射或文件；复用已计费段中的空闲块不二次计费；dedicated 段等待对端 `read_done`/GC 期间保持计费。
 
@@ -48,7 +48,28 @@ FastDB 载荷内容对该层不透明：C-Two 只搬运字节或共享内存指�
 
 校验约束：`pool_enabled=False` 时 `pool_prewarm_segments` 必须为 0（禁用的 buddy 池必须保持惰性），非法组合在 Rust 解析层被拒绝；`pool_min_retained_segments` 不得超过 `max_pool_segments` 与 `reassembly_max_segments`。
 
-## 5. 最小配置示例：低负载、禁用 buddy、保持惰性
+## 5. 池段容量与单消息上限相互独立（0.7.1）
+
+`pool_segment_size` 与 `max_payload_size` 是相互独立的维度，对 buddy 开启和关闭两种情况一致：一个较大的池段可以容纳多个较小的消息，池段总容量不必小于每条消息上限。0.7.0 校验中"`pool_segment_size` 不得超过 `max_payload_size`"的交叉限制已删除；保留的只有真正约束构造与线格式的检查（尺寸为正、索引可表示、段数有限、乘法不溢出），实际超过 `max_payload_size` 的请求与响应仍会被拒绝，不会因池段足够大而放行。
+
+因此以下组合在 0.7.1 直接合法：限制单条消息 32 MiB、保留默认 256 MiB 池段，并且关闭 buddy 时不创建任何 buddy 后备，dedicated SHM 仍按需可用：
+
+```python
+import c_two as cc
+
+cc.set_server(ipc_overrides={
+    'pool_enabled': False,
+    'max_payload_size': 32 * 1024 * 1024,
+})
+cc.set_client(ipc_overrides={
+    'pool_enabled': False,
+    'max_payload_size': 32 * 1024 * 1024,
+})
+```
+
+分块、组装与各预算单元的既有回退全部保持原样；本项变更不改变层级回退顺序，也不引入流式或增量资源输入。
+
+## 6. 最小配置示例：低负载、禁用 buddy、保持惰性
 
 ```python
 import c_two as cc
@@ -60,7 +81,7 @@ cc.set_client(ipc_overrides={'pool_enabled': False})
 
 键与形状核对：`pool_enabled` 是基础/服务端/客户端三级覆盖目录都接受的布尔键。`pool_prewarm_segments` 与 `pool_min_retained_segments` 默认已是 0，无需写出，也绝不能在禁用 buddy 时设置预热。需要进一步收缩时才追加 `pool_segment_size`、`max_pool_segments` 等键。服务端与客户端是两个独立预算域，两侧都要设置。
 
-## 6. 显式有限预算示例：三个规范字段
+## 7. 显式有限预算示例：三个规范字段
 
 ```python
 import c_two as cc
@@ -94,7 +115,7 @@ c3 relay --bind 127.0.0.1:8080 \
 
 此范围只包含 relay 自有的数据面 IPC 后备与组装。注册证明和控制 watch 使用独立的惰性默认上下文，对端映射和 HTTP 缓冲不计入该预算。HTTP 响应目前仍会全量物化后分片发送；小的发送分片不等于小的响应内存占用。后续治理边界见 [HTTP 预算设计提案](plans/2026-10-06-http-memory-budget.md)，该提案尚未实施。
 
-## 7. 只读统计：`cc.memory_stats()` 与 `cc.hold_stats()`
+## 8. 只读统计：`cc.memory_stats()` 与 `cc.hold_stats()`
 
 `cc.memory_stats()` 返回只读、按方向标注的快照：`runtime_outgoing`（本 Runtime 出站客户端域，首次连接尝试时冻结；观察它不会触发冻结或连接）、`server`（本进程服务端方向，无主机时为 `None`）、`retired`（先前会话关闭时仍有持有者的域，`state="retired"`）、`holds`（与 `cc.hold_stats()` 同源的保留租约计数）与 `budget_cells_note`。每个域含 `role`、`state`、`limits`（三个已解析上限）与 `cells`（`shm`/`file`/`reassembly`），每格为 `limit_bytes`、`used_bytes`、`peak_bytes`、`rejected_allocations`、`rejected_bytes`，峰值跨释放保留高水位。
 
@@ -102,17 +123,17 @@ c3 relay --bind 127.0.0.1:8080 \
 
 读数纪律：三个单元是独立的计费口径，分别描述后备与组装/保留容量，不要把任何单元格求和当成物理内存占用，也不要把它们当成零拷贝证明——适配层仍可能有拷贝路径。retired 域的呈现方式属于实现中的行为，本文不对其细节作稳定性承诺。
 
-## 8. held 生命周期与 FastDB 边界
+## 9. held 生命周期与 FastDB 边界
 
 `cc.hold(proxy.method)(args)` 返回 `HeldResult`，提供 `.value`、`.unsafe_buffer` 与 `.release()`；安全层为显式 `release()`、`with` 上下文与 `__del__` 兜底。`release()` 的顺序固定：先执行 FastDB 检查视图失效回调，再释放传输租约。对便携方法，`held.value` 是 FastDB `Payload` 持有者，释放持有会使该持有者与其检查视图失效。需要在租约范围之外长期保存的数据，必须先通过 FastDB 官方 API 物化；`unsafe_buffer` 是显式不安全逃生口，无法机械失效用户自行导出的裸指针或 NumPy 别名。
 
 关闭后的持有生命周期：`cc.shutdown()` 不强制释放仍被持有的数据，也不清零计账。其预算计费与保留租约转入 retired 域，继续出现在 `cc.memory_stats()['retired']`，只要旧代理、在途调用或 held 仍持有计数所有者，记录就继续可观察；计费归零与记录删除是两个时刻。最后一个真实所有者消失后，弱观察记录才移除，统计自身不会挽留池、连接、Runtime、回调或 payload。
 
-## 9. 本文不承诺的事项
+## 10. 本文不承诺的事项
 
 本文不声称分块路径提供流式或增量资源输入；不给出任何性能百分比；Windows 验证限于最终报告列出的 Server 2022/2025 门禁；不是发布或发布公告；不引入也不承诺兼容 shim。配置与行为以对应版本的 Rust resolver 为准；源码证据见下文。
 
-## 10. 证据指针
+## 11. 证据指针
 
 - `core/foundation/c2-config/src/memory.rs` — 三字段、有限默认与零值语义；`core/foundation/c2-config/src/ipc.rs` — 已解析默认值、覆盖键目录、`FORBIDDEN_IPC_OVERRIDE_KEYS` 与校验规则。
 - `core/foundation/c2-mem/src/budget.rs`、`pool.rs`、`pressure.rs`、`dedicated.rs`、`buddy_segment.rs`、`spill.rs` — 预留原语、层级回退、压力启发式与后备级 guard。
@@ -123,4 +144,5 @@ c3 relay --bind 127.0.0.1:8080 \
 - `sdk/python/src/c_two/crm/transferable.py` — `HeldResult` 释放顺序；`.env.example` — `C2_IPC_POOL_ENABLED`/`PREWARM`/`MIN_RETAINED` 键。
 - `docs/reports/memory-budget-contract.md` 与 `docs/plans/2026-09-26-memory-policy.md` — 目标契约与计划背景。
 - [内存阶段验收](reports/memory-native-final-validation.md) — 该阶段固定源码与开发产物证据，保留其历史状态。
-- [当前统一验收](reports/canonical-local-endpoint-validation.md) — 后续唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希；不证明 0.7 正式包发布矩阵。
+- [0.7.0 统一验收](reports/canonical-local-endpoint-validation.md) — 0.7.0 时期唯一端点的确切源码、Windows/Linux 门禁与开发产物哈希；是历史记录，不作为 0.7.1 证据。
+- [0.7.1 发布说明](releases/0.7.1.md) — 本版本候选的当前状态与已记录的阶段验证边界。

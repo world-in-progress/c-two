@@ -13,6 +13,7 @@ fn relay_help_exposes_mesh_and_idle_options() {
         .stdout(predicate::str::contains("--relay-id"))
         .stdout(predicate::str::contains("--advertise-url"))
         .stdout(predicate::str::contains("--upstream"))
+        .stdout(predicate::str::contains("--ipc-root"))
         .stdout(predicate::str::contains("--ipc-pool-enabled"))
         .stdout(predicate::str::contains("--ipc-shm-backing-budget-bytes"))
         .stdout(predicate::str::contains("--ipc-file-backing-budget-bytes"))
@@ -346,4 +347,113 @@ fn relay_ipc_rejects_malformed_cli_values() {
             .failure()
             .stderr(predicate::str::contains("unexpected argument").not());
     }
+}
+
+#[test]
+fn relay_default_context_matches_platform_authority() {
+    let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+    isolated_relay_command()
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "local_namespace={}",
+            context.namespace_id()
+        )));
+    #[cfg(windows)]
+    assert_eq!(
+        context.platform_kind(),
+        c2_config::LocalEndpointNamespace::WindowsNamedPipe
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn relay_root_cli_overrides_env_and_env_overrides_dotenv() {
+    let alpha = tempfile::Builder::new()
+        .prefix("c3r-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let beta = tempfile::Builder::new()
+        .prefix("c3r-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let env_file = alpha.path().join("relay.env");
+    std::fs::write(
+        &env_file,
+        format!("C2_IPC_ROOT={}\n", alpha.path().display()),
+    )
+    .unwrap();
+    let alpha_id = c2_config::LocalEndpointContext::with_unix_root(alpha.path()).unwrap();
+    let beta_id = c2_config::LocalEndpointContext::with_unix_root(beta.path()).unwrap();
+    isolated_relay_command()
+        .env("C2_ENV_FILE", &env_file)
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "local_namespace={}",
+            alpha_id.namespace_id()
+        )));
+    isolated_relay_command()
+        .env("C2_ENV_FILE", &env_file)
+        .env("C2_IPC_ROOT", beta.path())
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "local_namespace={}",
+            beta_id.namespace_id()
+        )));
+    isolated_relay_command()
+        .env("C2_ENV_FILE", &env_file)
+        .env("C2_IPC_ROOT", beta.path())
+        .args(["relay", "--ipc-root"])
+        .arg(alpha.path())
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "local_namespace={}",
+            alpha_id.namespace_id()
+        )));
+}
+
+#[cfg(unix)]
+#[test]
+fn relay_invalid_root_is_rejected_before_listening_and_dry_run_creates_nothing() {
+    isolated_relay_command()
+        .args(["relay", "--ipc-root", "relative", "--bind", "invalid-bind"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("local endpoint root option"))
+        .stderr(predicate::str::contains("failed to start relay").not());
+    let root = tempfile::Builder::new()
+        .prefix("c3r-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let missing = root.path().join("missing");
+    isolated_relay_command()
+        .args(["relay", "--ipc-root"])
+        .arg(&missing)
+        .arg("--dry-run")
+        .assert()
+        .success();
+    assert!(!missing.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn relay_windows_root_override_is_not_applicable() {
+    isolated_relay_command()
+        .args(["relay", "--ipc-root", r"C:\c2-root", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not applicable"));
+    isolated_relay_command()
+        .env("C2_IPC_ROOT", r"C:\c2-root")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not applicable"));
 }

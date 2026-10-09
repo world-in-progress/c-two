@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use c2_config::RelayConfig;
+#[cfg(test)]
+use c2_config::{ConfigResolver, ConfigSources, LocalEndpointOptions};
+use c2_config::{LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
@@ -24,12 +26,32 @@ use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
 use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey};
 
+#[derive(Default)]
+struct UpstreamControls {
+    closed: bool,
+    tasks: HashMap<UpstreamOwnerKey, UpstreamControlTask>,
+}
+
+#[cfg(test)]
+type TestPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 pub struct RelayState {
     route_table: RwLock<RouteTable>,
     conn_pool: ConnectionPool,
-    upstream_controls: RwLock<HashMap<UpstreamOwnerKey, UpstreamControlTask>>,
+    upstream_controls: RwLock<UpstreamControls>,
+    #[cfg(test)]
+    registration_watch_seam: parking_lot::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    controls_stop_seam: parking_lot::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    acquire_recheck_seam: parking_lot::Mutex<Option<TestPause>>,
     upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
+    endpoint_context: LocalEndpointContext,
+    default_endpoint_namespace: bool,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     /// One shared memory context for every data-plane upstream `IpcClient`
     /// this relay owns. Each connection's request and reassembly pools charge
@@ -41,9 +63,11 @@ pub struct RelayState {
     /// Config scope: `config.upstream_ipc` is the complete resolved policy
     /// frozen at startup. First connections and reconnects clone that policy
     /// and this same budget; acquisition never reloads the environment.
-    /// Control-plane attestation/watch clients use private lazy default
-    /// contexts and do not charge this data-plane budget.
+    /// Control-plane attestation/watch clients use private lazy memory
+    /// contexts with the same frozen endpoint namespace and do not charge this data-plane budget.
     upstream_memory_budget: c2_mem::MemoryBudget,
+    pub(crate) forwarding: crate::relay::forwarding::ForwardingDomain,
+    pub(crate) clients: Arc<crate::relay::client_lifecycle::ClientLifecycle>,
 }
 
 fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
@@ -127,21 +151,63 @@ async fn verify_route_after_watch_unavailable(
 }
 
 impl RelayState {
+    #[cfg(test)]
     pub fn new(
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     ) -> Self {
+        let context = ConfigResolver::resolve_local_endpoint(
+            LocalEndpointOptions::default(),
+            ConfigSources::from_process(),
+        )
+        .expect("invalid relay local endpoint configuration");
+        Self::new_with_context(config, disseminator, context)
+    }
+
+    /// Test constructor with explicit default execution limits.
+    #[cfg(test)]
+    pub fn new_with_context(
+        config: Arc<RelayConfig>,
+        disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+        endpoint_context: LocalEndpointContext,
+    ) -> Self {
+        Self::new_with_execution_limits(
+            config,
+            disseminator,
+            endpoint_context,
+            c2_config::CallExecutionLimits::default(),
+        )
+    }
+
+    pub(crate) fn new_with_execution_limits(
+        config: Arc<RelayConfig>,
+        disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+        endpoint_context: LocalEndpointContext,
+        limits: c2_config::CallExecutionLimits,
+    ) -> Self {
+        let default_endpoint_namespace = LocalEndpointContext::default_for_platform()
+            .is_ok_and(|default| default == endpoint_context);
         let owner_lease_duration = owner_lease_duration(&config);
         let upstream_memory_budget =
             c2_mem::MemoryBudget::from_limits(&config.upstream_ipc.memory_budget_limits());
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
-            upstream_controls: RwLock::new(HashMap::new()),
+            upstream_controls: RwLock::new(UpstreamControls::default()),
+            #[cfg(test)]
+            registration_watch_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            controls_stop_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            acquire_recheck_seam: parking_lot::Mutex::new(None),
             upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
+            endpoint_context,
+            default_endpoint_namespace,
             upstream_memory_budget,
+            forwarding: crate::relay::forwarding::ForwardingDomain::new(&limits),
+            clients: crate::relay::client_lifecycle::ClientLifecycle::new(),
         }
     }
 
@@ -161,6 +227,14 @@ impl RelayState {
     pub fn config(&self) -> &RelayConfig {
         &self.config
     }
+    pub fn endpoint_context(&self) -> &LocalEndpointContext {
+        &self.endpoint_context
+    }
+
+    pub(crate) fn is_default_endpoint_namespace(&self) -> bool {
+        self.default_endpoint_namespace
+    }
+
     pub fn relay_id(&self) -> &str {
         &self.config.relay_id
     }
@@ -333,9 +407,11 @@ impl RelayState {
         let expected_for_connect = expected.clone();
         // Every data-plane connection (including reconnects) uses the frozen
         // resolved policy and the relay's one shared upstream memory context.
-        // `with_shared_budget` validates the pair before connection I/O.
+        // `with_endpoint_and_shared_budget` validates the pair before connection I/O.
         let upstream_ipc = self.config.upstream_ipc.clone();
         let upstream_memory_budget = self.upstream_memory_budget.clone();
+        let endpoint_context = self.endpoint_context.clone();
+        let clients = self.clients.clone();
 
         let lease = match self
             .conn_pool
@@ -344,6 +420,8 @@ impl RelayState {
                 let route_name = route_name.clone();
                 let upstream_ipc = upstream_ipc.clone();
                 let upstream_memory_budget = upstream_memory_budget.clone();
+                let endpoint_context = endpoint_context.clone();
+                let clients = clients.clone();
                 async move {
                     if expected.ipc_address.as_deref() != Some(endpoint.address()) {
                         return Err(c2_ipc::IpcError::Protocol(format!(
@@ -363,11 +441,12 @@ impl RelayState {
                             expected.ipc_address
                         )));
                     }
-                    let mut client = IpcClient::with_shared_budget(
-                        endpoint.address(),
+                    let endpoint = endpoint_context.endpoint(endpoint.address()).map_err(c2_ipc::IpcError::Io)?;
+                    let mut client = clients.manage(|| IpcClient::with_endpoint_and_shared_budget(
+                        endpoint,
                         upstream_ipc,
                         upstream_memory_budget,
-                    );
+                    ))?;
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -375,7 +454,7 @@ impl RelayState {
                         let got_server_id = client.server_id().unwrap_or("").to_string();
                         let got_server_instance_id =
                             client.server_instance_id().unwrap_or("").to_string();
-                        client.close().await;
+                        drop(client);
                         return Err(c2_ipc::IpcError::IdentityMismatch {
                             expected_server_id: expected.server_id.clone().unwrap_or_default(),
                             expected_server_instance_id: expected
@@ -388,10 +467,10 @@ impl RelayState {
                     }
                     let expected_contract = expected_contract_for_route(&expected);
                     if let Err(err) = client.acquire_route(&expected_contract).await {
-                        client.close().await;
+                        drop(client);
                         return Err(err);
                     }
-                    Ok(Arc::new(client))
+                    Ok(client.into_shared())
                 }
             })
             .await
@@ -424,7 +503,7 @@ impl RelayState {
                 Ok(()) => {}
                 Err(error) if should_treat_as_semantic_route_failure(&error) => {
                     if let Some(old_client) = lease.evict_current_client() {
-                        old_client.close_shared().await;
+                        self.close_failed_acquire_client(&old_client).await;
                     }
                     drop(lease);
                     return Err(UpstreamAcquireError::Unreachable {
@@ -435,7 +514,7 @@ impl RelayState {
                 }
                 Err(error) => {
                     if let Some(old_client) = lease.evict_current_client() {
-                        old_client.close_shared().await;
+                        self.close_failed_acquire_client(&old_client).await;
                     }
                     drop(lease);
                     return Err(UpstreamAcquireError::WatchUnavailable {
@@ -457,7 +536,7 @@ impl RelayState {
             Ok(binding) => binding,
             Err(error) => {
                 if let Some(old_client) = lease.evict_current_client() {
-                    old_client.close_shared().await;
+                    self.close_failed_acquire_client(&old_client).await;
                 }
                 drop(lease);
                 return match error {
@@ -473,6 +552,8 @@ impl RelayState {
             }
         };
 
+        #[cfg(test)]
+        Self::pause_for_test(&self.acquire_recheck_seam).await;
         let lease_endpoint = lease.endpoint();
         let route_matches_lease =
             self.renew_owner_lease_if_current_route(expected, &lease_endpoint);
@@ -482,10 +563,20 @@ impl RelayState {
         } else {
             let client = lease.client();
             drop(lease);
-            client.close_shared().await;
+            self.close_failed_acquire_client(&client).await;
             Err(UpstreamAcquireError::Stale {
                 route: expected.clone(),
             })
+        }
+    }
+
+    // Mark the exact registered owner before awaiting native disconnect initiation.
+    // A false confirmation leaves that owner with the bounded lifecycle observer.
+    async fn close_failed_acquire_client(&self, client: &Arc<IpcClient>) {
+        self.clients.close(client);
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        if !confirmed {
+            tracing::debug!("relay acquire cleanup remains owned by lifecycle observer");
         }
     }
 
@@ -590,24 +681,81 @@ impl RelayState {
         }
     }
 
+    pub(crate) async fn stop_upstream_controls(&self) {
+        let tasks = {
+            let mut controls = self.upstream_controls.write();
+            controls.closed = true;
+            std::mem::take(&mut controls.tasks)
+        };
+        #[cfg(test)]
+        Self::pause_for_test(&self.controls_stop_seam).await;
+        for task in tasks.into_values() {
+            task.abort_and_wait().await;
+        }
+    }
+
     pub(crate) fn start_upstream_control(self: &Arc<Self>, entry: &RouteEntry) {
         let Some(key) = upstream_control::owner_key_for_route(entry) else {
             return;
         };
-        {
-            let controls = self.upstream_controls.read();
-            if controls.contains_key(&key) {
-                return;
-            }
-        }
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let task = upstream_control::spawn(Arc::clone(self), key.clone());
-        let old_task = self.upstream_controls.write().insert(key, task);
-        if let Some(old_task) = old_task {
-            old_task.abort();
+        // Spawn and publication share stop's fence. No task can reserve a
+        // native client after the stop snapshot without its join being observed.
+        let mut controls = self.upstream_controls.write();
+        if controls.closed || controls.tasks.contains_key(&key) {
+            return;
         }
+        let task = upstream_control::spawn(Arc::clone(self), key.clone());
+        controls.tasks.insert(key, task);
+    }
+
+    #[cfg(test)]
+    async fn pause_for_test(seam: &parking_lot::Mutex<Option<TestPause>>) {
+        let pause = seam.lock().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(10), resume).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_registration_watch_seam_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.registration_watch_seam.lock() = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn before_registration_watch_for_test(&self) {
+        Self::pause_for_test(&self.registration_watch_seam).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_controls_stop_seam_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.controls_stop_seam.lock() = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controls_snapshot_for_test(&self) -> (bool, usize) {
+        let controls = self.upstream_controls.read();
+        (controls.closed, controls.tasks.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_acquire_recheck_seam_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.acquire_recheck_seam.lock() = Some((entered, resume));
     }
 
     pub(crate) fn mark_upstream_control_watch_unavailable(
@@ -648,10 +796,11 @@ impl RelayState {
     ) {
         let mut controls = self.upstream_controls.write();
         if controls
+            .tasks
             .get(key)
             .is_some_and(|task| task.token_matches(token))
         {
-            controls.remove(key);
+            controls.tasks.remove(key);
             drop(controls);
             self.clear_upstream_control_watch_unavailable(key);
         }
@@ -664,7 +813,7 @@ impl RelayState {
         if !self.local_routes_for_owner(&key).is_empty() {
             return;
         }
-        if let Some(task) = self.upstream_controls.write().remove(&key) {
+        if let Some(task) = self.upstream_controls.write().tasks.remove(&key) {
             task.abort();
         }
         self.clear_upstream_control_watch_unavailable(&key);
@@ -719,6 +868,7 @@ impl RelayState {
             .local_route(name)
             .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
         {
+            self.clients.adopt_for_test(&client);
             self.conn_pool.reconnect(&key, client);
         }
     }

@@ -7,44 +7,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
-fn prepare_native_namespace() {
-    static PREPARED: std::sync::Once = std::sync::Once::new();
-    PREPARED.call_once(|| {
-        let address = unique_address("namespace-setup");
-        let mut overrides = c2_config::ServerIpcConfigOverrides::default();
-        let runtime = c2_core::Runtime::new(c2_core::RuntimeOptions {
-            server_id: Some(address.strip_prefix("ipc://").unwrap().to_owned()),
-            server_ipc_overrides: Some(overrides),
-            use_process_relay_anchor: false,
-            ..Default::default()
-        })
-        .unwrap();
-        let host = runtime
-            .host(c2_core::HostOptions::default().without_relay())
-            .unwrap();
-        let outcome = host.shutdown();
-        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
-    });
-}
-
-#[cfg(unix)]
-fn inspect_when_gate_available(mut command: Command) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        let output = command.output().unwrap();
-        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        if report["status"] != "io-error" {
-            assert!(output.status.success(), "{report:?}");
-            return report;
-        }
-        assert_eq!(output.status.code(), Some(1));
-        assert_eq!(report["reason"], std::io::ErrorKind::WouldBlock.to_string());
-        assert!(
-            std::time::Instant::now() < deadline,
-            "namespace gate stayed busy: {report:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+fn inspect_report(mut command: Command) -> serde_json::Value {
+    let output = command.output().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success(), "{report:?}");
+    report
 }
 
 fn unique_address(label: &str) -> String {
@@ -64,9 +31,8 @@ struct TestSocket {
 
 #[cfg(unix)]
 impl TestSocket {
-    fn bind(address: &str) -> Self {
-        prepare_native_namespace();
-        let endpoint = c2_core::LocalEndpoint::from_address(address).unwrap();
+    fn bind(namespace: &TestNamespace, address: &str) -> Self {
+        let endpoint = namespace.context.endpoint(address).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(endpoint.os_name()).unwrap();
         Self {
             endpoint,
@@ -90,7 +56,325 @@ impl Drop for TestSocket {
 fn c3() -> Command {
     let mut command = Command::cargo_bin("c3").unwrap();
     command.env("C2_ENV_FILE", "");
+    command.env_remove("C2_IPC_ROOT");
     command
+}
+
+#[cfg(unix)]
+fn short_root() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("c3r-")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn missing_short_root() -> PathBuf {
+    let root = short_root();
+    let missing = root.path().to_owned();
+    root.close().unwrap();
+    missing
+}
+
+#[cfg(unix)]
+#[test]
+fn short_fixture_roots_fit_native_endpoint_capacity() {
+    let ready = short_root();
+    let missing = missing_short_root();
+    for root in [ready.path(), missing.as_path()] {
+        let context = c2_config::LocalEndpointContext::with_unix_root(root).unwrap();
+        context.endpoint(&unique_address("capacity")).unwrap();
+        context.endpoint("ipc://c3-endpoint-sweep").unwrap();
+    }
+    assert!(!missing.exists(), "pure derivation must not create a root");
+}
+
+/// One verified namespace per real Unix fixture: sibling targets share this
+/// domain, while parallel tests never contend on the default coordinator.
+#[cfg(unix)]
+struct TestNamespace {
+    root: tempfile::TempDir,
+    context: c2_config::LocalEndpointContext,
+}
+
+#[cfg(unix)]
+impl TestNamespace {
+    fn new() -> Self {
+        let root = short_root();
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        let host = host_at(&unique_address("namespace-setup"), root.path());
+        let outcome = host.shutdown();
+        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+        Self { root, context }
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = c3();
+        command.args(args).arg("--ipc-root").arg(self.root.path());
+        command
+    }
+}
+
+#[cfg(unix)]
+fn host_at(address: &str, root: &std::path::Path) -> c2_core::Host {
+    let runtime = c2_core::Runtime::new(c2_core::RuntimeOptions {
+        server_id: Some(address.strip_prefix("ipc://").unwrap().to_owned()),
+        use_process_relay_anchor: false,
+        ..Default::default()
+    })
+    .unwrap();
+    runtime
+        .set_local_endpoint(c2_config::LocalEndpointOptions {
+            unix_root: Some(root.to_owned()),
+        })
+        .unwrap();
+    runtime
+        .host(c2_core::HostOptions::default().without_relay())
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn credential_at(address: &str, root: &std::path::Path) -> serde_json::Value {
+    let mut command = c3();
+    command
+        .args(["endpoint", "inspect", address])
+        .arg("--ipc-root")
+        .arg(root);
+    inspect_report(command)["credential"].clone()
+}
+
+#[test]
+fn endpoint_help_exposes_root_on_each_command() {
+    for command in ["inspect", "reap", "sweep"] {
+        c3().args(["endpoint", command, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--ipc-root"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspect_root_precedence_and_sweep_use_the_selected_domain() {
+    let alpha = short_root();
+    let beta = short_root();
+    let address = unique_address("domains");
+    let host = host_at(&address, alpha.path());
+    let beta_host = host_at(&unique_address("beta-setup"), beta.path());
+    assert!(beta_host.shutdown().runtime_barrier_error.is_none());
+    let env_file = beta.path().join("endpoint.env");
+    std::fs::write(
+        &env_file,
+        format!("C2_IPC_ROOT={}\n", beta.path().display()),
+    )
+    .unwrap();
+    let mut from_file = c3();
+    from_file
+        .env("C2_ENV_FILE", &env_file)
+        .args(["endpoint", "inspect", &address]);
+    assert_eq!(inspect_report(from_file)["status"], "absent");
+    let mut from_env = c3();
+    from_env
+        .env("C2_ENV_FILE", &env_file)
+        .env("C2_IPC_ROOT", alpha.path())
+        .args(["endpoint", "inspect", &address]);
+    assert_eq!(
+        inspect_report(from_env)["credential"]["unixRoot"],
+        alpha.path().to_str().unwrap()
+    );
+    let mut from_cli = c3();
+    from_cli
+        .env("C2_ENV_FILE", &env_file)
+        .env("C2_IPC_ROOT", beta.path())
+        .args(["endpoint", "inspect", &address, "--ipc-root"])
+        .arg(alpha.path());
+    assert_eq!(inspect_report(from_cli)["status"], "present");
+    for (root, examined, busy) in [(alpha.path(), 1, 1), (beta.path(), 0, 0)] {
+        let output = c3()
+            .env("C2_IPC_ROOT", beta.path())
+            .args(["endpoint", "sweep", "--ipc-root"])
+            .arg(root)
+            .args([
+                "--address",
+                &address,
+                "--max-entries",
+                "4096",
+                "--max-ms",
+                "1000",
+            ])
+            .assert()
+            .success();
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.get_output().stdout).unwrap();
+        assert_eq!(report["sweep"]["endpointsExamined"], examined);
+        assert_eq!(report["sweep"]["busy"], busy);
+    }
+    assert!(host.shutdown().runtime_barrier_error.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn reap_captured_context_ignores_env_and_rejects_explicit_other_root() {
+    let root = short_root();
+    let address = unique_address("captured");
+    let host = host_at(&address, root.path());
+    let credential = credential_at(&address, root.path());
+    assert_eq!(credential["schemaVersion"], 3);
+    let file = root.path().join("credential.json");
+    std::fs::write(&file, credential.to_string()).unwrap();
+    let missing_root = root.path().join("missing");
+    c3().env("C2_IPC_ROOT", "relative-invalid-env")
+        .args(["endpoint", "reap", &address, "--credential"])
+        .arg(&file)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("coordinator-held"));
+    c3().env("C2_IPC_ROOT", root.path())
+        .args(["endpoint", "reap", &address, "--credential"])
+        .arg(&file)
+        .arg("--ipc-root")
+        .arg(&missing_root)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("credential-context-mismatch"));
+    assert!(
+        !missing_root.exists(),
+        "reject must not create the mismatched root"
+    );
+    assert!(host.shutdown().runtime_barrier_error.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn historical_schema2_reap_is_not_reinterpreted_by_env() {
+    let address = unique_address("historic");
+    let dir = short_root();
+    let file = dir.path().join("credential.json");
+    let document = serde_json::json!({"schemaVersion":2,"address":address,"protocol":"managed-v2","platform":"unix","incarnation":"00112233445566778899aabbccddeeff","device":1,"inode":2,"changedSecs":3,"changedNanos":4});
+    let credential = c2_core::EndpointCredential::from_json(&document.to_string()).unwrap();
+    assert_eq!(
+        credential.endpoint().context(),
+        &c2_config::LocalEndpointContext::default_for_platform().unwrap(),
+        "schema 2 captures the historical /tmp domain"
+    );
+    std::fs::write(&file, document.to_string()).unwrap();
+    c3().env("C2_IPC_ROOT", "relative-invalid-env")
+        .args(["endpoint", "reap", &address, "--credential"])
+        .arg(&file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already-absent"));
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_custom_root_is_never_created_by_inspection_or_sweep() {
+    let missing = missing_short_root();
+    c3().args([
+        "endpoint",
+        "inspect",
+        &unique_address("missing"),
+        "--ipc-root",
+    ])
+    .arg(&missing)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("absent"));
+    c3().args(["endpoint", "sweep", "--ipc-root"])
+        .arg(&missing)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot open"));
+    assert!(!missing.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn root_maintenance_keeps_uid_scope_and_rejects_replaced_gate_nonce() {
+    let root = short_root();
+    let address = unique_address("nonce");
+    let host = host_at(&address, root.path());
+    let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+    let endpoint = context.endpoint(&address).unwrap();
+    let namespace = std::path::Path::new(endpoint.os_name()).parent().unwrap();
+    let document = credential_at(&address, root.path());
+    let file = root.path().join("credential.json");
+    std::fs::write(&file, document.to_string()).unwrap();
+    assert!(host.shutdown().runtime_barrier_error.is_none());
+
+    // A different uid's directory is an unrelated namespace, even under the
+    // same configured root. Native derivation must never scan it.
+    let other_uid = context.unix_uid().unwrap().wrapping_add(1);
+    let other_namespace = root.path().join(format!("c2-{other_uid:x}")).join("v2.2");
+    std::fs::create_dir_all(&other_namespace).unwrap();
+    let sentinel = other_namespace.join("do-not-adopt");
+    std::fs::write(&sentinel, b"unrelated uid namespace").unwrap();
+    c3().args(["endpoint", "sweep", "--ipc-root"])
+        .arg(root.path())
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"unrelated uid namespace"
+    );
+
+    let gate = namespace.join(".gate");
+    let marker = namespace.join(".gate.marker");
+    let before_marker = std::fs::read(&marker).unwrap();
+    let mut replaced_gate = std::fs::read(&gate).unwrap();
+    assert_eq!(replaced_gate.len(), 25, "format-2 gate has a nonce");
+    replaced_gate[9] ^= 1;
+    std::fs::write(&gate, &replaced_gate).unwrap();
+    c3().args(["endpoint", "inspect", &address, "--ipc-root"])
+        .arg(root.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("coordinator-replaced"));
+    c3().args(["endpoint", "reap", &address, "--credential"])
+        .arg(&file)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("coordinator-replaced"));
+    let report = c3()
+        .args(["endpoint", "sweep", "--ipc-root"])
+        .arg(root.path())
+        .assert()
+        .success();
+    let report: serde_json::Value = serde_json::from_slice(&report.get_output().stdout).unwrap();
+    assert_eq!(report["sweep"]["reaped"], 0);
+    assert_eq!(std::fs::read(&gate).unwrap(), replaced_gate);
+    assert_eq!(std::fs::read(&marker).unwrap(), before_marker);
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"unrelated uid namespace"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_root_override_is_explicitly_not_applicable() {
+    for command in ["inspect", "sweep"] {
+        let mut cmd = c3();
+        cmd.args(["endpoint", command]);
+        if command == "inspect" {
+            cmd.arg(unique_address("windows-root"));
+        }
+        cmd.args(["--ipc-root", r"C:\c2-root"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("not applicable"));
+    }
+    let address = unique_address("windows-reap-root");
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("credential.json");
+    let document = serde_json::json!({"schemaVersion":1,"address":address,"protocol":"named-pipe","platform":"windows"});
+    std::fs::write(&file, document.to_string()).unwrap();
+    c3().args(["endpoint", "reap", &address, "--credential"])
+        .arg(&file)
+        .args(["--ipc-root", r"C:\c2-root"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not applicable"));
 }
 
 /// A credential file whose document is rejected by the strict codec: a v2
@@ -119,10 +403,13 @@ fn help_exposes_the_three_bounded_subcommands() {
 #[test]
 fn inspect_reports_absent_without_inventing_an_endpoint() {
     let address = unique_address("absent");
-    let assert = c3()
-        .args(["endpoint", "inspect", &address])
-        .assert()
-        .success();
+    let mut command = c3();
+    command.args(["endpoint", "inspect", &address]);
+    #[cfg(unix)]
+    let namespace = TestNamespace::new();
+    #[cfg(unix)]
+    command.arg("--ipc-root").arg(namespace.root.path());
+    let assert = command.assert().success();
     #[cfg(unix)]
     assert.stdout(predicate::str::contains(r#""status":"absent""#));
     #[cfg(windows)]
@@ -216,23 +503,24 @@ fn reap_rejects_an_oversized_credential_file() {
 #[test]
 fn sweep_reports_an_honest_status_field() {
     #[cfg(unix)]
-    prepare_native_namespace();
+    let namespace = TestNamespace::new();
     let address = unique_address("sweep");
-    let assert = c3()
-        .args([
-            "endpoint",
-            "sweep",
-            "--address",
-            &address,
-            "--max-entries",
-            "4096",
-            "--max-ms",
-            "1000",
-            "--max-batches",
-            "4096",
-        ])
-        .assert()
-        .success();
+    let mut command = c3();
+    command.args([
+        "endpoint",
+        "sweep",
+        "--address",
+        &address,
+        "--max-entries",
+        "4096",
+        "--max-ms",
+        "1000",
+        "--max-batches",
+        "4096",
+    ]);
+    #[cfg(unix)]
+    command.arg("--ipc-root").arg(namespace.root.path());
+    let assert = command.assert().success();
     let report: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
     assert_eq!(report["status"], "complete");
     assert_eq!(report["sweep"]["roundComplete"], true);
@@ -245,10 +533,10 @@ fn sweep_reports_an_honest_status_field() {
     {
         let selected = unique_address("sweep-incomplete");
         let other = unique_address("sweep-extra-entry");
-        let selected_socket = TestSocket::bind(&selected);
-        let other_socket = TestSocket::bind(&other);
-        let limited = c3()
-            .args([
+        let selected_socket = TestSocket::bind(&namespace, &selected);
+        let other_socket = TestSocket::bind(&namespace, &other);
+        let limited = namespace
+            .command(&[
                 "endpoint",
                 "sweep",
                 "--address",
@@ -323,40 +611,15 @@ fn reap_rejects_a_non_utf8_credential_file() {
 fn reap_uses_the_native_credential_endpoint() {
     #[cfg(unix)]
     {
-        use c2_config::ServerIpcConfigOverrides;
-        use c2_core::{
-            EndpointInspection, HostOptions, Runtime, RuntimeOptions, inspect_endpoint,
-            ping_direct_ipc,
-        };
+        use c2_core::{EndpointInspection, inspect_endpoint, ping_direct_ipc_with_context};
+        let root = short_root();
         let address = unique_address("derive");
-        let mut overrides = ServerIpcConfigOverrides::default();
-        let runtime = Runtime::new(RuntimeOptions {
-            server_id: Some(address.strip_prefix("ipc://").unwrap().to_string()),
-            server_ipc_overrides: Some(overrides),
-            use_process_relay_anchor: false,
-            ..RuntimeOptions::default()
-        })
-        .unwrap();
-        // host() waits for native readiness; no global gate is held by this test.
-        let host = runtime
-            .host(HostOptions::default().without_relay())
-            .unwrap();
-        let endpoint = c2_core::LocalEndpoint::from_address(&address).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let credential = loop {
-            match inspect_endpoint(&endpoint) {
-                EndpointInspection::Present(credential) => break credential,
-                EndpointInspection::IoError(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "namespace gate stayed busy"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                other => panic!("ready listener credential observation failed: {other:?}"),
-            }
+        let host = host_at(&address, root.path());
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        let endpoint = context.endpoint(&address).unwrap();
+        let credential = match inspect_endpoint(&endpoint) {
+            EndpointInspection::Present(credential) => credential,
+            other => panic!("ready listener credential observation failed: {other:?}"),
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("managed.json");
@@ -369,7 +632,10 @@ fn reap_uses_the_native_credential_endpoint() {
             .code(1)
             .stdout(predicate::str::contains(r#""status":"busy""#))
             .stdout(predicate::str::contains(r#""reason":"coordinator-held""#));
-        assert!(ping_direct_ipc(&address, std::time::Duration::from_secs(1)).unwrap());
+        assert!(
+            ping_direct_ipc_with_context(&address, &context, std::time::Duration::from_secs(1))
+                .unwrap()
+        );
         let shutdown = host.shutdown();
         assert!(shutdown.runtime_barrier_error.is_none(), "{shutdown:?}");
     }
@@ -442,25 +708,30 @@ fn sweep_accepts_repeated_logical_targets_without_touching_unselected_entries() 
     let selected = unique_address("selected");
     let other = unique_address("unselected");
     #[cfg(unix)]
-    let selected_socket = TestSocket::bind(&selected);
+    let namespace = TestNamespace::new();
     #[cfg(unix)]
-    let unselected_socket = TestSocket::bind(&other);
+    let selected_socket = TestSocket::bind(&namespace, &selected);
+    #[cfg(unix)]
+    let unselected_socket = TestSocket::bind(&namespace, &other);
     let second = unique_address("second");
-    let assert = c3()
-        .args([
-            "endpoint",
-            "sweep",
-            "--address",
-            &selected,
-            "--address",
-            &second,
-            "--max-entries",
-            "4096",
-            "--max-ms",
-            "1000",
-            "--max-batches",
-            "4096",
-        ])
+    let mut command = c3();
+    command.args([
+        "endpoint",
+        "sweep",
+        "--address",
+        &selected,
+        "--address",
+        &second,
+        "--max-entries",
+        "4096",
+        "--max-ms",
+        "1000",
+        "--max-batches",
+        "4096",
+    ]);
+    #[cfg(unix)]
+    command.arg("--ipc-root").arg(namespace.root.path());
+    let assert = command
         .assert()
         .success()
         .stdout(predicate::str::contains(r#""reaped":0"#));

@@ -519,8 +519,10 @@ fn assert_external_crate_rejected(name: &str, source: &str, expected_stderr: &st
 
 #[test]
 fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
-    let pair: fn() -> std::io::Result<(c2_core::OwnerControlKeepalive, c2_core::OwnerControlReceiver)> =
-        c_two::owner_control_pair;
+    let pair: fn() -> std::io::Result<(
+        c2_core::OwnerControlKeepalive,
+        c2_core::OwnerControlReceiver,
+    )> = c_two::owner_control_pair;
     assert_eq!(
         std::any::TypeId::of::<c_two::ServerLifecyclePolicy>(),
         std::any::TypeId::of::<c2_core::ServerLifecyclePolicy>(),
@@ -534,7 +536,9 @@ fn owner_lifecycle_facade_uses_the_exact_core_capability_types() {
     runtime
         .set_lifecycle_policy(c_two::ServerLifecyclePolicy::owner_bound(Duration::ZERO).unwrap())
         .expect("Core validates the policy");
-    runtime.attach_owner_control(receiver).expect("Core takes receiver");
+    runtime
+        .attach_owner_control(receiver)
+        .expect("Core takes receiver");
     assert!(runtime.owner_control_attached());
     keepalive.shutdown();
 }
@@ -560,4 +564,348 @@ fn native_endpoint_and_admin_probes_are_thin_facade_reexports() {
     let outcome = shutdown_direct_ipc(&address, Duration::from_millis(20)).unwrap();
     assert!(outcome.server_stopped && !outcome.shutdown_started);
     assert!(outcome.route_outcomes.is_empty());
+}
+
+#[test]
+fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
+    use c_two::{
+        CallExecutionLimits, CallExecutionLimitsOverrides, CallExecutionSnapshot, CallOptions,
+        CallTimeout, ConfigSources, EnvFilePolicy, EnvMap,
+    };
+
+    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    runtime
+        .set_call_execution_limits_with_sources(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: EnvMap::from([
+                    ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
+                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "17".into()),
+                ]),
+            },
+        )
+        .unwrap();
+    let snapshot: CallExecutionSnapshot = runtime.call_execution_snapshot().unwrap();
+    assert_eq!(
+        (snapshot.max_operations, snapshot.max_retained_bytes),
+        (3, 17)
+    );
+    assert_eq!(
+        (snapshot.used_operations, snapshot.used_retained_bytes),
+        (0, 0)
+    );
+    // Observation leaves configuration mutable; the Runtime clone sees the same policy.
+    let limits = CallExecutionLimits::zeroed();
+    runtime
+        .clone()
+        .set_call_execution_limits_with_sources(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(limits.max_outstanding_calls),
+                retained_input_budget_bytes: Some(limits.retained_input_budget_bytes),
+            },
+            ConfigSources::empty(),
+        )
+        .unwrap();
+    assert_eq!(runtime.call_execution_snapshot().unwrap().max_operations, 0);
+    assert_eq!(CallOptions::new().timeout(), CallTimeout::Inherit);
+    assert_eq!(
+        CallOptions::with_timeout(CallTimeout::Unlimited)
+            .effective_timeout(Some(Duration::from_secs(300))),
+        None
+    );
+    assert_eq!(
+        CallTimeout::try_after_seconds(0.0).unwrap(),
+        CallTimeout::After(Duration::ZERO)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_roots_and_admin_contexts_share_the_core_freeze_authority() {
+    use c_two::{
+        ConfigSources, LifecycleError, LocalEndpointContext, LocalEndpointNamespace,
+        LocalEndpointOptions, direct_ipc_endpoint_with_context, ping_direct_ipc_with_context,
+        shutdown_direct_ipc_with_context,
+    };
+
+    let first = Runtime::new(RuntimeOptions::default()).unwrap();
+    let second = Runtime::new(RuntimeOptions::default()).unwrap();
+    // Pure projection uses deliberately absent roots: no fixture directory or endpoint is created.
+    // Darwin's sun_path is only 104 bytes, including Core's endpoint suffix.
+    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let roots = [
+        std::path::PathBuf::from(format!("/tmp/r{:x}{id:x}a", std::process::id())),
+        std::path::PathBuf::from(format!("/tmp/r{:x}{id:x}b", std::process::id())),
+    ];
+    for (runtime, root) in [(&first, &roots[0]), (&second, &roots[1])] {
+        runtime
+            .set_local_endpoint_with_sources(
+                LocalEndpointOptions {
+                    unix_root: Some(root.clone()),
+                },
+                ConfigSources::empty(),
+            )
+            .unwrap();
+    }
+    let address = format!("ipc://{}", unique_name("sdk-two-roots"));
+    let first_context: LocalEndpointContext = first.local_endpoint_context().unwrap();
+    let second_context = second.local_endpoint_context().unwrap();
+    assert_eq!(
+        first_context.platform_kind(),
+        LocalEndpointNamespace::UnixFilesystem
+    );
+    assert_ne!(first_context, second_context);
+    let first_endpoint = direct_ipc_endpoint_with_context(&address, &first_context).unwrap();
+    assert_eq!(first_endpoint, first.local_endpoint(&address).unwrap());
+    assert_ne!(first_endpoint, second.local_endpoint(&address).unwrap());
+    assert!(!first.local_endpoint_frozen());
+    assert!(!ping_direct_ipc_with_context(&address, &first_context, Duration::ZERO).unwrap());
+    let stopped =
+        shutdown_direct_ipc_with_context(&address, &first_context, Duration::ZERO).unwrap();
+    // A zero observation budget makes no exchange and cannot establish absence.
+    assert!(!stopped.acknowledged && !stopped.server_stopped && !stopped.shutdown_started);
+    assert!(!first.local_endpoint_frozen());
+    assert!(!first.ping_direct_ipc(&address, Duration::ZERO).unwrap());
+    assert!(first.local_endpoint_frozen());
+    assert!(!second.local_endpoint_frozen());
+    assert_eq!(
+        first.set_local_endpoint_with_sources(
+            LocalEndpointOptions {
+                unix_root: Some(roots[1].clone())
+            },
+            ConfigSources::empty(),
+        ),
+        Err(LifecycleError::ConfigFrozen)
+    );
+    first
+        .set_local_endpoint_with_sources(
+            LocalEndpointOptions {
+                unix_root: Some(roots[0].clone()),
+            },
+            ConfigSources::empty(),
+        )
+        .unwrap();
+    assert_eq!(first.local_endpoint_context().unwrap(), first_context);
+    assert!(roots.iter().all(|root| !root.exists()));
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_admin_context_uses_the_windows_namespace_without_unix_overrides() {
+    use c_two::{
+        ConfigSources, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
+        direct_ipc_endpoint_with_context,
+    };
+    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    runtime
+        .set_local_endpoint_with_sources(LocalEndpointOptions::default(), ConfigSources::empty())
+        .unwrap();
+    let context: LocalEndpointContext = runtime.local_endpoint_context().unwrap();
+    assert_eq!(
+        context.platform_kind(),
+        LocalEndpointNamespace::WindowsNamedPipe
+    );
+    let address = format!("ipc://{}", unique_name("sdk-windows-context"));
+    assert_eq!(
+        direct_ipc_endpoint_with_context(&address, &context).unwrap(),
+        runtime.local_endpoint(&address).unwrap()
+    );
+    assert!(!runtime.ping_direct_ipc(&address, Duration::ZERO).unwrap());
+    assert!(runtime.local_endpoint_frozen());
+}
+
+struct CountedEcho(Arc<AtomicU64>);
+
+impl EncodedService for CountedEcho {
+    fn invoke(&self, method_index: u16, request: &[u8]) -> Result<Vec<u8>, C2Error> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Echo.invoke(method_index, request)
+    }
+}
+
+fn preparation_fixture(
+    slots: u64,
+    bytes: u64,
+) -> (
+    Runtime,
+    c_two::Host,
+    c_two::Registration,
+    c_two::Client,
+    Arc<AtomicU64>,
+) {
+    use c_two::{CallExecutionLimitsOverrides, ConfigSources};
+    let runtime = Runtime::new(RuntimeOptions {
+        server_id: Some(unique_name("sdk-preparation")),
+        use_process_relay_anchor: false,
+        ..RuntimeOptions::default()
+    })
+    .unwrap();
+    runtime
+        .set_call_execution_limits_with_sources(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(slots),
+                retained_input_budget_bytes: Some(bytes),
+            },
+            ConfigSources::empty(),
+        )
+        .unwrap();
+    let host = runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let route = unique_name("preparation-echo");
+    let release = release();
+    let calls = Arc::new(AtomicU64::new(0));
+    let service = ServiceDefinition::new(
+        &release,
+        release.reference(),
+        &route,
+        [
+            MethodDefinition {
+                index: 0,
+                name: "ping".into(),
+                access: MethodAccess::Read,
+            },
+            MethodDefinition {
+                index: 1,
+                name: "echo".into(),
+                access: MethodAccess::Write,
+            },
+        ],
+        Arc::new(CountedEcho(calls.clone())),
+    )
+    .unwrap();
+    let registration = host.register(service).unwrap();
+    let client = runtime
+        .connect(
+            release.expected_route(&route).unwrap(),
+            Connect::DirectIpc {
+                address: runtime.server_address().unwrap(),
+            },
+        )
+        .unwrap();
+    (runtime, host, registration, client, calls)
+}
+
+fn assert_call_error(error: Error, code: ErrorCode) {
+    let Error::Semantic(error) = error else {
+        panic!("expected semantic error, got {error}")
+    };
+    assert_eq!(error.code, code);
+}
+
+#[test]
+fn sdk_preparation_rejects_zero_deadline_and_capacity_before_factories_and_business() {
+    use c_two::{CallOptions, CallTimeout};
+    let (runtime, _host, mut registration, client, calls) = preparation_fixture(0, 0);
+    let factories = Arc::new(AtomicU64::new(0));
+    for (timeout, expected) in [
+        (
+            CallTimeout::After(Duration::ZERO),
+            ErrorCode::CallDeadlineExceeded,
+        ),
+        (
+            CallTimeout::After(Duration::from_secs(1)),
+            ErrorCode::CallCapacityExceeded,
+        ),
+    ] {
+        let count = factories.clone();
+        let result = client
+            .with_call_options(CallOptions::with_timeout(timeout))
+            .begin_call("echo")
+            .and_then(|prepared| {
+                prepared.encode(1, move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![42])
+                })
+            })
+            .and_then(|encoded| encoded.call_owned());
+        assert_call_error(result.unwrap_err(), expected);
+    }
+    assert_eq!(factories.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runtime.call_execution_snapshot().unwrap().used_operations,
+        0
+    );
+    assert_eq!(
+        client
+            .with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
+            .begin_call("echo")
+            .unwrap()
+            .encode_vec(vec![42])
+            .unwrap()
+            .call_owned()
+            .unwrap(),
+        vec![42]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime.call_execution_snapshot().unwrap().used_operations,
+        0
+    );
+    registration.close().unwrap();
+}
+
+#[test]
+fn sdk_preparation_charges_before_copy_and_keeps_the_original_serialization_deadline() {
+    use c_two::{
+        CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources, LifecycleError,
+    };
+    let (runtime, _host, mut registration, client, calls) = preparation_fixture(1, 8);
+    let finite = client.with_call_options(CallOptions::with_timeout(CallTimeout::After(
+        Duration::from_secs(1),
+    )));
+    let factories = Arc::new(AtomicU64::new(0));
+    let count = factories.clone();
+    let result = finite
+        .begin_call("echo")
+        .unwrap()
+        .encode(9, move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0; 9])
+        })
+        .and_then(|encoded| encoded.call_owned());
+    assert_call_error(result.unwrap_err(), ErrorCode::CallCapacityExceeded);
+    assert_eq!(factories.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let delayed = client.with_call_options(CallOptions::with_timeout(CallTimeout::After(
+        Duration::from_millis(10),
+    )));
+    let mut prepared = delayed.begin_call("echo").unwrap();
+    assert_eq!(
+        runtime.call_execution_snapshot().unwrap().used_operations,
+        1
+    );
+    // Borrowed/non-Send serializers stay on the caller; their elapsed time still spends this call's D.
+    std::thread::sleep(Duration::from_millis(30));
+    assert_call_error(
+        prepared.charge_input(1).unwrap_err(),
+        ErrorCode::CallDeadlineExceeded,
+    );
+    drop(prepared);
+    assert_eq!(
+        runtime.call_execution_snapshot().unwrap().used_operations,
+        0
+    );
+    assert_eq!(
+        runtime
+            .call_execution_snapshot()
+            .unwrap()
+            .used_retained_bytes,
+        0
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runtime.set_call_execution_limits_with_sources(
+            CallExecutionLimitsOverrides {
+                max_outstanding_calls: Some(2),
+                retained_input_budget_bytes: Some(8)
+            },
+            ConfigSources::empty(),
+        ),
+        Err(LifecycleError::ConfigFrozen)
+    );
+    registration.close().unwrap();
 }

@@ -121,11 +121,24 @@ export interface C2MemFfiResponsePoolSymbols<Handle = unknown> extends C2MemFfiA
   c2_mem_ffi_response_pool_release(pool: Handle, block: C2MemFfiResponseBlock): MaybePromise<C2MemFfiCallResult>;
 }
 
-export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> {
+/** Native addon owner; the Rust context pointer is never exposed to JavaScript. */
+export interface C2MemFfiNativeLocalEndpointContext {
+  endpointName(address: string): C2MemFfiCallResult<string>;
+  namespaceId(): C2MemFfiCallResult<string>;
+  close(): void;
+}
+
+export interface C2MemFfiLocalEndpointSymbols {
+  c2_mem_ffi_abi_version(): number;
   /**
    * Resolve the automatic platform endpoint through the Rust configuration owner.
    */
   c2_mem_ffi_local_endpoint(address: string): C2MemFfiCallResult<string>;
+  /** Optional capability: older ABI 3 libraries may omit this entire group. */
+  c2_mem_ffi_local_endpoint_context_capture?(unixRoot: string | null): C2MemFfiCallResult<C2MemFfiNativeLocalEndpointContext>;
+}
+
+export interface C2MemFfiNodeNativeExtraSymbols<Handle = unknown> extends C2MemFfiLocalEndpointSymbols {
   c2_mem_ffi_request_pool_read_local(pool: Handle, block: C2MemFfiRequestBlock, destination: Uint8Array): MaybePromise<C2MemFfiCallResult<number>>;
 }
 
@@ -144,14 +157,40 @@ export interface C2MemFfiNodeNativeLoadOptions {
   readonly addonPath?: string;
 }
 
+export interface C2MemFfiLocalEndpointCaptureOptions {
+  /** Unix IPC root override; native configuration rejects this on Windows. */
+  readonly ipcRoot?: string;
+}
+
+const endpointContextBrand: unique symbol = Symbol("C-Two local endpoint context");
+
+/**
+ * A reusable native configuration snapshot. Each connector retains its own
+ * reference on first connect; closing this handle does not invalidate those
+ * references. Close unused handles explicitly. Native ownership ends when the
+ * last reference closes, with garbage collection as a fallback.
+ */
+export interface C2MemFfiLocalEndpointContext {
+  readonly [endpointContextBrand]: true;
+  endpointName(address: string): string;
+  namespaceId(): string;
+  close(): void;
+}
+
+export interface C2MemFfiLocalEndpointOptions extends C2MemFfiNodeNativeLoadOptions, C2MemFfiLocalEndpointCaptureOptions {
+  readonly endpointContext?: C2MemFfiLocalEndpointContext;
+}
+
 export interface C2MemFfiResponsePoolFactory {
   createResponsePool(config: C2MemFfiPoolConfig): Promise<C2MemFfiNativeResponsePool>;
 }
 
 export interface C2MemFfiNodeRuntime {
-  readonly connect: C2NodeIpcConnect;
+  readonly connect: C2NodeIpcConnector;
   readonly resolveEndpoint: (address: string) => string;
   readonly responsePoolFactory: C2MemFfiResponsePoolFactory;
+  /** Release this runtime's endpoint snapshot; existing sockets remain usable. */
+  close(): void;
 }
 
 export interface C2NodeIpcConnection {
@@ -161,6 +200,14 @@ export interface C2NodeIpcConnection {
 }
 
 export type C2NodeIpcConnect = (address: string) => MaybePromise<C2NodeIpcConnection>;
+
+/** First connect attempt freezes native configuration, including failed attempts. */
+export type C2NodeIpcConnector = C2NodeIpcConnect & {
+  /** Before first connect this is a pure, unfrozen native query. */
+  readonly resolveEndpoint: (address: string) => string;
+  /** Release the factory snapshot, without closing sockets it has created. */
+  readonly close: () => void;
+};
 
 export interface C2NodeIpcSocket {
   readonly destroyed: boolean;
@@ -178,7 +225,9 @@ export interface C2NodeIpcSocket {
   off(event: "close", listener: () => void): C2NodeIpcSocket;
 }
 
-export interface C2NodeIpcConnectOptions {
+export interface C2NodeIpcConnectOptions extends C2MemFfiLocalEndpointOptions {
+  /** Optional already-loaded native endpoint symbols; never implements path derivation in TypeScript. */
+  readonly nativeSymbols?: C2MemFfiLocalEndpointSymbols;
   readonly resolveEndpoint?: (address: string) => string;
   readonly createConnection?: (socketPath: string) => C2NodeIpcSocket;
 }
@@ -206,6 +255,160 @@ export class C2NodeIpcConnectionError extends Error {
   }
 }
 
+export class C2MemFfiEndpointContextUnsupportedError extends C2MemFfiBindingError {
+  readonly code = "C2_ENDPOINT_CONTEXT_UNSUPPORTED";
+
+  constructor() {
+    super("C-Two native library does not support endpoint contexts or ipcRoot. ABI version 3 does not guarantee this capability.");
+    this.name = "C2MemFfiEndpointContextUnsupportedError";
+    Object.setPrototypeOf(this, C2MemFfiEndpointContextUnsupportedError.prototype);
+  }
+}
+
+interface LocalEndpointContextState {
+  readonly native: C2MemFfiNativeLocalEndpointContext;
+  references: number;
+}
+
+interface LocalEndpointContextOwner {
+  readonly state: LocalEndpointContextState;
+  closed: boolean;
+}
+
+interface LocalEndpointContextLease {
+  readonly owner: LocalEndpointContextOwner;
+}
+
+function releaseEndpointContextOwner(owner: LocalEndpointContextOwner): void {
+  if (owner.closed) return;
+  owner.closed = true;
+  if (--owner.state.references === 0) owner.state.native.close();
+}
+
+// The target shell is kept alive by every accessor using this reference. The
+// held owner never references that shell, so detached accessors are safe too.
+const endpointContextFinalizer = new FinalizationRegistry<LocalEndpointContextOwner>(releaseEndpointContextOwner);
+const localEndpointContexts = new WeakMap<C2MemFfiLocalEndpointContext, LocalEndpointContextLease>();
+
+function leaseEndpointContext(state: LocalEndpointContextState): LocalEndpointContextLease {
+  const owner: LocalEndpointContextOwner = { state, closed: false };
+  const lease = { owner };
+  state.references += 1;
+  endpointContextFinalizer.register(lease, owner, owner);
+  return lease;
+}
+
+function closeEndpointContextLease(lease: LocalEndpointContextLease): void {
+  endpointContextFinalizer.unregister(lease.owner);
+  releaseEndpointContextOwner(lease.owner);
+}
+
+function nativeEndpointContext(lease: LocalEndpointContextLease): C2MemFfiNativeLocalEndpointContext {
+  if (lease.owner.closed) throw new C2NodeIpcConnectionError("C-Two endpoint context is closed.");
+  return lease.owner.state.native;
+}
+
+/** Capture code/environment/.env/default configuration once without creating directories. */
+export function captureLocalIpcEndpointContext(
+  options: C2MemFfiNodeNativeLoadOptions & C2MemFfiLocalEndpointCaptureOptions = {},
+): C2MemFfiLocalEndpointContext {
+  requireEndpointOptions(options);
+  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
+  return captureLocalIpcEndpointContextFromSymbols(symbols, options);
+}
+
+/** Capture through a loaded library; ABI 3 and endpoint-context capability are checked separately. */
+export function captureLocalIpcEndpointContextFromSymbols(
+  symbols: C2MemFfiLocalEndpointSymbols,
+  options: C2MemFfiLocalEndpointCaptureOptions = {},
+): C2MemFfiLocalEndpointContext {
+  requireEndpointOptions(options);
+  requireEndpointSymbols(symbols);
+  if (symbols.c2_mem_ffi_local_endpoint_context_capture === undefined) {
+    throw new C2MemFfiEndpointContextUnsupportedError();
+  }
+  const result = symbols.c2_mem_ffi_local_endpoint_context_capture(options.ipcRoot ?? null);
+  const native = result?.value;
+  if (result?.status !== C2_MEM_FFI_STATUS_OK || typeof native !== "object" || native === null
+    || typeof native.endpointName !== "function" || typeof native.namespaceId !== "function" || typeof native.close !== "function") {
+    if (typeof native === "object" && native !== null && typeof native.close === "function") {
+      native.close();
+    }
+    throw new C2NodeIpcConnectionError(`C-Two native endpoint context capture failed (status ${result?.status}).`);
+  }
+  const lease = leaseEndpointContext({ native, references: 0 });
+  const context: C2MemFfiLocalEndpointContext = Object.freeze({
+    [endpointContextBrand]: true as const,
+    endpointName(address: string): string {
+      const native = nativeEndpointContext(lease);
+      requireLogicalIpcAddress(address);
+      return requireNativeEndpointString(native.endpointName(address), "endpoint resolution");
+    },
+    namespaceId(): string {
+      const native = nativeEndpointContext(lease);
+      return requireNativeEndpointString(native.namespaceId(), "endpoint namespace query");
+    },
+    close(): void {
+      closeEndpointContextLease(lease);
+    },
+  });
+  localEndpointContexts.set(context, lease);
+  return context;
+}
+
+function requireEndpointSymbols(symbols: C2MemFfiLocalEndpointSymbols): void {
+  if (typeof symbols !== "object" || symbols === null || typeof symbols.c2_mem_ffi_abi_version !== "function") {
+    throw new C2MemFfiBindingError("C-Two native endpoint symbols must provide c2_mem_ffi_abi_version().");
+  }
+  const abiVersion = symbols.c2_mem_ffi_abi_version();
+  if (abiVersion !== C2_MEM_FFI_ABI_VERSION) {
+    throw new C2MemFfiBindingError(`C-Two native endpoint symbols report ABI version ${abiVersion}; expected version ${C2_MEM_FFI_ABI_VERSION}.`);
+  }
+  if (typeof symbols.c2_mem_ffi_local_endpoint !== "function") {
+    throw new C2MemFfiBindingError("C-Two native endpoint symbols must provide c2_mem_ffi_local_endpoint().");
+  }
+  if (symbols.c2_mem_ffi_local_endpoint_context_capture !== undefined && typeof symbols.c2_mem_ffi_local_endpoint_context_capture !== "function") {
+    throw new C2MemFfiBindingError("C-Two native endpoint context capture symbol must be a function when provided.");
+  }
+}
+
+function requireEndpointOptions(options: C2MemFfiLocalEndpointCaptureOptions & { readonly endpointContext?: C2MemFfiLocalEndpointContext }): void {
+  if (typeof options !== "object" || options === null) {
+    throw new C2NodeIpcConnectionError("C-Two endpoint options must be an object.");
+  }
+  if (options.ipcRoot !== undefined && (typeof options.ipcRoot !== "string" || options.ipcRoot.includes("\0"))) {
+    throw new C2NodeIpcConnectionError("C-Two ipcRoot must be a string without NUL characters.");
+  }
+  if (options.ipcRoot !== undefined && options.endpointContext !== undefined) {
+    throw new C2NodeIpcConnectionError("C-Two ipcRoot and endpointContext options are mutually exclusive.");
+  }
+  if (options.endpointContext !== undefined && !localEndpointContexts.has(options.endpointContext)) {
+    throw new C2NodeIpcConnectionError("C-Two endpointContext must be created by captureLocalIpcEndpointContext().");
+  }
+}
+
+function requireLogicalIpcAddress(address: string): void {
+  if (typeof address !== "string" || address.includes("\0")) {
+    throw new C2NodeIpcConnectionError("C-Two IPC address must be a string without NUL characters.");
+  }
+}
+
+function requireNativeEndpointString(result: C2MemFfiCallResult<string>, operation: string): string {
+  if (result?.status !== C2_MEM_FFI_STATUS_OK || typeof result.value !== "string" || result.value.length === 0 || result.value.includes("\0")) {
+    throw new C2NodeIpcConnectionError(`C-Two native ${operation} failed (status ${result?.status}).`);
+  }
+  return result.value;
+}
+
+function retainEndpointContext(context: C2MemFfiLocalEndpointContext): LocalEndpointContextLease {
+  const lease = localEndpointContexts.get(context);
+  if (lease === undefined) {
+    throw new C2NodeIpcConnectionError("C-Two endpointContext must be created by captureLocalIpcEndpointContext().");
+  }
+  nativeEndpointContext(lease);
+  return leaseEndpointContext(lease.owner.state);
+}
+
 export function resolveBundledC2MemFfiNodeNativeLibraryPath(): string {
   const libraryName = bundledC2MemFfiNodeNativeLibraryName();
   const require = createRequire(import.meta.url);
@@ -219,17 +422,20 @@ export function loadBundledC2MemFfiNodeNativeSymbols<Handle = unknown>(
 }
 
 export function createBundledC2MemFfiNodeRuntime(
-  options: C2MemFfiNodeNativeLoadOptions = {},
+  options: C2MemFfiLocalEndpointOptions = {},
 ): C2MemFfiNodeRuntime {
-  const resolveEndpoint = (address: string): string => resolveLocalIpcEndpoint(address, options);
+  const connect = createNodeIpcConnect(options);
+  const loadOptions: C2MemFfiNodeNativeLoadOptions = options.addonPath === undefined ? {} : { addonPath: options.addonPath };
+  options = loadOptions;
   return Object.freeze({
-    connect: createNodeIpcConnect({ resolveEndpoint }),
-    resolveEndpoint,
+    connect,
+    resolveEndpoint: connect.resolveEndpoint,
+    close: connect.close,
     responsePoolFactory: Object.freeze({
       async createResponsePool(
         config: C2MemFfiPoolConfig,
       ): Promise<C2MemFfiNativeResponsePool> {
-        const { responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
+        const { responseSymbols } = loadBundledC2MemFfiNodeNativeSymbols(loadOptions);
         return await createC2MemFfiResponsePoolFromSymbols(
           responseSymbols,
           config,
@@ -246,79 +452,169 @@ export function createBundledC2MemFfiNodeRuntime(
  */
 export function resolveLocalIpcEndpoint(
   address: string,
-  options: C2MemFfiNodeNativeLoadOptions = {},
+  options: C2MemFfiLocalEndpointOptions = {},
 ): string {
-  if (typeof address !== "string" || address.includes("\0")) {
-    throw new C2NodeIpcConnectionError("C-Two IPC address must be a string without NUL characters.");
+  requireLogicalIpcAddress(address);
+  requireEndpointOptions(options);
+  if (options.endpointContext !== undefined) {
+    return options.endpointContext.endpointName(address);
   }
-  if (typeof options !== "object" || options === null) {
-    throw new C2NodeIpcConnectionError("C-Two endpoint resolution options must be an object.");
+  if (options.ipcRoot !== undefined) {
+    const context = captureLocalIpcEndpointContext(options);
+    try {
+      return context.endpointName(address);
+    } finally {
+      context.close();
+    }
   }
   const { symbols } = loadBundledC2MemFfiNodeNativeSymbols(options);
-  const result = symbols.c2_mem_ffi_local_endpoint(address);
-  if (result.status !== C2_MEM_FFI_STATUS_OK || typeof result.value !== "string") {
-    throw new C2NodeIpcConnectionError(`C-Two native endpoint resolution failed for ${address} (status ${result.status}).`);
-  }
-  return result.value;
+  requireEndpointSymbols(symbols);
+  return requireNativeEndpointString(symbols.c2_mem_ffi_local_endpoint(address), "endpoint resolution");
 }
 
-export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2NodeIpcConnect {
+export function createNodeIpcConnect(options: C2NodeIpcConnectOptions = {}): C2NodeIpcConnector {
   if (typeof options !== "object" || options === null) {
     throw new C2NodeIpcConnectionError("C-Two Node IPC connect options must be an object.");
   }
+  requireEndpointOptions(options);
+  if (options.resolveEndpoint !== undefined && (options.ipcRoot !== undefined || options.endpointContext !== undefined || options.nativeSymbols !== undefined)) {
+    throw new C2NodeIpcConnectionError("C-Two custom resolveEndpoint cannot be combined with ipcRoot, endpointContext, or nativeSymbols.");
+  }
+  if (options.endpointContext !== undefined && options.nativeSymbols !== undefined) {
+    throw new C2NodeIpcConnectionError("C-Two endpointContext and nativeSymbols options are mutually exclusive.");
+  }
   const openSocket = options.createConnection ?? createConnection;
-  const resolveEndpoint = options.resolveEndpoint ?? resolveLocalIpcEndpoint;
-  if (typeof resolveEndpoint !== "function") {
+  if (options.resolveEndpoint !== undefined && typeof options.resolveEndpoint !== "function") {
     throw new C2NodeIpcConnectionError("C-Two Node IPC resolveEndpoint option must be a function.");
   }
   if (typeof openSocket !== "function") {
     throw new C2NodeIpcConnectionError("C-Two Node IPC createConnection option must be a function.");
   }
-  return async (address: string): Promise<C2NodeIpcConnection> => {
-    const normalizedPath = requireNodeIpcSocketPath(resolveEndpoint(address));
-    let socket: C2NodeIpcSocket;
+  options = { ...options };
+  let snapshot: LocalEndpointContextLease | undefined;
+  let legacySymbols: C2MemFfiLocalEndpointSymbols | undefined;
+  let attempted = false;
+  let captureFailed = false;
+  let captureError: unknown;
+  let closed = false;
+  const requireOpen = (): void => {
+    if (closed) throw new C2NodeIpcConnectionError("C-Two Node IPC connector is closed.");
+  };
+  const freeze = (): void => {
+    requireOpen();
+    if (!attempted) {
+      attempted = true;
+      try {
+        if (options.endpointContext !== undefined) {
+          snapshot = retainEndpointContext(options.endpointContext);
+          // Retain the snapshot reference, not the caller's disposable handle.
+          const { endpointContext, ...remainingOptions } = options;
+          options = remainingOptions;
+        } else if (options.resolveEndpoint === undefined) {
+          const symbols = options.nativeSymbols ?? loadBundledC2MemFfiNodeNativeSymbols(options).symbols;
+          requireEndpointSymbols(symbols);
+          if (symbols.c2_mem_ffi_local_endpoint_context_capture !== undefined || options.ipcRoot !== undefined) {
+            const context = captureLocalIpcEndpointContextFromSymbols(symbols, options);
+            try {
+              snapshot = retainEndpointContext(context);
+            } finally {
+              context.close();
+            }
+          } else {
+            // Older ABI3 libraries still support their existing default query.
+            // They cannot provide a complete captured configuration snapshot.
+            legacySymbols = symbols;
+          }
+        }
+      } catch (error) {
+        captureFailed = true;
+        captureError = error;
+      }
+    }
+    if (captureFailed) throw captureError;
+  };
+  const resolveEndpoint = (address: string): string => {
+    requireOpen();
+    if (captureFailed) throw captureError;
+    if (options.resolveEndpoint !== undefined) return requireNodeIpcSocketPath(options.resolveEndpoint(address));
+    requireLogicalIpcAddress(address);
+    if (snapshot !== undefined) {
+      return requireNativeEndpointString(nativeEndpointContext(snapshot).endpointName(address), "endpoint resolution");
+    }
+    if (options.endpointContext !== undefined) return options.endpointContext.endpointName(address);
+    const symbols = legacySymbols ?? options.nativeSymbols ?? loadBundledC2MemFfiNodeNativeSymbols(options).symbols;
+    requireEndpointSymbols(symbols);
+    if (options.ipcRoot !== undefined) {
+      const context = captureLocalIpcEndpointContextFromSymbols(symbols, options);
+      try {
+        return context.endpointName(address);
+      } finally {
+        context.close();
+      }
+    }
+    return requireNativeEndpointString(symbols.c2_mem_ffi_local_endpoint(address), "endpoint resolution");
+  };
+  const connect = async (address: string): Promise<C2NodeIpcConnection> => {
+    let socket: C2NodeIpcSocket | undefined;
     try {
-      socket = openSocket(normalizedPath);
+      freeze();
+      const normalizedPath = requireNodeIpcSocketPath(resolveEndpoint(address));
+      const pendingSocket = openSocket(normalizedPath);
+      socket = pendingSocket;
+      return await new Promise<C2NodeIpcConnection>((resolve, reject) => {
+        let settled = false;
+        const cleanup = (): void => {
+          pendingSocket.off("connect", onConnect);
+          pendingSocket.off("error", onError);
+          pendingSocket.off("close", onClose);
+        };
+        const onConnect = (): void => {
+          if (settled) return;
+          try {
+            const connection = new NodeIpcConnection(pendingSocket);
+            settled = true;
+            cleanup();
+            resolve(connection);
+          } catch (error) {
+            settled = true;
+            cleanup();
+            reject(error);
+          }
+        };
+        const onError = (error: Error): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(nodeIpcError("C-Two Node IPC connect failed", error));
+        };
+        const onClose = (): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(new C2NodeIpcConnectionError(`C-Two Node IPC socket closed before connect completed for ${normalizedPath}.`));
+        };
+        pendingSocket.once("connect", onConnect);
+        pendingSocket.once("error", onError);
+        pendingSocket.once("close", onClose);
+      });
     } catch (error) {
+      socket?.destroy();
+      if (error instanceof C2MemFfiBindingError) throw error;
       throw nodeIpcError("C-Two Node IPC connect failed", error);
     }
-    return await new Promise<C2NodeIpcConnection>((resolve, reject) => {
-      let settled = false;
-      const cleanup = (): void => {
-        socket.off("connect", onConnect);
-        socket.off("error", onError);
-        socket.off("close", onClose);
-      };
-      const onConnect = (): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        cleanup();
-        resolve(new NodeIpcConnection(socket));
-      };
-      const onError = (error: Error): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        cleanup();
-        socket.destroy();
-        reject(nodeIpcError("C-Two Node IPC connect failed", error));
-      };
-      const onClose = (): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        cleanup();
-        reject(new C2NodeIpcConnectionError(`C-Two Node IPC socket closed before connect completed for ${normalizedPath}.`));
-      };
-      socket.once("connect", onConnect);
-      socket.once("error", onError);
-      socket.once("close", onClose);
-    });
   };
+  return Object.freeze(Object.assign(connect, {
+    resolveEndpoint,
+    close(): void {
+      if (closed) return;
+      closed = true;
+      if (snapshot !== undefined) closeEndpointContextLease(snapshot);
+      snapshot = undefined;
+      legacySymbols = undefined;
+      captureError = undefined;
+      options = {};
+    },
+  }));
 }
 
 export function loadC2MemFfiNodeNativeSymbols<Handle = unknown>(
@@ -819,7 +1115,7 @@ function requireUint8Array(value: Uint8Array, label: string): Uint8Array {
   return value;
 }
 
-function requireNodeIpcSocketPath(value: string): string {
+function requireNodeIpcSocketPath(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new C2NodeIpcConnectionError("C-Two Node IPC socket path must be a non-empty string.");
   }

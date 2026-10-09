@@ -1,8 +1,27 @@
 use fastdb::{CompiledSpec, OpenOptions, Payload, PayloadError};
 
-use c2_core::HeldResponse;
+use c2_core::{AdapterFailurePhase, HeldResponse, PreparedCall};
 
-use crate::Held;
+use crate::{Error, Held};
+
+/// Charge a portable input before the existing serializer makes its owned copy.
+///
+/// FastDB's checked access supplies the byte length without copying or parsing
+/// its layout. The borrowed serializer stays on the caller thread; its work is
+/// covered by the original Core deadline, but is not hard real time. The
+/// serializer must still validate the expected specification and live owner.
+pub fn charge_payload_input(call: &mut PreparedCall, payload: &Payload) -> Result<(), Error> {
+    let phase = AdapterFailurePhase::ClientInputSerializing;
+    let access = payload
+        .acquire()
+        .map_err(|error| Error::Semantic(crate::error::fastdb_adapter_error(phase, error)))?;
+    let bytes = access
+        .payload_bytes()
+        .map_err(|error| Error::Semantic(crate::error::fastdb_adapter_error(phase, error)))?;
+    let nbytes = u64::try_from(bytes.len())
+        .map_err(|_| c2_core::LifecycleError::Configuration("input length exceeds u64".into()))?;
+    call.charge_input(nbytes)
+}
 
 /// Open an owned FastDB copy from detached response bytes.
 ///

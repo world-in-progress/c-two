@@ -46,6 +46,7 @@ sha2 = { version = "0.11", optional = true }
 hex = { version = "0.4", optional = true }
 
 [dev-dependencies]
+c2-ipc = { version = "0.1.0", path = "../c2-ipc", features = ["test-support"] }
 c2-mem = { version = "0.1.0", path = "../../foundation/c2-mem" }
 c2-server = { version = "0.1.0", path = "../c2-server" }
 tower = { version = "0.5", features = ["util"] }

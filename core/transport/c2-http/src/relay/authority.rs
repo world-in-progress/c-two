@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use c2_contract::{ExpectedRouteContract, MAX_WIRE_TEXT_BYTES};
-use c2_ipc::IpcClient;
+use c2_ipc::{ClientIpcConfig, IpcClient};
 
 use crate::relay::conn_pool::{
     CachedClient, OwnerReplaceError, OwnerReplacementEvidence, OwnerToken,
@@ -412,11 +412,11 @@ impl<'a> RouteAuthority<'a> {
     }
 
     pub(crate) fn validate_ipc_address(&self, address: &str) -> Result<(), ControlError> {
-        // Registration validation uses this relay's resolved upstream
-        // protocol: a managed-v2 upstream on a platform that cannot serve it
-        // is rejected here as a configuration error, never probed across
-        // endpoint namespaces.
-        c2_ipc::local_endpoint_from_ipc_address(address)
+        // Validate native endpoint capacity in this relay's frozen namespace,
+        // without opening it or consulting configuration again.
+        self.state
+            .endpoint_context()
+            .endpoint(address)
             .map(|_| ())
             .map_err(|err| ControlError::InvalidAddress {
                 reason: err.to_string(),
@@ -809,7 +809,7 @@ impl<'a> RouteAuthority<'a> {
                 .state
                 .remove_connection_if_endpoint_unused(&old_endpoint)
         {
-            close_replaced_owner_client(client);
+            self.state.clients.close(&client);
         }
         Ok(RouteCommandResult::Registered { entry })
     }
@@ -1027,7 +1027,22 @@ impl<'a> RouteAuthority<'a> {
     }
 
     async fn probe_captured_owner(&self, replacement: &OwnerReplacementCandidate) -> OwnerProbe {
-        let mut client = IpcClient::new(&replacement.existing_address);
+        let endpoint = match self
+            .state
+            .endpoint_context()
+            .endpoint(&replacement.existing_address)
+        {
+            Ok(endpoint) => endpoint,
+            Err(_) => return OwnerProbe::Dead,
+        };
+        let Ok(mut client) = self
+            .state
+            .clients
+            .manage(|| IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()))
+        else {
+            // Owner capacity is not evidence that the captured route is dead.
+            return OwnerProbe::Stale;
+        };
         match client.connect().await {
             Ok(()) => {
                 let identity_matches = client.server_id() == Some(replacement.server_id.as_str())
@@ -1043,7 +1058,7 @@ impl<'a> RouteAuthority<'a> {
                                 && contract.abi_hash == replacement.abi_hash
                                 && contract.signature_hash == replacement.signature_hash
                         });
-                client.close().await;
+                drop(client);
 
                 if !route_matches {
                     OwnerProbe::RouteMissing
@@ -1066,12 +1081,6 @@ enum OwnerProbe {
     RouteMissing,
     Dead,
     Stale,
-}
-
-fn close_replaced_owner_client(client: Arc<IpcClient>) {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move { client.close_shared().await });
-    }
 }
 
 #[cfg(test)]
@@ -1112,6 +1121,47 @@ mod tests {
         let after_start = &source[start_idx..];
         let end_idx = after_start.find(end)?;
         Some(&after_start[..end_idx])
+    }
+
+    #[test]
+    fn endpoint_validation_preserves_platform_default_logical_addresses() {
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let state = RelayState::new_with_context(
+            Arc::new(RelayConfig::default()),
+            Arc::new(NullDisseminator),
+            context,
+        );
+        let authority = RouteAuthority::new(&state);
+        authority.validate_ipc_address("ipc://worker").unwrap();
+        for address in ["worker", "http://worker", "ipc://", "ipc://../worker"] {
+            assert!(
+                matches!(
+                    authority.validate_ipc_address(address),
+                    Err(ControlError::InvalidAddress { .. })
+                ),
+                "{address}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_validation_uses_captured_root_capacity_without_opening_it() {
+        // Construction is pure: an overlong root is legal as a context, but
+        // deriving its endpoint must fail the platform's sun_path bound.
+        let root = std::path::PathBuf::from(format!("/{}", "x".repeat(256)));
+        let context = c2_config::LocalEndpointContext::with_unix_root(&root).unwrap();
+        let state = RelayState::new_with_context(
+            Arc::new(RelayConfig::default()),
+            Arc::new(NullDisseminator),
+            context,
+        );
+        let default = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        default.endpoint("ipc://worker").unwrap();
+        assert!(matches!(
+            RouteAuthority::new(&state).validate_ipc_address("ipc://worker"),
+            Err(ControlError::InvalidAddress { reason }) if reason.contains("sun_path")
+        ));
     }
 
     #[test]

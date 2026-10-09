@@ -32,7 +32,9 @@ struct PoolEntry {
 /// references are released, the client is kept for a grace period
 /// before being destroyed.
 pub struct HttpClientPool {
-    entries: Mutex<HashMap<String, PoolEntry>>,
+    // Controlled calls have a separate no-total-timeout view. Legacy clients
+    // retain their configured policy, including when both views are live.
+    entries: Mutex<HashMap<(String, bool), PoolEntry>>,
     grace_period: Duration,
     default_max_connections: usize,
 }
@@ -80,9 +82,35 @@ impl HttpClientPool {
         timeout_secs: f64,
         remote_payload_chunk_size: u64,
     ) -> Result<Arc<HttpClient>, HttpError> {
+        self.acquire_view(
+            base_url,
+            use_proxy,
+            timeout_secs,
+            remote_payload_chunk_size,
+            false,
+        )
+    }
+
+    pub(crate) fn acquire_controlled(
+        &self,
+        base_url: &str,
+        use_proxy: bool,
+        remote_payload_chunk_size: u64,
+    ) -> Result<Arc<HttpClient>, HttpError> {
+        self.acquire_view(base_url, use_proxy, 0.0, remote_payload_chunk_size, true)
+    }
+
+    fn acquire_view(
+        &self,
+        base_url: &str,
+        use_proxy: bool,
+        timeout_secs: f64,
+        remote_payload_chunk_size: u64,
+        controlled: bool,
+    ) -> Result<Arc<HttpClient>, HttpError> {
         crate::payload::validate_remote_payload_chunk_size(remote_payload_chunk_size)?;
         self.sweep_expired();
-        let key = canonical_base_url(base_url);
+        let key = (canonical_base_url(base_url), controlled);
 
         let mut entries = self.entries.lock();
 
@@ -113,13 +141,22 @@ impl HttpClientPool {
         }
 
         // Create a new client (lock held — HttpClient::new is fast).
-        let client = Arc::new(HttpClient::new_with_transport_policy(
-            &key,
-            timeout_secs,
-            self.default_max_connections,
-            use_proxy,
-            remote_payload_chunk_size,
-        )?);
+        let client = Arc::new(if controlled {
+            HttpClient::new_controlled(
+                &key.0,
+                self.default_max_connections,
+                use_proxy,
+                remote_payload_chunk_size,
+            )?
+        } else {
+            HttpClient::new_with_transport_policy(
+                &key.0,
+                timeout_secs,
+                self.default_max_connections,
+                use_proxy,
+                remote_payload_chunk_size,
+            )?
+        });
 
         entries.insert(
             key,
@@ -138,7 +175,11 @@ impl HttpClientPool {
 
     /// Decrement reference count; mark for grace-period cleanup at 0.
     pub fn release(&self, base_url: &str) {
-        let key = canonical_base_url(base_url);
+        self.release_view(base_url, false);
+    }
+
+    pub(crate) fn release_view(&self, base_url: &str, controlled: bool) {
+        let key = (canonical_base_url(base_url), controlled);
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.get_mut(&key) {
             if entry.ref_count == 0 {
@@ -182,7 +223,7 @@ impl HttpClientPool {
     pub fn refcount(&self, base_url: &str) -> usize {
         self.entries
             .lock()
-            .get(&canonical_base_url(base_url))
+            .get(&(canonical_base_url(base_url), false))
             .map_or(0, |e| e.ref_count)
     }
 }
@@ -203,6 +244,37 @@ impl HttpClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_view_coexists_with_live_legacy_timeout_policy() {
+        let pool = HttpClientPool::new(60.0);
+        let url = "http://localhost:9989";
+        let legacy = pool.acquire_with_options(url, false, 300.0, 1024).unwrap();
+        let controlled = pool.acquire_controlled(url, false, 1024).unwrap();
+        let controlled_again = pool.acquire_controlled(url, false, 1024).unwrap();
+        let legacy_again = pool.acquire_with_options(url, false, 300.0, 1024).unwrap();
+
+        assert!(!Arc::ptr_eq(&legacy, &controlled));
+        assert!(Arc::ptr_eq(&controlled, &controlled_again));
+        assert!(Arc::ptr_eq(&legacy, &legacy_again));
+        assert_eq!(pool.refcount(url), 2);
+        assert_eq!(pool.entries.lock()[&(url.to_string(), true)].ref_count, 2);
+
+        pool.release_view(url, true);
+        pool.release_view(url, true);
+        assert_eq!(
+            pool.refcount(url),
+            2,
+            "controlled release must not release legacy leases"
+        );
+        assert_eq!(pool.entries.lock()[&(url.to_string(), true)].ref_count, 0);
+        assert_eq!(
+            pool.entries.lock()[&(url.to_string(), false)].timeout_secs,
+            300.0
+        );
+        pool.release(url);
+        pool.release(url);
+    }
 
     #[test]
     fn test_pool_new() {

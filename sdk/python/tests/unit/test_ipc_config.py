@@ -53,11 +53,13 @@ def _reset_registry_and_settings(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     yield
-    cc.shutdown()
-    _ProcessRegistry.reset()
-    settings.relay_anchor_address = None
-    settings.shm_threshold = None
-    settings.remote_payload_chunk_size = None
+    try:
+        cc.shutdown()
+        _ProcessRegistry.reset()
+    finally:
+        settings.relay_anchor_address = None
+        settings.shm_threshold = None
+        settings.remote_payload_chunk_size = None
 
 
 def test_public_config_exports_only_override_schemas():
@@ -675,36 +677,69 @@ class _FakeRetiredObservation:
     """
 
 
+class _FakeRuntimeSession:
+    """Only the native projections used by these route/teardown spies.
+
+    Contexts are real opaque native values; the double derives no endpoint
+    paths and invents no default execution policy.
+    """
+
+    client_config_frozen = False
+    server_id = None
+    server_id_override = None
+    server_ipc_overrides = None
+    client_ipc_overrides = None
+
+    def __init__(
+        self,
+        *,
+        max_outstanding_calls: int | None = None,
+        retained_input_budget_bytes: int | None = None,
+        **_kwargs,
+    ) -> None:
+        from c_two._native import resolve_local_endpoint_context
+
+        self._context = resolve_local_endpoint_context()
+        self._limits = {
+            key: value for key, value in (
+                ('max_outstanding_calls', max_outstanding_calls),
+                ('retained_input_budget_bytes', retained_input_budget_bytes),
+            ) if value is not None
+        }
+        self.adopted_observations: list[_FakeRetiredObservation] = []
+
+    @property
+    def call_execution_limits_overrides(self) -> dict[str, int]:
+        return dict(self._limits)
+
+    def local_endpoint_context(self) -> cc.LocalEndpointContext:
+        return self._context
+
+    def inherit_local_endpoint_selection(self, previous: _FakeRuntimeSession) -> None:
+        self._context = previous._context
+
+    def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
+        assert route_names == []
+        return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
+
+    def retire_memory_observation(self) -> _FakeRetiredObservation:
+        return _FakeRetiredObservation()
+
+    def adopt_retired_memory_observation(self, observation: _FakeRetiredObservation) -> None:
+        self.adopted_observations.append(observation)
+
+    def set_relay_anchor_address(self, relay_address: str | None) -> None:
+        self.relay_anchor_address_override = relay_address
+
+    def lease_tracker(self):
+        return None
+
+
 def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(monkeypatch):
     registry = _ProcessRegistry.get()
-    settings.relay_anchor_address = 'http://registry-relay.test'
     calls = []
 
-    class FakeRuntimeSession:
-        client_config_frozen = False
-        server_id = None
-        server_id_override = None
-        server_ipc_overrides = None
-        client_ipc_overrides = None
-
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
-            assert route_names == []
-            return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
-
-        def retire_memory_observation(self):
-            # Test double: the registry moves a retirement bundle between
-            # sessions on shutdown, so the double models the full interface.
-            return _FakeRetiredObservation()
-
-        def adopt_retired_memory_observation(self, observation):  # noqa: ARG002
-            pass
-
-        def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
-            self.relay_anchor_address_override = relay_address
-
+    class FakeRuntimeSession(_FakeRuntimeSession):
         def connect_via_relay(
             self,
             route_name: str,
@@ -725,30 +760,49 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
             ))
             return FakeRelayAwareClient()
 
-        def lease_tracker(self):
-            return None
-
     class FakeRelayAwareClient:
         def close(self):
             pass
 
-    registry._runtime_session = FakeRuntimeSession()  # noqa: SLF001
+    with monkeypatch.context() as patch:
+        patch.setattr(settings, 'relay_anchor_address', 'http://registry-relay.test')
+        patch.setattr(registry, '_runtime_session', FakeRuntimeSession())
 
-    crm = registry.connect(IUnitConfigCRM, name='unit-route')
+        crm = registry.connect(IUnitConfigCRM, name='unit-route')
 
-    assert 'RustClientPool.instance()' not in inspect.getsource(type(registry))
-    assert len(calls) == 1
-    relay_address, route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash = calls[0]
-    assert (relay_address, route_name, crm_ns, crm_name, crm_ver) == (
-        'http://registry-relay.test',
-        'unit-route',
-        'unit.config',
-        'IUnitConfigCRM',
-        '0.1.0',
+        assert 'RustClientPool.instance()' not in inspect.getsource(type(registry))
+        assert len(calls) == 1
+        relay_address, route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash = calls[0]
+        assert (relay_address, route_name, crm_ns, crm_name, crm_ver) == (
+            'http://registry-relay.test',
+            'unit-route',
+            'unit.config',
+            'IUnitConfigCRM',
+            '0.1.0',
+        )
+        assert len(abi_hash) == 64
+        assert len(signature_hash) == 64
+        assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
+
+
+def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeypatch):
+    registry = _ProcessRegistry.get()
+    installed = _FakeRuntimeSession(
+        max_outstanding_calls=7, retained_input_budget_bytes=8192,
     )
-    assert len(abi_hash) == 64
-    assert len(signature_hash) == 64
-    assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
+    captured = installed.local_endpoint_context()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(registry, '_runtime_session', installed)
+        assert registry.shutdown()['completed'] is True
+        replacement = registry._runtime_session  # noqa: SLF001
+        assert replacement is not installed
+        assert replacement.local_endpoint_context() is captured
+        assert replacement.call_execution_limits_overrides == {
+            'max_outstanding_calls': 7, 'retained_input_budget_bytes': 8192,
+        }
+        assert len(replacement.adopted_observations) == 1
+        assert isinstance(replacement.adopted_observations[0], _FakeRetiredObservation)
 
 
 def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
@@ -764,6 +818,8 @@ def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
 
 
 def test_relay_connected_http_mode_uses_single_core_client_call_path():
+    import re
+
     repo_root = Path(__file__).resolve().parents[4]
     runtime_source = (
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
@@ -773,36 +829,23 @@ def test_relay_connected_http_mode_uses_single_core_client_call_path():
     ).read_text(encoding='utf-8')
 
     assert 'Connect::RelayAware' in runtime_source
-    assert 'self.connect_core(py, expected, Connect::RelayAware)' in runtime_source
-    assert 'inner: Mutex<Option<Client>>' in client_source
-    assert '.call_held(method_name, &request)' in client_source
+    assert re.search(
+        r'self\s*\.\s*connect_core\s*\(\s*py\s*,\s*expected\s*,\s*Connect::RelayAware\s*,?\s*\)',
+        runtime_source,
+    )
+    assert re.search(r'inner:\s*Mutex\s*<\s*Option\s*<\s*Client\s*>\s*>', client_source)
+    # Encoding consumes the prepared scope; execution receives only that
+    # encoded owner, with no second route or method argument.
+    assert re.search(r'fn\s+finish\s*\([^)]*encoded:\s*c2_core::EncodedCall\s*,?\s*\)', client_source)
+    assert re.search(r'py\s*\.detach\(move\s*\|\|\s*encoded\.call_held\(\)\)', client_source)
     assert 'RelayAwareHttpClient' not in runtime_source
     assert 'release_http_client_from_global_pool' not in client_source
 
 
 def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatch):
     registry = _ProcessRegistry.get()
-    settings.relay_anchor_address = 'http://registry-relay.test'
 
-    class FakeRuntimeSession:
-        client_config_frozen = False
-
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        def shutdown(self, *, route_names, relay_anchor_address, timeout_seconds):
-            assert route_names == []
-            return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
-
-        def retire_memory_observation(self):
-            return _FakeRetiredObservation()
-
-        def adopt_retired_memory_observation(self, observation):  # noqa: ARG002
-            pass
-
-        def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
-            pass
-
+    class FakeRuntimeSession(_FakeRuntimeSession):
         def connect_via_relay(
             self,
             route_name: str,
@@ -816,13 +859,12 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
             err.status_code = 404
             raise err
 
-        def lease_tracker(self):
-            return None
+    with monkeypatch.context() as patch:
+        patch.setattr(settings, 'relay_anchor_address', 'http://registry-relay.test')
+        patch.setattr(registry, '_runtime_session', FakeRuntimeSession())
 
-    registry._runtime_session = FakeRuntimeSession()  # noqa: SLF001
-
-    with pytest.raises(ResourceNotFound, match="Resource 'unit-route' not found"):
-        registry.connect(IUnitConfigCRM, name='unit-route')
+        with pytest.raises(ResourceNotFound, match="Resource 'unit-route' not found"):
+            registry.connect(IUnitConfigCRM, name='unit-route')
 
 
 def test_removed_low_level_server_parameters_are_rejected():

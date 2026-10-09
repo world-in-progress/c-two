@@ -45,9 +45,6 @@ pub(crate) fn reap_endpoint(
 
 pub(crate) struct EndpointSweep(crate::unix_managed::ManagedSweep);
 impl EndpointSweep {
-    pub(crate) fn open() -> io::Result<Self> {
-        Self::for_endpoint(&LocalEndpoint::from_address("ipc://c2-endpoint-sweep")?)
-    }
     pub(crate) fn for_endpoint(endpoint: &LocalEndpoint) -> io::Result<Self> {
         crate::unix_managed::ManagedSweep::for_endpoint(endpoint).map(Self)
     }

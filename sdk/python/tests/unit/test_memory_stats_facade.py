@@ -376,6 +376,12 @@ def test_failed_session_replacement_preserves_previous_and_own_observations() ->
             if type(self).fail_next_construction:
                 raise RuntimeError('invalid replacement policy')
 
+        @property
+        def call_execution_limits_overrides(self) -> dict[str, int]:
+            # No explicit limits were accepted by this installed session.
+            # Let the swap reach the deliberately failing constructor.
+            return {}
+
         def retire_memory_observation(self):
             return _StubObservation()
 
