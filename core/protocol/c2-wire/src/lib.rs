@@ -18,7 +18,6 @@ pub mod assembler;
 pub mod buddy;
 pub mod chunk;
 pub mod control;
-pub mod ctrl;
 pub mod flags;
 pub mod frame;
 pub mod handshake;

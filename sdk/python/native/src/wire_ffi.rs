@@ -390,50 +390,6 @@ fn decode_chunk_header(data: &[u8], offset: usize) -> PyResult<(u16, u16, usize)
     c2_wire::chunk::decode_chunk_header(data, offset).map_err(decode_err)
 }
 
-// ── Control messages (IPC) ──────────────────────────────────────────────
-
-/// Encode `CTRL_SEGMENT_ANNOUNCE`.
-#[pyfunction]
-fn encode_ctrl_segment_announce(direction: u8, index: u8, size: u32, name: &str) -> Vec<u8> {
-    c2_wire::ctrl::encode_ctrl_segment_announce(direction, index, size, name)
-}
-
-/// Decode `CTRL_SEGMENT_ANNOUNCE`.
-///
-/// Returns `(direction, index, size, name)`.
-#[pyfunction]
-fn decode_ctrl_segment_announce(payload: &[u8]) -> PyResult<(u8, u8, u32, String)> {
-    c2_wire::ctrl::decode_ctrl_segment_announce(payload).map_err(decode_err)
-}
-
-/// Encode `CTRL_CONSUMED`.
-#[pyfunction]
-fn encode_ctrl_consumed(direction: u8, index: u8) -> Vec<u8> {
-    c2_wire::ctrl::encode_ctrl_consumed(direction, index).to_vec()
-}
-
-/// Decode `CTRL_CONSUMED`.
-///
-/// Returns `(direction, index)`.
-#[pyfunction]
-fn decode_ctrl_consumed(payload: &[u8]) -> PyResult<(u8, u8)> {
-    c2_wire::ctrl::decode_ctrl_consumed(payload).map_err(decode_err)
-}
-
-/// Encode `CTRL_BUDDY_ANNOUNCE`.
-#[pyfunction]
-fn encode_ctrl_buddy_announce(seg_idx: u16, size: u32, name: &str) -> Vec<u8> {
-    c2_wire::ctrl::encode_ctrl_buddy_announce(seg_idx, size, name)
-}
-
-/// Decode `CTRL_BUDDY_ANNOUNCE`.
-///
-/// Returns `(seg_idx, size, name)`.
-#[pyfunction]
-fn decode_ctrl_buddy_announce(payload: &[u8]) -> PyResult<(u16, u32, String)> {
-    c2_wire::ctrl::decode_ctrl_buddy_announce(payload).map_err(decode_err)
-}
-
 // ── Handshake ───────────────────────────────────────────────────────────
 
 /// Encode client→server handshake.
@@ -624,14 +580,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_chunk_header, m)?)?;
     m.add_function(wrap_pyfunction!(decode_chunk_header, m)?)?;
 
-    // ── Control messages ────────────────────────────────────────────
-    m.add_function(wrap_pyfunction!(encode_ctrl_segment_announce, m)?)?;
-    m.add_function(wrap_pyfunction!(decode_ctrl_segment_announce, m)?)?;
-    m.add_function(wrap_pyfunction!(encode_ctrl_consumed, m)?)?;
-    m.add_function(wrap_pyfunction!(decode_ctrl_consumed, m)?)?;
-    m.add_function(wrap_pyfunction!(encode_ctrl_buddy_announce, m)?)?;
-    m.add_function(wrap_pyfunction!(decode_ctrl_buddy_announce, m)?)?;
-
     // ── Handshake ───────────────────────────────────────────────────
     m.add_function(wrap_pyfunction!(encode_client_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(encode_server_handshake, m)?)?;
@@ -717,16 +665,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         PyBytes::new(py, &c2_wire::msg_type::DISCONNECT_ACK_BYTES),
     )?;
     m.add("SIGNAL_SIZE", c2_wire::msg_type::SIGNAL_SIZE)?;
-
-    // ── Control message constants ───────────────────────────────────
-    m.add(
-        "CTRL_SEGMENT_ANNOUNCE",
-        c2_wire::ctrl::CTRL_SEGMENT_ANNOUNCE,
-    )?;
-    m.add("CTRL_CONSUMED", c2_wire::ctrl::CTRL_CONSUMED)?;
-    m.add("CTRL_BUDDY_ANNOUNCE", c2_wire::ctrl::CTRL_BUDDY_ANNOUNCE)?;
-    m.add("POOL_DIR_OUTBOUND", c2_wire::ctrl::POOL_DIR_OUTBOUND)?;
-    m.add("POOL_DIR_RESPONSE", c2_wire::ctrl::POOL_DIR_RESPONSE)?;
 
     // ── Size constants ──────────────────────────────────────────────
     m.add("FRAME_HEADER_SIZE", c2_wire::frame::HEADER_SIZE)?;

@@ -398,6 +398,13 @@ async fn call(client: &IpcClient, binding: &RouteBinding, upstream: &Upstream) -
         .unwrap()
 }
 
+fn expect_inline(response: ResponseData) -> Vec<u8> {
+    let ResponseData::Inline(bytes) = response else {
+        panic!("probe verdict must use the inline response carrier");
+    };
+    bytes
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     // One real dedicated allocation fits exactly; two cannot fit together.
@@ -410,7 +417,7 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     for upstream in [&a, &b] {
         let (lease, client, binding) = upstream.acquire(&state).await;
         assert_eq!(
-            call(&client, &binding, upstream).await.into_inline_bytes(),
+            expect_inline(call(&client, &binding, upstream).await),
             b"dedicated"
         );
         drop(lease);
@@ -451,7 +458,7 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
         "active leases prevent idle eviction"
     );
     assert_eq!(
-        call(&client_b, &binding_b, &b).await.into_inline_bytes(),
+        expect_inline(call(&client_b, &binding_b, &b).await),
         b"handle"
     );
     let competed = snapshot(&state, "request-b-fallback");
@@ -460,11 +467,7 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     assert!(competed.shm.rejected_bytes >= before.shm.rejected_bytes + charge);
     body_tx.send(a.probe.expected.clone()).unwrap();
     assert_eq!(
-        bounded(pending.join())
-            .await
-            .unwrap()
-            .unwrap()
-            .into_inline_bytes(),
+        expect_inline(bounded(pending.join()).await.unwrap().unwrap()),
         b"dedicated"
     );
     drop(lease_b);
@@ -487,7 +490,7 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
     // Each role individually succeeds with real dedicated SHM storage.
     let (lease, client, binding) = a.acquire(&state).await;
     assert_eq!(
-        call(&client, &binding, &a).await.into_inline_bytes(),
+        expect_inline(call(&client, &binding, &a).await),
         b"dedicated"
     );
     drop(lease);
@@ -556,11 +559,7 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
     release(&mut fallback);
     body_tx.send(a.probe.expected.clone()).unwrap();
     assert_eq!(
-        bounded(pending.join())
-            .await
-            .unwrap()
-            .unwrap()
-            .into_inline_bytes(),
+        expect_inline(bounded(pending.join()).await.unwrap().unwrap()),
         b"dedicated"
     );
     assert_eq!(a.probe.calls.load(Ordering::SeqCst), 2);
