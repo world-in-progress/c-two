@@ -26,10 +26,28 @@ use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
 use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey};
 
+#[derive(Default)]
+struct UpstreamControls {
+    closed: bool,
+    tasks: HashMap<UpstreamOwnerKey, UpstreamControlTask>,
+}
+
+#[cfg(test)]
+type TestPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 pub struct RelayState {
     route_table: RwLock<RouteTable>,
     conn_pool: ConnectionPool,
-    upstream_controls: RwLock<HashMap<UpstreamOwnerKey, UpstreamControlTask>>,
+    upstream_controls: RwLock<UpstreamControls>,
+    #[cfg(test)]
+    registration_watch_seam: parking_lot::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    controls_stop_seam: parking_lot::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    acquire_recheck_seam: parking_lot::Mutex<Option<TestPause>>,
     upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
     endpoint_context: LocalEndpointContext,
@@ -175,7 +193,13 @@ impl RelayState {
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
-            upstream_controls: RwLock::new(HashMap::new()),
+            upstream_controls: RwLock::new(UpstreamControls::default()),
+            #[cfg(test)]
+            registration_watch_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            controls_stop_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            acquire_recheck_seam: parking_lot::Mutex::new(None),
             upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
@@ -479,7 +503,7 @@ impl RelayState {
                 Ok(()) => {}
                 Err(error) if should_treat_as_semantic_route_failure(&error) => {
                     if let Some(old_client) = lease.evict_current_client() {
-                        self.clients.close(&old_client);
+                        self.close_failed_acquire_client(&old_client).await;
                     }
                     drop(lease);
                     return Err(UpstreamAcquireError::Unreachable {
@@ -490,7 +514,7 @@ impl RelayState {
                 }
                 Err(error) => {
                     if let Some(old_client) = lease.evict_current_client() {
-                        self.clients.close(&old_client);
+                        self.close_failed_acquire_client(&old_client).await;
                     }
                     drop(lease);
                     return Err(UpstreamAcquireError::WatchUnavailable {
@@ -512,7 +536,7 @@ impl RelayState {
             Ok(binding) => binding,
             Err(error) => {
                 if let Some(old_client) = lease.evict_current_client() {
-                    self.clients.close(&old_client);
+                    self.close_failed_acquire_client(&old_client).await;
                 }
                 drop(lease);
                 return match error {
@@ -528,6 +552,8 @@ impl RelayState {
             }
         };
 
+        #[cfg(test)]
+        Self::pause_for_test(&self.acquire_recheck_seam).await;
         let lease_endpoint = lease.endpoint();
         let route_matches_lease =
             self.renew_owner_lease_if_current_route(expected, &lease_endpoint);
@@ -537,10 +563,20 @@ impl RelayState {
         } else {
             let client = lease.client();
             drop(lease);
-            self.clients.close(&client);
+            self.close_failed_acquire_client(&client).await;
             Err(UpstreamAcquireError::Stale {
                 route: expected.clone(),
             })
+        }
+    }
+
+    // Mark the exact registered owner before awaiting native disconnect initiation.
+    // A false confirmation leaves that owner with the bounded lifecycle observer.
+    async fn close_failed_acquire_client(&self, client: &Arc<IpcClient>) {
+        self.clients.close(client);
+        let confirmed = client.close_shared_bounded(Duration::from_millis(50)).await;
+        if !confirmed {
+            tracing::debug!("relay acquire cleanup remains owned by lifecycle observer");
         }
     }
 
@@ -646,7 +682,13 @@ impl RelayState {
     }
 
     pub(crate) async fn stop_upstream_controls(&self) {
-        let tasks = std::mem::take(&mut *self.upstream_controls.write());
+        let tasks = {
+            let mut controls = self.upstream_controls.write();
+            controls.closed = true;
+            std::mem::take(&mut controls.tasks)
+        };
+        #[cfg(test)]
+        Self::pause_for_test(&self.controls_stop_seam).await;
         for task in tasks.into_values() {
             task.abort_and_wait().await;
         }
@@ -656,20 +698,64 @@ impl RelayState {
         let Some(key) = upstream_control::owner_key_for_route(entry) else {
             return;
         };
-        {
-            let controls = self.upstream_controls.read();
-            if controls.contains_key(&key) {
-                return;
-            }
-        }
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let task = upstream_control::spawn(Arc::clone(self), key.clone());
-        let old_task = self.upstream_controls.write().insert(key, task);
-        if let Some(old_task) = old_task {
-            old_task.abort();
+        // Spawn and publication share stop's fence. No task can reserve a
+        // native client after the stop snapshot without its join being observed.
+        let mut controls = self.upstream_controls.write();
+        if controls.closed || controls.tasks.contains_key(&key) {
+            return;
         }
+        let task = upstream_control::spawn(Arc::clone(self), key.clone());
+        controls.tasks.insert(key, task);
+    }
+
+    #[cfg(test)]
+    async fn pause_for_test(seam: &parking_lot::Mutex<Option<TestPause>>) {
+        let pause = seam.lock().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = tokio::time::timeout(Duration::from_secs(10), resume).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_registration_watch_seam_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.registration_watch_seam.lock() = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn before_registration_watch_for_test(&self) {
+        Self::pause_for_test(&self.registration_watch_seam).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_controls_stop_seam_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.controls_stop_seam.lock() = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controls_snapshot_for_test(&self) -> (bool, usize) {
+        let controls = self.upstream_controls.read();
+        (controls.closed, controls.tasks.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_acquire_recheck_seam_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.acquire_recheck_seam.lock() = Some((entered, resume));
     }
 
     pub(crate) fn mark_upstream_control_watch_unavailable(
@@ -710,10 +796,11 @@ impl RelayState {
     ) {
         let mut controls = self.upstream_controls.write();
         if controls
+            .tasks
             .get(key)
             .is_some_and(|task| task.token_matches(token))
         {
-            controls.remove(key);
+            controls.tasks.remove(key);
             drop(controls);
             self.clear_upstream_control_watch_unavailable(key);
         }
@@ -726,7 +813,7 @@ impl RelayState {
         if !self.local_routes_for_owner(&key).is_empty() {
             return;
         }
-        if let Some(task) = self.upstream_controls.write().remove(&key) {
+        if let Some(task) = self.upstream_controls.write().tasks.remove(&key) {
             task.abort();
         }
         self.clear_upstream_control_watch_unavailable(&key);

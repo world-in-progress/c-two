@@ -852,8 +852,7 @@ async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
         bounded(upload.write_all(b"1\r\n\x07\r\n0\r\n\r\n"))
             .await
             .unwrap();
-        let mut reply = Vec::new();
-        bounded(upload.read_to_end(&mut reply)).await.unwrap();
+        let reply = bounded(read_framed_reply(&mut upload)).await.unwrap();
         assert!(
             reply.starts_with(b"HTTP/1.1 502 "),
             "actual incremental capacity rejection: {}",
@@ -1041,8 +1040,7 @@ async fn h1_admitted_unknown_upload_growth_after_close_is_pre_dispatch_capacity_
         bounded(upload.write_all(b"1\r\n\x07\r\n0\r\n\r\n"))
             .await
             .unwrap();
-        let mut reply = Vec::new();
-        bounded(upload.read_to_end(&mut reply)).await.unwrap();
+        let reply = bounded(read_framed_reply(&mut upload)).await.unwrap();
         assert!(
             reply.starts_with(b"HTTP/1.1 502 "),
             "actual close rejection: {}",

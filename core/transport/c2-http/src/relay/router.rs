@@ -1165,6 +1165,8 @@ async fn handle_register(
                 entry.crm_name,
                 entry.crm_ver
             );
+            #[cfg(test)]
+            state.before_registration_watch_for_test().await;
             state.start_upstream_control(&entry);
             entry
         }
@@ -1180,6 +1182,8 @@ async fn handle_register(
                 entry.crm_name,
                 entry.crm_ver
             );
+            #[cfg(test)]
+            state.before_registration_watch_for_test().await;
             state.start_upstream_control(&entry);
             return (
                 StatusCode::OK,
