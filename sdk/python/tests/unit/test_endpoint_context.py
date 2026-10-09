@@ -307,7 +307,7 @@ def test_admin_probes_surface_windows_root_not_applicable(
     updates = {'C2_IPC_ROOT': root}
     if source == 'dotenv':
         dotenv = tmp_path / 'windows-root.env'
-        dotenv.write_text(f'C2_IPC_ROOT={root}\n', encoding='utf-8')
+        dotenv.write_text(f"C2_IPC_ROOT='{root}'\n", encoding='utf-8')
         updates = {'C2_ENV_FILE': str(dotenv)}
     _run_isolated(f'''
         from c_two.transport.client import util
