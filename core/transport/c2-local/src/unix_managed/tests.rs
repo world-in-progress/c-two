@@ -2723,6 +2723,7 @@ async fn cross_user_cannot_connect_to_0600_socket_in_0755_directory() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("CROSS_USER_DENIED_VERIFIED"));
     assert_eq!(identity_of(&socket_path(&endpoint)), identity);
     assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    println!("CROSS_USER_DENIED_VERIFIED ordinary_uid={uid} socket_mode=0600 root_mode=0755");
 }
 
 #[tokio::test]
