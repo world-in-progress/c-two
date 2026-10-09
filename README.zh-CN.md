@@ -28,7 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-本文介绍 **C-Two 0.7.3**，支持 Python 3.10+，依赖 FastDB 0.2.1。
+本文介绍 **C-Two 0.7.4**，支持 Python 3.10+，依赖 FastDB 0.2.1。
 
 ## 特点
 
@@ -50,10 +50,10 @@ uv pip install c-two
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.sh | sh -s -- --version 0.3.2
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.sh | sh -s -- --version 0.3.3
 ```
 
-Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
+Windows x64 使用[可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-x86_64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/windows-native-usage.md#install-python-and-c3)。
 
 源码构建与测试见[开发指南](docs/development.md)。
 
@@ -101,7 +101,7 @@ finally:
 | Python 契约、跨语言载荷与 hold | [Python SDK 指南](docs/python-usage.md) |
 | Rust SDK | [Rust SDK 指南](sdk/rust/README.md) |
 | Relay 与契约工具 | [c3 CLI 指南](cli/README.md) |
-| 端点目录配置 | [0.7.3 指南](docs/releases/0.7.3.zh-CN.md) |
+| 端点目录与生命周期 | [生命周期指南](docs/local-endpoint-lifecycle.md) |
 | Windows | [构建与使用](docs/windows-native-usage.md) |
 | 环境变量 | [.env.example](.env.example) |
 | 开发 | [构建与测试](docs/development.md)、[贡献指南](CONTRIBUTING.md) |

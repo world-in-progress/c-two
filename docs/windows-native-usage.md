@@ -2,7 +2,7 @@
 
 The native Windows backend uses byte-mode Named Pipes for `ipc://` control traffic and named file mappings for shared payload memory. It runs within one logon session under that session's SID. Ordinary SDK code continues to use logical `ipc://` addresses; do not construct pipe or mapping names in an SDK. HTTP relay still provides the network path.
 
-This guide covers Python C-Two **0.7.3**, c3 **0.3.2** and FastDB **0.2.1** on Windows x64. Install the matching Python and c3 versions together; see the [0.7.3 guide](releases/0.7.3.md) for endpoint behavior.
+This guide covers Python C-Two **0.7.4**, c3 **0.3.3** and FastDB **0.2.1** on Windows x64. Install the matching Python and c3 versions together; see the [0.7.4 guide](releases/0.7.4.md) for endpoint behavior.
 
 Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current logon SID.
 
@@ -11,13 +11,13 @@ Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-ro
 In an activated Python environment, explicitly select the documented version:
 
 ```powershell
-uv pip install 'c-two==0.7.3'
+uv pip install 'c-two==0.7.4'
 ```
 
-The [c3 0.3.2 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.2) provides `c3-x86_64-pc-windows-msvc.exe`, its `.exe.sha256` checksum and `c3-installer.ps1`. Download and verify the standalone executable before running it:
+The [c3 0.3.3 release](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.3) provides `c3-x86_64-pc-windows-msvc.exe`, its `.exe.sha256` checksum and `c3-installer.ps1`. Download and verify the standalone executable before running it:
 
 ```powershell
-$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.2'
+$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.3.3'
 $asset = 'c3-x86_64-pc-windows-msvc.exe'
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset" -OutFile ".\$asset"
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset.sha256" -OutFile ".\$asset.sha256"
@@ -34,7 +34,7 @@ Alternatively, use the checksum-verifying installer:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.2 -Target x86_64-pc-windows-msvc
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.3 -Target x86_64-pc-windows-msvc
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```

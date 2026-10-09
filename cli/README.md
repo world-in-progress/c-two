@@ -4,7 +4,7 @@
 
 This guide covers the native c3 interface. Configuration is documented in the
 [configuration guide](../docs/configuration.en.md); endpoint directory changes
-are described in the [0.7.3 guide](../docs/releases/0.7.3.md).
+are described in the [0.7.4 guide](../docs/releases/0.7.4.md).
 
 ## Scope
 
@@ -256,7 +256,7 @@ python tools/dev/generate_banner.py
 
 ## Release
 
-The coordinated [c3 0.3.2 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.2)
+The coordinated [c3 0.3.3 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.3.3)
 uses the following binary target convention. Installation and checksum
 verification are in the [Windows guide](../docs/windows-native-usage.md):
 
@@ -273,14 +273,14 @@ The matching release's `rc-manifest.json` identifies the artifact source.
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.2
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.3
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to
 `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.2 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.3.3 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64
@@ -289,7 +289,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.2 -Target x86_64-pc-windows-msvc
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.3.3 -Target x86_64-pc-windows-msvc
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```
