@@ -36,6 +36,14 @@ PORTABLE = (
 TYPESCRIPT = f"{SDK}/integration/test_typescript_real_calls.py"
 # The SDK pyproject is pytest's root, so nodeids start with tests/.
 WINDOWS_ENDPOINT_TEST = "tests/unit/test_endpoint_context.py::test_windows_root_override_is_explicitly_unsupported_and_preserves_default"
+WINDOWS_ENDPOINT_TESTS = frozenset((
+    WINDOWS_ENDPOINT_TEST,
+    *(
+        "tests/unit/test_endpoint_context.py::test_admin_probes_surface_windows_root_not_applicable"
+        f"[{source}-{probe}]"
+        for source in ("environment", "dotenv") for probe in ("ping", "shutdown")
+    ),
+))
 FASTDB_SHA = "4f99f86a662b0e950a0dd29800c25a1c9fca4def"
 PLUGIN = "tools.dev.test_python"
 
@@ -211,7 +219,7 @@ def validate_execution(directory: Path, expected: list[str], workers: int) -> No
         raise RunnerError("同一nodeid被执行多次")
     platform_skips = {
         row["nodeid"] for row in reports
-        if sys.platform != "win32" and row["nodeid"] == WINDOWS_ENDPOINT_TEST
+        if sys.platform != "win32" and row["nodeid"] in WINDOWS_ENDPOINT_TESTS
         and row["when"] == "setup" and row["outcome"] == "skipped"
         and row.get("skip_reason") == "Skipped: Windows named-pipe platform contract"
     }

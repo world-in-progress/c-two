@@ -104,12 +104,14 @@ def test_collection_skip_stops_before_execution(tmp_path: Path, monkeypatch: pyt
 
 
 @pytest.mark.parametrize('platform,nodeid,phase,reason,accepted', [
-    ('darwin', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: Windows named-pipe platform contract', True),
-    ('linux', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: Windows named-pipe platform contract', True),
+    *((platform, nodeid, 'setup', 'Skipped: Windows named-pipe platform contract', True)
+      for platform in ('darwin', 'linux') for nodeid in sorted(runner.WINDOWS_ENDPOINT_TESTS)),
     ('win32', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: Windows named-pipe platform contract', False),
     ('darwin', runner.WINDOWS_ENDPOINT_TEST, 'call', 'Skipped: Windows named-pipe platform contract', False),
     ('darwin', runner.WINDOWS_ENDPOINT_TEST, 'setup', 'Skipped: missing native', False),
     ('darwin', 'unexpected::test_skip', 'setup', 'Skipped: Windows named-pipe platform contract', False),
+    ('darwin', 'tests/unit/test_endpoint_context.py::test_admin_probes_surface_windows_root_not_applicable[other-ping]',
+     'setup', 'Skipped: Windows named-pipe platform contract', False),
 ])
 def test_only_declared_windows_setup_skip_is_not_applicable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
