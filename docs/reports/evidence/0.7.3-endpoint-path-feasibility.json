@@ -1,0 +1,60 @@
+{
+  "kind": "OS primitive feasibility probe, not C-Two integration validation",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "rows": [
+    {
+      "directory_utf8_bytes": 128,
+      "basename_bytes": 32,
+      "absolute_socket_path_bytes": 161,
+      "nonblocking_connect_result": 0,
+      "live_probe_result": 0,
+      "dead_probe_result": 61,
+      "roundtrip": true,
+      "global_cwd_unchanged": true,
+      "socket_removed": true,
+      "temporary_tree_removed": true
+    },
+    {
+      "directory_utf8_bytes": 256,
+      "basename_bytes": 32,
+      "absolute_socket_path_bytes": 289,
+      "nonblocking_connect_result": 0,
+      "live_probe_result": 0,
+      "dead_probe_result": 61,
+      "roundtrip": true,
+      "global_cwd_unchanged": true,
+      "socket_removed": true,
+      "temporary_tree_removed": true
+    },
+    {
+      "directory_utf8_bytes": 512,
+      "basename_bytes": 32,
+      "absolute_socket_path_bytes": 545,
+      "nonblocking_connect_result": 0,
+      "live_probe_result": 0,
+      "dead_probe_result": 61,
+      "roundtrip": true,
+      "global_cwd_unchanged": true,
+      "socket_removed": true,
+      "temporary_tree_removed": true
+    },
+    {
+      "directory_utf8_bytes": 768,
+      "basename_bytes": 32,
+      "absolute_socket_path_bytes": 801,
+      "nonblocking_connect_result": 0,
+      "live_probe_result": 0,
+      "dead_probe_result": 61,
+      "roundtrip": true,
+      "global_cwd_unchanged": true,
+      "socket_removed": true,
+      "temporary_tree_removed": true
+    }
+  ],
+  "status": "passed",
+  "design_target": "0.7.3",
+  "date": "2026-10-09",
+  "baseline_source": "7590977489d1cf920df0f0b676ec02ce6eb3cba5",
+  "probe_script_sha256": "3e59dbce390ed1615a04412666f253fb50382ab0223c981cc3924f52f45cf730",
+  "scope": "OS primitive feasibility only; C-Two integration, Rust pending/cancellation and other operating systems remain untested."
+}
